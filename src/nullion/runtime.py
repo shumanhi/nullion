@@ -1782,6 +1782,31 @@ def _active_boundary_permit_duplicate(
     return None
 
 
+def _active_boundary_rule_duplicate(
+    store: RuntimeStore,
+    rule: BoundaryPolicyRule,
+    *,
+    now: datetime,
+) -> BoundaryPolicyRule | None:
+    for existing in store.list_boundary_policy_rules():
+        if existing.rule_id == rule.rule_id:
+            continue
+        if existing.principal_id != rule.principal_id:
+            continue
+        if existing.kind is not rule.kind:
+            continue
+        if existing.mode is not rule.mode:
+            continue
+        if existing.selector != rule.selector:
+            continue
+        if existing.revoked_at is not None and existing.revoked_at <= now:
+            continue
+        if existing.expires_at is not None and existing.expires_at <= now:
+            continue
+        return existing
+    return None
+
+
 def _approval_permission_candidates(approval: ApprovalRequest) -> tuple[str, ...]:
     if approval.action == "use_tool":
         tool_name = approval.resource
@@ -2088,6 +2113,8 @@ def _approval_decision_always_allow_node(state: _ApprovalDecisionState) -> dict[
         reason=updated.decision_reason,
         expires_at=state.get("expires_at"),
     )
+    if _active_boundary_rule_duplicate(state["store"], rule, now=updated.decided_at) is not None:
+        return {"boundary_rules": []}
     state["store"].add_boundary_policy_rule(rule)
     return {"boundary_rules": [rule]}
 
@@ -6410,7 +6437,7 @@ def invoke_tool_with_boundary_policy(
             denied_tool_names=denied_tool_names,
         )
 
-    if result.status != "denied":
+    if result.status != "denied" and invocation.tool_name == "terminal_exec":
         _record_wildcard_boundary_permit_accesses(store, invocation, active_permits)
         for permit in active_permits:
             if permit.uses_remaining <= 0:

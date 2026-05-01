@@ -131,14 +131,18 @@ def approve_request_with_mode(
         principal_id=approval.requested_by,
         permissions=approval_tool_permissions(approval),
         boundary_allow_once_selector=(
-            "*"
-            if is_run_wide_web
-            else approval_selector(approval, "allow_once")
+            approval_selector(approval, "allow_once")
             if normalized_mode == "once"
             else None
         ),
-        boundary_allow_once_uses=100 if is_run_wide_web else None,
-        boundary_always_allow_selector=approval_selector(approval, "always_allow") if normalized_mode == "always" else None,
+        boundary_allow_once_uses=None,
+        boundary_always_allow_selector=(
+            "*"
+            if is_run_wide_web
+            else approval_selector(approval, "always_allow")
+            if normalized_mode == "always"
+            else None
+        ),
         boundary_kind=boundary_kind,
         expires_at=decision_expires_at,
         actor="operator",
@@ -159,8 +163,7 @@ def approve_request_with_mode(
                 other.approval_id,
                 principal_id=other.requested_by,
                 permissions=approval_tool_permissions(other),
-                boundary_allow_once_selector="*",
-                boundary_allow_once_uses=100,
+                boundary_always_allow_selector="*",
                 boundary_kind=other_boundary_kind,
                 expires_at=decision_expires_at,
                 actor="operator",
