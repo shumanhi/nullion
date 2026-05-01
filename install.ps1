@@ -860,6 +860,8 @@ $NULLION_DISCORD_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-discord.exe"
 Write-Info "Installing dependencies (this may take a minute)..."
 & $PIP install --quiet --upgrade pip
 & $PIP install --quiet -e $SOURCE_DIR
+& $VENV_PYTHON -c "import PIL; import pypdf"
+if ($LASTEXITCODE -ne 0) { throw "PDF runtime dependency check failed." }
 Write-Ok "Nullion installed."
 
 [void](Install-PlaywrightRuntime)

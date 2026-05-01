@@ -1119,6 +1119,10 @@ fi
 print_info "Installing dependencies (this may take a minute)..."
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 "$VENV_DIR/bin/pip" install --quiet -e "$SOURCE_DIR"
+"$VENV_DIR/bin/python" - <<'PY'
+import PIL
+import pypdf
+PY
 print_ok "Nullion installed."
 
 install_playwright_runtime || true

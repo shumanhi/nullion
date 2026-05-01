@@ -69,6 +69,18 @@ def _src_dir() -> Path:
     # Fallback: installer layout
     return _install_dir() / "src"
 
+
+def _verify_pdf_runtime_dependencies() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "import PIL; import pypdf"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        details = result.stderr.strip() or result.stdout.strip() or "missing PIL or pypdf"
+        raise RuntimeError(f"PDF runtime dependency check failed: {details}")
+
+
 def _backup_dir() -> Path:
     d = _install_dir() / "backups"
     d.mkdir(parents=True, exist_ok=True)
@@ -825,6 +837,7 @@ async def _update_apply_node(state: _UpdateWorkflowState) -> dict[str, object]:
         )
         if install_result.returncode != 0:
             raise RuntimeError(f"pip install failed: {install_result.stderr}")
+        await _update_run_blocking(_verify_pdf_runtime_dependencies)
 
         state = {**state, "steps": steps}
         steps = _update_emit(state, "apply", "Update installed.")
