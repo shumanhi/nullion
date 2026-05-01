@@ -2346,6 +2346,96 @@ def revoke_session_web_boundary_permits(
     return revoked
 
 
+def revoke_related_boundary_permission(
+    store: RuntimeStore,
+    *,
+    permission_kind: str,
+    permission_id: str,
+    actor: str = "operator",
+    reason: str = "Revoked from web UI",
+) -> int:
+    normalized_actor = _require_trusted_mutation_actor(actor=actor, action="approval.boundary_permission_revoked")
+    now = datetime.now(UTC)
+    if permission_kind == "boundary-permit":
+        target = store.get_boundary_permit(permission_id)
+        if target is None:
+            raise KeyError(permission_id)
+        boundary_kind = target.boundary_kind
+        selector = target.selector
+        revoke_permits = True
+        revoke_rules = True
+        rule_mode = PolicyMode.ALLOW
+    elif permission_kind == "boundary-rule":
+        target = store.get_boundary_policy_rule(permission_id)
+        if target is None:
+            raise KeyError(permission_id)
+        boundary_kind = target.kind
+        selector = target.selector
+        revoke_permits = target.mode is PolicyMode.ALLOW
+        revoke_rules = True
+        rule_mode = target.mode
+    else:
+        raise ValueError("unknown permission kind")
+
+    def selector_matches(candidate: str) -> bool:
+        if selector == "*" or candidate == "*":
+            return selector == candidate
+        if boundary_kind is BoundaryKind.OUTBOUND_NETWORK:
+            return normalize_outbound_network_selector(candidate) == normalize_outbound_network_selector(selector)
+        return candidate == selector
+
+    revoked = 0
+    revoked_permit_ids: list[str] = []
+    revoked_rule_ids: list[str] = []
+    if revoke_permits:
+        for permit in store.list_boundary_permits():
+            if permit.revoked_at is not None:
+                continue
+            if permit.boundary_kind is not boundary_kind or not selector_matches(permit.selector):
+                continue
+            store.add_boundary_permit(
+                replace(
+                    permit,
+                    revoked_by=normalized_actor,
+                    revoked_at=now,
+                    revoked_reason=reason,
+                )
+            )
+            revoked += 1
+            revoked_permit_ids.append(permit.permit_id)
+    if revoke_rules:
+        for rule in store.list_boundary_policy_rules():
+            if rule.revoked_at is not None:
+                continue
+            if rule.kind is not boundary_kind or rule.mode is not rule_mode or not selector_matches(rule.selector):
+                continue
+            store.add_boundary_policy_rule(replace(rule, revoked_at=now))
+            revoked += 1
+            revoked_rule_ids.append(rule.rule_id)
+    normalized_selector = (
+        normalize_outbound_network_selector(selector)
+        if boundary_kind is BoundaryKind.OUTBOUND_NETWORK and selector != "*"
+        else selector
+    )
+    store.add_event(
+        make_event(
+            event_type="approval.boundary_permission_revoked",
+            actor=normalized_actor,
+            payload={
+                "permission_kind": permission_kind,
+                "permission_id": permission_id,
+                "boundary_kind": str(getattr(boundary_kind, "value", boundary_kind)),
+                "selector": normalized_selector,
+                "revoked_permit_ids": revoked_permit_ids,
+                "revoked_rule_ids": revoked_rule_ids,
+                "count": revoked,
+                "reason": reason,
+            },
+        )
+    )
+    return revoked
+
+
 
 def _auto_create_mission_for_turn(
     store: RuntimeStore,
@@ -6589,6 +6679,7 @@ __all__ = [
     "render_tool_result_for_telegram",
     "report_health_issue",
     "revoke_permission_grant",
+    "revoke_related_boundary_permission",
     "revoke_session_web_boundary_permits",
     "resolve_sentinel_escalation",
     "resolve_sentinel_escalation_for_approval",

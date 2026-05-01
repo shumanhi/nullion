@@ -13814,21 +13814,21 @@ def create_app(runtime, orchestrator, registry):
         try:
             if permission_kind == "grant":
                 runtime.revoke_permission_grant(permission_id, actor="operator", reason="Revoked from web UI")
-            elif permission_kind == "boundary-rule":
-                rule = runtime.store.get_boundary_policy_rule(permission_id)
-                if rule is None:
-                    return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-                runtime.store.add_boundary_policy_rule(replace(rule, revoked_at=datetime.now(UTC)))
+                return JSONResponse({"ok": True})
+            elif permission_kind in {"boundary-rule", "boundary-permit"}:
+                from nullion.runtime import revoke_related_boundary_permission
+
+                revoked = revoke_related_boundary_permission(
+                    runtime.store,
+                    permission_kind=permission_kind,
+                    permission_id=permission_id,
+                    actor="operator",
+                    reason="Revoked from web UI",
+                )
                 runtime.checkpoint()
-            elif permission_kind == "boundary-permit":
-                permit = runtime.store.get_boundary_permit(permission_id)
-                if permit is None:
-                    return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-                runtime.store.add_boundary_permit(replace(permit, revoked_at=datetime.now(UTC)))
-                runtime.checkpoint()
+                return JSONResponse({"ok": True, "revoked": revoked})
             else:
                 return JSONResponse({"ok": False, "error": "unknown permission kind"}, status_code=400)
-            return JSONResponse({"ok": True})
         except KeyError:
             return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
         except Exception as exc:
