@@ -8931,8 +8931,10 @@ async function loadConfig() {
     // NOTE: do NOT call onProviderChange() here. It was already called above
     // (with _providerChangeIsInitialLoad guarded). Calling it a second time
     // without the guard hits the "isConfigured → toggle ON" branch and
-    // flips a just-saved disabled toggle back to enabled.
-    onSetupProviderChange();
+    // flips a just-saved disabled toggle back to enabled. Do run the full
+    // media refresh after defaults and setup availability are hydrated, or
+    // model-backed helper suggestions may not appear until the next click.
+    refreshMediaHelperOptionsFromInventory();
     // Load profile separately
     try {
       const p = await API('/api/profile');

@@ -808,6 +808,11 @@ def test_media_model_javascript_rejects_provider_mismatches() -> None:
     assert "belongs under a different provider" in _HTML
 
 
+def test_settings_load_refreshes_media_helper_options_after_hydration() -> None:
+    assert "model-backed helper suggestions may not appear until the next click" in _HTML
+    assert "refreshMediaHelperOptionsFromInventory();" in _HTML
+
+
 def test_media_selection_rejects_partial_selection_and_codex_audio_even_if_declared() -> None:
     media_models = {"codex": [{"model": "gpt-5.5", "capabilities": ["audio_input", "image_input"]}]}
 
