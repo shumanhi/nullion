@@ -228,6 +228,10 @@ def test_runtime_store_round_trips_full_workflow_surface_json_and_sqlite(tmp_pat
             pending_step_idx=1,
             messages_snapshot=[{"role": "user"}],
             pending_tool_calls=[{"id": "tool"}],
+            task_id="task-1",
+            group_id="group-1",
+            agent_id="agent-1",
+            resume_token={"backend": "deepagents", "thread_id": "thread-1"},
         )
     )
     store.add_doctor_signal(
@@ -332,6 +336,8 @@ def test_runtime_store_round_trips_full_workflow_surface_json_and_sqlite(tmp_pat
     assert loaded.get_capsule(capsule.capsule_id).goal == "ship"
     assert loaded.get_reminder("rem").delivered_at == now
     assert loaded.get_suspended_turn("ap").pending_step_idx == 1
+    assert loaded.get_suspended_turn("ap").resume_token["backend"] == "deepagents"
+    assert loaded.get_suspended_turn("ap").task_id == "task-1"
     assert loaded.list_missions()[0].steps[0].step_id == "step"
     assert loaded.get_task_frame("frame").metadata == {"k": "v"}
     assert loaded.get_conversation_head("conv")["active_turn_id"] == "turn"
@@ -346,6 +352,7 @@ def test_runtime_store_round_trips_full_workflow_surface_json_and_sqlite(tmp_pat
     save_runtime_store(store, sqlite_path)
     sqlite_loaded = load_runtime_store(sqlite_path)
     assert sqlite_loaded.get_task_frame("frame").summary == "summary"
+    assert sqlite_loaded.get_suspended_turn("ap").group_id == "group-1"
     assert sqlite_loaded.list_skill_execution_plans()["cap"].plan_id == "plan"
     sqlite_doctor_signal = sqlite_loaded.list_doctor_signals()[0]
     assert sqlite_doctor_signal.summary == "Probe failed"

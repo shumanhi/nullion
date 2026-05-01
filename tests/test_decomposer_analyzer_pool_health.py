@@ -27,6 +27,7 @@ from nullion.task_decomposer import (
     _validate_dag_plan,
 )
 from nullion.task_queue import TaskPriority, TaskStatus
+from nullion.task_queue import TaskResult
 from nullion.warm_pool import EVICT_AFTER_TASKS, AgentState, SharedResources, WarmAgentPool, get_agent_client
 
 
@@ -91,6 +92,8 @@ def test_task_decomposer_dispatches_valid_parallel_and_sequential_groups() -> No
     assert group.tasks[1].priority is TaskPriority.NORMAL
     assert group.tasks[1].dependencies == [group.tasks[0].task_id]
     assert group.planner_metadata["dispatchable"] is True
+    assert group.tasks[0].deep_agent_skills == ["/skills/nullion/"]
+    assert group.tasks[0].deep_agent_subagents[0]["name"] == "research_agent"
 
 
 def test_task_decomposer_strips_web_composer_mode_prefix_before_model_call() -> None:
@@ -293,12 +296,62 @@ def test_conversation_analyzer_filters_dedupes_and_caches() -> None:
     assert [proposal.title for proposal in proposals] == ["Deploy Checklist"]
     assert proposals[0].tags == ["ops", "deploy", "extra", "four"]
     assert proposals[0].to_skill_kwargs()["trigger"] == "deploy this"
+    validation = proposals[0].deep_agent_validation_snapshot()
+    assert validation["status"] == "ready"
+    assert validation["skill_source"] == "/skills/auto-skill/"
+    assert "/skills/auto-skill/deploy-checklist/SKILL.md" in validation["skill_files"]
+    assert validation["subagents"][0]["name"] == "auto_skill_validator"
+    assert validation["golden_workflows"][0]["prompt"] == "deploy this"
+    validation_task = proposals[0].deep_agent_validation_task(
+        group_id="g1",
+        conversation_id="c1",
+        principal_id="workspace:test",
+    )
+    assert validation_task.deep_agent_skills == ["/skills/auto-skill/"]
+    assert validation_task.deep_agent_subagents[0]["name"] == "auto_skill_validator"
+    assert "/skills/auto-skill/deploy-checklist/SKILL.md" in validation_task.deep_agent_skill_files
 
     cache_proposals("c1", proposals)
     assert get_cached_proposals("c1") == proposals
     clear_cached_proposals("c1")
     assert get_cached_proposals("c1") == []
     assert analyze_conversation(store, ModelClient(payload), "c1", existing_skill_titles=["Deploy Checklist"]) == []
+
+
+@pytest.mark.asyncio
+async def test_auto_skill_validation_runs_through_deep_agent_runner() -> None:
+    proposal = ConversationAnalysis(
+        title="Deploy Checklist",
+        summary="Run deploy checks",
+        trigger="deploy this",
+        steps=["Run tests", "Deploy"],
+        confidence=0.9,
+    )
+    captured = {}
+
+    class Runner:
+        async def run(self, config, **kwargs):
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+            return TaskResult(config.task.task_id, "success", output="validation passed")
+
+    result = await proposal.run_deep_agent_validation(
+        model_client=SimpleNamespace(),
+        tool_registry=SimpleNamespace(),
+        policy_store=None,
+        approval_store=None,
+        context_bus=SimpleNamespace(),
+        progress_queue=asyncio.Queue(),
+        group_id="g1",
+        conversation_id="c1",
+        principal_id="workspace:test",
+        runner=Runner(),
+    )
+
+    assert result.status == "success"
+    assert captured["config"].agent_id == "auto-skill-validator"
+    assert captured["config"].task.deep_agent_skills == ["/skills/auto-skill/"]
+    assert captured["config"].task.deep_agent_subagents[0]["name"] == "auto_skill_validator"
 
 
 def test_conversation_analyzer_handles_short_conversations_fallback_client_and_multi_conversation() -> None:

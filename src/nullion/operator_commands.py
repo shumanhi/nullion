@@ -2129,6 +2129,7 @@ def _cmd_auto_skill(runtime: PersistentRuntime, conv_id: str | None) -> str:
             f"   {p.summary}\n"
             f"   Trigger: \"{p.trigger}\"\n"
             f"   Steps: {len(p.steps)}\n"
+            f"   Deep Agents validation: {len(p.deep_agent_validation_snapshot().get('checks', []))} checks ready\n"
             f"   Evidence: {p.evidence}\n"
         )
     lines.append(f"Accept a proposal with /accept-skill <1–{len(proposals)}>")

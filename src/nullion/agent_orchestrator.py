@@ -1358,7 +1358,7 @@ class AgentOrchestrator:
                 group = self._task_registry.get_group(group_id)
                 if group is None:
                     return
-                if group.all_terminal():
+                if _group_all_quiescent(group):
                     return
 
                 now = datetime.now(UTC)
@@ -1370,7 +1370,7 @@ class AgentOrchestrator:
                 }
                 failures: list[tuple[Any, str]] = []
                 for task in group.tasks:
-                    if task.is_terminal():
+                    if task.is_terminal() or task.status == TaskStatus.WAITING_INPUT:
                         continue
                     failed_dependency_ids = [dep_id for dep_id in task.dependencies if dep_id in failed_deps]
                     if failed_dependency_ids:
@@ -1413,7 +1413,7 @@ class AgentOrchestrator:
                         )
 
                 group = self._task_registry.get_group(group_id)
-                if group is None or group.all_terminal():
+                if group is None or _group_all_quiescent(group):
                     return
                 monotonic_now = time.monotonic()
                 if monotonic_now - last_status_at >= interval:
@@ -1609,9 +1609,11 @@ class AgentOrchestrator:
         from nullion.warm_pool import get_agent_client
 
         agent = None
+        agent_id = task.agent_id or "mini-agent"
         result: TaskResult | None = None
         try:
             agent = await self._pool.acquire(preferred_tools=task.allowed_tools, task_id=task.task_id)
+            agent_id = agent.agent_id
             config = MiniAgentConfig(
                 agent_id=agent.agent_id,
                 task=task,
@@ -1649,11 +1651,12 @@ class AgentOrchestrator:
             if agent is not None:
                 self._pool.release(agent)
 
-        final_status = TaskStatus.COMPLETE if result.status == "success" else TaskStatus.FAILED
+        final_status = _task_status_for_task_result(result)
+        _store_delegated_pause_suspended_turn(policy_store, approval_store, task=task, result=result, agent_id=agent_id)
         self._transition_dispatch_task_run(
             policy_store,
             task,
-            MiniAgentRunStatus.COMPLETED if result.status == "success" else MiniAgentRunStatus.FAILED,
+            _mini_agent_run_status_for_task_result(result),
             result_summary=result.output or result.error,
         )
         await self._task_registry.update_task(
@@ -1663,10 +1666,10 @@ class AgentOrchestrator:
         if self._progress_queue is not None:
             await self._progress_queue.put(
                 ProgressUpdate(
-                    agent_id=agent.agent_id,
+                    agent_id=agent_id,
                     task_id=task.task_id,
                     group_id=task.group_id,
-                    kind="task_complete" if result.status == "success" else "task_failed",
+                    kind=_progress_kind_for_task_result(result),
                     message=result.output or result.error,
                 )
             )
@@ -1684,6 +1687,79 @@ class AgentOrchestrator:
         grp = self._task_registry.get_group(task.group_id)
         if grp is not None and grp.all_terminal():
             self._context_bus.clear_group(task.group_id)
+
+    async def resume_paused_task(
+        self,
+        *,
+        task_id: str,
+        tool_registry: ToolRegistry,
+        policy_store: Any,
+        approval_store: Any,
+        user_response: str | None = None,
+    ) -> Any | None:
+        """Resume a delegated task that paused for approval or user input.
+
+        Deep Agents do not yet persist a process-independent checkpointer in
+        Nullion, so resume re-runs the scoped delegated task with the approval
+        now granted or the user's response appended to the task prompt.
+        """
+        from nullion.mini_agent_runner import MiniAgentRunner
+        from nullion.task_queue import TaskStatus
+
+        if self._task_registry is None:
+            return None
+        task = self._task_registry.get_task(task_id)
+        if task is None or task.status is not TaskStatus.WAITING_INPUT:
+            return None
+        group = self._task_registry.get_group(task.group_id)
+        if group is None:
+            return None
+        description = task.description
+        response = str(user_response or "").strip()
+        if response:
+            description = f"{description}\n\nUser response for paused task: {response}"
+        task = await self._task_registry.update_task(
+            task.task_id,
+            status=TaskStatus.QUEUED,
+            completed_at=None,
+            result=None,
+            description=description,
+        )
+        if task is None:
+            return None
+        await self._run_task(
+            task,
+            runner=MiniAgentRunner(),
+            group=group,
+            tool_registry=tool_registry,
+            policy_store=policy_store,
+            approval_store=approval_store,
+        )
+        updated = self._task_registry.get_task(task_id)
+        return getattr(updated, "result", None)
+
+    def resume_paused_task_sync(
+        self,
+        *,
+        task_id: str,
+        tool_registry: ToolRegistry,
+        policy_store: Any,
+        approval_store: Any,
+        user_response: str | None = None,
+        timeout_s: float = 30.0,
+    ) -> Any | None:
+        loop = self._ensure_dispatcher_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            self.resume_paused_task(
+                task_id=task_id,
+                tool_registry=tool_registry,
+                policy_store=policy_store,
+                approval_store=approval_store,
+                user_response=user_response,
+            ),
+            loop,
+        )
+        return future.result(timeout=timeout_s)
 
     def get_status(
         self,
@@ -1742,6 +1818,60 @@ def _messaging_target_from_conversation_id(conversation_id: str) -> str | None:
     return None
 
 
+def _delegated_pause_store(policy_store: Any, approval_store: Any) -> Any | None:
+    for store in (policy_store, approval_store):
+        if store is not None and hasattr(store, "add_suspended_turn"):
+            return store
+    return None
+
+
+def _store_delegated_pause_suspended_turn(
+    policy_store: Any,
+    approval_store: Any,
+    *,
+    task: Any,
+    result: Any,
+    agent_id: str | None,
+) -> None:
+    if getattr(result, "status", None) != "partial":
+        return
+    resume_token = getattr(result, "resume_token", None)
+    if not isinstance(resume_token, dict) or not resume_token:
+        return
+    store = _delegated_pause_store(policy_store, approval_store)
+    if store is None:
+        return
+    approval_id = resume_token.get("approval_id")
+    pause_id = str(approval_id or f"task:{task.task_id}")
+    try:
+        store.add_suspended_turn(
+            SuspendedTurn(
+                approval_id=pause_id,
+                conversation_id=str(task.conversation_id),
+                chat_id=_messaging_target_from_conversation_id(str(task.conversation_id)),
+                message=str(task.description),
+                request_id=None,
+                message_id=None,
+                created_at=datetime.now(UTC),
+                task_id=str(task.task_id),
+                group_id=str(task.group_id),
+                agent_id=str(agent_id or task.agent_id or ""),
+                resume_token=dict(resume_token),
+            )
+        )
+    except Exception:
+        logger.debug("Could not persist delegated task pause for %s", task.task_id, exc_info=True)
+
+
+def _group_all_quiescent(group: Any) -> bool:
+    from nullion.task_queue import TaskStatus
+
+    return all(
+        task.is_terminal() or task.status is TaskStatus.WAITING_INPUT
+        for task in getattr(group, "tasks", ()) or ()
+    )
+
+
 def _planner_summary_from_group(group: Any) -> str:
     metadata = getattr(group, "planner_metadata", None)
     if not isinstance(metadata, dict):
@@ -1759,6 +1889,33 @@ def _planner_summary_from_group(group: Any) -> str:
     if task_count:
         return f"{label} • {task_count} task{'s' if task_count != 1 else ''}"
     return label
+
+
+def _task_status_for_task_result(result: Any) -> TaskStatus:
+    from nullion.task_queue import TaskStatus
+
+    if getattr(result, "status", None) == "success":
+        return TaskStatus.COMPLETE
+    if getattr(result, "status", None) == "partial":
+        return TaskStatus.WAITING_INPUT
+    return TaskStatus.FAILED
+
+
+def _mini_agent_run_status_for_task_result(result: Any) -> MiniAgentRunStatus:
+    if getattr(result, "status", None) == "success":
+        return MiniAgentRunStatus.COMPLETED
+    if getattr(result, "status", None) == "partial":
+        return MiniAgentRunStatus.WAITING_INPUT
+    return MiniAgentRunStatus.FAILED
+
+
+def _progress_kind_for_task_result(result: Any) -> str:
+    if getattr(result, "status", None) == "success":
+        return "task_complete"
+    if getattr(result, "status", None) == "partial":
+        output = str(getattr(result, "output", "") or "")
+        return "input_needed" if output.startswith("Waiting for user input:") else "approval_needed"
+    return "task_failed"
 
 
 def _serialize_pending_tool_calls(tool_results: list[ToolResult]) -> list[dict[str, object]]:

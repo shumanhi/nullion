@@ -112,6 +112,26 @@ class ConversationAnalysis:
             "tags": self.tags,
         }
 
+    def deep_agent_validation_snapshot(self) -> dict[str, object]:
+        from nullion.auto_skill_validation import build_auto_skill_validation_snapshot
+
+        return build_auto_skill_validation_snapshot(self)
+
+    def deep_agent_validation_task(self, *, group_id: str, conversation_id: str, principal_id: str):
+        from nullion.auto_skill_validation import build_auto_skill_validation_task
+
+        return build_auto_skill_validation_task(
+            self,
+            group_id=group_id,
+            conversation_id=conversation_id,
+            principal_id=principal_id,
+        )
+
+    async def run_deep_agent_validation(self, **kwargs: Any):
+        from nullion.auto_skill_validation import run_auto_skill_validation
+
+        return await run_auto_skill_validation(self, **kwargs)
+
 
 # ── Core analysis ─────────────────────────────────────────────────────────────
 

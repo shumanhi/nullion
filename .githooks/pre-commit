@@ -5,6 +5,7 @@ set -eu
 # These can accumulate when sandboxed tools cannot clean up tmp objects
 # on a macOS mount.
 git_dir="$(git rev-parse --git-dir)"
+git_local_env="$(git rev-parse --local-env-vars)"
 for lock in \
     "$git_dir/HEAD.lock" \
     "$git_dir/index.lock" \
@@ -28,6 +29,7 @@ cleanup_coverage() {
 trap cleanup_coverage EXIT
 
 echo "Running test suite before commit with coverage; overall coverage must be at least 70%..."
+unset $git_local_env
 "$python_cmd" -m coverage erase
 "$python_cmd" -m coverage run --source=src/nullion -m pytest -q
 "$python_cmd" -m coverage report --fail-under=70

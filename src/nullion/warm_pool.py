@@ -339,7 +339,7 @@ def _build_sync_openai_adapter(api_key: str) -> Any:
 
 
 class _PooledAgent:
-    """WarmAgentPool picks agents; this gives _model_create a compatible interface."""
+    """WarmAgentPool picks agents; this gives Deep Agents a compatible client."""
     def __init__(self, agent: PooledAgent) -> None:
         self._agent = agent
 
@@ -361,7 +361,7 @@ class _PooledAgent:
 
 
 def get_agent_client(agent: PooledAgent) -> Any:
-    """Return a client wrapper suitable for use in MiniAgentRunner._model_create."""
+    """Return a client wrapper suitable for the Deep Agents model adapter."""
     return _PooledAgent(agent)
 
 
