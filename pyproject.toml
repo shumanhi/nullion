@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nullion"
+dynamic = ["version"]
+description = "Security-first AI agent platform"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+  "python-telegram-bot[webhooks]>=22.6,<23",
+  "pyyaml>=6.0.3",
+  "httpx>=0.27",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "websockets>=12.0",
+  "python-multipart>=0.0.9",
+  "openai>=1.0",
+  "anthropic>=0.25",
+  "croniter>=1.3",
+  "cryptography>=42",
+  "pillow>=10,<12",
+  "playwright>=1.46",
+  "pystray>=0.19.5,<1",
+  "pywebview>=5,<7",
+  "slack-bolt>=1.21,<2",
+  "discord.py>=2.4,<3",
+  "langgraph>=1.0,<2",
+]
+
+[project.scripts]
+nullion          = "nullion.cli:nullion_ctl"
+nullion-telegram = "nullion.telegram_entrypoint:cli"
+nullion-operator = "nullion.telegram_entrypoint:cli"
+nullion-slack    = "nullion.slack_app:cli"
+nullion-discord  = "nullion.discord_app:cli"
+nullion-auth     = "nullion.auth:cli"
+nullion-cli      = "nullion.cli:cli"
+nullion-web      = "nullion.web_app:cli"
+nullion-tray     = "nullion.tray_app:cli"
+nullion-webview  = "nullion.webview_app:cli"
+nullion-recovery = "nullion.recovery:cli"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nullion = ["assets/*.svg"]
+
+[tool.setuptools_scm]
+tag_regex = "^v(?P<version>[0-9]+(?:\\.[0-9]+)*)$"
+fallback_version = "0.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+  ".git",
+  ".pytest_cache",
+  ".venv",
+  ".worktrees",
+  "__pycache__",
+  "htmlcov",
+]
+
+[tool.coverage.run]
+data_file = ".pytest_cache/.coverage"
+
+[tool.coverage.html]
+directory = ".pytest_cache/htmlcov"
+
+[tool.coverage.report]
+fail_under = 50
+exclude_also = [
+  "def create_app\\(",
+  "def _enforce_web_response_fulfillment\\(",
+  "def _web_artifact_roots\\(",
+  "def _web_screenshot_payload_if_requested\\(",
+  "def _run_doctor_remediation_command\\(",
+  "def _launchd_status_for_labels\\(",
+  "def _process_running_for_command\\(",
+  "def _restart_chat_services\\(",
+  "def _restart_non_web_services\\(",
+  "def _restart_telegram_launchd_service\\(",
+  "def _restart_launchd_service_for_labels\\(",
+  "def _start_web_task_frame\\(",
+  "def _finish_web_task_frame\\(",
+  "def _handle_web_config_request\\(",
+  "def _remember_web_explicit_memory\\(",
+  "def _try_dispatch_web_mini_agents\\(",
+  "def _build_web_skill_hint\\(",
+  "def _queue_web_build_mode_proposal\\(",
+  "def _try_web_builder_reflection\\(",
+  "def _resume_web_turn_from_snapshot\\(",
+  "def _orchestrator_for_admin_forced_model\\(",
+  "def _orchestrator_for_video_attachments\\(",
+  "def cli\\(",
+  "def _cli_impl\\(",
+  "def _run_web_server\\(",
+  "def _build_runtime\\(",
+  "def _run_turn_sync\\(",
+  "def _schedule_process_restart\\(",
+  "def _build_anthropic_client\\(",
+  "def _build_openai_client\\(",
+  "async def _stream_codex_reauth_events\\(",
+  "if __name__ == .__main__.:",
+]

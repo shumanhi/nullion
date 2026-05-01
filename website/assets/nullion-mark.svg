@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Nulliøn">
+  <defs>
+    <radialGradient id="brandButton" cx="40%" cy="30%" r="72%">
+      <stop offset="0%" stop-color="#9b84ff"/>
+      <stop offset="55%" stop-color="#7b63ff"/>
+      <stop offset="100%" stop-color="#5b3fd4"/>
+    </radialGradient>
+    <filter id="buttonShadow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="8"/>
+    </filter>
+  </defs>
+
+  <circle cx="64" cy="78" r="48" fill="#1e293b" opacity="0.38" filter="url(#buttonShadow)"/>
+  <circle cx="64" cy="64" r="54" fill="#4f46e5" opacity="0.16" filter="url(#buttonShadow)"/>
+  <circle cx="64" cy="64" r="46" fill="url(#brandButton)"/>
+  <circle cx="64" cy="64" r="46" fill="none" stroke="#37208f" stroke-width="4" opacity="0.28"/>
+  <circle cx="64" cy="64" r="48" fill="none" stroke="#6d5df6" stroke-width="2" opacity="0.22"/>
+  <circle cx="48" cy="47" r="15" fill="#ffffff" opacity="0.12"/>
+  <circle cx="64" cy="64" r="22" fill="none" stroke="#ffffff" stroke-width="14"/>
+  <line x1="43" y1="88" x2="88" y2="40" stroke="#ffffff" stroke-width="14" stroke-linecap="square"/>
+</svg>

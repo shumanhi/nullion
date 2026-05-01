@@ -1,0 +1,13 @@
+{
+  "ignore_dirs": [
+    ".git",
+    ".pytest_cache",
+    ".venv",
+    ".worktrees",
+    "__pycache__",
+    "htmlcov"
+  ],
+  "ignore_vcs": [
+    ".git"
+  ]
+}

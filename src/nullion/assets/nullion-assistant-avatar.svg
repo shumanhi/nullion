@@ -1,0 +1,123 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="40%" r="70%">
+      <stop offset="0%" stop-color="#7dd3fc"/>
+      <stop offset="45%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </radialGradient>
+    <linearGradient id="face" x1="25%" y1="20%" x2="75%" y2="85%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.96"/>
+      <stop offset="100%" stop-color="#dbeafe" stop-opacity="0.94"/>
+    </linearGradient>
+    <radialGradient id="brandButton" cx="40%" cy="30%" r="72%">
+      <stop offset="0%" stop-color="#9b84ff"/>
+      <stop offset="55%" stop-color="#7b63ff"/>
+      <stop offset="100%" stop-color="#5b3fd4"/>
+    </radialGradient>
+    <linearGradient id="leftArmShadow" x1="278" y1="930" x2="360" y2="930" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#b8d4f2" stop-opacity="0.36"/>
+      <stop offset="48%" stop-color="#5f8fc6" stop-opacity="0.44"/>
+      <stop offset="100%" stop-color="#d7ebfb" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="rightArmShadow" x1="664" y1="930" x2="746" y2="930" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#d7ebfb" stop-opacity="0.18"/>
+      <stop offset="52%" stop-color="#5f8fc6" stop-opacity="0.44"/>
+      <stop offset="100%" stop-color="#b8d4f2" stop-opacity="0.36"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="24" stdDeviation="24" flood-color="#020617" flood-opacity="0.35"/>
+    </filter>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="badgeGlow" x="-70%" y="-70%" width="240%" height="240%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#7b63ff" flood-opacity="0.42"/>
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#020617" flood-opacity="0.24"/>
+    </filter>
+    <filter id="carvedMark" x="-45%" y="-45%" width="190%" height="190%">
+      <feDropShadow dx="0" dy="3" stdDeviation="1.8" flood-color="#ffffff" flood-opacity="0.6"/>
+      <feDropShadow dx="0" dy="-4" stdDeviation="2.2" flood-color="#7b63ff" flood-opacity="0.46"/>
+      <feDropShadow dx="0" dy="7" stdDeviation="6" flood-color="#020617" flood-opacity="0.24"/>
+    </filter>
+    <filter id="buttonShadow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- subtle stars / data dots -->
+  <g fill="#ffffff" opacity="0.55">
+    <circle cx="130" cy="160" r="4"/>
+    <circle cx="860" cy="135" r="3"/>
+    <circle cx="905" cy="345" r="5"/>
+    <circle cx="105" cy="720" r="3"/>
+    <circle cx="785" cy="815" r="4"/>
+    <circle cx="250" cy="860" r="2.8"/>
+  </g>
+
+  <!-- network arcs -->
+  <g fill="none" stroke="#bae6fd" stroke-width="3" opacity="0.28">
+    <path d="M126 252 C290 70, 743 71, 894 260"/>
+    <path d="M126 768 C300 940, 725 930, 894 760"/>
+    <path d="M85 512 C220 420, 285 610, 405 520"/>
+    <path d="M619 520 C745 610, 800 420, 940 512"/>
+  </g>
+
+  <g transform="translate(0 44)">
+  <!-- assistant head -->
+  <g filter="url(#shadow)">
+    <rect x="220" y="250" width="584" height="458" rx="130" fill="url(#face)"/>
+    <rect x="250" y="282" width="524" height="394" rx="104" fill="none" stroke="#ffffff" stroke-width="10" opacity="0.75"/>
+  </g>
+
+  <!-- antenna -->
+  <g filter="url(#glow)">
+    <line x1="512" y1="250" x2="512" y2="166" stroke="#e0f2fe" stroke-width="16" stroke-linecap="round"/>
+    <circle cx="512" cy="140" r="34" fill="#38bdf8" stroke="#e0f2fe" stroke-width="10"/>
+  </g>
+
+  <!-- ears -->
+  <g filter="url(#shadow)">
+    <rect x="166" y="402" width="80" height="172" rx="36" fill="#dbeafe"/>
+    <rect x="778" y="402" width="80" height="172" rx="36" fill="#dbeafe"/>
+  </g>
+
+  <!-- eyes -->
+  <g>
+    <ellipse cx="405" cy="468" rx="48" ry="56" fill="#111827"/>
+    <ellipse cx="619" cy="468" rx="48" ry="56" fill="#111827"/>
+    <circle cx="423" cy="446" r="13" fill="#ffffff" opacity="0.95"/>
+    <circle cx="637" cy="446" r="13" fill="#ffffff" opacity="0.95"/>
+  </g>
+
+  <!-- smile -->
+  <path d="M400 575 C455 640, 570 640, 624 575" fill="none" stroke="#2563eb" stroke-width="22" stroke-linecap="round"/>
+
+  <!-- cheeks -->
+  <ellipse cx="333" cy="555" rx="38" ry="24" fill="#fb7185" opacity="0.22"/>
+  <ellipse cx="691" cy="555" rx="38" ry="24" fill="#fb7185" opacity="0.22"/>
+
+  <!-- chest / base -->
+  <g filter="url(#shadow)">
+    <path d="M320 710 H704 C748 710 784 744 794 790 L842 1024 H182 L230 790 C240 744 276 710 320 710Z" fill="#e0f2fe" opacity="0.96"/>
+    <g opacity="0.72">
+      <path d="M342 830 C310 884 292 956 286 1024 H360 C382 958 379 896 350 834 C347 831 345 830 342 830Z" fill="url(#leftArmShadow)"/>
+      <path d="M682 830 C714 884 732 956 738 1024 H664 C642 958 645 896 674 834 C677 831 679 830 682 830Z" fill="url(#rightArmShadow)"/>
+    </g>
+    <circle cx="512" cy="856" r="62" fill="#1e293b" opacity="0.38" filter="url(#buttonShadow)"/>
+    <circle cx="512" cy="835" r="66" fill="#4f46e5" opacity="0.16" filter="url(#buttonShadow)"/>
+    <g>
+      <circle cx="512" cy="835" r="52" fill="url(#brandButton)"/>
+      <circle cx="512" cy="835" r="52" fill="none" stroke="#37208f" stroke-width="5" opacity="0.28"/>
+      <circle cx="512" cy="835" r="54" fill="none" stroke="#6d5df6" stroke-width="2" opacity="0.22"/>
+      <circle cx="494" cy="815" r="17" fill="#ffffff" opacity="0.12"/>
+      <text x="512" y="835" text-anchor="middle" dominant-baseline="central" font-family="Inter, Arial, sans-serif" font-size="70" font-weight="850" fill="#ffffff">Ø</text>
+    </g>
+  </g>
+  </g>
+</svg>
