@@ -9,6 +9,11 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
+from nullion.deep_agent_profiles import (
+    deep_agent_profile_names_for_task,
+    deep_agent_skills_for_task,
+    deep_agent_subagents_for_task,
+)
 from nullion.missions import MissionContinuationPolicy, MissionRecord, MissionStatus, MissionStep
 from nullion.task_frames import TaskFrame
 
@@ -265,12 +270,32 @@ def _step_scope_metadata_node(state: _StepMetadataState) -> dict[str, object]:
     metadata["tool_scope"] = list(decision.tool_scope)
     if decision.evidence:
         metadata["tool_scope_evidence"] = list(decision.evidence)
+    profile_task = _PlannerProfileTask(state["clause"], list(decision.tool_scope))
+    profiles = deep_agent_profile_names_for_task(profile_task)
+    if profiles:
+        metadata["deep_agent_profiles"] = profiles
+        metadata["deep_agent_skills"] = deep_agent_skills_for_task(profile_task)
+        metadata["deep_agent_subagents"] = [
+            str(subagent["name"])
+            for subagent in deep_agent_subagents_for_task(profile_task)
+            if isinstance(subagent.get("name"), str)
+        ]
     metadata["checkpoint_before"] = _contains_checkpoint_phrase(state["clause"])
     return {"metadata": metadata}
 
 
 def _step_tool_scope_node(state: _StepMetadataState) -> dict[str, object]:
     return {"tool_scope_decision": _tool_scope_decision_for_clause(state["clause"])}
+
+
+@dataclass(frozen=True, slots=True)
+class _PlannerProfileTask:
+    description: str
+    allowed_tools: list[str]
+
+    @property
+    def title(self) -> str:
+        return self.description
 
 
 def _step_active_frame_metadata_node(state: _StepMetadataState) -> dict[str, object]:
@@ -331,6 +356,9 @@ def _tool_scope_decision_for_clause(clause: str) -> ToolScopeDecision:
     elif word_set & {"search", "find"}:
         scope.append("web_search")
         evidence.append("search_intent")
+    if word_set & {"pdf"}:
+        scope.append("pdf_create")
+        evidence.append("pdf_deliverable")
     return ToolScopeDecision(
         tool_scope=tuple(dict.fromkeys(scope)),
         evidence=tuple(dict.fromkeys(evidence)),

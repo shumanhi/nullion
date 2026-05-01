@@ -70,6 +70,17 @@ def test_fresh_install_provisions_media_and_browser_runtime_by_default() -> None
     assert '$providerBindings = "search_plugin=$SEARCH_PROVIDER,media_plugin=local_media_provider"' in install_ps1
 
 
+def test_fresh_install_verifies_pdf_runtime_dependencies() -> None:
+    install_sh = open("install.sh", encoding="utf-8").read()
+    install_ps1 = open("install.ps1", encoding="utf-8").read()
+
+    assert '"$VENV_DIR/bin/python" - <<' in install_sh
+    assert "import PIL" in install_sh
+    assert "import pypdf" in install_sh
+    assert '& $VENV_PYTHON -c "import PIL; import pypdf"' in install_ps1
+    assert 'throw "PDF runtime dependency check failed."' in install_ps1
+
+
 def test_fresh_install_sets_verbose_full_by_default() -> None:
     install_sh = open("install.sh", encoding="utf-8").read()
     install_ps1 = open("install.ps1", encoding="utf-8").read()

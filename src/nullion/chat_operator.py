@@ -1505,6 +1505,7 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         "Chat delivery contract:\n"
         f"- When the user asks you to send, attach, upload, or deliver a file, write it with file_write under this workspace artifact directory only: {artifact_root}\n"
         f"- Legacy artifact directory still supported for older turns: {legacy_artifact_root}\n"
+        "- When the user asks for a PDF, use pdf_create for new PDFs or pdf_edit for PDF changes. Do not ask to install PDF tools or use terminal_exec for normal PDF creation/editing.\n"
         "- For ordinary saved files, use this user's workspace file folder.\n"
         f"{workspace_storage_text}\n"
         "- Do not write deliverable files under arbitrary folders.\n"

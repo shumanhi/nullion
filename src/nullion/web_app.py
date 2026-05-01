@@ -13237,6 +13237,7 @@ def create_app(runtime, orchestrator, registry):
                         "tags": p.tags,
                         "confidence": p.confidence,
                         "evidence": p.evidence,
+                        "deep_agent_validation": p.deep_agent_validation_snapshot(),
                     }
                     for p in proposals
                 ],
@@ -17155,6 +17156,58 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     if suspended_turn is None:
         return None
 
+    if suspended_turn.task_id:
+        if orchestrator is None:
+            return None
+        resume_task = getattr(orchestrator, "resume_paused_task_sync", None)
+        if not callable(resume_task):
+            return None
+        logger.info("Resuming delegated task %s from approval %s", suspended_turn.task_id, approval_id)
+        result = resume_task(
+            task_id=suspended_turn.task_id,
+            tool_registry=registry,
+            policy_store=store,
+            approval_store=store,
+        )
+        store.remove_suspended_turn(approval_id)
+        try:
+            runtime.checkpoint()
+        except Exception:
+            logger.debug("Unable to checkpoint after resuming delegated approval", exc_info=True)
+        if result is None:
+            return {
+                "type": "message",
+                "text": (
+                    "I saved that approval. The paused delegated task is no longer active, "
+                    "so send the request again and I will continue with the saved approval."
+                ),
+            }
+        if getattr(result, "status", None) == "partial":
+            resume_token = getattr(result, "resume_token", {}) or {}
+            return {
+                "type": "approval_required" if resume_token.get("approval_id") else "message",
+                "approval_id": resume_token.get("approval_id"),
+                "tool_name": "delegated task",
+                "tool_detail": getattr(result, "output", None) or "Paused delegated task",
+                "is_web_request": True,
+                "text": getattr(result, "output", None) or "The delegated task paused again.",
+            }
+        if getattr(result, "status", None) == "failure":
+            return {
+                "type": "message",
+                "text": getattr(result, "error", None) or "The delegated task could not resume.",
+            }
+        artifacts = _web_artifact_descriptors(
+            runtime,
+            list(getattr(result, "artifacts", []) or []),
+            principal_id=suspended_turn.conversation_id or "web:resume",
+        )
+        return {
+            "type": "message",
+            "text": getattr(result, "output", None) or "(no reply)",
+            "artifacts": artifacts,
+        }
+
     user_text = _last_user_text_from_snapshot(suspended_turn.messages_snapshot)
     if not user_text:
         user_text = str(suspended_turn.message or "").removeprefix("/chat ").strip()
@@ -17495,6 +17548,8 @@ def _run_turn_sync(
             "text": (
                 "Web delivery contract: when the user asks for a downloadable file, attachment, or saved artifact, "
                 f"write it with file_write under this workspace artifact directory: {workspace_artifact_root}. "
+                "When the user asks for a PDF, use pdf_create for new PDFs or pdf_edit for PDF changes; "
+                "do not ask to install PDF tools or use terminal_exec for normal PDF creation/editing. "
                 "For ordinary saved files, use this user's workspace file folder.\n\n"
                 f"{workspace_storage_text}\n\n"
                 "Do not say a file was saved, attached, or sent "

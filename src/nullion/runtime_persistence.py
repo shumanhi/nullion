@@ -423,6 +423,10 @@ def _serialize_suspended_turn(suspended_turn: SuspendedTurn) -> dict[str, object
         "pending_step_idx": suspended_turn.pending_step_idx,
         "messages_snapshot": suspended_turn.messages_snapshot,
         "pending_tool_calls": suspended_turn.pending_tool_calls,
+        "task_id": suspended_turn.task_id,
+        "group_id": suspended_turn.group_id,
+        "agent_id": suspended_turn.agent_id,
+        "resume_token": suspended_turn.resume_token,
     }
 
 
@@ -439,6 +443,10 @@ def _deserialize_suspended_turn(payload: dict[str, object]) -> SuspendedTurn:
         pending_step_idx=None if payload.get("pending_step_idx") is None else int(payload.get("pending_step_idx")),
         messages_snapshot=payload.get("messages_snapshot"),
         pending_tool_calls=payload.get("pending_tool_calls"),
+        task_id=None if payload.get("task_id") is None else str(payload.get("task_id")),
+        group_id=None if payload.get("group_id") is None else str(payload.get("group_id")),
+        agent_id=None if payload.get("agent_id") is None else str(payload.get("agent_id")),
+        resume_token=payload.get("resume_token") if isinstance(payload.get("resume_token"), dict) else None,
     )
 
 

@@ -87,6 +87,9 @@ def test_task_planner_builds_single_parallel_and_sequential_missions() -> None:
     assert single.disposition is PlanDisposition.SINGLE_TURN
     assert single.dispatch_mode is PlanDispatchMode.NONE
     assert single.mission.steps[0].metadata["tool_scope"] == ["web_fetch"]
+    assert single.mission.steps[0].metadata["deep_agent_profiles"] == ["research"]
+    assert single.mission.steps[0].metadata["deep_agent_skills"] == ["/skills/nullion/"]
+    assert single.mission.steps[0].metadata["deep_agent_subagents"] == ["research_agent"]
 
     parallel = planner.build_execution_plan(
         user_message="search docs today and email summary now",
@@ -97,7 +100,9 @@ def test_task_planner_builds_single_parallel_and_sequential_missions() -> None:
     assert parallel.can_dispatch_mini_agents is True
     assert parallel.can_run_mission is True
     assert [step.title for step in parallel.mission.steps] == ["Search docs today", "Email summary now"]
+    assert parallel.mission.steps[0].metadata["deep_agent_profiles"] == ["research"]
     assert parallel.mission.steps[1].metadata["tool_scope"] == ["email_send"]
+    assert "deep_agent_profiles" not in parallel.mission.steps[1].metadata
 
     generic_send = planner.build_execution_plan(
         user_message="send summary now",

@@ -10,6 +10,7 @@ class MiniAgentRunStatus(str, Enum):
 
     PENDING = "pending"
     RUNNING = "running"
+    WAITING_INPUT = "waiting_input"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -28,7 +29,16 @@ class MiniAgentRun:
 
 _ALLOWED_TRANSITIONS: dict[MiniAgentRunStatus, set[MiniAgentRunStatus]] = {
     MiniAgentRunStatus.PENDING: {MiniAgentRunStatus.RUNNING},
-    MiniAgentRunStatus.RUNNING: {MiniAgentRunStatus.COMPLETED, MiniAgentRunStatus.FAILED},
+    MiniAgentRunStatus.RUNNING: {
+        MiniAgentRunStatus.WAITING_INPUT,
+        MiniAgentRunStatus.COMPLETED,
+        MiniAgentRunStatus.FAILED,
+    },
+    MiniAgentRunStatus.WAITING_INPUT: {
+        MiniAgentRunStatus.RUNNING,
+        MiniAgentRunStatus.COMPLETED,
+        MiniAgentRunStatus.FAILED,
+    },
     MiniAgentRunStatus.COMPLETED: set(),
     MiniAgentRunStatus.FAILED: set(),
 }
