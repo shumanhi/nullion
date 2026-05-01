@@ -7159,8 +7159,7 @@ function renderPermissions(data) {
     const scope = item.principal_id === 'global:operator'
       ? 'All workspaces and sessions'
       : (String(item.principal_id || '').startsWith('workspace:') ? 'This workspace and all sessions' : (item.principal_id || 'Legacy scope'));
-    const permitMeta = isPermit ? ` · ${item.uses_remaining} use${item.uses_remaining === 1 ? '' : 's'} left` : '';
-    const meta = `${scope} · ${permissionExpiryLabel(item.expires_at)}${permitMeta} · from ${String(item.approval_id || item.rule_id || item.permit_id || item.grant_id).slice(0, 8)}`;
+    const meta = `${scope} · ${permissionExpiryLabel(item.expires_at)} · from ${String(item.approval_id || item.rule_id || item.permit_id || item.grant_id).slice(0, 8)}`;
     const revokeKind = isPermit ? 'boundary-permit' : (isRule ? 'boundary-rule' : 'grant');
     const id = isPermit ? item.permit_id : (isRule ? item.rule_id : item.grant_id);
     const targetLabel = (isRule || isPermit)

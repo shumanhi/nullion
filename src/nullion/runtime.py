@@ -2064,6 +2064,7 @@ def _approval_decision_allow_once_node(state: _ApprovalDecisionState) -> dict[st
         if boundary_kind is BoundaryKind.OUTBOUND_NETWORK and selector != "*"
         else selector
     )
+    explicit_uses = state.get("boundary_allow_once_uses")
     permit = create_boundary_permit(
         approval_id=updated.approval_id,
         principal_id=permission_principal,
@@ -2071,11 +2072,7 @@ def _approval_decision_allow_once_node(state: _ApprovalDecisionState) -> dict[st
         selector=permit_selector,
         granted_by=state["normalized_actor"],
         granted_at=updated.decided_at,
-        uses_remaining=(
-            state.get("boundary_allow_once_uses")
-            if isinstance(state.get("boundary_allow_once_uses"), int) and state["boundary_allow_once_uses"] > 0
-            else (100 if permit_selector == "*" else 20 if boundary_kind is BoundaryKind.OUTBOUND_NETWORK else 1)
-        ),
+        uses_remaining=explicit_uses if isinstance(explicit_uses, int) and explicit_uses > 0 else 1,
         expires_at=state.get("expires_at"),
     )
     if _active_boundary_permit_duplicate(state["store"], permit, now=updated.decided_at) is not None:

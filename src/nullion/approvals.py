@@ -201,7 +201,7 @@ def consume_boundary_permit(
     del consumed_by, consumed_at
     if permit.uses_remaining <= 0:
         raise ValueError("boundary permit has no remaining uses")
-    return replace(permit, uses_remaining=permit.uses_remaining - 1)
+    return replace(permit, uses_remaining=0)
 
 
 def approve(
