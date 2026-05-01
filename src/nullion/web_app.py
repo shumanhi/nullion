@@ -12569,7 +12569,7 @@ def create_app(runtime, orchestrator, registry):
     """Build and return the FastAPI application."""
     try:
         from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     except ImportError:
         raise RuntimeError("fastapi not installed. Run: pip install fastapi uvicorn")
     globals()["Request"] = Request
@@ -12762,15 +12762,28 @@ def create_app(runtime, orchestrator, registry):
                 return _csrf_response()
         return await call_next(request)
 
+    def _svg_asset_response(filename: str, fallback_svg: str):
+        path = Path(__file__).resolve().parents[2] / "website" / "assets" / filename
+        if path.exists():
+            return FileResponse(path, media_type="image/svg+xml")
+        return Response(content=fallback_svg, media_type="image/svg+xml")
+
     @app.get("/assets/nullion-mark.svg")
     async def _nullion_mark_asset():
-        path = Path(__file__).resolve().parents[2] / "website" / "assets" / "nullion-mark.svg"
-        return FileResponse(path, media_type="image/svg+xml")
+        return _svg_asset_response(
+            "nullion-mark.svg",
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#6f5cff"/><circle cx="32" cy="32" r="18" fill="none" stroke="#fff" stroke-width="6"/><path d="M32 14v36M14 32h36" stroke="#fff" stroke-width="6" stroke-linecap="round"/></svg>',
+        )
 
     @app.get("/assets/nullion-assistant-avatar.svg")
     async def _nullion_assistant_avatar_asset():
-        path = Path(__file__).resolve().parents[2] / "website" / "assets" / "nullion-assistant-avatar.svg"
-        return FileResponse(path, media_type="image/svg+xml")
+        path = Path(__file__).resolve().parent / "assets" / "nullion-assistant-avatar.svg"
+        if path.exists():
+            return FileResponse(path, media_type="image/svg+xml")
+        return Response(
+            content='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="26" fill="#6f5cff"/><rect x="22" y="28" width="52" height="38" rx="15" fill="#fff"/><circle cx="39" cy="47" r="5" fill="#6f5cff"/><circle cx="57" cy="47" r="5" fill="#6f5cff"/><path d="M40 58c5 4 11 4 16 0" fill="none" stroke="#6f5cff" stroke-width="4" stroke-linecap="round"/></svg>',
+            media_type="image/svg+xml",
+        )
 
     # Max upload size for the file upload endpoint. The chat pipeline accepts
     # arbitrary files and describes non-media uploads by local path for tools.
