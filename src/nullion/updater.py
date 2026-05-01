@@ -70,11 +70,22 @@ def _src_dir() -> Path:
     return _install_dir() / "src"
 
 
+def _subprocess_cwd(preferred: Path | None = None) -> Path:
+    """Return an existing directory for subprocesses that do not need caller cwd."""
+    home = Path.home()
+    candidates = [preferred, _src_dir(), _install_dir(), home]
+    for candidate in candidates:
+        if candidate is not None and candidate.exists():
+            return candidate
+    return home
+
+
 def _verify_pdf_runtime_dependencies() -> None:
     result = subprocess.run(
         [sys.executable, "-c", "import PIL; import pypdf"],
         capture_output=True,
         text=True,
+        cwd=_subprocess_cwd(),
     )
     if result.returncode != 0:
         details = result.stderr.strip() or result.stdout.strip() or "missing PIL or pypdf"
@@ -230,6 +241,7 @@ def snapshot() -> Path:
     result = subprocess.run(
         [str(pip), "freeze"],
         capture_output=True, text=True,
+        cwd=_subprocess_cwd(),
     )
     (snap / "requirements.txt").write_text(result.stdout)
 
@@ -322,6 +334,7 @@ def rollback(snap: Path) -> bool:
             result = subprocess.run(
                 [str(pip), "install", "--quiet", "-r", str(req_file)],
                 capture_output=True, text=True,
+                cwd=_subprocess_cwd(),
             )
             if result.returncode != 0:
                 log.error("pip restore failed: %s", result.stderr)
@@ -583,6 +596,7 @@ def health_check(
         capture_output=True,
         text=True,
         timeout=30,
+        cwd=_subprocess_cwd(),
     )
     # Collect any provider warnings emitted by _build_runtime.
     if _warnings_out is not None:
@@ -833,6 +847,7 @@ async def _update_apply_node(state: _UpdateWorkflowState) -> dict[str, object]:
             lambda: subprocess.run(
                 [str(pip), "install", "--quiet", "-e", str(src)],
                 capture_output=True, text=True,
+                cwd=_subprocess_cwd(src),
             ),
         )
         if install_result.returncode != 0:
