@@ -233,6 +233,61 @@ async def test_mini_agent_runner_delegates_to_deepagents(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_can_resume_paused_delegated_task(monkeypatch) -> None:
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.task_queue import TaskGroup, TaskRegistry
+
+    seen_descriptions: list[str] = []
+
+    async def fake_run(self, config, **kwargs):
+        seen_descriptions.append(config.task.description)
+        return TaskResult(config.task.task_id, "success", output="resumed")
+
+    class Pool:
+        async def acquire(self, **kwargs):
+            return SimpleNamespace(agent_id="agent-resume")
+
+        def release(self, agent) -> None:
+            pass
+
+    monkeypatch.setattr(MiniAgentRunner, "run", fake_run)
+
+    task = TaskRecord(
+        task_id="task-resume",
+        group_id="group-resume",
+        conversation_id="web:demo",
+        principal_id="workspace:demo",
+        title="Ask",
+        description="Ask for input",
+        status=TaskStatus.WAITING_INPUT,
+        priority=TaskPriority.NORMAL,
+        allowed_tools=[],
+        dependencies=[],
+        result=TaskResult("task-resume", "partial", output="Waiting for user input: Which repo?"),
+    )
+    registry = TaskRegistry()
+    await registry.add_group(TaskGroup("group-resume", "web:demo", "resume original", [task]))
+
+    orchestrator = AgentOrchestrator(model_client=None)
+    orchestrator._task_registry = registry
+    orchestrator._context_bus = ContextBus()
+    orchestrator._progress_queue = asyncio.Queue()
+    orchestrator._pool = Pool()
+
+    result = await orchestrator.resume_paused_task(
+        task_id="task-resume",
+        tool_registry=SimpleNamespace(),
+        policy_store=SimpleNamespace(),
+        approval_store=SimpleNamespace(),
+        user_response="Repo A",
+    )
+
+    assert result.status == "success"
+    assert registry.get_task("task-resume").status is TaskStatus.COMPLETE
+    assert "User response for paused task: Repo A" in seen_descriptions[0]
+
+
+@pytest.mark.asyncio
 async def test_deepagents_default_path_tracks_artifacts_and_progress(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("NULLION_DEEP_AGENTS_MODEL", raising=False)
     artifact = tmp_path / "out.txt"

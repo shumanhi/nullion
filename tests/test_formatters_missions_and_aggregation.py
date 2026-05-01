@@ -239,15 +239,55 @@ def test_mini_agent_launch_policy_covers_hold_deny_launch_and_safe_routes() -> N
 
 
 def test_orchestrator_partial_task_results_map_to_waiting_input() -> None:
-    from nullion.agent_orchestrator import _progress_kind_for_task_result, _task_status_for_task_result
+    from nullion.agent_orchestrator import (
+        _mini_agent_run_status_for_task_result,
+        _progress_kind_for_task_result,
+        _task_status_for_task_result,
+    )
+    from nullion.mini_agent_runs import MiniAgentRunStatus
 
     user_input = TaskResult("t1", "partial", output="Waiting for user input: Pick one")
     approval = TaskResult("t2", "partial", output="Approval required before this delegated task can continue.")
 
     assert _task_status_for_task_result(user_input) is TaskStatus.WAITING_INPUT
+    assert _mini_agent_run_status_for_task_result(user_input) is MiniAgentRunStatus.WAITING_INPUT
     assert _progress_kind_for_task_result(user_input) == "input_needed"
     assert _task_status_for_task_result(approval) is TaskStatus.WAITING_INPUT
     assert _progress_kind_for_task_result(approval) == "approval_needed"
+
+
+def test_delegated_pause_persists_resume_token_for_approval() -> None:
+    from nullion.agent_orchestrator import _store_delegated_pause_suspended_turn
+    from nullion.runtime_store import RuntimeStore
+
+    store = RuntimeStore()
+    record = SimpleNamespace(
+        task_id="task-1",
+        group_id="group-1",
+        conversation_id="web:abc",
+        description="Fetch a page",
+        agent_id=None,
+    )
+    result = TaskResult(
+        "task-1",
+        "partial",
+        output="Approval required before this delegated task can continue. Approval ID: ap-1",
+        resume_token={
+            "backend": "deepagents",
+            "reason": "approval_required",
+            "approval_id": "ap-1",
+            "thread_id": "thread-1",
+        },
+    )
+
+    _store_delegated_pause_suspended_turn(store, store, task=record, result=result, agent_id="agent-1")
+
+    suspended = store.get_suspended_turn("ap-1")
+    assert suspended is not None
+    assert suspended.task_id == "task-1"
+    assert suspended.group_id == "group-1"
+    assert suspended.agent_id == "agent-1"
+    assert suspended.resume_token["thread_id"] == "thread-1"
 
 
 def task(task_id: str, status: TaskStatus = TaskStatus.QUEUED, *, result: TaskResult | None = None) -> TaskRecord:
