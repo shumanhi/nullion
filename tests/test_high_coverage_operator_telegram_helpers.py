@@ -1067,8 +1067,8 @@ def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> N
     sent_operator_messages = []
     status_calls = []
 
-    async def fake_send_operator_message(bot_token, chat_id, text):
-        sent_operator_messages.append((chat_id, text))
+    async def fake_send_operator_message(bot_token, chat_id, text, **kwargs):
+        sent_operator_messages.append((chat_id, text, kwargs))
         return None
 
     async def fake_send_or_edit_status(bot, status_messages, **kwargs):
@@ -1103,7 +1103,10 @@ def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> N
     deliver_holder["fn"]("telegram:123", "progress", is_status=True, group_id="g", status_kind="progress_note")
     deliver_holder["fn"]("telegram:123", "status", is_status=True, group_id="g", status_kind="task_summary")
     deliver_holder["fn"]("telegram:123", "hello")
+    deliver_holder["fn"]("telegram:123", "/tmp/report.pdf", is_artifact=True)
     assert not any(call.get("text") == "progress" for call in status_calls)
+    assert ("123", "hello", {"principal_id": "telegram_chat"}) in sent_operator_messages
+    assert ("123", "MEDIA:/tmp/report.pdf", {"principal_id": "telegram_chat"}) in sent_operator_messages
 
 
 def test_telegram_refresh_busy_ack_and_registration_helpers(tmp_path, monkeypatch) -> None:

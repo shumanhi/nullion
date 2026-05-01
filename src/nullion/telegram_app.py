@@ -1367,13 +1367,32 @@ async def _send_or_edit_telegram_status_message(
         status_texts[key] = text
 
 
-async def _send_operator_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
+async def _send_operator_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    *,
+    principal_id: str | None = None,
+) -> None:
     if not bot_token or not chat_id or not text:
         return
     try:
         from telegram import Bot  # type: ignore[import]
+
+        delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
         async with Bot(bot_token) as bot:
-            await bot.send_message(chat_id=chat_id, text=text)
+            if delivery.attachments:
+                caption = delivery.text
+                for index, attachment_path in enumerate(delivery.attachments):
+                    with attachment_path.open("rb") as document:
+                        await bot.send_document(
+                            chat_id=chat_id,
+                            document=document,
+                            caption=caption[:1024] if caption and index == 0 else None,
+                        )
+                return
+            if delivery.text:
+                await bot.send_message(chat_id=chat_id, text=delivery.text)
     except Exception:
         logger.debug("Failed to deliver Telegram operator message", exc_info=True)
 
@@ -2904,13 +2923,29 @@ class ChatOperatorService:
                         logger.debug("Telegram planner status skipped because no event loop is running")
                         return False
                 # Fire-and-forget via a fresh task if a loop is running, else asyncio.run
+                principal_id = principal_id_for_messaging_identity("telegram", chat_id, _service_ref.settings)
+                outbound_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text
                 try:
                     loop = _asyncio.get_running_loop()
-                    loop.create_task(_send_operator_telegram_message(_bot_token, chat_id, text))
+                    loop.create_task(
+                        _send_operator_telegram_message(
+                            _bot_token,
+                            chat_id,
+                            outbound_text,
+                            principal_id=principal_id,
+                        )
+                    )
                     return True
                 except RuntimeError:
                     try:
-                        _asyncio.run(_send_operator_telegram_message(_bot_token, chat_id, text))
+                        _asyncio.run(
+                            _send_operator_telegram_message(
+                                _bot_token,
+                                chat_id,
+                                outbound_text,
+                                principal_id=principal_id,
+                            )
+                        )
                         return True
                     except Exception:
                         logger.debug("Phase 5 deliver_fn: failed to send message", exc_info=True)
