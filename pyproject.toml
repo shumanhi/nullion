@@ -28,6 +28,8 @@ dependencies = [
   "slack-bolt>=1.21,<2",
   "discord.py>=2.4,<3",
   "langgraph>=1.0,<2",
+  "langchain>=1.2,<2",
+  "deepagents>=0.5,<1",
 ]
 
 [project.scripts]

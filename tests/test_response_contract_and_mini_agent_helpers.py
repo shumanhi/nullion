@@ -9,11 +9,6 @@ import pytest
 from nullion.mini_agent_runner import (
     MiniAgentConfig,
     MiniAgentRunner,
-    ProgressUpdate,
-    _build_tool_list,
-    _emit,
-    _model_create,
-    _tool_result,
 )
 from nullion.context_bus import ContextBus
 from nullion.response_sanitizer import sanitize_user_visible_reply, user_requested_raw_output
@@ -193,27 +188,6 @@ def test_response_fulfillment_handles_requested_deliverable_without_active_frame
     )
     assert blocked.satisfied is False
     assert "mark this complete yet" in blocked.reply
-
-
-def test_build_tool_list_supports_modern_legacy_and_broken_registries() -> None:
-    class Modern:
-        def list_tool_definitions(self, *, allowed):
-            return [{"name": name} for name in allowed]
-
-    class Legacy:
-        def list_tool_definitions(self):
-            return [{"name": "a"}, {"name": "b"}]
-
-    class Broken:
-        def list_tool_definitions(self, *args, **kwargs):
-            raise RuntimeError("boom")
-
-    assert [item["name"] for item in _build_tool_list(Modern(), allowed=["a"])][:1] == ["a"]
-    assert [item["name"] for item in _build_tool_list(Legacy(), allowed=["b"])][:1] == ["b"]
-    assert [item["name"] for item in _build_tool_list(Broken(), allowed=["a"])] == [
-        "report_progress",
-        "request_user_input",
-    ]
 
 
 def test_raw_structured_tool_payload_is_blocked_unless_requested() -> None:
@@ -474,168 +448,20 @@ async def test_mini_agent_empty_final_answer_is_failure() -> None:
         dependencies=[],
     )
 
-    result = await MiniAgentRunner()._inner_loop(
+    result = await MiniAgentRunner().run(
         MiniAgentConfig(agent_id="a1", task=task),
         anthropic_client=EmptyFinalClient(),
-        tool_registry=SimpleNamespace(list_tool_definitions=lambda **kwargs: []),
+        tool_registry=SimpleNamespace(
+            list_tool_definitions=lambda **kwargs: [],
+            run_cleanup_hooks=lambda **kwargs: None,
+        ),
         policy_store=None,
         approval_store=None,
-        context_bus=SimpleNamespace(get=lambda *args, **kwargs: None),
+        context_bus=ContextBus(),
         progress_queue=asyncio.Queue(),
     )
 
     assert result.status == "failure"
-    assert result.error == "Agent finished without a final answer."
+    assert result.error == "Deep Agent finished without a final answer."
     assert result.output is None
 
-
-@pytest.mark.asyncio
-async def test_mini_agent_can_continue_once_after_iteration_tranche() -> None:
-    class ContinuingClient:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def create(self, **kwargs):  # noqa: ANN002, ANN003
-            self.calls += 1
-            if self.calls == 1:
-                return {
-                    "stop_reason": "tool_use",
-                    "content": [
-                        {"type": "tool_use", "id": "tool-1", "name": "file_read", "input": {"path": "/tmp/a"}}
-                    ],
-                }
-            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done after continuation"}]}
-
-    class Registry:
-        def list_tool_definitions(self, *, allowed):  # noqa: ANN002, ANN003
-            return [{"name": name} for name in allowed]
-
-        def invoke(self, invocation):
-            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", "tool output")
-
-    task = TaskRecord(
-        task_id="t1",
-        group_id="g1",
-        conversation_id="c1",
-        principal_id="p1",
-        title="Continue",
-        description="Use a tool and finish",
-        status=TaskStatus.RUNNING,
-        priority=TaskPriority.NORMAL,
-        allowed_tools=["file_read"],
-        dependencies=[],
-    )
-    client = ContinuingClient()
-    progress_queue: asyncio.Queue = asyncio.Queue()
-
-    result = await MiniAgentRunner()._inner_loop(
-        MiniAgentConfig(agent_id="a1", task=task, max_iterations=1, max_continuations=1),
-        anthropic_client=client,
-        tool_registry=Registry(),
-        policy_store=None,
-        approval_store=None,
-        context_bus=SimpleNamespace(get=lambda *args, **kwargs: None),
-        progress_queue=progress_queue,
-    )
-
-    assert result.status == "success"
-    assert result.output == "done after continuation"
-    assert client.calls == 2
-    progress_messages = [progress_queue.get_nowait().message for _ in range(progress_queue.qsize())]
-    assert "Continuing after 1 tool steps." in progress_messages
-
-
-@pytest.mark.asyncio
-async def test_mini_agent_max_iterations_still_stops_without_continuation_budget() -> None:
-    class LoopingClient:
-        def create(self, **kwargs):  # noqa: ANN002, ANN003
-            return {
-                "stop_reason": "tool_use",
-                "content": [{"type": "tool_use", "id": "tool-1", "name": "file_read", "input": {"path": "/tmp/a"}}],
-            }
-
-    class Registry:
-        def list_tool_definitions(self, *, allowed):  # noqa: ANN002, ANN003
-            return [{"name": name} for name in allowed]
-
-        def invoke(self, invocation):
-            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", "tool output")
-
-    task = TaskRecord(
-        task_id="t1",
-        group_id="g1",
-        conversation_id="c1",
-        principal_id="p1",
-        title="Stop",
-        description="Never finish",
-        status=TaskStatus.RUNNING,
-        priority=TaskPriority.NORMAL,
-        allowed_tools=["file_read"],
-        dependencies=[],
-    )
-
-    result = await MiniAgentRunner()._inner_loop(
-        MiniAgentConfig(agent_id="a1", task=task, max_iterations=1, max_continuations=0),
-        anthropic_client=LoopingClient(),
-        tool_registry=Registry(),
-        policy_store=None,
-        approval_store=None,
-        context_bus=SimpleNamespace(get=lambda *args, **kwargs: None),
-        progress_queue=asyncio.Queue(),
-    )
-
-    assert result.status == "partial"
-    assert result.output == "Reached max iterations (1) without completing."
-
-
-@pytest.mark.asyncio
-async def test_model_create_supports_sync_async_and_anthropic_style_clients() -> None:
-    class SyncClient:
-        def create(self, **kwargs):
-            return {"content": [{"type": "text", "text": kwargs["prompt"]}]}
-
-    class AsyncClient:
-        async def create(self, **kwargs):
-            return {"content": [{"type": "text", "text": kwargs["prompt"]}]}
-
-    class Block:
-        type = "text"
-        text = "anthropic text"
-
-    class ToolBlock:
-        type = "tool_use"
-        id = "tool-1"
-        name = "file_read"
-        input = {"path": "x"}
-
-    class Messages:
-        async def create(self, **kwargs):
-            return SimpleNamespace(stop_reason="end_turn", content=[Block(), ToolBlock()])
-
-    assert await _model_create(SyncClient(), prompt="sync") == {"content": [{"type": "text", "text": "sync"}]}
-    assert await _model_create(AsyncClient(), prompt="async") == {"content": [{"type": "text", "text": "async"}]}
-    assert await _model_create(SimpleNamespace(messages=Messages()), tools=[]) == {
-        "stop_reason": "end_turn",
-        "content": [
-            {"type": "text", "text": "anthropic text"},
-            {"type": "tool_use", "id": "tool-1", "name": "file_read", "input": {"path": "x"}},
-        ],
-    }
-
-
-@pytest.mark.asyncio
-async def test_emit_drops_when_queue_is_full_and_tool_result_marks_errors() -> None:
-    queue: asyncio.Queue = asyncio.Queue(maxsize=1)
-    update = ProgressUpdate(agent_id="a", task_id="t", group_id="g", kind="progress_note")
-
-    await _emit(queue, update)
-    await _emit(queue, update)
-
-    assert queue.qsize() == 1
-    assert queue.get_nowait() is update
-    assert _tool_result("tool-1", "ok") == {
-        "type": "tool_result",
-        "tool_use_id": "tool-1",
-        "content": [{"type": "text", "text": "ok"}],
-    }
-    assert _tool_result("tool-1", "bad", is_error=True)["is_error"] is True

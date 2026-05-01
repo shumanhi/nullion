@@ -157,6 +157,9 @@ NULLION_BROWSER_ENABLED=true
 NULLION_BROWSER_BACKEND=auto
 NULLION_WORKSPACE_ROOT=/Users/you/Projects
 NULLION_ALLOWED_ROOTS=/Users/you/Projects,/Users/you/.nullion/.nullion-artifacts
+# Optional override for Deep Agents model selection. When unset, Deep Agents
+# uses the same model client Nullion already configured for mini-agents.
+# NULLION_DEEP_AGENTS_MODEL=openai:gpt-5.4
 # Recommended audio default: installer-managed whisper.cpp + ffmpeg with
 # ggml-base.en.bin at ~/.nullion/models/ggml-base.en.bin. Leave the command
 # unset unless you need a custom wrapper.
