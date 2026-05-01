@@ -430,6 +430,22 @@ def test_set_default_chat_model_action_lives_with_chat_model_default_strip() -> 
     assert button not in _HTML[_HTML.index(provider_test):]
 
 
+def test_header_model_switcher_only_lists_enabled_provider_models() -> None:
+    start = _HTML.index("function renderHeaderConfig(cfg)")
+    end = _HTML.index("async function switchHeaderProvider()", start)
+    body = _HTML[start:end]
+
+    provider_ids_block = body[body.index("const providerIds = Array.from(new Set(["):body.index("])).filter(Boolean);")]
+    assert "...Object.keys(providerModels)" in provider_ids_block
+    assert "...Object.keys(providersEnabled)" in provider_ids_block
+    assert "...Object.keys(providersConfigured)" not in provider_ids_block
+    assert "const providerIsEnabled = id => hasEnabledFlag(id)" in body
+    assert "? providersEnabled[id] === true" in body
+    assert "const providerHasModels = id =>" in body
+    assert "splitModelEntries(providerModels[id]).length > 0" in body
+    assert "providerIsEnabled(id) && providerHasModels(id) && providerIsUsable(id)" in body
+
+
 def test_web_approval_card_uses_explicit_web_flag_for_id_only_details() -> None:
     assert "Boolean(data.is_web_request)" in _HTML
     assert "Boolean(msg.is_web_request)" in _HTML

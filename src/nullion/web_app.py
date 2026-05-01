@@ -9023,13 +9023,21 @@ function renderHeaderConfig(cfg) {
     const providerIds = Array.from(new Set([
       ...Object.keys(providerModels),
       ...Object.keys(providersEnabled),
-      ...Object.keys(providersConfigured),
       provider,
     ])).filter(Boolean);
+    const hasEnabledFlag = id => Object.prototype.hasOwnProperty.call(providersEnabled, id);
+    const providerIsEnabled = id => hasEnabledFlag(id)
+      ? providersEnabled[id] === true
+      : (id === provider && _headerConfig.model_provider_enabled !== false);
+    const providerHasModels = id =>
+      splitModelEntries(providerModels[id]).length > 0 || (id === provider && !!(_headerConfig.model_name || ''));
+    const providerIsUsable = id => id === provider || providersConfigured[id] === true;
     const enabledProviderIds = providerIds.filter(id =>
-      id === provider || (providersEnabled[id] !== false && (providersConfigured[id] || splitModelEntries(providerModels[id]).length))
+      providerIsEnabled(id) && providerHasModels(id) && providerIsUsable(id)
     );
-    const visibleProviders = enabledProviderIds.length ? enabledProviderIds : (provider ? [provider] : []);
+    const visibleProviders = enabledProviderIds.length ? enabledProviderIds : (
+      provider && providerIsEnabled(provider) && providerHasModels(provider) ? [provider] : []
+    );
     providerSelect.innerHTML = visibleProviders.map(id =>
       `<option value="${escHtml(id)}">${escHtml(providerLabel(id))}</option>`
     ).join('') || '<option value="">Provider</option>';
