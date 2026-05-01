@@ -382,7 +382,9 @@ def test_web_mini_agent_final_delivery_broadcasts_with_task_planner_mode(monkeyp
 
 def test_task_status_cards_use_structured_checklist_renderer() -> None:
     assert "function renderTaskStatusText(text)" in _HTML
-    assert "bubble.innerHTML = renderTaskStatusText(text);" in _HTML
+    assert "function mergeTaskStatusText(previousText, nextText)" in _HTML
+    assert "taskStatusRank(previousGlyph) > taskStatusRank(row.glyph)" in _HTML
+    assert "bubble.innerHTML = renderTaskStatusText(mergedText);" in _HTML
     assert ".task-status-row {\n    display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 8px; align-items: start;\n    margin-left: 18px;" in _HTML
     assert ".task-status-icon {\n    width: 12px; height: 12px;" in _HTML
     assert "const states = {" in _HTML

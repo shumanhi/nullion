@@ -377,6 +377,31 @@ async def test_result_aggregator_ignores_terminal_event_until_registry_is_termin
 
 
 @pytest.mark.asyncio
+async def test_result_aggregator_status_summaries_do_not_regress_terminal_rows() -> None:
+    deliveries: list[tuple[str, str, dict]] = []
+    first = task("first", TaskStatus.COMPLETE)
+    second = task("second", TaskStatus.RUNNING)
+    group = TaskGroup(group_id="g1", conversation_id="c1", original_message="Do work", tasks=[first, second])
+    registry = SimpleNamespace(
+        get_group=lambda group_id: group if group_id == "g1" else None,
+        get_task=lambda task_id: next((item for item in group.tasks if item.task_id == task_id), None),
+    )
+    aggregator = ResultAggregator(
+        deliver_fn=lambda conversation_id, text, **kwargs: deliveries.append((conversation_id, text, kwargs)),
+        task_registry=registry,
+        min_progress_interval_s=0,
+    )
+
+    await aggregator._handle(ProgressUpdate(agent_id="a", task_id="second", group_id="g1", kind="task_started"))
+    second.status = TaskStatus.PENDING
+    await aggregator._handle(ProgressUpdate(agent_id="a", task_id="second", group_id="g1", kind="task_started"))
+
+    assert "☑ Task first" in deliveries[-1][1]
+    assert "◐ Task second" in deliveries[-1][1]
+    assert "☐ Task first" not in deliveries[-1][1]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_supervisor_refreshes_checklist_instead_of_leaking_prose(monkeypatch) -> None:
     deliveries: list[tuple[str, str, dict]] = []
     running = task("find", TaskStatus.RUNNING)

@@ -1057,10 +1057,18 @@ def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> N
         model_client=object(),
         agent_orchestrator=SimpleNamespace(set_deliver_fn=lambda fn: deliver_holder.setdefault("fn", fn)),
     )
+    sent_operator_messages = []
+    status_calls = []
+
     async def fake_send_operator_message(bot_token, chat_id, text):
+        sent_operator_messages.append((chat_id, text))
         return None
 
+    async def fake_send_or_edit_status(bot, status_messages, **kwargs):
+        status_calls.append(kwargs)
+
     monkeypatch.setattr(telegram_app, "_send_operator_telegram_message", fake_send_operator_message, raising=False)
+    monkeypatch.setattr(telegram_app, "_send_or_edit_telegram_status_message", fake_send_or_edit_status, raising=False)
     monkeypatch.setattr(type(svc), "register_handlers", lambda self, app: setattr(app, "registered", True))
     monkeypatch.setattr(type(svc), "_build_health_monitor", lambda self, app: SimpleNamespace(start=lambda: None, stop=lambda: None))
 
@@ -1085,8 +1093,10 @@ def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> N
     app = App()
     returned = svc.run_polling(application=app)
     assert returned is app and app.ran is True
-    deliver_holder["fn"]("telegram:123", "status", is_status=True, group_id="g")
+    deliver_holder["fn"]("telegram:123", "progress", is_status=True, group_id="g", status_kind="progress_note")
+    deliver_holder["fn"]("telegram:123", "status", is_status=True, group_id="g", status_kind="task_summary")
     deliver_holder["fn"]("telegram:123", "hello")
+    assert not any(call.get("text") == "progress" for call in status_calls)
 
 
 def test_telegram_refresh_busy_ack_and_registration_helpers(tmp_path, monkeypatch) -> None:

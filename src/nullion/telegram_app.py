@@ -1275,6 +1275,20 @@ def _telegram_allows_status_streaming(runtime: PersistentRuntime, *, chat_id: st
     }
 
 
+def _is_planner_status_ack(text: str | None) -> bool:
+    raw = str(text or "").strip()
+    return raw.startswith("Planner:") and "\n→ Working on " in raw
+
+
+def _should_suppress_planner_status_ack(
+    runtime: PersistentRuntime,
+    *,
+    chat_id: str | None,
+    reply: str | None,
+) -> bool:
+    return _is_planner_status_ack(reply) and _telegram_allows_status_streaming(runtime, chat_id=chat_id)
+
+
 async def _send_or_edit_telegram_status_message(
     bot,
     status_messages: dict[tuple[str, str], int],
@@ -1283,10 +1297,26 @@ async def _send_or_edit_telegram_status_message(
     group_id: str,
     text: str,
     status_texts: dict[tuple[str, str], str] | None = None,
+    status_locks: dict[tuple[str, str], asyncio.Lock] | None = None,
 ) -> None:
     if bot is None or not chat_id or not group_id or not text:
         return
     key = (chat_id, group_id)
+    if status_locks is not None:
+        lock = status_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            status_locks[key] = lock
+        async with lock:
+            await _send_or_edit_telegram_status_message(
+                bot,
+                status_messages,
+                chat_id=chat_id,
+                group_id=group_id,
+                text=text,
+                status_texts=status_texts,
+            )
+        return
     if status_texts is not None and status_texts.get(key) == text:
         return
     if isinstance(bot, str):
@@ -2357,6 +2387,7 @@ class ChatOperatorService:
         _suggestion_markup = None
         reply_activity_phase = RunActivityPhase.ACTIVE
         keep_typing_until_delivery = False
+        suppress_primary_reply_delivery = False
 
         try:
             async with turn_registration:
@@ -2459,6 +2490,14 @@ class ChatOperatorService:
                         self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
                         self.runtime.checkpoint()
                     return
+                suppress_primary_reply_delivery = (
+                    handler_error is None
+                    and _should_suppress_planner_status_ack(
+                        self.runtime,
+                        chat_id=chat_id_text,
+                        reply=reply,
+                    )
+                )
                 # Persist to unified chat history
                 try:
                     from nullion.chat_store import get_chat_store as _get_chat_store
@@ -2470,7 +2509,7 @@ class ChatOperatorService:
                     if _user_text:
                         _store.save_message(conversation_id or _channel, "user", _user_text,
                                            channel=_channel, channel_label=_channel_label)
-                    if _visible_reply_for_history:
+                    if _visible_reply_for_history and not suppress_primary_reply_delivery:
                         _store.save_message(conversation_id or _channel, "bot", str(_visible_reply_for_history),
                                            channel=_channel, channel_label=_channel_label)
                 except Exception:
@@ -2508,6 +2547,8 @@ class ChatOperatorService:
                 logger.info("Telegram run entered waiting_approval phase (chat_id=%s)", chat_id_text)
             if activity_streamer is not None:
                 await activity_streamer.finish()
+            if suppress_primary_reply_delivery:
+                return
 
             message = getattr(update, "message", None)
             if message is None:
@@ -2822,6 +2863,7 @@ class ChatOperatorService:
             _service_ref = self
             _status_messages: dict[tuple[str, str], int] = {}
             _status_texts: dict[tuple[str, str], str] = {}
+            _status_locks: dict[tuple[str, str], _asyncio.Lock] = {}
 
             def _telegram_deliver_fn(conversation_id: str, text: str, **kwargs) -> None:
                 """Route aggregator output back to the originating Telegram chat."""
@@ -2835,7 +2877,12 @@ class ChatOperatorService:
                     return
                 if kwargs.get("is_status"):
                     group_id = str(kwargs.get("group_id") or "")
-                    if not group_id or not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id):
+                    status_kind = str(kwargs.get("status_kind") or "task_summary")
+                    if (
+                        status_kind != "task_summary"
+                        or not group_id
+                        or not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id)
+                    ):
                         return
                     try:
                         loop = _asyncio.get_running_loop()
@@ -2847,6 +2894,7 @@ class ChatOperatorService:
                                 group_id=group_id,
                                 text=text,
                                 status_texts=_status_texts,
+                                status_locks=_status_locks,
                             )
                         )
                     except RuntimeError:

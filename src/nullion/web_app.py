@@ -5132,6 +5132,51 @@ function taskStatusVisual(glyph) {
   return states[glyph] || {cls: 'pending', symbol: '•'};
 }
 
+function taskStatusRank(glyph) {
+  if (['☑', '✕', '⊘'].includes(glyph)) return 3;
+  if (['◐', '▣', '▤'].includes(glyph)) return 2;
+  if (glyph === '☐') return 1;
+  return 0;
+}
+
+function parseTaskStatusText(text) {
+  const lines = String(text || '').split('\n').map(line => line.trimEnd()).filter(line => line.trim());
+  const taskLinePattern = /^\s*([☐◐☑✕⊘▣▤])\s+(.+)$/u;
+  const parsed = { planner: [], titles: [], rows: [] };
+  lines.forEach((line) => {
+    if (line.startsWith('Planner:')) {
+      parsed.planner.push(line);
+      return;
+    }
+    const taskMatch = line.match(taskLinePattern);
+    if (taskMatch) {
+      parsed.rows.push({ glyph: taskMatch[1], label: taskMatch[2] });
+      return;
+    }
+    parsed.titles.push(line);
+  });
+  return parsed;
+}
+
+function mergeTaskStatusText(previousText, nextText) {
+  const previous = parseTaskStatusText(previousText);
+  const next = parseTaskStatusText(nextText);
+  if (!previous.rows.length || !next.rows.length) return String(nextText || '');
+  const previousByLabel = new Map(previous.rows.map(row => [row.label, row.glyph]));
+  const mergedRows = next.rows.map((row) => {
+    const previousGlyph = previousByLabel.get(row.label);
+    if (previousGlyph && taskStatusRank(previousGlyph) > taskStatusRank(row.glyph)) {
+      return { ...row, glyph: previousGlyph };
+    }
+    return row;
+  });
+  return [
+    ...(next.planner.length ? next.planner : previous.planner),
+    ...(next.titles.length ? next.titles : previous.titles),
+    ...mergedRows.map(row => `  ${row.glyph} ${row.label}`),
+  ].join('\n');
+}
+
 function renderTaskStatusText(text) {
   const lines = String(text || '').split('\n').map(line => line.trimEnd()).filter(line => line.trim());
   const planner = [];
@@ -5183,12 +5228,14 @@ function updateTaskStatusCard(data) {
   }
   if (!bubble) bubble = ensureBotBubble(turnId);
   const activity = detachRunActivity(bubble);
+  const previousText = bubble.dataset.rawText || '';
+  const mergedText = mergeTaskStatusText(previousText, text);
   bubble.classList.remove('typing-bubble', 'status-bubble', 'thinking', 'has-run-activity');
   bubble.classList.add('task-status-bubble');
   bubble.dataset.taskGroupId = groupId;
-  bubble.dataset.rawText = text;
+  bubble.dataset.rawText = mergedText;
   delete bubble.dataset.statusText;
-  bubble.innerHTML = renderTaskStatusText(text);
+  bubble.innerHTML = renderTaskStatusText(mergedText);
   restoreRunActivity(bubble, activity);
   _taskStatusBubbles.set(groupId, bubble);
   if (turnId) _botTurnBubbles.set(turnId, bubble);

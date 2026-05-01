@@ -107,6 +107,12 @@ class ResultAggregator:
     async def _deliver_status(self, gs: GroupState, group: TaskGroup) -> None:
         """Emit the current status summary for the group."""
         planner_summary = _planner_summary_from_group(group)
+        for task in group.tasks:
+            if task.status in {TaskStatus.RUNNING, TaskStatus.QUEUED, TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                current = gs.status_lines.get(task.task_id)
+                next_line = format_task_status_line(task)
+                if current is None or _task_status_rank(next_line) >= _task_status_rank(current):
+                    gs.status_lines[task.task_id] = next_line
         await self._deliver(
             gs.conversation_id,
             format_task_status_summary(
@@ -190,6 +196,17 @@ class ResultAggregator:
                 await result
         except Exception as exc:
             logger.debug("ResultAggregator: deliver_fn failed: %s", exc)
+
+
+def _task_status_rank(line: str | None) -> int:
+    text = str(line or "").lstrip()
+    if text.startswith(("☑", "✕", "⊘")):
+        return 3
+    if text.startswith(("◐", "▣", "▤")):
+        return 2
+    if text.startswith("☐"):
+        return 1
+    return 0
 
 
 class _ResultAggregationState(TypedDict, total=False):
