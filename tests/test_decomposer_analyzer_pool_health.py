@@ -91,6 +91,8 @@ def test_task_decomposer_dispatches_valid_parallel_and_sequential_groups() -> No
     assert group.tasks[1].priority is TaskPriority.NORMAL
     assert group.tasks[1].dependencies == [group.tasks[0].task_id]
     assert group.planner_metadata["dispatchable"] is True
+    assert group.tasks[0].deep_agent_skills == ["/skills/nullion/"]
+    assert group.tasks[0].deep_agent_subagents[0]["name"] == "research_agent"
 
 
 def test_task_decomposer_strips_web_composer_mode_prefix_before_model_call() -> None:

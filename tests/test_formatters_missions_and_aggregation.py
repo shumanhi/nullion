@@ -238,6 +238,18 @@ def test_mini_agent_launch_policy_covers_hold_deny_launch_and_safe_routes() -> N
     assert decide_mini_agent_launch(capsule("unknown")).reason == "intent_state=unknown;decision=deny"
 
 
+def test_orchestrator_partial_task_results_map_to_waiting_input() -> None:
+    from nullion.agent_orchestrator import _progress_kind_for_task_result, _task_status_for_task_result
+
+    user_input = TaskResult("t1", "partial", output="Waiting for user input: Pick one")
+    approval = TaskResult("t2", "partial", output="Approval required before this delegated task can continue.")
+
+    assert _task_status_for_task_result(user_input) is TaskStatus.WAITING_INPUT
+    assert _progress_kind_for_task_result(user_input) == "input_needed"
+    assert _task_status_for_task_result(approval) is TaskStatus.WAITING_INPUT
+    assert _progress_kind_for_task_result(approval) == "approval_needed"
+
+
 def task(task_id: str, status: TaskStatus = TaskStatus.QUEUED, *, result: TaskResult | None = None) -> TaskRecord:
     return TaskRecord(
         task_id=task_id,
@@ -346,6 +358,21 @@ async def test_result_aggregator_progress_input_failure_cancel_and_model_summary
     assert any(text == "→ [Task t1] halfway" for _, text, _ in deliveries)
     assert any(text == "? Pick one" and kwargs["is_question"] for _, text, kwargs in deliveries)
     assert any(text == "model summary" for _, text, _ in deliveries)
+
+    await aggregator._handle(
+        ProgressUpdate(
+            agent_id="a",
+            task_id="t1",
+            group_id="g1",
+            kind="approval_needed",
+            message="Approval required before continuing.",
+        )
+    )
+    assert any(
+        text == "Approval required before continuing."
+        and kwargs == {"is_status": True, "group_id": "g1", "status_kind": "approval_needed"}
+        for _, text, kwargs in deliveries
+    )
 
     deliveries.clear()
     group2 = TaskGroup(group_id="g2", conversation_id="c2", original_message="Cancel", tasks=[task("t2", TaskStatus.CANCELLED)])

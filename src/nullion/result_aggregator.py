@@ -108,7 +108,14 @@ class ResultAggregator:
         """Emit the current status summary for the group."""
         planner_summary = _planner_summary_from_group(group)
         for task in group.tasks:
-            if task.status in {TaskStatus.RUNNING, TaskStatus.QUEUED, TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            if task.status in {
+                TaskStatus.RUNNING,
+                TaskStatus.QUEUED,
+                TaskStatus.WAITING_INPUT,
+                TaskStatus.COMPLETE,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
                 current = gs.status_lines.get(task.task_id)
                 next_line = format_task_status_line(task)
                 if current is None or _task_status_rank(next_line) >= _task_status_rank(current):
@@ -246,7 +253,7 @@ def _result_aggregation_ensure_group_state_node(state: _ResultAggregationState) 
 
 def _result_aggregation_route_kind(state: _ResultAggregationState) -> str:
     kind = state["update"].kind
-    if kind in {"progress_note", "task_started", "task_complete", "task_failed", "task_cancelled", "input_needed"}:
+    if kind in {"progress_note", "task_started", "task_complete", "task_failed", "task_cancelled", "input_needed", "approval_needed"}:
         return kind
     return END
 
@@ -329,6 +336,19 @@ async def _result_aggregation_input_needed_node(state: _ResultAggregationState) 
     return {}
 
 
+async def _result_aggregation_approval_needed_node(state: _ResultAggregationState) -> dict[str, object]:
+    update = state["update"]
+    gs = state["group_state"]
+    await state["aggregator"]._deliver(
+        gs.conversation_id,
+        update.message or "Approval required before this task can continue.",
+        is_status=True,
+        group_id=gs.group_id,
+        status_kind="approval_needed",
+    )
+    return {}
+
+
 @lru_cache(maxsize=1)
 def _compiled_result_aggregation_graph():
     graph = StateGraph(_ResultAggregationState)
@@ -340,6 +360,7 @@ def _compiled_result_aggregation_graph():
     graph.add_node("task_failed", _result_aggregation_task_failed_node)
     graph.add_node("task_cancelled", _result_aggregation_task_cancelled_node)
     graph.add_node("input_needed", _result_aggregation_input_needed_node)
+    graph.add_node("approval_needed", _result_aggregation_approval_needed_node)
     graph.add_edge(START, "load")
     graph.add_conditional_edges("load", _result_aggregation_route_after_load, {"ensure_group_state": "ensure_group_state", END: END})
     graph.add_conditional_edges(
@@ -352,10 +373,11 @@ def _compiled_result_aggregation_graph():
             "task_failed": "task_failed",
             "task_cancelled": "task_cancelled",
             "input_needed": "input_needed",
+            "approval_needed": "approval_needed",
             END: END,
         },
     )
-    for node in ("progress_note", "task_started", "task_complete", "task_failed", "task_cancelled", "input_needed"):
+    for node in ("progress_note", "task_started", "task_complete", "task_failed", "task_cancelled", "input_needed", "approval_needed"):
         graph.add_edge(node, END)
     return graph.compile()
 

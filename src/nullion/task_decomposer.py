@@ -28,6 +28,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from nullion.deep_agent_profiles import deep_agent_skills_for_task, deep_agent_subagents_for_task
 from nullion.task_planner import strip_composer_mode_instruction
 from nullion.task_queue import (
     TaskGroup,
@@ -195,7 +196,7 @@ class TaskDecomposer:
             else:
                 initial_status = TaskStatus.QUEUED
 
-            records.append(TaskRecord(
+            record = TaskRecord(
                 task_id=task_ids[i],
                 group_id=gid,
                 conversation_id=conversation_id,
@@ -208,7 +209,10 @@ class TaskDecomposer:
                 dependencies=dep_ids,
                 context_key_in=dt.context_key_in,
                 context_key_out=dt.context_key_out,
-            ))
+            )
+            record.deep_agent_skills = deep_agent_skills_for_task(record)
+            record.deep_agent_subagents = deep_agent_subagents_for_task(record)
+            records.append(record)
 
         group = TaskGroup(
             group_id=gid,

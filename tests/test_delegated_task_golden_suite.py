@@ -190,7 +190,7 @@ async def test_golden_approval_workflow_returns_partial_result() -> None:
 
     assert result.status == "partial"
     assert result.output == "Approval required before this delegated task can continue. Approval ID: ap-1"
-    assert any(update.kind == "progress_note" and update.message == "web_fetch completed." for update in updates)
+    assert any(update.kind == "approval_needed" and update.data["approval_id"] == "ap-1" for update in updates)
 
 
 @pytest.mark.asyncio
@@ -221,6 +221,7 @@ async def test_golden_skills_and_subagents_are_forwarded(monkeypatch) -> None:
 
     class FakeAgent:
         async def ainvoke(self, payload, config=None):
+            captured["payload"] = payload
             return {"messages": [SimpleNamespace(type="ai", content="delegated")]}
 
     def fake_create_deep_agent(**kwargs):
@@ -229,7 +230,10 @@ async def test_golden_skills_and_subagents_are_forwarded(monkeypatch) -> None:
 
     monkeypatch.setattr(deepagents, "create_deep_agent", fake_create_deep_agent)
     record = task(description="Delegate", tools=[])
-    record.deep_agent_skills = ["repo-review"]
+    record.deep_agent_skills = ["/skills/custom/"]
+    record.deep_agent_skill_files = {
+        "/skills/custom/repo-review/SKILL.md": "---\nname: repo-review\ndescription: Inspect repository context\n---\n"
+    }
     record.deep_agent_subagents = [
         {
             "name": "repo-researcher",
@@ -242,7 +246,13 @@ async def test_golden_skills_and_subagents_are_forwarded(monkeypatch) -> None:
 
     assert result.status == "success"
     assert result.output == "delegated"
-    assert captured["skills"] == ["repo-review"]
+    assert captured["skills"] == ["/skills/custom/"]
+    assert captured["payload"]["files"] == {
+        "/skills/custom/repo-review/SKILL.md": {
+            "content": "---\nname: repo-review\ndescription: Inspect repository context\n---\n",
+            "encoding": "utf-8",
+        }
+    }
     assert captured["subagents"] == [
         {
             "name": "repo-researcher",
@@ -250,3 +260,32 @@ async def test_golden_skills_and_subagents_are_forwarded(monkeypatch) -> None:
             "system_prompt": "Focus on repository evidence.",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_golden_inferred_subagents_are_forwarded(monkeypatch) -> None:
+    import deepagents
+
+    captured = {}
+    payloads = []
+
+    class FakeAgent:
+        async def ainvoke(self, payload, config=None):
+            payloads.append(payload)
+            return {"messages": [SimpleNamespace(type="ai", content="profiled")]}
+
+    def fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+        return FakeAgent()
+
+    monkeypatch.setattr(deepagents, "create_deep_agent", fake_create_deep_agent)
+    record = task(description="Research the docs and write an artifact", tools=["web_search", "file_write"])
+
+    result, _updates = await run_task(ScriptedClient([]), GoldenRegistry({}), record)
+
+    assert result.status == "success"
+    assert result.output == "profiled"
+    assert captured["skills"] == ["/skills/nullion/"]
+    assert [agent["name"] for agent in captured["subagents"]] == ["research_agent", "artifact_agent"]
+    assert "/skills/nullion/research/SKILL.md" in payloads[0]["files"]
+    assert "/skills/nullion/artifact/SKILL.md" in payloads[0]["files"]

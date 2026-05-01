@@ -8,6 +8,11 @@ import logging
 import os
 from typing import Any
 
+from nullion.deep_agent_profiles import (
+    deep_agent_skill_files_for_task,
+    deep_agent_skills_for_task,
+    deep_agent_subagents_for_task,
+)
 from nullion.langchain_adapters import nullion_client_as_langchain_chat_model, nullion_tools_as_langchain_tools
 from nullion.response_sanitizer import sanitize_user_visible_reply
 from nullion.response_fulfillment_contract import artifact_paths_from_tool_results
@@ -145,6 +150,9 @@ class DeepAgentMiniAgentRunner:
             subagents=_deep_agent_subagents_for_task(config),
         )
         payload = {"messages": [{"role": "user", "content": task.description}]}
+        skill_files = _deep_agent_skill_files_for_task(config)
+        if skill_files:
+            payload["files"] = skill_files
         response = await _invoke_agent(
             agent,
             payload,
@@ -168,10 +176,20 @@ class DeepAgentMiniAgentRunner:
         artifacts = artifact_paths_from_tool_results(tool_results)
         pending_approval = _pending_approval_from_tool_results(tool_results)
         if pending_approval is not None:
+            await _emit_progress(
+                progress_queue,
+                config=config,
+                kind="approval_needed",
+                message=pending_approval["message"],
+                data={
+                    "approval_id": pending_approval.get("approval_id"),
+                    "resume_supported": True,
+                },
+            )
             return TaskResult(
                 task_id=task.task_id,
                 status="partial",
-                output=pending_approval,
+                output=pending_approval["message"],
                 artifacts=artifacts,
                 context_out=output_text,
             )
@@ -211,17 +229,40 @@ def _deep_agent_skills_for_task(config) -> list[str] | None:
     raw = getattr(task, "deep_agent_skills", None)
     if raw is None:
         raw = os.environ.get("NULLION_DEEP_AGENTS_SKILLS", "")
-    skills = [str(skill).strip() for skill in (raw if isinstance(raw, (list, tuple)) else str(raw).split(","))]
+    inferred = deep_agent_skills_for_task(task)
+    raw_values = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    skills = [str(skill).strip() for skill in [*raw_values, *inferred]]
     skills = [skill for skill in skills if skill]
-    return skills or None
+    return list(dict.fromkeys(skills)) or None
+
+
+def _deep_agent_skill_files_for_task(config) -> dict[str, dict[str, str]]:
+    files: dict[str, dict[str, str]] = {}
+    raw = getattr(config.task, "deep_agent_skill_files", None)
+    if isinstance(raw, dict):
+        files.update({str(path): _skill_file_payload(content) for path, content in raw.items()})
+    files.update(deep_agent_skill_files_for_task(config.task))
+    return files
+
+
+def _skill_file_payload(content: Any) -> dict[str, str]:
+    if isinstance(content, dict):
+        text = str(content.get("content") or "")
+        encoding = str(content.get("encoding") or "utf-8")
+        return {"content": text, "encoding": encoding}
+    return {"content": str(content), "encoding": "utf-8"}
 
 
 def _deep_agent_subagents_for_task(config) -> list[dict[str, Any]] | None:
     raw = getattr(config.task, "deep_agent_subagents", None)
-    if not raw:
-        return None
+    if isinstance(raw, dict):
+        raw_items = [raw]
+    elif isinstance(raw, (list, tuple)):
+        raw_items = list(raw)
+    else:
+        raw_items = []
     subagents: list[dict[str, Any]] = []
-    for item in raw:
+    for item in [*raw_items, *deep_agent_subagents_for_task(config.task)]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
@@ -319,18 +360,20 @@ async def _invoke_agent_with_events(
     async for event in agent.astream_events(payload, config=config, version="v2"):
         if event.get("event") == "on_chain_end" and event.get("name") == "LangGraph":
             final_output = (event.get("data") or {}).get("output")
-        progress_message = _progress_message_from_deep_agent_event(event)
-        if progress_message is None:
+        progress_update = _progress_update_from_deep_agent_event(event)
+        if progress_update is None:
             continue
-        signature = (str(event.get("run_id") or ""), progress_message)
+        kind, message, data = progress_update
+        signature = (str(event.get("run_id") or ""), kind, message)
         if signature in emitted:
             continue
         emitted.add(signature)
         await _emit_progress(
             progress_queue,
             config=mini_agent_config,
-            kind="progress_note",
-            message=progress_message,
+            kind=kind,
+            message=message,
+            data=data,
         )
     if final_output is not None:
         return final_output
@@ -338,22 +381,88 @@ async def _invoke_agent_with_events(
 
 
 def _progress_message_from_deep_agent_event(event: dict[str, Any]) -> str | None:
+    progress_update = _progress_update_from_deep_agent_event(event)
+    if progress_update is None:
+        return None
+    return progress_update[1]
+
+
+def _progress_update_from_deep_agent_event(event: dict[str, Any]) -> tuple[str, str, dict[str, Any] | None] | None:
     event_name = str(event.get("event") or "")
     name = str(event.get("name") or "")
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
     node = str(metadata.get("langgraph_node") or name)
     if event_name == "on_chain_start" and node == "model":
-        return "Planning next step."
+        return "progress_note", "Planning next step.", {"phase": "model_start"}
+    if event_name == "on_chain_start" and _looks_like_subagent_event(name, metadata):
+        return "progress_note", f"Starting {_human_label(name)}.", {"phase": "subagent_start", "subagent": name}
+    if event_name == "on_chain_end" and _looks_like_subagent_event(name, metadata):
+        return "progress_note", f"{_human_label(name)} completed.", {"phase": "subagent_end", "subagent": name}
     if event_name == "on_chat_model_end":
         tool_names = _tool_names_from_chat_model_output((event.get("data") or {}).get("output"))
         if tool_names:
-            return f"Planning tool use: {', '.join(tool_names[:3])}."
-        return "Model step completed."
+            return "progress_note", f"Planning tool use: {', '.join(tool_names[:3])}.", {"phase": "tool_plan", "tools": tool_names}
+        return "progress_note", "Model step completed.", {"phase": "model_end"}
     if event_name == "on_tool_start":
-        return f"Calling {name}."
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        return "progress_note", f"Calling {name}.", {
+            "phase": "tool_start",
+            "tool": name,
+            "args_preview": _redacted_preview(data.get("input")),
+        }
     if event_name == "on_tool_end":
-        return f"{name} completed."
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        output = data.get("output")
+        if _tool_output_requires_approval(output):
+            return "approval_needed", f"{name} needs approval before continuing.", {"phase": "approval_needed", "tool": name}
+        if _tool_output_failed(output):
+            return "progress_note", f"{name} reported a recoverable failure.", {"phase": "tool_failed", "tool": name}
+        return "progress_note", f"{name} completed.", {"phase": "tool_end", "tool": name}
+    if event_name == "on_retry":
+        return "progress_note", f"Retrying {_human_label(name)}.", {"phase": "retry", "name": name}
     return None
+
+
+def _looks_like_subagent_event(name: str, metadata: dict[str, Any]) -> bool:
+    label = " ".join(str(value or "") for value in (name, metadata.get("subagent"), metadata.get("agent_name"))).lower().strip()
+    return "subagent" in label or label.endswith("_agent")
+
+
+def _human_label(name: str) -> str:
+    return str(name or "agent").replace("_", " ").replace("-", " ").strip() or "agent"
+
+
+def _redacted_preview(value: Any, *, limit: int = 160) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if any(secret in key_text.lower() for secret in ("token", "secret", "password", "api_key", "key")):
+                redacted[key_text] = "[redacted]"
+            else:
+                redacted[key_text] = item
+        value = redacted
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def _tool_output_failed(output: Any) -> bool:
+    status = getattr(output, "status", None)
+    if status is None and isinstance(output, dict):
+        status = output.get("status")
+    error = getattr(output, "error", None)
+    if error is None and isinstance(output, dict):
+        error = output.get("error")
+    return str(status or "").lower() in {"failed", "failure", "error", "denied"} or bool(error)
+
+
+def _tool_output_requires_approval(output: Any) -> bool:
+    payload = getattr(output, "output", output)
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("reason") == "approval_required" or bool(payload.get("requires_approval"))
 
 
 def _tool_names_from_chat_model_output(output: Any) -> list[str]:
@@ -408,7 +517,7 @@ def _message_role(message: Any) -> str | None:
     return str(role).lower() if role else None
 
 
-def _pending_approval_from_tool_results(tool_results: list[Any]) -> str | None:
+def _pending_approval_from_tool_results(tool_results: list[Any]) -> dict[str, str | None] | None:
     for result in tool_results:
         output = getattr(result, "output", None)
         if not isinstance(output, dict):
@@ -417,8 +526,11 @@ def _pending_approval_from_tool_results(tool_results: list[Any]) -> str | None:
             continue
         approval_id = output.get("approval_id")
         if approval_id:
-            return f"Approval required before this delegated task can continue. Approval ID: {approval_id}"
-        return "Approval required before this delegated task can continue."
+            return {
+                "message": f"Approval required before this delegated task can continue. Approval ID: {approval_id}",
+                "approval_id": str(approval_id),
+            }
+        return {"message": "Approval required before this delegated task can continue.", "approval_id": None}
     return None
 
 

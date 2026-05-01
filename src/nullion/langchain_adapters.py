@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import asyncio
 import inspect
+import os
 from importlib.util import find_spec
 from typing import Any
 from uuid import uuid4
@@ -62,8 +63,9 @@ def nullion_tools_as_langchain_tools(
                 tool_result_callback=tool_result_callback,
             ),
             name=str(tool_def.get("name")),
-            description=str(tool_def.get("description") or ""),
+            description=_enhanced_tool_description(tool_def),
             args_schema=_normalized_input_schema(tool_def),
+            metadata={"nullion_tool_group": _tool_group_for_name(str(tool_def.get("name") or ""))},
         )
         for tool_def in tool_definitions
         if isinstance(tool_def.get("name"), str)
@@ -201,20 +203,35 @@ def _invoke_nullion_tool(
     tool_registry: Any,
     policy_store: Any,
 ) -> ToolResult:
-    if policy_store is None:
-        return tool_registry.invoke(invocation)
-    try:
-        from nullion.runtime import invoke_tool
+    attempts = max(1, _tool_retry_attempts())
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if policy_store is None:
+                return tool_registry.invoke(invocation)
+            from nullion.runtime import invoke_tool
 
-        return invoke_tool(policy_store, invocation, registry=tool_registry)
-    except Exception as exc:
-        return ToolResult(
-            invocation.invocation_id,
-            invocation.tool_name,
-            "failed",
-            {"error": str(exc) or exc.__class__.__name__},
-            error=str(exc) or exc.__class__.__name__,
-        )
+            return invoke_tool(policy_store, invocation, registry=tool_registry)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+    error = str(last_exc) if last_exc is not None else "tool invocation failed"
+    return ToolResult(
+        invocation.invocation_id,
+        invocation.tool_name,
+        "failed",
+        {"error": error or last_exc.__class__.__name__},
+        error=error or last_exc.__class__.__name__,
+    )
+
+
+def _tool_retry_attempts() -> int:
+    raw = os.environ.get("NULLION_LANGCHAIN_TOOL_RETRIES", "2")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2
 
 
 def _tool_result_text(result: ToolResult) -> str:
@@ -245,10 +262,33 @@ async def _call_nullion_model(
         "system": system,
     }
     create = getattr(client, "create")
+    attempts = max(1, _model_retry_attempts())
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await _call_create(create, create_kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            await asyncio.sleep(min(0.25 * attempt, 1.0))
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _call_create(create: Any, create_kwargs: dict[str, Any]) -> dict[str, Any]:
     if inspect.iscoroutinefunction(create):
         return await create(**create_kwargs)
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: create(**create_kwargs))
+
+
+def _model_retry_attempts() -> int:
+    raw = os.environ.get("NULLION_LANGCHAIN_MODEL_RETRIES", "2")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2
 
 
 def _nullion_messages_from_langchain_messages(
@@ -355,6 +395,31 @@ def _args_schema_from_langchain_tool(tool: Any) -> dict[str, Any]:
     if isinstance(args, dict):
         return {"type": "object", "properties": args}
     return {"type": "object", "properties": {}}
+
+
+def _enhanced_tool_description(tool_definition: dict[str, Any]) -> str:
+    name = str(tool_definition.get("name") or "")
+    base = str(tool_definition.get("description") or "").strip()
+    group = _tool_group_for_name(name)
+    suffix = f"Nullion scoped tool. Group: {group}. Sentinel policy and approval checks still apply."
+    return f"{base}\n\n{suffix}" if base else suffix
+
+
+def _tool_group_for_name(name: str) -> str:
+    lowered = str(name or "").lower()
+    if lowered.startswith("browser_"):
+        return "browser"
+    if lowered in {"web_search", "web_fetch"}:
+        return "research"
+    if lowered in {"file_write", "render", "image_generate"} or "screenshot" in lowered:
+        return "artifact"
+    if lowered in {"file_read", "file_search", "workspace_summary"}:
+        return "repo_analysis"
+    if "approval" in lowered:
+        return "approval"
+    if "service" in lowered or "doctor" in lowered or "health" in lowered:
+        return "doctor"
+    return "general"
 
 
 def _chat_result_from_nullion_response(response: dict[str, Any]):

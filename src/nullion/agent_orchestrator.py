@@ -1589,7 +1589,7 @@ class AgentOrchestrator:
             if agent is not None:
                 self._pool.release(agent)
 
-        final_status = TaskStatus.COMPLETE if result.status == "success" else TaskStatus.FAILED
+        final_status = _task_status_for_task_result(result)
         self._transition_dispatch_task_run(
             policy_store,
             task,
@@ -1606,7 +1606,7 @@ class AgentOrchestrator:
                     agent_id=agent.agent_id,
                     task_id=task.task_id,
                     group_id=task.group_id,
-                    kind="task_complete" if result.status == "success" else "task_failed",
+                    kind=_progress_kind_for_task_result(result),
                     message=result.output or result.error,
                 )
             )
@@ -1699,6 +1699,25 @@ def _planner_summary_from_group(group: Any) -> str:
     if task_count:
         return f"{label} • {task_count} task{'s' if task_count != 1 else ''}"
     return label
+
+
+def _task_status_for_task_result(result: Any) -> TaskStatus:
+    from nullion.task_queue import TaskStatus
+
+    if getattr(result, "status", None) == "success":
+        return TaskStatus.COMPLETE
+    if getattr(result, "status", None) == "partial":
+        return TaskStatus.WAITING_INPUT
+    return TaskStatus.FAILED
+
+
+def _progress_kind_for_task_result(result: Any) -> str:
+    if getattr(result, "status", None) == "success":
+        return "task_complete"
+    if getattr(result, "status", None) == "partial":
+        output = str(getattr(result, "output", "") or "")
+        return "input_needed" if output.startswith("Waiting for user input:") else "approval_needed"
+    return "task_failed"
 
 
 def _serialize_pending_tool_calls(tool_results: list[ToolResult]) -> list[dict[str, object]]:

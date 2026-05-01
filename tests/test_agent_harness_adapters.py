@@ -51,9 +51,73 @@ async def test_langchain_tool_adapter_invokes_nullion_registry() -> None:
     )
 
     assert [tool.name for tool in tools] == ["file_read"]
+    assert "Group: repo_analysis" in tools[0].description
+    assert tools[0].metadata == {"nullion_tool_group": "repo_analysis"}
     assert await tools[0].ainvoke({"path": "/tmp/a.txt"}) == '{"path": "/tmp/a.txt"}'
     assert calls[0].principal_id == "workspace:demo"
     assert calls[0].capsule_id == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_langchain_model_adapter_retries_transient_failures(monkeypatch) -> None:
+    from langchain_core.messages import HumanMessage
+
+    from nullion.langchain_adapters import nullion_client_as_langchain_chat_model
+
+    monkeypatch.setenv("NULLION_LANGCHAIN_MODEL_RETRIES", "2")
+
+    class FlakyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary model failure")
+            return {"content": [{"type": "text", "text": "recovered"}]}
+
+    client = FlakyClient()
+    model = nullion_client_as_langchain_chat_model(client)
+
+    response = await model.ainvoke([HumanMessage(content="hello")])
+
+    assert response.content == "recovered"
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_langchain_tool_adapter_retries_transient_registry_failures(monkeypatch) -> None:
+    monkeypatch.setenv("NULLION_LANGCHAIN_TOOL_RETRIES", "2")
+
+    class Registry:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_tool_definitions(self, *, allowed):
+            return [
+                {
+                    "name": "file_read",
+                    "description": "Read file",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                }
+            ]
+
+        def invoke(self, invocation):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary tool failure")
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"content": "ok"})
+
+    registry = Registry()
+    tools = nullion_tools_as_langchain_tools(
+        registry,
+        allowed_tools=["file_read"],
+        principal_id="workspace:demo",
+        cleanup_scope="task-1",
+    )
+
+    assert await tools[0].ainvoke({"path": "/tmp/a.txt"}) == '{"content": "ok"}'
+    assert registry.calls == 2
 
 
 @pytest.mark.asyncio
@@ -231,3 +295,72 @@ async def test_deepagents_default_path_can_pause_for_user_input(monkeypatch) -> 
     input_updates = [update for update in updates if update.kind == "input_needed"]
     assert input_updates
     assert input_updates[0].data == {"options": ["A", "B"]}
+
+
+def test_deep_agent_event_mapping_covers_subagents_retries_and_redaction() -> None:
+    from nullion.deep_agent_runner import _progress_update_from_deep_agent_event
+
+    subagent_start = _progress_update_from_deep_agent_event(
+        {"event": "on_chain_start", "name": "repo_analysis_agent", "metadata": {}}
+    )
+    assert subagent_start == (
+        "progress_note",
+        "Starting repo analysis agent.",
+        {"phase": "subagent_start", "subagent": "repo_analysis_agent"},
+    )
+
+    tool_start = _progress_update_from_deep_agent_event(
+        {
+            "event": "on_tool_start",
+            "name": "file_write",
+            "data": {"input": {"path": "/tmp/out.txt", "api_key": "secret"}},
+        }
+    )
+    assert tool_start is not None
+    assert tool_start[1] == "Calling file_write."
+    assert "'api_key': '[redacted]'" in tool_start[2]["args_preview"]
+
+    retry = _progress_update_from_deep_agent_event({"event": "on_retry", "name": "browser_agent"})
+    assert retry == ("progress_note", "Retrying browser agent.", {"phase": "retry", "name": "browser_agent"})
+
+
+def test_builtin_deep_agent_profiles_infer_skills_and_subagents() -> None:
+    from nullion.deep_agent_profiles import (
+        deep_agent_skill_files_for_task,
+        deep_agent_skills_for_task,
+        deep_agent_subagents_for_task,
+    )
+
+    record = TaskRecord(
+        task_id="task-profile",
+        group_id="group-1",
+        conversation_id="conv-1",
+        principal_id="workspace:demo",
+        title="Research and write report",
+        description="Research docs and write a report artifact",
+        status=TaskStatus.QUEUED,
+        priority=TaskPriority.NORMAL,
+        allowed_tools=["web_search", "file_write"],
+        dependencies=[],
+    )
+
+    assert deep_agent_skills_for_task(record) == ["/skills/nullion/"]
+    skill_files = deep_agent_skill_files_for_task(record)
+    assert "/skills/nullion/research/SKILL.md" in skill_files
+    assert "/skills/nullion/artifact/SKILL.md" in skill_files
+    assert [agent["name"] for agent in deep_agent_subagents_for_task(record)] == ["research_agent", "artifact_agent"]
+
+    scheduled = TaskRecord(
+        task_id="task-scheduled",
+        group_id="group-1",
+        conversation_id="conv-1",
+        principal_id="workspace:demo",
+        title="Monitor reminder",
+        description="Run the scheduled monitor and alert if needed",
+        status=TaskStatus.QUEUED,
+        priority=TaskPriority.NORMAL,
+        allowed_tools=[],
+        dependencies=[],
+    )
+    assert "scheduled_job_agent" in [agent["name"] for agent in deep_agent_subagents_for_task(scheduled)]
+    assert "/skills/nullion/scheduled-job/SKILL.md" in deep_agent_skill_files_for_task(scheduled)
