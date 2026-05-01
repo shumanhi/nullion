@@ -28,15 +28,65 @@ def test_encrypted_credentials_round_trip_without_plaintext(tmp_path) -> None:
 
 def test_legacy_credentials_json_migrates_and_removes_plaintext(tmp_path) -> None:
     json_path = tmp_path / "credentials.json"
-    json_path.write_text(json.dumps({"provider": "codex", "refresh_token": "refresh-secret"}), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(
+            {
+                "provider": "codex",
+                "api_key": "access-secret",
+                "refresh_token": "refresh-secret",
+                "model": "gpt-5.5",
+            }
+        ),
+        encoding="utf-8",
+    )
     db_path = tmp_path / "runtime.db"
 
     migrated = migrate_credentials_json_to_db(json_path, db_path=db_path)
 
     assert migrated["provider"] == "codex"
-    assert load_encrypted_credentials(db_path=db_path)["refresh_token"] == "refresh-secret"
+    stored = load_encrypted_credentials(db_path=db_path)
+    assert stored["refresh_token"] == "refresh-secret"
+    assert stored["keys"]["codex"] == "access-secret"
+    assert stored["models"]["codex"] == "gpt-5.5"
     assert not json_path.exists()
     assert b"refresh-secret" not in db_path.read_bytes()
+
+
+def test_legacy_credentials_json_preserves_codex_when_existing_db_has_other_provider(tmp_path) -> None:
+    json_path = tmp_path / "credentials.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "provider": "codex",
+                "api_key": "codex-access",
+                "refresh_token": "codex-refresh",
+                "model": "gpt-5.5",
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "runtime.db"
+    save_encrypted_credentials(
+        {
+            "provider": "openrouter",
+            "api_key": "sk-or-secret",
+            "model": "qwen/qwen3.6-flash",
+            "keys": {"openrouter": "sk-or-secret"},
+            "models": {"openrouter": "qwen/qwen3.6-flash"},
+        },
+        db_path=db_path,
+    )
+
+    migrated = migrate_credentials_json_to_db(json_path, db_path=db_path)
+
+    assert migrated["provider"] == "openrouter"
+    assert migrated["api_key"] == "sk-or-secret"
+    assert migrated["refresh_token"] == "codex-refresh"
+    assert migrated["keys"]["openrouter"] == "sk-or-secret"
+    assert migrated["keys"]["codex"] == "codex-access"
+    assert migrated["models"]["openrouter"] == "qwen/qwen3.6-flash"
+    assert migrated["models"]["codex"] == "gpt-5.5"
+    assert not json_path.exists()
 
 
 def test_env_credentials_migrate_to_db_without_clobbering_existing(tmp_path) -> None:

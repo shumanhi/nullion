@@ -125,6 +125,75 @@ def _merge_credentials(
     return merged
 
 
+def _normalized_provider(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_credential_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Expand legacy single-provider fields into provider-specific maps.
+
+    Older installs stored one active provider as ``provider/api_key/model``.
+    The settings UI now lets users keep multiple providers configured, so a
+    migration must preserve the legacy active provider before any later env
+    import changes the active provider.
+    """
+    normalized = dict(payload)
+    provider = _normalized_provider(normalized.get("provider"))
+    if provider:
+        normalized["provider"] = provider
+
+    keys = normalized.get("keys")
+    keys_map = dict(keys) if isinstance(keys, dict) else {}
+    api_key = str(normalized.get("api_key") or "").strip()
+    if provider and api_key and api_key != "none":
+        keys_map.setdefault(provider, api_key)
+    if keys_map:
+        normalized["keys"] = keys_map
+
+    models = normalized.get("models")
+    models_map = dict(models) if isinstance(models, dict) else {}
+    model = str(normalized.get("model") or "").strip()
+    if provider and model:
+        models_map.setdefault(provider, model)
+    if models_map:
+        normalized["models"] = models_map
+
+    return normalized
+
+
+def _source_credentials_preserved(source: dict[str, Any], loaded: dict[str, Any] | None) -> bool:
+    if not isinstance(loaded, dict):
+        return False
+    normalized = _normalize_credential_payload(source)
+    provider = _normalized_provider(normalized.get("provider"))
+    loaded_keys = loaded.get("keys")
+    loaded_keys_map = loaded_keys if isinstance(loaded_keys, dict) else {}
+    source_keys = normalized.get("keys")
+    if isinstance(source_keys, dict):
+        for key, value in source_keys.items():
+            if value not in ("", None) and loaded_keys_map.get(key) != value:
+                return False
+
+    source_models = normalized.get("models")
+    loaded_models = loaded.get("models")
+    loaded_models_map = loaded_models if isinstance(loaded_models, dict) else {}
+    if isinstance(source_models, dict):
+        for key, value in source_models.items():
+            if value not in ("", None) and loaded_models_map.get(key) != value:
+                return False
+
+    api_key = str(normalized.get("api_key") or "").strip()
+    if provider and api_key and api_key != "none":
+        if loaded_keys_map.get(provider) != api_key:
+            return False
+
+    for key in ("refresh_token", "access_token", "id_token"):
+        value = normalized.get(key)
+        if value not in ("", None) and loaded.get(key) != value:
+            return False
+    return True
+
+
 def save_encrypted_credentials(creds: dict[str, Any], *, db_path: str | Path | None = None) -> Path:
     target = Path(db_path).expanduser() if db_path is not None else _credentials_db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -233,12 +302,17 @@ def migrate_credentials_json_to_db(json_path: str | Path, *, db_path: str | Path
         return load_encrypted_credentials(db_path=db_path)
     if not isinstance(data, dict) or not data:
         return load_encrypted_credentials(db_path=db_path)
+    source_data = _normalize_credential_payload(data)
+    data = source_data
     existing = load_encrypted_credentials(db_path=db_path)
     if existing:
-        data = _merge_credentials(data, existing, overwrite=True)
+        data = _normalize_credential_payload(_merge_credentials(data, existing, overwrite=True))
     save_encrypted_credentials(data, db_path=db_path)
+    loaded = load_encrypted_credentials(db_path=db_path)
+    if not _source_credentials_preserved(source_data, loaded):
+        return loaded
     try:
         source.unlink()
     except OSError:
         pass
-    return data
+    return loaded or data
