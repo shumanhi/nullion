@@ -121,6 +121,82 @@ async def test_langchain_tool_adapter_retries_transient_registry_failures(monkey
 
 
 @pytest.mark.asyncio
+async def test_langchain_tool_adapter_uses_declared_fallback_tools() -> None:
+    results = []
+
+    class Registry:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def list_tool_definitions(self, *, allowed):
+            return [
+                {
+                    "name": "primary_lookup",
+                    "description": "Primary lookup",
+                    "fallback_tools": ["fallback_lookup"],
+                    "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ]
+
+        def invoke(self, invocation):
+            self.calls.append(invocation.tool_name)
+            if invocation.tool_name == "primary_lookup":
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"error": "down"}, error="down")
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"answer": "fallback"})
+
+    registry = Registry()
+    tools = nullion_tools_as_langchain_tools(
+        registry,
+        allowed_tools=["primary_lookup"],
+        principal_id="workspace:demo",
+        cleanup_scope="task-1",
+        tool_result_callback=results.append,
+    )
+
+    assert await tools[0].ainvoke({"query": "x"}) == '{"answer": "fallback"}'
+    assert registry.calls == ["primary_lookup", "fallback_lookup"]
+    assert [result.tool_name for result in results] == ["primary_lookup", "fallback_lookup"]
+
+
+@pytest.mark.asyncio
+async def test_langchain_tool_adapter_does_not_fallback_on_approval_required() -> None:
+    class Registry:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def list_tool_definitions(self, *, allowed):
+            return [
+                {
+                    "name": "web_fetch",
+                    "description": "Fetch web page",
+                    "fallback_tools": ["web_search"],
+                    "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}},
+                }
+            ]
+
+        def invoke(self, invocation):
+            self.calls.append(invocation.tool_name)
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "denied",
+                {"reason": "approval_required", "approval_id": "ap-1"},
+                error="Approval required",
+            )
+
+    registry = Registry()
+    tools = nullion_tools_as_langchain_tools(
+        registry,
+        allowed_tools=["web_fetch"],
+        principal_id="workspace:demo",
+        cleanup_scope="task-1",
+    )
+
+    assert await tools[0].ainvoke({"url": "https://example.com"}) == "Approval required"
+    assert registry.calls == ["web_fetch"]
+
+
+@pytest.mark.asyncio
 async def test_mini_agent_runner_delegates_to_deepagents(monkeypatch) -> None:
     from nullion.deep_agent_runner import DeepAgentMiniAgentRunner
 
@@ -291,6 +367,10 @@ async def test_deepagents_default_path_can_pause_for_user_input(monkeypatch) -> 
 
     assert result.status == "partial"
     assert result.output == "Waiting for user input: Which file?"
+    assert result.resume_token["backend"] == "deepagents"
+    assert result.resume_token["reason"] == "user_input"
+    assert result.resume_token["question"] == "Which file?"
+    assert result.resume_token["thread_id"] == "nullion:group-1:task-input:agent-1"
     updates = [progress_queue.get_nowait() for _ in range(progress_queue.qsize())]
     input_updates = [update for update in updates if update.kind == "input_needed"]
     assert input_updates
@@ -348,7 +428,12 @@ def test_builtin_deep_agent_profiles_infer_skills_and_subagents() -> None:
     skill_files = deep_agent_skill_files_for_task(record)
     assert "/skills/nullion/research/SKILL.md" in skill_files
     assert "/skills/nullion/artifact/SKILL.md" in skill_files
-    assert [agent["name"] for agent in deep_agent_subagents_for_task(record)] == ["research_agent", "artifact_agent"]
+    assert "/skills/nullion/artifact-verifier/SKILL.md" in skill_files
+    assert [agent["name"] for agent in deep_agent_subagents_for_task(record)] == [
+        "research_agent",
+        "artifact_agent",
+        "artifact_verifier_agent",
+    ]
 
     scheduled = TaskRecord(
         task_id="task-scheduled",

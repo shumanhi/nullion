@@ -13237,6 +13237,7 @@ def create_app(runtime, orchestrator, registry):
                         "tags": p.tags,
                         "confidence": p.confidence,
                         "evidence": p.evidence,
+                        "deep_agent_validation": p.deep_agent_validation_snapshot(),
                     }
                     for p in proposals
                 ],

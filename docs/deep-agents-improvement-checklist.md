@@ -18,10 +18,13 @@ Deep Agents and LangChain migration.
 - [ ] Resume delegated tasks after approval or user input from the paused Deep Agents step.
 - [ ] Route auto-skill proposals through a Deep Agents skill/subagent golden test loop.
 - [ ] Add scheduled-job agents for cron/reminder run-inspect-notify workflows.
-- [ ] Move artifact report/screenshot delivery checks behind a dedicated artifact subagent.
+- [x] Move artifact report/screenshot delivery checks behind a dedicated artifact verifier subagent profile.
 - [x] Strengthen LangChain tool schemas with better descriptions and grouping from Nullion's registry.
 - [x] Add LangChain retry wrappers for transient Nullion-backed model failures.
 - [x] Add LangChain retry wrappers for transient Nullion tool invocation failures.
 - [x] Add scheduled-job Deep Agents profile for cron/reminder/monitor run-inspect-notify tasks.
-- [ ] Add LangChain fallback wrappers for fragile tool paths with multiple equivalent tools.
+- [x] Attach Deep Agents validation skill/subagent/golden-check descriptors to auto-skill proposals.
+- [x] Add LangChain fallback wrappers for fragile tool paths with multiple equivalent tools.
+- [x] Add delegated Deep Agents validation task builder for auto-skill golden checks.
+- [x] Capture Deep Agents thread IDs and structured resume tokens for approval/user-input pauses.
 - [ ] Replace remaining hand-rolled mini-agent planning in mission/task planner code where Deep Agents is a clear fit.

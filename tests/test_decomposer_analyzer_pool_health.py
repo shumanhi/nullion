@@ -295,6 +295,20 @@ def test_conversation_analyzer_filters_dedupes_and_caches() -> None:
     assert [proposal.title for proposal in proposals] == ["Deploy Checklist"]
     assert proposals[0].tags == ["ops", "deploy", "extra", "four"]
     assert proposals[0].to_skill_kwargs()["trigger"] == "deploy this"
+    validation = proposals[0].deep_agent_validation_snapshot()
+    assert validation["status"] == "ready"
+    assert validation["skill_source"] == "/skills/auto-skill/"
+    assert "/skills/auto-skill/deploy-checklist/SKILL.md" in validation["skill_files"]
+    assert validation["subagents"][0]["name"] == "auto_skill_validator"
+    assert validation["golden_workflows"][0]["prompt"] == "deploy this"
+    validation_task = proposals[0].deep_agent_validation_task(
+        group_id="g1",
+        conversation_id="c1",
+        principal_id="workspace:test",
+    )
+    assert validation_task.deep_agent_skills == ["/skills/auto-skill/"]
+    assert validation_task.deep_agent_subagents[0]["name"] == "auto_skill_validator"
+    assert "/skills/auto-skill/deploy-checklist/SKILL.md" in validation_task.deep_agent_skill_files
 
     cache_proposals("c1", proposals)
     assert get_cached_proposals("c1") == proposals

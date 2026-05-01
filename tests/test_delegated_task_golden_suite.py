@@ -190,6 +190,8 @@ async def test_golden_approval_workflow_returns_partial_result() -> None:
 
     assert result.status == "partial"
     assert result.output == "Approval required before this delegated task can continue. Approval ID: ap-1"
+    assert result.resume_token["reason"] == "approval_required"
+    assert result.resume_token["approval_id"] == "ap-1"
     assert any(update.kind == "approval_needed" and update.data["approval_id"] == "ap-1" for update in updates)
 
 
@@ -286,6 +288,11 @@ async def test_golden_inferred_subagents_are_forwarded(monkeypatch) -> None:
     assert result.status == "success"
     assert result.output == "profiled"
     assert captured["skills"] == ["/skills/nullion/"]
-    assert [agent["name"] for agent in captured["subagents"]] == ["research_agent", "artifact_agent"]
+    assert [agent["name"] for agent in captured["subagents"]] == [
+        "research_agent",
+        "artifact_agent",
+        "artifact_verifier_agent",
+    ]
     assert "/skills/nullion/research/SKILL.md" in payloads[0]["files"]
     assert "/skills/nullion/artifact/SKILL.md" in payloads[0]["files"]
+    assert "/skills/nullion/artifact-verifier/SKILL.md" in payloads[0]["files"]

@@ -74,6 +74,11 @@ class DeepAgentMiniAgentRunner:
                 task_id=task.task_id,
                 status="partial",
                 output=f"Waiting for user input: {exc.question}",
+                resume_token=_resume_token_for_pause(
+                    config,
+                    reason="user_input",
+                    payload={"question": exc.question, "options": exc.options},
+                ),
             )
         except asyncio.TimeoutError:
             logger.warning("DeepAgent mini-agent %s timed out after %.0fs", config.agent_id, config.timeout_s)
@@ -192,6 +197,11 @@ class DeepAgentMiniAgentRunner:
                 output=pending_approval["message"],
                 artifacts=artifacts,
                 context_out=output_text,
+                resume_token=_resume_token_for_pause(
+                    config,
+                    reason="approval_required",
+                    payload={"approval_id": pending_approval.get("approval_id")},
+                ),
             )
         return TaskResult(
             task_id=task.task_id,
@@ -318,7 +328,24 @@ def _deep_agent_graph_config(config) -> dict[str, Any]:
     budget = int(config.max_iterations) * (max(0, int(config.max_continuations)) + 1)
     return {
         "recursion_limit": max(25, budget * 3 + 8),
+        "configurable": {"thread_id": _deep_agent_thread_id(config)},
         "metadata": {"nullion_mini_agent_id": config.agent_id, "nullion_task_id": config.task.task_id},
+    }
+
+
+def _deep_agent_thread_id(config) -> str:
+    return f"nullion:{config.task.group_id}:{config.task.task_id}:{config.agent_id}"
+
+
+def _resume_token_for_pause(config, *, reason: str, payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "backend": "deepagents",
+        "reason": reason,
+        "thread_id": _deep_agent_thread_id(config),
+        "agent_id": config.agent_id,
+        "task_id": config.task.task_id,
+        "group_id": config.task.group_id,
+        **{key: value for key, value in payload.items() if value is not None},
     }
 
 

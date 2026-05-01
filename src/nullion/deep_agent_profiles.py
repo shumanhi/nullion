@@ -22,6 +22,11 @@ _PROFILE_DEFINITIONS: dict[str, dict[str, str]] = {
         "description": "Create or update files, reports, screenshots, or other deliverable artifacts.",
         "system_prompt": "Use artifact-producing tools for deliverables and verify created paths before claiming completion.",
     },
+    "artifact_verifier": {
+        "name": "artifact_verifier_agent",
+        "description": "Verify reports, screenshots, and other artifact delivery evidence before final user-visible claims.",
+        "system_prompt": "Check that artifact paths, expected formats, and delivery evidence are present before reporting success.",
+    },
     "browser": {
         "name": "browser_agent",
         "description": "Navigate, inspect, screenshot, or test browser-based workflows.",
@@ -65,6 +70,7 @@ def deep_agent_profile_names_for_task(task: Any) -> list[str]:
         profiles.append("browser")
     if tools & {"file_write", "render", "image_generate"} or any(word in text for word in ("artifact", "report", "write file", "screenshot")):
         profiles.append("artifact")
+        profiles.append("artifact_verifier")
     if any(word in text for word in ("doctor", "health", "recover", "restart service", "approval")):
         profiles.append("doctor")
     if any(word in text for word in ("migrate", "migration", "refactor", "replace old code", "dependency")):

@@ -56,6 +56,7 @@ def nullion_tools_as_langchain_tools(
         StructuredTool.from_function(
             coroutine=_make_langchain_tool_coroutine(
                 name=str(tool_def.get("name")),
+                fallback_tools=[str(tool) for tool in (tool_def.get("fallback_tools") or []) if isinstance(tool, str)],
                 principal_id=principal_id,
                 cleanup_scope=cleanup_scope,
                 tool_registry=tool_registry,
@@ -169,6 +170,7 @@ def _normalized_input_schema(tool_definition: dict[str, Any]) -> dict[str, Any]:
 def _make_langchain_tool_coroutine(
     *,
     name: str,
+    fallback_tools: list[str],
     principal_id: str,
     cleanup_scope: str,
     tool_registry: Any,
@@ -188,8 +190,28 @@ def _make_langchain_tool_coroutine(
             tool_registry=tool_registry,
             policy_store=policy_store,
         )
+        emitted_results = [result]
+        if _result_allows_fallback(result):
+            for fallback_name in fallback_tools:
+                fallback_invocation = ToolInvocation(
+                    invocation_id=f"lc-{uuid4().hex[:12]}",
+                    tool_name=fallback_name,
+                    principal_id=principal_id,
+                    arguments=dict(kwargs),
+                    capsule_id=cleanup_scope,
+                )
+                fallback_result = _invoke_nullion_tool(
+                    fallback_invocation,
+                    tool_registry=tool_registry,
+                    policy_store=policy_store,
+                )
+                emitted_results.append(fallback_result)
+                if not _result_allows_fallback(fallback_result):
+                    result = fallback_result
+                    break
         if tool_result_callback is not None:
-            tool_result_callback(result)
+            for emitted_result in emitted_results:
+                tool_result_callback(emitted_result)
         return _tool_result_text(result)
 
     _run_nullion_tool.__name__ = f"nullion_{name}"
@@ -232,6 +254,13 @@ def _tool_retry_attempts() -> int:
         return max(1, int(raw))
     except ValueError:
         return 2
+
+
+def _result_allows_fallback(result: ToolResult) -> bool:
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("reason") == "approval_required" or output.get("requires_approval"):
+        return False
+    return str(result.status).lower() in {"failed", "failure", "error"} or bool(result.error)
 
 
 def _tool_result_text(result: ToolResult) -> str:

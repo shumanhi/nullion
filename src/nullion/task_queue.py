@@ -53,6 +53,7 @@ class TaskResult:
     artifacts: list[str] = field(default_factory=list)   # file paths produced
     error: str | None = None
     context_out: object = None                            # published to context bus
+    resume_token: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
