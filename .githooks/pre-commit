@@ -21,6 +21,21 @@ else
     python_cmd="python"
 fi
 
+app_root="$(git rev-parse --show-toplevel)"
+test_repo="${NULLION_TEST_REPO:-"$(dirname "$app_root")/nullion-test"}"
+test_path="$test_repo/tests"
+
+if [ "${NULLION_SKIP_PRIVATE_TESTS:-}" = "1" ]; then
+    echo "Skipping private test repo because NULLION_SKIP_PRIVATE_TESTS=1."
+    exit 0
+fi
+
+if [ ! -d "$test_path" ]; then
+    echo "Private test repo not found at: $test_repo" >&2
+    echo "Set NULLION_TEST_REPO to the private nullion-test checkout, or clone shumanhi/nullion-test next to this repo." >&2
+    exit 1
+fi
+
 coverage_file="$(mktemp "${TMPDIR:-/tmp}/nullion-coverage.XXXXXX")"
 export COVERAGE_FILE="$coverage_file"
 cleanup_coverage() {
@@ -28,8 +43,9 @@ cleanup_coverage() {
 }
 trap cleanup_coverage EXIT
 
-echo "Running test suite before commit with coverage; overall coverage must be at least 70%..."
+echo "Running private test suite before commit with coverage; overall coverage must be at least 70%..."
 unset $git_local_env
+export NULLION_APP_REPO="$app_root"
 "$python_cmd" -m coverage erase
-"$python_cmd" -m coverage run --source=src/nullion -m pytest -q
+"$python_cmd" -m coverage run --source=src/nullion -m pytest -q "$test_path"
 "$python_cmd" -m coverage report --fail-under=70
