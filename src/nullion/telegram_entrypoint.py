@@ -354,9 +354,23 @@ def _build_runtime_service_from_settings(
     }
     active_tool_registry = create_plugin_tool_registry(**filtered_factory_kwargs)
     provider_bindings = _validate_plugin_bootstrap_settings(settings)
+    enabled_plugins = list(dict.fromkeys(settings.enabled_plugins))
+    try:
+        from nullion.connections import infer_email_plugin_provider
+
+        inferred_email_provider = infer_email_plugin_provider()
+    except Exception:
+        inferred_email_provider = None
+    if (
+        inferred_email_provider
+        and "email_plugin" not in enabled_plugins
+        and "email_plugin" not in provider_bindings
+    ):
+        enabled_plugins.append("email_plugin")
+        provider_bindings["email_plugin"] = inferred_email_provider
     _register_enabled_plugins(
         registry=active_tool_registry,
-        enabled_plugins=tuple(settings.enabled_plugins),
+        enabled_plugins=tuple(enabled_plugins),
         provider_bindings=provider_bindings,
         settings=settings,
         workspace_plugin_default_root=_REPO_ROOT,

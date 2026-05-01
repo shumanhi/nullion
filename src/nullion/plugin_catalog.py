@@ -154,8 +154,8 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
             PluginProviderCatalogEntry(
                 provider_id="imap_smtp_provider",
                 name="IMAP / SMTP",
-                status="planned",
-                notes="Planned standards-based provider adapter.",
+                status="preview",
+                notes="Standards-based provider adapter for email_search and email_read.",
             ),
             PluginProviderCatalogEntry(
                 provider_id="custom_api_provider",
@@ -167,7 +167,7 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
                 ),
             ),
         ),
-        setup_hint="Enable email_plugin and bind it to google_workspace_provider or custom_api_provider.",
+        setup_hint="Enable email_plugin and bind it to google_workspace_provider, imap_smtp_provider, or custom_api_provider.",
     ),
     PluginCatalogEntry(
         plugin_id="calendar_plugin",

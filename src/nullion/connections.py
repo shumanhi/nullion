@@ -14,6 +14,13 @@ from nullion.users import load_user_registry, resolve_messaging_user
 
 _CONNECTIONS_PATH = Path.home() / ".nullion" / "connections.json"
 _ADMIN_WORKSPACE_ID = "workspace_admin"
+_NATIVE_EMAIL_PROVIDER_IDS = frozenset(
+    {
+        "google_workspace_provider",
+        "custom_api_provider",
+        "imap_smtp_provider",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -312,12 +319,30 @@ def format_workspace_connections_for_prompt(*, principal_id: str | None = None) 
     return "\n".join(lines)
 
 
+def infer_email_plugin_provider(*, principal_id: str | None = None, path: Path | str | None = None) -> str | None:
+    """Return the active native email provider implied by saved connections."""
+    registry = load_connection_registry(path=path)
+    active = [connection for connection in registry.connections if connection.active]
+    if principal_id is not None:
+        workspace_id = workspace_id_for_principal(principal_id)
+        active = [
+            connection
+            for connection in active
+            if connection.workspace_id in {workspace_id, _ADMIN_WORKSPACE_ID}
+        ]
+    for connection in active:
+        if connection.provider_id in _NATIVE_EMAIL_PROVIDER_IDS:
+            return connection.provider_id
+    return None
+
+
 __all__ = [
     "ConnectionRegistry",
     "ProviderConnection",
     "connection_for_principal",
     "connection_for_workspace",
     "format_workspace_connections_for_prompt",
+    "infer_email_plugin_provider",
     "load_connection_registry",
     "multi_user_connections_active",
     "require_workspace_connection_for_principal",

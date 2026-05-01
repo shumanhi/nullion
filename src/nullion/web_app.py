@@ -15342,6 +15342,7 @@ def create_app(runtime, orchestrator, registry):
                 for raw_connection in raw_connections
                 if isinstance(raw_connection, dict)
             )
+            native_email_provider: str | None = None
             if isinstance(raw_connections, list):
                 for raw_connection in raw_connections:
                     if not isinstance(raw_connection, dict):
@@ -15369,6 +15370,12 @@ def create_app(runtime, orchestrator, registry):
                             env_updates[env_name] = env_value
                     credential_scope = str(raw_connection.get("credential_scope") or "").strip().lower()
                     provider_id = str(raw_connection.get("provider_id") or "").strip()
+                    if (
+                        bool(raw_connection.get("active", True))
+                        and provider_id in {"google_workspace_provider", "custom_api_provider", "imap_smtp_provider"}
+                        and native_email_provider is None
+                    ):
+                        native_email_provider = provider_id
                     provider_policy = auth_provider_policies.get(provider_id)
                     if credential_scope in {"shared", "global", "admin_shared", "all_workspaces"}:
                         if provider_policy is not None and provider_policy.get("shared_allowed") is False:
@@ -15399,6 +15406,27 @@ def create_app(runtime, orchestrator, registry):
                     env_updates[credential_name] = credential_value
             if has_connector_connection:
                 env_updates["NULLION_CONNECTOR_ACCESS_ENABLED"] = "true"
+            if native_email_provider:
+                plugins = [
+                    item.strip()
+                    for item in os.environ.get("NULLION_ENABLED_PLUGINS", "").split(",")
+                    if item.strip()
+                ]
+                if "email_plugin" not in plugins:
+                    plugins.append("email_plugin")
+                    env_updates["NULLION_ENABLED_PLUGINS"] = ",".join(plugins)
+                    os.environ["NULLION_ENABLED_PLUGINS"] = env_updates["NULLION_ENABLED_PLUGINS"]
+                bindings: dict[str, str] = {}
+                for part in os.environ.get("NULLION_PROVIDER_BINDINGS", "").split(","):
+                    plugin, sep, provider_name = part.strip().partition("=")
+                    if sep and plugin.strip() and provider_name.strip():
+                        bindings[plugin.strip()] = provider_name.strip()
+                if not bindings.get("email_plugin"):
+                    bindings["email_plugin"] = native_email_provider
+                    env_updates["NULLION_PROVIDER_BINDINGS"] = ",".join(
+                        f"{plugin}={provider_name}" for plugin, provider_name in bindings.items()
+                    )
+                    os.environ["NULLION_PROVIDER_BINDINGS"] = env_updates["NULLION_PROVIDER_BINDINGS"]
             if env_updates:
                 env_path = _find_env_path()
                 _write_env_updates(env_path, env_updates)
@@ -15412,6 +15440,20 @@ def create_app(runtime, orchestrator, registry):
                     register_connector_plugin(registry)
                 except Exception:
                     logger.debug("Could not hot-register connector plugin after connection save", exc_info=True)
+            if native_email_provider:
+                try:
+                    from nullion.providers import resolve_plugin_provider_kwargs
+                    from nullion.tools import register_email_plugin
+
+                    register_email_plugin(
+                        registry,
+                        **resolve_plugin_provider_kwargs(
+                            plugin_name="email_plugin",
+                            provider_name=native_email_provider,
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Could not hot-register email plugin after connection save", exc_info=True)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
         return JSONResponse({"ok": True, "registry": connection_registry.to_dict()})
@@ -17721,13 +17763,27 @@ def _build_runtime():
     # same provider-backed tools.
     try:
         bindings = {binding.capability: binding.provider for binding in app_settings.provider_bindings}
+        try:
+            from nullion.connections import infer_email_plugin_provider
+
+            inferred_email_provider = infer_email_plugin_provider()
+        except Exception:
+            inferred_email_provider = None
+        enabled_plugins = list(dict.fromkeys(app_settings.enabled_plugins))
+        if (
+            inferred_email_provider
+            and "email_plugin" not in enabled_plugins
+            and "email_plugin" not in bindings
+        ):
+            enabled_plugins.append("email_plugin")
+            bindings["email_plugin"] = inferred_email_provider
         plugin_registrars = {
             "search_plugin": register_search_plugin,
             "email_plugin": register_email_plugin,
             "calendar_plugin": register_calendar_plugin,
             "media_plugin": register_media_plugin,
         }
-        for plugin_name in dict.fromkeys(app_settings.enabled_plugins):
+        for plugin_name in enabled_plugins:
             if plugin_name in {"browser", "browser_plugin", "workspace_plugin"}:
                 continue
             registrar = plugin_registrars.get(plugin_name)

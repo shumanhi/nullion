@@ -350,8 +350,43 @@ def test_provider_commands_custom_api_and_resolution(monkeypatch, tmp_path) -> N
     assert providers._custom_api_email_search("hello", 30, principal_id="p") == [{"id": 1}]
     assert providers._custom_api_email_read("m/id", principal_id="p") == {"id": "m"}
 
+    class FakeImap:
+        def __init__(self, host, port):
+            self.host = host
+            self.port = port
+            self.logged_out = False
+
+        def login(self, username, password):
+            assert (username, password) == ("agent@example.com", "pw")
+
+        def select(self, mailbox, readonly=True):
+            assert mailbox == "INBOX"
+            assert readonly is True
+            return "OK", [b"1"]
+
+        def uid(self, command, *args):
+            if command == "SEARCH":
+                return "OK", [b"42"]
+            if command == "FETCH" and args[0] == "42" and args[1] == "(BODY.PEEK[HEADER])":
+                return "OK", [(b"42", b"Subject: Hello\r\nFrom: Ada <ada@example.com>\r\nTo: Agent <agent@example.com>\r\nDate: Thu, 30 Apr 2026 10:00:00 -0400\r\n\r\n")]
+            if command == "FETCH" and args[0] == "42" and args[1] == "(RFC822)":
+                return "OK", [(b"42", b"Subject: Hello\r\nFrom: Ada <ada@example.com>\r\nTo: Agent <agent@example.com>\r\n\r\nBody text")]
+            raise AssertionError((command, args))
+
+        def logout(self):
+            self.logged_out = True
+
+    monkeypatch.setattr(providers, "_imap_smtp_connection", lambda principal_id: SimpleNamespace(credential_ref="AGENT"))
+    monkeypatch.setattr(providers.imaplib, "IMAP4_SSL", FakeImap)
+    monkeypatch.setenv("NULLION_IMAP_AGENT_HOST", "imap.example.com")
+    monkeypatch.setenv("NULLION_IMAP_AGENT_USERNAME", "agent@example.com")
+    monkeypatch.setenv("NULLION_IMAP_AGENT_PASSWORD", "pw")
+    assert providers._imap_smtp_email_search("hello", 5, principal_id="p")[0]["id"] == "42"
+    assert providers._imap_smtp_email_read("42", principal_id="p")["body"] == "Body text"
+
     assert "web_searcher" in providers.resolve_plugin_provider_kwargs(plugin_name="search_plugin", provider_name="builtin_search_provider")
     assert "email_reader" in providers.resolve_plugin_provider_kwargs(plugin_name="email_plugin", provider_name="custom_api_provider")
+    assert "email_reader" in providers.resolve_plugin_provider_kwargs(plugin_name="email_plugin", provider_name="imap_smtp_provider")
     assert "calendar_lister" in providers.resolve_plugin_provider_kwargs(plugin_name="calendar_plugin", provider_name="google_workspace_provider")
     assert "image_generator" in providers.resolve_plugin_provider_kwargs(plugin_name="media_plugin", provider_name="local_media_provider")
     with pytest.raises(ValueError):

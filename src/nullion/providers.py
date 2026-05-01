@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import base64
+import email
+from email import policy
+import imaplib
 import inspect
 import mimetypes
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -1225,6 +1229,189 @@ def _custom_api_email_read(
     return message
 
 
+def _env_key_from_reference(value: object, *, default: str = "ACCOUNT") -> str:
+    text = re.sub(r"[^A-Z0-9_]+", "_", str(value or "").strip().upper()).strip("_")
+    return text or default
+
+
+def _imap_smtp_connection(principal_id: str | None):
+    from nullion.connections import require_workspace_connection_for_principal
+
+    return require_workspace_connection_for_principal(principal_id, "imap_smtp_provider")
+
+
+def _imap_env_prefix(connection: object | None) -> str:
+    ref = getattr(connection, "credential_ref", None) or getattr(connection, "provider_profile", None)
+    return f"NULLION_IMAP_{_env_key_from_reference(ref)}"
+
+
+def _imap_required_env(prefix: str, name: str) -> str:
+    env_name = f"{prefix}_{name}"
+    value = os.environ.get(env_name, "").strip()
+    if not value:
+        raise RuntimeError(f"imap_smtp_provider requires {env_name}")
+    return value
+
+
+def _imap_connect(connection: object | None) -> imaplib.IMAP4:
+    prefix = _imap_env_prefix(connection)
+    host = _imap_required_env(prefix, "HOST")
+    username = _imap_required_env(prefix, "USERNAME")
+    password = _imap_required_env(prefix, "PASSWORD")
+    raw_port = os.environ.get(f"{prefix}_PORT", "").strip()
+    port = int(raw_port) if raw_port else 993
+    use_ssl = os.environ.get(f"{prefix}_SSL", "true").strip().lower() not in {"0", "false", "no", "off"}
+    client: imaplib.IMAP4
+    if use_ssl:
+        client = imaplib.IMAP4_SSL(host, port)
+    else:
+        client = imaplib.IMAP4(host, port)
+    client.login(username, password)
+    return client
+
+
+def _imap_select_mailbox(client: imaplib.IMAP4, connection: object | None, *, readonly: bool = True) -> None:
+    prefix = _imap_env_prefix(connection)
+    mailbox = os.environ.get(f"{prefix}_MAILBOX", "INBOX").strip() or "INBOX"
+    status, _ = client.select(mailbox, readonly=readonly)
+    if status != "OK":
+        raise RuntimeError(f"imap_smtp_provider could not select mailbox {mailbox}")
+
+
+def _message_addresses(message: email.message.EmailMessage, header_name: str) -> str:
+    value = message.get(header_name, "")
+    return str(value or "")
+
+
+def _message_body(message: email.message.EmailMessage) -> str:
+    if message.is_multipart():
+        html_fallback = ""
+        for part in message.walk():
+            content_disposition = str(part.get("Content-Disposition", "")).lower()
+            if "attachment" in content_disposition:
+                continue
+            content_type = part.get_content_type()
+            if content_type == "text/plain":
+                try:
+                    return str(part.get_content()).strip()
+                except Exception:
+                    payload = part.get_payload(decode=True) or b""
+                    return payload.decode(part.get_content_charset() or "utf-8", errors="replace").strip()
+            if content_type == "text/html" and not html_fallback:
+                try:
+                    html_fallback = str(part.get_content()).strip()
+                except Exception:
+                    payload = part.get_payload(decode=True) or b""
+                    html_fallback = payload.decode(part.get_content_charset() or "utf-8", errors="replace").strip()
+        return html_fallback
+    try:
+        return str(message.get_content()).strip()
+    except Exception:
+        payload = message.get_payload(decode=True) or b""
+        return payload.decode(message.get_content_charset() or "utf-8", errors="replace").strip()
+
+
+def _message_to_summary(message_id: str, message: email.message.EmailMessage) -> dict[str, object]:
+    return {
+        "id": message_id,
+        "subject": str(message.get("Subject", "")),
+        "from": _message_addresses(message, "From"),
+        "to": _message_addresses(message, "To"),
+        "date": str(message.get("Date", "")),
+    }
+
+
+def _message_to_detail(message_id: str, message: email.message.EmailMessage) -> dict[str, object]:
+    attachments: list[dict[str, object]] = []
+    if message.is_multipart():
+        for part in message.walk():
+            filename = part.get_filename()
+            if filename:
+                attachments.append(
+                    {
+                        "filename": filename,
+                        "content_type": part.get_content_type(),
+                    }
+                )
+    detail = _message_to_summary(message_id, message)
+    detail.update(
+        {
+            "cc": _message_addresses(message, "Cc"),
+            "body": _message_body(message),
+            "attachments": attachments,
+        }
+    )
+    return detail
+
+
+def _imap_fetch_message(client: imaplib.IMAP4, message_id: str, fetch_spec: str) -> email.message.EmailMessage:
+    status, data = client.uid("FETCH", message_id, fetch_spec)
+    if status != "OK":
+        raise RuntimeError(f"imap_smtp_provider could not fetch message {message_id}")
+    for item in data:
+        if isinstance(item, tuple) and isinstance(item[1], (bytes, bytearray)):
+            return email.message_from_bytes(bytes(item[1]), policy=policy.default)
+    raise RuntimeError(f"imap_smtp_provider returned empty message {message_id}")
+
+
+def _imap_search_ids(client: imaplib.IMAP4, query: str) -> list[str]:
+    attempts = (
+        ("SEARCH", "CHARSET", "UTF-8", "TEXT", query),
+        ("SEARCH", "TEXT", query),
+        ("SEARCH", "ALL"),
+    )
+    for args in attempts:
+        status, data = client.uid(*args)
+        if status == "OK":
+            raw_ids = data[0] if data else b""
+            if isinstance(raw_ids, bytes):
+                return [item.decode("ascii", errors="ignore") for item in raw_ids.split() if item]
+            if isinstance(raw_ids, str):
+                return [item for item in raw_ids.split() if item]
+    raise RuntimeError("imap_smtp_provider email search failed")
+
+
+def _imap_smtp_email_search(
+    query: str,
+    limit: int,
+    *,
+    principal_id: str | None = None,
+) -> list[dict[str, object]]:
+    connection = _imap_smtp_connection(principal_id)
+    client = _imap_connect(connection)
+    try:
+        _imap_select_mailbox(client, connection, readonly=True)
+        message_ids = list(reversed(_imap_search_ids(client, query)))[: _clamped_limit(limit)]
+        results: list[dict[str, object]] = []
+        for message_id in message_ids:
+            message = _imap_fetch_message(client, message_id, "(BODY.PEEK[HEADER])")
+            results.append(_message_to_summary(message_id, message))
+        return results
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
+def _imap_smtp_email_read(
+    message_id: str,
+    *,
+    principal_id: str | None = None,
+) -> dict[str, object]:
+    connection = _imap_smtp_connection(principal_id)
+    client = _imap_connect(connection)
+    try:
+        _imap_select_mailbox(client, connection, readonly=True)
+        message = _imap_fetch_message(client, message_id, "(RFC822)")
+        return _message_to_detail(message_id, message)
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
 
 def resolve_plugin_provider_kwargs(*, plugin_name: str, provider_name: str) -> dict[str, object]:
     if plugin_name == "search_plugin":
@@ -1264,6 +1451,11 @@ def resolve_plugin_provider_kwargs(*, plugin_name: str, provider_name: str) -> d
             return {
                 "email_searcher": _custom_api_email_search,
                 "email_reader": _custom_api_email_read,
+            }
+        if provider_name == "imap_smtp_provider":
+            return {
+                "email_searcher": _imap_smtp_email_search,
+                "email_reader": _imap_smtp_email_read,
             }
         raise ValueError(f"unknown provider binding for email_plugin: {provider_name}")
     if plugin_name == "calendar_plugin":

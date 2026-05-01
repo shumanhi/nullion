@@ -182,6 +182,23 @@ def test_connections_registry_env_inference_principal_resolution_and_prompt(tmp_
     configured = connections.load_connection_registry(path=connector_path)
     assert configured.connections[0].provider_id == "skill_pack_connector_acme_shipments"
 
+    imap_path = tmp_path / "imap-connections.json"
+    connections.save_connection_registry(
+        {
+            "connections": [
+                {
+                    "workspace_id": "workspace_admin",
+                    "provider_id": "imap_smtp_provider",
+                    "display_name": "Agent email",
+                    "provider_profile": "AGENT",
+                    "credential_ref": "AGENT",
+                }
+            ]
+        },
+        path=imap_path,
+    )
+    assert connections.infer_email_plugin_provider(path=imap_path) == "imap_smtp_provider"
+
     monkeypatch.setattr(
         connections,
         "load_user_registry",
