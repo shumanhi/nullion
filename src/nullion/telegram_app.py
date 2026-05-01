@@ -1602,7 +1602,7 @@ async def _send_callback_follow_up(
     reply: str,
     *,
     principal_id: str | None = None,
-    allow_attachments: bool = True,
+    allow_attachments: bool | None = None,
 ) -> None:
     visible_reply = strip_tool_approval_marker(reply)
     delivery = prepare_reply_for_platform_delivery(
