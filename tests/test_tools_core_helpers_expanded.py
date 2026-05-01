@@ -578,6 +578,22 @@ def test_pdf_create_and_edit_handlers_are_local_artifact_tools(tmp_path) -> None
     assert created_path.read_bytes().startswith(b"%PDF")
     assert len(PdfReader(str(created_path)).pages) == 2
 
+    text_created_path = tmp_path / "single-text.pdf"
+    text_created = create_handler(
+        ToolInvocation(
+            "inv",
+            "pdf_create",
+            "operator",
+            {
+                "output_path": str(text_created_path),
+                "text_pages": "A single text page should be accepted.",
+                "title": "Text",
+            },
+        )
+    )
+    assert text_created.status == "completed"
+    assert text_created.output["page_count"] == 1
+
     edit_handler = _build_pdf_edit_handler(workspace_root=tmp_path, include_principal_workspace=False)
     edited_path = tmp_path / "edited.pdf"
     edited = edit_handler(

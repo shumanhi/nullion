@@ -227,6 +227,7 @@ _TELEGRAM_ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
 _TELEGRAM_MESSAGE_CHUNK_SIZE = 3900
 _TELEGRAM_BOT_TOKEN_PATTERN = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{20,}$")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_ACTIVE_TASK_STATUS_PREFIXES = ("☐", "◐", "▣", "▤")
 
 
 def _attachments_include_video(attachments: list[dict[str, str]] | None) -> bool:
@@ -1367,6 +1368,63 @@ async def _send_or_edit_telegram_status_message(
         status_texts[key] = text
 
 
+async def _send_or_edit_telegram_task_status_message(
+    bot,
+    status_messages: dict[tuple[str, str], int],
+    *,
+    chat_id: str,
+    group_id: str,
+    text: str,
+    runtime: PersistentRuntime,
+    bot_token: str,
+    status_texts: dict[tuple[str, str], str] | None = None,
+    status_locks: dict[tuple[str, str], asyncio.Lock] | None = None,
+    typing_tasks: dict[tuple[str, str], asyncio.Task[None]] | None = None,
+) -> None:
+    key = (chat_id, group_id)
+    has_active_work = _telegram_task_status_has_active_work(text)
+    if has_active_work and typing_tasks is not None:
+        existing = typing_tasks.get(key)
+        if existing is None or existing.done():
+            typing_tasks[key] = asyncio.create_task(
+                _run_telegram_chat_typing_keepalive(
+                    bot_token,
+                    chat_id=chat_id,
+                    runtime=runtime,
+                    text=text,
+                )
+            )
+
+    await _send_or_edit_telegram_status_message(
+        bot,
+        status_messages,
+        chat_id=chat_id,
+        group_id=group_id,
+        text=text,
+        status_texts=status_texts,
+        status_locks=status_locks,
+    )
+
+    if has_active_work:
+        try:
+            await _send_telegram_chat_typing_indicator_by_token(
+                bot_token,
+                chat_id=chat_id,
+                runtime=runtime,
+                text=text,
+            )
+        except Exception:
+            logger.debug("Telegram task status typing refresh failed", exc_info=True)
+        return
+
+    if typing_tasks is not None:
+        await _stop_typing_keepalive(typing_tasks.pop(key, None))
+
+
+def _telegram_task_status_has_active_work(text: str) -> bool:
+    return any(line.strip().startswith(_ACTIVE_TASK_STATUS_PREFIXES) for line in str(text or "").splitlines())
+
+
 async def _send_operator_telegram_message(
     bot_token: str,
     chat_id: str,
@@ -1410,8 +1468,16 @@ def _activity_icon(status: str) -> str:
 
 
 class _TelegramActivityStreamer:
-    def __init__(self, message) -> None:
+    def __init__(
+        self,
+        message,
+        *,
+        runtime: PersistentRuntime | None = None,
+        typing_text: str | None = None,
+    ) -> None:
         self._message = message
+        self._runtime = runtime
+        self._typing_text = typing_text
         self._status_message = None
         self._events: dict[str, dict[str, str]] = {}
         self._loop = asyncio.get_running_loop()
@@ -1451,14 +1517,24 @@ class _TelegramActivityStreamer:
                 if reply_text is None:
                     return
                 self._status_message = await reply_text(formatted, do_quote=False, **kwargs)
+                await self._refresh_typing_after_status_update()
                 return
             edit_text = getattr(self._status_message, "edit_text", None)
             if edit_text is None:
                 return
             try:
                 await edit_text(formatted, **kwargs)
+                await self._refresh_typing_after_status_update()
             except Exception:
                 logger.debug("Telegram activity message edit failed", exc_info=True)
+
+    async def _refresh_typing_after_status_update(self) -> None:
+        if self._runtime is None:
+            return
+        try:
+            await _send_typing_indicator(self._message, runtime=self._runtime, text=self._typing_text)
+        except Exception:
+            logger.debug("Telegram typing refresh after activity update failed", exc_info=True)
 
     @staticmethod
     def _detail_is_activity_sublist(detail: str) -> bool:
@@ -1701,6 +1777,53 @@ async def _send_typing_indicator(message, *, runtime: PersistentRuntime, text: s
         raise
 
 
+async def _send_telegram_chat_typing_indicator(
+    bot,
+    *,
+    chat_id: str,
+    runtime: PersistentRuntime,
+    text: str | None,
+) -> None:
+    if bot is None or not chat_id:
+        return
+    send_chat_action = getattr(bot, "send_chat_action", None)
+    if send_chat_action is None:
+        return
+    try:
+        result = send_chat_action(chat_id=chat_id, action="typing")
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        _report_runner_health_issue(
+            runtime,
+            issue_type=HealthIssueType.ERROR,
+            message="Telegram typing indicator failed.",
+            chat_id=chat_id,
+            text=text,
+            stage="typing_indicator",
+            detail="Failed to send Telegram typing indicator.",
+        )
+        raise
+
+
+async def _send_telegram_chat_typing_indicator_by_token(
+    bot_token: str,
+    *,
+    chat_id: str,
+    runtime: PersistentRuntime,
+    text: str | None,
+) -> None:
+    if not bot_token or not chat_id:
+        return
+    try:
+        from telegram import Bot  # type: ignore[import]
+    except Exception:
+        logger.debug("Telegram typing indicator skipped because python-telegram-bot is unavailable", exc_info=True)
+        return
+    async with Bot(bot_token) as bot:
+        await _send_telegram_chat_typing_indicator(bot, chat_id=chat_id, runtime=runtime, text=text)
+
+
 async def _run_typing_keepalive(message, *, runtime: PersistentRuntime, text: str | None) -> None:
     try:
         while True:
@@ -1710,6 +1833,28 @@ async def _run_typing_keepalive(message, *, runtime: PersistentRuntime, text: st
         raise
     except Exception:
         logger.debug("Stopped Telegram typing keepalive after send failure.", exc_info=True)
+
+
+async def _run_telegram_chat_typing_keepalive(
+    bot_token: str,
+    *,
+    chat_id: str,
+    runtime: PersistentRuntime,
+    text: str | None,
+) -> None:
+    try:
+        while True:
+            await _send_telegram_chat_typing_indicator_by_token(
+                bot_token,
+                chat_id=chat_id,
+                runtime=runtime,
+                text=text,
+            )
+            await asyncio.sleep(_TYPING_KEEPALIVE_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Stopped Telegram chat typing keepalive after send failure.", exc_info=True)
 
 
 async def _stop_typing_keepalive(task: asyncio.Task[None] | None) -> None:
@@ -2398,7 +2543,11 @@ class ChatOperatorService:
                 or text_for_ack.strip().lower().startswith("/chat ")
             )
         )
-        activity_streamer = _TelegramActivityStreamer(message) if should_live_stream_activity else None
+        activity_streamer = (
+            _TelegramActivityStreamer(message, runtime=self.runtime, typing_text=text_for_ack)
+            if should_live_stream_activity
+            else None
+        )
 
         reply = None
         decision_card = None
@@ -2885,6 +3034,7 @@ class ChatOperatorService:
             _status_messages: dict[tuple[str, str], int] = {}
             _status_texts: dict[tuple[str, str], str] = {}
             _status_locks: dict[tuple[str, str], _asyncio.Lock] = {}
+            _status_typing_tasks: dict[tuple[str, str], _asyncio.Task[None]] = {}
 
             def _telegram_deliver_fn(conversation_id: str, text: str, **kwargs) -> bool:
                 """Route aggregator output back to the originating Telegram chat."""
@@ -2908,14 +3058,17 @@ class ChatOperatorService:
                     try:
                         loop = _asyncio.get_running_loop()
                         loop.create_task(
-                            _send_or_edit_telegram_status_message(
+                            _send_or_edit_telegram_task_status_message(
                                 _bot_token,
                                 _status_messages,
                                 chat_id=chat_id,
                                 group_id=group_id,
                                 text=text,
+                                runtime=_service_ref.runtime,
+                                bot_token=_bot_token,
                                 status_texts=_status_texts,
                                 status_locks=_status_locks,
+                                typing_tasks=_status_typing_tasks,
                             )
                         )
                         return True

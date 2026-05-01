@@ -2474,6 +2474,9 @@ def _safe_pdf_stem(title: str) -> str:
 def _coerce_string_list(value: object, *, field: str) -> tuple[list[str], str | None]:
     if value is None:
         return [], None
+    if isinstance(value, str):
+        text = value.strip()
+        return ([text] if text else []), None
     if not isinstance(value, list):
         return [], f"{field} must be a list of strings"
     items = [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()]

@@ -140,6 +140,86 @@ async def test_telegram_planner_status_reuses_editable_message() -> None:
     assert "☑ Find data" in bot.edited[0][2]
 
 
+@pytest.mark.asyncio
+async def test_telegram_task_status_typing_keepalive_runs_until_terminal(tmp_path, monkeypatch) -> None:
+    from nullion.runtime import bootstrap_persistent_runtime
+    from nullion.telegram_app import (
+        _send_or_edit_telegram_task_status_message,
+        _telegram_task_status_has_active_work,
+    )
+
+    runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    started: list[tuple[str, str]] = []
+    refreshed: list[str] = []
+    cancelled: list[str] = []
+
+    async def fake_keepalive(bot_token, *, chat_id, runtime, text):
+        del runtime
+        started.append((bot_token, chat_id))
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(chat_id)
+            raise
+
+    async def fake_refresh(bot_token, *, chat_id, runtime, text):
+        del bot_token, runtime, text
+        refreshed.append(chat_id)
+
+    monkeypatch.setattr("nullion.telegram_app._run_telegram_chat_typing_keepalive", fake_keepalive)
+    monkeypatch.setattr("nullion.telegram_app._send_telegram_chat_typing_indicator_by_token", fake_refresh)
+
+    class Bot:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, str, dict]] = []
+            self.edited: list[dict] = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.sent.append((chat_id, text, kwargs))
+            return SimpleNamespace(message_id=42)
+
+        def edit_message_text(self, **kwargs):
+            self.edited.append(kwargs)
+            return SimpleNamespace(message_id=kwargs["message_id"])
+
+    bot = Bot()
+    status_messages: dict[tuple[str, str], int] = {}
+    typing_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+
+    active_text = "→ Working on 1 task:\n  ◐ Find data"
+    done_text = "→ Working on 1 task:\n  ☑ Find data"
+    assert _telegram_task_status_has_active_work(active_text)
+    assert not _telegram_task_status_has_active_work(done_text)
+
+    await _send_or_edit_telegram_task_status_message(
+        bot,
+        status_messages,
+        chat_id="123",
+        group_id="grp-1",
+        text=active_text,
+        runtime=runtime,
+        bot_token="token",
+        typing_tasks=typing_tasks,
+    )
+    await asyncio.sleep(0)
+    assert started == [("token", "123")]
+    assert refreshed == ["123"]
+    assert not typing_tasks[("123", "grp-1")].done()
+
+    await _send_or_edit_telegram_task_status_message(
+        bot,
+        status_messages,
+        chat_id="123",
+        group_id="grp-1",
+        text=done_text,
+        runtime=runtime,
+        bot_token="token",
+        typing_tasks=typing_tasks,
+    )
+    assert ("123", "grp-1") not in typing_tasks
+    assert cancelled == ["123"]
+
+
 def test_telegram_suppresses_planner_ack_when_status_streaming_enabled(tmp_path) -> None:
     from nullion.runtime import bootstrap_persistent_runtime
     from nullion.telegram_app import _should_suppress_planner_status_ack
