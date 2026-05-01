@@ -139,17 +139,23 @@ async def test_golden_repo_analysis_reads_files_before_answering() -> None:
 
 
 @pytest.mark.asyncio
-async def test_golden_artifact_workflow_tracks_created_file() -> None:
+async def test_golden_artifact_workflow_tracks_created_file(tmp_path, monkeypatch) -> None:
+    from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path))
+    artifact = workspace_storage_roots_for_principal("workspace:demo").artifacts / "report.md"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("# Report", encoding="utf-8")
     client = ScriptedClient([
-        use_tool(tool_use("write-1", "file_write", {"path": "/tmp/report.md", "content": "# Report"})),
+        use_tool(tool_use("write-1", "file_write", {"path": str(artifact), "content": "# Report"})),
         final("Saved the markdown report."),
     ])
-    registry = GoldenRegistry({"file_write": {"path": "/tmp/report.md"}})
+    registry = GoldenRegistry({"file_write": {"path": str(artifact)}})
 
     result, updates = await run_task(client, registry, task(description="Write report", tools=["file_write"]))
 
     assert result.status == "success"
-    assert result.artifacts == ["/tmp/report.md"]
+    assert result.artifacts == [str(artifact)]
     assert result.output == "Saved the markdown report."
     assert any(update.message == "file_write completed." for update in updates)
 

@@ -8,6 +8,21 @@ known Markdown constructs readable across narrow chat surfaces.
 from __future__ import annotations
 
 
+def _is_generic_column_label(label: str) -> bool:
+    normalized = " ".join(str(label or "").strip().lower().split())
+    if not normalized:
+        return True
+    if normalized == "column":
+        return True
+    if normalized.startswith("column ") and normalized.removeprefix("column ").strip().isdigit():
+        return True
+    return normalized in {"field", "item", "label", "name"}
+
+
+def _clean_cell(text: str) -> str:
+    return " ".join(str(text or "").strip().split())
+
+
 def _split_table_row(line: str) -> list[str] | None:
     stripped = line.strip()
     if not (stripped.startswith("|") and stripped.endswith("|")):
@@ -28,14 +43,23 @@ def _is_separator_row(cells: list[str]) -> bool:
 
 def _render_table_as_list(header: list[str], rows: list[list[str]]) -> list[str]:
     rendered: list[str] = []
-    for row_index, row in enumerate(rows, start=1):
-        if rendered:
-            rendered.append("")
-        rendered.append(f"Row {row_index}:")
+    for row in rows:
+        cells = [_clean_cell(row[index] if index < len(row) else "") for index in range(len(header))]
+        if len(header) == 2 and cells[0] and cells[1]:
+            rendered.append(f"- {cells[0]}: {cells[1]}")
+            continue
+        parts: list[str] = []
         for cell_index, heading in enumerate(header):
-            label = heading or f"Column {cell_index + 1}"
-            value = row[cell_index] if cell_index < len(row) else ""
-            rendered.append(f"- {label}: {value}")
+            value = cells[cell_index] if cell_index < len(cells) else ""
+            if not value:
+                continue
+            label = _clean_cell(heading)
+            if _is_generic_column_label(label):
+                parts.append(value)
+            else:
+                parts.append(f"{label}: {value}")
+        if parts:
+            rendered.append(f"- {' · '.join(parts)}")
     return rendered
 
 

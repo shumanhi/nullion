@@ -6,8 +6,10 @@ import asyncio
 import inspect
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
+from nullion.artifacts import artifact_descriptor_for_path, artifact_root_for_principal
 from nullion.deep_agent_profiles import (
     deep_agent_skill_files_for_task,
     deep_agent_skills_for_task,
@@ -179,6 +181,7 @@ class DeepAgentMiniAgentRunner:
             source="deep-agent",
         ) or output_text
         artifacts = artifact_paths_from_tool_results(tool_results)
+        deliverable_artifacts = _deliverable_artifact_paths_for_task(config, artifacts)
         pending_approval = _pending_approval_from_tool_results(tool_results)
         if pending_approval is not None:
             await _emit_progress(
@@ -195,7 +198,7 @@ class DeepAgentMiniAgentRunner:
                 task_id=task.task_id,
                 status="partial",
                 output=pending_approval["message"],
-                artifacts=artifacts,
+                artifacts=deliverable_artifacts,
                 context_out=output_text,
                 resume_token=_resume_token_for_pause(
                     config,
@@ -203,27 +206,125 @@ class DeepAgentMiniAgentRunner:
                     payload={"approval_id": pending_approval.get("approval_id")},
                 ),
             )
+        artifact_failure = _artifact_delivery_failure_for_task(config, artifacts, deliverable_artifacts)
+        if artifact_failure:
+            return TaskResult(
+                task_id=task.task_id,
+                status="failure",
+                error=artifact_failure,
+                context_out=output_text,
+            )
         return TaskResult(
             task_id=task.task_id,
             status="success",
             output=output_text,
-            artifacts=artifacts,
+            artifacts=deliverable_artifacts,
             context_out=output_text,
         )
 
 
 def _system_prompt_for_task(config, *, context_in: Any) -> str:
     task = config.task
+    artifact_root = _artifact_root_for_prompt(task)
     prompt = (
         "You are a scoped Deep Agent running inside Nullion. Complete only the assigned task. "
         "Use the provided Nullion tools for side effects so Sentinel policy remains authoritative. "
         "Do not claim a file, message, approval, or external change succeeded unless a tool result confirms it. "
         "Return a concise final answer for the user.\n\n"
+        "File delivery rules:\n"
+        f"- Save final user-facing files under the workspace artifact directory: {artifact_root}\n"
+        "- Do not use /tmp, /var/tmp, or arbitrary absolute paths for final files the user asked to receive.\n"
+        "- Temporary scratch files must also stay inside the workspace storage area unless a tool explicitly returns "
+        "a workspace-safe generated path.\n"
+        "- Mention a saved or attached file only after file_write, pdf_create, or another file-producing tool "
+        "returns a path in the workspace artifact directory.\n\n"
         f"Task: {task.description}"
     )
     if context_in is not None:
         prompt += f"\n\nContext input ({task.context_key_in}):\n{context_in}"
     return prompt
+
+
+def _artifact_root_for_prompt(task) -> str:
+    try:
+        return str(artifact_root_for_principal(task.principal_id))
+    except Exception:
+        logger.debug("Could not resolve artifact root for deep-agent prompt", exc_info=True)
+        return "the current workspace artifacts directory"
+
+
+def _deliverable_artifact_paths_for_task(config, artifact_paths: list[str]) -> list[str]:
+    if not artifact_paths:
+        return []
+    task = config.task
+    try:
+        artifact_root = artifact_root_for_principal(task.principal_id)
+    except Exception:
+        logger.debug("Could not resolve artifact root for mini-agent artifact validation", exc_info=True)
+        return list(dict.fromkeys(artifact_paths))
+    deliverable: list[str] = []
+    for raw_path in artifact_paths:
+        try:
+            descriptor = artifact_descriptor_for_path(Path(raw_path), artifact_root=artifact_root)
+        except Exception:
+            descriptor = None
+        if descriptor is not None:
+            deliverable.append(descriptor.path)
+    return list(dict.fromkeys(deliverable))
+
+
+def _artifact_delivery_failure_for_task(config, artifact_paths: list[str], deliverable_artifacts: list[str]) -> str | None:
+    task = config.task
+    if deliverable_artifacts:
+        return None
+    if not artifact_paths and not _task_requires_user_file_delivery(task):
+        return None
+    try:
+        artifact_root = artifact_root_for_principal(task.principal_id)
+    except Exception:
+        artifact_root = None
+    root_text = str(artifact_root) if artifact_root is not None else "the workspace artifacts directory"
+    if artifact_paths:
+        return (
+            "The mini-agent created a file outside the downloadable workspace, so it was not delivered. "
+            f"Final user-facing files must be written under {root_text}."
+        )
+    return (
+        "The mini-agent did not create a downloadable file for this request. "
+        f"Final user-facing files must be written under {root_text}."
+    )
+
+
+def _task_requires_user_file_delivery(task) -> bool:
+    text = f"{getattr(task, 'title', '')} {getattr(task, 'description', '')}".lower()
+    action_terms = (
+        "send",
+        "attach",
+        "download",
+        "deliver",
+        "save",
+        "write",
+        "create",
+        "generate",
+        "export",
+        "compile",
+    )
+    file_terms = (
+        " file",
+        "pdf",
+        "txt",
+        " text",
+        "text file",
+        "csv",
+        "xlsx",
+        "xls",
+        "spreadsheet",
+        "docx",
+        "document",
+        "html",
+        "report",
+    )
+    return any(term in text for term in action_terms) and any(term in text for term in file_terms)
 
 
 def _completion_progress_kind(result: TaskResult) -> str:

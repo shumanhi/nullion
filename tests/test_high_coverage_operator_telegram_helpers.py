@@ -1555,6 +1555,8 @@ async def test_telegram_delivery_download_streamer_and_service_helpers(tmp_path,
     with pytest.raises(RuntimeError):
         await telegram_app._send_typing_indicator(SimpleNamespace(chat=SimpleNamespace(id=1, send_action=failing_action)), runtime=health_runtime, text="hi")
     assert health_runtime.issues
+    assert health_runtime.issues[-1]["issue_type"] is telegram_app.HealthIssueType.DEGRADED
+    assert "RuntimeError: boom" in health_runtime.issues[-1]["details"]["detail"]
     assert telegram_app._should_quote_reply("/chat hi") is False
     assert telegram_app._should_quote_reply("plain") is True
 

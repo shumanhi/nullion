@@ -2042,9 +2042,26 @@ _HTML = r"""<!DOCTYPE html>
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .approval-url-value {
-    color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; word-break: break-word;
+    color: var(--text);
   }
+  .target-code-block {
+    display: grid; gap: 5px; min-width: 0;
+    border: 1px solid rgba(255,255,255,0.075);
+    background: rgba(7,7,10,0.55);
+    border-radius: 7px; padding: 8px 9px;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+  }
+  .target-code-label {
+    color: var(--muted); font-size: 10px; font-weight: 800; line-height: 1;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .target-code-value {
+    display: block; color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.45; white-space: pre-wrap;
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  .approval-url-card .target-code-block { margin: 0; }
   .approval-actions {
     display: flex; flex-wrap: wrap;
     gap: 10px; align-items: center;
@@ -2270,8 +2287,11 @@ _HTML = r"""<!DOCTYPE html>
   }
   .decision-status.approved { color: var(--green); border-color: rgba(52,211,153,0.38); background: rgba(52,211,153,0.08); }
   .decision-status.denied { color: var(--red); border-color: rgba(248,113,113,0.38); background: rgba(248,113,113,0.08); }
-  .decision-detail { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 7px 0 0 42px; word-break: break-word; }
-  .decision-meta { color: var(--faint); font-size: 10px; margin: 6px 0 0 42px; }
+  .decision-detail { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 7px 0 0 32px; word-break: break-word; }
+  .decision-code-block,
+  .control-code-block { margin: 8px 0 0 32px; }
+  .decision-meta,
+  .control-time { color: var(--faint); font-size: 10px; line-height: 1.35; margin: 7px 0 0 32px; }
   .view-all-row {
     display: flex; justify-content: center; margin-top: 9px;
   }
@@ -2319,7 +2339,7 @@ _HTML = r"""<!DOCTYPE html>
   .control-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .control-icon { width: 24px; height: 24px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center; background: rgba(52,211,153,0.1); flex-shrink: 0; }
   .control-title { color: var(--text); font-weight: 650; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .control-meta { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 7px 0 0 42px; word-break: break-word; }
+  .control-meta { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 7px 0 0 32px; word-break: break-word; }
   .memory-chip-list { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
   .memory-chip-list.full { gap: 10px; }
   .memory-chip {
@@ -2338,10 +2358,12 @@ _HTML = r"""<!DOCTYPE html>
     line-height: 1; padding: 0; flex-shrink: 0;
   }
   .memory-chip-x:hover { color: var(--text); background: rgba(248,113,113,0.18); }
-  .doctor-body { margin: 8px 0 0 42px; display: grid; gap: 7px; }
+  .doctor-body { margin: 8px 0 0 32px; display: grid; gap: 7px; }
   .doctor-note { color: var(--muted); font-size: 11px; line-height: 1.4; word-break: break-word; }
   .doctor-note strong { display: block; color: var(--text); font-size: 10px; letter-spacing: 0; text-transform: uppercase; margin-bottom: 2px; }
-  .control-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0 0 42px; }
+  .doctor-body .control-meta,
+  .doctor-body .control-time { margin: 0; }
+  .control-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0 0 32px; }
   .mini-btn {
     border: 1px solid var(--border); background: #15151c; color: var(--muted);
     border-radius: 6px; padding: 4px 8px; font: inherit; font-size: 11px; cursor: pointer;
@@ -5520,7 +5542,7 @@ async function connect() {
         refreshDashboard();
       } else if (data.type === 'background_message') {
         if (!data.conversation_id || data.conversation_id === conversationId) {
-          addMessage('bot', data.text || '');
+          addMessage('bot', data.text || '', false, { artifacts: data.artifacts || [] });
           refreshDashboard();
         }
       } else if (data.type === 'gateway_notice') {
@@ -5826,6 +5848,7 @@ function addMessage(role, text, isError = false, metadata = null) {
 
 async function downloadArtifact(event, url, name) {
   event.preventDefault();
+  event.stopPropagation();
   const link = event.currentTarget;
   const originalText = link.textContent;
   link.textContent = `Saving ${name || 'file'}...`;
@@ -6224,6 +6247,13 @@ function approvalTargetUrl(detail) {
   return match ? match[0] : '';
 }
 
+function targetCodeBlockHtml(value, label = 'Target', extraClass = '') {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const cls = extraClass ? ` target-code-block ${extraClass}` : 'target-code-block';
+  return `<div class="${cls}"><span class="target-code-label">${escHtml(label)}</span><code class="target-code-value">${escHtml(text)}</code></div>`;
+}
+
 function approvalIsWebRequest(toolName, detail) {
   const haystack = `${toolName || ''} ${detail || ''}`.toLowerCase();
   return haystack.includes('outbound_network')
@@ -6280,8 +6310,8 @@ function approvalDetailHtml(toolName, detail, forceWeb = false) {
     const host = approvalTargetHost(url);
     const tool = String(toolName || '').trim();
     return `<div class="approval-detail approval-url-card">
-      <div class="approval-url-meta"><span>Requested URL</span><span class="approval-url-host">${escHtml(host)}</span></div>
-      <div class="approval-url-value">${escHtml(url)}</div>
+      <div class="approval-url-meta"><span>Web target</span><span class="approval-url-host">${escHtml(host)}</span></div>
+      ${targetCodeBlockHtml(url, 'URL', 'approval-url-value')}
       ${tool ? `<div class="approval-url-tool">Tool: ${escHtml(tool)}</div>` : ''}
     </div>`;
   }
@@ -6771,34 +6801,66 @@ function approvalTarget(a) {
   return String(ctx.tool_name || a.resource || a.action || 'tool');
 }
 
+function approvalFullTarget(a) {
+  const ctx = (a && typeof a.context === 'object' && a.context) ? a.context : {};
+  const selectors = (ctx.selector_candidates && typeof ctx.selector_candidates === 'object') ? ctx.selector_candidates : {};
+  return String(
+    ctx.target
+    || selectors.always_allow
+    || selectors.allow_once
+    || a.resource
+    || ''
+  ).trim();
+}
+
 function decisionTitle(a) {
   const kind = approvalKind(a);
   const target = approvalTarget(a);
-  return kind === 'domain' ? `Domain access: ${target}` : `Tool request: ${target}`;
+  return kind === 'domain' ? `Web access · ${target}` : `Tool request · ${target}`;
 }
 
-function decisionDetail(a) {
+function decisionDetailParts(a) {
   const ctx = (a && typeof a.context === 'object' && a.context) ? a.context : {};
   const parts = [];
   if (a.requested_by) parts.push(`Requested from ${a.requested_by}`);
   const triggerLabel = approvalTriggerLabelFor(a);
   if (triggerLabel) parts.push(`Triggered by ${triggerLabel}`);
   if (a.action) parts.push(`Action ${a.action}`);
+  let target = '';
+  let targetLabel = approvalKind(a) === 'domain' ? 'URL' : 'Resource';
   if (ctx.selector_candidates && approvalStatusValue(a.status) === 'approved') {
     const selector = ctx.selector_candidates.always_allow || ctx.selector_candidates.allow_once;
-    if (selector) parts.push(`Scope ${selector}`);
+    if (selector) {
+      target = selector;
+      targetLabel = 'Scope';
+    }
   } else if (a.resource) {
-    parts.push(`Resource ${a.resource}`);
+    target = a.resource;
   }
-  return parts.join(' · ');
+  target = target || approvalFullTarget(a);
+  return { meta: parts.join(' · '), target, targetLabel };
 }
 
-function decisionTime(a) {
-  const raw = a.decided_at || a.created_at;
+function decisionDetail(a) {
+  return decisionDetailParts(a).meta;
+}
+
+function decisionDetailHtml(a) {
+  const detail = decisionDetailParts(a);
+  return `
+    <div class="decision-detail">${escHtml(detail.meta || 'No additional request details')}</div>
+    ${targetCodeBlockHtml(detail.target, detail.targetLabel, 'decision-code-block')}`;
+}
+
+function dashboardTimeLabel(raw) {
   if (!raw) return '';
   const date = new Date(raw);
   if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+function decisionTime(a) {
+  return dashboardTimeLabel(a.decided_at || a.created_at);
 }
 
 function decisionHasDurablePermission(a) {
@@ -6824,7 +6886,7 @@ function decisionItemHtml(a) {
         <span class="decision-title">${escHtml(decisionTitle(a))}</span>
         <span class="decision-status ${escHtml(status)}">${escHtml(statusLabel)}</span>
       </div>
-      <div class="decision-detail">${escHtml(decisionDetail(a) || 'No additional request details')}</div>
+      ${decisionDetailHtml(a)}
       ${meta ? `<div class="decision-meta">${escHtml(meta)}</div>` : ''}
       ${(canAllow || canRevoke) ? `<div class="control-actions">
         ${canAllow ? `<button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','once')">Allow once</button><button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','always')">Always allow</button>` : ''}
@@ -7071,22 +7133,16 @@ function renderPermissions(data) {
     el.innerHTML = '<div class="empty"><strong>No active grants</strong>Always-allowed tool and domain permissions will appear here.</div>';
     return;
   }
-  const permissionTimeLabel = raw => {
-    if (!raw) return '';
-    const date = new Date(raw);
-    if (Number.isNaN(date.getTime())) return '';
-    return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-  };
   const permissionItemHtml = item => {
     if (item.kind === 'boundary_permit_domain_audit') {
       const tool = item.tool_name ? ` · ${item.tool_name}` : '';
-      const whenLabel = permissionTimeLabel(item.accessed_at);
-      const when = whenLabel ? ` · ${whenLabel}` : '';
-      const target = item.target ? ` · ${item.target}` : '';
-      const meta = `Allowed by Allow all${tool}${when}${target}`;
+      const whenLabel = dashboardTimeLabel(item.accessed_at);
+      const meta = `Allowed by Allow all${tool}`;
       return `<div class="control-card">
-        <div class="control-top"><span class="control-icon">${NI.globe()}</span><span class="control-title">${escHtml(`Domain access: ${item.domain}`)}</span></div>
+        <div class="control-top"><span class="control-icon">${NI.globe()}</span><span class="control-title">${escHtml(`Web access · ${item.domain}`)}</span></div>
         <div class="control-meta">${escHtml(meta)}</div>
+        ${targetCodeBlockHtml(item.target, 'URL', 'control-code-block')}
+        ${whenLabel ? `<div class="control-time">${escHtml(whenLabel)}</div>` : ''}
       </div>`;
     }
     const isRule = item.kind === 'boundary_rule';
@@ -7094,9 +7150,9 @@ function renderPermissions(data) {
     const icon = (isRule || isPermit) ? NI.shield() : NI.wrench();
     const isAllowAllOutbound = (isRule || isPermit) && item.boundary_kind === 'outbound_network' && item.selector === '*';
     const title = isAllowAllOutbound
-      ? 'Domain access: all outbound domains'
+      ? 'Web access · all outbound domains'
       : (isRule || isPermit)
-        ? `${item.boundary_kind}: ${item.selector}`
+        ? `${item.boundary_kind.replaceAll('_', ' ')} · ${item.selector}`
         : item.permission;
     const scope = item.principal_id === 'global:operator'
       ? 'All workspaces and sessions'
@@ -7105,9 +7161,15 @@ function renderPermissions(data) {
     const meta = `${scope} · ${permissionExpiryLabel(item.expires_at)}${permitMeta} · from ${String(item.approval_id || item.rule_id || item.permit_id || item.grant_id).slice(0, 8)}`;
     const revokeKind = isPermit ? 'boundary-permit' : (isRule ? 'boundary-rule' : 'grant');
     const id = isPermit ? item.permit_id : (isRule ? item.rule_id : item.grant_id);
+    const targetLabel = (isRule || isPermit)
+      ? (item.boundary_kind === 'outbound_network' ? 'Scope' : 'Target')
+      : '';
+    const whenLabel = dashboardTimeLabel(item.accessed_at || item.granted_at || item.created_at || item.decided_at);
     return `<div class="control-card">
       <div class="control-top"><span class="control-icon">${icon}</span><span class="control-title">${escHtml(title)}</span></div>
       <div class="control-meta">${escHtml(meta)}</div>
+      ${(isRule || isPermit) ? targetCodeBlockHtml(item.selector, targetLabel, 'control-code-block') : ''}
+      ${whenLabel ? `<div class="control-time">${escHtml(whenLabel)}</div>` : ''}
       <div class="control-actions"><button class="mini-btn danger" onclick="revokePermission('${revokeKind}','${escHtml(id)}')">Revoke</button></div>
     </div>`;
   };
@@ -7124,10 +7186,14 @@ function renderBuilder(list) {
     el.innerHTML = '<div class="empty"><strong>Builder quiet</strong>Proposals and learned workflows will appear here.</div>';
     return;
   }
-  const builderItemHtml = p => `<div class="control-card">
-    <div class="control-top"><span class="control-icon">${NI.wrench()}</span><span class="control-title">${escHtml(p.title || p.proposal_id)}</span><span class="decision-status ${escHtml(p.status || '')}">${escHtml(p.status || 'pending')}</span></div>
-    <div class="control-meta">${escHtml(p.summary || '')}</div>
-  </div>`;
+  const builderItemHtml = p => {
+    const timestamp = dashboardTimeLabel(p.updated_at || p.created_at || p.decided_at);
+    return `<div class="control-card">
+      <div class="control-top"><span class="control-icon">${NI.wrench()}</span><span class="control-title">${escHtml(p.title || p.proposal_id)}</span><span class="decision-status ${escHtml(p.status || '')}">${escHtml(p.status || 'pending')}</span></div>
+      <div class="control-meta">${escHtml(p.summary || '')}</div>
+      ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
+    </div>`;
+  };
   renderDynamicList(el, list, builderItemHtml, { key: 'builder', title: `Builder · ${list.length}` });
 }
 
@@ -7345,11 +7411,11 @@ function renderDoctor(data) {
     return `<div class="control-card">
       <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
       <div class="doctor-body">
-        ${timestampText ? `<div class="control-meta" style="margin:0">${escHtml(timestampText)}</div>` : ''}
         <div class="doctor-note"><strong>What Doctor saw</strong>${escHtml(doctorDiagnosisText(item))}</div>
         <div class="doctor-note"><strong>Suggested fix</strong>${escHtml(doctorSuggestionText(item))}</div>
-        <div class="control-meta" style="margin:0">${escHtml(doctorDetailText(item))}</div>
-        ${feedback ? `<div class="control-meta" style="margin:7px 0 0">${escHtml(feedback)}</div>` : ''}
+        <div class="control-meta">${escHtml(doctorDetailText(item))}</div>
+        ${feedback ? `<div class="control-meta">${escHtml(feedback)}</div>` : ''}
+        ${timestampText ? `<div class="control-time">${escHtml(timestampText)}</div>` : ''}
       </div>
       ${actions ? `<div class="control-actions">${actions}</div>` : ''}
     </div>`;
@@ -7423,8 +7489,8 @@ function renderDeliveryReceipts(items) {
     return `<div class="control-card">
       <div class="control-top"><span class="control-icon">📦</span><span class="control-title">${escHtml(deliveryReceiptTitle(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(status)}</span></div>
       <div class="doctor-body">
-        ${timestamp ? `<div class="control-meta" style="margin:0">${escHtml(timestamp)}</div>` : ''}
         <div class="doctor-note"><strong>Delivery boundary</strong>${escHtml(deliveryReceiptDetail(item))}</div>
+        ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
       </div>
     </div>`;
   };
@@ -10885,12 +10951,14 @@ document.getElementById('user-input').addEventListener('blur', () => {
   // Delay so mousedown on an item fires first
   setTimeout(_slashClose, 150);
 });
-document.getElementById('send-btn').addEventListener('click', sendMessage);
+document.getElementById('send-btn').addEventListener('click', () => sendMessage());
 
 // ── Attachment handling ───────────────────────────────────────────────────────
 let _pendingFiles = [];
 window._pendingMessageAttachments = [];
+let _chatUserInteractedSinceLoad = false;
 document.getElementById('file-input').addEventListener('change', function() {
+  _chatUserInteractedSinceLoad = true;
   for (const f of this.files) _pendingFiles.push(f);
   this.value = '';
   renderAttachments();
@@ -10933,6 +11001,7 @@ async function uploadFiles(files) {
 }
 const _origSendMessage = sendMessage;
 sendMessage = async function() {
+  _chatUserInteractedSinceLoad = true;
   if (_pendingFiles.length) {
     const uploaded = await uploadFiles(_pendingFiles);
     if (uploaded.length) {
@@ -11023,14 +11092,26 @@ function renderRestoredMessages(messages) {
 async function _restoreConversation() {
   try {
     const data = await fetch(`/api/chat/history/${encodeURIComponent(conversationId)}`).then(r => r.json());
+    if (_chatUserInteractedSinceLoad) {
+      _chatSaveEnabled = true;
+      return;
+    }
     let msgs = data.messages || [];
     if (!msgs.length && localStorage.getItem('nullion_chat_restore_suppressed') !== 'true') {
       const latest = await fetch('/api/chat/conversations/latest?channel=web').then(r => r.json());
+      if (_chatUserInteractedSinceLoad) {
+        _chatSaveEnabled = true;
+        return;
+      }
       const latestConv = latest.conversation || null;
       if (latest.ok && latestConv && latestConv.id && latestConv.id !== conversationId) {
         conversationId = latestConv.id;
         localStorage.setItem('nullion_conv_id', conversationId);
         const latestData = await fetch(`/api/chat/history/${encodeURIComponent(conversationId)}`).then(r => r.json());
+        if (_chatUserInteractedSinceLoad) {
+          _chatSaveEnabled = true;
+          return;
+        }
         msgs = latestData.messages || [];
       }
     }
@@ -15695,6 +15776,7 @@ def create_app(runtime, orchestrator, registry):
         group_id: str | None = None,
         is_status: bool = False,
         status_kind: str | None = None,
+        artifacts: list[dict[str, object]] | None = None,
     ) -> None:
         payload = json.dumps({
             "type": "task_status" if is_status and group_id else "background_message",
@@ -15702,6 +15784,7 @@ def create_app(runtime, orchestrator, registry):
             "text": text,
             **({"group_id": group_id} if group_id else {}),
             **({"status_kind": status_kind} if status_kind else {}),
+            **({"artifacts": artifacts} if artifacts else {}),
         })
         stale: list[WebSocket] = []
         for client in list(_WEB_GATEWAY_CLIENTS):
@@ -15772,6 +15855,63 @@ def create_app(runtime, orchestrator, registry):
                 return
             text = str(text or "").strip()
             if not text:
+                return
+            if kwargs.get("is_artifact"):
+                artifacts = _web_artifact_descriptors(runtime, [text], principal_id=conversation_id)
+                if artifacts:
+                    artifact_text = "Attached the requested file."
+                    try:
+                        from nullion.chat_store import get_chat_store
+                        get_chat_store().save_message(
+                            conversation_id,
+                            "bot",
+                            artifact_text,
+                            is_error=False,
+                            metadata={"artifacts": artifacts},
+                        )
+                    except Exception:
+                        logger.debug("Could not persist web mini-agent artifact delivery", exc_info=True)
+                    loop = _WEB_DELIVERY_LOOP
+                    if loop is not None and not loop.is_closed():
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                _broadcast_web_background_message(
+                                    conversation_id,
+                                    artifact_text,
+                                    artifacts=artifacts,
+                                ),
+                                loop,
+                            )
+                        except Exception:
+                            logger.debug("Could not broadcast web mini-agent artifact delivery", exc_info=True)
+                    return
+                filename = Path(text).name or "the generated file"
+                artifact_text = (
+                    f"I couldn't attach `{filename}` because it was saved outside the downloadable workspace. "
+                    "Please recreate it under the workspace artifacts folder so it can be sent here."
+                )
+                try:
+                    from nullion.chat_store import get_chat_store
+                    get_chat_store().save_message(
+                        conversation_id,
+                        "bot",
+                        artifact_text,
+                        is_error=True,
+                    )
+                except Exception:
+                    logger.debug("Could not persist web mini-agent artifact delivery failure", exc_info=True)
+                loop = _WEB_DELIVERY_LOOP
+                if loop is not None and not loop.is_closed():
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _broadcast_web_background_message(
+                                conversation_id,
+                                artifact_text,
+                            ),
+                            loop,
+                        )
+                    except Exception:
+                        logger.debug("Could not broadcast web mini-agent artifact delivery failure", exc_info=True)
                 return
             planner_feed_mode = task_planner_feed_mode()
             if kwargs.get("is_status"):
@@ -16112,7 +16252,8 @@ def create_app(runtime, orchestrator, registry):
                     await send_activity_event({"id": "command", "label": "Running command", "status": "done"})
                 await send_activity_event({"id": "respond", "label": "Writing response", "status": "running"})
                 await send_reply_text(reply)
-                await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})
+                if not result.get("mini_agent_dispatch"):
+                    await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})
                 await send_websocket_event(turn_payload({"type": "done", "artifacts": []}))
                 return
 
@@ -17630,7 +17771,6 @@ def _run_turn_sync(
         )
         _remember_web_explicit_memory(runtime, user_message=user_text)
         _emit_activity(activity_callback, "memory", "Saving conversation", "done")
-        _emit_activity(activity_callback, "respond", "Writing response", "running")
         _finish_web_task_frame(
             runtime,
             conversation_id=conv_id,

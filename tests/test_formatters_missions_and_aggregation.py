@@ -65,13 +65,8 @@ def test_markdown_table_rendering_preserves_non_tables_and_fenced_tables() -> No
     assert make_markdown_tables_chat_readable(text) == "\n".join(
         [
             "Before",
-            "Row 1:",
-            "- Name: Alpha",
-            "- Value: 1",
-            "",
-            "Row 2:",
-            "- Name: Beta",
-            "- Value: 2",
+            "- Alpha: 1",
+            "- Beta: 2",
             "",
             "```",
             "| Raw | Table |",
@@ -80,6 +75,31 @@ def test_markdown_table_rendering_preserves_non_tables_and_fenced_tables() -> No
         ]
     )
     assert make_markdown_tables_chat_readable("| A | B |\nnot separator") == "| A | B |\nnot separator"
+
+
+def test_markdown_table_rendering_avoids_row_column_dump_for_chat() -> None:
+    weather_table = "\n".join(
+        [
+            "| Column 1 | Details |",
+            "| --- | --- |",
+            "| Conditions | Partly cloudy early, becoming overcast overnight |",
+            "| Current | 61°F, sunny |",
+            "| Sunset | 7:52 PM |",
+            "",
+            "Hourly outlook:",
+            "| Time | Temp |",
+            "| --- | --- |",
+            "| 6 PM | 60° |",
+            "| 7 PM | 59° |",
+        ]
+    )
+
+    rendered = make_markdown_tables_chat_readable(weather_table)
+
+    assert "Row 1" not in rendered
+    assert "Column 1" not in rendered
+    assert "- Conditions: Partly cloudy early, becoming overcast overnight" in rendered
+    assert "- 6 PM: 60°" in rendered
 
 
 def test_chat_streaming_modes_and_chunking() -> None:
@@ -332,12 +352,91 @@ async def test_result_aggregator_delivers_status_summary_final_and_artifacts() -
     await aggregator._handle(ProgressUpdate(agent_id="a1", task_id="t1", group_id="g1", kind="task_complete", message="ok"))
 
     assert any("Parallel • 2 tasks" in text for _, text, kwargs in deliveries if kwargs.get("is_status"))
-    assert ("c1", "Completed 2/2 task(s). • Task t1: alpha • Task t2: beta", {}) in deliveries
+    assert ("c1", 'Result for "Do work":\nCompleted 2/2 task(s). • Task t1: alpha • Task t2: beta', {}) in deliveries
     assert ("c1", "/tmp/a.txt", {"is_artifact": True}) in deliveries
 
     deliveries.clear()
     await aggregator._handle(ProgressUpdate(agent_id="a1", task_id="t1", group_id="g1", kind="task_complete"))
     assert not any(kwargs == {} for _, _, kwargs in deliveries)
+
+
+@pytest.mark.asyncio
+async def test_result_aggregator_materializes_missing_text_artifact(monkeypatch, tmp_path) -> None:
+    import nullion.delegated_artifact_workflow as delegated_artifacts
+
+    deliveries: list[tuple[str, str, dict]] = []
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    output_path = artifact_root / "cnn-headlines.txt"
+
+    monkeypatch.setattr(delegated_artifacts, "artifact_root_for_principal", lambda principal_id: artifact_root)
+    monkeypatch.setattr(
+        delegated_artifacts,
+        "artifact_path_for_generated_workspace_file",
+        lambda *, principal_id, suffix, stem="nullion-artifact": output_path,
+    )
+
+    group = TaskGroup(
+        group_id="g-file",
+        conversation_id="telegram:123",
+        original_message="Can you fetch cnn.com headlines and send me in a text file?",
+        tasks=[
+            task(
+                "fetch",
+                TaskStatus.COMPLETE,
+                result=TaskResult(
+                    "fetch",
+                    "success",
+                    output="Judge privately admonishes prosecutors\nNew video shows moments before shooting",
+                ),
+            ),
+            task(
+                "write",
+                TaskStatus.FAILED,
+                result=TaskResult("write", "failure", output="No file was generated due to the path error."),
+            ),
+        ],
+        planner_metadata={"disposition": "sequential_mission", "tasks": ["fetch", "write"]},
+    )
+    registry = SimpleNamespace(
+        get_group=lambda group_id: group if group_id == "g-file" else None,
+        get_task=lambda task_id: next((item for item in group.tasks if item.task_id == task_id), None),
+    )
+    aggregator = ResultAggregator(
+        deliver_fn=lambda conversation_id, text, **kwargs: deliveries.append((conversation_id, text, kwargs)),
+        task_registry=registry,
+        min_progress_interval_s=0,
+    )
+
+    await aggregator._handle(ProgressUpdate(agent_id="a", task_id="write", group_id="g-file", kind="task_failed"))
+
+    assert output_path.read_text(encoding="utf-8").startswith(
+        "Original request: Can you fetch cnn.com headlines and send me in a text file?"
+    )
+    assert "Judge privately admonishes prosecutors" in output_path.read_text(encoding="utf-8")
+    assert "path error" not in output_path.read_text(encoding="utf-8")
+    assert (
+        "telegram:123",
+        str(output_path),
+        {"is_artifact": True},
+    ) in deliveries
+    assert any("created the requested file" in text for _, text, kwargs in deliveries if kwargs == {})
+
+
+def test_result_aggregator_final_summary_names_original_request() -> None:
+    from nullion.result_aggregator import _summary_with_original_request_context
+
+    group = TaskGroup(
+        group_id="g1",
+        conversation_id="telegram:1",
+        original_message="can you fetch news from cbs and send me in a text file?",
+        tasks=[],
+    )
+
+    assert _summary_with_original_request_context(group, "The text file failed.") == (
+        'Result for "can you fetch news from cbs and send me in a text file?":\n'
+        "The text file failed."
+    )
 
 
 @pytest.mark.asyncio
@@ -430,7 +529,7 @@ async def test_result_aggregator_keeps_failure_summary_when_task_feed_hidden() -
     await aggregator._handle(ProgressUpdate(agent_id="a", task_id="fetch", group_id="g-hidden", kind="task_failed", message="fetch failed"))
 
     assert any(kwargs.get("is_status") for _, _, kwargs in deliveries)
-    assert ("telegram:123", "Completed 0/1 task(s). 1 failed.", {}) in deliveries
+    assert ("telegram:123", 'Result for "make a report":\nCompleted 0/1 task(s). 1 failed.', {}) in deliveries
 
 
 @pytest.mark.asyncio
@@ -457,7 +556,7 @@ async def test_result_aggregator_progress_input_failure_cancel_and_model_summary
 
     assert any(text == "→ [Task t1] halfway" for _, text, _ in deliveries)
     assert any(text == "? Pick one" and kwargs["is_question"] for _, text, kwargs in deliveries)
-    assert any(text == "model summary" for _, text, _ in deliveries)
+    assert any(text == 'Result for "Do work":\nmodel summary' for _, text, _ in deliveries)
 
     await aggregator._handle(
         ProgressUpdate(

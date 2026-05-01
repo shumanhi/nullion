@@ -420,6 +420,24 @@ async def test_warm_pool_shared_resources_and_agent_client(monkeypatch) -> None:
         "content": [{"type": "text", "text": "hello"}],
     }
 
+    class NoMaxTokensClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create(self, *, messages, tools=None, system=None):
+            self.calls.append({"messages": messages, "tools": tools, "system": system})
+            return {"ok": True}
+
+    no_max = NoMaxTokensClient()
+    wrapped = await get_agent_client(SimpleNamespace(anthropic_client=no_max)).create(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        max_tokens=128,
+        system="sys",
+    )
+    assert wrapped == {"ok": True}
+    assert no_max.calls == [{"messages": [{"role": "user", "content": "hi"}], "tools": [], "system": "sys"}]
+
 
 @pytest.mark.asyncio
 async def test_health_monitor_counts_failures_escalates_and_resolves(monkeypatch) -> None:

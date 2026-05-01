@@ -24,6 +24,7 @@ from typing import Any, Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from nullion.delegated_artifact_workflow import finalize_delegated_artifacts
 from nullion.mini_agent_runner import ProgressUpdate
 from nullion.task_queue import TaskGroup, TaskRecord, TaskRegistry, TaskStatus
 from nullion.task_status_format import format_task_status_line, format_task_status_summary
@@ -141,20 +142,27 @@ class ResultAggregator:
         if group.group_id in self._completed_groups:
             return
         self._completed_groups.add(group.group_id)
-        summary = await self._generate_summary(group)
+        recovered_artifacts = finalize_delegated_artifacts(group)
+        summary = (
+            _artifact_recovery_summary(group, recovered_artifacts)
+            if recovered_artifacts
+            else await self._generate_summary(group)
+        )
         fallback = self._fallback_summary(group)
         if not (
             gs.task_summary_visible
             and summary == fallback
             and self._fallback_summary_is_bare_failure_notice(group)
         ):
-            await self._deliver(gs.conversation_id, summary)
+            await self._deliver(gs.conversation_id, _summary_with_original_request_context(group, summary))
 
         # Deliver any artifacts.
         for task in group.tasks:
             if task.result and task.result.artifacts:
                 for artifact in task.result.artifacts:
                     await self._deliver(gs.conversation_id, artifact, is_artifact=True)
+        for artifact in recovered_artifacts:
+            await self._deliver(gs.conversation_id, artifact, is_artifact=True)
 
         # Clean up group state.
         self._group_state.pop(gs.group_id, None)
@@ -224,6 +232,29 @@ class ResultAggregator:
         except Exception as exc:
             logger.debug("ResultAggregator: deliver_fn failed: %s", exc)
             return False
+
+
+def _summary_with_original_request_context(group: TaskGroup, summary: str) -> str:
+    text = str(summary or "").strip()
+    request = _compact_original_request(group.original_message)
+    if not text or not request:
+        return text
+    if text.lower().startswith("result for "):
+        return text
+    return f'Result for "{request}":\n{text}'
+
+
+def _artifact_recovery_summary(group: TaskGroup, artifact_paths: list[str]) -> str:
+    if len(artifact_paths) == 1:
+        return f"I created the requested file from the completed task output and attached it: {artifact_paths[0]}"
+    return f"I created {len(artifact_paths)} requested files from the completed task output and attached them."
+
+
+def _compact_original_request(message: str, *, limit: int = 120) -> str:
+    text = " ".join(str(message or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
 
 
 def _task_status_rank(line: str | None) -> int:

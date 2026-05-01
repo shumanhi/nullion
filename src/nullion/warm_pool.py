@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -357,12 +358,25 @@ class _PooledAgent:
             }
         # Sync adapter
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: client.create(**kwargs))
+        try:
+            return await loop.run_in_executor(None, lambda: client.create(**kwargs))
+        except TypeError as exc:
+            key = _unexpected_keyword_argument(exc)
+            if key is None or key not in kwargs:
+                raise
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop(key, None)
+            return await loop.run_in_executor(None, lambda: client.create(**fallback_kwargs))
 
 
 def get_agent_client(agent: PooledAgent) -> Any:
     """Return a client wrapper suitable for the Deep Agents model adapter."""
     return _PooledAgent(agent)
+
+
+def _unexpected_keyword_argument(exc: TypeError) -> str | None:
+    match = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", str(exc))
+    return match.group(1) if match else None
 
 
 __all__ = [

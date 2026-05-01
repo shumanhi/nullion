@@ -1764,15 +1764,15 @@ async def _send_typing_indicator(message, *, runtime: PersistentRuntime, text: s
     chat_id_text = None if chat_id is None else str(chat_id)
     try:
         await send_action("typing")
-    except Exception:
+    except Exception as exc:
         _report_runner_health_issue(
             runtime,
-            issue_type=HealthIssueType.ERROR,
+            issue_type=HealthIssueType.DEGRADED,
             message="Telegram typing indicator failed.",
             chat_id=chat_id_text,
             text=text,
             stage="typing_indicator",
-            detail="Failed to send Telegram typing indicator.",
+            detail=_typing_indicator_failure_detail(exc),
         )
         raise
 
@@ -1793,15 +1793,15 @@ async def _send_telegram_chat_typing_indicator(
         result = send_chat_action(chat_id=chat_id, action="typing")
         if inspect.isawaitable(result):
             await result
-    except Exception:
+    except Exception as exc:
         _report_runner_health_issue(
             runtime,
-            issue_type=HealthIssueType.ERROR,
+            issue_type=HealthIssueType.DEGRADED,
             message="Telegram typing indicator failed.",
             chat_id=chat_id,
             text=text,
             stage="typing_indicator",
-            detail="Failed to send Telegram typing indicator.",
+            detail=_typing_indicator_failure_detail(exc),
         )
         raise
 
@@ -1855,6 +1855,13 @@ async def _run_telegram_chat_typing_keepalive(
         raise
     except Exception:
         logger.debug("Stopped Telegram chat typing keepalive after send failure.", exc_info=True)
+
+
+def _typing_indicator_failure_detail(exc: BaseException) -> str:
+    message = str(exc).strip()
+    exc_name = type(exc).__name__
+    suffix = f"{exc_name}: {message}" if message else exc_name
+    return f"Failed to send Telegram typing indicator: {suffix}"
 
 
 async def _stop_typing_keepalive(task: asyncio.Task[None] | None) -> None:

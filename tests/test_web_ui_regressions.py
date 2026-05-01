@@ -19,6 +19,8 @@ from nullion.web_app import (
     _normalize_media_models,
 )
 
+_SOURCE = Path(web_app.__file__).read_text(encoding="utf-8")
+
 
 def test_media_provider_toggle_defaults_off_until_explicitly_enabled() -> None:
     options = _media_model_options(
@@ -104,6 +106,22 @@ def test_decision_history_header_keeps_status_badge_on_one_line() -> None:
     assert "grid-template-columns: 24px minmax(0, 1fr) max-content" in _HTML
     assert ".decision-title {\n    min-width: 0;" in _HTML
     assert "letter-spacing: 0.06em; white-space: nowrap; border-radius: 999px;" in _HTML
+
+
+def test_permission_and_decision_cards_render_targets_as_code_blocks() -> None:
+    assert "function targetCodeBlockHtml(value, label = 'Target', extraClass = '')" in _HTML
+    assert "Web access · ${target}" in _HTML
+    assert "Web access · ${item.domain}" in _HTML
+    assert "Domain access:" not in _HTML
+    assert "target-code-block" in _HTML
+    assert "target-code-value" in _HTML
+    assert "${targetCodeBlockHtml(item.target, 'URL', 'control-code-block')}" in _HTML
+    assert "${decisionDetailHtml(a)}" in _HTML
+    assert ".control-code-block { margin: 8px 0 0 32px; }" in _HTML
+    assert ".control-meta { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 7px 0 0 32px;" in _HTML
+    assert "function dashboardTimeLabel(raw)" in _HTML
+    assert "const meta = `Allowed by Allow all${tool}`;" in _HTML
+    assert "${whenLabel ? `<div class=\"control-time\">${escHtml(whenLabel)}</div>` : ''}" in _HTML
 
 
 def test_delivery_receipts_panel_and_api(monkeypatch) -> None:
@@ -378,6 +396,117 @@ def test_web_mini_agent_final_delivery_broadcasts_with_task_planner_mode(monkeyp
     assert fake_store.saved_messages == [
         (("web:operator", "bot", "Final delegated answer"), {"is_error": False})
     ]
+
+
+def test_web_mini_agent_artifact_delivery_broadcasts_download_card(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    from nullion.tools import ToolRegistry
+
+    class CapturingOrchestrator:
+        deliver_fn = None
+
+        def set_deliver_fn(self, deliver_fn):
+            self.deliver_fn = deliver_fn
+
+    class FakeChatStore:
+        def __init__(self) -> None:
+            self.saved_messages = []
+
+        def save_message(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.saved_messages.append((args, kwargs))
+            return len(self.saved_messages)
+
+    artifact = {
+        "path": "/tmp/report.pdf",
+        "url": "/api/artifacts/report",
+        "name": "report.pdf",
+        "media_type": "application/pdf",
+    }
+    fake_store = FakeChatStore()
+    monkeypatch.setattr("nullion.chat_store.get_chat_store", lambda: fake_store)
+    monkeypatch.setattr(web_app, "_web_artifact_descriptors", lambda runtime, paths, principal_id=None: [artifact])
+    orchestrator = CapturingOrchestrator()
+    app = create_app(SimpleNamespace(store=None), orchestrator=orchestrator, registry=ToolRegistry())
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert orchestrator.deliver_fn is not None
+            orchestrator.deliver_fn("web:operator", "/tmp/report.pdf", is_artifact=True)
+
+            data = websocket.receive_json()
+
+    assert data["type"] == "background_message"
+    assert data["conversation_id"] == "web:operator"
+    assert data["text"] == "Attached the requested file."
+    assert data["artifacts"] == [artifact]
+    assert fake_store.saved_messages == [
+        (
+            ("web:operator", "bot", "Attached the requested file."),
+            {"is_error": False, "metadata": {"artifacts": [artifact]}},
+        )
+    ]
+
+
+def test_web_mini_agent_artifact_delivery_refuses_invalid_paths(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    from nullion.tools import ToolRegistry
+
+    class CapturingOrchestrator:
+        deliver_fn = None
+
+        def set_deliver_fn(self, deliver_fn):
+            self.deliver_fn = deliver_fn
+
+    class FakeChatStore:
+        def __init__(self) -> None:
+            self.saved_messages = []
+
+        def save_message(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.saved_messages.append((args, kwargs))
+            return len(self.saved_messages)
+
+    fake_store = FakeChatStore()
+    monkeypatch.setattr("nullion.chat_store.get_chat_store", lambda: fake_store)
+    monkeypatch.setattr(web_app, "_web_artifact_descriptors", lambda runtime, paths, principal_id=None: [])
+    orchestrator = CapturingOrchestrator()
+    app = create_app(SimpleNamespace(store=None), orchestrator=orchestrator, registry=ToolRegistry())
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/chat") as websocket:
+            assert orchestrator.deliver_fn is not None
+            orchestrator.deliver_fn("web:operator", "/tmp/report.pdf", is_artifact=True)
+
+            data = websocket.receive_json()
+
+    assert data["type"] == "background_message"
+    assert data["conversation_id"] == "web:operator"
+    assert "couldn't attach `report.pdf`" in data["text"]
+    assert "downloadable workspace" in data["text"]
+    assert "/tmp/report.pdf" not in data["text"]
+    assert "artifacts" not in data
+    assert fake_store.saved_messages == [
+        (
+            ("web:operator", "bot", data["text"]),
+            {"is_error": True},
+        )
+    ]
+
+
+def test_web_download_click_does_not_bubble_into_chat_controls() -> None:
+    assert "event.stopPropagation();" in _HTML
+    assert "addMessage('bot', data.text || '', false, { artifacts: data.artifacts || [] });" in _HTML
+
+
+def test_delegated_runs_do_not_mark_writing_response_done_early() -> None:
+    assert 'if not result.get("mini_agent_dispatch"):' in _SOURCE
+    dispatch_branch = _SOURCE[
+        _SOURCE.index('if dispatch_result is not None and getattr(dispatch_result, "dispatched", True):'):
+        _SOURCE.index('try:\n        with reminder_chat_context(conv_id):')
+    ]
+    assert '"mini-agents", "Mini-Agents", "running"' in dispatch_branch
+    assert '"respond", "Writing response"' not in dispatch_branch
 
 
 def test_task_status_cards_use_structured_checklist_renderer() -> None:
@@ -705,6 +834,13 @@ def test_web_chat_allows_parallel_active_turns() -> None:
     assert "sendMessage = async function() {\n  if (chatTurnInFlight())" not in _HTML
     assert "beginTurnUi(turnId, displayText);" in _HTML
     assert "finishTurnUi(data.turn_id || null);" in _HTML
+
+
+def test_chat_restore_does_not_rerender_after_user_interaction() -> None:
+    assert "let _chatUserInteractedSinceLoad = false;" in _HTML
+    assert "_chatUserInteractedSinceLoad = true;" in _HTML
+    assert "if (_chatUserInteractedSinceLoad) {" in _HTML
+    assert "document.getElementById('send-btn').addEventListener('click', () => sendMessage());" in _HTML
 
 
 def test_websocket_chat_dispatches_turns_concurrently() -> None:

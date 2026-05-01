@@ -54,6 +54,67 @@ def test_artifact_paths_from_completed_tool_results_are_deduped() -> None:
     assert artifact_paths_from_tool_results(results) == ["/tmp/a.txt", "/tmp/b.txt", "/tmp/c.txt"]
 
 
+def test_deep_agent_prompt_pins_deliverables_to_workspace_artifacts(tmp_path, monkeypatch) -> None:
+    from nullion.deep_agent_runner import _system_prompt_for_task
+    from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path))
+    task = TaskRecord(
+        task_id="t1",
+        group_id="g1",
+        conversation_id="web:operator",
+        principal_id="web:operator",
+        title="Save News to Text",
+        description="Fetch CBS news and send me a text file",
+        status=TaskStatus.QUEUED,
+        priority=TaskPriority.NORMAL,
+        allowed_tools=["web_fetch", "file_write"],
+        dependencies=[],
+    )
+
+    prompt = _system_prompt_for_task(MiniAgentConfig(agent_id="a1", task=task), context_in=None)
+
+    assert str(workspace_storage_roots_for_principal("web:operator").artifacts) in prompt
+    assert "Do not use /tmp, /var/tmp" in prompt
+    assert "returns a path in the workspace artifact directory" in prompt
+
+
+def test_deep_agent_rejects_file_delivery_outside_workspace_artifacts(tmp_path, monkeypatch) -> None:
+    from nullion.deep_agent_runner import (
+        _artifact_delivery_failure_for_task,
+        _deliverable_artifact_paths_for_task,
+    )
+    from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path))
+    roots = workspace_storage_roots_for_principal("web:operator")
+    valid_artifact = roots.artifacts / "cbs_news.txt"
+    valid_artifact.write_text("news", encoding="utf-8")
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("news", encoding="utf-8")
+    task = TaskRecord(
+        task_id="t1",
+        group_id="g1",
+        conversation_id="web:operator",
+        principal_id="web:operator",
+        title="Save News to Text",
+        description="Fetch CBS news and send me a text file",
+        status=TaskStatus.QUEUED,
+        priority=TaskPriority.NORMAL,
+        allowed_tools=["web_fetch", "file_write"],
+        dependencies=[],
+    )
+    config = MiniAgentConfig(agent_id="a1", task=task)
+
+    assert _deliverable_artifact_paths_for_task(config, [str(outside_file), str(valid_artifact)]) == [
+        str(valid_artifact)
+    ]
+    failure = _artifact_delivery_failure_for_task(config, [str(outside_file)], [])
+    assert failure is not None
+    assert "outside the downloadable workspace" in failure
+    assert str(roots.artifacts) in failure
+
+
 def test_response_fulfillment_does_not_treat_file_read_path_as_attachment(tmp_path) -> None:
     decision = evaluate_response_fulfillment(
         store=Store(None),
@@ -464,4 +525,3 @@ async def test_mini_agent_empty_final_answer_is_failure() -> None:
     assert result.status == "failure"
     assert result.error == "Deep Agent finished without a final answer."
     assert result.output is None
-

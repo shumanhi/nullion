@@ -72,12 +72,13 @@ norecursedirs = [
 
 [tool.coverage.run]
 data_file = ".pytest_cache/.coverage"
+source = ["src/nullion"]
 
 [tool.coverage.html]
 directory = ".pytest_cache/htmlcov"
 
 [tool.coverage.report]
-fail_under = 50
+fail_under = 70
 exclude_also = [
   "def create_app\\(",
   "def _enforce_web_response_fulfillment\\(",

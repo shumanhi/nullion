@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -290,7 +291,10 @@ async def test_orchestrator_can_resume_paused_delegated_task(monkeypatch) -> Non
 @pytest.mark.asyncio
 async def test_deepagents_default_path_tracks_artifacts_and_progress(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("NULLION_DEEP_AGENTS_MODEL", raising=False)
-    artifact = tmp_path / "out.txt"
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path))
+    from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+    artifact = workspace_storage_roots_for_principal("workspace:demo").artifacts / "out.txt"
 
     class Client:
         def __init__(self) -> None:
@@ -342,6 +346,7 @@ async def test_deepagents_default_path_tracks_artifacts_and_progress(monkeypatch
             ]
 
         def invoke(self, invocation):
+            Path(invocation.arguments["path"]).write_text(invocation.arguments.get("content", ""), encoding="utf-8")
             return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"path": invocation.arguments["path"]})
 
         def run_cleanup_hooks(self, *, scope_id):
