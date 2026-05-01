@@ -302,6 +302,10 @@ def test_skill_pack_auth_provider_catalog_is_skill_agnostic(tmp_path, monkeypatc
     )
     assert not any(provider["skill_pack_id"] == "custom/notes" for provider in providers)
     assert not any(provider["provider_id"] == "maton_connector_provider" for provider in providers)
+    assert any(
+        provider["provider_id"] == "imap_smtp_provider" and provider["shared_allowed"] is True
+        for provider in providers
+    )
 
 
 def test_skill_pack_auth_provider_catalog_includes_active_external_connectors(monkeypatch) -> None:

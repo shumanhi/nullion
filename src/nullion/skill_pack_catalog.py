@@ -118,9 +118,9 @@ SKILL_PACK_CATALOG: tuple[SkillPackCatalogEntry, ...] = (
             SkillPackAuthProvider(
                 provider_id="imap_smtp_provider",
                 name="IMAP / SMTP",
-                credential_policy="workspace",
-                shared_allowed=False,
-                notes="Use app passwords or account-specific credentials per workspace.",
+                credential_policy="admin_decides",
+                shared_allowed=True,
+                notes="Use workspace-specific personal mailboxes or an intentionally shared service mailbox.",
             ),
         ),
     ),
