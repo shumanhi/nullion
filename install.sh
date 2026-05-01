@@ -987,6 +987,27 @@ ensure_git() {
     print_ok "git installed."
 }
 
+checkout_latest_release() {
+    local source_dir="$1"
+    local latest_tag
+
+    if [[ "$(git -C "$source_dir" rev-parse --is-shallow-repository 2>/dev/null || echo false)" == "true" ]]; then
+        git -C "$source_dir" fetch --quiet --unshallow origin
+    else
+        git -C "$source_dir" fetch --quiet origin main
+    fi
+    git -C "$source_dir" fetch --quiet --prune --prune-tags --force origin "refs/tags/*:refs/tags/*"
+    latest_tag="$(git -C "$source_dir" describe --tags --abbrev=0 --match "v[0-9]*" origin/main)"
+    if [[ -z "$latest_tag" ]]; then
+        print_err "No release tags found in Nullion repository."
+        exit 1
+    fi
+    git -C "$source_dir" reset --quiet --hard "$latest_tag"
+    git -C "$source_dir" clean --quiet -ffd
+    NULLION_VERSION="${latest_tag#v}"
+    print_ok "Checked out latest release $latest_tag."
+}
+
 # ── banner ────────────────────────────────────────────────────────────────────
 clear 2>/dev/null || true
 echo
@@ -1097,15 +1118,14 @@ else
     print_info "Cloning Nullion from GitHub..."
     ensure_git
     SOURCE_DIR="$NULLION_INSTALL_DIR/src"
+    cd "$NULLION_INSTALL_DIR"
     if [[ -d "$SOURCE_DIR/.git" ]]; then
         git -C "$SOURCE_DIR" remote set-url origin "$REPO_URL" >/dev/null 2>&1 || true
-        git -C "$SOURCE_DIR" fetch --quiet --depth 1 origin main
-        git -C "$SOURCE_DIR" reset --quiet --hard FETCH_HEAD
-        git -C "$SOURCE_DIR" clean --quiet -ffd
-        print_ok "Updated to latest."
+        checkout_latest_release "$SOURCE_DIR"
     else
-        git clone --depth 1 "$REPO_URL" "$SOURCE_DIR"
+        git clone --quiet "$REPO_URL" "$SOURCE_DIR"
         print_ok "Cloned."
+        checkout_latest_release "$SOURCE_DIR"
     fi
 fi
 

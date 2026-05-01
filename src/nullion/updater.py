@@ -1,9 +1,9 @@
 """Safe updater with automatic rollback.
 
 Flow:
-  1. fetch()     — git fetch, compare HEAD vs origin/main
+  1. fetch()     — git fetch, compare HEAD vs the selected update target
   2. snapshot()  — save pip freeze + current git commit when an update exists
-  3. apply()     — reset source to origin/main + pip install -e .
+  3. apply()     — reset source to the target commit + pip install -e .
   4. health()    — import check + /api/status + messaging bootstrap probes
   5. rollback()  — restore pip state + git reset if health fails
 
@@ -157,9 +157,16 @@ def _fetch_update_refs(cwd: Path | None = None) -> None:
     code, out = _git("fetch", "--quiet", "origin", "main", cwd=cwd)
     if code != 0:
         raise RuntimeError(out or "git fetch failed")
-    # Release tags may be moved while preserving a single public root commit.
-    # Force-refreshing tags is best-effort so a stale tag never blocks updates.
-    _git("fetch", "--quiet", "--force", "origin", "refs/tags/*:refs/tags/*", cwd=cwd)
+    code, out = _git("rev-parse", "--is-shallow-repository", cwd=cwd)
+    if code == 0 and out.strip() == "true":
+        code, out = _git("fetch", "--quiet", "--unshallow", "origin", cwd=cwd)
+        if code != 0:
+            raise RuntimeError(out or "git unshallow failed")
+    # Force-refresh and prune release tags so a deleted/stale local tag cannot
+    # masquerade as the latest available release.
+    code, out = _git("fetch", "--quiet", "--prune", "--prune-tags", "--force", "origin", "refs/tags/*:refs/tags/*", cwd=cwd)
+    if code != 0:
+        raise RuntimeError(out or "git tag fetch failed")
 
 
 def _remote_commit(cwd: Path | None = None) -> str:
@@ -171,13 +178,12 @@ def _remote_commit(cwd: Path | None = None) -> str:
 
 
 def _latest_release_tag(cwd: Path | None = None) -> str:
-    code, out = _git("tag", "--list", "v[0-9]*", "--sort=-version:refname", cwd=cwd)
+    code, out = _git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", "origin/main", cwd=cwd)
     if code != 0:
-        raise RuntimeError(out or "could not list release tags")
-    for line in out.splitlines():
-        tag = line.strip()
-        if tag:
-            return tag
+        raise RuntimeError(out or "could not resolve latest release tag")
+    tag = out.strip()
+    if tag:
+        return tag
     raise RuntimeError("No release tags found. Use `nullion update --hash` to update to the latest repository commit.")
 
 

@@ -721,6 +721,40 @@ function Ensure-Git {
     Write-Ok "git installed."
 }
 
+function Checkout-LatestRelease {
+    param([string]$SourceDir)
+
+    $isShallow = (& git -C $SourceDir rev-parse --is-shallow-repository 2>$null)
+    if ($isShallow -eq "true") {
+        & git -C $SourceDir fetch --quiet --unshallow origin
+        if ($LASTEXITCODE -ne 0) { throw "git fetch --unshallow failed" }
+    } else {
+        & git -C $SourceDir fetch --quiet origin main
+        if ($LASTEXITCODE -ne 0) { throw "git fetch origin main failed" }
+    }
+
+    & git -C $SourceDir fetch --quiet --prune --prune-tags --force origin "refs/tags/*:refs/tags/*"
+    if ($LASTEXITCODE -ne 0) { throw "git fetch release tags failed" }
+
+    $latestTag = (& git -C $SourceDir describe --tags --abbrev=0 --match "v[0-9]*" origin/main)
+    if (-not $latestTag) {
+        Write-Err "No release tags found in Nullion repository."
+        exit 1
+    }
+
+    & git -C $SourceDir reset --quiet --hard $latestTag
+    if ($LASTEXITCODE -ne 0) { throw "git reset to $latestTag failed" }
+    & git -C $SourceDir clean --quiet -ffd
+    if ($LASTEXITCODE -ne 0) { throw "git clean failed" }
+
+    if ($latestTag.StartsWith("v")) {
+        $script:NULLION_VERSION = $latestTag.Substring(1)
+    } else {
+        $script:NULLION_VERSION = $latestTag
+    }
+    Write-Ok "Checked out latest release $latestTag."
+}
+
 function Get-PythonExe {
     # Try well-known names in PATH first
     foreach ($candidate in @("python3.13","python3.12","python3.11","python3","python")) {
@@ -834,12 +868,18 @@ if (Test-Path (Join-Path $SCRIPT_DIR "pyproject.toml")) {
     Write-Info "Cloning Nullion from GitHub..."
     Ensure-Git
     $SOURCE_DIR = Join-Path $NULLION_DIR "src"
-    if (Test-Path (Join-Path $SOURCE_DIR ".git")) {
-        git -C $SOURCE_DIR pull --quiet
-        Write-Ok "Updated to latest."
-    } else {
-        git clone --depth 1 $REPO_URL $SOURCE_DIR
-        Write-Ok "Cloned."
+    Push-Location $NULLION_DIR
+    try {
+        if (Test-Path (Join-Path $SOURCE_DIR ".git")) {
+            git -C $SOURCE_DIR remote set-url origin $REPO_URL 2>$null
+            Checkout-LatestRelease $SOURCE_DIR
+        } else {
+            git clone --quiet $REPO_URL $SOURCE_DIR
+            Write-Ok "Cloned."
+            Checkout-LatestRelease $SOURCE_DIR
+        }
+    } finally {
+        Pop-Location
     }
 }
 
