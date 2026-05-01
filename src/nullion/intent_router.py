@@ -243,6 +243,8 @@ def _is_referential_follow_up(normalized_text: str) -> bool:
         return False
 
     first = words[0]
+    if first.startswith("c") and first[1:] in _REFERENTIAL_QUESTION_WORDS:
+        first = first[1:]
     if first in _REFERENTIAL_AUXILIARY_VERBS:
         return words[1] in _REFERENTIAL_SUBJECTS
 
@@ -253,7 +255,7 @@ def _is_referential_follow_up(normalized_text: str) -> bool:
     if words[1] in _REFERENTIAL_AUXILIARY_VERBS:
         reference_index = 2
 
-    return reference_index < len(words) and words[reference_index] in _REFERENTIAL_SUBJECTS
+    return reference_index < len(words) and any(word in _REFERENTIAL_SUBJECTS for word in words[reference_index:])
 
 
 def _intent_normalize_node(state: _IntentClassificationState) -> dict[str, object]:
@@ -496,6 +498,12 @@ def _turn_disposition_followup_node(state: _TurnDispositionState) -> dict[str, o
         active_branch_exists=active_branch_exists,
         previous_assistant_message=previous_assistant_message,
     ):
+        return {"decision": ConversationTurnDispositionDecision(
+            disposition=ConversationTurnDisposition.CONTINUE,
+            reason="referential_follow_up",
+        )}
+
+    if active_branch_exists and _is_referential_follow_up(normalized):
         return {"decision": ConversationTurnDispositionDecision(
             disposition=ConversationTurnDisposition.CONTINUE,
             reason="referential_follow_up",

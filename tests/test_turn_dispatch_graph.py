@@ -47,6 +47,19 @@ def test_turn_dispatch_runs_additive_standalone_request_in_parallel() -> None:
     assert decision.disposition is ConversationTurnDisposition.INDEPENDENT
 
 
+@pytest.mark.parametrize("text", ["where did you find this cron?", "cwhere did you find this cron?"])
+def test_turn_dispatch_waits_for_referential_question(text: str) -> None:
+    decision = route_turn_dispatch(
+        text,
+        active_turn_ids=("turn:first", "turn:latest"),
+    )
+
+    assert decision.policy is TurnDispatchPolicy.WAIT_FOR_ACTIVE
+    assert decision.dependency_turn_ids == ("turn:latest",)
+    assert decision.disposition is ConversationTurnDisposition.CONTINUE
+    assert decision.reason == "referential_follow_up"
+
+
 def test_turn_dispatch_has_no_dependency_without_active_turn() -> None:
     decision = route_turn_dispatch("add images too", active_turn_ids=())
 
