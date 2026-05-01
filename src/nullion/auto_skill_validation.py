@@ -105,6 +105,41 @@ def build_auto_skill_validation_task(
     return task
 
 
+async def run_auto_skill_validation(
+    proposal: Any,
+    *,
+    model_client: Any,
+    tool_registry: Any,
+    policy_store: Any,
+    approval_store: Any,
+    context_bus: Any,
+    progress_queue: Any,
+    group_id: str,
+    conversation_id: str,
+    principal_id: str,
+    agent_id: str = "auto-skill-validator",
+    runner: Any = None,
+):
+    from nullion.mini_agent_runner import MiniAgentConfig, MiniAgentRunner
+
+    task = build_auto_skill_validation_task(
+        proposal,
+        group_id=group_id,
+        conversation_id=conversation_id,
+        principal_id=principal_id,
+    )
+    effective_runner = runner or MiniAgentRunner()
+    return await effective_runner.run(
+        MiniAgentConfig(agent_id=agent_id, task=task),
+        anthropic_client=model_client,
+        tool_registry=tool_registry,
+        policy_store=policy_store,
+        approval_store=approval_store,
+        context_bus=context_bus,
+        progress_queue=progress_queue,
+    )
+
+
 def _skill_markdown(*, slug: str, title: str, summary: str, trigger: str, steps: list[str]) -> str:
     lines = [
         "---",
@@ -134,4 +169,5 @@ __all__ = [
     "build_auto_skill_validation_plan",
     "build_auto_skill_validation_snapshot",
     "build_auto_skill_validation_task",
+    "run_auto_skill_validation",
 ]
