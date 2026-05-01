@@ -23,6 +23,8 @@ from nullion.tools import (
     _boundary_policy_principal_for_fact,
     _boundary_risk_score,
     _build_file_patch_handler,
+    _build_pdf_create_handler,
+    _build_pdf_edit_handler,
     _build_file_read_handler,
     _build_file_write_handler,
     _build_connector_request_handler,
@@ -75,6 +77,8 @@ def test_tool_status_registry_schemas_and_env_flags(monkeypatch, tmp_path) -> No
 
     assert _default_input_schema_for_tool("file_read")["required"] == ["path"]
     assert _default_input_schema_for_tool("file_write")["required"] == ["path", "content"]
+    assert "image_paths" in _default_input_schema_for_tool("pdf_create")["properties"]
+    assert _default_input_schema_for_tool("pdf_edit")["required"] == ["input_path"]
     assert _default_input_schema_for_tool("unknown")["type"] == "object"
 
     registry = ToolRegistry(plugin_registration_allowed=False, filesystem_allowed_roots=[tmp_path])
@@ -495,6 +499,56 @@ def test_file_read_write_patch_and_workspace_summary_handlers(tmp_path) -> None:
     assert summary.status == "completed"
     assert summary.output["file_count"] == 1
     assert summary.output["extensions"] == [{"extension": ".txt", "count": 1}]
+
+
+def test_pdf_create_and_edit_handlers_are_local_artifact_tools(tmp_path) -> None:
+    from PIL import Image
+    from pypdf import PdfReader
+
+    first_image = tmp_path / "first.png"
+    second_image = tmp_path / "second.png"
+    Image.new("RGB", (80, 60), "blue").save(first_image)
+    Image.new("RGB", (60, 80), "green").save(second_image)
+
+    create_handler = _build_pdf_create_handler(workspace_root=tmp_path, include_principal_workspace=False)
+    created_path = tmp_path / "combined.pdf"
+    created = create_handler(
+        ToolInvocation(
+            "inv",
+            "pdf_create",
+            "operator",
+            {
+                "output_path": str(created_path),
+                "image_paths": [str(first_image), str(second_image)],
+                "title": "Birds",
+            },
+        )
+    )
+
+    assert created.status == "completed"
+    assert created.output["artifact_path"] == str(created_path)
+    assert created_path.read_bytes().startswith(b"%PDF")
+    assert len(PdfReader(str(created_path)).pages) == 2
+
+    edit_handler = _build_pdf_edit_handler(workspace_root=tmp_path, include_principal_workspace=False)
+    edited_path = tmp_path / "edited.pdf"
+    edited = edit_handler(
+        ToolInvocation(
+            "inv",
+            "pdf_edit",
+            "operator",
+            {
+                "input_path": str(created_path),
+                "output_path": str(edited_path),
+                "page_numbers": [2, 1],
+                "append_text_pages": ["A local text appendix."],
+            },
+        )
+    )
+
+    assert edited.status == "completed"
+    assert edited.output["artifact_path"] == str(edited_path)
+    assert len(PdfReader(str(edited_path)).pages) == 3
 
 
 def test_file_handlers_allow_trusted_filesystem_selector_without_workspace_root(tmp_path) -> None:

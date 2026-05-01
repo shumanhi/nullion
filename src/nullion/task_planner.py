@@ -356,6 +356,9 @@ def _tool_scope_decision_for_clause(clause: str) -> ToolScopeDecision:
     elif word_set & {"search", "find"}:
         scope.append("web_search")
         evidence.append("search_intent")
+    if word_set & {"pdf"}:
+        scope.append("pdf_create")
+        evidence.append("pdf_deliverable")
     return ToolScopeDecision(
         tool_scope=tuple(dict.fromkeys(scope)),
         evidence=tuple(dict.fromkeys(evidence)),

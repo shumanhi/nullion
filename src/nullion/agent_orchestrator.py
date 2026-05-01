@@ -60,7 +60,7 @@ def _artifact_paths_from_tool_result(result: ToolResult, *, runtime_store=None) 
         return []
     output = result.output if isinstance(result.output, dict) else {}
     forwarded_paths: list[str] = []
-    for key in ("artifact_paths", "artifacts"):
+    for key in ("artifact_path", "artifact_paths", "artifacts"):
         value = output.get(key)
         if isinstance(value, list):
             forwarded_paths.extend(path for path in value if isinstance(path, str) and path)

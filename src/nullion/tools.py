@@ -20,6 +20,8 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
+import textwrap
 import threading
 from typing import Callable, Iterable, Protocol
 import urllib.request
@@ -745,6 +747,75 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 "content": {"type": "string", "description": "Text content to write."},
             },
             "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+        "pdf_create": {
+            "type": "object",
+            "properties": {
+                "output_path": {
+                    "type": "string",
+                    "description": "Destination .pdf path. If omitted, Nullion creates one in the artifact directory.",
+                },
+                "image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Existing image artifact paths to place into the PDF, one image per page.",
+                },
+                "text_pages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional plain text pages to render into the PDF.",
+                },
+                "title": {"type": "string", "description": "Optional title used for metadata and default filename."},
+                "page_size": {
+                    "type": "string",
+                    "enum": ["letter", "a4"],
+                    "description": "Optional page size. Defaults to letter.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "pdf_edit": {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string", "description": "Existing PDF path to edit."},
+                "output_path": {
+                    "type": "string",
+                    "description": "Destination .pdf path. If omitted, Nullion creates one in the artifact directory.",
+                },
+                "page_numbers": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional 1-based page numbers to keep or reorder.",
+                },
+                "rotate_degrees": {
+                    "type": "integer",
+                    "enum": [0, 90, 180, 270],
+                    "description": "Optional clockwise rotation applied to kept pages.",
+                },
+                "append_pdf_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional existing PDFs to append after the kept input pages.",
+                },
+                "append_image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional image paths to append as new PDF pages.",
+                },
+                "append_text_pages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional plain text pages to append.",
+                },
+                "title": {"type": "string", "description": "Optional title used for metadata and default filename."},
+                "page_size": {
+                    "type": "string",
+                    "enum": ["letter", "a4"],
+                    "description": "Optional page size for appended image/text pages. Defaults to letter.",
+                },
+            },
+            "required": ["input_path"],
             "additionalProperties": False,
         },
         "terminal_exec": {
@@ -2283,6 +2354,424 @@ def _build_file_write_handler(
     return handler
 
 
+_PDF_PAGE_SIZES = {
+    "letter": (1275, 1650),
+    "a4": (1240, 1754),
+}
+
+
+def _pdf_default_output_path(invocation: ToolInvocation, *, title: str, roots: tuple[Path, ...]) -> Path:
+    try:
+        from nullion.artifacts import artifact_path_for_generated_workspace_file
+
+        return artifact_path_for_generated_workspace_file(
+            principal_id=invocation.principal_id,
+            suffix=".pdf",
+            stem=_safe_pdf_stem(title),
+        ).resolve()
+    except Exception:
+        root = roots[0]
+        return (root / f"{_safe_pdf_stem(title)}.pdf").resolve()
+
+
+def _safe_pdf_stem(title: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(title or "nullion-artifact").strip().lower())
+    cleaned = cleaned.strip(".-")
+    return cleaned[:48] or "nullion-artifact"
+
+
+def _coerce_string_list(value: object, *, field: str) -> tuple[list[str], str | None]:
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], f"{field} must be a list of strings"
+    items = [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()]
+    return items, None
+
+
+def _image_to_pdf_page(path: Path, *, page_size: tuple[int, int]):
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image)
+        if image.mode not in {"RGB", "L"}:
+            background = Image.new("RGB", image.size, "white")
+            if image.mode in {"RGBA", "LA"}:
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+        else:
+            image = image.convert("RGB")
+        fitted = ImageOps.contain(image, page_size)
+        page = Image.new("RGB", page_size, "white")
+        offset = ((page_size[0] - fitted.width) // 2, (page_size[1] - fitted.height) // 2)
+        page.paste(fitted, offset)
+        return page
+
+
+def _text_to_pdf_page(text: str, *, title: str, page_size: tuple[int, int]):
+    from PIL import Image, ImageDraw, ImageFont
+
+    page = Image.new("RGB", page_size, "white")
+    draw = ImageDraw.Draw(page)
+    font = ImageFont.load_default()
+    margin = 84
+    y = margin
+    if title.strip():
+        draw.text((margin, y), title.strip()[:120], fill="black", font=font)
+        y += 34
+    max_chars = max(40, (page_size[0] - margin * 2) // 8)
+    for paragraph in str(text or "").splitlines() or [""]:
+        lines = textwrap.wrap(paragraph, width=max_chars) or [""]
+        for line in lines:
+            if y > page_size[1] - margin:
+                return page
+            draw.text((margin, y), line, fill="black", font=font)
+            y += 20
+        y += 10
+    return page
+
+
+def _build_pdf_pages(
+    *,
+    image_paths: list[str],
+    text_pages: list[str],
+    page_size: tuple[int, int],
+    roots: tuple[Path, ...],
+    invocation: ToolInvocation,
+    title: str,
+) -> tuple[list[object], list[str], str | None]:
+    pages = []
+    source_images: list[str] = []
+    for raw_path in image_paths:
+        image_path = Path(raw_path).expanduser().resolve()
+        if not _path_within_any_root(image_path, roots) and not _is_approved_filesystem_path(
+            image_path, invocation.trusted_filesystem_selectors
+        ):
+            return pages, source_images, f"Image path is outside workspace root: {image_path}"
+        if not image_path.is_file():
+            return pages, source_images, f"Image file not found: {image_path}"
+        try:
+            pages.append(_image_to_pdf_page(image_path, page_size=page_size))
+        except Exception as exc:
+            return pages, source_images, f"Could not load image file {image_path}: {exc}"
+        source_images.append(str(image_path))
+    for text in text_pages:
+        pages.append(_text_to_pdf_page(text, title=title, page_size=page_size))
+    return pages, source_images, None
+
+
+def _save_pdf_pages(path: Path, pages: list[object], *, title: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pages[0].save(
+        path,
+        "PDF",
+        save_all=True,
+        append_images=pages[1:],
+        resolution=150.0,
+        title=title or None,
+    )
+
+
+def _build_pdf_create_handler(
+    workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
+    *,
+    include_principal_workspace: bool = True,
+) -> ToolHandler:
+    resolved_root = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        effective_roots = _effective_filesystem_roots(
+            invocation=invocation,
+            resolved_root=resolved_root,
+            resolved_allowed_roots=resolved_allowed_roots,
+            include_principal_workspace=include_principal_workspace,
+        )
+        if not effective_roots:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="pdf_create requires workspace_root or allowed_roots",
+            )
+
+        image_paths, image_error = _coerce_string_list(invocation.arguments.get("image_paths"), field="image_paths")
+        if image_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, image_error)
+        text_pages, text_error = _coerce_string_list(invocation.arguments.get("text_pages"), field="text_pages")
+        if text_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, text_error)
+        if not image_paths and not text_pages:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="pdf_create requires at least one image_paths or text_pages entry",
+            )
+
+        title = str(invocation.arguments.get("title") or "Nullion PDF").strip()
+        raw_page_size = str(invocation.arguments.get("page_size") or "letter").strip().lower()
+        page_size = _PDF_PAGE_SIZES.get(raw_page_size)
+        if page_size is None:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=f"Unsupported page_size: {raw_page_size}",
+            )
+
+        raw_output_path = invocation.arguments.get("output_path")
+        if isinstance(raw_output_path, str) and raw_output_path.strip():
+            output_path = Path(raw_output_path).expanduser().resolve()
+            if output_path.suffix.lower() != ".pdf":
+                output_path = output_path.with_suffix(".pdf")
+        else:
+            output_path = _pdf_default_output_path(invocation, title=title, roots=effective_roots)
+
+        if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
+            output_path, invocation.trusted_filesystem_selectors
+        ):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=f"Output path is outside workspace root: {output_path}",
+            )
+
+        pages, source_images, page_error = _build_pdf_pages(
+            image_paths=image_paths,
+            text_pages=text_pages,
+            page_size=page_size,
+            roots=effective_roots,
+            invocation=invocation,
+            title=title,
+        )
+        if page_error is not None:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=page_error,
+            )
+        try:
+            _save_pdf_pages(output_path, pages, title=title)
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=f"PDF creation failed: {exc}",
+            )
+        finally:
+            for page in pages:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+        size_bytes = output_path.stat().st_size if output_path.exists() else 0
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "path": str(output_path),
+                "artifact_path": str(output_path),
+                "artifact_paths": [str(output_path)],
+                "bytes_written": size_bytes,
+                "page_count": len(source_images) + len(text_pages),
+                "source_image_paths": source_images,
+            },
+            error=None,
+        )
+
+    return handler
+
+
+def _build_pdf_edit_handler(
+    workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
+    *,
+    include_principal_workspace: bool = True,
+) -> ToolHandler:
+    resolved_root = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=f"pdf_edit requires the pypdf package: {exc}",
+            )
+
+        effective_roots = _effective_filesystem_roots(
+            invocation=invocation,
+            resolved_root=resolved_root,
+            resolved_allowed_roots=resolved_allowed_roots,
+            include_principal_workspace=include_principal_workspace,
+        )
+        if not effective_roots:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "pdf_edit requires workspace_root or allowed_roots")
+
+        raw_input_path = invocation.arguments.get("input_path")
+        if not isinstance(raw_input_path, str) or not raw_input_path.strip():
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "Missing required argument: input_path")
+        input_path = Path(raw_input_path).expanduser().resolve()
+        if not _path_within_any_root(input_path, effective_roots) and not _is_approved_filesystem_path(
+            input_path, invocation.trusted_filesystem_selectors
+        ):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Input path is outside workspace root: {input_path}")
+        if not input_path.is_file():
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"PDF file not found: {input_path}")
+
+        append_pdf_paths, append_pdf_error = _coerce_string_list(invocation.arguments.get("append_pdf_paths"), field="append_pdf_paths")
+        if append_pdf_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, append_pdf_error)
+        append_image_paths, append_image_error = _coerce_string_list(invocation.arguments.get("append_image_paths"), field="append_image_paths")
+        if append_image_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, append_image_error)
+        append_text_pages, append_text_error = _coerce_string_list(invocation.arguments.get("append_text_pages"), field="append_text_pages")
+        if append_text_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, append_text_error)
+
+        title = str(invocation.arguments.get("title") or input_path.stem or "Nullion PDF").strip()
+        raw_page_size = str(invocation.arguments.get("page_size") or "letter").strip().lower()
+        page_size = _PDF_PAGE_SIZES.get(raw_page_size)
+        if page_size is None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Unsupported page_size: {raw_page_size}")
+
+        raw_output_path = invocation.arguments.get("output_path")
+        if isinstance(raw_output_path, str) and raw_output_path.strip():
+            output_path = Path(raw_output_path).expanduser().resolve()
+            if output_path.suffix.lower() != ".pdf":
+                output_path = output_path.with_suffix(".pdf")
+        else:
+            output_path = _pdf_default_output_path(invocation, title=f"{title}-edited", roots=effective_roots)
+        if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
+            output_path, invocation.trusted_filesystem_selectors
+        ):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Output path is outside workspace root: {output_path}")
+
+        raw_page_numbers = invocation.arguments.get("page_numbers")
+        if raw_page_numbers is not None and not isinstance(raw_page_numbers, list):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "page_numbers must be a list of 1-based integers")
+        rotate_degrees = invocation.arguments.get("rotate_degrees")
+        if rotate_degrees is None:
+            rotate_degrees = 0
+        if not isinstance(rotate_degrees, int) or rotate_degrees not in {0, 90, 180, 270}:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "rotate_degrees must be one of 0, 90, 180, 270")
+
+        temp_paths: list[Path] = []
+        try:
+            reader = PdfReader(str(input_path))
+            writer = PdfWriter()
+            selected_pages = (
+                [int(page_number) - 1 for page_number in raw_page_numbers if isinstance(page_number, int)]
+                if isinstance(raw_page_numbers, list)
+                else list(range(len(reader.pages)))
+            )
+            if isinstance(raw_page_numbers, list) and len(selected_pages) != len(raw_page_numbers):
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "page_numbers must contain only integers")
+            for page_index in selected_pages:
+                if page_index < 0 or page_index >= len(reader.pages):
+                    return ToolResult(
+                        invocation.invocation_id,
+                        invocation.tool_name,
+                        "failed",
+                        {},
+                        f"page_numbers contains out-of-range page: {page_index + 1}",
+                    )
+                page = reader.pages[page_index]
+                if rotate_degrees:
+                    page = page.rotate(rotate_degrees)
+                writer.add_page(page)
+
+            for raw_path in append_pdf_paths:
+                append_path = Path(raw_path).expanduser().resolve()
+                if not _path_within_any_root(append_path, effective_roots) and not _is_approved_filesystem_path(
+                    append_path, invocation.trusted_filesystem_selectors
+                ):
+                    return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Append PDF path is outside workspace root: {append_path}")
+                if not append_path.is_file():
+                    return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Append PDF file not found: {append_path}")
+                append_reader = PdfReader(str(append_path))
+                for page in append_reader.pages:
+                    writer.add_page(page)
+
+            if append_image_paths or append_text_pages:
+                pages, _source_images, page_error = _build_pdf_pages(
+                    image_paths=append_image_paths,
+                    text_pages=append_text_pages,
+                    page_size=page_size,
+                    roots=effective_roots,
+                    invocation=invocation,
+                    title=title,
+                )
+                if page_error is not None:
+                    return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, page_error)
+                temp_file = tempfile.NamedTemporaryFile(prefix="nullion-pdf-append-", suffix=".pdf", delete=False)
+                temp_path = Path(temp_file.name)
+                temp_file.close()
+                temp_paths.append(temp_path)
+                try:
+                    _save_pdf_pages(temp_path, pages, title=title)
+                finally:
+                    for page in pages:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                append_reader = PdfReader(str(temp_path))
+                for page in append_reader.pages:
+                    writer.add_page(page)
+
+            if len(writer.pages) == 0:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "pdf_edit produced no pages")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("wb") as handle:
+                writer.write(handle)
+            page_count = len(PdfReader(str(output_path)).pages)
+        except Exception as exc:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"PDF edit failed: {exc}")
+        finally:
+            for temp_path in temp_paths:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        size_bytes = output_path.stat().st_size if output_path.exists() else 0
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "path": str(output_path),
+                "artifact_path": str(output_path),
+                "artifact_paths": [str(output_path)],
+                "bytes_written": size_bytes,
+                "page_count": page_count,
+            },
+            error=None,
+        )
+
+    return handler
+
+
 
 def _build_file_patch_handler(
     workspace_root: str | Path | None = None,
@@ -2727,6 +3216,46 @@ def _build_kernel_tool_registry(
                 timeout_seconds=20,
             ),
             _build_file_write_handler(
+                None
+                if workspace_root is None
+                else Path(workspace_root),
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
+            ),
+        )
+        registry.register(
+            ToolSpec(
+                name="pdf_create",
+                description=(
+                    "Create a real PDF artifact locally from existing image files and/or simple text pages. "
+                    "Use this for packaging images, reports, or notes into a PDF. "
+                    "Prefer this over terminal_exec or installing command-line PDF tools."
+                ),
+                risk_level=ToolRiskLevel.MEDIUM,
+                side_effect_class=ToolSideEffectClass.WRITE,
+                requires_approval=False,
+                timeout_seconds=30,
+            ),
+            _build_pdf_create_handler(
+                None
+                if workspace_root is None
+                else Path(workspace_root),
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
+            ),
+        )
+        registry.register(
+            ToolSpec(
+                name="pdf_edit",
+                description=(
+                    "Edit a PDF locally into a new PDF artifact: keep/reorder pages, rotate pages, "
+                    "append other PDFs, append image pages, or append text pages. "
+                    "Prefer this over terminal_exec or installing command-line PDF tools."
+                ),
+                risk_level=ToolRiskLevel.MEDIUM,
+                side_effect_class=ToolSideEffectClass.WRITE,
+                requires_approval=False,
+                timeout_seconds=30,
+            ),
+            _build_pdf_edit_handler(
                 None
                 if workspace_root is None
                 else Path(workspace_root),

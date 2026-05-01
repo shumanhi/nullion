@@ -17548,6 +17548,8 @@ def _run_turn_sync(
             "text": (
                 "Web delivery contract: when the user asks for a downloadable file, attachment, or saved artifact, "
                 f"write it with file_write under this workspace artifact directory: {workspace_artifact_root}. "
+                "When the user asks for a PDF, use pdf_create for new PDFs or pdf_edit for PDF changes; "
+                "do not ask to install PDF tools or use terminal_exec for normal PDF creation/editing. "
                 "For ordinary saved files, use this user's workspace file folder.\n\n"
                 f"{workspace_storage_text}\n\n"
                 "Do not say a file was saved, attached, or sent "

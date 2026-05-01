@@ -440,7 +440,7 @@ def _tool_group_for_name(name: str) -> str:
         return "browser"
     if lowered in {"web_search", "web_fetch"}:
         return "research"
-    if lowered in {"file_write", "render", "image_generate"} or "screenshot" in lowered:
+    if lowered in {"file_write", "pdf_create", "pdf_edit", "render", "image_generate"} or "screenshot" in lowered:
         return "artifact"
     if lowered in {"file_read", "file_search", "workspace_summary"}:
         return "repo_analysis"

@@ -68,7 +68,9 @@ def deep_agent_profile_names_for_task(task: Any) -> list[str]:
         profiles.append("repo_analysis")
     if any(tool.startswith("browser_") for tool in tools):
         profiles.append("browser")
-    if tools & {"file_write", "render", "image_generate"} or any(word in text for word in ("artifact", "report", "write file", "screenshot")):
+    if tools & {"file_write", "pdf_create", "pdf_edit", "render", "image_generate"} or any(
+        word in text for word in ("artifact", "report", "write file", "screenshot", "pdf")
+    ):
         profiles.append("artifact")
         profiles.append("artifact_verifier")
     if any(word in text for word in ("doctor", "health", "recover", "restart service", "approval")):
