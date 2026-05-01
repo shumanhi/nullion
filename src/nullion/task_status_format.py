@@ -58,7 +58,11 @@ def format_task_status_summary(
     lines: list[str] = []
     if planner_summary:
         lines.append(f"Planner: {planner_summary}")
-    lines.append(f"→ Working on {len(task_list)} tasks:")
+    count_label = f"{len(task_list)} task{'s' if len(task_list) != 1 else ''}"
+    if planner_summary.lower().startswith("parallel mission"):
+        lines.append(f"→ Running {count_label} in parallel:")
+    else:
+        lines.append(f"→ Working on {count_label}:")
     known_lines = status_lines or {}
     for task in task_list:
         fallback = format_task_status_line(

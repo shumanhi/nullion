@@ -28,6 +28,8 @@ _BLOCKED_DOWNLOAD_SUFFIXES = frozenset(
     }
 )
 _MEDIA_DIRECTIVE_PREFIX = "MEDIA:"
+_ARTIFACT_DIRECTIVE_PREFIX = "ARTIFACT:"
+_ATTACHMENT_DIRECTIVE_PREFIXES = (_MEDIA_DIRECTIVE_PREFIX, _ARTIFACT_DIRECTIVE_PREFIX)
 _MEDIA_DIRECTIVE_STRIP_CHARS = "\ufeff\u200b\u200c\u200d"
 
 
@@ -160,16 +162,22 @@ def is_safe_artifact_path(path: Path, *, artifact_root: Path | None = None) -> b
 
 def parse_media_directive_line(raw_line: str) -> MediaDirective | None:
     line = str(raw_line or "").strip().lstrip(_MEDIA_DIRECTIVE_STRIP_CHARS).strip()
-    media_index = line.find(_MEDIA_DIRECTIVE_PREFIX)
-    if media_index < 0:
+    directive_prefix = ""
+    media_index = -1
+    for prefix in _ATTACHMENT_DIRECTIVE_PREFIXES:
+        candidate_index = line.find(prefix)
+        if candidate_index >= 0 and (media_index < 0 or candidate_index < media_index):
+            directive_prefix = prefix
+            media_index = candidate_index
+    if media_index < 0 or not directive_prefix:
         return None
     raw_text = str(raw_line or "")
-    raw_media_index = raw_text.find(_MEDIA_DIRECTIVE_PREFIX)
+    raw_media_index = raw_text.find(directive_prefix)
     prefix = raw_text[:raw_media_index].strip() if raw_media_index >= 0 else ""
     prefix = prefix.lstrip(_MEDIA_DIRECTIVE_STRIP_CHARS).strip()
     if prefix and not prefix.lstrip("-*•> ").strip():
         prefix = ""
-    attachment_path = line[media_index:].removeprefix(_MEDIA_DIRECTIVE_PREFIX).strip()
+    attachment_path = line[media_index:].removeprefix(directive_prefix).strip()
     attachment_path = attachment_path.split(maxsplit=1)[0].strip("`'\"<>")
     if not attachment_path:
         return None

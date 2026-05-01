@@ -1042,6 +1042,148 @@ class TerminalExecutionResult:
     stderr: str
 
 
+_FIND_PATH_OPTION_ARITY = {
+    "-H": 0,
+    "-L": 0,
+    "-P": 0,
+    "-O0": 0,
+    "-O1": 0,
+    "-O2": 0,
+    "-O3": 0,
+    "-D": 1,
+}
+_FIND_EXPRESSION_STARTERS = {
+    "(",
+    "!",
+    "-",
+}
+
+
+def _terminal_filesystem_safety_denial(
+    command: str,
+    *,
+    allowed_roots: Iterable[Path] = (),
+) -> dict[str, object] | None:
+    """Reject shell commands likely to trigger broad local data traversal."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = shlex.split(command, posix=True)
+    except Exception:
+        return None
+    if not tokens:
+        return None
+
+    home = str(Path.home())
+    resolved_allowed_roots = tuple(Path(root).expanduser().resolve() for root in allowed_roots)
+    home_variants = {home, "$HOME", "${HOME}", "~"}
+    broad_root_variants = {"/", "/Users"}
+    protected_home_roots = {
+        str(Path(home) / "Library"),
+        str(Path(home) / "Library" / "Application Support"),
+        str(Path(home) / "Library" / "Containers"),
+        str(Path(home) / "Library" / "Group Containers"),
+    }
+
+    for index, token in enumerate(tokens):
+        if token != "find":
+            continue
+        path_tokens = _find_path_tokens(tokens[index + 1 :])
+        if not path_tokens:
+            path_tokens = ["."]
+        maxdepth = _find_maxdepth(tokens[index + 1 :])
+        for raw_path in path_tokens:
+            normalized_path = _normalize_find_root(raw_path, home=home)
+            if normalized_path in broad_root_variants:
+                return {
+                    "reason": "filesystem_traversal_denied",
+                    "command_family": "find",
+                    "path": raw_path,
+                    "message": "Refusing to run a broad filesystem search from the system or users root.",
+                }
+            if _path_is_allowed_by_config(normalized_path, resolved_allowed_roots):
+                continue
+            if normalized_path in home_variants and maxdepth != 1:
+                return {
+                    "reason": "filesystem_traversal_denied",
+                    "command_family": "find",
+                    "path": raw_path,
+                    "message": (
+                        "Refusing to recursively search the home folder because it can cross "
+                        "macOS-protected app data. Search a specific subfolder instead."
+                    ),
+                }
+            if any(_path_is_at_or_under(normalized_path, root) for root in protected_home_roots) and maxdepth != 1:
+                return {
+                    "reason": "filesystem_traversal_denied",
+                    "command_family": "find",
+                    "path": raw_path,
+                    "message": (
+                        "Refusing to recursively search protected home Library data. "
+                        "Use a specific file path or a narrow app folder with explicit approval."
+                    ),
+                }
+    return None
+
+
+def _find_path_tokens(tokens: list[str]) -> list[str]:
+    paths: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {";", "&&", "||", "|"}:
+            break
+        if token in _FIND_PATH_OPTION_ARITY:
+            index += 1 + _FIND_PATH_OPTION_ARITY[token]
+            continue
+        if any(token.startswith(prefix) for prefix in _FIND_EXPRESSION_STARTERS):
+            break
+        paths.append(token)
+        index += 1
+    return paths
+
+
+def _find_maxdepth(tokens: list[str]) -> int | None:
+    for index, token in enumerate(tokens):
+        if token == "-maxdepth" and index + 1 < len(tokens):
+            try:
+                return int(tokens[index + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _normalize_find_root(raw_path: str, *, home: str) -> str:
+    if raw_path in {"$HOME", "${HOME}", "~"}:
+        return raw_path
+    try:
+        expanded = Path(os.path.expandvars(raw_path)).expanduser()
+        return str(expanded.resolve(strict=False))
+    except Exception:
+        return raw_path
+
+
+def _path_is_at_or_under(path: str, root: str) -> bool:
+    try:
+        normalized_path = Path(path)
+        normalized_root = Path(root)
+        return normalized_path == normalized_root or normalized_root in normalized_path.parents
+    except Exception:
+        return False
+
+
+def _path_is_allowed_by_config(path: str, allowed_roots: Iterable[Path]) -> bool:
+    if path in {"$HOME", "${HOME}", "~"}:
+        path = str(Path.home())
+    try:
+        resolved_path = Path(os.path.expandvars(path)).expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    return any(_is_within_allowed_root(resolved_path, root) for root in allowed_roots)
+
+
 @dataclass(frozen=True, slots=True)
 class TerminalAttestationEvidence:
     format: str
@@ -1106,18 +1248,12 @@ class SubprocessTerminalExecutorBackend:
         policy: TerminalExecutionPolicy,
     ) -> TerminalExecutionResult:
         del policy
-        try:
-            argv = shlex.split(command)
-        except ValueError as exc:
-            return TerminalExecutionResult(
-                exit_code=64,
-                stdout="",
-                stderr=f"Invalid terminal command: {exc}",
-            )
+        shell_executable = os.environ.get("NULLION_TERMINAL_SHELL") or "/bin/sh"
         try:
             completed = subprocess.run(
-                argv,
-                shell=False,
+                command,
+                shell=True,
+                executable=shell_executable,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -3078,10 +3214,16 @@ def _build_workspace_summary_handler(
 
 def _build_terminal_exec_handler(
     workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
     terminal_executor_backend: TerminalExecutorBackend | None = None,
     terminal_attestation_verifier: TerminalAttestationVerifier | None = None,
 ) -> ToolHandler:
     cwd = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = (
+        tuple(Path(root).expanduser().resolve() for root in allowed_roots)
+        if allowed_roots is not None
+        else (() if cwd is None else (cwd,))
+    )
     backend = terminal_executor_backend or SubprocessTerminalExecutorBackend()
 
     def handler(invocation: ToolInvocation) -> ToolResult:
@@ -3093,6 +3235,19 @@ def _build_terminal_exec_handler(
                 status="failed",
                 output={},
                 error="Missing required argument: command",
+            )
+
+        filesystem_denial = _terminal_filesystem_safety_denial(
+            raw_command,
+            allowed_roots=resolved_allowed_roots,
+        )
+        if filesystem_denial is not None:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=filesystem_denial,
+                error=str(filesystem_denial.get("message") or "Filesystem traversal denied"),
             )
 
         egress_attempts = _egress_attempts_for_invocation(invocation)
@@ -3375,6 +3530,7 @@ def _build_kernel_tool_registry(
             ),
             _build_terminal_exec_handler(
                 workspace_root,
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
                 terminal_executor_backend=terminal_executor_backend,
                 terminal_attestation_verifier=terminal_attestation_verifier,
             ),

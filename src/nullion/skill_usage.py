@@ -4,29 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-import re
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 LEARNED_SKILL_INJECT_MIN_SCORE = 4
 DEFAULT_LEARNED_SKILL_USAGE_LIMIT = 3
-
-_ARTIFACT_REQUEST_PATTERN = re.compile(
-    r"\b(?:"
-    r"pdf|file|files|text file|attachment|attach|artifact|document|doc|docx|"
-    r"spreadsheet|sheet|xlsx|csv|image|images|picture|photo"
-    r")\b",
-    re.IGNORECASE,
-)
-_ARTIFACT_SKILL_PATTERN = re.compile(
-    r"\b(?:"
-    r"pdf|file|files|attachment|artifact|document|doc|docx|"
-    r"spreadsheet|xlsx|csv|image|images|picture|photo"
-    r")\b",
-    re.IGNORECASE,
-)
-
 
 @dataclass(frozen=True, slots=True)
 class LearnedSkillUsageHint:
@@ -45,8 +28,8 @@ class _SkillUsageState(TypedDict, total=False):
 
 def _skill_usage_artifact_signal_node(state: _SkillUsageState) -> dict[str, object]:
     return {
-        "message_requests_artifact": _ARTIFACT_REQUEST_PATTERN.search(state.get("user_message") or "") is not None,
-        "skill_produces_artifact": _ARTIFACT_SKILL_PATTERN.search(state.get("skill_text") or "") is not None,
+        "message_requests_artifact": False,
+        "skill_produces_artifact": False,
     }
 
 

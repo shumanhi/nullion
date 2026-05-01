@@ -45,100 +45,6 @@ class LiveInformationResolutionDecision:
     missing_plugins: tuple[str, ...]
 
 
-_LIVE_LOOKUP_CUE_TOKENS: frozenset[str] = frozenset(
-    {
-        "fetch",
-        "search",
-        "find",
-        "lookup",
-        "check",
-        "open",
-        "visit",
-        "read",
-        "curl",
-        "today",
-        "tomorrow",
-        "current",
-        "latest",
-        "live",
-        "price",
-        "prices",
-        "availability",
-        "available",
-        "hours",
-        "schedule",
-        "times",
-        "nearby",
-        "news",
-        "headline",
-        "headlines",
-        "stock",
-        "stocks",
-        "market",
-        "markets",
-    }
-)
-_LIVE_LOOKUP_CUE_PHRASES: tuple[str, ...] = (
-    "look up",
-    "near me",
-    "breaking news",
-    "top stories",
-)
-_NON_LIVE_INTERNAL_PHRASES: tuple[str, ...] = (
-    "your own code",
-    "own code",
-    "codebase",
-    "repo",
-    "repository",
-    "source code",
-    "tooling",
-    "capability",
-    "capabilities",
-    "what tools are available",
-)
-_NON_LIVE_INTERNAL_TOKENS: frozenset[str] = frozenset({"tool", "tools"})
-_NON_LIVE_EXECUTION_PHRASES: tuple[str, ...] = (
-    "python script",
-    "curl call",
-    "curl command",
-    "api call",
-)
-_NON_LIVE_EXECUTION_TOKENS: frozenset[str] = frozenset(
-    {
-        "script",
-        "execute",
-        "execution",
-        "terminal",
-        "shell",
-        "bash",
-        "command",
-    }
-)
-
-
-def _word_tokens(message: str) -> tuple[str, ...]:
-    tokens: list[str] = []
-    current: list[str] = []
-    for char in message:
-        if char.isalnum():
-            current.append(char)
-            continue
-        if current:
-            tokens.append("".join(current))
-            current = []
-    if current:
-        tokens.append("".join(current))
-    return tuple(tokens)
-
-
-def _contains_any_phrase(lowered_message: str, phrases: tuple[str, ...]) -> bool:
-    return any(phrase in lowered_message for phrase in phrases)
-
-
-def _contains_any_token(tokens: tuple[str, ...], candidates: frozenset[str]) -> bool:
-    return any(token in candidates for token in tokens)
-
-
 def _looks_like_domain(value: str) -> bool:
     if "." not in value:
         return False
@@ -176,44 +82,13 @@ def _contains_live_lookup_target(lowered_message: str, message: str) -> bool:
     return any(_looks_like_domain(part) or _looks_like_zip_code(part) for part in parts)
 
 
-def _contains_live_lookup_cue(lowered_message: str, tokens: tuple[str, ...]) -> bool:
-    return _contains_any_phrase(lowered_message, _LIVE_LOOKUP_CUE_PHRASES) or _contains_any_token(
-        tokens,
-        _LIVE_LOOKUP_CUE_TOKENS,
-    )
-
-
-def _contains_non_live_internal_signal(lowered_message: str, tokens: tuple[str, ...]) -> bool:
-    return _contains_any_phrase(lowered_message, _NON_LIVE_INTERNAL_PHRASES) or _contains_any_token(
-        tokens,
-        _NON_LIVE_INTERNAL_TOKENS,
-    )
-
-
-def _contains_non_live_execution_signal(lowered_message: str, tokens: tuple[str, ...]) -> bool:
-    return _contains_any_phrase(lowered_message, _NON_LIVE_EXECUTION_PHRASES) or _contains_any_token(
-        tokens,
-        _NON_LIVE_EXECUTION_TOKENS,
-    )
-
-
 def classify_live_information_route(message: str) -> LiveInformationRoute:
     stripped = message.strip()
     lowered_message = message.lower()
-    tokens = _word_tokens(lowered_message)
-    if _contains_non_live_internal_signal(lowered_message, tokens):
-        return LiveInformationRoute.NONE
     if _is_url_only_prompt(stripped):
         return LiveInformationRoute.LIVE_LOOKUP
-    if _contains_live_lookup_cue(lowered_message, tokens) and _contains_live_lookup_target(
-        lowered_message,
-        message,
-    ):
+    if _contains_live_lookup_target(lowered_message, message):
         return LiveInformationRoute.LIVE_LOOKUP
-    if _contains_live_lookup_cue(lowered_message, tokens):
-        return LiveInformationRoute.LIVE_LOOKUP
-    if _contains_non_live_execution_signal(lowered_message, tokens):
-        return LiveInformationRoute.NONE
     return LiveInformationRoute.NONE
 
 

@@ -72,12 +72,14 @@ from nullion.cron_delivery import (
 )
 from nullion.doctor_playbooks import execute_doctor_playbook_command
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
+from nullion.fetch_artifact_workflow import run_fetch_artifact_workflow
 from nullion.memory import (
     capture_explicit_user_memory,
     format_memory_context,
     memory_entries_for_owner,
     memory_owner_for_web_admin,
 )
+from nullion.mini_agent_routing import should_route_without_mini_agents
 from nullion.messaging_adapters import list_platform_delivery_receipts, messaging_file_allowed_roots, messaging_upload_root
 from nullion.operator_commands import operator_command_suggestions
 from nullion.prompt_injection import is_untrusted_tool_name, safe_untrusted_tool_metadata
@@ -11840,6 +11842,7 @@ def _web_artifact_descriptors(
         artifact_root_for_runtime(runtime),
         artifact_root_for_principal(principal_id),
         messaging_upload_root(),
+        workspace_roots.files,
         workspace_roots.media,
     )
     descriptors = []
@@ -12016,6 +12019,7 @@ def _web_artifact_roots(runtime) -> list[Path]:
         from nullion.workspace_storage import workspace_storage_base
 
         artifact_roots.extend(path for path in workspace_storage_base().glob("*/artifacts") if path.is_dir())
+        artifact_roots.extend(path for path in workspace_storage_base().glob("*/files") if path.is_dir())
         artifact_roots.extend(path for path in workspace_storage_base().glob("*/media") if path.is_dir())
     except Exception:
         pass
@@ -12229,39 +12233,18 @@ def _materialize_fetch_artifact_for_web(
     prompt: str,
     tool_results: list[ToolResult] | tuple[ToolResult, ...],
     principal_id: str | None = None,
+    registry: ToolRegistry | None = None,
 ) -> list[str]:
-    extension = _requested_web_attachment_extension(prompt)
-    if extension is None:
+    if _requested_web_attachment_extension(prompt) is None and plan_attachment_format(prompt or "").extension != ".pdf":
         return []
-    fetch_result = _latest_completed_web_tool_result(tool_results, tool_name="web_fetch")
-    terminal_result = None
-    content = None
-    source_result = None
-    if fetch_result is not None:
-        content = _web_fetch_body_for_attachment(fetch_result, extension=extension)
-        if isinstance(content, str) and content.strip():
-            source_result = fetch_result
-    if not isinstance(content, str) or not content.strip():
-        terminal_result = _latest_completed_web_tool_result(tool_results, tool_name="terminal_exec")
-        if terminal_result is None:
-            return []
-        content = _terminal_exec_output_for_attachment(terminal_result, extension=extension)
-        if isinstance(content, str) and content.strip():
-            source_result = terminal_result
-    if not isinstance(content, str) or not content.strip():
-        return []
-    output = source_result.output if source_result is not None and isinstance(source_result.output, dict) else {}
-    url = output.get("url") if isinstance(output.get("url"), str) else None
-    if extension == ".html":
-        content = _viewable_static_html(content, source_url=url)
-    if principal_id:
-        from nullion.artifacts import artifact_path_for_generated_workspace_file
-
-        artifact_path = artifact_path_for_generated_workspace_file(principal_id=principal_id, suffix=extension)
-    else:
-        artifact_path = artifact_path_for_generated_file(runtime, suffix=extension)
-    artifact_path.write_text(content, encoding="utf-8")
-    return [str(artifact_path)]
+    result = run_fetch_artifact_workflow(
+        runtime,
+        prompt=prompt,
+        tool_results=list(tool_results),
+        registry=registry,
+        principal_id=principal_id,
+    )
+    return result.artifact_paths if result.completed else []
 
 
 def _web_artifact_path_for_id(runtime, artifact_id: str) -> Path | None:
@@ -15953,6 +15936,8 @@ def create_app(runtime, orchestrator, registry):
                 logger.debug("Could not broadcast web mini-agent delivery", exc_info=True)
 
         orchestrator.set_deliver_fn(_web_deliver_fn)
+        if hasattr(orchestrator, "set_checkpoint_fn"):
+            orchestrator.set_checkpoint_fn(runtime.checkpoint)
 
     def _web_port_from_request(request: Request) -> int:
         request_port = getattr(request.url, "port", None)
@@ -17034,6 +17019,7 @@ def _try_dispatch_web_mini_agents(
         or not hasattr(orchestrator, "dispatch_request_sync")
         or not _feature_enabled("NULLION_TASK_DECOMPOSITION_ENABLED")
         or not _feature_enabled("NULLION_MULTI_AGENT_ENABLED")
+        or should_route_without_mini_agents(user_message, has_attachments=has_attachments)
     ):
         return None
     plan = TaskPlanner().build_execution_plan(
@@ -17427,6 +17413,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         prompt=user_text,
         tool_results=getattr(result, "tool_results", []),
         principal_id=conversation_id,
+        registry=registry,
     ) or list(getattr(result, "artifacts", []) or [])
     artifact_paths = _web_delivery_artifact_paths(
         runtime,
@@ -17850,6 +17837,7 @@ def _run_turn_sync(
         prompt=user_text,
         tool_results=tool_results,
         principal_id=conv_id,
+        registry=registry,
     ) or list(getattr(result, "artifacts", []) or [])
     artifact_paths = _web_delivery_artifact_paths(
         runtime,

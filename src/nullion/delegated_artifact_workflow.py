@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TypedDict
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from nullion.artifacts import (
@@ -23,22 +24,6 @@ from nullion.task_queue import TaskGroup
 logger = logging.getLogger(__name__)
 
 _TEXT_ARTIFACT_EXTENSIONS = frozenset({".txt", ".md", ".csv", ".json", ".yaml", ".yml"})
-_FILE_INTENT_TOKENS = frozenset(
-    {
-        "attach",
-        "attached",
-        "deliver",
-        "download",
-        "export",
-        "file",
-        "generate",
-        "save",
-        "saved",
-        "send",
-        "sent",
-        "write",
-    }
-)
 
 
 class DelegatedArtifactState(TypedDict, total=False):
@@ -50,17 +35,24 @@ class DelegatedArtifactState(TypedDict, total=False):
     candidate_text: str
     created_artifacts: list[str]
     error: str | None
+    write_attempts: int
 
 
 def finalize_delegated_artifacts(group: TaskGroup) -> list[str]:
     """Materialize missing text artifacts for a completed mini-agent group."""
 
+    existing = _created_artifacts_from_group_metadata(group)
+    if existing:
+        return existing
     try:
         final_state = _compiled_delegated_artifact_graph().invoke(
-            {"group": group},
+            {"group": group, "write_attempts": 0},
             config={"configurable": {"thread_id": f"delegated-artifacts:{group.group_id}"}},
         )
-        return list(final_state.get("created_artifacts") or [])
+        created = list(final_state.get("created_artifacts") or [])
+        if created:
+            _record_created_artifacts(group, created)
+        return created
     except Exception as exc:
         logger.debug("Delegated artifact finalization failed: %s", exc, exc_info=True)
         return []
@@ -77,20 +69,21 @@ def _compiled_delegated_artifact_graph():
     graph.add_edge("plan", "validate_existing")
     graph.add_edge("validate_existing", "collect_content")
     graph.add_edge("collect_content", "write_artifact")
-    graph.add_edge("write_artifact", END)
-    return graph.compile()
+    graph.add_conditional_edges("write_artifact", _route_after_write, {"retry": "write_artifact", END: END})
+    return graph.compile(checkpointer=MemorySaver())
 
 
 def _plan_requested_artifact(state: DelegatedArtifactState) -> dict[str, object]:
     group = state["group"]
     extension = plan_attachment_format(group.original_message).extension
-    should_materialize = extension in _TEXT_ARTIFACT_EXTENSIONS and _has_file_delivery_intent(group.original_message)
+    should_materialize = extension in _TEXT_ARTIFACT_EXTENSIONS
     return {
         "requested_extension": extension,
         "should_materialize": should_materialize,
         "principal_id": _principal_id_for_group(group),
         "created_artifacts": [],
         "existing_artifacts": [],
+        "error": None,
     }
 
 
@@ -144,12 +137,13 @@ def _collect_candidate_content(state: DelegatedArtifactState) -> dict[str, objec
 
 
 def _write_missing_artifact(state: DelegatedArtifactState) -> dict[str, object]:
+    attempts = int(state.get("write_attempts") or 0) + 1
     if (
         not state.get("should_materialize")
         or state.get("existing_artifacts")
         or not str(state.get("candidate_text") or "").strip()
     ):
-        return {}
+        return {"write_attempts": attempts}
     principal_id = state.get("principal_id")
     extension = str(state.get("requested_extension") or ".txt")
     try:
@@ -161,15 +155,18 @@ def _write_missing_artifact(state: DelegatedArtifactState) -> dict[str, object]:
         path.write_text(str(state["candidate_text"]), encoding="utf-8")
         artifact_root = artifact_root_for_principal(principal_id)
         if artifact_descriptor_for_path(path, artifact_root=artifact_root) is None:
-            return {"error": f"created artifact was not deliverable: {path}"}
-        return {"created_artifacts": [str(path)]}
+            return {"error": f"created artifact was not deliverable: {path}", "write_attempts": attempts}
+        return {"created_artifacts": [str(path)], "error": None, "write_attempts": attempts}
     except Exception as exc:
-        return {"error": str(exc) or exc.__class__.__name__}
+        return {"error": str(exc) or exc.__class__.__name__, "write_attempts": attempts}
 
 
-def _has_file_delivery_intent(message: str) -> bool:
-    tokens = set(re.findall(r"[a-z0-9]+", str(message or "").lower()))
-    return bool(tokens & _FILE_INTENT_TOKENS)
+def _route_after_write(state: DelegatedArtifactState) -> str:
+    if state.get("created_artifacts"):
+        return END
+    if state.get("error") and int(state.get("write_attempts") or 0) < 2:
+        return "retry"
+    return END
 
 
 def _principal_id_for_group(group: TaskGroup) -> str | None:
@@ -197,6 +194,34 @@ def _artifact_stem_for_request(message: str) -> str:
     text = re.sub(r"[^a-zA-Z0-9]+", "-", str(message or "").lower()).strip("-")
     text = re.sub(r"-+", "-", text)
     return (text[:56].strip("-") or "delegated-result")
+
+
+def _created_artifacts_from_group_metadata(group: TaskGroup) -> list[str]:
+    metadata = getattr(group, "planner_metadata", {}) or {}
+    raw_paths = metadata.get("created_artifacts")
+    if not isinstance(raw_paths, list):
+        return []
+    principal_id = _principal_id_for_group(group)
+    artifact_root = artifact_root_for_principal(principal_id)
+    paths: list[str] = []
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str):
+            continue
+        descriptor = artifact_descriptor_for_path(Path(raw_path), artifact_root=artifact_root)
+        if descriptor is not None:
+            paths.append(descriptor.path)
+    return paths
+
+
+def _record_created_artifacts(group: TaskGroup, paths: list[str]) -> None:
+    try:
+        metadata = getattr(group, "planner_metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        existing = [path for path in metadata.get("created_artifacts", []) if isinstance(path, str)]
+        metadata["created_artifacts"] = list(dict.fromkeys([*existing, *paths]))
+    except Exception:
+        logger.debug("Could not record delegated artifact metadata", exc_info=True)
 
 
 __all__ = [

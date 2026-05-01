@@ -24,6 +24,7 @@ from nullion.artifacts import (
     artifact_root_for_runtime,
     is_safe_artifact_path,
     media_candidate_paths_from_text,
+    parse_media_directive_line,
     split_media_reply_attachments,
 )
 from nullion.attachment_format_graph import plan_attachment_format
@@ -62,13 +63,15 @@ from nullion.conversation_runtime import (
 )
 from nullion.health import HealthIssueType
 from nullion.artifact_workflow_graph import ArtifactWorkflowResult, run_pre_chat_artifact_workflow
-from nullion.intent_router import IntentLabel, classify_intent, split_compound_intent
+from nullion.fetch_artifact_workflow import run_fetch_artifact_workflow
+from nullion.intent_router import split_compound_intent
 from nullion.memory import (
     capture_explicit_user_memory,
     format_memory_context,
     memory_entries_for_owner,
     memory_owner_for_messaging,
 )
+from nullion.mini_agent_routing import should_route_without_mini_agents
 from nullion.operator_commands import handle_operator_command, normalize_operator_command_head
 from nullion.runtime import (
     PersistentRuntime,
@@ -120,11 +123,6 @@ logger = logging.getLogger(__name__)
 ActivityCallback = Callable[[dict[str, str]], None]
 _MAX_CHAT_TURNS = 6
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 4
-_GREETING_PATTERN = re.compile(r"^(hi|hello|hey|yo|hiya)(?:\s+\d+)?[!?. ]*$", re.IGNORECASE)
-_THANKS_PATTERN = re.compile(r"^(thanks|thank you|thx|ty)(?:\s+so much)?[!?. ]*$", re.IGNORECASE)
-_OKAY_PATTERN = re.compile(r"^(ok|okay|kk|sounds good|got it)[!?. ]*$", re.IGNORECASE)
-_MORNING_PATTERN = re.compile(r"^(gm|good morning)[!?. ]*$", re.IGNORECASE)
-_FAREWELL_PATTERN = re.compile(r"^(bye|goodbye|good night|goodnight|gn|night|cya|see ya|ttyl)[!?. ]*$", re.IGNORECASE)
 
 
 def _trim_context_text(text: str, max_chars: int) -> str:
@@ -139,7 +137,7 @@ def _trim_context_text(text: str, max_chars: int) -> str:
 def _strip_media_directives_from_context(text: str) -> str:
     lines: list[str] = []
     for raw_line in str(text or "").splitlines():
-        if raw_line.strip().startswith("MEDIA:"):
+        if parse_media_directive_line(raw_line) is not None:
             continue
         lines.append(raw_line)
     return "\n".join(lines)
@@ -971,24 +969,7 @@ def build_instant_ack(
 
 
 def _local_chat_reply_body(prompt: str) -> str | None:
-    classification = classify_intent(prompt)
-    if classification.label is not IntentLabel.CHITCHAT:
-        return None
-
-    if classification.intent_key == "gratitude":
-        return "Anytime."
-    if classification.intent_key == "acknowledgment":
-        return "Okay."
-    if classification.intent_key == "morning":
-        return "Good morning ☀️"
-    if classification.intent_key == "farewell":
-        normalized = _normalize_local_intent_text(prompt)
-        return "Good night 🌙" if normalized in {"good night", "goodnight", "gn", "night"} else "Talk soon."
-    return (
-        "Hey! I'm Nullion. I can remind you of things, look stuff up, answer questions, "
-        "and help you get things done — all without leaving Telegram.\n\n"
-        "What would you like to try?"
-    )
+    return None
 
 
 def _restore_chat_thread_from_store(runtime: PersistentRuntime, *, chat_id: str | None) -> list[dict[str, str]]:
@@ -1223,11 +1204,7 @@ def _is_low_information_acknowledgment_reply(reply: str | None) -> bool:
         return False
     if "?" in reply or _assistant_reply_exposes_referencable_artifact(reply):
         return False
-    if _GREETING_PATTERN.fullmatch(reply) or _THANKS_PATTERN.fullmatch(reply) or _OKAY_PATTERN.fullmatch(reply):
-        return True
-    if _MORNING_PATTERN.fullmatch(reply) or _FAREWELL_PATTERN.fullmatch(reply):
-        return True
-    return len(normalized.split()) <= 12 and normalized.startswith("got it")
+    return False
 
 
 
@@ -1422,33 +1399,19 @@ def _maybe_materialize_requested_fetch_attachment(
         return reply
     if any(result.tool_name == "file_write" for result in tool_results):
         return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
-    fetch_result = _latest_completed_tool_result(tool_results, tool_name="web_fetch")
-    if fetch_result is None:
-        return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
-    content = _materializable_fetch_body(fetch_result, extension=extension)
-    if not isinstance(content, str) or not content:
-        return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
-    from nullion.artifacts import artifact_path_for_generated_workspace_file
-
-    artifact_path = artifact_path_for_generated_workspace_file(principal_id=principal_id, suffix=extension)
-    write_result = invoke_tool_with_boundary_policy(
-        runtime.store,
-        ToolInvocation(
-            invocation_id=f"live-chat-file_write-{uuid4().hex}",
-            tool_name="file_write",
-            principal_id=principal_id or "telegram_chat",
-            arguments={"path": str(artifact_path), "content": content},
-            capsule_id=None,
-        ),
+    result = run_fetch_artifact_workflow(
+        runtime,
+        prompt=prompt,
+        reply=reply,
+        tool_results=tool_results,
         registry=runtime.active_tool_registry,
+        principal_id=principal_id,
     )
-    tool_results.append(write_result)
-    if normalize_tool_status(write_result.status) != "completed":
+    if not result.completed:
         return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
-    written_path = write_result.output.get("path") if isinstance(write_result.output, dict) else None
-    if not isinstance(written_path, str) or not written_path:
-        written_path = str(artifact_path)
-    return f"Done — fetched the URL and attached the requested file.\n\nMEDIA:{written_path}"
+    if len(result.tool_results) > len(tool_results):
+        tool_results.extend(result.tool_results[len(tool_results):])
+    return f"Done — fetched the URL and attached the requested file.\n\nMEDIA:{result.artifact_paths[0]}"
 
 
 def _clean_undeliverable_media_reply(
@@ -1511,6 +1474,7 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         "- Do not write deliverable files under arbitrary folders.\n"
         "- Do not create helper scripts, diagnostic scripts, or source-code files unless the user explicitly asks you to create code.\n"
         "- For read-only diagnostics, inspect with read-only commands and return the findings in chat instead of writing helper files.\n"
+        "- When inspecting local files, search the narrowest concrete folder available; do not recursively scan the system root or the user's home folder.\n"
         "- Do not say the chat platform cannot attach files. Nullion will attach completed artifact files after your turn.\n"
         "- Never answer only 'Done', 'OK', or 'Completed'. Always include the requested answer, file status, or concrete result.\n"
         "- If a tool result has status denied or error, treat it as failed and ask for the needed approval or report the failure."
@@ -2665,6 +2629,7 @@ def _render_chat_turn(
                 and hasattr(agent_orchestrator, "dispatch_request_sync")
                 and not normalized_attachments
                 and allow_mini_agents
+                and not should_route_without_mini_agents(effective_prompt, has_attachments=bool(normalized_attachments))
             ):
                 planned_task_titles = _mission_step_titles(mission)
                 if activity_callback is not None:

@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 from langgraph.graph import END, START, StateGraph
 
 from nullion.attachment_format_graph import plan_attachment_format
-from nullion.intent_router import IntentLabel, classify_intent
 
 
 _URL_DISALLOWED_EDGE_CHARS = "()[]{}<>`\"'\".,;:!?"
@@ -220,7 +219,6 @@ def _extract_url_target(text: str) -> TaskFrameTarget | None:
 
 
 def _detect_output_override(text: str, current: TaskFrameOutputContract) -> TaskFrameOutputContract | None:
-    normalized = text.strip().lower()
     requested_format = plan_attachment_format(text)
     if requested_format.extension is not None:
         return TaskFrameOutputContract(
@@ -228,25 +226,13 @@ def _detect_output_override(text: str, current: TaskFrameOutputContract) -> Task
             delivery_mode=DELIVERY_MODE_ATTACHMENT,
             response_shape=current.response_shape,
         )
-    if "paste it here" in normalized or "inline" in normalized:
-        return TaskFrameOutputContract(
-            artifact_kind=None,
-            delivery_mode=DELIVERY_MODE_INLINE_TEXT,
-            response_shape="inline_text",
-        )
     return None
 
 
 
 def _is_referential_task_follow_up(text: str) -> bool:
-    words = [word.strip(".,!?;:\"'`") for word in text.strip().lower().replace("’", "'").split()]
-    if len(words) < 2:
-        return False
-    referents = {"it", "this", "that", "them", "these", "those"}
-    if words[0] in {"send", "attach", "upload", "deliver", "share", "use", "do", "make", "change", "update"}:
-        return words[1] in referents
-    if words[0] in referents:
-        return True
+    """Free-form referential language is handled by the model, not local keywords."""
+
     return False
 
 
@@ -322,18 +308,6 @@ def _task_frame_substitute_target_node(state: _TaskFrameContinuationState) -> di
 def _task_frame_actionable_new_task_node(state: _TaskFrameContinuationState) -> dict[str, object]:
     if state.get("decision") is not None:
         return {}
-    if _is_referential_task_follow_up(state["text"]):
-        return {}
-    classification = classify_intent(state["text"])
-    if classification.label is IntentLabel.ACTIONABLE and _extract_url_target(state["text"]) is None:
-        return {"decision": TaskFrameContinuationDecision(
-            mode=TaskFrameContinuationMode.START_NEW,
-            operation=None,
-            target=None,
-            output=None,
-            execution=None,
-            finish=None,
-        )}
     return {}
 
 

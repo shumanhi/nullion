@@ -18,7 +18,6 @@ from nullion.runtime import invoke_tool
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
 
 
-_SCREENSHOT_RE = re.compile(r"\b(screen\s*shot|screenshot|capture)\b", re.IGNORECASE)
 _EXPLICIT_URL_RE = re.compile(r"https?://[^\s<>()\]]+", re.IGNORECASE)
 _DOMAIN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b", re.IGNORECASE)
 
@@ -66,18 +65,8 @@ def _normalize_url(value: str) -> str | None:
 
 
 def parse_screenshot_request(prompt: str) -> ScreenshotRequest | None:
-    if not isinstance(prompt, str) or not _SCREENSHOT_RE.search(prompt):
-        return None
-    explicit_match = _EXPLICIT_URL_RE.search(prompt)
-    if explicit_match:
-        url = _normalize_url(explicit_match.group(0))
-        return ScreenshotRequest(url=url) if url else None
+    """Free-form prompts are not parsed into screenshot intent locally."""
 
-    for match in _DOMAIN_RE.finditer(prompt):
-        candidate = match.group(0)
-        url = _normalize_url(candidate)
-        if url:
-            return ScreenshotRequest(url=url)
     return None
 
 

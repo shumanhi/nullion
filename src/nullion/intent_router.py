@@ -46,7 +46,6 @@ class IntentSignals:
             self.action_terms
             or self.information_targets
             or self.has_url
-            or ("send" in self.action_terms and (self.communication_targets or self.artifact_targets))
         )
 
 
@@ -77,119 +76,7 @@ class _TurnDispositionState(TypedDict, total=False):
     decision: ConversationTurnDispositionDecision | None
 
 
-_SOCIAL_PHRASES = {
-    "hi",
-    "hello",
-    "hey",
-    "yo",
-    "hiya",
-    "hi there",
-    "hello there",
-    "hey there",
-    "hey man",
-    "hey nullion",
-    "howdy",
-    "sup",
-    "whats up",
-    "wassup",
-    "wats up",
-    "whsts up baby",
-    "hows it going",
-}
-_GRATITUDE_PHRASES = {"thanks", "thank you", "thx", "ty", "thank you so much"}
-_ACK_PHRASES = {"ok", "okay", "kk", "sounds good", "got it"}
-_MORNING_PHRASES = {"gm", "good morning"}
-_FAREWELL_PHRASES = {"bye", "goodbye", "good night", "goodnight", "gn", "night", "cya", "see ya", "ttyl"}
-_ACTION_TERMS = {
-    "get",
-    "give",
-    "show",
-    "pull",
-    "fetch",
-    "read",
-    "check",
-    "summarize",
-    "analyze",
-    "find",
-    "search",
-    "open",
-    "deploy",
-    "delete",
-    "buy",
-    "sell",
-}
-_SEND_TERMS = {"send", "email", "message"}
-_INFORMATION_TARGET_TERMS = {
-    "news",
-    "headline",
-    "weather",
-    "stock",
-    "market",
-}
-_COMMUNICATION_TARGET_TERMS = {
-    "email",
-    "mail",
-    "message",
-    "dm",
-    "slack",
-    "discord",
-    "telegram",
-}
-_ARTIFACT_TARGET_TERMS = {
-    "file",
-    "pdf",
-    "doc",
-    "docx",
-    "spreadsheet",
-    "xlsx",
-    "csv",
-    "attachment",
-    "artifact",
-}
 _URL_TERMS = ("http://", "https://", "www.")
-_SOCIAL_OPENERS = {"hey", "hi", "hello", "yo", "howdy"}
-_CONTINUE_ANYWHERE_PHRASES = ("that one", "around here", "near me")
-_CONTINUE_ANYWHERE_PATTERN = re.compile(
-    r"\b(?:more|another|same|meant|too|as well|only|continue)\b",
-    re.IGNORECASE,
-)
-_INTERRUPT_OR_REVISE_PREFIXES = (
-    ("wait",),
-    ("actually",),
-    ("instead",),
-    ("no",),
-    ("change", "that"),
-)
-_CONTINUE_PREFIXES = (
-    ("also",),
-    ("and",),
-    ("plus",),
-    ("same",),
-    ("what", "about"),
-    ("how", "about"),
-)
-_REFERENTIAL_AUXILIARY_VERBS = {
-    "is",
-    "isnt",
-    "was",
-    "were",
-    "does",
-    "do",
-    "did",
-    "can",
-    "could",
-    "would",
-    "should",
-    "will",
-    "wont",
-    "has",
-    "have",
-    "had",
-    "are",
-    "am",
-}
-_REFERENTIAL_SUBJECTS = {"that", "this", "it", "those", "these"}
-_REFERENTIAL_QUESTION_WORDS = {"why", "how", "when", "where"}
 
 
 def _normalize(text: str) -> str:
@@ -216,46 +103,21 @@ def _starts_with_any_phrase(words: list[str], phrases: tuple[tuple[str, ...], ..
 def _intent_signals(normalized_text: str) -> IntentSignals:
     words = tuple(_words(normalized_text))
     word_set = set(words)
-    action_terms = tuple(word for word in words if word in _ACTION_TERMS)
-    send_terms = tuple(word for word in words if word in _SEND_TERMS)
-    information_targets = tuple(word for word in words if word in _INFORMATION_TARGET_TERMS)
-    communication_targets = tuple(word for word in words if word in _COMMUNICATION_TARGET_TERMS)
-    artifact_targets = tuple(word for word in words if word in _ARTIFACT_TARGET_TERMS)
-    if send_terms and (communication_targets or artifact_targets):
-        action_terms = (*action_terms, *send_terms)
     return IntentSignals(
-        action_terms=tuple(dict.fromkeys(action_terms)),
-        information_targets=tuple(dict.fromkeys(information_targets)),
-        communication_targets=tuple(dict.fromkeys(communication_targets)),
-        artifact_targets=tuple(dict.fromkeys(artifact_targets)),
+        action_terms=(),
+        information_targets=(),
+        communication_targets=(),
+        artifact_targets=(),
         has_url=any(term in normalized_text for term in _URL_TERMS) or any("." in word for word in word_set),
     )
 
 
 def _has_social_open_prefix(normalized_text: str) -> bool:
-    words = _words(normalized_text)
-    return bool(words) and words[0] in _SOCIAL_OPENERS
+    return False
 
 
 def _is_referential_follow_up(normalized_text: str) -> bool:
-    words = _words(normalized_text)
-    if len(words) < 2:
-        return False
-
-    first = words[0]
-    if first.startswith("c") and first[1:] in _REFERENTIAL_QUESTION_WORDS:
-        first = first[1:]
-    if first in _REFERENTIAL_AUXILIARY_VERBS:
-        return words[1] in _REFERENTIAL_SUBJECTS
-
-    if first not in _REFERENTIAL_QUESTION_WORDS:
-        return False
-
-    reference_index = 1
-    if words[1] in _REFERENTIAL_AUXILIARY_VERBS:
-        reference_index = 2
-
-    return reference_index < len(words) and any(word in _REFERENTIAL_SUBJECTS for word in words[reference_index:])
+    return False
 
 
 def _intent_normalize_node(state: _IntentClassificationState) -> dict[str, object]:
@@ -278,17 +140,6 @@ def _intent_signal_node(state: _IntentClassificationState) -> dict[str, object]:
 def _intent_social_node(state: _IntentClassificationState) -> dict[str, object]:
     if state.get("classification") is not None:
         return {}
-    normalized = state.get("normalized") or ""
-    if normalized in _GRATITUDE_PHRASES:
-        return {"classification": IntentClassification(label=IntentLabel.CHITCHAT, intent_key="gratitude", confidence=0.99)}
-    if normalized in _ACK_PHRASES:
-        return {"classification": IntentClassification(label=IntentLabel.CHITCHAT, intent_key="acknowledgment", confidence=0.99)}
-    if normalized in _MORNING_PHRASES:
-        return {"classification": IntentClassification(label=IntentLabel.CHITCHAT, intent_key="morning", confidence=0.99)}
-    if normalized in _FAREWELL_PHRASES:
-        return {"classification": IntentClassification(label=IntentLabel.CHITCHAT, intent_key="farewell", confidence=0.99)}
-    if normalized in _SOCIAL_PHRASES or re.fullmatch(r"(hi|hello|hey|yo|hiya)(?: \d+)?", normalized):
-        return {"classification": IntentClassification(label=IntentLabel.CHITCHAT, intent_key="greeting", confidence=0.98)}
     return {}
 
 
@@ -297,13 +148,8 @@ def _intent_actionable_node(state: _IntentClassificationState) -> dict[str, obje
         return {}
     normalized = state.get("normalized") or ""
     signals = state.get("signals") or _intent_signals(normalized)
-    has_action = signals.actionable
-    has_social_open = _has_social_open_prefix(normalized)
-
-    if has_social_open and has_action:
-        return {"classification": IntentClassification(label=IntentLabel.AMBIGUOUS, intent_key="mixed", confidence=0.6)}
-    if has_action:
-        return {"classification": IntentClassification(label=IntentLabel.ACTIONABLE, intent_key="request", confidence=0.9)}
+    if signals.has_url:
+        return {"classification": IntentClassification(label=IntentLabel.ACTIONABLE, intent_key="structural_target", confidence=0.8)}
     return {}
 
 
@@ -344,31 +190,19 @@ def classify_intent(text: str) -> IntentClassification:
 
 
 def _matches_interrupt_or_revise_prefix(normalized_text: str) -> bool:
-    return _starts_with_any_phrase(_words(normalized_text), _INTERRUPT_OR_REVISE_PREFIXES)
+    return False
 
 
 def _matches_continue_prefix(normalized_text: str) -> bool:
-    return _starts_with_any_phrase(_words(normalized_text), _CONTINUE_PREFIXES)
+    return False
 
 
 def _looks_like_additive_independent_request(normalized_text: str) -> bool:
-    words = _words(normalized_text)
-    if len(words) < 2 or words[0] not in {"and", "also", "plus"}:
-        return False
-    if any(word in _REFERENTIAL_SUBJECTS for word in words[1:]):
-        return False
-    remainder = " ".join(words[1:])
-    signals = _intent_signals(remainder)
-    return bool(signals.actionable and (signals.information_targets or signals.communication_targets or signals.has_url))
+    return False
 
 
 def _is_short_social_message(normalized_text: str) -> bool:
-    token_count = len(normalized_text.split())
-    if token_count > 4:
-        return False
-
-    classification = classify_intent(normalized_text)
-    return classification.label is IntentLabel.CHITCHAT
+    return False
 
 
 def _looks_like_short_follow_up_answer(normalized_text: str) -> bool:
@@ -377,7 +211,7 @@ def _looks_like_short_follow_up_answer(normalized_text: str) -> bool:
     if len(normalized_text) > 80:
         return False
     words = normalized_text.split()
-    return 1 <= len(words) <= 8
+    return 1 <= len(words) <= 4
 
 
 def _continues_previous_assistant_question(
@@ -453,11 +287,7 @@ def _turn_disposition_marker_node(state: _TurnDispositionState) -> dict[str, obj
             reason="additive_independent_request",
         )}
 
-    if active_branch_exists and (
-        _matches_continue_prefix(normalized)
-        or any(phrase in normalized for phrase in _CONTINUE_ANYWHERE_PHRASES)
-        or _CONTINUE_ANYWHERE_PATTERN.search(normalized) is not None
-    ):
+    if active_branch_exists and _matches_continue_prefix(normalized):
         return {"decision": ConversationTurnDispositionDecision(
             disposition=ConversationTurnDisposition.CONTINUE,
             reason="continue_marker",
@@ -480,6 +310,7 @@ def _turn_disposition_social_node(state: _TurnDispositionState) -> dict[str, obj
 def _turn_disposition_followup_node(state: _TurnDispositionState) -> dict[str, object]:
     if state.get("decision") is not None:
         return {}
+    text = state.get("text") or ""
     normalized = state.get("normalized") or ""
     active_branch_exists = bool(state.get("active_branch_exists"))
     previous_assistant_message = state.get("previous_assistant_message")
@@ -487,7 +318,7 @@ def _turn_disposition_followup_node(state: _TurnDispositionState) -> dict[str, o
         normalized,
         active_branch_exists=active_branch_exists,
         previous_assistant_message=previous_assistant_message,
-    ):
+    ) and "?" not in text:
         return {"decision": ConversationTurnDispositionDecision(
             disposition=ConversationTurnDisposition.CONTINUE,
             reason="question_follow_up",
@@ -630,26 +461,7 @@ def classify_turn_disposition_with_reason(
 
 
 def split_compound_intent(text: str) -> list[str]:
-    normalized_original = text.strip()
-    if not normalized_original:
-        return [text]
-
-    parts = re.split(r"\band then\b", normalized_original, maxsplit=1, flags=re.IGNORECASE)
-    if len(parts) != 2:
-        return [text]
-
-    left, right = (part.strip(" ,") for part in parts)
-    if not left or not right:
-        return [text]
-
-    left_classification = classify_intent(left)
-    right_classification = classify_intent(right)
-    if left_classification.label is not IntentLabel.ACTIONABLE:
-        return [text]
-    if right_classification.label is not IntentLabel.ACTIONABLE:
-        return [text]
-
-    return [left, right]
+    return [text]
 
 
 __all__ = [

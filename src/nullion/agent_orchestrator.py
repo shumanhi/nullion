@@ -1221,6 +1221,7 @@ class AgentOrchestrator:
     _progress_queue: Any = None
     _aggregator_task: Any = None
     _deliver_fn: Any = None
+    _checkpoint_fn: Any = None
     _supervisor_tasks: set[asyncio.Task] | None = None
     _dispatcher_loop: Any = None
     _dispatcher_thread: threading.Thread | None = None
@@ -1228,6 +1229,21 @@ class AgentOrchestrator:
     def set_deliver_fn(self, fn: Any) -> None:
         """Set the callback used by the result aggregator to deliver text."""
         self._deliver_fn = fn
+
+    def set_checkpoint_fn(self, fn: Any) -> None:
+        """Set the callback used to persist delegated-task state transitions."""
+        self._checkpoint_fn = fn
+
+    def _checkpoint_dispatch_state(self) -> None:
+        fn = self._checkpoint_fn
+        if fn is None:
+            return
+        try:
+            result = fn()
+            if asyncio.iscoroutine(result):
+                logger.debug("Ignoring asynchronous mini-agent checkpoint callback")
+        except Exception:
+            logger.debug("Could not checkpoint mini-agent dispatch state", exc_info=True)
 
     def _ensure_dispatcher_loop(self) -> asyncio.AbstractEventLoop:
         """Return the persistent loop used by sync chat adapters for background dispatch."""
@@ -1521,6 +1537,7 @@ class AgentOrchestrator:
             available_tools=tools,
         )
         await self._task_registry.add_group(group)
+        self._checkpoint_dispatch_state()
 
         # Single-task fast path — no async overhead.
         if len(group.tasks) == 1:
@@ -1566,6 +1583,7 @@ class AgentOrchestrator:
 
         for task in group.tasks:
             self._record_dispatch_task_run_pending(policy_store, task)
+        self._checkpoint_dispatch_state()
 
         runner = MiniAgentRunner()
         for task in group.tasks:
@@ -1626,6 +1644,7 @@ class AgentOrchestrator:
                 started_at=datetime.now(UTC), agent_id=agent.agent_id,
             )
             self._transition_dispatch_task_run(policy_store, task, MiniAgentRunStatus.RUNNING)
+            self._checkpoint_dispatch_state()
             if self._progress_queue is not None:
                 await self._progress_queue.put(
                     ProgressUpdate(
@@ -1663,6 +1682,7 @@ class AgentOrchestrator:
             task.task_id, status=final_status,
             completed_at=datetime.now(UTC), result=result,
         )
+        self._checkpoint_dispatch_state()
         if self._progress_queue is not None:
             await self._progress_queue.put(
                 ProgressUpdate(
@@ -1677,6 +1697,7 @@ class AgentOrchestrator:
         # Unblock dependents.
         for dep_task in self._task_registry.ready_tasks_for_group(task.group_id):
             await self._task_registry.update_task(dep_task.task_id, status=TaskStatus.QUEUED)
+            self._checkpoint_dispatch_state()
             asyncio.create_task(
                 self._run_task(dep_task, runner=runner, group=group,
                                tool_registry=tool_registry, policy_store=policy_store,
@@ -1699,9 +1720,10 @@ class AgentOrchestrator:
     ) -> Any | None:
         """Resume a delegated task that paused for approval or user input.
 
-        Deep Agents do not yet persist a process-independent checkpointer in
-        Nullion, so resume re-runs the scoped delegated task with the approval
-        now granted or the user's response appended to the task prompt.
+        Resume re-runs the scoped delegated task with the approval now granted
+        or the user's response appended to the task prompt. Dispatch state is
+        checkpointed before and after each resume transition when the host
+        runtime provides a checkpoint callback.
         """
         from nullion.mini_agent_runner import MiniAgentRunner
         from nullion.task_queue import TaskStatus
@@ -1727,6 +1749,7 @@ class AgentOrchestrator:
         )
         if task is None:
             return None
+        self._checkpoint_dispatch_state()
         await self._run_task(
             task,
             runner=MiniAgentRunner(),

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Iterable
 
 from nullion.artifacts import artifact_descriptors_for_paths, media_candidate_paths_from_text
@@ -149,19 +148,6 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
-def _has_completion_claim(text: str) -> bool:
-    tokens = re.findall(r"[a-z']+", text.casefold().replace("’", "'"))
-    claim_words = {"done", "completed", "finished", "attached", "saved", "created", "generated", "added", "updated", "uploaded", "delivered"}
-    negators = {"not", "never", "haven't", "hasn't", "hadn't", "didn't", "doesn't", "can't", "cannot", "couldn't", "won't"}
-    for index, token in enumerate(tokens):
-        if token not in claim_words:
-            continue
-        if any(previous in negators for previous in tokens[max(0, index - 4) : index]):
-            continue
-        return True
-    return False
-
-
 def _reply_valid_media_paths(reply: str, *, artifact_roots: Iterable[Path]) -> list[str]:
     candidates = [str(path) for path in media_candidate_paths_from_text(reply)]
     return _existing_deliverable_paths(candidates, artifact_roots=artifact_roots)
@@ -244,9 +230,6 @@ def evaluate_response_fulfillment(
         missing.append(f"{artifact_kind} attachment")
 
     if missing:
-        has_completion_claim = _has_completion_claim(reply or "")
-        if not has_completion_claim:
-            return ResponseFulfillmentDecision(False, reply, tuple(missing))
         if attempted_tool_names:
             missing_text = ", ".join(f"a {item}" for item in missing)
             final_sentence = (

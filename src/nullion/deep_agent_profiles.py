@@ -1,8 +1,6 @@
 """Built-in Deep Agents profile hints for delegated Nullion tasks."""
 
 from __future__ import annotations
-
-import re
 from typing import Any
 
 
@@ -53,32 +51,19 @@ _BUILTIN_SKILL_SOURCE = "/skills/nullion/"
 
 
 def deep_agent_profile_names_for_task(task: Any) -> list[str]:
-    """Infer reusable Deep Agents profiles from task text and scoped tools."""
+    """Infer reusable Deep Agents profiles from structured scoped tools."""
     tools = {str(tool).lower() for tool in (getattr(task, "allowed_tools", None) or [])}
-    text = " ".join(
-        str(value or "")
-        for value in (getattr(task, "title", ""), getattr(task, "description", ""))
-    ).lower()
-    words = set(re.findall(r"[a-z0-9_]+", text))
     profiles: list[str] = []
 
-    if tools & {"web_search", "web_fetch"} or any(word in text for word in ("research", "search", "summarize sources")):
+    if tools & {"web_search", "web_fetch"}:
         profiles.append("research")
-    if tools & {"file_read", "file_search", "workspace_summary"} or words & {"repo", "repository", "codebase", "readme"} or "analyze files" in text:
+    if tools & {"file_read", "file_search", "workspace_summary"}:
         profiles.append("repo_analysis")
     if any(tool.startswith("browser_") for tool in tools):
         profiles.append("browser")
-    if tools & {"file_write", "pdf_create", "pdf_edit", "render", "image_generate"} or any(
-        word in text for word in ("artifact", "report", "write file", "screenshot", "pdf")
-    ):
+    if tools & {"file_write", "pdf_create", "pdf_edit", "render", "image_generate"}:
         profiles.append("artifact")
         profiles.append("artifact_verifier")
-    if any(word in text for word in ("doctor", "health", "recover", "restart service", "approval")):
-        profiles.append("doctor")
-    if any(word in text for word in ("migrate", "migration", "refactor", "replace old code", "dependency")):
-        profiles.append("migration")
-    if words & {"cron", "reminder", "scheduled", "schedule", "monitor", "monitoring", "alert"}:
-        profiles.append("scheduled_job")
 
     return list(dict.fromkeys(profiles))
 

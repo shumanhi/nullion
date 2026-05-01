@@ -51,7 +51,6 @@ from nullion.chat_streaming import (
 from nullion.doctor_actions import PENDING as DOCTOR_ACTION_PENDING
 from nullion.run_activity import RunActivityPhase, classify_run_activity_phase
 from nullion.health import HealthIssueType
-from nullion.intent_router import IntentLabel, classify_intent
 from nullion.operator_commands import (
     chat_model_option_for_token,
     chat_model_options,
@@ -3112,6 +3111,8 @@ class ChatOperatorService:
                         return False
 
             self.agent_orchestrator.set_deliver_fn(_telegram_deliver_fn)
+            if hasattr(self.agent_orchestrator, "set_checkpoint_fn"):
+                self.agent_orchestrator.set_checkpoint_fn(self.runtime.checkpoint)
             logger.debug("Phase 5: deliver_fn wired to orchestrator")
 
         # Wire health monitor as PTB post_init / shutdown lifecycle hooks

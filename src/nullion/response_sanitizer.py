@@ -17,16 +17,6 @@ from typing import Any, Iterable
 from nullion.tools import ToolResult
 
 
-_RAW_OUTPUT_REQUEST_RE = re.compile(
-    r"\b("
-    r"raw|verbatim|exact|full|complete|json|payload|dump|debug"
-    r")\b.{0,40}\b("
-    r"output|tool result|tool call|payload|json|response|dump"
-    r")\b"
-    r"|\b(show|send|give|return|print)\b.{0,40}\b(raw|json|payload|dump)\b",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-
 _SENSITIVE_STRUCTURED_KEYS = {
     "arguments",
     "audit_entries",
@@ -48,7 +38,9 @@ _SENSITIVE_STRUCTURED_KEYS = {
 
 
 def user_requested_raw_output(user_message: str | None) -> bool:
-    return bool(_RAW_OUTPUT_REQUEST_RE.search(str(user_message or "")))
+    """Free-form user text does not bypass raw payload protection."""
+
+    return False
 
 
 def sanitize_user_visible_reply(

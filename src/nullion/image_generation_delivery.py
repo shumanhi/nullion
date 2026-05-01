@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-import re
 import shutil
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
@@ -14,29 +13,6 @@ from langgraph.graph import END, START, StateGraph
 
 from nullion.artifacts import artifact_path_for_generated_workspace_file
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
-
-
-_IMAGE_GENERATION_VERB_RE = re.compile(
-    r"\b(generate|create|make|draw|render|paint|illustrate|design)\b",
-    re.IGNORECASE,
-)
-_IMAGE_OUTPUT_NOUN_RE = re.compile(
-    r"\b(image|picture|photo|illustration|artwork|art|logo|icon|wallpaper|poster)\b",
-    re.IGNORECASE,
-)
-_DRAW_DIRECT_RE = re.compile(r"\b(draw|paint|illustrate)\s+(?:me\s+)?(?:an?\s+)?\w+", re.IGNORECASE)
-_IMAGE_EDIT_VERB_RE = re.compile(
-    r"\b(add|put|place|insert|remove|replace|change|edit|modify|transform|make)\b",
-    re.IGNORECASE,
-)
-_IMAGE_EDIT_CONTEXT_RE = re.compile(
-    r"\b(image|picture|photo|screenshot|background|foreground|canvas|logo|icon|object|person|face|subject|style|color|colour|crop|resize|blur)\b",
-    re.IGNORECASE,
-)
-_EXTERNAL_DOCUMENT_TARGET_RE = re.compile(
-    r"\b(bug\s+report|excel|spreadsheet|sheet|workbook|csv|xlsx?|document|docx?|word\s+doc|pdf|report)\b",
-    re.IGNORECASE,
-)
 
 
 @dataclass(slots=True)
@@ -57,26 +33,15 @@ class ImageArtifactRequest:
 
 
 def parse_image_generation_request(prompt: str) -> bool:
-    """Return True when the prompt is plainly asking to create a new image."""
+    """Free-form prompts are not parsed into image-generation intent locally."""
 
-    text = " ".join(prompt.strip().split())
-    if not text:
-        return False
-    return bool(
-        (_IMAGE_GENERATION_VERB_RE.search(text) and _IMAGE_OUTPUT_NOUN_RE.search(text))
-        or _DRAW_DIRECT_RE.search(text)
-    )
+    return False
 
 
 def parse_image_edit_request(prompt: str) -> bool:
-    """Return True when a prompt with an attached source image asks for an edit."""
+    """Free-form prompts are not parsed into image-edit intent locally."""
 
-    text = " ".join(prompt.strip().split())
-    if not text:
-        return False
-    if _EXTERNAL_DOCUMENT_TARGET_RE.search(text) and not _IMAGE_EDIT_CONTEXT_RE.search(text):
-        return False
-    return bool(_IMAGE_EDIT_VERB_RE.search(text))
+    return False
 
 
 def _get_tool_spec(registry: ToolRegistry | None, name: str):

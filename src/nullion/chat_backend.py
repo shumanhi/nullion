@@ -13,6 +13,8 @@ import urllib.request
 from ipaddress import ip_address
 from urllib.parse import quote_plus, urlparse
 
+from nullion.mini_agent_routing import should_route_without_mini_agents
+
 # Try to import optional decompressors; advertise their encodings only when
 # we can actually decode the response. This lets us look like a real browser
 # (which always advertises br/zstd) without claiming what we can't handle.
@@ -557,6 +559,7 @@ def _try_dispatch_mini_agents(
         or not hasattr(agent_orchestrator, "dispatch_request_sync")
         or not _feature_enabled("NULLION_TASK_DECOMPOSITION_ENABLED")
         or not _feature_enabled("NULLION_MULTI_AGENT_ENABLED")
+        or should_route_without_mini_agents(message, has_attachments=has_attachments)
     ):
         return None
     plan = TaskPlanner().build_execution_plan(

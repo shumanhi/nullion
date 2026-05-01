@@ -19,6 +19,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from nullion.builder import BuilderDecisionType, BuilderProposal
 from nullion.builder_observer import PatternSignal, TurnSignal
@@ -76,6 +80,16 @@ class ReflectionResult:
     raw_json: str | None = None
 
 
+class _BuilderReflectionState(TypedDict, total=False):
+    model_client: Any
+    user_message: str
+    assistant_reply: str | None
+    turn_signal: TurnSignal
+    should_call_model: bool
+    raw_json: str
+    result: ReflectionResult
+
+
 def reflect_on_turn(
     *,
     model_client,
@@ -88,23 +102,44 @@ def reflect_on_turn(
     Returns a ReflectionResult. Always succeeds — errors return
     should_propose=False and are logged at DEBUG level.
     """
-    if turn_signal.tool_count < _MIN_TOOLS_FOR_REFLECTION:
-        return ReflectionResult(should_propose=False)
-    if turn_signal.outcome.value != "success":
-        return ReflectionResult(should_propose=False)
+    final_state = _compiled_builder_reflection_graph().invoke(
+        {
+            "model_client": model_client,
+            "user_message": user_message,
+            "assistant_reply": assistant_reply,
+            "turn_signal": turn_signal,
+        },
+        config={"configurable": {"thread_id": "builder-reflect-turn"}},
+    )
+    result = final_state.get("result")
+    return result if isinstance(result, ReflectionResult) else ReflectionResult(should_propose=False)
 
-    distinct_tools = list(dict.fromkeys(turn_signal.tool_names))   # ordered dedup
+
+def _reflection_precheck_node(state: _BuilderReflectionState) -> dict[str, object]:
+    turn_signal = state["turn_signal"]
+    should_call = turn_signal.tool_count >= _MIN_TOOLS_FOR_REFLECTION and turn_signal.outcome.value == "success"
+    if not should_call:
+        return {"should_call_model": False, "result": ReflectionResult(should_propose=False)}
+    return {"should_call_model": True}
+
+
+def _reflection_route_after_precheck(state: _BuilderReflectionState) -> str:
+    return "model" if state.get("should_call_model") else END
+
+
+def _reflection_model_node(state: _BuilderReflectionState) -> dict[str, object]:
+    turn_signal = state["turn_signal"]
+    distinct_tools = list(dict.fromkeys(turn_signal.tool_names))
     tool_list = ", ".join(distinct_tools)
-    reply_preview = (assistant_reply or "")[:400]
+    reply_preview = (state.get("assistant_reply") or "")[:400]
 
     user_content = (
-        f"User request: {user_message}\n\n"
+        f"User request: {state.get('user_message') or ''}\n\n"
         f"Tools used (in order): {tool_list}\n\n"
         f"Assistant reply: {reply_preview}"
     )
-
     try:
-        response = model_client.create(
+        response = state["model_client"].create(
             messages=[
                 {
                     "role": "system",
@@ -120,7 +155,7 @@ def reflect_on_turn(
         )
     except Exception as exc:
         logger.debug("Builder reflection model call failed: %s", exc)
-        return ReflectionResult(should_propose=False)
+        return {"result": ReflectionResult(should_propose=False)}
 
     content = response.get("content") or []
     raw = "".join(
@@ -128,8 +163,29 @@ def reflect_on_turn(
         for block in content
         if isinstance(block, dict) and block.get("type") == "text"
     ).strip()
+    return {"raw_json": raw}
 
-    return _parse_reflection_response(raw, user_message=user_message)
+
+def _reflection_parse_node(state: _BuilderReflectionState) -> dict[str, object]:
+    return {
+        "result": _parse_reflection_response(
+            state.get("raw_json") or "",
+            user_message=state.get("user_message") or "",
+        )
+    }
+
+
+@lru_cache(maxsize=1)
+def _compiled_builder_reflection_graph():
+    graph = StateGraph(_BuilderReflectionState)
+    graph.add_node("precheck", _reflection_precheck_node)
+    graph.add_node("model", _reflection_model_node)
+    graph.add_node("parse", _reflection_parse_node)
+    graph.add_edge(START, "precheck")
+    graph.add_conditional_edges("precheck", _reflection_route_after_precheck, {"model": "model", END: END})
+    graph.add_edge("model", "parse")
+    graph.add_edge("parse", END)
+    return graph.compile()
 
 
 def reflect_on_pattern(

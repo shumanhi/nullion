@@ -145,6 +145,7 @@ class _CronRunDeliveryState(TypedDict, total=False):
     text: str
     artifacts: object
     block_reason: str | None
+    send_attempts: int
 
 
 def _cron_run_resolve_route_node(state: _CronRunDeliveryState) -> dict[str, object]:
@@ -247,6 +248,7 @@ def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, objec
 def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
     callbacks = state["callbacks"]
     result = dict(state.get("result") or {})
+    attempts = int(state.get("send_attempts") or 0) + 1
     text = cron_delivery_text(str(state.get("text") or ""), state.get("artifacts"))
     if callbacks.send_platform_delivery(state["job"], state["delivery_channel"], text):
         if callbacks.clear_background_delivery is not None:
@@ -259,7 +261,17 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
             state["conversation_id"],
         )
         result["cron_delivery_status"] = "sent"
-        return {"result": result}
+        return {"result": result, "send_attempts": attempts}
+    if attempts < 2:
+        callbacks.record_event(
+            "cron.delivery.retry",
+            state["job"],
+            state["delivery_channel"],
+            state["delivery_target"],
+            state["conversation_id"],
+            reason="platform delivery failed",
+        )
+        return {"result": result, "send_attempts": attempts}
     callbacks.record_event(
         "cron.delivery.failed",
         state["job"],
@@ -270,7 +282,16 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
     )
     result["cron_delivery_status"] = "failed"
     result["cron_delivery_failed"] = True
-    return {"result": result}
+    return {"result": result, "send_attempts": attempts}
+
+
+def _cron_run_route_after_messaging(state: _CronRunDeliveryState) -> str:
+    result = state.get("result") or {}
+    if result.get("cron_delivery_status") in {"sent", "failed"}:
+        return END
+    if int(state.get("send_attempts") or 0) < 2:
+        return "retry"
+    return END
 
 
 @lru_cache(maxsize=1)
@@ -287,7 +308,8 @@ def _compiled_cron_run_delivery_graph():
     graph.add_edge("resolve_route", "run_agent")
     graph.add_conditional_edges("run_agent", _cron_run_route_after_agent, {"paused": "paused", "prepare": "prepare"})
     graph.add_conditional_edges("prepare", _cron_run_route_prepared, {"blocked": "blocked", "web": "web", "messaging": "messaging"})
-    for node in ("paused", "blocked", "web", "messaging"):
+    graph.add_conditional_edges("messaging", _cron_run_route_after_messaging, {"retry": "messaging", END: END})
+    for node in ("paused", "blocked", "web"):
         graph.add_edge(node, END)
     return graph.compile()
 

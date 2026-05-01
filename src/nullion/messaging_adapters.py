@@ -664,7 +664,7 @@ def _messaging_output_roots(*, principal_id: str | None) -> tuple[Path, ...]:
     roots = [artifact_root_for_principal(principal_id)]
     try:
         workspace_roots = workspace_storage_roots_for_principal(principal_id)
-        roots.extend([workspace_roots.artifacts, workspace_roots.media])
+        roots.extend([workspace_roots.artifacts, workspace_roots.files, workspace_roots.media])
     except Exception:
         pass
     return tuple(dict.fromkeys(root.resolve() for root in roots))

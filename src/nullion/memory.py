@@ -54,17 +54,6 @@ class _MemoryCaptureState(TypedDict, total=False):
     candidate: MemoryCandidate
 
 
-_HOME_ZIP_PATTERN = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
-_REMEMBER_PATTERN = re.compile(
-    r"\bremember(?:\s+that)?\s+(?P<fact>.+?)(?:[.!?]\s*)?$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-_MY_FIELD_PATTERN = re.compile(
-    r"^my\s+(?P<key>[a-z][a-z0-9 _-]{1,48}?)\s+(?:is|=)\s+(?P<value>.+)$",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-
-
 def _slug_key(value: str, *, default: str = "memory") -> str:
     key = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     return key[:60] or default
@@ -153,26 +142,7 @@ def _memory_detect_candidates_node(state: _MemoryCaptureState) -> dict[str, obje
     stripped = state.get("stripped") or ""
     if not stripped:
         return {"candidate": MemoryCandidate()}
-    zip_match = _HOME_ZIP_PATTERN.search(stripped)
-    remember_match = _REMEMBER_PATTERN.search(stripped)
-    field_match_without_prefix = _MY_FIELD_PATTERN.match(stripped)
-    words = set(re.findall(r"[a-z0-9]+", stripped.lower()))
-    is_remember_request = (
-        remember_match is not None
-        or field_match_without_prefix is not None
-        or "remember" in words
-    )
-    zip_context = re.search(r"\b(zip|zipcode|zip code|postal code)\b", stripped, flags=re.IGNORECASE)
-    weather_context = re.search(r"\bweather\b", stripped, flags=re.IGNORECASE)
-    return {"candidate": MemoryCandidate(
-        zip_code=zip_match.group(1) if zip_match else None,
-        remember_fact=remember_match.group("fact").strip(" .") if remember_match is not None else None,
-        field_key=field_match_without_prefix.group("key") if field_match_without_prefix is not None else None,
-        field_value=field_match_without_prefix.group("value").strip(" .") if field_match_without_prefix is not None else None,
-        is_remember_request=is_remember_request,
-        zip_context=bool(zip_context),
-        weather_context=bool(weather_context),
-    )}
+    return {"candidate": MemoryCandidate()}
 
 
 def _memory_zip_node(state: _MemoryCaptureState) -> dict[str, object]:
@@ -211,24 +181,6 @@ def _memory_remember_field_node(state: _MemoryCaptureState) -> dict[str, object]
     if not fact:
         return {}
     written = list(state.get("written") or [])
-    field_match = _MY_FIELD_PATTERN.match(fact)
-    if field_match is not None:
-        key = field_match.group("key")
-        value = field_match.group("value").strip(" .")
-        if _slug_key(key) == "zip" or _slug_key(key) == "zip_code":
-            return {"written": written, "candidate": MemoryCandidate(zip_code=candidate.zip_code)}
-        if value:
-            written.append(
-                remember_text_fact(
-                    state["store"],
-                    owner=state["owner"],
-                    key=key,
-                    value=value,
-                    source=state["source"],
-                    kind=UserMemoryKind.PREFERENCE,
-                )
-            )
-        return {"written": written, "candidate": MemoryCandidate(zip_code=candidate.zip_code)}
     return {"written": written}
 
 

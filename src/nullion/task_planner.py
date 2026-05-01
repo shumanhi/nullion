@@ -175,37 +175,7 @@ def _split_clauses(message: str) -> list[str]:
     normalized = message.replace("\n", " ").strip()
     if not normalized:
         return []
-    separators = [" and then ", " then ", ";", " and "]
-    clauses = [normalized]
-    for separator in separators:
-        if separator in normalized.lower():
-            lowered = normalized
-            pieces: list[str] = []
-            remaining = lowered
-            while True:
-                index = remaining.lower().find(separator)
-                if index < 0:
-                    pieces.append(remaining)
-                    break
-                left = remaining[:index]
-                if left.strip():
-                    pieces.append(left)
-                remaining = remaining[index + len(separator):]
-            clauses = pieces or [normalized]
-            break
-    cleaned: list[str] = []
-    for clause in clauses:
-        stripped = clause.strip().strip(".,;:")
-        if not stripped:
-            continue
-        if stripped.lower().startswith("and then "):
-            stripped = stripped[9:]
-        elif stripped.lower().startswith("then "):
-            stripped = stripped[5:]
-        cleaned.append(stripped)
-    if len(cleaned) > 1 and separator == " and " and not _substantial_parallel_clauses(cleaned):
-        return [normalized]
-    return cleaned
+    return [normalized.strip().strip(".,;:")]
 
 
 def _step_title(clause: str) -> str:
@@ -222,25 +192,12 @@ def _truncate_title(title: str, limit: int = 60) -> str:
     return compact[: limit - 1].rstrip() + "…"
 
 
-def _substantial_parallel_clauses(clauses: list[str]) -> bool:
-    return all(len(clause.split()) >= 3 for clause in clauses)
-
-
 def _classify_plan_shape(steps: tuple[MissionStep, ...]) -> tuple[PlanDisposition, PlanDispatchMode]:
     if len(steps) <= 1:
         return PlanDisposition.SINGLE_TURN, PlanDispatchMode.NONE
     if any(step.metadata.get("checkpoint_before") for step in steps if isinstance(step.metadata, dict)):
         return PlanDisposition.SEQUENTIAL_MISSION, PlanDispatchMode.SEQUENTIAL
-    return PlanDisposition.PARALLEL_MISSION, PlanDispatchMode.PARALLEL
-
-
-CHECKPOINT_PHRASES = (
-    "check with me before",
-    "let me know before",
-    "ask me first",
-    "confirm before",
-    "pause before",
-)
+    return PlanDisposition.SEQUENTIAL_MISSION, PlanDispatchMode.SEQUENTIAL
 
 
 def _step_metadata(clause: str, *, step_index: int, active_task_frame: TaskFrame | None) -> dict[str, object]:
@@ -325,8 +282,7 @@ def _compiled_step_metadata_graph():
 
 
 def _contains_checkpoint_phrase(text: str) -> bool:
-    lowered = text.lower()
-    return any(phrase in lowered for phrase in CHECKPOINT_PHRASES)
+    return False
 
 
 def _normalized_clause_words(clause: str) -> tuple[str, ...]:
@@ -343,22 +299,14 @@ def _clause_has_url_target(clause: str) -> bool:
 
 
 def _tool_scope_decision_for_clause(clause: str) -> ToolScopeDecision:
-    words = _normalized_clause_words(clause)
-    word_set = set(words)
     scope: list[str] = []
     evidence: list[str] = []
-    if word_set & {"email", "mail"}:
-        scope.append("email_send")
-        evidence.append("communication_target")
-    if word_set & {"fetch", "open", "visit", "browse"} or _clause_has_url_target(clause):
+    if _clause_has_url_target(clause):
         scope.append("web_fetch")
-        evidence.append("web_source_target")
-    elif word_set & {"search", "find"}:
-        scope.append("web_search")
-        evidence.append("search_intent")
-    if word_set & {"pdf"}:
+        evidence.append("url_target")
+    if any(word == "pdf" for word in _normalized_clause_words(clause)):
         scope.append("pdf_create")
-        evidence.append("pdf_deliverable")
+        evidence.append("extension_token")
     return ToolScopeDecision(
         tool_scope=tuple(dict.fromkeys(scope)),
         evidence=tuple(dict.fromkeys(evidence)),
