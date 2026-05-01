@@ -215,6 +215,8 @@ def _media_model_supports(capability: str, provider: str, model: str) -> bool:
     model_l = model.strip().lower()
     if not provider_l or not model_l:
         return False
+    if not _media_model_matches_provider(provider_l, model_l):
+        return False
     if capability == "audio_transcribe":
         if provider_l in {"openai", "groq", "custom"}:
             return any(token in model_l for token in ("transcribe", "whisper", "audio"))
@@ -250,6 +252,21 @@ def _media_model_supports(capability: str, provider: str, model: str) -> bool:
             return any(token in model_l for token in ("gpt-4o", "gpt-4.1", "gpt-5", "video", "sora"))
         return any(token in model_l for token in ("video", "veo", "gemini", "vision", "vl"))
     return False
+
+
+def _media_model_matches_provider(provider: str, model: str) -> bool:
+    provider_l = provider.strip().lower()
+    model_l = model.strip().lower()
+    if provider_l in {"custom", "ollama", "openrouter", "openrouter-key", "groq", "mistral", "deepseek", "xai", "together"}:
+        return True
+    branded_tokens = {
+        "anthropic": ("claude", "sonnet", "opus", "haiku"),
+        "codex": ("gpt-", "o1", "o3", "o4", "codex"),
+        "gemini": ("gemini", "imagen", "veo"),
+        "openai": ("gpt-", "o1", "o3", "o4", "dall-e", "whisper", "sora"),
+    }
+    tokens = branded_tokens.get(provider_l)
+    return True if tokens is None else any(token in model_l for token in tokens)
 
 
 def _media_capability_supported(capability: str, provider: str, model: str) -> bool:
@@ -354,6 +371,27 @@ def _normalize_media_models(raw: object) -> dict[str, list[dict[str, object]]]:
         if provider_records:
             normalized[provider_key] = provider_records
     return normalized
+
+
+def _filter_supported_media_models(
+    media_models: dict[str, list[dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    filtered: dict[str, list[dict[str, object]]] = {}
+    for provider, records in media_models.items():
+        provider_records: list[dict[str, object]] = []
+        for record in records:
+            model = str(record.get("model") or "").strip()
+            raw_caps = record.get("capabilities")
+            caps = [
+                str(cap).strip()
+                for cap in (raw_caps if isinstance(raw_caps, list) else [])
+                if str(cap).strip() and _media_capability_supported(str(cap).strip(), provider, model)
+            ]
+            if model and caps:
+                provider_records.append({"model": model, "capabilities": sorted(set(caps))})
+        if provider_records:
+            filtered[provider] = provider_records
+    return filtered
 
 
 def _media_capability_keys(capability: str) -> set[str]:
@@ -8135,11 +8173,27 @@ function mediaCapabilitiesForName(provider, model) {
   const name = String(model || '').toLowerCase();
   const providerKey = String(provider || '').toLowerCase();
   const caps = new Set();
+  if (!mediaModelMatchesProvider(providerKey, name)) return [];
   if (/(gpt-4o|gpt-4\.1|gpt-5|vision|vl|llava|pixtral|gemini|claude|sonnet|opus|haiku)/.test(name)) caps.add('image_input');
   if (/(transcribe|whisper|audio)/.test(name) && ['openai', 'groq', 'custom'].includes(providerKey)) caps.add('audio_input');
   if ((providerKey === 'openai' && /(gpt-image|dall-e|image)/.test(name)) || (providerKey === 'custom' || /(image|imagen|flux|stable-diffusion|sdxl)/.test(name))) caps.add('image_output');
   if (/(video|sora|veo)/.test(name)) caps.add('video_input');
   return Array.from(caps);
+}
+
+function mediaModelMatchesProvider(provider, model) {
+  const providerKey = String(provider || '').toLowerCase();
+  const name = String(model || '').toLowerCase();
+  if (!providerKey || !name) return false;
+  if (['custom', 'ollama', 'openrouter', 'openrouter-key', 'groq', 'mistral', 'deepseek', 'xai', 'together'].includes(providerKey)) return true;
+  const branded = {
+    anthropic: ['claude', 'sonnet', 'opus', 'haiku'],
+    codex: ['gpt-', 'o1', 'o3', 'o4', 'codex'],
+    gemini: ['gemini', 'imagen', 'veo'],
+    openai: ['gpt-', 'o1', 'o3', 'o4', 'dall-e', 'whisper', 'sora'],
+  };
+  const tokens = branded[providerKey];
+  return !tokens || tokens.some(token => name.includes(token));
 }
 
 function mediaCapabilityIsValid(provider, model, cap) {
@@ -8430,7 +8484,9 @@ function addMediaModel() {
   const invalid = capabilities.filter(cap => !mediaCapabilityIsValid(provider, model, cap));
   if (invalid.length) {
     if (fb) {
-      fb.textContent = `${model} does not look valid for ${invalid.map(mediaCapabilityLabel).join(', ')}.`;
+      fb.textContent = !mediaModelMatchesProvider(provider, model)
+        ? `${model} belongs under a different provider, not ${providerLabel(provider)}.`
+        : `${model} does not look valid for ${invalid.map(mediaCapabilityLabel).join(', ')}.`;
       fb.className = 'err';
     }
     return;
@@ -14009,7 +14065,7 @@ def create_app(runtime, orchestrator, registry):
         provider_models: dict[str, str] = {
             k: str(v or "") for k, v in provider_models_raw.items() if isinstance(k, str)
         }
-        media_models = _normalize_media_models(creds.get("media_models"))
+        media_models = _filter_supported_media_models(_normalize_media_models(creds.get("media_models")))
         legacy_model = creds.get("model", "")
         if legacy_model and provider and not provider_models.get(provider):
             provider_models[provider] = legacy_model
@@ -14766,7 +14822,7 @@ def create_app(runtime, orchestrator, registry):
         effective_media_models = (
             _normalize_media_models(media_models_body)
             if media_models_body is not None
-            else _normalize_media_models(existing_creds_for_media.get("media_models"))
+            else _filter_supported_media_models(_normalize_media_models(existing_creds_for_media.get("media_models")))
         )
         invalid_media_models = _invalid_media_model_capabilities(effective_media_models)
         if invalid_media_models:

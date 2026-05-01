@@ -11,8 +11,10 @@ from nullion.web_app import (
     _version_tag,
     _approval_display_from_turn_result,
     create_app,
+    _filter_supported_media_models,
     _invalid_media_model_capabilities,
     _media_model_options,
+    _media_model_supports,
     _media_selection_supported,
     _normalize_media_models,
 )
@@ -775,13 +777,35 @@ def test_media_model_normalization_dedupes_and_drops_invalid_records() -> None:
 def test_invalid_media_model_capabilities_are_reported_before_save() -> None:
     errors = _invalid_media_model_capabilities(
         {
-            "codex": [{"model": "gpt-5.5", "capabilities": ["audio_input"]}],
+            "codex": [
+                {"model": "gpt-5.5", "capabilities": ["audio_input"]},
+                {"model": "gemini-3.1-flash-image-preview", "capabilities": ["image_output"]},
+            ],
             "openai": [{"model": "gpt-4o", "capabilities": []}],
         }
     )
 
     assert "codex · gpt-5.5 does not look valid for audio_input" in errors
+    assert "codex · gemini-3.1-flash-image-preview does not look valid for image_output" in errors
     assert "openai · gpt-4o needs a model type" in errors
+
+
+def test_media_models_are_provider_scoped() -> None:
+    assert _media_model_supports("image_generate", "codex", "gemini-3.1-flash-image-preview") is False
+    assert _media_model_supports("image_generate", "gemini", "gemini-3.1-flash-image-preview") is True
+    assert _filter_supported_media_models(
+        {
+            "codex": [{"model": "gemini-3.1-flash-image-preview", "capabilities": ["image_output"]}],
+            "gemini": [{"model": "gemini-3.1-flash-image-preview", "capabilities": ["image_output"]}],
+        }
+    ) == {
+        "gemini": [{"model": "gemini-3.1-flash-image-preview", "capabilities": ["image_output"]}]
+    }
+
+
+def test_media_model_javascript_rejects_provider_mismatches() -> None:
+    assert "function mediaModelMatchesProvider(provider, model)" in _HTML
+    assert "belongs under a different provider" in _HTML
 
 
 def test_media_selection_rejects_partial_selection_and_codex_audio_even_if_declared() -> None:
