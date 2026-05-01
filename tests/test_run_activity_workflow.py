@@ -139,6 +139,59 @@ async def test_telegram_planner_status_reuses_editable_message() -> None:
     assert "☑ Find data" in bot.edited[0][2]
 
 
+@pytest.mark.asyncio
+async def test_telegram_planner_status_does_not_duplicate_on_noop_edit() -> None:
+    from nullion.telegram_app import _send_or_edit_telegram_status_message
+
+    class Bot:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, str, dict]] = []
+            self.edit_count = 0
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.sent.append((chat_id, text, kwargs))
+            return SimpleNamespace(message_id=42)
+
+        def edit_message_text(self, **kwargs):
+            self.edit_count += 1
+            raise RuntimeError("Message is not modified")
+
+    bot = Bot()
+    status_messages: dict[tuple[str, str], int] = {}
+    status_texts: dict[tuple[str, str], str] = {}
+    text = "→ Working on 1 task:\n  ☐ Find data"
+
+    await _send_or_edit_telegram_status_message(
+        bot,
+        status_messages,
+        chat_id="123",
+        group_id="grp-1",
+        text=text,
+        status_texts=status_texts,
+    )
+    await _send_or_edit_telegram_status_message(
+        bot,
+        status_messages,
+        chat_id="123",
+        group_id="grp-1",
+        text=text,
+        status_texts=status_texts,
+    )
+    status_texts.clear()
+    await _send_or_edit_telegram_status_message(
+        bot,
+        status_messages,
+        chat_id="123",
+        group_id="grp-1",
+        text=text,
+        status_texts=status_texts,
+    )
+
+    assert len(bot.sent) == 1
+    assert bot.edit_count == 1
+    assert status_messages == {("123", "grp-1"): 42}
+
+
 def test_verbose_mode_documentation_and_website_content_are_current() -> None:
     docs = "\n".join(
         Path(path).read_text(encoding="utf-8")

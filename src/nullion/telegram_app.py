@@ -1282,8 +1282,12 @@ async def _send_or_edit_telegram_status_message(
     chat_id: str,
     group_id: str,
     text: str,
+    status_texts: dict[tuple[str, str], str] | None = None,
 ) -> None:
     if bot is None or not chat_id or not group_id or not text:
+        return
+    key = (chat_id, group_id)
+    if status_texts is not None and status_texts.get(key) == text:
         return
     if isinstance(bot, str):
         try:
@@ -1298,11 +1302,11 @@ async def _send_or_edit_telegram_status_message(
                 chat_id=chat_id,
                 group_id=group_id,
                 text=text,
+                status_texts=status_texts,
             )
         return
     formatted, kwargs = format_telegram_text(text)
     kwargs = {**kwargs, "disable_web_page_preview": True}
-    key = (chat_id, group_id)
     message_id = status_messages.get(key)
     if message_id is not None:
         try:
@@ -1314,14 +1318,23 @@ async def _send_or_edit_telegram_status_message(
             )
             if inspect.isawaitable(result):
                 await result
+            if status_texts is not None:
+                status_texts[key] = text
             return
-        except Exception:
-            logger.debug("Telegram planner status edit failed; sending a fresh status message", exc_info=True)
+        except Exception as exc:
+            if "message is not modified" in str(exc).lower():
+                if status_texts is not None:
+                    status_texts[key] = text
+                return
+            logger.debug("Telegram planner status edit failed; keeping existing status message", exc_info=True)
+            return
     result = bot.send_message(chat_id, formatted, **kwargs)
     sent_message = await result if inspect.isawaitable(result) else result
     sent_message_id = getattr(sent_message, "message_id", None)
     if sent_message_id is not None:
         status_messages[key] = int(sent_message_id)
+    if status_texts is not None:
+        status_texts[key] = text
 
 
 async def _send_operator_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
@@ -2808,6 +2821,7 @@ class ChatOperatorService:
             _bot_token = self.bot_token
             _service_ref = self
             _status_messages: dict[tuple[str, str], int] = {}
+            _status_texts: dict[tuple[str, str], str] = {}
 
             def _telegram_deliver_fn(conversation_id: str, text: str, **kwargs) -> None:
                 """Route aggregator output back to the originating Telegram chat."""
@@ -2832,6 +2846,7 @@ class ChatOperatorService:
                                 chat_id=chat_id,
                                 group_id=group_id,
                                 text=text,
+                                status_texts=_status_texts,
                             )
                         )
                     except RuntimeError:
