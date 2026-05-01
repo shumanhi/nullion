@@ -25,6 +25,7 @@ from nullion.prompt_injection import (
     safe_untrusted_tool_metadata,
 )
 from nullion.response_sanitizer import sanitize_user_visible_reply, safe_raw_tool_payload_replacement
+from nullion.response_fulfillment_contract import evaluate_response_fulfillment
 from nullion.runtime import (
     mark_mission_completed,
     mark_mission_failed,
@@ -282,6 +283,32 @@ def _post_tool_delivery_nudge() -> str:
         "Use the tool results above to provide the requested answer or delivery status. "
         "Do not answer only Done, OK, Complete, or Completed."
     )
+
+
+def _missing_artifact_delivery_nudge(missing_requirements: tuple[str, ...]) -> str:
+    missing = ", ".join(missing_requirements) or "the required attachment"
+    return (
+        "The active task is not deliverable yet. Before giving a final reply, produce and attach "
+        f"{missing}. If a command failed, inspect the error, repair the script or command, rerun it, "
+        "and only finish after a real artifact path is available."
+    )
+
+
+def _artifact_roots_for_agent_turn(runtime_store: object, principal_id: str) -> tuple[Any, ...]:
+    roots: list[Any] = []
+    try:
+        from nullion.artifacts import artifact_root_for_principal
+
+        roots.append(artifact_root_for_principal(principal_id))
+    except Exception:
+        logger.debug("Could not resolve principal artifact root", exc_info=True)
+    try:
+        from nullion.artifacts import artifact_root_for_runtime
+
+        roots.append(artifact_root_for_runtime(runtime_store))
+    except Exception:
+        logger.debug("Could not resolve runtime artifact root", exc_info=True)
+    return tuple(roots)
 
 
 def _conversation_visible_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -792,6 +819,39 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                 final_text = _last_useful_tool_message(tool_results)
         else:
             final_text = _bare_completion_without_work_text(final_text)
+    if (
+        tool_results
+        and not state.get("post_tool_delivery_nudged", False)
+        and state.get("runtime_store") is not None
+    ):
+        decision = evaluate_response_fulfillment(
+            store=state["runtime_store"],
+            conversation_id=state["conversation_id"],
+            user_message=state["user_message"],
+            reply=final_text or "",
+            tool_results=tool_results,
+            artifact_paths=artifacts,
+            artifact_roots=_artifact_roots_for_agent_turn(
+                state["runtime_store"],
+                state["principal_id"],
+            ),
+        )
+        if not decision.satisfied and any(
+            "attachment" in requirement for requirement in decision.missing_requirements
+        ):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": _missing_artifact_delivery_nudge(decision.missing_requirements)}],
+                }
+            )
+            return {"messages": messages, "post_tool_delivery_nudged": True}
     final_text = sanitize_user_visible_reply(
         user_message=state["user_message"],
         reply=final_text,

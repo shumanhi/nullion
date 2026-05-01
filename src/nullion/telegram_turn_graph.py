@@ -9,12 +9,15 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from nullion.messaging_adapters import DeliveryContract, delivery_contract_for_turn
+from nullion.messaging_adapters import delivery_contract_for_runtime_turn
 
 
 class TelegramPostRunState(TypedDict, total=False):
     text_for_ack: str | None
     reply: str
     inbound_attachments: tuple[dict[str, str], ...]
+    runtime: Any
+    conversation_id: str | None
     decision_card: Any
     suggestion_markup: Any
     stream_final_reply: bool
@@ -49,13 +52,23 @@ def _split_decision_card_node(state: TelegramPostRunState) -> dict[str, object]:
 
 
 def _build_delivery_contract_node(state: TelegramPostRunState) -> dict[str, object]:
-    return {
-        "delivery_contract": delivery_contract_for_turn(
+    runtime = state.get("runtime")
+    conversation_id = state.get("conversation_id")
+    if runtime is not None and isinstance(conversation_id, str) and conversation_id:
+        delivery_contract = delivery_contract_for_runtime_turn(
+            runtime,
+            conversation_id,
             state.get("text_for_ack"),
             reply=state["reply"],
             inbound_attachments=state.get("inbound_attachments") or (),
         )
-    }
+    else:
+        delivery_contract = delivery_contract_for_turn(
+            state.get("text_for_ack"),
+            reply=state["reply"],
+            inbound_attachments=state.get("inbound_attachments") or (),
+        )
+    return {"delivery_contract": delivery_contract}
 
 
 def _select_streaming_mode_node(state: TelegramPostRunState) -> dict[str, object]:
@@ -86,6 +99,8 @@ def plan_telegram_post_run_delivery(
     text_for_ack: str | None,
     reply: str,
     inbound_attachments: tuple[dict[str, str], ...] = (),
+    runtime: Any = None,
+    conversation_id: str | None = None,
     decision_card: Any = None,
     suggestion_markup: Any = None,
     stream_final_reply: bool,
@@ -97,6 +112,8 @@ def plan_telegram_post_run_delivery(
             "text_for_ack": text_for_ack,
             "reply": reply,
             "inbound_attachments": inbound_attachments,
+            "runtime": runtime,
+            "conversation_id": conversation_id,
             "decision_card": decision_card,
             "suggestion_markup": suggestion_markup,
             "stream_final_reply": stream_final_reply,

@@ -64,6 +64,15 @@ def test_openai_chat_adapter_serializes_messages_tools_and_parses_tool_calls() -
     assert serialized[4]["content"] == "{'ok': True}"
     assert serialized[5] == {"role": "custom", "content": ""}
 
+    repaired = model_clients.OpenAIChatCompletionsModelClient._serialize_messages(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "late sys"},
+            {"role": "assistant", "content": "hello"},
+        ]
+    )
+    assert [message["role"] for message in repaired] == ["system", "user", "assistant"]
+
     tools = model_clients.OpenAIChatCompletionsModelClient._serialize_tool_definitions(
         [{"name": "search", "description": "Search", "input_schema": {"type": "object"}}, {"bad": True}]
     )

@@ -194,6 +194,70 @@ def test_messaging_turn_graph_ignores_text_only_file_verbs(monkeypatch) -> None:
     assert result.delivery_contract.source == "message"
 
 
+def test_messaging_turn_graph_uses_active_task_frame_attachment_contract(monkeypatch) -> None:
+    from nullion import messaging_adapters as adapters
+    from nullion.task_frames import (
+        TaskFrame,
+        TaskFrameExecutionContract,
+        TaskFrameFinishCriteria,
+        TaskFrameOperation,
+        TaskFrameOutputContract,
+        TaskFrameStatus,
+        TaskFrameTarget,
+    )
+
+    frame = TaskFrame(
+        frame_id="frame-1",
+        conversation_id="slack:U1",
+        branch_id="branch-1",
+        source_turn_id="turn-1",
+        parent_frame_id=None,
+        status=TaskFrameStatus.ACTIVE,
+        operation=TaskFrameOperation.GENERATE_ARTIFACT,
+        target=TaskFrameTarget(kind="file", value="brief"),
+        execution=TaskFrameExecutionContract(),
+        output=TaskFrameOutputContract(artifact_kind="pdf", delivery_mode="attachment"),
+        finish=TaskFrameFinishCriteria(requires_artifact_delivery=True, required_artifact_kind="pdf"),
+        summary="Create brief",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    class Store:
+        def get_active_task_frame_id(self, conversation_id):
+            return "frame-1" if conversation_id == "slack:U1" else None
+
+        def get_task_frame(self, frame_id):
+            return frame if frame_id == "frame-1" else None
+
+        def list_approval_requests(self):
+            return []
+
+        def list_doctor_actions(self):
+            return []
+
+        def list_reminders(self):
+            return []
+
+    class Service:
+        def __init__(self):
+            self.runtime = SimpleNamespace(store=Store(), list_pending_builder_proposals=lambda: [])
+
+        def handle_text_message(self, **kwargs):
+            return "I’m not done yet — this task still needs a file attachment."
+
+    monkeypatch.setattr(adapters, "save_messaging_chat_history", lambda ingress, reply: None)
+
+    result = adapters.handle_messaging_ingress_result(
+        Service(),
+        adapters.MessagingIngress("slack", "U1", "and those columns sounds good"),
+    )
+
+    assert result.delivery_contract.requires_attachment_delivery
+    assert result.delivery_contract.source == "task_frame"
+    assert result.delivery_contract.required_attachment_extensions == (".pdf",)
+
+
 def test_prepare_reply_for_platform_delivery_sanitizes_and_reports_missing_attachments(monkeypatch, tmp_path) -> None:
     from nullion import messaging_adapters as adapters
 

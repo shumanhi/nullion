@@ -21,13 +21,14 @@ from nullion.artifacts import (
 )
 from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
-from nullion.attachment_format_graph import plan_attachment_format
+from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, plan_attachment_format
 from nullion.chat_attachments import guess_media_type
 from nullion.chat_text import make_markdown_tables_chat_readable
 from nullion.config import NullionSettings
 from nullion.remediation import remediation_buttons_for_recommendation_code
 from nullion.users import is_authorized_messaging_identity, resolve_messaging_user
 from nullion.workspace_storage import workspace_storage_roots_for_principal
+from nullion.task_frames import TaskFrameStatus
 
 
 class MessagingAdapterConfigurationError(ValueError):
@@ -764,6 +765,86 @@ def delivery_contract_for_turn(
     return DeliveryContract.message_only()
 
 
+def _active_task_frame_for_delivery_contract(runtime: object, conversation_id: str | None):
+    store = getattr(runtime, "store", runtime)
+    if store is None or not isinstance(conversation_id, str) or not conversation_id:
+        return None
+    try:
+        active_frame_id = store.get_active_task_frame_id(conversation_id)
+    except Exception:
+        return None
+    if not isinstance(active_frame_id, str) or not active_frame_id:
+        return None
+    try:
+        frame = store.get_task_frame(active_frame_id)
+    except Exception:
+        return None
+    if frame is None or getattr(frame, "status", None) not in {
+        TaskFrameStatus.ACTIVE,
+        TaskFrameStatus.RUNNING,
+        TaskFrameStatus.WAITING_APPROVAL,
+        TaskFrameStatus.WAITING_INPUT,
+        TaskFrameStatus.VERIFYING,
+    }:
+        return None
+    return frame
+
+
+def _extension_for_artifact_kind(artifact_kind: object) -> str | None:
+    normalized = str(artifact_kind or "").strip().lower().removeprefix(".")
+    if not normalized or normalized == "file":
+        return None
+    extension = ATTACHMENT_TOKEN_EXTENSIONS.get(normalized)
+    if extension is not None:
+        return extension
+    direct_extension = f".{normalized}"
+    if direct_extension in set(ATTACHMENT_TOKEN_EXTENSIONS.values()):
+        return direct_extension
+    return None
+
+
+def delivery_contract_for_runtime_turn(
+    runtime: object,
+    conversation_id: str | None,
+    text: str | None,
+    *,
+    reply: str | None = None,
+    inbound_attachments: list[dict[str, str]] | tuple[dict[str, str], ...] | None = None,
+    artifact_paths: list[str] | tuple[str, ...] | None = None,
+    requires_attachment_delivery: bool = False,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
+) -> DeliveryContract:
+    """Build a delivery contract and fold in the active task-frame finish line."""
+    base_contract = delivery_contract_for_turn(
+        text,
+        reply=reply,
+        inbound_attachments=inbound_attachments,
+        artifact_paths=artifact_paths,
+        requires_attachment_delivery=requires_attachment_delivery,
+        required_attachment_extensions=required_attachment_extensions,
+    )
+    frame = _active_task_frame_for_delivery_contract(runtime, conversation_id)
+    finish = getattr(frame, "finish", None)
+    if frame is None or not bool(getattr(finish, "requires_artifact_delivery", False)):
+        return base_contract
+    output = getattr(frame, "output", None)
+    required_extension = _extension_for_artifact_kind(
+        getattr(finish, "required_artifact_kind", None) or getattr(output, "artifact_kind", None)
+    )
+    required_extensions = _required_attachment_extensions_from_contract(
+        text,
+        required_attachment_extensions=(
+            *(base_contract.required_attachment_extensions or ()),
+            *((required_extension,) if required_extension else ()),
+        ),
+    )
+    return DeliveryContract.attachment_required(
+        source="task_frame",
+        allow_plain_paths=True,
+        required_attachment_extensions=required_extensions,
+    )
+
+
 def _required_attachment_extensions_from_contract(
     text: str | None,
     *,
@@ -1002,6 +1083,7 @@ __all__ = [
     "PlatformDeliveryReceipt",
     "DeliveryContract",
     "build_platform_delivery_receipt",
+    "delivery_contract_for_runtime_turn",
     "delivery_contract_for_turn",
     "delivery_receipt_status",
     "ensure_messaging_storage_roots",

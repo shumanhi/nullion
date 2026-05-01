@@ -2585,6 +2585,8 @@ class ChatOperatorService:
                     text_for_ack=text_for_ack,
                     reply=reply,
                     inbound_attachments=telegram_attachments,
+                    runtime=self.runtime,
+                    conversation_id=conversation_id,
                     decision_card=decision_card,
                     suggestion_markup=_suggestion_markup,
                     stream_final_reply=stream_final_reply,

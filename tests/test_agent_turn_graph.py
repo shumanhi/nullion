@@ -1,6 +1,18 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from nullion.agent_orchestrator import AgentOrchestrator
+from nullion.artifacts import artifact_path_for_generated_file
+from nullion.task_frames import (
+    TaskFrame,
+    TaskFrameExecutionContract,
+    TaskFrameFinishCriteria,
+    TaskFrameOperation,
+    TaskFrameOutputContract,
+    TaskFrameStatus,
+    TaskFrameTarget,
+)
 from nullion.tools import ToolRegistry, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
 
 
@@ -122,3 +134,89 @@ def test_agent_turn_graph_resume_executes_pending_tool_before_model() -> None:
     assert client.calls == 1
     assert result.final_text == "done with resumed tool"
     assert [tool.tool_name for tool in result.tool_results] == ["workspace_summary"]
+
+
+def test_agent_turn_graph_repairs_missing_required_attachment(tmp_path, monkeypatch) -> None:
+    frame = TaskFrame(
+        frame_id="frame-1",
+        conversation_id="telegram:123",
+        branch_id="branch-1",
+        source_turn_id="turn-1",
+        parent_frame_id=None,
+        status=TaskFrameStatus.ACTIVE,
+        operation=TaskFrameOperation.GENERATE_ARTIFACT,
+        target=TaskFrameTarget(kind="file", value="brief"),
+        execution=TaskFrameExecutionContract(),
+        output=TaskFrameOutputContract(artifact_kind="pdf", delivery_mode="attachment"),
+        finish=TaskFrameFinishCriteria(requires_artifact_delivery=True, required_artifact_kind="pdf"),
+        summary="Create brief",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    class Store:
+        checkpoint_path = tmp_path / "runtime.db"
+
+        def get_active_task_frame_id(self, conversation_id):
+            return "frame-1" if conversation_id == "telegram:123" else None
+
+        def get_task_frame(self, frame_id):
+            return frame if frame_id == "frame-1" else None
+
+    store = Store()
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.repair_requested = False
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "tool-1", "name": "inspect", "input": {}}],
+                }
+            last_content = kwargs["messages"][-1]["content"]
+            last_text = last_content[0].get("text", "") if isinstance(last_content, list) and last_content else ""
+            if "not deliverable yet" in last_text:
+                self.repair_requested = True
+                return {
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "tool-2", "name": "write_pdf", "input": {}}],
+                }
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Done."}]}
+
+    def invoke_tool(store, invocation, registry):
+        return registry.invoke(invocation)
+
+    monkeypatch.setattr("nullion.runtime.invoke_tool_with_boundary_policy", invoke_tool)
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec("inspect", "inspect", ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 5),
+        lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"summary": "missing"}),
+    )
+
+    def write_pdf(invocation):
+        path = artifact_path_for_generated_file(store, suffix=".pdf")
+        path.write_text("pdf bytes", encoding="utf-8")
+        return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {"artifact_path": str(path)})
+
+    registry.register(
+        ToolSpec("write_pdf", "write_pdf", ToolRiskLevel.LOW, ToolSideEffectClass.WRITE, False, 5),
+        write_pdf,
+    )
+
+    client = Client()
+    result = AgentOrchestrator(model_client=client).run_turn(
+        conversation_id="telegram:123",
+        principal_id="telegram_chat",
+        user_message="create the PDF",
+        conversation_history=[],
+        tool_registry=registry,
+        policy_store=store,
+        approval_store=store,
+    )
+
+    assert client.repair_requested is True

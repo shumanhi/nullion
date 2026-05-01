@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from nullion.telegram_turn_graph import plan_telegram_post_run_delivery
+from nullion.task_frames import (
+    TaskFrame,
+    TaskFrameExecutionContract,
+    TaskFrameFinishCriteria,
+    TaskFrameOperation,
+    TaskFrameOutputContract,
+    TaskFrameStatus,
+    TaskFrameTarget,
+)
 
 
 def test_telegram_post_run_graph_splits_supplemental_card_and_contracts_media(monkeypatch, tmp_path) -> None:
@@ -66,3 +76,45 @@ def test_telegram_post_run_graph_ignores_text_only_file_verbs() -> None:
 
     assert not plan.delivery_contract.requires_attachment_delivery
     assert plan.delivery_contract.source == "message"
+
+
+def test_telegram_post_run_graph_uses_runtime_task_frame_contract() -> None:
+    frame = TaskFrame(
+        frame_id="frame-1",
+        conversation_id="telegram:123",
+        branch_id="branch-1",
+        source_turn_id="turn-1",
+        parent_frame_id=None,
+        status=TaskFrameStatus.ACTIVE,
+        operation=TaskFrameOperation.GENERATE_ARTIFACT,
+        target=TaskFrameTarget(kind="file", value="news"),
+        execution=TaskFrameExecutionContract(),
+        output=TaskFrameOutputContract(artifact_kind="pdf", delivery_mode="attachment"),
+        finish=TaskFrameFinishCriteria(requires_artifact_delivery=True, required_artifact_kind="pdf"),
+        summary="Create PDF",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    class Store:
+        def get_active_task_frame_id(self, conversation_id):
+            return "frame-1" if conversation_id == "telegram:123" else None
+
+        def get_task_frame(self, frame_id):
+            return frame if frame_id == "frame-1" else None
+
+    plan = plan_telegram_post_run_delivery(
+        text_for_ack="and those columns sounds good",
+        reply="I’m not done yet — this task still needs a file attachment.",
+        runtime=SimpleNamespace(store=Store()),
+        conversation_id="telegram:123",
+        decision_card=None,
+        suggestion_markup=None,
+        stream_final_reply=True,
+        streaming_mode="stream",
+        final_only_streaming_mode="final",
+    )
+
+    assert plan.delivery_contract.requires_attachment_delivery
+    assert plan.delivery_contract.source == "task_frame"
+    assert plan.delivery_contract.required_attachment_extensions == (".pdf",)

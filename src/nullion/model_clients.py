@@ -213,12 +213,13 @@ class OpenAIChatCompletionsModelClient:
 
     @staticmethod
     def _serialize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        system_messages: list[dict[str, Any]] = []
         serialized: list[dict[str, Any]] = []
         for message in messages:
             role = message.get("role")
             content = message.get("content")
             if role == "system":
-                serialized.append({"role": "system", "content": OpenAIChatCompletionsModelClient._serialize_text_content(content)})
+                system_messages.append({"role": "system", "content": OpenAIChatCompletionsModelClient._serialize_text_content(content)})
                 continue
             if role == "user":
                 if isinstance(content, list):
@@ -302,7 +303,7 @@ class OpenAIChatCompletionsModelClient:
                 )
                 continue
             serialized.append({"role": role, "content": OpenAIChatCompletionsModelClient._serialize_text_content(content)})
-        return serialized
+        return [*system_messages, *serialized]
 
     @staticmethod
     def _serialize_tool_definitions(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

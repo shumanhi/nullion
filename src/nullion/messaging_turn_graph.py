@@ -69,7 +69,9 @@ def _finalize_reply_node(state: MessagingTurnState) -> dict[str, object]:
     return {
         "visible_reply": visible_reply,
         "reply": reply,
-        "delivery_contract": adapters.delivery_contract_for_turn(
+        "delivery_contract": adapters.delivery_contract_for_runtime_turn(
+            getattr(state["service"], "runtime", None),
+            ingress.operator_chat_id,
             ingress.text,
             reply=reply,
             inbound_attachments=ingress.attachments,
