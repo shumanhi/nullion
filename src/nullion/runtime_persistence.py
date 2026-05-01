@@ -136,6 +136,16 @@ def _approval_merge_value(current: ApprovalRequest, previous: ApprovalRequest) -
     return current
 
 
+def _revocable_record_merge_value(current, previous):
+    current_revoked_at = getattr(current, "revoked_at", None)
+    previous_revoked_at = getattr(previous, "revoked_at", None)
+    if current_revoked_at is None and previous_revoked_at is not None:
+        return previous
+    if current_revoked_at is not None and previous_revoked_at is not None and previous_revoked_at > current_revoked_at:
+        return previous
+    return current
+
+
 def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeStore) -> None:
     dict_attrs = (
         "suspended_turns",
@@ -156,6 +166,8 @@ def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeSto
                 current[key] = value
             elif attr == "approval_requests":
                 current[key] = _approval_merge_value(current[key], value)
+            elif attr in {"permission_grants", "boundary_permits", "boundary_policy_rules"}:
+                current[key] = _revocable_record_merge_value(current[key], value)
     for attr in ("events", "audit_records"):
         _merge_list_records(getattr(store, attr), getattr(previous, attr))
 
