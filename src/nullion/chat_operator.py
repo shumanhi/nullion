@@ -1264,15 +1264,8 @@ def _chat_ambiguity_fallback(thread: list[dict[str, str]], prompt: str):
     ambiguity_reason = _assistant_reply_referencable_artifact_reason(previous_assistant)
 
     def fallback(text: str, active_branch_exists: bool):
-        if not active_branch_exists:
-            return None
-        if text != prompt:
-            return None
-        if not _looks_like_short_ambiguous_follow_up(text):
-            return None
-        if ambiguity_reason is None:
-            return None
-        return ConversationTurnDisposition.CONTINUE
+        _ = (text, active_branch_exists, prompt, ambiguity_reason)
+        return None
 
     return fallback, ambiguity_reason
 

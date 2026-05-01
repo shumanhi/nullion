@@ -290,6 +290,10 @@ def _is_telegram_parse_error(exc: BaseException) -> bool:
     )
 
 
+def _is_telegram_message_not_modified_error(exc: BaseException) -> bool:
+    return exc.__class__.__name__ == "BadRequest" and "message is not modified" in str(exc).lower()
+
+
 def _telegram_plain_format_fallback_text(plain_text: str) -> str:
     return (
         "Telegram could not render the formatted reply, so here is the same text as plain output:\n\n"
@@ -2907,7 +2911,12 @@ class ChatOperatorService:
                 return
             formatted_reply, reply_kwargs = format_telegram_text(reply)
             reply_kwargs = {**reply_kwargs, "reply_markup": None}
-            await message.edit_text(formatted_reply, **reply_kwargs)
+            try:
+                await message.edit_text(formatted_reply, **reply_kwargs)
+            except Exception as exc:
+                if not _is_telegram_message_not_modified_error(exc):
+                    raise
+                logger.debug("Telegram callback acknowledgement already reflected in message.")
             should_resume_approval = kind == "approval" and action in {"approve", "allow_session", "allow_once", "always_allow"}
             if should_resume_approval:
                 approval = self.runtime.store.get_approval_request(record_id)
