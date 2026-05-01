@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from pathlib import Path
 from typing import Any, Iterable
 
 from nullion.tools import ToolResult
@@ -77,6 +78,8 @@ def safe_raw_tool_payload_replacement(
     source: str = "agent",
 ) -> str:
     results = list(tool_results or ())
+    if file_search_summary := _file_search_payload_summary(results):
+        return file_search_summary
     tool_names = _completed_tool_names(results)
     if tool_names:
         tool_text = ", ".join(f"`{name}`" for name in tool_names[:4])
@@ -96,6 +99,33 @@ def safe_raw_tool_payload_replacement(
         f"{tool_sentence}{detail} Please ask me to summarize the result or rerun a focused check, "
         "and I’ll return a human-readable answer instead of the raw data."
     )
+
+
+def _file_search_payload_summary(results: list[ToolResult]) -> str | None:
+    for result in reversed(results):
+        if result.tool_name != "file_search" or result.status != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        matches = output.get("matches")
+        if not isinstance(matches, list):
+            continue
+        safe_names: list[str] = []
+        for match in matches:
+            if not isinstance(match, str) or not match.strip():
+                continue
+            name = Path(match).name
+            if name and name not in safe_names:
+                safe_names.append(name)
+        if not safe_names:
+            return "I searched the available files but did not find a matching file."
+        shown = ", ".join(f"`{name}`" for name in safe_names[:5])
+        extra = len(safe_names) - 5
+        if extra > 0:
+            shown += f", and {extra} more"
+        count = len(safe_names)
+        noun = "file" if count == 1 else "files"
+        return f"I found {count} matching {noun}: {shown}."
+    return None
 
 
 def _completed_tool_names(results: list[ToolResult]) -> list[str]:
@@ -168,4 +198,3 @@ def _canonical(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     except Exception:
         return repr(value)
-

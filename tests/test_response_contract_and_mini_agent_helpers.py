@@ -229,6 +229,36 @@ def test_raw_structured_tool_payload_is_blocked_unless_requested() -> None:
     assert user_requested_raw_output("please dump the raw tool result as JSON") is True
 
 
+def test_sanitizer_humanizes_file_search_payload_without_paths() -> None:
+    result = ToolResult(
+        "search-1",
+        "file_search",
+        "completed",
+        {
+            "matches": [
+                "/Users/example/.nullion/workspaces/workspace_admin/artifacts/provincetown_airbnb_monitor_2026-04-30_images-fixed.html"
+            ]
+        },
+    )
+    raw_reply = (
+        '{"matches": ["/Users/example/.nullion/workspaces/workspace_admin/artifacts/'
+        'provincetown_airbnb_monitor_2026-04-30_images-fixed.html"]}'
+    )
+
+    sanitized = sanitize_user_visible_reply(
+        user_message="Images are missing",
+        reply=raw_reply,
+        tool_results=[result],
+        source="agent",
+    )
+
+    assert sanitized == (
+        "I found 1 matching file: `provincetown_airbnb_monitor_2026-04-30_images-fixed.html`."
+    )
+    assert "/Users/example" not in sanitized
+    assert "blocked a raw structured payload" not in sanitized
+
+
 def test_sanitizer_covers_expected_and_unexpected_payload_shapes() -> None:
     sensitive_result = ToolResult(
         "inv-sensitive",
