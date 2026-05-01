@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,7 +50,9 @@ def _env_enabled(name: str, default: bool = True) -> bool:
 
 def _load_credentials() -> dict[str, object]:
     try:
-        payload = json.loads(_credentials_path().read_text(encoding="utf-8"))
+        from nullion.credential_store import migrate_credentials_json_to_db
+
+        payload = migrate_credentials_json_to_db(_credentials_path(), db_path=_credentials_path().with_name("runtime.db"))
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
@@ -165,9 +166,9 @@ def persist_model_name(model_name: str) -> None:
         raise ValueError("model name is required")
     creds = _load_credentials()
     creds["model"] = normalized
-    path = _credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(creds, indent=2) + "\n", encoding="utf-8")
+    from nullion.credential_store import save_encrypted_credentials
+
+    save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
     os.environ["NULLION_MODEL"] = normalized
 
 
@@ -182,9 +183,9 @@ def persist_admin_forced_model(model_name: str) -> None:
         raise ValueError("model name is required")
     creds = _load_credentials()
     creds["admin_forced_model"] = normalized
-    path = _credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(creds, indent=2) + "\n", encoding="utf-8")
+    from nullion.credential_store import save_encrypted_credentials
+
+    save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
     os.environ["NULLION_ADMIN_FORCED_MODEL"] = normalized
 
 
@@ -192,9 +193,9 @@ def clear_admin_forced_model() -> None:
     """Remove the admin-forced model so sessions fall back to the global default."""
     creds = _load_credentials()
     creds.pop("admin_forced_model", None)
-    path = _credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(creds, indent=2) + "\n", encoding="utf-8")
+    from nullion.credential_store import save_encrypted_credentials
+
+    save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
     os.environ.pop("NULLION_ADMIN_FORCED_MODEL", None)
 
 

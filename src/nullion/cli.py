@@ -666,24 +666,18 @@ def _detect_service_manager() -> str:
 
 
 def _switch_model(*, model: str | None, provider: str | None) -> None:
-    """Write provider/model to credentials.json and .env, then restart service."""
-    import json as _json
-    creds_path = Path.home() / ".nullion" / "credentials.json"
+    """Write provider/model to encrypted credentials and .env, then restart service."""
     env_path   = Path.home() / ".nullion" / ".env"
 
-    # Update credentials.json
-    creds: dict = {}
-    if creds_path.exists():
-        try:
-            creds = _json.loads(creds_path.read_text())
-        except Exception:
-            pass
+    from nullion.credential_store import load_encrypted_credentials, save_encrypted_credentials
+
+    credentials_db_path = Path.home() / ".nullion" / "runtime.db"
+    creds: dict = load_encrypted_credentials(db_path=credentials_db_path) or {}
     if provider:
         creds["provider"] = provider
     if model:
         creds["model"] = model
-    creds_path.parent.mkdir(parents=True, exist_ok=True)
-    creds_path.write_text(_json.dumps(creds, indent=2) + "\n")
+    save_encrypted_credentials(creds, db_path=credentials_db_path)
 
     # Update .env
     updates: dict[str, str] = {}

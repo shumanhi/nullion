@@ -172,7 +172,7 @@ def _image_artifact_prepare_node(state: _ImageArtifactWorkflowState) -> dict[str
         tool_name="image_generate",
         principal_id=str(state.get("principal_id") or ""),
         arguments={
-            "prompt": str(state.get("prompt") or ""),
+            "prompt": _image_artifact_prompt(str(state.get("prompt") or ""), request=request),
             "output_path": str(output_path),
             "size": "1024x1024",
             **({"source_path": source_image_path} if source_image_path else {}),
@@ -180,6 +180,18 @@ def _image_artifact_prepare_node(state: _ImageArtifactWorkflowState) -> dict[str
         capsule_id=None,
     )
     return {"output_path": output_path, "invocation": invocation}
+
+
+def _image_artifact_prompt(prompt: str, *, request: ImageArtifactRequest) -> str:
+    cleaned = " ".join(str(prompt or "").split()).strip()
+    if request.kind != "edit":
+        return cleaned
+    return (
+        "Edit the attached source image. Keep the same subject, identity, pose, and overall composition. "
+        "Apply this requested visual change clearly and visibly: "
+        f"{cleaned}. "
+        "Return the edited image itself, not an unchanged copy."
+    )
 
 
 def _image_artifact_route_prepared(state: _ImageArtifactWorkflowState) -> str:

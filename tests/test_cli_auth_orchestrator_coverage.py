@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from nullion import agent_orchestrator, auth, cli, updater
+from nullion.credential_store import load_encrypted_credentials
 from nullion.tools import ToolRegistry, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
 
 
@@ -125,7 +126,7 @@ def test_cli_update_skill_pack_display_and_model_helpers(tmp_path, monkeypatch, 
     assert "Task frames" in output and "Skill" in output and "tools registered" in output
 
     cli._switch_model(model="gpt-test", provider="openai")
-    assert "gpt-test" in (tmp_path / ".nullion" / "credentials.json").read_text(encoding="utf-8")
+    assert load_encrypted_credentials(db_path=tmp_path / ".nullion" / "runtime.db")["model"] == "gpt-test"
     assert cli._xml_escape('<a&"') == "&lt;a&amp;&quot;"
     monkeypatch.setenv("NULLION_WEB_PORT", "bad")
     assert cli._default_web_port() == 8742
@@ -149,7 +150,7 @@ def test_auth_api_key_save_reauth_and_cli_token_helpers(tmp_path, monkeypatch, c
     saved_path = auth.save_credentials_for_provider(
         {"id": "openai", "kind": "api_key", "default_model": "gpt-5.5", "key_hint": "sk-..."}
     )
-    assert saved_path == auth.CREDENTIALS_PATH
+    assert saved_path == auth.CREDENTIALS_PATH.with_name("runtime.db")
     assert auth.load_stored_credentials()["provider"] == "openai"
 
     monkeypatch.setattr(auth, "_codex_device_code_oauth", lambda: ("access", "refresh"))
@@ -159,7 +160,7 @@ def test_auth_api_key_save_reauth_and_cli_token_helpers(tmp_path, monkeypatch, c
     assert auth.load_stored_credentials()["provider"] == "openai"
     path = auth.reauthenticate_codex_oauth()
     saved = auth.load_stored_credentials()
-    assert path == auth.CREDENTIALS_PATH
+    assert path == auth.CREDENTIALS_PATH.with_name("runtime.db")
     assert saved["keys"]["codex"] == "access"
     assert saved["models"]["codex"] == "old"
 

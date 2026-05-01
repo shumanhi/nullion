@@ -355,10 +355,125 @@ def _default_checkpoint_path() -> Path:
     explicit = os.environ.get("NULLION_CHECKPOINT")
     if explicit:
         return Path(explicit)
-    installed = _install_dir() / "runtime-store.json"
+    installed = _install_dir() / "runtime.db"
     if installed.exists():
         return installed
-    return _src_dir() / "runtime-store.json"
+    return _src_dir() / "runtime.db"
+
+
+def run_post_update_migrations(
+    *,
+    env_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+    install_dir: str | Path | None = None,
+    overwrite_env_credentials: bool = False,
+) -> dict[str, object]:
+    """Import legacy runtime/credential files into the DB after an update."""
+    resolved_install_dir = Path(install_dir).expanduser() if install_dir is not None else _install_dir()
+    checkpoint = Path(checkpoint_path).expanduser() if checkpoint_path is not None else resolved_install_dir / "runtime.db"
+    resolved_env_path = Path(env_path).expanduser() if env_path is not None else _default_env_path()
+    loaded_env_values: dict[str, str] = {}
+    if resolved_env_path is not None:
+        try:
+            from nullion.config import load_env_file_into_environ
+
+            loaded_env_values = load_env_file_into_environ(resolved_env_path)
+        except Exception:
+            log.warning("Could not load env file before migration: %s", resolved_env_path, exc_info=True)
+
+    details: dict[str, object] = {
+        "checkpoint_path": str(checkpoint),
+        "credentials_json_path": str(resolved_install_dir / "credentials.json"),
+        "credentials_imported": False,
+        "env_credentials_imported": False,
+        "credentials_json_deleted": False,
+        "runtime_json_path": str(checkpoint.with_name("runtime-store.json")),
+        "runtime_imported": False,
+        "warnings": [],
+    }
+
+    try:
+        from nullion.credential_store import migrate_credentials_json_to_db, migrate_env_credentials_to_db
+
+        credentials_json = resolved_install_dir / "credentials.json"
+        had_credentials_json = credentials_json.exists()
+        migrated_credentials = migrate_credentials_json_to_db(credentials_json, db_path=checkpoint)
+        before_env = dict(migrated_credentials or {})
+        credential_env = {**os.environ, **loaded_env_values}
+        migrated_credentials = (
+            migrate_env_credentials_to_db(
+                db_path=checkpoint,
+                env=credential_env,
+                overwrite=overwrite_env_credentials,
+            )
+            or migrated_credentials
+        )
+        details["credentials_imported"] = bool(had_credentials_json and migrated_credentials)
+        details["env_credentials_imported"] = bool(migrated_credentials and migrated_credentials != before_env)
+        details["credentials_json_deleted"] = bool(had_credentials_json and not credentials_json.exists())
+    except Exception as exc:
+        details["warnings"].append(f"credential migration skipped: {exc}")
+        log.warning("Credential migration skipped: %s", exc, exc_info=True)
+
+    try:
+        from nullion.runtime import bootstrap_persistent_runtime
+
+        runtime_json = checkpoint.with_name("runtime-store.json")
+        had_runtime_json = runtime_json.exists()
+        runtime = bootstrap_persistent_runtime(checkpoint)
+        runtime.checkpoint()
+        details["runtime_imported"] = bool(had_runtime_json and checkpoint.exists())
+    except Exception as exc:
+        details["warnings"].append(f"runtime migration skipped: {exc}")
+        log.warning("Runtime migration skipped: %s", exc, exc_info=True)
+
+    return details
+
+
+def fresh_post_update_migrations(
+    *,
+    env_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+    install_dir: str | Path | None = None,
+    overwrite_env_credentials: bool = False,
+) -> dict[str, object]:
+    """Run post-update migrations from the freshly installed package."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys\n"
+                "from nullion.updater import run_post_update_migrations\n"
+                "env_path = sys.argv[1] or None\n"
+                "checkpoint_path = sys.argv[2] or None\n"
+                "install_dir = sys.argv[3] or None\n"
+                "overwrite_env_credentials = sys.argv[4].lower() in {'1', 'true', 'yes'}\n"
+                "print(json.dumps(run_post_update_migrations(\n"
+                "    env_path=env_path,\n"
+                "    checkpoint_path=checkpoint_path,\n"
+                "    install_dir=install_dir,\n"
+                "    overwrite_env_credentials=overwrite_env_credentials,\n"
+                "), sort_keys=True))\n"
+            ),
+            "" if env_path is None else str(env_path),
+            "" if checkpoint_path is None else str(checkpoint_path),
+            "" if install_dir is None else str(install_dir),
+            "true" if overwrite_env_credentials else "false",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        cwd=_src_dir(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail or "post-update migration failed")
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    except Exception as exc:
+        raise RuntimeError(f"post-update migration returned invalid output: {result.stdout.strip()}") from exc
+    return payload if isinstance(payload, dict) else {"warnings": ["migration returned non-object payload"]}
 
 
 def _probe_messaging_platform_bootstrap(
@@ -738,6 +853,69 @@ async def _update_apply_node(state: _UpdateWorkflowState) -> dict[str, object]:
 
 
 def _update_route_after_apply(state: _UpdateWorkflowState) -> str:
+    return END if state.get("result") is not None else "migrate"
+
+
+async def _update_migrate_node(state: _UpdateWorkflowState) -> dict[str, object]:
+    steps = list(state.get("steps", []))
+    snap = state.get("snap")
+    from_label = str(state.get("from_label") or "")
+    to_label = str(state.get("to_label") or "")
+    state = {**state, "steps": steps}
+    steps = _update_emit(state, "migrate", "Migrating local runtime data...")
+    try:
+        migration = await _update_run_blocking(
+            lambda: fresh_post_update_migrations(
+                env_path=state.get("env_path"),
+                checkpoint_path=state.get("checkpoint_path") or _default_checkpoint_path(),
+                install_dir=_install_dir(),
+            ),
+        )
+    except Exception as exc:
+        state = {**state, "steps": steps}
+        steps = _update_emit(state, "migrate", f"Migration failed: {exc}", ok=False)
+        if bool(state.get("ignore_check_failures", False)):
+            return {"steps": steps}
+        state = {**state, "steps": steps}
+        steps = _update_emit(state, "rollback", "Rolling back to previous version...")
+        ok = await _update_run_blocking(lambda: rollback(snap))
+        msg = "Rollback successful. Previous version restored." if ok else "Rollback also failed — check logs."
+        state = {**state, "steps": steps}
+        steps = _update_emit(state, "rollback", msg, ok=ok)
+        return {
+            "steps": steps,
+            "result": UpdateResult(
+                success=False,
+                rolled_back=ok,
+                from_version=from_label,
+                to_version=to_label,
+                error=str(exc),
+                snapshot_path=str(snap) if snap else "",
+                steps=steps,
+            ),
+        }
+
+    migrated_bits: list[str] = []
+    if migration.get("credentials_imported"):
+        migrated_bits.append("credentials")
+    if migration.get("runtime_imported"):
+        migrated_bits.append("runtime")
+    deleted_credentials = bool(migration.get("credentials_json_deleted"))
+    message = "Migration complete"
+    if migrated_bits:
+        message += f" ({', '.join(migrated_bits)} imported)"
+    if deleted_credentials:
+        message += "; plaintext credentials file removed"
+    message += "."
+    state = {**state, "steps": steps}
+    steps = _update_emit(state, "migrate", message)
+    for warning in migration.get("warnings") or []:
+        state = {**state, "steps": steps}
+        steps = _update_emit(state, "migrate", f"Warning: {warning}", ok=False)
+    return {"steps": steps}
+
+
+def _update_route_after_migrate(state: _UpdateWorkflowState) -> str:
     return END if state.get("result") is not None else "health"
 
 
@@ -819,11 +997,13 @@ def _compiled_update_workflow_graph():
     graph.add_node("fetch", _update_fetch_node)
     graph.add_node("snapshot", _update_snapshot_node)
     graph.add_node("apply", _update_apply_node)
+    graph.add_node("migrate", _update_migrate_node)
     graph.add_node("health", _update_health_node)
     graph.add_edge(START, "fetch")
     graph.add_conditional_edges("fetch", _update_route_after_node, {"snapshot": "snapshot", END: END})
     graph.add_conditional_edges("snapshot", _update_route_after_snapshot, {"apply": "apply", END: END})
-    graph.add_conditional_edges("apply", _update_route_after_apply, {"health": "health", END: END})
+    graph.add_conditional_edges("apply", _update_route_after_apply, {"migrate": "migrate", END: END})
+    graph.add_conditional_edges("migrate", _update_route_after_migrate, {"health": "health", END: END})
     graph.add_edge("health", END)
     return graph.compile()
 

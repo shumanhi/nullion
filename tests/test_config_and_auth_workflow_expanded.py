@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import stat
 
 import pytest
@@ -140,12 +139,11 @@ def test_auth_persistence_reauth_and_cli_paths(tmp_path, monkeypatch, capsys) ->
     credentials_path = tmp_path / "credentials.json"
     monkeypatch.setattr(auth, "CREDENTIALS_PATH", credentials_path)
     auth._save({"provider": "openai", "api_key": "sk-test"})
-    assert json.loads(credentials_path.read_text(encoding="utf-8"))["api_key"] == "sk-test"
-    assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
     assert auth.load_stored_credentials()["provider"] == "openai"
+    assert auth.load_stored_credentials()["api_key"] == "sk-test"
 
     credentials_path.write_text("{bad", encoding="utf-8")
-    assert auth.load_stored_credentials() is None
+    assert auth.load_stored_credentials()["provider"] == "openai"
 
     monkeypatch.setattr(
         auth,
@@ -158,9 +156,9 @@ def test_auth_persistence_reauth_and_cli_paths(tmp_path, monkeypatch, capsys) ->
             "model": "gpt-5.5",
         },
     )
-    credentials_path.write_text(json.dumps({"provider": "codex", "model": "custom"}), encoding="utf-8")
-    assert auth.reauthenticate_codex_oauth() == credentials_path
-    saved = json.loads(credentials_path.read_text(encoding="utf-8"))
+    auth._save({"provider": "codex", "model": "custom"})
+    assert auth.reauthenticate_codex_oauth() == credentials_path.with_name("runtime.db")
+    saved = auth.load_stored_credentials()
     assert saved["keys"]["codex"] == "access"
     assert saved["models"]["codex"] == "custom"
 

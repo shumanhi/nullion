@@ -247,7 +247,7 @@ write_chat_launchd_plist() {
     <array>
         <string>$(xml_escape "${VENV_DIR}/bin/${command_name}")</string>
         <string>--checkpoint</string>
-        <string>$(xml_escape "${NULLION_INSTALL_DIR}/runtime-store.json")</string>
+        <string>$(xml_escape "${NULLION_INSTALL_DIR}/runtime.db")</string>
         <string>--env-file</string>
         <string>$(xml_escape "$NULLION_ENV_FILE")</string>
     </array>
@@ -292,7 +292,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${VENV_DIR}/bin/${command_name} --checkpoint ${NULLION_INSTALL_DIR}/runtime-store.json --env-file ${NULLION_ENV_FILE}
+ExecStart=${VENV_DIR}/bin/${command_name} --checkpoint ${NULLION_INSTALL_DIR}/runtime.db --env-file ${NULLION_ENV_FILE}
 EnvironmentFile=${NULLION_ENV_FILE}
 WorkingDirectory=${NULLION_INSTALL_DIR}
 StandardOutput=append:${NULLION_LOG_DIR}/${log_prefix}.log
@@ -407,6 +407,36 @@ initialize_key_storage() {
     exit 1
 }
 
+finalize_runtime_database() {
+    print_info "Finalizing local runtime database..."
+    if NULLION_ENV_FILE="$NULLION_ENV_FILE" \
+       NULLION_INSTALL_DIR="$NULLION_INSTALL_DIR" \
+       NULLION_CHECKPOINT_PATH="${NULLION_INSTALL_DIR}/runtime.db" \
+       "$VENV_DIR/bin/python" - "$NULLION_ENV_FILE" "${NULLION_INSTALL_DIR}/runtime.db" "$NULLION_INSTALL_DIR" >/tmp/nullion_runtime_finalize.out 2>/tmp/nullion_runtime_finalize.err <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from nullion.updater import run_post_update_migrations
+
+details = run_post_update_migrations(
+    env_path=Path(sys.argv[1]),
+    checkpoint_path=Path(sys.argv[2]),
+    install_dir=Path(sys.argv[3]),
+    overwrite_env_credentials=True,
+)
+warnings = details.get("warnings") or []
+print(json.dumps({"ok": True, "warnings": warnings}, sort_keys=True))
+PY
+    then
+        print_ok "Local runtime database is ready."
+    else
+        local err
+        err="$(cat /tmp/nullion_runtime_finalize.err 2>/dev/null || true)"
+        print_err "Could not finalize the local runtime database. Setup can continue; run Nullion once to retry migrations.${err:+ ${err}}"
+    fi
+}
+
 env_value_from_file() {
     local file="$1"
     local key="$2"
@@ -495,6 +525,43 @@ first_existing_provider_key_value() {
         fi
     done
     return 0
+}
+
+stored_credential_value() {
+    local field="$1"
+    NULLION_ENV_FILE="$NULLION_ENV_FILE" \
+    NULLION_INSTALL_DIR="$NULLION_INSTALL_DIR" \
+    NULLION_CHECKPOINT_PATH="${NULLION_INSTALL_DIR}/runtime.db" \
+    "$VENV_DIR/bin/python" - "$field" "$NULLION_ENV_FILE" "$NULLION_INSTALL_DIR" 2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+from nullion.config import load_env_file_into_environ
+from nullion.credential_store import migrate_credentials_json_to_db
+
+field = sys.argv[1]
+env_path = Path(sys.argv[2])
+install_dir = Path(sys.argv[3])
+if env_path.exists():
+    load_env_file_into_environ(env_path)
+creds = migrate_credentials_json_to_db(install_dir / "credentials.json", db_path=install_dir / "runtime.db") or {}
+provider = str(creds.get("provider") or "").strip()
+keys = creds.get("keys")
+if not isinstance(keys, dict):
+    keys = {}
+api_key = str(keys.get(provider) or creds.get("api_key") or "").strip()
+models = creds.get("models")
+if not isinstance(models, dict):
+    models = {}
+values = {
+    "provider": provider,
+    "api_key_prefix": api_key[:8],
+    "api_key": api_key,
+    "model": str(creds.get("model") or models.get(provider) or "").strip(),
+    "base_url": str(creds.get("base_url") or "").strip(),
+}
+print(values.get(field, ""))
+PY
 }
 
 mask_secret() {
@@ -1318,17 +1385,18 @@ if [[ "$EXISTING_PROVIDER_DONE" == "true" || -n "$EXISTING_MODEL_PROVIDER$EXISTI
     fi
 fi
 
-if [[ -f "$CREDENTIALS_FILE" ]]; then
-    _EXISTING_PROVIDER=$(python3 -c "import json,sys; d=json.load(open('$CREDENTIALS_FILE')); print(d.get('provider',''))" 2>/dev/null || true)
-    _EXISTING_KEY=$(python3 -c "import json,sys; d=json.load(open('$CREDENTIALS_FILE')); print(d.get('api_key','')[:8])" 2>/dev/null || true)
-    if [[ "$SKIP_PROVIDER" == "false" && -n "$_EXISTING_PROVIDER" && -n "$_EXISTING_KEY" ]]; then
-        echo
-        print_ok "Found existing credentials for: $_EXISTING_PROVIDER"
-        if confirm "Keep existing credentials and skip provider setup?"; then
-            SKIP_PROVIDER=true
-            MODEL_PROVIDER="$_EXISTING_PROVIDER"
-            print_ok "Using existing credentials."
-        fi
+_EXISTING_STORED_PROVIDER="$(stored_credential_value provider)"
+_EXISTING_STORED_KEY="$(stored_credential_value api_key_prefix)"
+if [[ "$SKIP_PROVIDER" == "false" && -n "$_EXISTING_STORED_PROVIDER" && -n "$_EXISTING_STORED_KEY" ]]; then
+    echo
+    print_ok "Found existing encrypted credentials for: $_EXISTING_STORED_PROVIDER"
+    if confirm "Keep existing credentials and skip provider setup?"; then
+        SKIP_PROVIDER=true
+        MODEL_PROVIDER="$_EXISTING_STORED_PROVIDER"
+        MODEL_BASE_URL="$(stored_credential_value base_url)"
+        MODEL_NAME="$(stored_credential_value model)"
+        OPENAI_KEY="$(stored_credential_value api_key)"
+        print_ok "Using existing encrypted credentials."
     fi
 fi
 
@@ -2712,6 +2780,7 @@ fi
 } > "$NULLION_ENV_FILE"
 chmod 600 "$NULLION_ENV_FILE"
 print_ok "Configuration saved to $NULLION_ENV_FILE"
+finalize_runtime_database
 
 # ── Step 4: Auto-start ────────────────────────────────────────────────────
 print_header "Step 4 of 4 — Auto-start"
@@ -2744,6 +2813,8 @@ if [[ "$PLATFORM" == "macos" ]]; then
         <string>nullion.web_app</string>
         <string>--port</string>
         <string>$(xml_escape "$NULLION_WEB_PORT")</string>
+        <string>--checkpoint</string>
+        <string>$(xml_escape "${NULLION_INSTALL_DIR}/runtime.db")</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -2833,7 +2904,7 @@ PLIST
     <array>
         <string>$(xml_escape "${VENV_DIR}/bin/nullion-telegram")</string>
         <string>--checkpoint</string>
-        <string>$(xml_escape "${NULLION_INSTALL_DIR}/runtime-store.json")</string>
+        <string>$(xml_escape "${NULLION_INSTALL_DIR}/runtime.db")</string>
         <string>--env-file</string>
         <string>$(xml_escape "$NULLION_ENV_FILE")</string>
     </array>
@@ -2934,7 +3005,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${VENV_DIR}/bin/nullion-web --port ${NULLION_WEB_PORT}
+ExecStart=${VENV_DIR}/bin/nullion-web --port ${NULLION_WEB_PORT} --checkpoint ${NULLION_INSTALL_DIR}/runtime.db
 EnvironmentFile=${NULLION_ENV_FILE}
 WorkingDirectory=${NULLION_INSTALL_DIR}
 StandardOutput=append:${NULLION_LOG_DIR}/nullion.log
@@ -3000,24 +3071,24 @@ fi
 if [[ "${AUTOSTART_CONFIGURED:-false}" == "false" ]]; then
     print_info "Skipped auto-start. You can start Nullion manually any time:"
     echo
-    echo -e "    ${CYAN}source ${NULLION_ENV_FILE} && ${VENV_DIR}/bin/nullion-web --port ${NULLION_WEB_PORT}${RESET}"
+    echo -e "    ${CYAN}source ${NULLION_ENV_FILE} && ${VENV_DIR}/bin/nullion-web --port ${NULLION_WEB_PORT} --checkpoint ${NULLION_INSTALL_DIR}/runtime.db${RESET}"
     if [[ "$TELEGRAM_ENABLED" == "true" ]]; then
         echo
         print_info "Telegram was configured but not registered for auto-start. Start it manually with:"
         echo
-        echo -e "    ${CYAN}${VENV_DIR}/bin/nullion-telegram --checkpoint ${NULLION_INSTALL_DIR}/runtime-store.json --env-file ${NULLION_ENV_FILE}${RESET}"
+        echo -e "    ${CYAN}${VENV_DIR}/bin/nullion-telegram --checkpoint ${NULLION_INSTALL_DIR}/runtime.db --env-file ${NULLION_ENV_FILE}${RESET}"
     fi
     if [[ "$SLACK_ENABLED" == "true" ]]; then
         echo
         print_info "Slack was configured. Start it manually with:"
         echo
-        echo -e "    ${CYAN}${VENV_DIR}/bin/nullion-slack --checkpoint ${NULLION_INSTALL_DIR}/runtime-store.json --env-file ${NULLION_ENV_FILE}${RESET}"
+        echo -e "    ${CYAN}${VENV_DIR}/bin/nullion-slack --checkpoint ${NULLION_INSTALL_DIR}/runtime.db --env-file ${NULLION_ENV_FILE}${RESET}"
     fi
     if [[ "$DISCORD_ENABLED" == "true" ]]; then
         echo
         print_info "Discord was configured. Start it manually with:"
         echo
-        echo -e "    ${CYAN}${VENV_DIR}/bin/nullion-discord --checkpoint ${NULLION_INSTALL_DIR}/runtime-store.json --env-file ${NULLION_ENV_FILE}${RESET}"
+        echo -e "    ${CYAN}${VENV_DIR}/bin/nullion-discord --checkpoint ${NULLION_INSTALL_DIR}/runtime.db --env-file ${NULLION_ENV_FILE}${RESET}"
     fi
     echo
 fi
@@ -3049,7 +3120,7 @@ elif confirm "Open Nullion in your browser now?"; then
         # shellcheck source=/dev/null
         source "$NULLION_ENV_FILE"
         set +a
-        nohup "$VENV_DIR/bin/nullion-web" --port "${NULLION_WEB_PORT}" \
+        nohup "$VENV_DIR/bin/nullion-web" --port "${NULLION_WEB_PORT}" --checkpoint "${NULLION_INSTALL_DIR}/runtime.db" \
             >> "$NULLION_LOG_DIR/nullion.log" \
             2>> "$NULLION_LOG_DIR/nullion-error.log" &
         WEB_PID=$!
@@ -3073,7 +3144,7 @@ elif confirm "Open Nullion in your browser now?"; then
 else
     echo
     print_info "To start manually:"
-    echo -e "    ${CYAN}source ${NULLION_ENV_FILE} && ${VENV_DIR}/bin/nullion-web --port ${NULLION_WEB_PORT}${RESET}"
+    echo -e "    ${CYAN}source ${NULLION_ENV_FILE} && ${VENV_DIR}/bin/nullion-web --port ${NULLION_WEB_PORT} --checkpoint ${NULLION_INSTALL_DIR}/runtime.db${RESET}"
     echo
     echo -e "  Then open:  ${BOLD}${GREEN}http://localhost:${NULLION_WEB_PORT}${RESET}"
     echo

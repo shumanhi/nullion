@@ -33,6 +33,7 @@ from nullion.users import resolve_messaging_user
 
 logger = logging.getLogger(__name__)
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
+_DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
 
 
 def _record_discord_delivery_receipt(
@@ -345,7 +346,7 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
 
 async def run_discord_app(
     *,
-    checkpoint_path: str | Path = "runtime-store.json",
+    checkpoint_path: str | Path = _DEFAULT_CHECKPOINT_PATH,
     env_path: str | Path | None = _DEFAULT_ENV_PATH,
     service_builder=build_messaging_runtime_service_from_settings,
 ) -> None:
@@ -402,7 +403,7 @@ async def run_discord_app(
 
 def main(
     *,
-    checkpoint_path: str | Path = "runtime-store.json",
+    checkpoint_path: str | Path = _DEFAULT_CHECKPOINT_PATH,
     env_path: str | Path | None = _DEFAULT_ENV_PATH,
 ) -> None:
     asyncio.run(run_discord_app(checkpoint_path=checkpoint_path, env_path=env_path))
@@ -411,7 +412,7 @@ def main(
 def cli() -> None:
     def _run() -> None:
         parser = argparse.ArgumentParser(description="Run the Nullion Discord adapter")
-        parser.add_argument("--checkpoint", default="runtime-store.json", help="Runtime checkpoint path")
+        parser.add_argument("--checkpoint", default=str(_DEFAULT_CHECKPOINT_PATH), help="Runtime checkpoint path")
         parser.add_argument("--env-file", default=str(_DEFAULT_ENV_PATH), help="Environment file path")
         args = parser.parse_args()
         return run_single_instance_entrypoint(

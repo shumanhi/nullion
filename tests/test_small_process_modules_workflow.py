@@ -67,12 +67,14 @@ def test_runtime_config_snapshot_prompt_and_persistence(tmp_path, monkeypatch) -
     assert "Disabled capabilities: browser" in prompt
 
     runtime_config.persist_model_name("new-model")
-    assert json.loads(creds.read_text(encoding="utf-8"))["model"] == "new-model"
+    from nullion.credential_store import load_encrypted_credentials
+
+    assert load_encrypted_credentials(db_path=creds.with_name("runtime.db"))["model"] == "new-model"
     assert runtime_config.os.environ["NULLION_MODEL"] == "new-model"
     runtime_config.persist_admin_forced_model("forced")
-    assert json.loads(creds.read_text(encoding="utf-8"))["admin_forced_model"] == "forced"
+    assert load_encrypted_credentials(db_path=creds.with_name("runtime.db"))["admin_forced_model"] == "forced"
     runtime_config.clear_admin_forced_model()
-    assert "admin_forced_model" not in json.loads(creds.read_text(encoding="utf-8"))
+    assert "admin_forced_model" not in load_encrypted_credentials(db_path=creds.with_name("runtime.db"))
     with pytest.raises(ValueError):
         runtime_config.persist_model_name(" ")
     with pytest.raises(ValueError):
@@ -395,9 +397,13 @@ def test_image_generation_delivery_paths(tmp_path, monkeypatch) -> None:
 
     source = tmp_path / "source.jpg"
     source.write_bytes(b"jpg")
+    seen_prompts: list[str] = []
     monkeypatch.setattr(
         "nullion.runtime.invoke_tool_with_boundary_policy",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("provider down")),
+        lambda store, invocation, registry: (
+            seen_prompts.append(invocation.arguments["prompt"]),
+            (_ for _ in ()).throw(RuntimeError("provider down")),
+        )[1],
     )
     fallback = images.generate_image_artifact(
         SimpleNamespace(store=object()),
@@ -409,6 +415,9 @@ def test_image_generation_delivery_paths(tmp_path, monkeypatch) -> None:
     assert fallback.completed
     assert fallback.fallback_used
     assert fallback.error == "provider down"
+    assert seen_prompts
+    assert "Edit the attached source image" in seen_prompts[-1]
+    assert "not an unchanged copy" in seen_prompts[-1]
 
     unconfigured = images.generate_image_artifact(SimpleNamespace(store=object()), prompt="make an image", registry=ToolRegistry(), principal_id="operator")
     assert "not configured" in unconfigured.error

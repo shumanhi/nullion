@@ -1,6 +1,6 @@
 """nullion auth — interactive credential setup.
 
-Stores credentials in ~/.nullion/credentials.json.
+Stores credentials encrypted in ~/.nullion/runtime.db.
 Run: uv run nullion-auth   (from the project directory)
 """
 from __future__ import annotations
@@ -25,6 +25,11 @@ from nullion.entrypoint_guard import run_user_facing_entrypoint
 from langgraph.graph import END, START, StateGraph
 
 import httpx
+from nullion.credential_store import (
+    load_encrypted_credentials,
+    migrate_credentials_json_to_db,
+    save_encrypted_credentials,
+)
 
 CREDENTIALS_PATH = Path.home() / ".nullion" / "credentials.json"
 
@@ -391,9 +396,7 @@ def _collect_api_key(provider: dict[str, Any]) -> dict[str, Any]:
 # ── Persistence ────────────────────────────────────────────────────────────────
 
 def _save(creds: dict[str, Any]) -> None:
-    CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CREDENTIALS_PATH.write_text(json.dumps(creds, indent=2), encoding="utf-8")
-    CREDENTIALS_PATH.chmod(0o600)
+    save_encrypted_credentials(creds, db_path=CREDENTIALS_PATH.with_name("runtime.db"))
 
 
 def codex_oauth_credentials() -> dict[str, Any]:
@@ -457,7 +460,7 @@ def _auth_merge_credentials_node(state: _AuthCredentialWorkflowState) -> dict[st
 def _auth_save_credentials_node(state: _AuthCredentialWorkflowState) -> dict[str, object]:
     creds = dict(state.get("credentials") or {})
     _save(creds)
-    return {"saved_path": CREDENTIALS_PATH}
+    return {"saved_path": CREDENTIALS_PATH.with_name("runtime.db")}
 
 
 @lru_cache(maxsize=1)
@@ -478,7 +481,7 @@ def save_credentials_for_provider(provider: dict[str, Any]) -> Path:
         {"mode": "setup", "provider": provider},
         config={"configurable": {"thread_id": f"auth-setup:{provider.get('id', 'unknown')}"}},
     )
-    return final_state.get("saved_path") or CREDENTIALS_PATH
+    return final_state.get("saved_path") or CREDENTIALS_PATH.with_name("runtime.db")
 
 
 def reauthenticate_codex_oauth() -> Path:
@@ -486,7 +489,7 @@ def reauthenticate_codex_oauth() -> Path:
         {"mode": "reauth_codex", "provider": {"id": "codex", "kind": "oauth"}},
         config={"configurable": {"thread_id": "auth-reauth:codex"}},
     )
-    saved_path = final_state.get("saved_path") or CREDENTIALS_PATH
+    saved_path = final_state.get("saved_path") or CREDENTIALS_PATH.with_name("runtime.db")
     print()
     print(f"  Saved Codex OAuth credentials to {saved_path}")
     print()
@@ -494,12 +497,10 @@ def reauthenticate_codex_oauth() -> Path:
 
 
 def load_stored_credentials() -> dict[str, Any] | None:
-    if not CREDENTIALS_PATH.exists():
-        return None
-    try:
-        return json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    stored = load_encrypted_credentials(db_path=CREDENTIALS_PATH.with_name("runtime.db"))
+    if stored:
+        return stored
+    return migrate_credentials_json_to_db(CREDENTIALS_PATH, db_path=CREDENTIALS_PATH.with_name("runtime.db"))
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
@@ -553,7 +554,7 @@ def _cli_impl(argv: list[str] | None = None) -> None:
         print()
         print("  Restart the bot:")
         print("    pkill -f nullion-telegram")
-        print("    nullion-telegram --checkpoint runtime-store.json --env-file .env >> /private/tmp/nullion.log 2>&1 &")
+        print("    nullion-telegram --checkpoint runtime.db --env-file .env >> /private/tmp/nullion.log 2>&1 &")
         print()
     except KeyboardInterrupt:
         print()

@@ -1,11 +1,10 @@
-"""Nullion settings — reads from env vars and ~/.nullion/credentials.json.
+"""Nullion settings — reads from env vars and encrypted local credentials.
 
 This is the single source of truth for runtime configuration. Both web_app.py
 and cli.py call Settings() to get a fully resolved config object.
 """
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -161,7 +160,9 @@ class Settings:
 
 def _load_credentials() -> dict[str, Any]:
     try:
-        return json.loads(_CREDENTIALS_PATH.read_text(encoding="utf-8"))
+        from nullion.credential_store import migrate_credentials_json_to_db
+
+        return migrate_credentials_json_to_db(_CREDENTIALS_PATH, db_path=_CREDENTIALS_PATH.with_name("runtime.db")) or {}
     except Exception:
         return {}
 

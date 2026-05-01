@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import base64
 import email
 from email import policy
 import imaplib
 import inspect
+import json
 import mimetypes
 import os
 from pathlib import Path
@@ -38,11 +38,12 @@ _MEDIA_COMMAND_TIMEOUT_SECONDS = int(os.environ.get("NULLION_MEDIA_COMMAND_TIMEO
 
 def _read_credentials_json() -> dict[str, object]:
     try:
+        from nullion.credential_store import migrate_credentials_json_to_db
+
         path = Path.home() / ".nullion" / "credentials.json"
-        if path.exists():
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                return payload
+        payload = migrate_credentials_json_to_db(path, db_path=path.with_name("runtime.db"))
+        if isinstance(payload, dict):
+            return payload
     except Exception:
         pass
     return {}

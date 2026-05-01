@@ -53,9 +53,24 @@ def test_artifact_paths_from_completed_tool_results_are_deduped() -> None:
         ToolResult("2", "render", "completed", {"artifact_path": "/tmp/b.txt", "artifact_paths": ["/tmp/a.txt", "/tmp/c.txt"]}),
         ToolResult("3", "render", "failed", {"artifact_path": "/tmp/ignored.txt"}),
         ToolResult("4", "render", "completed", {"artifacts": ["/tmp/c.txt", "", 42]}),
+        ToolResult("5", "file_read", "completed", {"path": "/tmp/source.txt"}),
     ]
 
     assert artifact_paths_from_tool_results(results) == ["/tmp/a.txt", "/tmp/b.txt", "/tmp/c.txt"]
+
+
+def test_response_fulfillment_does_not_treat_file_read_path_as_attachment(tmp_path) -> None:
+    decision = evaluate_response_fulfillment(
+        store=Store(None),
+        conversation_id="c1",
+        user_message="its inside my home folder",
+        reply="Done, imported the crons.",
+        tool_results=[ToolResult("1", "file_read", "completed", {"path": str(tmp_path / "jobs.json")})],
+        artifact_roots=[tmp_path],
+    )
+
+    assert decision.satisfied is True
+    assert decision.reply == "Done, imported the crons."
 
 
 class Store:

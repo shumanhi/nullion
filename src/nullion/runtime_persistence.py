@@ -1572,7 +1572,7 @@ def build_runtime_from_settings(settings: object) -> "PersistentRuntime":
     """Construct a PersistentRuntime from a Settings object.
 
     Reads ``settings.checkpoint_path`` (falls back to
-    ``~/.nullion/runtime-store.json``) and bootstraps the store.
+    ``~/.nullion/runtime.db``) and bootstraps the store.
     """
     from pathlib import Path as _Path
     from nullion.runtime import bootstrap_persistent_runtime

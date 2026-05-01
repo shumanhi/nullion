@@ -80,7 +80,7 @@ class ModelSettings:
 
     Precedence (highest to lowest):
       1. explicit env vars, including NULLION_MODEL_PROVIDER / NULLION_MODEL
-      2. ~/.nullion/credentials.json (set via `nullion-auth`):
+      2. encrypted local credentials in ~/.nullion/runtime.db (set via `nullion-auth`):
          - provider=codex → CodexResponsesModelClient
          - provider=anthropic → AnthropicMessagesModelClient
          - anything else  → OpenAI-compatible client
@@ -449,8 +449,8 @@ def load_settings(
     if not openai_base_url and normalized_provider in _OPENAI_COMPAT_PROVIDER_BASE_URLS:
         openai_base_url = _OPENAI_COMPAT_PROVIDER_BASE_URLS[normalized_provider]
 
-    # Fall back to ~/.nullion/credentials.json (set via `nullion auth`).
-    # We load the credentials file unconditionally and consult it for any
+    # Fall back to encrypted local credentials (set via `nullion auth`).
+    # We load stored credentials unconditionally and consult them for any
     # field that env vars didn't already cover. Previously this whole block
     # was guarded by `if not openai_api_key`, which meant the Codex OAuth
     # `refresh_token` would silently fail to load whenever an access token
@@ -458,7 +458,7 @@ def load_settings(
     # sets OPENAI_API_KEY=<oauth_token>). The result was a misleading
     # "Codex OAuth access token has no chatgpt_account_id claim and no
     # refresh token is saved" error even when the refresh token sat right
-    # there in credentials.json.
+    # there in the encrypted credential store.
     from nullion.auth import load_stored_credentials
     stored = {} if explicit_env else (load_stored_credentials() or {})
     if stored:

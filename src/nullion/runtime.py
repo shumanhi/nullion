@@ -3689,7 +3689,98 @@ def restore_runtime_store_checkpoint(path: str | Path, *, generation: int = 0) -
 
 
 
-def _import_legacy_json_skills_if_needed(store: RuntimeStore, source: Path) -> bool:
+def _legacy_runtime_record_identity(record: object) -> str:
+    for attr in (
+        "event_id",
+        "audit_id",
+        "update_id",
+        "run_id",
+        "action_id",
+        "escalation_id",
+        "frame_id",
+        "turn_id",
+        "branch_id",
+        "proposal_id",
+        "skill_id",
+        "task_id",
+        "id",
+    ):
+        value = getattr(record, attr, None)
+        if isinstance(value, str) and value:
+            return f"{attr}:{value}"
+    if isinstance(record, dict):
+        for key in (
+            "event_id",
+            "audit_id",
+            "update_id",
+            "run_id",
+            "action_id",
+            "escalation_id",
+            "frame_id",
+            "turn_id",
+            "branch_id",
+            "proposal_id",
+            "skill_id",
+            "task_id",
+            "id",
+        ):
+            value = record.get(key)
+            if isinstance(value, str) and value:
+                return f"{key}:{value}"
+    return repr(record)
+
+
+def _merge_legacy_runtime_list(current: list, legacy: list) -> int:
+    imported = 0
+    seen = {_legacy_runtime_record_identity(item) for item in current}
+    for item in legacy:
+        identity = _legacy_runtime_record_identity(item)
+        if identity in seen:
+            continue
+        current.append(deepcopy(item))
+        seen.add(identity)
+        imported += 1
+    return imported
+
+
+def _merge_legacy_runtime_dict(store: RuntimeStore, legacy_store: RuntimeStore, attr: str) -> int:
+    current = getattr(store, attr)
+    legacy = getattr(legacy_store, attr)
+    imported = 0
+    for key, value in legacy.items():
+        if key not in current:
+            if attr == "skills" and _find_duplicate_skill(store, title=value.title, summary=value.summary, trigger=value.trigger):
+                continue
+            current[key] = deepcopy(value)
+            imported += 1
+            continue
+        if attr == "approval_requests":
+            existing = current[key]
+            if existing.status is ApprovalStatus.PENDING and value.status is not ApprovalStatus.PENDING:
+                current[key] = deepcopy(value)
+                imported += 1
+            elif existing.decided_at is None and value.decided_at is not None:
+                current[key] = deepcopy(value)
+                imported += 1
+            elif existing.decided_at is not None and value.decided_at is not None and value.decided_at > existing.decided_at:
+                current[key] = deepcopy(value)
+                imported += 1
+    return imported
+
+
+def _merge_legacy_runtime_sets(store: RuntimeStore, legacy_store: RuntimeStore, attr: str) -> int:
+    current = getattr(store, attr)
+    legacy = getattr(legacy_store, attr)
+    imported = 0
+    for key, values in legacy.items():
+        current_values = current.setdefault(key, set())
+        before = len(current_values)
+        current_values.update(values)
+        imported += len(current_values) - before
+    return imported
+
+
+def _import_legacy_json_records_if_needed(store: RuntimeStore, source: Path) -> bool:
     if source.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
         return False
     legacy_json = source.with_name("runtime-store.json")
@@ -3700,31 +3791,60 @@ def _import_legacy_json_skills_if_needed(store: RuntimeStore, source: Path) -> b
     except Exception:
         return False
 
-    imported_skills = 0
-    for skill_id, skill in legacy_store.skills.items():
-        if skill_id in store.skills:
-            continue
-        if _find_duplicate_skill(store, title=skill.title, summary=skill.summary, trigger=skill.trigger):
-            continue
-        store.skills[skill_id] = deepcopy(skill)
-        imported_skills += 1
+    imported_by_collection: dict[str, int] = {}
+    for attr in (
+        "capsules",
+        "scheduled_tasks",
+        "reminders",
+        "suspended_turns",
+        "approval_requests",
+        "permission_grants",
+        "boundary_permits",
+        "boundary_policy_rules",
+        "mini_agent_runs",
+        "missions",
+        "builder_proposals",
+        "skills",
+        "user_facts",
+        "preferences",
+        "environment_facts",
+        "skill_execution_plans",
+        "task_frames",
+        "active_task_frames",
+        "conversation_turns",
+        "conversation_branches",
+        "conversation_heads",
+    ):
+        imported_by_collection[attr] = _merge_legacy_runtime_dict(store, legacy_store, attr)
+    for attr in ("conversation_commits", "conversation_ingress_ids"):
+        imported_by_collection[attr] = _merge_legacy_runtime_sets(store, legacy_store, attr)
+    for attr in (
+        "events",
+        "audit_records",
+        "progress_updates",
+        "doctor_signals",
+        "sentinel_signals",
+        "sentinel_escalations",
+        "doctor_recommendations",
+        "doctor_actions",
+        "conversation_events",
+    ):
+        imported_by_collection[attr] = _merge_legacy_runtime_list(getattr(store, attr), getattr(legacy_store, attr))
 
-    imported_proposals = 0
-    for proposal_id, proposal in legacy_store.builder_proposals.items():
-        if proposal_id in store.builder_proposals:
-            continue
-        store.builder_proposals[proposal_id] = deepcopy(proposal)
-        imported_proposals += 1
-
-    if imported_skills or imported_proposals:
+    imported_total = sum(imported_by_collection.values())
+    if imported_total:
         details = {
             "checkpoint_path": str(source),
             "legacy_path": str(legacy_json),
-            "skills_imported": str(imported_skills),
-            "builder_proposals_imported": str(imported_proposals),
+            "records_imported": str(imported_total),
+            **{
+                f"{collection}_imported": str(count)
+                for collection, count in imported_by_collection.items()
+                if count
+            },
         }
-        store.add_event(make_event(event_type="runtime.legacy_skills_imported", actor="runtime", payload=details))
-        store.add_audit_record(make_audit_record(action="runtime.legacy_skills_imported", actor="runtime", details=details))
+        store.add_event(make_event(event_type="runtime.legacy_records_imported", actor="runtime", payload=details))
+        store.add_audit_record(make_audit_record(action="runtime.legacy_records_imported", actor="runtime", details=details))
         return True
     return False
 
@@ -3740,7 +3860,7 @@ def bootstrap_runtime_store(path: str | Path) -> RuntimeStore:
     if not source.exists():
         return RuntimeStore()
     store = load_runtime_store(source)
-    changed = _import_legacy_json_skills_if_needed(store, source)
+    changed = _import_legacy_json_records_if_needed(store, source)
     changed = bool(deduplicate_skills(store, actor="runtime")) or changed
     if changed:
         save_runtime_store(store, source)

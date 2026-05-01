@@ -14,6 +14,7 @@ from nullion.missions import MissionChecklistItem, MissionContinuationPolicy, Mi
 from nullion.policy import BoundaryKind, BoundaryPolicyRule, PolicyMode
 from nullion.progress import ProgressState, ProgressUpdate
 from nullion.reminders import ReminderRecord
+from nullion.runtime import bootstrap_runtime_store
 from nullion.runtime_persistence import (
     get_latest_runtime_restore_metadata,
     list_runtime_store_backups,
@@ -134,6 +135,44 @@ def test_sqlite_save_merges_approval_rows_from_other_runtime_process(tmp_path) -
     loaded = load_runtime_store(checkpoint)
     assert loaded.get_approval_request(approval.approval_id) is not None
     assert any(record.action == "web.status.refresh" for record in loaded.list_audit_records())
+
+
+def test_existing_sqlite_bootstrap_imports_legacy_json_boundaries(tmp_path) -> None:
+    checkpoint = tmp_path / "runtime.db"
+    legacy_json = tmp_path / "runtime-store.json"
+    save_runtime_store(RuntimeStore(), checkpoint)
+
+    legacy = RuntimeStore()
+    approval = approve(
+        create_approval_request(
+            requested_by="telegram:123",
+            action="allow_boundary",
+            resource="*",
+            request_kind="boundary_policy",
+            context={"boundary_kind": "outbound_network", "target": "*"},
+        ),
+        decided_by="operator",
+    )
+    permit = create_boundary_permit(
+        approval_id=approval.approval_id,
+        principal_id="global:operator",
+        boundary_kind=BoundaryKind.OUTBOUND_NETWORK,
+        selector="*",
+        granted_by="operator",
+        uses_remaining=80,
+    )
+    legacy.add_approval_request(approval)
+    legacy.add_boundary_permit(permit)
+    legacy.add_event(make_event("boundary_permit.wildcard_access", "runtime", {"permit_id": permit.permit_id}))
+    save_runtime_store(legacy, legacy_json)
+
+    imported = bootstrap_runtime_store(checkpoint)
+
+    assert imported.get_approval_request(approval.approval_id).status.name == "APPROVED"
+    assert imported.get_boundary_permit(permit.permit_id).selector == "*"
+    assert any(event.event_type == "runtime.legacy_records_imported" for event in imported.list_events())
+    reloaded = load_runtime_store(checkpoint)
+    assert reloaded.get_boundary_permit(permit.permit_id).uses_remaining == 80
 
 
 def test_sqlite_merge_does_not_restore_suspended_turn_for_decided_approval(tmp_path) -> None:

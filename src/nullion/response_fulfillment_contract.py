@@ -79,7 +79,7 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
             path = output.get("path")
             if isinstance(path, str) and path.strip():
                 paths.append(path)
-        for key in ("artifact_path", "path"):
+        for key in ("artifact_path",):
             value = output.get(key)
             if isinstance(value, str) and value.strip():
                 paths.append(value)

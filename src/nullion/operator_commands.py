@@ -1934,16 +1934,18 @@ def _credentials_path() -> Path:
 
 def _read_credentials() -> dict[str, object]:
     try:
-        payload = json.loads(_credentials_path().read_text(encoding="utf-8"))
+        from nullion.credential_store import migrate_credentials_json_to_db
+
+        payload = migrate_credentials_json_to_db(_credentials_path(), db_path=_credentials_path().with_name("runtime.db"))
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
 
 
 def _write_credentials(creds: dict[str, object]) -> None:
-    path = _credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(creds, indent=2) + "\n", encoding="utf-8")
+    from nullion.credential_store import save_encrypted_credentials
+
+    save_encrypted_credentials(dict(creds), db_path=_credentials_path().with_name("runtime.db"))
 
 
 def _split_model_entries(value: object) -> list[str]:

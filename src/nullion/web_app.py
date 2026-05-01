@@ -88,6 +88,7 @@ from nullion.response_fulfillment_contract import (
     evaluate_response_fulfillment,
     user_visible_text_from_output,
 )
+from nullion.runtime_persistence import load_runtime_store
 from nullion.response_sanitizer import sanitize_user_visible_reply
 from nullion.remediation import remediation_buttons_for_recommendation_code
 from nullion.run_activity import (
@@ -492,7 +493,7 @@ def _install_log_buffer_handler() -> None:
 def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
     """Best-effort backfill from runtime conversation events into web history."""
     checkpoint_path = Path(
-        getattr(runtime, "checkpoint_path", None) or Path.home() / ".nullion" / "runtime-store.json"
+        getattr(runtime, "checkpoint_path", None) or Path.home() / ".nullion" / "runtime.db"
     )
     if not checkpoint_path.exists():
         return
@@ -501,11 +502,14 @@ def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
         cache_key = str(checkpoint_path.resolve())
         if _RUNTIME_HISTORY_SYNC_MTIMES.get(cache_key) == mtime:
             return
-        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-        events = data.get("conversation_events") if isinstance(data, dict) else None
-        if not isinstance(events, list):
-            _RUNTIME_HISTORY_SYNC_MTIMES[cache_key] = mtime
-            return
+        if checkpoint_path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+            events = load_runtime_store(checkpoint_path).list_conversation_events()
+        else:
+            data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            events = data.get("conversation_events") if isinstance(data, dict) else None
+            if not isinstance(events, list):
+                _RUNTIME_HISTORY_SYNC_MTIMES[cache_key] = mtime
+                return
         turns = [
             event
             for event in events
@@ -14069,7 +14073,7 @@ def create_app(runtime, orchestrator, registry):
 
     @app.get("/api/config")
     async def get_config():
-        """Return current config (secrets masked). Reads env vars + credentials.json fallback."""
+        """Return current config (secrets masked). Reads env vars + encrypted credential fallback."""
         import os
         creds = _read_credentials_json()
         tg_token = os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", "")
@@ -14339,7 +14343,7 @@ def create_app(runtime, orchestrator, registry):
             "chat_services": _chat_services_status_payload(),
             "model_provider":         provider,
             "model_provider_enabled": (
-                # credentials.json is the durable source of truth (survives
+                # Encrypted local credentials are the durable source of truth (survives
                 # restart). The env var is a runtime kill-switch — if set to a
                 # truthy value (anything other than "", "0", "false", "no",
                 # "off"), it forces the provider OFF regardless of creds.
@@ -14600,7 +14604,7 @@ def create_app(runtime, orchestrator, registry):
 
     @app.post("/api/config")
     async def post_config(request: Request):
-        """Write config values to credentials.json + .env and update the live environment."""
+        """Write config values to encrypted credentials + .env and update the live environment."""
         import os
         try:
             body = await request.json()
@@ -14898,7 +14902,7 @@ def create_app(runtime, orchestrator, registry):
                     status_code=400,
                 )
 
-        # Update credentials.json if provider/key/model/browser changed
+        # Update encrypted credentials if provider/key/model/browser changed
         provider_enabled = body.get("model_provider_enabled")  # bool or None
         browser_backend_val = body.get("browser_backend")  # None = not sent, "" = clear
         # Disabling a provider must NOT promote it to the active provider just
@@ -15292,7 +15296,7 @@ def create_app(runtime, orchestrator, registry):
 
         # Hot-swap the in-memory model client when provider/key/model changed.
         # Without this the running orchestrator keeps using the old client even
-        # though credentials.json and os.environ are already updated.
+        # though encrypted credentials and os.environ are already updated.
         # NOTE: orchestrator.model_client is a read-only @property (no setter),
         # so we must use __dict__.update(new_instance.__dict__) — the same
         # pattern already used in _handle_web_config_request for /model switching.
@@ -17747,10 +17751,13 @@ def _cli_impl() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8742, help="Bind port (default: 8742)")
     parser.add_argument("--env-file", default=None, help="Path to .env file")
+    parser.add_argument("--checkpoint", default=None, help="Runtime checkpoint path")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload (dev mode)")
     args = parser.parse_args()
 
     _load_env(args.env_file)
+    if args.checkpoint:
+        os.environ["NULLION_CHECKPOINT_PATH"] = str(Path(args.checkpoint).expanduser())
 
     return run_single_instance_entrypoint(
         "web",
@@ -17805,7 +17812,7 @@ def _resolve_browser_backend() -> str | None:
     Resolution order:
     1. NULLION_BROWSER_BACKEND env var (explicit, set by installer or user)
     2. NULLION_PLUGINS env var containing 'browser'
-    3. credentials.json key 'browser_backend'
+    3. encrypted credential key 'browser_backend'
     Returns None if the browser plugin is not configured.
     """
     if os.environ.get("NULLION_BROWSER_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
@@ -17821,7 +17828,7 @@ def _resolve_browser_backend() -> str | None:
     if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):
         return "auto"
 
-    # 3. credentials.json
+    # 3. encrypted credentials
     try:
         from nullion.auth import load_stored_credentials
         creds = load_stored_credentials() or {}
@@ -18181,23 +18188,31 @@ def _credentials_path() -> Path:
 
 
 def _read_credentials_json() -> dict:
-    """Read ~/.nullion/credentials.json, return {} if missing."""
+    """Read encrypted credentials from runtime.db, with legacy JSON fallback."""
     try:
-        path = _credentials_path()
-        if path.exists():
-            import json as _json
-            return _json.loads(path.read_text())
+        from nullion.auth import CREDENTIALS_PATH, load_stored_credentials
+
+        original_path = CREDENTIALS_PATH
+        try:
+            import nullion.auth as auth_module
+
+            auth_module.CREDENTIALS_PATH = _credentials_path()
+            return load_stored_credentials() or {}
+        finally:
+            auth_module.CREDENTIALS_PATH = original_path
     except Exception:
-        pass
-    return {}
+        return {}
 
 
 def _write_credentials_json(creds: dict) -> None:
-    """Write dict back to ~/.nullion/credentials.json."""
-    import json as _json
-    path = _credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_json.dumps(creds, indent=2) + "\n")
+    """Write encrypted credentials to runtime.db."""
+    try:
+        from nullion.credential_store import save_encrypted_credentials
+
+        save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
+    except Exception:
+        logger.exception("Could not write encrypted credentials")
+        raise
 
 
 def _find_env_path() -> Path:

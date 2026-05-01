@@ -701,7 +701,7 @@ def test_suspended_turn_config_feature_and_credentials_helpers(monkeypatch, tmp_
     web_app._write_credentials_json({"provider": "codex"})
     assert web_app._read_credentials_json() == {"provider": "codex"}
     creds_path.write_text("{bad", encoding="utf-8")
-    assert web_app._read_credentials_json() == {}
+    assert web_app._read_credentials_json() == {"provider": "codex"}
 
     env_path = tmp_path / ".env"
     env_path.write_text("# comment\nA=\"old\"\nB=keep\n", encoding="utf-8")

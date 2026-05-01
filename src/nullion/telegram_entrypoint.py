@@ -39,6 +39,7 @@ from nullion.tools import (
 logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
+_DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
 
 
 def _resolve_browser_backend() -> str | None:
@@ -217,7 +218,7 @@ def _workspace_plugin_kwargs_from_settings(
     def normalize_root(raw_root: object) -> str:
         if not isinstance(raw_root, str) or not raw_root:
             raise ValueError("workspace plugin roots must be absolute paths")
-        candidate = Path(raw_root)
+        candidate = Path(raw_root).expanduser()
         if not candidate.is_absolute():
             raise ValueError("workspace plugin roots must be absolute paths")
         resolved = candidate.resolve()
@@ -572,7 +573,7 @@ def _complete_gateway_restart_marker(service) -> None:
 
 def main(
     *,
-    checkpoint_path: str | Path = "runtime-store.json",
+    checkpoint_path: str | Path = _DEFAULT_CHECKPOINT_PATH,
     env_path: str | Path | None = _DEFAULT_ENV_PATH,
     service_builder=build_runtime_service_from_settings,
     polling_retry_delay_seconds: float = 1.0,
@@ -720,7 +721,7 @@ def main(
 def cli(argv: list[str] | None = None, *, runner=main):
     def _run() -> None:
         parser = argparse.ArgumentParser(prog="nullion-telegram")
-        parser.add_argument("--checkpoint", default="runtime-store.json")
+        parser.add_argument("--checkpoint", default=str(_DEFAULT_CHECKPOINT_PATH))
         parser.add_argument("--env-file", default=str(_DEFAULT_ENV_PATH))
         args = parser.parse_args(argv)
 

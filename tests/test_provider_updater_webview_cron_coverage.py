@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 from nullion import crons, providers, updater, webview_app
+from nullion.approvals import create_approval_request
+from nullion.credential_store import load_encrypted_credentials
+from nullion.runtime_persistence import load_runtime_store, save_runtime_store
+from nullion.runtime_store import RuntimeStore
 from nullion.tools import (
     ToolInvocation,
     _build_create_cron_handler,
@@ -227,6 +231,63 @@ def test_updater_helpers_rollback_and_health_checks(tmp_path, monkeypatch) -> No
     assert updater.fresh_health_check() is False
 
 
+def test_post_update_migrations_import_credentials_and_runtime_json(tmp_path, monkeypatch) -> None:
+    install = tmp_path / "install"
+    install.mkdir()
+    monkeypatch.setenv("NULLION_INSTALL_DIR", str(install))
+    env_path = install / ".env"
+    env_path.write_text('NULLION_KEY_STORAGE="local"\n', encoding="utf-8")
+    credentials_json = install / "credentials.json"
+    credentials_json.write_text(json.dumps({"provider": "openai", "api_key": "sk-secret"}), encoding="utf-8")
+
+    checkpoint = install / "runtime.db"
+    legacy = RuntimeStore()
+    approval = create_approval_request(
+        requested_by="telegram_chat",
+        action="allow_boundary",
+        resource="https://www.cnn.com/*",
+        request_kind="boundary_policy",
+    )
+    legacy.add_approval_request(approval)
+    save_runtime_store(legacy, install / "runtime-store.json")
+
+    result = updater.run_post_update_migrations(env_path=env_path, checkpoint_path=checkpoint, install_dir=install)
+
+    assert result["credentials_imported"] is True
+    assert result["credentials_json_deleted"] is True
+    assert result["runtime_imported"] is True
+    assert load_encrypted_credentials(db_path=checkpoint)["api_key"] == "sk-secret"
+    assert load_runtime_store(checkpoint).get_approval_request(approval.approval_id) is not None
+
+
+def test_post_update_migrations_import_env_credentials_when_db_is_empty(tmp_path, monkeypatch) -> None:
+    install = tmp_path / "install"
+    install.mkdir()
+    monkeypatch.setenv("NULLION_INSTALL_DIR", str(install))
+    env_path = install / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                'NULLION_KEY_STORAGE="local"',
+                'NULLION_MODEL_PROVIDER="openrouter"',
+                'NULLION_MODEL="openai/gpt-4o"',
+                'OPENROUTER_API_KEY="sk-or-secret"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env_path.chmod(0o600)
+
+    checkpoint = install / "runtime.db"
+    result = updater.run_post_update_migrations(env_path=env_path, checkpoint_path=checkpoint, install_dir=install)
+
+    assert result["env_credentials_imported"] is True
+    stored = load_encrypted_credentials(db_path=checkpoint)
+    assert stored["provider"] == "openrouter"
+    assert stored["api_key"] == "sk-or-secret"
+    assert stored["model"] == "openai/gpt-4o"
+
+
 def test_run_update_workflow_handles_no_update_success_and_rollback(tmp_path, monkeypatch) -> None:
     emitted: list[updater.UpdateProgress] = []
     target = updater.UpdateTarget(channel="release", ref="v2", commit="new1234", label="v2")
@@ -255,6 +316,7 @@ def test_run_update_workflow_handles_no_update_success_and_rollback(tmp_path, mo
     monkeypatch.setattr(updater, "_venv_pip", lambda: tmp_path / "pip")
     monkeypatch.setattr(updater, "_src_dir", lambda: tmp_path)
     monkeypatch.setattr(updater.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(updater, "fresh_post_update_migrations", lambda **kwargs: {"warnings": []})
     monkeypatch.setattr(updater, "fresh_health_check", lambda **kwargs: True)
 
     updated = asyncio.run(updater.run_update(emit=emitted.append))
@@ -265,7 +327,9 @@ def test_run_update_workflow_handles_no_update_success_and_rollback(tmp_path, mo
     assert updated.snapshot_path == str(snapshot_path)
     assert ("reset", "--hard", "v2") in git_calls
     assert ("clean", "-fd") in git_calls
-    assert emitted[-1].step == "done"
+    emitted_steps = [step.step for step in emitted]
+    assert "migrate" in emitted_steps
+    assert emitted_steps[-1] == "done"
 
     emitted.clear()
     rolled_back: list[Path | None] = []
