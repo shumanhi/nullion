@@ -2217,6 +2217,49 @@ def _is_approved_filesystem_path(path: Path, selectors: Iterable[str]) -> bool:
     return False
 
 
+_FILE_WALK_PRUNED_DIR_NAMES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".svn",
+        ".venv",
+        "__pycache__",
+        "brave-debug",
+        "chrome-debug",
+        "chromium-debug",
+        "node_modules",
+        "venv",
+    }
+)
+
+_MACOS_PROTECTED_APP_DATA_SUFFIXES = (
+    ("library", "application support", "addressbook"),
+    ("library", "calendars"),
+    ("library", "containers"),
+    ("library", "group containers"),
+    ("library", "mail"),
+    ("library", "messages"),
+    ("library", "safari"),
+)
+
+
+def _has_path_suffix(path: Path, suffix: tuple[str, ...]) -> bool:
+    parts = tuple(part.lower() for part in path.parts)
+    if len(parts) < len(suffix):
+        return False
+    return any(parts[index : index + len(suffix)] == suffix for index in range(len(parts) - len(suffix) + 1))
+
+
+def _should_prune_filesystem_walk_dir(path: Path) -> bool:
+    name = path.name.lower()
+    if name in _FILE_WALK_PRUNED_DIR_NAMES:
+        return True
+    return any(_has_path_suffix(path, suffix) for suffix in _MACOS_PROTECTED_APP_DATA_SUFFIXES)
+
+
 def _build_file_read_handler(
     workspace_root: str | Path | None = None,
     allowed_roots: list[Path] | tuple[Path, ...] | None = None,
@@ -2907,7 +2950,10 @@ def _build_workspace_summary_handler(
     resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
 
     def _resolve_candidate_within_scope(candidate: Path, root: Path) -> Path | None:
-        resolved_candidate = candidate.resolve()
+        try:
+            resolved_candidate = candidate.resolve()
+        except OSError:
+            return None
         if not _is_within_allowed_root(resolved_candidate, root):
             return None
         return resolved_candidate
@@ -2935,6 +2981,8 @@ def _build_workspace_summary_handler(
                 scoped_dirnames: list[str] = []
                 for dirname in sorted(dirnames):
                     candidate_dir = current_path / dirname
+                    if candidate_dir.is_symlink() or _should_prune_filesystem_walk_dir(candidate_dir):
+                        continue
                     resolved_dir = _resolve_candidate_within_scope(candidate_dir, root)
                     if resolved_dir is None:
                         continue
@@ -2944,6 +2992,8 @@ def _build_workspace_summary_handler(
                 dirnames[:] = scoped_dirnames
                 for filename in sorted(filenames):
                     candidate_file = current_path / filename
+                    if candidate_file.is_symlink():
+                        continue
                     resolved_file = _resolve_candidate_within_scope(candidate_file, root)
                     if resolved_file is None or resolved_file in seen_files:
                         continue
@@ -3902,19 +3952,55 @@ def _build_file_search_handler(
                 error="file_search requires workspace_root or allowed_roots",
             )
 
+        raw_limit = invocation.arguments.get("limit")
+        limit = 100
+        if isinstance(raw_limit, int) and raw_limit > 0:
+            limit = min(raw_limit, 500)
+
+        pattern = raw_pattern.lower()
         matches: list[str] = []
         for root in search_roots:
-            for path in sorted(root.rglob("*")):
-                if not path.is_file():
-                    continue
-                resolved_path = path.resolve()
-                if not _path_within_any_root(resolved_path, search_roots):
-                    continue
-                elif resolved_root is not None and not _is_within_allowed_root(resolved_path, resolved_root):
-                    continue
-                if raw_pattern.lower() not in path.name.lower():
-                    continue
-                matches.append(str(resolved_path))
+            for current_dir, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+                current_path = Path(current_dir)
+                scoped_dirnames: list[str] = []
+                for dirname in sorted(dirnames):
+                    candidate_dir = current_path / dirname
+                    if candidate_dir.is_symlink() or _should_prune_filesystem_walk_dir(candidate_dir):
+                        continue
+                    try:
+                        resolved_dir = candidate_dir.resolve()
+                    except OSError:
+                        continue
+                    if not _path_within_any_root(resolved_dir, search_roots):
+                        continue
+                    if resolved_root is not None and not _is_within_allowed_root(resolved_dir, resolved_root):
+                        continue
+                    scoped_dirnames.append(dirname)
+                dirnames[:] = scoped_dirnames
+
+                for filename in sorted(filenames):
+                    if pattern not in filename.lower():
+                        continue
+                    candidate_file = current_path / filename
+                    if candidate_file.is_symlink():
+                        continue
+                    try:
+                        if not candidate_file.is_file():
+                            continue
+                        resolved_path = candidate_file.resolve()
+                    except OSError:
+                        continue
+                    if not _path_within_any_root(resolved_path, search_roots):
+                        continue
+                    if resolved_root is not None and not _is_within_allowed_root(resolved_path, resolved_root):
+                        continue
+                    matches.append(str(resolved_path))
+                    if len(matches) >= limit:
+                        break
+                if len(matches) >= limit:
+                    break
+            if len(matches) >= limit:
+                break
 
         return ToolResult(
             invocation_id=invocation.invocation_id,

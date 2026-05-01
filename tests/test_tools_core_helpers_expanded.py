@@ -22,6 +22,7 @@ from nullion.tools import (
     _boundary_approval_match_key,
     _boundary_policy_principal_for_fact,
     _boundary_risk_score,
+    _build_file_search_handler,
     _build_file_patch_handler,
     _build_pdf_create_handler,
     _build_pdf_edit_handler,
@@ -499,6 +500,29 @@ def test_file_read_write_patch_and_workspace_summary_handlers(tmp_path) -> None:
     assert summary.status == "completed"
     assert summary.output["file_count"] == 1
     assert summary.output["extensions"] == [{"extension": ".txt", "count": 1}]
+
+
+def test_file_search_and_summary_prune_browser_profiles_and_symlinks(tmp_path) -> None:
+    safe_match = tmp_path / "cron" / "daily-cron.json"
+    safe_match.parent.mkdir()
+    safe_match.write_text("{}", encoding="utf-8")
+    browser_match = tmp_path / "brave-debug" / "Default" / "secret-cron.json"
+    browser_match.parent.mkdir(parents=True)
+    browser_match.write_text("{}", encoding="utf-8")
+    link_match = tmp_path / "linked-cron.json"
+    link_match.symlink_to(safe_match)
+
+    search_handler = _build_file_search_handler(workspace_root=tmp_path, include_principal_workspace=False)
+    found = search_handler(ToolInvocation("inv", "file_search", "operator", {"pattern": "cron"}))
+
+    assert found.status == "completed"
+    assert found.output["matches"] == [str(safe_match.resolve())]
+
+    summary_handler = _build_workspace_summary_handler(workspace_root=tmp_path, include_principal_workspace=False)
+    summary = summary_handler(ToolInvocation("inv", "workspace_summary", "operator", {}))
+
+    assert summary.output["file_count"] == 1
+    assert summary.output["sample_files"] == ["cron/daily-cron.json"]
 
 
 def test_pdf_create_and_edit_handlers_are_local_artifact_tools(tmp_path) -> None:
