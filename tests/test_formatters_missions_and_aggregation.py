@@ -322,6 +322,66 @@ async def test_result_aggregator_updates_checklist_top_to_bottom_without_marking
 
 
 @pytest.mark.asyncio
+async def test_result_aggregator_suppresses_bare_failure_summary_when_task_feed_visible() -> None:
+    deliveries: list[tuple[str, str, dict]] = []
+    tasks = [
+        task("fetch", TaskStatus.FAILED, result=TaskResult("fetch", "failure", error="fetch failed")),
+        task("pdf", TaskStatus.FAILED, result=TaskResult("pdf", "failure", error="pdf failed")),
+    ]
+    group = TaskGroup(
+        group_id="g-failed",
+        conversation_id="telegram:123",
+        original_message="make a report",
+        tasks=tasks,
+        planner_metadata={"disposition": "sequential_mission", "tasks": ["fetch", "pdf"]},
+    )
+    registry = SimpleNamespace(
+        get_group=lambda group_id: group if group_id == "g-failed" else None,
+        get_task=lambda task_id: next((item for item in group.tasks if item.task_id == task_id), None),
+    )
+    aggregator = ResultAggregator(
+        deliver_fn=lambda conversation_id, text, **kwargs: deliveries.append((conversation_id, text, kwargs)),
+        task_registry=registry,
+        min_progress_interval_s=0,
+    )
+
+    await aggregator._handle(ProgressUpdate(agent_id="a", task_id="fetch", group_id="g-failed", kind="task_failed", message="fetch failed"))
+
+    assert any("✕ Task fetch" in text and "✕ Task pdf" in text for _, text, kwargs in deliveries if kwargs.get("is_status"))
+    assert not any(text == "Completed 0/2 task(s). 2 failed." and kwargs == {} for _, text, kwargs in deliveries)
+
+
+@pytest.mark.asyncio
+async def test_result_aggregator_keeps_failure_summary_when_task_feed_hidden() -> None:
+    deliveries: list[tuple[str, str, dict]] = []
+    failed_task = task("fetch", TaskStatus.FAILED, result=TaskResult("fetch", "failure", error="fetch failed"))
+    group = TaskGroup(
+        group_id="g-hidden",
+        conversation_id="telegram:123",
+        original_message="make a report",
+        tasks=[failed_task],
+        planner_metadata={"disposition": "sequential_mission", "tasks": ["fetch"]},
+    )
+    registry = SimpleNamespace(
+        get_group=lambda group_id: group if group_id == "g-hidden" else None,
+        get_task=lambda task_id: failed_task if task_id == "fetch" else None,
+    )
+
+    def deliver(conversation_id: str, text: str, **kwargs) -> bool | None:
+        deliveries.append((conversation_id, text, kwargs))
+        if kwargs.get("is_status"):
+            return False
+        return None
+
+    aggregator = ResultAggregator(deliver_fn=deliver, task_registry=registry, min_progress_interval_s=0)
+
+    await aggregator._handle(ProgressUpdate(agent_id="a", task_id="fetch", group_id="g-hidden", kind="task_failed", message="fetch failed"))
+
+    assert any(kwargs.get("is_status") for _, _, kwargs in deliveries)
+    assert ("telegram:123", "Completed 0/1 task(s). 1 failed.", {}) in deliveries
+
+
+@pytest.mark.asyncio
 async def test_result_aggregator_progress_input_failure_cancel_and_model_summary() -> None:
     deliveries: list[tuple[str, str, dict]] = []
 

@@ -8,6 +8,7 @@ import pytest
 
 from nullion.approvals import BoundaryPermit
 from nullion.policy import BoundaryFact, BoundaryKind
+from nullion.runtime import invoke_tool
 from nullion.runtime_store import RuntimeStore
 from nullion.tools import (
     TerminalAttestationEvidence,
@@ -381,6 +382,29 @@ def test_filesystem_and_network_helper_edges(monkeypatch, tmp_path) -> None:
     assert _network_attempt_allowed(attempt={"target": "https://evil.com"}, network_mode="approved_only", approved_targets=["https://example.com/*"]) is False
     assert _network_attempt_allowed(attempt={}, network_mode="none", approved_targets=[]) is False
     assert _network_is_approved(target="https://www.example.com/a", approved_targets=["https://example.com/*"]) is True
+
+
+def test_virtual_workspace_path_resolves_to_principal_workspace_without_approval(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("NULLION_WORKSPACE_STORAGE_ROOT", str(tmp_path / "workspaces"))
+    store = RuntimeStore()
+    registry = create_core_tool_registry()
+
+    result = invoke_tool(
+        store,
+        invocation=ToolInvocation(
+            "inv",
+            "file_write",
+            "telegram_chat",
+            {"path": "/workspace/bird1.png", "content": "png-ish"},
+        ),
+        registry=registry,
+    )
+
+    expected_path = tmp_path / "workspaces" / "workspace_admin" / "bird1.png"
+    assert result.status == "completed"
+    assert result.output["path"] == str(expected_path.resolve())
+    assert expected_path.read_text(encoding="utf-8") == "png-ish"
+    assert store.list_approval_requests() == []
 
 
 def test_boundary_approval_contexts_and_match_keys() -> None:

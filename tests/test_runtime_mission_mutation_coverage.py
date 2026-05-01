@@ -150,6 +150,7 @@ def test_runtime_mission_validation_and_terminal_guards() -> None:
 
     runtime.set_mission_plan(store, mission.mission_id, steps=[MissionStep("s1", "Title", "pending", "tool")])
     terminal = runtime.mark_mission_completed(store, mission.mission_id, result_summary="done")
+    assert terminal.steps[0].status == "completed"
     assert runtime.advance_mission(store, mission.mission_id) is terminal
     with pytest.raises(ValueError):
         runtime.mark_mission_step_running(store, mission.mission_id, step_id="s1")

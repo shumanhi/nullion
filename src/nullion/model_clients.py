@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 import json
+import os
 from typing import Any
 
 try:  # pragma: no cover - import guard
@@ -119,6 +120,96 @@ def _refresh_codex_access_token(refresh_token: str) -> str:
 
 class ModelClientConfigurationError(RuntimeError):
     """Raised when model client configuration cannot be resolved."""
+
+
+_DEFAULT_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS = 700_000
+_TRIMMED_TEXT_MARKER = "\n...[context trimmed]...\n"
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _chat_completions_input_budget_chars() -> int:
+    raw_value = os.environ.get("NULLION_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS")
+    if raw_value is None:
+        return _DEFAULT_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS
+    try:
+        return int(raw_value)
+    except ValueError:
+        return _DEFAULT_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS
+
+
+def _trim_text_to_budget(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(_TRIMMED_TEXT_MARKER) + 20:
+        return text[:max_chars]
+    head_chars = max_chars // 2
+    tail_chars = max_chars - head_chars - len(_TRIMMED_TEXT_MARKER)
+    return f"{text[:head_chars].rstrip()}{_TRIMMED_TEXT_MARKER}{text[-tail_chars:].lstrip()}"
+
+
+def _trim_serialized_message_text(message: dict[str, Any], max_text_chars: int) -> dict[str, Any]:
+    trimmed = dict(message)
+    content = trimmed.get("content")
+    if isinstance(content, str):
+        trimmed["content"] = _trim_text_to_budget(content, max_text_chars)
+        return trimmed
+    if not isinstance(content, list):
+        return trimmed
+    content_parts: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            content_parts.append(part)
+            continue
+        block = dict(part)
+        if isinstance(block.get("text"), str):
+            block["text"] = _trim_text_to_budget(block["text"], max_text_chars)
+        if isinstance(block.get("content"), str):
+            block["content"] = _trim_text_to_budget(block["content"], max_text_chars)
+        content_parts.append(block)
+    trimmed["content"] = content_parts
+    return trimmed
+
+
+def _trim_serialized_messages_for_budget(messages: list[dict[str, Any]], max_chars: int) -> list[dict[str, Any]]:
+    if max_chars <= 0 or _json_size(messages) <= max_chars:
+        return messages
+
+    system_messages = [message for message in messages if message.get("role") == "system"]
+    conversation_messages = [message for message in messages if message.get("role") != "system"]
+
+    system_budget = min(80_000, max(200, max_chars // 4))
+    system_budget = min(system_budget, max(0, max_chars // 2))
+    if system_messages:
+        per_system_message = max(500, system_budget // len(system_messages))
+        system_messages = [_trim_serialized_message_text(message, per_system_message) for message in system_messages]
+        while _json_size(system_messages) > system_budget and per_system_message > 250:
+            per_system_message //= 2
+            system_messages = [_trim_serialized_message_text(message, per_system_message) for message in system_messages]
+
+    remaining_budget = max(1_000, max_chars - _json_size(system_messages) - 2)
+    kept_reversed: list[dict[str, Any]] = []
+    for message in reversed(conversation_messages):
+        message_size = _json_size(message)
+        if message_size <= remaining_budget:
+            kept_reversed.append(message)
+            remaining_budget -= message_size
+            continue
+        if remaining_budget > 300:
+            kept_reversed.append(_trim_serialized_message_text(message, remaining_budget - 100))
+        break
+
+    result = [*system_messages, *reversed(kept_reversed)]
+    while _json_size(result) > max_chars and len(result) > len(system_messages) + 1:
+        result.pop(len(system_messages))
+    if _json_size(result) > max_chars:
+        per_message = max(200, (max_chars // max(1, len(result))) - 200)
+        result = [_trim_serialized_message_text(message, per_message) for message in result]
+    return result
 
 
 def _coerce_tool_input(value: Any) -> dict[str, Any]:
@@ -365,7 +456,8 @@ class OpenAIChatCompletionsModelClient:
         text_blocks = [{"type": "text", "text": text_value}] if text_value else []
         return "end_turn", [*thinking_blocks, *text_blocks]
 
-    def create(self, *, messages, tools):
+    def create(self, *, messages, tools, max_tokens: int | None = None, system: str | None = None):
+        del max_tokens
         # Only attach `tools` / `tool_choice` when we actually have tools.
         # OpenRouter's provider routing treats `tool_choice="auto"` as a
         # required-feature signal — sending it with an empty tool list makes
@@ -373,9 +465,17 @@ class OpenAIChatCompletionsModelClient:
         # surfaces as a confusing 404 "No allowed providers are available
         # for the selected model" for any model whose only providers happen
         # to lack tool support (e.g. mistralai/mistral-nemo on free tiers).
+        messages_list = list(messages)
+        if system:
+            messages_list.insert(0, {"role": "system", "content": system})
+        serialized_messages = self._serialize_messages(messages_list)
+        serialized_messages = _trim_serialized_messages_for_budget(
+            serialized_messages,
+            _chat_completions_input_budget_chars(),
+        )
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": self._serialize_messages(list(messages)),
+            "messages": serialized_messages,
         }
         kwargs.update(_chat_reasoning_kwargs(self.provider, self.model, self.reasoning_effort))
         serialized_tools = self._serialize_tool_definitions(list(tools))

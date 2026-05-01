@@ -116,6 +116,7 @@ def test_chat_operator_text_and_session_helpers(monkeypatch) -> None:
     assert chat_operator._word_tokens("File: report-v2.xlsx!") == ("file", "report", "v2", "xlsx")
     assert chat_operator._is_explicit_approval_reply("please approve") is True
     assert chat_operator._contains_file_reference("Saved to /tmp/report.pdf") is True
+    assert chat_operator._contains_file_reference("Look in /tmp/artifacts") is False
     assert chat_operator._contains_file_reference("Version 1.2 is not a file") is False
     assert chat_operator._requested_attachment_extension("make a word document") == ".docx"
     assert chat_operator._requested_attachment_extension("send as text file") == ".txt"
@@ -185,6 +186,12 @@ def test_chat_operator_conversation_memory_approval_and_artifact_helpers(tmp_pat
     assert chat_operator._is_approval_pending_message({"role": "assistant", "content": "Tool approval requested: ap-chat"}) is True
     assert chat_operator._is_telegram_resume_principal("telegram:123") is True
 
+    media_context = chat_operator._build_conversation_context(
+        [{"user": "why so many files?", "assistant": f"Done.\nMEDIA:{tmp_path / 'old.pdf'}"}]
+    )
+    assert media_context is not None
+    assert "MEDIA:" not in media_context
+
     monkeypatch.setenv("NULLION_MEMORY_ENABLED", "1")
     chat_operator._remember_explicit_memory(runtime, chat_id="123", settings=settings, prompt="Remember I like vim")
     assert "vim" in (chat_operator._memory_context_for_chat(runtime, chat_id="123", settings=settings) or "").lower()
@@ -217,8 +224,8 @@ def test_chat_operator_conversation_memory_approval_and_artifact_helpers(tmp_pat
         prompt="frobnicate however tomorrow says it",
         tool_results=[],
     )
-    assert "MEDIA:" in reply
-    assert chat_operator._reply_has_deliverable_media(runtime, reply) is True
+    assert "MEDIA:" not in reply
+    assert chat_operator._reply_has_deliverable_media(runtime, reply) is False
     assert chat_operator._clean_undeliverable_media_reply(runtime, "hello\nMEDIA:/outside/missing.txt") == "hello"
 
     pdf_artifact = artifact_root / "report.pdf"

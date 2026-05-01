@@ -187,6 +187,53 @@ def _principal_workspace_file_roots(principal_id: str | None) -> tuple[Path, ...
         return ()
 
 
+_FILESYSTEM_PATH_ARGUMENTS_BY_TOOL = {
+    "audio_transcribe": ("path",),
+    "file_read": ("path",),
+    "file_write": ("path",),
+    "file_patch": ("path",),
+    "image_extract_text": ("path",),
+    "image_generate": ("source_path", "output_path"),
+}
+
+
+def _resolve_virtual_workspace_path(raw_path: str, *, principal_id: str | None) -> str:
+    try:
+        from nullion.workspace_storage import resolve_virtual_workspace_path_for_principal
+
+        return str(resolve_virtual_workspace_path_for_principal(raw_path, principal_id))
+    except Exception:
+        return raw_path
+
+
+def _with_resolved_virtual_workspace_paths(invocation: ToolInvocation) -> ToolInvocation:
+    path_keys = _FILESYSTEM_PATH_ARGUMENTS_BY_TOOL.get(invocation.tool_name)
+    if not path_keys:
+        return invocation
+    arguments = dict(invocation.arguments)
+    changed = False
+    for key in path_keys:
+        value = arguments.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        resolved_value = _resolve_virtual_workspace_path(value, principal_id=invocation.principal_id)
+        if resolved_value == value:
+            continue
+        arguments[key] = resolved_value
+        changed = True
+    if not changed:
+        return invocation
+    return ToolInvocation(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        principal_id=invocation.principal_id,
+        arguments=arguments,
+        capsule_id=invocation.capsule_id,
+        trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
+        flow_context=invocation.flow_context,
+    )
+
+
 def _effective_filesystem_roots(
     *,
     invocation: ToolInvocation,
@@ -2012,6 +2059,7 @@ class ToolExecutor:
         )
 
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
+        invocation = _with_resolved_virtual_workspace_paths(invocation)
         if invocation.tool_name in self._denied_tool_names:
             return self._deny_invocation(
                 invocation,

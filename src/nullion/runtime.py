@@ -4328,11 +4328,21 @@ def transition_mission_status(
         normalized_waiting_on = None
         normalized_blocked_reason = None
 
+    updated_steps = existing.steps
+    if new_status is MissionStatus.COMPLETED:
+        updated_steps = tuple(
+            replace(step, status="completed")
+            if step.status in {"pending", "running"}
+            else step
+            for step in existing.steps
+        )
+
     updated = replace(
         existing,
         status=new_status,
         active_capsule_id=existing.active_capsule_id if active_capsule_id is None else active_capsule_id,
         active_step_id=existing.active_step_id if not active_step_id_is_set else active_step_id,
+        steps=updated_steps,
         waiting_on=normalized_waiting_on,
         blocked_reason=normalized_blocked_reason,
         result_summary=normalized_result_summary,

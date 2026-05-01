@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from nullion.connections import workspace_id_for_principal
+
+_VIRTUAL_WORKSPACE_ROOT = PurePosixPath("/workspace")
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +66,32 @@ def workspace_file_roots_for_principal(principal_id: str | None, *, create: bool
     return (roots.root,)
 
 
+def resolve_virtual_workspace_path_for_principal(
+    path: str | Path,
+    principal_id: str | None,
+    *,
+    create: bool = True,
+) -> Path:
+    raw_path = str(path)
+    if raw_path != "/workspace" and not raw_path.startswith("/workspace/"):
+        return Path(raw_path).expanduser()
+    virtual_path = PurePosixPath(raw_path)
+    try:
+        relative_path = virtual_path.relative_to(_VIRTUAL_WORKSPACE_ROOT)
+    except ValueError:
+        return Path(raw_path).expanduser()
+    if any(part == ".." for part in relative_path.parts):
+        return Path(raw_path).expanduser()
+    roots = workspace_storage_roots_for_principal(principal_id, create=create)
+    workspace_root = roots.root.resolve()
+    resolved = (workspace_root / Path(*relative_path.parts)).resolve() if relative_path.parts else workspace_root
+    try:
+        resolved.relative_to(workspace_root)
+    except ValueError:
+        return Path(raw_path).expanduser()
+    return resolved
+
+
 def format_workspace_storage_for_prompt(*, principal_id: str | None = None) -> str:
     roots = workspace_storage_roots_for_principal(principal_id)
     return (
@@ -78,6 +106,7 @@ def format_workspace_storage_for_prompt(*, principal_id: str | None = None) -> s
 __all__ = [
     "WorkspaceStorageRoots",
     "format_workspace_storage_for_prompt",
+    "resolve_virtual_workspace_path_for_principal",
     "sanitize_workspace_id",
     "workspace_file_roots_for_principal",
     "workspace_storage_base",

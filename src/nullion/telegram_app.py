@@ -2867,7 +2867,7 @@ class ChatOperatorService:
             _status_texts: dict[tuple[str, str], str] = {}
             _status_locks: dict[tuple[str, str], _asyncio.Lock] = {}
 
-            def _telegram_deliver_fn(conversation_id: str, text: str, **kwargs) -> None:
+            def _telegram_deliver_fn(conversation_id: str, text: str, **kwargs) -> bool:
                 """Route aggregator output back to the originating Telegram chat."""
                 import asyncio as _asyncio
                 # conversation_id is "telegram:<chat_id>"
@@ -2876,7 +2876,7 @@ class ChatOperatorService:
                     # Fallback: deliver to operator chat
                     chat_id = _service_ref.operator_chat_id or ""
                 if not chat_id:
-                    return
+                    return False
                 if kwargs.get("is_status"):
                     group_id = str(kwargs.get("group_id") or "")
                     status_kind = str(kwargs.get("status_kind") or "task_summary")
@@ -2885,7 +2885,7 @@ class ChatOperatorService:
                         or not group_id
                         or not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id)
                     ):
-                        return
+                        return False
                     try:
                         loop = _asyncio.get_running_loop()
                         loop.create_task(
@@ -2899,18 +2899,22 @@ class ChatOperatorService:
                                 status_locks=_status_locks,
                             )
                         )
+                        return True
                     except RuntimeError:
                         logger.debug("Telegram planner status skipped because no event loop is running")
-                    return
+                        return False
                 # Fire-and-forget via a fresh task if a loop is running, else asyncio.run
                 try:
                     loop = _asyncio.get_running_loop()
                     loop.create_task(_send_operator_telegram_message(_bot_token, chat_id, text))
+                    return True
                 except RuntimeError:
                     try:
                         _asyncio.run(_send_operator_telegram_message(_bot_token, chat_id, text))
+                        return True
                     except Exception:
                         logger.debug("Phase 5 deliver_fn: failed to send message", exc_info=True)
+                        return False
 
             self.agent_orchestrator.set_deliver_fn(_telegram_deliver_fn)
             logger.debug("Phase 5: deliver_fn wired to orchestrator")

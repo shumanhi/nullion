@@ -108,9 +108,37 @@ def test_openai_chat_create_only_attaches_tools_when_present() -> None:
 
     assert adapter.create(messages=[{"role": "user", "content": "hi"}], tools=[]) == {"stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}]}
     assert "tools" not in calls[-1]
+    adapter.create(messages=[{"role": "user", "content": "hi"}], tools=[], max_tokens=123, system="sys2")
+    assert calls[-1]["messages"][0] == {"role": "system", "content": "sys2"}
     adapter.create(messages=[{"role": "user", "content": "hi"}], tools=[{"name": "t"}])
     assert calls[-1]["tool_choice"] == "auto"
     assert calls[-1]["reasoning_effort"] == "low"
+
+
+def test_openai_chat_adapter_trims_oversized_serialized_messages(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]), finish_reason="stop")])
+
+    monkeypatch.setenv("NULLION_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS", "1200")
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    adapter = model_clients.OpenAIChatCompletionsModelClient(client=client, model="m")
+    adapter.create(
+        messages=[
+            {"role": "system", "content": "sys" * 1000},
+            {"role": "user", "content": "old" * 1000},
+            {"role": "assistant", "content": "older" * 1000},
+            {"role": "user", "content": "new" * 1000},
+        ],
+        tools=[],
+    )
+
+    assert len(json.dumps(calls[-1]["messages"], ensure_ascii=False)) <= 1200
+    assert calls[-1]["messages"][0]["role"] == "system"
+    assert calls[-1]["messages"][-1]["role"] == "user"
 
 
 def test_anthropic_adapter_serializes_parses_and_creates() -> None:

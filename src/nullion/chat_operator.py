@@ -127,6 +127,24 @@ _MORNING_PATTERN = re.compile(r"^(gm|good morning)[!?. ]*$", re.IGNORECASE)
 _FAREWELL_PATTERN = re.compile(r"^(bye|goodbye|good night|goodnight|gn|night|cya|see ya|ttyl)[!?. ]*$", re.IGNORECASE)
 
 
+def _trim_context_text(text: str, max_chars: int) -> str:
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value
+    head = max(0, max_chars // 2)
+    tail = max(0, max_chars - head - 40)
+    return f"{value[:head].rstrip()}\n...[context trimmed]...\n{value[-tail:].lstrip()}"
+
+
+def _strip_media_directives_from_context(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        if raw_line.strip().startswith("MEDIA:"):
+            continue
+        lines.append(raw_line)
+    return "\n".join(lines)
+
+
 def _feature_enabled(name: str, *, default: bool = True) -> bool:
     import os
 
@@ -248,7 +266,10 @@ def _contains_file_reference(reply: str) -> bool:
         path_start = candidate.find("/")
         if path_start >= 0:
             path_candidate = candidate[path_start:]
-            _, extension = path_candidate.rsplit(".", maxsplit=1)
+            path_parts = path_candidate.rsplit(".", maxsplit=1)
+            if len(path_parts) != 2:
+                continue
+            _, extension = path_parts
             if extension.isalnum():
                 return True
         filename = candidate.rsplit("/", maxsplit=1)[-1]
@@ -987,7 +1008,11 @@ def _get_chat_thread(runtime: PersistentRuntime, chat_id: str | None) -> list[di
 def _build_conversation_context(thread: list[dict[str, str]]) -> str | None:
     if not thread:
         return None
-    parts = [f"User: {turn['user']}\nAssistant: {turn['assistant']}" for turn in thread]
+    parts = [
+        f"User: {_trim_context_text(turn['user'], 2000)}\n"
+        f"Assistant: {_trim_context_text(_strip_media_directives_from_context(turn['assistant']), 3000)}"
+        for turn in thread
+    ]
     return "\n\n".join(parts)
 
 
@@ -1574,11 +1599,6 @@ def _append_chat_artifacts_to_reply(
     candidate_paths = [
         *(artifact_paths or ()),
         *_artifact_paths_from_tool_results(tool_results),
-        *_artifact_paths_mentioned_in_reply(
-            runtime,
-            reply=reply,
-            principal_id=principal_id,
-        ),
     ]
     descriptors = []
     seen_ids: set[str] = set()

@@ -48,6 +48,7 @@ class GroupState:
     original_message: str
     last_progress_time: float = field(default_factory=time.monotonic)
     status_lines: dict[str, str] = field(default_factory=dict)  # task_id → one-line status
+    task_summary_visible: bool = False
 
 
 # Delivery callback type: (conversation_id, text, *, is_status) -> Awaitable[None] | None
@@ -113,7 +114,7 @@ class ResultAggregator:
                 next_line = format_task_status_line(task)
                 if current is None or _task_status_rank(next_line) >= _task_status_rank(current):
                     gs.status_lines[task.task_id] = next_line
-        await self._deliver(
+        delivered = await self._deliver(
             gs.conversation_id,
             format_task_status_summary(
                 group.tasks,
@@ -125,6 +126,8 @@ class ResultAggregator:
             group_id=group.group_id,
             status_kind="task_summary",
         )
+        if delivered:
+            gs.task_summary_visible = True
 
     async def _on_group_complete(self, gs: GroupState, group: TaskGroup) -> None:
         """All tasks terminal — generate and deliver the final summary."""
@@ -132,7 +135,13 @@ class ResultAggregator:
             return
         self._completed_groups.add(group.group_id)
         summary = await self._generate_summary(group)
-        await self._deliver(gs.conversation_id, summary)
+        fallback = self._fallback_summary(group)
+        if not (
+            gs.task_summary_visible
+            and summary == fallback
+            and self._fallback_summary_is_bare_failure_notice(group)
+        ):
+            await self._deliver(gs.conversation_id, summary)
 
         # Deliver any artifacts.
         for task in group.tasks:
@@ -189,13 +198,25 @@ class ResultAggregator:
                 parts.append(f"• {task.title}: {task.result.output[:120]}")
         return " ".join(parts)
 
-    async def _deliver(self, conversation_id: str, text: str, **kwargs) -> None:
+    @staticmethod
+    def _fallback_summary_is_bare_failure_notice(group: TaskGroup) -> bool:
+        failed = sum(1 for task in group.tasks if task.status == TaskStatus.FAILED)
+        if failed <= 0:
+            return False
+        return not any(
+            task.result and (task.result.output or task.result.artifacts)
+            for task in group.tasks
+        )
+
+    async def _deliver(self, conversation_id: str, text: str, **kwargs) -> bool:
         try:
             result = self._deliver_fn(conversation_id, text, **kwargs)
             if asyncio.iscoroutine(result):
-                await result
+                result = await result
+            return result is not False
         except Exception as exc:
             logger.debug("ResultAggregator: deliver_fn failed: %s", exc)
+            return False
 
 
 def _task_status_rank(line: str | None) -> int:
