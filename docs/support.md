@@ -107,6 +107,26 @@ boundary grant, or a health action.
 If the delegated plan itself is unclear, set Verbose to Planner or Full in
 Settings, then repeat the request.
 
+### A file or PDF was promised but not delivered
+
+Nullion should not mark an attachment task complete until the requested
+artifact is attached or exposed as a web download. Check:
+
+- The request explicitly asked for a file, PDF, image, document, spreadsheet,
+  or attachment.
+- The final artifact extension matches the request. A `.txt` or `.html` file
+  is not a valid PDF deliverable.
+- In the web UI, the answer shows a download button for the artifact, not only
+  a local filesystem path.
+- In Telegram, Slack, or Discord, the platform sends a document/image
+  attachment when one is expected.
+- Verbose Full shows `Preparing artifacts` and `Writing response` after the
+  file tool or artifact generation tool completes.
+
+If the file exists locally but no download button appears, restart the web app
+and retry once. If it still happens, include the requested format and the
+visible artifact path in the bug report.
+
 ### File tools cannot see a project
 
 Set one of:

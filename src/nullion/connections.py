@@ -280,6 +280,11 @@ def format_workspace_connections_for_prompt(*, principal_id: str | None = None) 
             if connection.workspace_id in {workspace_id, _ADMIN_WORKSPACE_ID}
         ]
     if not active:
+        if principal_id is not None and multi_user_connections_active():
+            return (
+                f"No workspace provider connections configured for workspace {workspace_id}. "
+                "Provider-backed account actions require a workspace connection or shared admin connection."
+            )
         return ""
     lines = [
         "Configured workspace connections are references only; they do not reveal raw secrets.",

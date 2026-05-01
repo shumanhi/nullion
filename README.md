@@ -5,8 +5,9 @@
 A local-first AI operator console with parallel mini-agents, Sentinel approvals,
 Doctor health checks, Builder skill learning, plugin integrations, and
 Telegram/Slack/Discord operator control. Recent builds add workspace-scoped
-approvals and schedules, platform-aware delivery routing, validated task
-planning, cleaner activity traces, and model fallback configuration.
+approvals and schedules, LangGraph-backed turn routing, platform-aware file and
+PDF delivery contracts, validated task planning, cleaner activity traces, and
+model fallback configuration.
 
 Online docs: https://www.nullion.ai/docs/
 
@@ -73,6 +74,8 @@ bash install.sh
 - Pluggable chat adapters — Telegram, Slack, Discord, and Web UI
 - Clear everyday wording
 - Parallel mini-agent execution through a warm pool
+- LangGraph-backed routing for parallel turns and dependent follow-ups
+- Contract-based file, PDF, image, and document delivery across web and messaging
 - Global Doctor for health checks and safe recovery
 - Global Sentinel for approval, boundary policy, and grant management
 - Workspace-scoped approvals, crons, grants, and member connections
@@ -93,6 +96,9 @@ bash install.sh
   planner task cards, compact tool outcomes, Builder/Doctor checkpoints, and
   generated image/file artifacts without
   dumping raw tracebacks into user-facing channels.
+- **Delivery as a contract** — message-only tasks finish when the reply is
+  delivered; attachment tasks finish only when the requested file exists and is
+  surfaced as a web download or messaging attachment.
 - **Self-healing runtime** — Doctor probes adapters, plugins, scheduler,
   database, browser backend, model client, and warm-pool capacity, then retries
   safe recovery before escalating.

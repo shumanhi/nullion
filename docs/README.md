@@ -5,7 +5,8 @@ to the model provider you choose, and can use approved tools for web research,
 local files, browser automation, media processing, scheduled work, and preview
 account connectors. Current builds include workspace-scoped approvals and
 scheduled jobs, platform-aware delivery routing, validated planner task cards,
-thinking-summary controls, model fallback settings, and cleaner activity traces.
+thinking-summary controls, LangGraph turn routing, model fallback settings,
+default PDF/document skill packs, and cleaner activity traces.
 
 This docs folder is written for a mixed audience:
 
@@ -40,6 +41,8 @@ Core systems:
   and Telegram takeover when the normal adapter is down
 - Builder skill proposals, learned skills, and memory compaction
 - Warm mini-agents for bounded parallel work
+- LangGraph-backed turn routing for independent parallel work versus dependent follow-ups
+- File/PDF delivery contracts across web, Telegram, Slack, and Discord
 - Validated DAG planning with optional planner task cards in chat surfaces
 - User-facing observability controls for Verbose modes, compact tool outcomes,
   planner task cards, generated artifacts, and reasoning summaries
@@ -104,6 +107,8 @@ runtime.
   grant real account access.
 - `support.md` gives first-response troubleshooting steps.
 - `runtime-persistence.md` covers local runtime checkpoint behavior.
+- The online docs at `website/docs/index.html` include the v0.2 delivery,
+  routing, and fresh-install notes shown on https://nullion.ai/docs/.
 - `operations/recovery-control-plane.md` covers break-glass recovery,
   config snapshots, service restarts, and Telegram takeover mode.
 - `operations/telegram-operator-runbook.md` covers Telegram operations.
@@ -126,3 +131,18 @@ all enabled workspaces, while packs that require API keys, OAuth, tokens, or
 account credentials must be connected under Settings -> Users -> Connections.
 Admins can keep credentials per workspace or deliberately share a supported
 admin credential across workspaces.
+
+## Delivery contract
+
+Nullion treats message delivery and file delivery as different completion
+contracts. A normal question is complete when the reply is sent. A file request
+is complete only when the requested artifact exists and is attached or exposed
+as a download. If the user asks for a PDF, a `.txt` or `.html` staging file does
+not satisfy the task even if the assistant text says it did.
+
+The same idea is used across web, Telegram, Slack, and Discord:
+
+- deliver files only when a file is requested or produced as a required artifact
+- prefer requested formats such as `.pdf`, `.docx`, `.xlsx`, `.csv`, or images
+- strip raw local paths from messaging captions when the platform attaches the file
+- leave the task active or report failure when a required attachment is missing

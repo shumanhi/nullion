@@ -26,6 +26,7 @@
       </a>
       <nav class="top-nav" aria-label="Primary">
         <a href="#features">Features</a>
+        <a href="#updates">v0.2</a>
         <a href="#internals">Internals</a>
         <a href="#showcase">Screenshots</a>
         <a href="#security">Security</a>
@@ -45,7 +46,7 @@
       <div class="hero-copy">
         <p class="eyebrow">Local-first AI operator</p>
         <h1>Nulli<span>ø</span>n.ai</h1>
-        <p class="hero-lede">A self-hosted AI operator that runs multiple tasks in parallel, keeps approvals and schedules scoped to the right workspace, fixes itself when something breaks, gives you an out-of-band recovery path when the main app is down, builds its own skills from your conversations, and asks before it acts on anything sensitive.</p>
+        <p class="hero-lede">A self-hosted AI operator that runs multiple tasks in parallel, delivers the right file when a task asks for an attachment, keeps approvals and schedules scoped to the right workspace, fixes itself when something breaks, builds its own skills from your conversations, and asks before it acts on anything sensitive.</p>
         <div class="hero-actions">
           <a class="primary-action" href="docs/">Read the docs</a>
           <a class="secondary-action" href="#showcase">See it in action</a>
@@ -53,9 +54,10 @@
         </div>
         <div class="trust-row" aria-label="Core promises">
           <span>Validated planner · warm pool</span>
+          <span>LangGraph turn routing</span>
+          <span>PDF/file delivery contracts</span>
           <span>Self-healing · Recovery</span>
           <span>Workspace-scoped grants</span>
-          <span>Telegram · Slack · Discord</span>
         </div>
       </div>
 
@@ -75,6 +77,35 @@
         <div><strong>Self-update</strong><span>Pip snapshot + rollback if health fails</span></div>
       </div>
     </div>
+
+    <!-- ── v0.2 update strip ───────────────────────────────────── -->
+    <section id="updates" class="section release-section">
+      <div class="wrap">
+        <div class="section-heading">
+          <p class="eyebrow">v0.2-ready update</p>
+          <h2>Delivery is now a contract, not a vibe.</h2>
+          <p>Recent work focused on the rough edges that matter in daily use: file delivery, follow-up routing, default setup, and connector permissions. A task is not complete until the promised message or attachment is actually deliverable.</p>
+        </div>
+        <div class="release-grid">
+          <article>
+            <strong>Correct attachment delivery</strong>
+            <span>PDF requests now prefer real PDF artifacts over staging text or HTML files. Web, Telegram, Slack, and Discord share platform-aware delivery checks.</span>
+          </article>
+          <article>
+            <strong>LangGraph routing</strong>
+            <span>Independent turns can run in parallel while true follow-ups wait for the result they reference. The same graph-backed decision model is used across chat surfaces.</span>
+          </article>
+          <article>
+            <strong>Fresh installs are ready</strong>
+            <span>Built-in skill packs, PDF/document workflows, media tools, and required packages install by default; users enable or disable capabilities without missing dependencies later.</span>
+          </article>
+          <article>
+            <strong>Own permission controls</strong>
+            <span>Connector write access and user/workspace permissions are managed inside Nulliøn's settings flow instead of relying on system dialogs.</span>
+          </article>
+        </div>
+      </div>
+    </section>
 
     <!-- ── Internal systems visual ──────────────────────────────── -->
     <section id="internals" class="section internals-section">

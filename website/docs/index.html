@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nulliøn Docs — Tools, Plugins & Reference</title>
-<meta name="description" content="Complete documentation for Nulliøn: tools, plugins, slash commands, Sentinel, Builder, workspace-scoped schedules, planner feeds, chat history, and API reference.">
+<title>Nulliøn Docs — v0.2, Tools, Plugins & Reference</title>
+<meta name="description" content="Complete documentation for Nulliøn: v0.2 updates, LangGraph routing, file and PDF delivery contracts, tools, plugins, slash commands, Sentinel, Builder, workspace-scoped schedules, chat history, and API reference.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -475,6 +475,7 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:28px 0}
     <div class="sidebar-section">
       <div class="sidebar-label">Overview</div>
       <a href="#getting-started" class="active">Getting Started</a>
+      <a href="#whats-new">What's New</a>
       <a href="#interface-tour">Interface Tour</a>
       <a href="#install">Installation</a>
       <a href="#first-run">First Run</a>
@@ -483,6 +484,7 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:28px 0}
     <div class="sidebar-section">
       <div class="sidebar-label">Core</div>
       <a href="#tools">Tools</a>
+      <a href="#delivery-routing">Delivery & Routing</a>
       <a href="#plugins">Plugins</a>
       <a href="#commands">Slash Commands</a>
     </div>
@@ -532,7 +534,8 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:28px 0}
         and can take real actions through tools: browse public pages, work with allowed local files,
         run approved terminal commands, transcribe media, and use preview email/calendar connectors.
         Sentinel approval policies decide what is allowed, what asks first, and what stays blocked,
-        while workspace ownership keeps member schedules, approvals, grants, and provider connections separated.
+        while workspace ownership keeps member schedules, approvals, grants, provider connections,
+        and generated artifacts separated.
       </p>
 
       <div class="card-grid">
@@ -564,12 +567,56 @@ hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:28px 0}
         <div class="card">
           <div class="card-icon">⚡</div>
           <h3>Warm Mini-Agents</h3>
-          <p>Multi-step requests can split into bounded subtasks that run in parallel, then merge through the result aggregator.</p>
+          <p>Multi-step requests can split into bounded subtasks that run in parallel, while follow-up turns are routed through LangGraph so dependent work waits only when it should.</p>
         </div>
         <div class="card">
           <div class="card-icon">🩺</div>
           <h3>Doctor</h3>
           <p>Background probes watch the model client, adapters, plugins, scheduler, database, browser backend, and warm pool.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── What's New ─────────────────────────────────────────────── -->
+    <section class="doc-section" id="whats-new">
+      <span class="section-eyebrow">v0.2-ready</span>
+      <h2>What's New</h2>
+      <p>
+        The latest Nulliøn work tightens the production contract around delivery, routing, setup, and permissions.
+        A task is not complete until its promised deliverable is actually delivered, whether that deliverable is
+        a message reply, a PDF, an image, an edited file, or an attachment.
+      </p>
+
+      <div class="card-grid">
+        <div class="card">
+          <div class="card-icon">📎</div>
+          <h3>File and PDF delivery contracts</h3>
+          <p>Web and messaging adapters inspect the final answer, completed tool outputs, and artifact records before declaring success. If the user asked for a PDF, staging text or HTML cannot satisfy the task.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">🧭</div>
+          <h3>LangGraph turn routing</h3>
+          <p>Independent tasks can run in parallel, while referential follow-ups wait for the active result they depend on. This prevents both fake serialization and accidental race conditions.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">📚</div>
+          <h3>Default skills and packages</h3>
+          <p>Fresh installs include built-in skill packs, PDF/document workflows, media tooling, and required runtime packages up front. Users can disable capabilities without discovering missing packages later.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">🔐</div>
+          <h3>Permission controls in Nulliøn</h3>
+          <p>Connector read/write capability and workspace permissions are controlled through Nulliøn settings instead of platform system dialogs.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">🔍</div>
+          <h3>Verbose defaults</h3>
+          <p>First-time installs default to Full visibility so early tests show activity, planner cards, tool outcomes, artifact preparation, and delivery state.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">🧪</div>
+          <h3>Release verification</h3>
+          <p>The release path is covered by the full test suite, artifact selector tests, turn-routing tests, and installed-service restart checks before publishing tags.</p>
         </div>
       </div>
     </section>
@@ -848,6 +895,53 @@ nullion update
         <li><strong>MEDIUM</strong> — write operations, external side effects, or account access. Ask-on-first-use by default.</li>
         <li><strong>HIGH</strong> — irreversible or broad-scope actions (shell exec, account mutations). Always ask unless explicitly granted.</li>
       </ul>
+    </section>
+
+    <!-- ── Delivery & Routing ─────────────────────────────────────── -->
+    <section class="doc-section" id="delivery-routing">
+      <span class="section-eyebrow">Core</span>
+      <h2>Delivery & Routing</h2>
+      <p>
+        Nulliøn treats delivery as a runtime contract. The model may write text, call tools, and mention paths,
+        but the platform adapter decides what is actually deliverable and blocks completion when the requested
+        artifact is missing or has the wrong format.
+      </p>
+
+      <h3>Message versus attachment</h3>
+      <p>Ordinary questions should return messages. File requests should return attachments. The adapter checks explicit artifact evidence instead of relying on loose verbs alone.</p>
+      <ul>
+        <li><strong>Message-only tasks</strong> finish when a clean answer is sent.</li>
+        <li><strong>Attachment tasks</strong> finish only when a safe file artifact exists and is attached or shown as a download.</li>
+        <li><strong>Format-specific tasks</strong> require the requested extension, such as <code>.pdf</code>, <code>.docx</code>, <code>.xlsx</code>, <code>.csv</code>, or image formats.</li>
+        <li><strong>Wrong-format artifacts</strong> are rejected even if the reply text claims they are correct.</li>
+      </ul>
+
+      <h3>How web downloads are selected</h3>
+      <p>The web UI builds the download list from completed tool outputs, explicit artifact metadata, and safe artifact paths mentioned in the final answer. It then filters by the requested format. If a run creates both <code>report.txt</code> and <code>report.pdf</code>, and the user asked for a PDF, only the PDF is surfaced as the download.</p>
+
+      <h3>How messaging attachments are selected</h3>
+      <p>Telegram, Slack, and Discord use the same platform delivery contract. They strip raw filesystem paths from captions when a file is attached, report unavailable artifacts clearly, and avoid sending files unless a file was requested or produced as a required deliverable.</p>
+
+      <h3>Parallel turns and follow-ups</h3>
+      <p>Incoming turns are routed through a LangGraph dispatch graph:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>User message</th><th>Routing decision</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td><code>Can you get today's news?</code></td><td>Parallel-capable</td><td>Independent information request</td></tr>
+            <tr><td><code>And weather for tomorrow</code></td><td>Parallel-capable</td><td>New standalone target, not a reference to the previous output</td></tr>
+            <tr><td><code>Add images too</code></td><td>Waits for active task</td><td>Modifies the active deliverable</td></tr>
+            <tr><td><code>Send that as a PDF</code></td><td>Waits for active task</td><td>References the prior result and changes its output contract</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout tip">
+        <span class="callout-icon">✅</span>
+        <div class="callout-body">
+          <strong>Testing tip:</strong> To verify delivery, ask for a specific format such as "send this in a PDF", then confirm the web UI shows a download button ending in <code>.pdf</code> and Telegram sends an actual document attachment.
+        </div>
+      </div>
     </section>
 
     <!-- ── Plugins ─────────────────────────────────────────────────── -->
