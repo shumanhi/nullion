@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Nullion — one-command installer for Windows
+    Nullion - one-command installer for Windows
 .DESCRIPTION
     Installs Nullion into %USERPROFILE%\.nullion, walks you through messaging
     apps and API key setup, and registers an auto-start task with Task Scheduler.
@@ -28,8 +28,9 @@ $DISCORD_TASK_NAME = "Nullion Discord"
 $NULLION_WEB_PORT  = 8742
 $WHISPER_CPP_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
 $WHISPER_CPP_MODEL = Join-Path $NULLION_DIR "models\ggml-base.en.bin"
+$PLAYWRIGHT_RUNTIME_READY = $false
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# helpers
 function Write-Header { param([string]$Text)
     Write-Host ""
     Write-Host "  +------------------------------------------------------------+" -ForegroundColor DarkGray
@@ -42,6 +43,72 @@ function Write-Ok     { param([string]$Text) Write-Host "  [OK]  $Text" -Foregro
 function Write-Info   { param([string]$Text) Write-Host "  [->]  $Text" -ForegroundColor Yellow }
 function Write-Err    { param([string]$Text) Write-Host "  [!!]  $Text" -ForegroundColor Red }
 function Write-Chip   { param([string]$Label, [string]$Text) Write-Host "  [$Label] $Text" -ForegroundColor DarkGray }
+
+function Get-InstallerScriptPath {
+    $pathValue = Get-Variable -Name PSCommandPath -ValueOnly -ErrorAction SilentlyContinue
+    if ((-not $pathValue) -and ($MyInvocation.MyCommand.PSObject.Properties.Name -contains "Path")) {
+        $pathValue = $MyInvocation.MyCommand.Path
+    }
+    if ($pathValue -and (Test-Path $pathValue)) { return $pathValue }
+    return $null
+}
+
+function Test-LocalInstallerSource {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $dir = Split-Path -Parent $Path
+    return ($dir -and (Test-Path (Join-Path $dir "pyproject.toml")))
+}
+
+function Invoke-InstallerSelfRefresh {
+    if ($env:NULLION_INSTALLER_SELF_REFRESHED -eq "true") { return }
+    if ($env:NULLION_INSTALLER_NO_SELF_REFRESH -eq "true") { return }
+
+    $currentPath = Get-InstallerScriptPath
+    if (Test-LocalInstallerSource $currentPath) { return }
+
+    $freshPath = Join-Path $env:TEMP ("nullion-install-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
+    $freshUrl = "https://raw.githubusercontent.com/shumanhi/nullion/main/install.ps1?cb=$([guid]::NewGuid().ToString("N"))"
+    try {
+        Write-Info "Refreshing installer from GitHub..."
+        Invoke-WebRequest -UseBasicParsing -Headers @{"Cache-Control"="no-cache"} -Uri $freshUrl -OutFile $freshPath
+        $env:NULLION_INSTALLER_SELF_REFRESHED = "true"
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $freshPath
+        $exitCode = $LASTEXITCODE
+        Remove-Item -Force $freshPath -ErrorAction SilentlyContinue
+        exit $exitCode
+    } catch {
+        Write-Info "Could not refresh installer automatically; continuing with the current copy."
+    }
+}
+
+Invoke-InstallerSelfRefresh
+
+function Refresh-ProcessPath {
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+}
+
+function Invoke-SchtasksCommand {
+    param([Parameter(Mandatory=$true)][string[]]$Arguments)
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = @(& schtasks @Arguments 2>&1 | ForEach-Object { [string]$_ })
+        return [pscustomobject]@{
+            ExitCode = $LASTEXITCODE
+            Output = ($output -join "`n")
+        }
+    } catch {
+        return [pscustomobject]@{
+            ExitCode = 1
+            Output = [string]$_.Exception.Message
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
 
 function Read-ModelName {
     param([Parameter(Mandatory=$true)][string]$Current)
@@ -113,7 +180,7 @@ function Write-SetupOverview {
     Write-Host "  +-- Setup Path ----------------------------------------------+" -ForegroundColor DarkGray
     Write-Host "  | " -ForegroundColor DarkGray -NoNewline
     Write-Host "1  Python runtime" -ForegroundColor White -NoNewline
-    Write-Host "        check or install Python 3.11+" -ForegroundColor DarkGray
+    Write-Host "        check or install Python 3.11-3.13" -ForegroundColor DarkGray
     Write-Host "  | " -ForegroundColor DarkGray -NoNewline
     Write-Host "2  Nullion app" -ForegroundColor White -NoNewline
     Write-Host "           install into $NULLION_DIR" -ForegroundColor DarkGray
@@ -151,14 +218,207 @@ function Get-EnvValue {
     return $value
 }
 
+function Set-EnvValue {
+    param(
+        [Parameter(Mandatory=$true)][string]$Key,
+        [AllowNull()][string]$Value = "",
+        [switch]$Raw
+    )
+    if (-not (Test-Path $NULLION_DIR)) {
+        [void](New-Item -ItemType Directory -Force -Path $NULLION_DIR)
+    }
+    $safeValue = ([string]$Value) -replace '[\r\n]', ''
+    $line = if ($Raw) { "$Key=$safeValue" } else { "$Key=`"$safeValue`"" }
+    $lines = @()
+    if (Test-Path $NULLION_ENV_FILE) {
+        $lines = @(Get-Content $NULLION_ENV_FILE)
+    }
+    $escaped = [regex]::Escape($Key)
+    $updated = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match "^$escaped=") {
+            $lines[$i] = $line
+            $updated = $true
+        }
+    }
+    if (-not $updated) {
+        $lines += $line
+    }
+    $lines | Set-Content -Path $NULLION_ENV_FILE -Encoding UTF8
+}
+
+function Protect-EnvFile {
+    if (-not (Test-Path $NULLION_ENV_FILE)) { return }
+    try {
+        $acl = Get-Acl $NULLION_ENV_FILE
+        $acl.SetAccessRuleProtection($true, $false)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $env:USERNAME, "FullControl", "Allow")
+        $acl.SetAccessRule($rule)
+        Set-Acl -Path $NULLION_ENV_FILE -AclObject $acl
+        Write-Ok "Restricted configuration file access to the current user."
+    } catch {
+        Write-Info "Could not restrict .env permissions automatically. Setup can continue; keep $NULLION_ENV_FILE private."
+    }
+}
+
+function Format-BoolText {
+    param([bool]$Value)
+    if ($Value) { return "true" }
+    return "false"
+}
+
+function Get-SetupValue {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [object]$Default = ""
+    )
+    $var = Get-Variable -Name $Name -ErrorAction SilentlyContinue
+    if ($var) { return $var.Value }
+    return $Default
+}
+
+function Get-SetupBool {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    return [bool](Get-SetupValue $Name $false)
+}
+
+function Save-PluginCheckpoint {
+    $searchProvider = [string](Get-SetupValue "SEARCH_PROVIDER" "builtin_search_provider")
+    $enabledPlugins = "search_plugin,browser_plugin,workspace_plugin,media_plugin"
+    $providerBindings = "search_plugin=$searchProvider,media_plugin=local_media_provider"
+
+    if (Get-SetupBool "EMAIL_CALENDAR_ENABLED") {
+        $enabledPlugins += ",email_plugin,calendar_plugin"
+        $providerBindings += ",email_plugin=google_workspace_provider,calendar_plugin=google_workspace_provider"
+    } elseif (Get-SetupBool "CUSTOM_EMAIL_API_ENABLED") {
+        $enabledPlugins += ",email_plugin"
+        $providerBindings += ",email_plugin=custom_api_provider"
+    }
+    Set-EnvValue "NULLION_ENABLED_PLUGINS" $enabledPlugins
+    Set-EnvValue "NULLION_PROVIDER_BINDINGS" $providerBindings
+}
+
+function Save-MessagingCheckpoint {
+    if (-not ($TELEGRAM_ENABLED -or $SLACK_ENABLED -or $DISCORD_ENABLED -or $SKIP_MESSAGING_SETUP)) {
+        return
+    }
+    Set-EnvValue "NULLION_SETUP_MESSAGING_DONE" "true" -Raw
+    Set-EnvValue "NULLION_WEB_PORT" "$NULLION_WEB_PORT" -Raw
+    Set-EnvValue "NULLION_TELEGRAM_CHAT_ENABLED" (Format-BoolText $TELEGRAM_ENABLED) -Raw
+    if ($TELEGRAM_ENABLED) {
+        Set-EnvValue "NULLION_TELEGRAM_BOT_TOKEN" $BOT_TOKEN
+        Set-EnvValue "NULLION_TELEGRAM_OPERATOR_CHAT_ID" $CHAT_ID
+    }
+    Set-EnvValue "NULLION_SLACK_ENABLED" (Format-BoolText $SLACK_ENABLED) -Raw
+    if ($SLACK_ENABLED) {
+        Set-EnvValue "NULLION_SLACK_BOT_TOKEN" $SLACK_BOT_TOKEN
+        Set-EnvValue "NULLION_SLACK_APP_TOKEN" $SLACK_APP_TOKEN
+        if ($SLACK_SIGNING_SECRET) { Set-EnvValue "NULLION_SLACK_SIGNING_SECRET" $SLACK_SIGNING_SECRET }
+        if ($SLACK_OPERATOR_USER_ID) { Set-EnvValue "NULLION_SLACK_OPERATOR_USER_ID" $SLACK_OPERATOR_USER_ID }
+    }
+    Set-EnvValue "NULLION_DISCORD_ENABLED" (Format-BoolText $DISCORD_ENABLED) -Raw
+    if ($DISCORD_ENABLED) {
+        Set-EnvValue "NULLION_DISCORD_BOT_TOKEN" $DISCORD_BOT_TOKEN
+    }
+    Write-Ok "Messaging setup checkpoint saved to $NULLION_ENV_FILE"
+}
+
+function Save-ProviderCheckpoint {
+    Set-EnvValue "NULLION_SETUP_PROVIDER_DONE" "true" -Raw
+    if ($ANTHROPIC_KEY) { Set-EnvValue "ANTHROPIC_API_KEY" $ANTHROPIC_KEY }
+    if ($OPENAI_KEY) { Set-EnvValue "OPENAI_API_KEY" $OPENAI_KEY }
+    if ($MODEL_PROVIDER) { Set-EnvValue "NULLION_MODEL_PROVIDER" $MODEL_PROVIDER }
+    if ($MODEL_BASE_URL) { Set-EnvValue "NULLION_OPENAI_BASE_URL" $MODEL_BASE_URL }
+    if ($MODEL_NAME) { Set-EnvValue "NULLION_MODEL" $MODEL_NAME }
+    Write-Ok "Provider setup checkpoint saved to $NULLION_ENV_FILE"
+}
+
+function Save-BrowserCheckpoint {
+    Set-EnvValue "NULLION_SETUP_BROWSER_DONE" "true" -Raw
+    if ($BROWSER_BACKEND) { Set-EnvValue "NULLION_BROWSER_BACKEND" $BROWSER_BACKEND }
+    if ($BROWSER_CDP_URL) { Set-EnvValue "NULLION_BROWSER_CDP_URL" $BROWSER_CDP_URL }
+    if ($BROWSER_PREFERRED) { Set-EnvValue "NULLION_BROWSER_PREFERRED" $BROWSER_PREFERRED }
+    Write-Ok "Browser setup checkpoint saved to $NULLION_ENV_FILE"
+}
+
+function Save-SearchCheckpoint {
+    Set-EnvValue "NULLION_SETUP_SEARCH_DONE" "true" -Raw
+    Save-PluginCheckpoint
+    if ($BRAVE_SEARCH_KEY) { Set-EnvValue "NULLION_BRAVE_SEARCH_API_KEY" $BRAVE_SEARCH_KEY }
+    if ($GOOGLE_SEARCH_KEY) { Set-EnvValue "NULLION_GOOGLE_SEARCH_API_KEY" $GOOGLE_SEARCH_KEY }
+    if ($GOOGLE_SEARCH_CX) { Set-EnvValue "NULLION_GOOGLE_SEARCH_CX" $GOOGLE_SEARCH_CX }
+    if ($PERPLEXITY_SEARCH_KEY) { Set-EnvValue "NULLION_PERPLEXITY_API_KEY" $PERPLEXITY_SEARCH_KEY }
+    Write-Ok "Search setup checkpoint saved to $NULLION_ENV_FILE"
+}
+
+function Save-AccountCheckpoint {
+    Set-EnvValue "NULLION_SETUP_ACCOUNT_DONE" "true" -Raw
+    Save-PluginCheckpoint
+    if ($MATON_API_KEY) { Set-EnvValue "MATON_API_KEY" $MATON_API_KEY }
+    if ($COMPOSIO_API_KEY) { Set-EnvValue "COMPOSIO_API_KEY" $COMPOSIO_API_KEY }
+    if ($NANGO_SECRET_KEY) { Set-EnvValue "NANGO_SECRET_KEY" $NANGO_SECRET_KEY }
+    if ($ACTIVEPIECES_API_KEY) { Set-EnvValue "ACTIVEPIECES_API_KEY" $ACTIVEPIECES_API_KEY }
+    if ($N8N_BASE_URL) { Set-EnvValue "N8N_BASE_URL" $N8N_BASE_URL }
+    if ($N8N_API_KEY) { Set-EnvValue "N8N_API_KEY" $N8N_API_KEY }
+    if ($MATON_CONNECTOR_ENABLED) { Set-EnvValue "NULLION_CONNECTOR_GATEWAY" "maton" }
+    if ($CUSTOM_API_BASE_URL) { Set-EnvValue "NULLION_CUSTOM_API_BASE_URL" $CUSTOM_API_BASE_URL }
+    if ($CUSTOM_API_TOKEN) { Set-EnvValue "NULLION_CUSTOM_API_TOKEN" $CUSTOM_API_TOKEN }
+    Write-Ok "Account/API setup checkpoint saved to $NULLION_ENV_FILE"
+}
+
+function Save-MediaCheckpoint {
+    Set-EnvValue "NULLION_SETUP_MEDIA_DONE" "true" -Raw
+    Save-PluginCheckpoint
+    if ($MEDIA_OPENAI_KEY) { Set-EnvValue "NULLION_MEDIA_OPENAI_API_KEY" $MEDIA_OPENAI_KEY }
+    if ($MEDIA_ANTHROPIC_KEY) { Set-EnvValue "NULLION_MEDIA_ANTHROPIC_API_KEY" $MEDIA_ANTHROPIC_KEY }
+    if ($MEDIA_OPENROUTER_KEY) { Set-EnvValue "NULLION_MEDIA_OPENROUTER_API_KEY" $MEDIA_OPENROUTER_KEY }
+    if ($MEDIA_GEMINI_KEY) { Set-EnvValue "NULLION_MEDIA_GEMINI_API_KEY" $MEDIA_GEMINI_KEY }
+    if ($MEDIA_GROQ_KEY) { Set-EnvValue "NULLION_MEDIA_GROQ_API_KEY" $MEDIA_GROQ_KEY }
+    if ($MEDIA_MISTRAL_KEY) { Set-EnvValue "NULLION_MEDIA_MISTRAL_API_KEY" $MEDIA_MISTRAL_KEY }
+    if ($MEDIA_DEEPSEEK_KEY) { Set-EnvValue "NULLION_MEDIA_DEEPSEEK_API_KEY" $MEDIA_DEEPSEEK_KEY }
+    if ($MEDIA_XAI_KEY) { Set-EnvValue "NULLION_MEDIA_XAI_API_KEY" $MEDIA_XAI_KEY }
+    if ($MEDIA_TOGETHER_KEY) { Set-EnvValue "NULLION_MEDIA_TOGETHER_API_KEY" $MEDIA_TOGETHER_KEY }
+    if ($MEDIA_CUSTOM_KEY) { Set-EnvValue "NULLION_MEDIA_CUSTOM_API_KEY" $MEDIA_CUSTOM_KEY }
+    if ($MEDIA_CUSTOM_BASE_URL) { Set-EnvValue "NULLION_MEDIA_CUSTOM_BASE_URL" $MEDIA_CUSTOM_BASE_URL }
+    if ($AUDIO_TRANSCRIBE_COMMAND) { Set-EnvValue "NULLION_AUDIO_TRANSCRIBE_COMMAND" $AUDIO_TRANSCRIBE_COMMAND }
+    if ($IMAGE_OCR_COMMAND) { Set-EnvValue "NULLION_IMAGE_OCR_COMMAND" $IMAGE_OCR_COMMAND }
+    if ($IMAGE_GENERATE_COMMAND) { Set-EnvValue "NULLION_IMAGE_GENERATE_COMMAND" $IMAGE_GENERATE_COMMAND }
+    if ($AUDIO_TRANSCRIBE_ENABLED) { Set-EnvValue "NULLION_AUDIO_TRANSCRIBE_ENABLED" "true" -Raw }
+    if ($AUDIO_TRANSCRIBE_PROVIDER) { Set-EnvValue "NULLION_AUDIO_TRANSCRIBE_PROVIDER" $AUDIO_TRANSCRIBE_PROVIDER }
+    if ($AUDIO_TRANSCRIBE_MODEL) { Set-EnvValue "NULLION_AUDIO_TRANSCRIBE_MODEL" $AUDIO_TRANSCRIBE_MODEL }
+    if ($IMAGE_OCR_ENABLED) { Set-EnvValue "NULLION_IMAGE_OCR_ENABLED" "true" -Raw }
+    if ($IMAGE_OCR_PROVIDER) { Set-EnvValue "NULLION_IMAGE_OCR_PROVIDER" $IMAGE_OCR_PROVIDER }
+    if ($IMAGE_OCR_MODEL) { Set-EnvValue "NULLION_IMAGE_OCR_MODEL" $IMAGE_OCR_MODEL }
+    if ($IMAGE_GENERATE_ENABLED) { Set-EnvValue "NULLION_IMAGE_GENERATE_ENABLED" "true" -Raw }
+    if ($IMAGE_GENERATE_PROVIDER) { Set-EnvValue "NULLION_IMAGE_GENERATE_PROVIDER" $IMAGE_GENERATE_PROVIDER }
+    if ($IMAGE_GENERATE_MODEL) { Set-EnvValue "NULLION_IMAGE_GENERATE_MODEL" $IMAGE_GENERATE_MODEL }
+    if ($VIDEO_INPUT_ENABLED) { Set-EnvValue "NULLION_VIDEO_INPUT_ENABLED" "true" -Raw }
+    if ($VIDEO_INPUT_PROVIDER) { Set-EnvValue "NULLION_VIDEO_INPUT_PROVIDER" $VIDEO_INPUT_PROVIDER }
+    if ($VIDEO_INPUT_MODEL) { Set-EnvValue "NULLION_VIDEO_INPUT_MODEL" $VIDEO_INPUT_MODEL }
+    Write-Ok "Media setup checkpoint saved to $NULLION_ENV_FILE"
+}
+
+function Save-SkillCheckpoint {
+    Set-EnvValue "NULLION_SETUP_SKILLS_DONE" "true" -Raw
+    if ($ENABLED_SKILL_PACKS) {
+        Set-EnvValue "NULLION_ENABLED_SKILL_PACKS" $ENABLED_SKILL_PACKS
+        Set-EnvValue "NULLION_SKILL_PACK_ACCESS_ENABLED" "true" -Raw
+        if (",$ENABLED_SKILL_PACKS," -like "*,nullion/connector-skills,*" -or $ENABLED_SKILL_PACKS -like "*api-gateway*") {
+            Set-EnvValue "NULLION_CONNECTOR_ACCESS_ENABLED" "true" -Raw
+        }
+    }
+    Write-Ok "Skill setup checkpoint saved to $NULLION_ENV_FILE"
+}
+
 function Format-MaskedSecret {
     param(
         [string]$Value,
         [int]$Visible = 8
     )
     if (-not $Value) { return "not set" }
-    if ($Value.Length -le 4) { return "••••" }
-    return "••••$($Value.Substring($Value.Length - 4))"
+    if ($Value.Length -le 4) { return "****" }
+    return "****$($Value.Substring($Value.Length - 4))"
 }
 
 function Join-SummaryParts {
@@ -316,8 +576,7 @@ function Install-DefaultLocalMediaRuntime {
             try {
                 Write-Info "Installing whisper.cpp with scoop..."
                 scoop install whisper.cpp
-                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                            [System.Environment]::GetEnvironmentVariable("Path","User")
+                Refresh-ProcessPath
             } catch {
                 Write-Err "scoop whisper.cpp install failed: $_"
             }
@@ -331,8 +590,7 @@ function Install-DefaultLocalMediaRuntime {
             try {
                 Write-Info "Installing ffmpeg with scoop..."
                 scoop install ffmpeg
-                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                            [System.Environment]::GetEnvironmentVariable("Path","User")
+                Refresh-ProcessPath
             } catch {
                 Write-Err "scoop ffmpeg install failed: $_"
             }
@@ -340,8 +598,7 @@ function Install-DefaultLocalMediaRuntime {
             try {
                 Write-Info "Installing ffmpeg with winget..."
                 winget install --id Gyan.FFmpeg --source winget --accept-package-agreements --accept-source-agreements -e
-                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                            [System.Environment]::GetEnvironmentVariable("Path","User")
+                Refresh-ProcessPath
             } catch {
                 Write-Err "winget ffmpeg install failed: $_"
             }
@@ -353,8 +610,7 @@ function Install-DefaultLocalMediaRuntime {
             try {
                 Write-Info "Installing tesseract with scoop..."
                 scoop install tesseract
-                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                            [System.Environment]::GetEnvironmentVariable("Path","User")
+                Refresh-ProcessPath
             } catch {
                 Write-Err "scoop tesseract install failed: $_"
             }
@@ -362,8 +618,7 @@ function Install-DefaultLocalMediaRuntime {
             try {
                 Write-Info "Installing tesseract with winget..."
                 winget install --id UB-Mannheim.TesseractOCR --source winget --accept-package-agreements --accept-source-agreements -e
-                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                            [System.Environment]::GetEnvironmentVariable("Path","User")
+                Refresh-ProcessPath
             } catch {
                 Write-Err "winget tesseract install failed: $_"
             }
@@ -387,8 +642,7 @@ function Ensure-WhisperCppRuntime {
             try {
                 Write-Info "Installing ffmpeg with winget..."
                 winget install --id Gyan.FFmpeg --source winget --accept-package-agreements --accept-source-agreements -e
-                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                            [System.Environment]::GetEnvironmentVariable("Path","User")
+                Refresh-ProcessPath
                 $hasFfmpeg = [bool](Get-Command "ffmpeg" -ErrorAction SilentlyContinue)
             } catch {
                 Write-Err "winget install failed: $_"
@@ -446,15 +700,19 @@ function Get-BrowserStatusLabel {
 
 function Install-PlaywrightRuntime {
     if ($script:PLAYWRIGHT_RUNTIME_READY) { return $true }
-    $pwPip = Join-Path $NULLION_VENV_DIR "Scripts\pip.exe"
+    $pwPython = Join-Path $NULLION_VENV_DIR "Scripts\python.exe"
     $pwExe = Join-Path $NULLION_VENV_DIR "Scripts\playwright.exe"
-    if (-not (Test-Path $pwPip)) {
+    if (-not (Test-Path $pwPython)) {
         Write-Info "Playwright runtime will be installed after the virtual environment is ready."
         return $false
     }
     try {
         Write-Info "Installing Playwright Chromium runtime so browser automation is ready when enabled..."
-        & $pwPip install --quiet playwright
+        & $pwPython -m pip install --quiet --no-cache-dir playwright
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Could not install Playwright Python package."
+            return $false
+        }
         & $pwExe install chromium
         if ($LASTEXITCODE -eq 0) {
             $script:PLAYWRIGHT_RUNTIME_READY = $true
@@ -706,8 +964,7 @@ function Ensure-Git {
     if ($winget) {
         try {
             winget install --id Git.Git --source winget --accept-package-agreements --accept-source-agreements -e
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                        [System.Environment]::GetEnvironmentVariable("Path","User")
+            Refresh-ProcessPath
         } catch {
             Write-Err "winget Git install failed: $_"
         }
@@ -721,7 +978,16 @@ function Ensure-Git {
     Write-Ok "git installed."
 }
 
-function Checkout-LatestRelease {
+function Test-SupportedPythonVersionText {
+    param([string]$VersionText)
+    if ($VersionText -match '(\d+)\.(\d+)') {
+        $maj = [int]$Matches[1]; $min = [int]$Matches[2]
+        return ($maj -eq 3 -and $min -ge 11 -and $min -le 13)
+    }
+    return $false
+}
+
+function Checkout-InstallTarget {
     param([string]$SourceDir)
 
     $isShallow = (& git -C $SourceDir rev-parse --is-shallow-repository 2>$null)
@@ -735,6 +1001,15 @@ function Checkout-LatestRelease {
 
     & git -C $SourceDir fetch --quiet --prune --prune-tags --force origin "refs/tags/*:refs/tags/*"
     if ($LASTEXITCODE -ne 0) { throw "git fetch release tags failed" }
+
+    if ($script:NULLION_VERSION -eq "main") {
+        & git -C $SourceDir reset --quiet --hard origin/main
+        if ($LASTEXITCODE -ne 0) { throw "git reset to origin/main failed" }
+        & git -C $SourceDir clean --quiet -ffd
+        if ($LASTEXITCODE -ne 0) { throw "git clean failed" }
+        Write-Ok "Checked out main."
+        return
+    }
 
     $latestTag = (& git -C $SourceDir describe --tags --abbrev=0 --match "v[0-9]*" origin/main)
     if (-not $latestTag) {
@@ -756,24 +1031,28 @@ function Checkout-LatestRelease {
 }
 
 function Get-PythonExe {
-    # Try well-known names in PATH first
+    # Try supported well-known names in PATH first. Python 3.14+ is skipped for
+    # now because Windows tray/webview dependencies do not reliably publish
+    # compatible wheels yet.
     foreach ($candidate in @("python3.13","python3.12","python3.11","python3","python")) {
         $found = Get-Command $candidate -ErrorAction SilentlyContinue
         if ($found) {
             $raw = & $candidate --version 2>&1
             if ($raw -match '(\d+)\.(\d+)') {
-                $maj = [int]$Matches[1]; $min = [int]$Matches[2]
-                if ($maj -ge 3 -and $min -ge 11) { return $candidate }
+                if (Test-SupportedPythonVersionText $raw) { return $candidate }
             }
         }
     }
-    # Also check the common py launcher
+    # Also check the common py launcher, asking for supported minors explicitly.
     $py = Get-Command "py" -ErrorAction SilentlyContinue
     if ($py) {
-        $raw = & py -3 --version 2>&1
-        if ($raw -match '(\d+)\.(\d+)') {
-            $maj = [int]$Matches[1]; $min = [int]$Matches[2]
-            if ($maj -ge 3 -and $min -ge 11) { return @("py", "-3") }
+        foreach ($minor in @("13","12","11")) {
+            $raw = & py "-3.$minor" --version 2>&1
+            if ($raw -match '(\d+)\.(\d+)') {
+                if (Test-SupportedPythonVersionText $raw) {
+                    return @("py", "-3.$minor")
+                }
+            }
         }
     }
     return $null
@@ -801,7 +1080,7 @@ function Format-PythonCommand {
     return [string]$Python
 }
 
-# ── banner ────────────────────────────────────────────────────────────────────
+# banner
 Clear-Host
 Write-Host ""
 Write-Logo
@@ -815,21 +1094,19 @@ if (-not (Confirm-PromptDefaultYes "Ready to start?")) {
     exit 0
 }
 
-# ── Step 1: Python ─────────────────────────────────────────────────────────
-Write-Header "Step 1 of 4 — Python"
+# Step 1: Python
+Write-Header "Step 1 of 4 - Python"
 
 $PYTHON = Get-PythonExe
 
 if (-not $PYTHON) {
-    Write-Info "Python 3.11+ not found. Attempting to install via winget..."
+    Write-Info "Python 3.11-3.13 not found. Attempting to install Python 3.12 via winget..."
 
     $winget = Get-Command "winget" -ErrorAction SilentlyContinue
     if ($winget) {
         try {
             winget install --id Python.Python.3.12 --source winget --accept-package-agreements --accept-source-agreements -e
-            # Refresh PATH so the new Python is visible
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
-                        [System.Environment]::GetEnvironmentVariable("Path","User")
+            Refresh-ProcessPath
             $PYTHON = Get-PythonExe
             if ($PYTHON) {
                 Write-Ok "Python installed via winget."
@@ -842,7 +1119,8 @@ if (-not $PYTHON) {
     if (-not $PYTHON) {
         Write-Err "Could not install Python automatically."
         Write-Host ""
-        Write-Info "Please install Python 3.11+ from https://python.org/downloads/"
+        Write-Info "Please install Python 3.12 from https://python.org/downloads/release/python-312/"
+        Write-Info "Do not use Python 3.14 for this install yet; some Windows wheels are not ready."
         Write-Info "Tick 'Add Python to PATH' during install, then re-run this script."
         exit 1
     }
@@ -852,16 +1130,22 @@ $pyVersion = Invoke-Python $PYTHON --version 2>&1
 $pythonDisplay = Format-PythonCommand $PYTHON
 Write-Ok "Using $pythonDisplay ($pyVersion)"
 
-# ── Step 2: Install Nullion ────────────────────────────────────────────────
-Write-Header "Step 2 of 4 — Installing Nullion"
+# Step 2: Install Nullion
+Write-Header "Step 2 of 4 - Installing Nullion"
 
 New-Item -ItemType Directory -Path $NULLION_DIR    -Force | Out-Null
 New-Item -ItemType Directory -Path $NULLION_LOG_DIR -Force | Out-Null
 
-# If running from inside a cloned repo, install from there
-$SCRIPT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
+# If running from inside a cloned repo, install from there. When the installer is
+# piped through `irm ... | iex`, PowerShell runs it as a script block with no
+# backing file path.
+$scriptPath = $null
+if ($MyInvocation.MyCommand.PSObject.Properties.Name -contains "Path") {
+    $scriptPath = $MyInvocation.MyCommand.Path
+}
+$SCRIPT_DIR = if ($scriptPath) { Split-Path -Parent $scriptPath } else { $null }
 $SOURCE_DIR = $null
-if (Test-Path (Join-Path $SCRIPT_DIR "pyproject.toml")) {
+if ($SCRIPT_DIR -and (Test-Path (Join-Path $SCRIPT_DIR "pyproject.toml"))) {
     $SOURCE_DIR = $SCRIPT_DIR
     Write-Info "Installing from local source at $SOURCE_DIR"
 } else {
@@ -872,14 +1156,32 @@ if (Test-Path (Join-Path $SCRIPT_DIR "pyproject.toml")) {
     try {
         if (Test-Path (Join-Path $SOURCE_DIR ".git")) {
             git -C $SOURCE_DIR remote set-url origin $REPO_URL 2>$null
-            Checkout-LatestRelease $SOURCE_DIR
+            Checkout-InstallTarget $SOURCE_DIR
         } else {
             git clone --quiet $REPO_URL $SOURCE_DIR
             Write-Ok "Cloned."
-            Checkout-LatestRelease $SOURCE_DIR
+            Checkout-InstallTarget $SOURCE_DIR
         }
     } finally {
         Pop-Location
+    }
+}
+
+$VENV_PYTHON = Join-Path $NULLION_VENV_DIR "Scripts\python.exe"
+if (Test-Path $NULLION_VENV_DIR) {
+    $recreateVenv = $false
+    if (-not (Test-Path $VENV_PYTHON)) {
+        Write-Info "Existing virtual environment is incomplete. Recreating it."
+        $recreateVenv = $true
+    } else {
+        $venvVersion = & $VENV_PYTHON --version 2>&1
+        if (-not (Test-SupportedPythonVersionText $venvVersion)) {
+            Write-Info "Existing virtual environment uses unsupported Python ($venvVersion). Recreating it."
+            $recreateVenv = $true
+        }
+    }
+    if ($recreateVenv) {
+        Remove-Item -Recurse -Force $NULLION_VENV_DIR
     }
 }
 
@@ -889,8 +1191,6 @@ if (-not (Test-Path $NULLION_VENV_DIR)) {
     Write-Ok "Virtual environment created."
 }
 
-$PIP = Join-Path $NULLION_VENV_DIR "Scripts\pip.exe"
-$VENV_PYTHON = Join-Path $NULLION_VENV_DIR "Scripts\python.exe"
 $NULLION_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-web.exe"
 $NULLION_TRAY_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-tray.exe"
 $NULLION_TELEGRAM_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-telegram.exe"
@@ -898,19 +1198,23 @@ $NULLION_SLACK_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-slack.exe"
 $NULLION_DISCORD_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-discord.exe"
 
 Write-Info "Installing dependencies (this may take a minute)..."
-& $PIP install --quiet --upgrade pip
-& $PIP install --quiet -e $SOURCE_DIR
+& $VENV_PYTHON -m ensurepip --upgrade
+if ($LASTEXITCODE -ne 0) { throw "Could not bootstrap pip in the virtual environment." }
+& $VENV_PYTHON -m pip install --quiet --no-cache-dir --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip in the virtual environment." }
+& $VENV_PYTHON -m pip install --quiet --no-cache-dir -e $SOURCE_DIR
+if ($LASTEXITCODE -ne 0) { throw "Nullion dependency install failed." }
 & $VENV_PYTHON -c "import PIL; import pypdf"
 if ($LASTEXITCODE -ne 0) { throw "PDF runtime dependency check failed." }
 Write-Ok "Nullion installed."
 
 [void](Install-PlaywrightRuntime)
 
-# ── Step 3: Capabilities ─────────────────────────────────────────────────
-Write-Header "Step 3 of 4 — Capabilities (optional)"
+# Step 3: Capabilities
+Write-Header "Step 3 of 4 - Capabilities (optional)"
 
 Write-Host ""
-Write-Host "  Nullion's web dashboard runs at http://localhost:$NULLION_WEB_PORT — no setup needed."
+Write-Host "  Nullion's web dashboard runs at http://localhost:$NULLION_WEB_PORT - no setup needed."
 Write-Host ""
 Write-Host "  Next you can enable optional capabilities: messaging apps, AI provider,"
 Write-Host "  browser/search access, account/API tools, media tools, and skill packs."
@@ -1033,11 +1337,10 @@ if (($MESSAGING_CHOICES -match '1') -or ($MESSAGING_CHOICES -match 'telegram')) 
     Write-Host ""
     Write-Host "  Now we need your Telegram chat ID so the bot knows who to talk to."
     Write-Host ""
-    Write-Host "  1. Send any message to your new bot in Telegram" -ForegroundColor White
-    Write-Host "  2. Open this URL in a browser:" -ForegroundColor White
-    Write-Host "     https://api.telegram.org/bot<your-bot-token>/getUpdates" -ForegroundColor Cyan
-    Write-Host "  3. Look for:  `"id`": 123456789  inside  `"chat`"" -ForegroundColor White
-    Write-Host "       That number is your chat ID." -ForegroundColor White
+    Write-Host "  1. In Telegram, search for @userinfobot" -ForegroundColor White
+    Write-Host "  2. Open it and send: /start" -ForegroundColor White
+    Write-Host "  3. Copy the numeric Id/User ID it replies with." -ForegroundColor White
+    Write-Host "     That number is your chat ID." -ForegroundColor White
     Write-Host ""
 
     if ($ExistingChatId) {
@@ -1054,7 +1357,7 @@ if (($MESSAGING_CHOICES -match '1') -or ($MESSAGING_CHOICES -match 'telegram')) 
                 Write-Ok "Chat ID: $CHAT_ID"
                 break
             }
-            Write-Err "That doesn't look right — it should be a number like 123456789."
+            Write-Err "That doesn't look right - it should be a number like 123456789."
         }
     }
 }
@@ -1095,6 +1398,8 @@ if (($MESSAGING_CHOICES -match '3') -or ($MESSAGING_CHOICES -match 'discord')) {
     Write-Ok "Discord messaging configured."
 }
 }
+
+Save-MessagingCheckpoint
 
 # Model provider
 Write-Host ""
@@ -1341,7 +1646,9 @@ switch ($providerChoice) {
 }
 }
 
-# ── Browser setup ──────────────────────────────────────────────────────────
+Save-ProviderCheckpoint
+
+# Browser setup
 Write-Host ""
 Write-Host "  Would you like Nullion to control a browser?" -ForegroundColor White
 Write-Host "  This lets it browse the web, fill forms, and take screenshots on your behalf."
@@ -1405,12 +1712,14 @@ switch ($BrowserChoice) {
         }
     }
     default {
-        Write-Info "No browser — skipped."
+        Write-Info "No browser - skipped."
     }
 }
 }
 
-# ── Search provider setup ─────────────────────────────────────────────────
+Save-BrowserCheckpoint
+
+# Search provider setup
 Write-Host ""
 Write-Host "  Choose your search provider:" -ForegroundColor White
 $SEARCH_PROVIDER = "builtin_search_provider"
@@ -1483,7 +1792,9 @@ switch ($SearchChoice) {
 }
 }
 
-# ── Account / API tools setup ──────────────────────────────────────────────
+Save-SearchCheckpoint
+
+# Account / API tools setup
 Write-Host ""
 Write-Host "  Choose account/API tools to enable:" -ForegroundColor White
 Write-Host "  These add account-aware tools. Native support is available for Gmail/Google"
@@ -1624,7 +1935,9 @@ if ((-not $EMAIL_CALENDAR_ENABLED) -and (-not $CUSTOM_EMAIL_API_ENABLED) -and (-
     }
 }
 
-# ── Local media tools setup ─────────────────────────────────────────────────
+Save-AccountCheckpoint
+
+# Local media tools setup
 Write-Host ""
 Write-Host "  Configure media tools?" -ForegroundColor White
 Write-Host "  We'll set these up separately so local tools are used where they are cheap"
@@ -1658,8 +1971,7 @@ $IMAGE_GENERATE_ENABLED = $false
 $VIDEO_INPUT_PROVIDER = ""
 $VIDEO_INPUT_MODEL = ""
 $VIDEO_INPUT_ENABLED = $false
-Write-Info "Installing default local media runtime so you can switch to local audio/OCR later."
-Install-DefaultLocalMediaRuntime
+Write-Info "Local media packages will only be installed if you choose local audio/OCR setup."
 
 if (",$ExistingEnabledPlugins," -match ',media_plugin,') {
     Write-Info "Found existing media tools setup."
@@ -1852,7 +2164,9 @@ if ((-not $MEDIA_ENABLED) -and (Confirm-Prompt "Configure media tools now?")) {
     Write-Info "Skipped media tools. You can easily set them up later in the web UI."
 }
 
-# ── Skill pack setup ───────────────────────────────────────────────────────
+Save-MediaCheckpoint
+
+# Skill pack setup
 Write-Host ""
 Write-Host "  Choose skill packs to enable:" -ForegroundColor White
 Write-Host "  All built-in skill packs ship with Nullion and are selected by default."
@@ -1903,67 +2217,28 @@ function Request-SkillPackChoices {
         @{ Title = "Install custom skill pack"; Detail = "Git URL, GitHub folder, or local folder with SKILL.md"; Badge = ""; Choice = "10" },
         @{ Title = "No default skill packs"; Detail = "Start with no enabled reference packs"; Badge = ""; Choice = "11" }
     )
-    $selected = New-Object bool[] $items.Count
-    for ($i = 0; $i -lt 9; $i++) { $selected[$i] = $true }
-    $current = 0
-    $startTop = [Console]::CursorTop
 
-    Write-Host "  Use Up/Down to move, Space to select/deselect, Enter to continue."
-    Write-Host "  You can also press the visible number for single-digit items."
-    Write-Host ""
-    $startTop = [Console]::CursorTop
-    try {
-        [Console]::CursorVisible = $false
-        $done = $false
-        while (-not $done) {
-            [Console]::SetCursorPosition(0, $startTop)
-            for ($i = 0; $i -lt $items.Count; $i++) {
-                Write-CheckItem $selected[$i] ($i -eq $current) $items[$i].Title $items[$i].Detail $items[$i].Badge
-            }
-            Write-Host ""
-            Write-Host "  Enter confirms the checked items." -ForegroundColor DarkGray
-            $clearWidth = [Math]::Max(1, [Console]::WindowWidth - 1)
-            for ($line = [Console]::CursorTop; $line -lt ($startTop + ($items.Count * 2) + 3); $line++) {
-                [Console]::SetCursorPosition(0, $line)
-                Write-Host (" " * $clearWidth) -NoNewline
-            }
-            [Console]::SetCursorPosition(0, $startTop + ($items.Count * 2) + 2)
-
-            $key = [Console]::ReadKey($true)
-            switch ($key.Key) {
-                "UpArrow" { $current = ($current - 1 + $items.Count) % $items.Count }
-                "DownArrow" { $current = ($current + 1) % $items.Count }
-                "Enter" { $done = $true }
-                "Spacebar" {
-                    if ($items[$current].Choice -eq "11") {
-                        for ($i = 0; $i -lt ($items.Count - 1); $i++) { $selected[$i] = $false }
-                        $selected[$current] = $true
-                    } else {
-                        $selected[$current] = -not $selected[$current]
-                        $selected[$items.Count - 1] = $false
-                    }
-                }
-                default {
-                    if ($key.KeyChar -match '^[1-9]$') {
-                        $current = [int]::Parse([string]$key.KeyChar) - 1
-                        if ($items[$current].Choice -eq "11") {
-                            for ($i = 0; $i -lt ($items.Count - 1); $i++) { $selected[$i] = $false }
-                            $selected[$current] = $true
-                        } else {
-                            $selected[$current] = -not $selected[$current]
-                            $selected[$items.Count - 1] = $false
-                        }
-                    }
-                }
-            }
-        }
-    } finally {
-        [Console]::CursorVisible = $true
+    foreach ($item in $items) {
+        $badge = $item.Badge
+        if (-not $badge -and [int]$item.Choice -le 9) { $badge = "[default]" }
+        Write-MenuItem $item.Choice $item.Title $item.Detail $badge
     }
+    Write-Host ""
+    Write-Info "Press Enter to use the default packs (1-9), or enter choices like 1,3,6."
+    $rawChoices = (Read-Host "  Skill packs [1,2,3,4,5,6,7,8,9]").Trim()
+    if (-not $rawChoices) { $rawChoices = "1,2,3,4,5,6,7,8,9" }
 
     $choices = New-Object System.Collections.Generic.List[string]
-    for ($i = 0; $i -lt $items.Count; $i++) {
-        if ($selected[$i]) { [void]$choices.Add([string]$items[$i].Choice) }
+    foreach ($choice in ($rawChoices -split '[^0-9]+')) {
+        if (-not $choice) { continue }
+        if ($choice -eq "11") {
+            $choices.Clear()
+            [void]$choices.Add("11")
+            break
+        }
+        if (($items | Where-Object { $_.Choice -eq $choice }) -and -not $choices.Contains($choice)) {
+            [void]$choices.Add($choice)
+        }
     }
     if ($choices.Count -eq 0) { [void]$choices.Add("11") }
     return $choices.ToArray()
@@ -2024,11 +2299,20 @@ if ($ENABLED_SKILL_PACKS) {
     Write-Ok "Skill packs enabled: $ENABLED_SKILL_PACKS"
 }
 
+Save-SkillCheckpoint
+
 # Write .env
 $envLines = @(
-    "# Nullion configuration — generated by install.ps1 on $(Get-Date)"
+    "# Nullion configuration - generated by install.ps1 on $(Get-Date)"
     "NULLION_WEB_PORT=$NULLION_WEB_PORT"
     "NULLION_KEY_STORAGE=local"
+    "NULLION_SETUP_MESSAGING_DONE=true"
+    "NULLION_SETUP_PROVIDER_DONE=true"
+    "NULLION_SETUP_BROWSER_DONE=true"
+    "NULLION_SETUP_SEARCH_DONE=true"
+    "NULLION_SETUP_ACCOUNT_DONE=true"
+    "NULLION_SETUP_MEDIA_DONE=true"
+    "NULLION_SETUP_SKILLS_DONE=true"
 )
 if ($TELEGRAM_ENABLED) {
     $envLines += "NULLION_TELEGRAM_BOT_TOKEN=`"$BOT_TOKEN`""
@@ -2126,23 +2410,17 @@ $envLines += "NULLION_LOG_LEVEL=INFO"
 
 $envLines | Set-Content -Path $NULLION_ENV_FILE -Encoding UTF8
 
-# Restrict .env to current user only
-$acl  = Get-Acl $NULLION_ENV_FILE
-$acl.SetAccessRuleProtection($true, $false)
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-    $env:USERNAME, "FullControl", "Allow")
-$acl.SetAccessRule($rule)
-Set-Acl $NULLION_ENV_FILE $acl
+Protect-EnvFile
 
 Write-Ok "Configuration saved to $NULLION_ENV_FILE"
 Invoke-NullionRuntimeFinalization
 
-# ── Step 4: Auto-start via Task Scheduler ─────────────────────────────────
-Write-Header "Step 4 of 4 — Auto-start"
+# Step 4: Auto-start via Task Scheduler
+Write-Header "Step 4 of 4 - Auto-start"
 
 Write-Host ""
 Write-Host "  Nullion can start automatically when you log in to Windows."
-Write-Host "  This uses Task Scheduler — no admin rights required."
+Write-Host "  This uses Task Scheduler - no admin rights required."
 Write-Host ""
 
 $AUTOSTART_CONFIGURED = $false
@@ -2211,7 +2489,7 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
 "@ | Set-Content -Path $discordWrapperBat -Encoding ASCII
     }
 
-    # Register with schtasks — runs at logon, hidden window
+    # Register with schtasks - runs at logon, hidden window
     $taskArgs = @(
         "/Create", "/F",
         "/TN", $TASK_NAME,
@@ -2220,13 +2498,13 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
         "/RL", "LIMITED",
         "/IT"
     )
-    $result = schtasks @taskArgs 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    $result = Invoke-SchtasksCommand $taskArgs
+    if ($result.ExitCode -eq 0) {
         Write-Ok "Auto-start task registered in Task Scheduler."
         $AUTOSTART_CONFIGURED = $true
     } else {
-        Write-Err "schtasks failed: $result"
-        Write-Info "You can start Nullion manually — see instructions below."
+        Write-Err "schtasks failed: $($result.Output)"
+        Write-Info "You can start Nullion manually - see instructions below."
     }
 
     $trayTaskArgs = @(
@@ -2237,11 +2515,11 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
         "/RL", "LIMITED",
         "/IT"
     )
-    $trayResult = schtasks @trayTaskArgs 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    $trayResult = Invoke-SchtasksCommand $trayTaskArgs
+    if ($trayResult.ExitCode -eq 0) {
         Write-Ok "Tray icon auto-start task registered in Task Scheduler."
     } else {
-        Write-Err "Tray schtasks failed: $trayResult"
+        Write-Err "Tray schtasks failed: $($trayResult.Output)"
     }
 
     if ($TELEGRAM_ENABLED) {
@@ -2253,11 +2531,11 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
             "/RL", "LIMITED",
             "/IT"
         )
-        $telegramResult = schtasks @telegramTaskArgs 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $telegramResult = Invoke-SchtasksCommand $telegramTaskArgs
+        if ($telegramResult.ExitCode -eq 0) {
             Write-Ok "Telegram auto-start task registered in Task Scheduler."
         } else {
-            Write-Err "Telegram schtasks failed: $telegramResult"
+            Write-Err "Telegram schtasks failed: $($telegramResult.Output)"
         }
     }
 
@@ -2270,11 +2548,11 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
             "/RL", "LIMITED",
             "/IT"
         )
-        $slackResult = schtasks @slackTaskArgs 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $slackResult = Invoke-SchtasksCommand $slackTaskArgs
+        if ($slackResult.ExitCode -eq 0) {
             Write-Ok "Slack auto-start task registered in Task Scheduler."
         } else {
-            Write-Err "Slack schtasks failed: $slackResult"
+            Write-Err "Slack schtasks failed: $($slackResult.Output)"
         }
     }
 
@@ -2287,11 +2565,11 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
             "/RL", "LIMITED",
             "/IT"
         )
-        $discordResult = schtasks @discordTaskArgs 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $discordResult = Invoke-SchtasksCommand $discordTaskArgs
+        if ($discordResult.ExitCode -eq 0) {
             Write-Ok "Discord auto-start task registered in Task Scheduler."
         } else {
-            Write-Err "Discord schtasks failed: $discordResult"
+            Write-Err "Discord schtasks failed: $($discordResult.Output)"
         }
     }
 }
@@ -2299,29 +2577,29 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
 if (-not $AUTOSTART_CONFIGURED) {
     Write-Info "Skipped auto-start. To start manually, run:"
     Write-Host ""
-    Write-Host "    $NULLION_EXE --port $NULLION_WEB_PORT --checkpoint $NULLION_INSTALL_DIR\runtime.db" -ForegroundColor Cyan
+    Write-Host "    $NULLION_EXE --port $NULLION_WEB_PORT --checkpoint $NULLION_DIR\runtime.db" -ForegroundColor Cyan
     if ($TELEGRAM_ENABLED) {
         Write-Host ""
         Write-Info "Telegram was configured. Start it manually with:"
         Write-Host ""
-        Write-Host "    nullion-telegram --checkpoint $NULLION_INSTALL_DIR\runtime.db --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
+        Write-Host "    nullion-telegram --checkpoint $NULLION_DIR\runtime.db --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
     }
     if ($SLACK_ENABLED) {
         Write-Host ""
         Write-Info "Slack was configured. Start it manually with:"
         Write-Host ""
-        Write-Host "    nullion-slack --checkpoint $NULLION_INSTALL_DIR\runtime.db --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
+        Write-Host "    nullion-slack --checkpoint $NULLION_DIR\runtime.db --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
     }
     if ($DISCORD_ENABLED) {
         Write-Host ""
         Write-Info "Discord was configured. Start it manually with:"
         Write-Host ""
-        Write-Host "    nullion-discord --checkpoint $NULLION_INSTALL_DIR\runtime.db --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
+        Write-Host "    nullion-discord --checkpoint $NULLION_DIR\runtime.db --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
     }
     Write-Host ""
 }
 
-# ── Start now ─────────────────────────────────────────────────────────────
+# Start now
 Write-Host ""
 Write-Header "All done!"
 Write-Host ""
@@ -2339,7 +2617,7 @@ if (Confirm-Prompt "Open Nullion in your browser now?") {
 
     $proc = Start-Process `
         -FilePath $NULLION_EXE `
-        -ArgumentList "--port", $NULLION_WEB_PORT, "--checkpoint", "$NULLION_INSTALL_DIR\runtime.db" `
+        -ArgumentList "--port", $NULLION_WEB_PORT, "--checkpoint", "$NULLION_DIR\runtime.db" `
         -RedirectStandardOutput (Join-Path $NULLION_LOG_DIR "nullion.log") `
         -RedirectStandardError  (Join-Path $NULLION_LOG_DIR "nullion-error.log") `
         -WindowStyle Hidden `
@@ -2359,7 +2637,7 @@ if (Confirm-Prompt "Open Nullion in your browser now?") {
 } else {
     Write-Host ""
     Write-Info "To start manually:"
-    Write-Host "    $NULLION_EXE --port $NULLION_WEB_PORT --checkpoint $NULLION_INSTALL_DIR\runtime.db" -ForegroundColor Cyan
+    Write-Host "    $NULLION_EXE --port $NULLION_WEB_PORT --checkpoint $NULLION_DIR\runtime.db" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Then open:  http://localhost:$NULLION_WEB_PORT" -ForegroundColor Green
     Write-Host ""

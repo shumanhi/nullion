@@ -146,7 +146,7 @@ print_setup_overview() {
     local width=84
     local border="──────────────────────────────────────────────────────────────────────────────────────"
     echo -e "  ${DIM}╭─ Setup Path ─────────────────────────────────────────────────────────────────────────╮${RESET}"
-    print_box_row "$width" "1  Python runtime        check or install Python 3.11+" "${BOLD}1${RESET}  Python runtime        ${DIM}check or install Python 3.11+${RESET}"
+    print_box_row "$width" "1  Python runtime        check or install Python 3.11-3.13" "${BOLD}1${RESET}  Python runtime        ${DIM}check or install Python 3.11-3.13${RESET}"
     print_box_row "$width" "2  Nullion app           install into ${NULLION_INSTALL_DIR}" "${BOLD}2${RESET}  Nullion app           ${DIM}install into ${NULLION_INSTALL_DIR}${RESET}"
     print_box_row "$width" "3  Capabilities          AI, chat, browser, media, skills" "${BOLD}3${RESET}  Capabilities          ${DIM}AI, chat, browser, media, skills${RESET}"
     print_box_row "$width" "4  Launch                dashboard at http://localhost:${NULLION_WEB_PORT}" "${BOLD}4${RESET}  Launch                ${DIM}dashboard at http://localhost:${NULLION_WEB_PORT}${RESET}"
@@ -997,6 +997,12 @@ checkout_latest_release() {
         git -C "$source_dir" fetch --quiet origin main
     fi
     git -C "$source_dir" fetch --quiet --prune --prune-tags --force origin "refs/tags/*:refs/tags/*"
+    if [[ "$NULLION_VERSION" == "main" ]]; then
+        git -C "$source_dir" reset --quiet --hard origin/main
+        git -C "$source_dir" clean --quiet -ffd
+        print_ok "Checked out main."
+        return
+    fi
     latest_tag="$(git -C "$source_dir" describe --tags --abbrev=0 --match "v[0-9]*" origin/main)"
     if [[ -z "$latest_tag" ]]; then
         print_err "No release tags found in Nullion repository."
@@ -1006,6 +1012,18 @@ checkout_latest_release() {
     git -C "$source_dir" clean --quiet -ffd
     NULLION_VERSION="${latest_tag#v}"
     print_ok "Checked out latest release $latest_tag."
+}
+
+python_version_supported() {
+    local version_text="$1"
+    local major minor
+    if [[ "$version_text" =~ ([0-9]+)\.([0-9]+) ]]; then
+        major="${BASH_REMATCH[1]}"
+        minor="${BASH_REMATCH[2]}"
+        [[ "$major" -eq 3 && "$minor" -ge 11 && "$minor" -le 13 ]]
+        return
+    fi
+    return 1
 }
 
 # ── banner ────────────────────────────────────────────────────────────────────
@@ -1029,9 +1047,7 @@ PYTHON=""
 for candidate in python3.13 python3.12 python3.11 python3; do
     if command_exists "$candidate"; then
         version=$("$candidate" --version 2>&1 | awk '{print $2}')
-        major=$(echo "$version" | cut -d. -f1)
-        minor=$(echo "$version" | cut -d. -f2)
-        if [[ "$major" -ge 3 && "$minor" -ge 11 ]]; then
+        if python_version_supported "Python $version"; then
             PYTHON="$candidate"
             print_ok "Found $candidate ($version)"
             break
@@ -1040,7 +1056,7 @@ for candidate in python3.13 python3.12 python3.11 python3; do
 done
 
 if [[ -z "$PYTHON" ]]; then
-    print_info "Python 3.11+ not found. Attempting to install..."
+    print_info "Python 3.11-3.13 not found. Attempting to install..."
 
     if [[ "$PLATFORM" == "macos" ]]; then
         if command_exists brew; then
@@ -1051,7 +1067,7 @@ if [[ -z "$PYTHON" ]]; then
         else
             print_err "Homebrew not found."
             print_info "Install Homebrew from https://brew.sh, then re-run this script."
-            print_info "Or download Python 3.11+ directly from https://python.org"
+            print_info "Or download Python 3.12 directly from https://python.org"
             exit 1
         fi
 
@@ -1076,13 +1092,13 @@ if [[ -z "$PYTHON" ]]; then
             PYTHON="python3.12"
         else
             print_err "No supported package manager found (apt, dnf, pacman, zypper)."
-            print_info "Please install Python 3.11+ manually from https://python.org"
+            print_info "Please install Python 3.12 manually from https://python.org"
             exit 1
         fi
 
         # Verify install succeeded
         if ! command_exists "$PYTHON"; then
-            print_err "Python install failed. Please install Python 3.11+ manually."
+            print_err "Python install failed. Please install Python 3.12 manually."
             exit 1
         fi
         print_ok "Python installed: $($PYTHON --version)"
@@ -1130,6 +1146,23 @@ else
 fi
 
 VENV_DIR="$NULLION_INSTALL_DIR/venv"
+if [[ -d "$VENV_DIR" ]]; then
+    recreate_venv=false
+    if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+        print_info "Existing virtual environment is incomplete. Recreating it."
+        recreate_venv=true
+    else
+        venv_version="$("$VENV_DIR/bin/python" --version 2>&1 || true)"
+        if ! python_version_supported "$venv_version"; then
+            print_info "Existing virtual environment uses unsupported Python ($venv_version). Recreating it."
+            recreate_venv=true
+        fi
+    fi
+    if [[ "$recreate_venv" == "true" ]]; then
+        rm -rf "$VENV_DIR"
+    fi
+fi
+
 if [[ ! -d "$VENV_DIR" ]]; then
     print_info "Creating virtual environment..."
     "$PYTHON" -m venv "$VENV_DIR"
@@ -1137,8 +1170,9 @@ if [[ ! -d "$VENV_DIR" ]]; then
 fi
 
 print_info "Installing dependencies (this may take a minute)..."
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet -e "$SOURCE_DIR"
+"$VENV_DIR/bin/python" -m ensurepip --upgrade
+"$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --upgrade pip
+"$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir -e "$SOURCE_DIR"
 "$VENV_DIR/bin/python" - <<'PY'
 import PIL
 import pypdf
@@ -1275,11 +1309,10 @@ if [[ "$MESSAGING_CHOICES" == *"1"* || "$MESSAGING_CHOICES" == *"telegram"* ]]; 
     echo
     echo -e "  Now we need your Telegram chat ID so the bot knows who to talk to."
     echo
-    echo -e "  ${BOLD}1.${RESET} Send any message to your new bot in Telegram"
-    echo -e "  ${BOLD}2.${RESET} Then open this URL in a browser:"
-    echo -e "       ${CYAN}https://api.telegram.org/bot<your-bot-token>/getUpdates${RESET}"
-    echo -e "  ${BOLD}3.${RESET} Look for:  ${YELLOW}\"id\": 123456789${RESET}  inside  ${YELLOW}\"chat\"${RESET}"
-    echo -e "       That number is your chat ID."
+    echo -e "  ${BOLD}1.${RESET} In Telegram, search for ${CYAN}@userinfobot${RESET}"
+    echo -e "  ${BOLD}2.${RESET} Open it and send: ${YELLOW}/start${RESET}"
+    echo -e "  ${BOLD}3.${RESET} Copy the numeric Id/User ID it replies with."
+    echo -e "     That number is your chat ID."
     echo
 
     if [[ -n "$EXISTING_CHAT_ID" ]]; then
