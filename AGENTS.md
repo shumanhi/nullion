@@ -23,6 +23,12 @@
 - Website, marketing, and docs-site work belongs in `/Users/himanc/Projects/nullion-website`, or the sibling checkout at `../nullion-website`, not in this app repo.
 - If a change needs app, test, and website updates, edit each repo in its own checkout and preserve unrelated dirty files.
 
+## Pull Requests
+
+- Use `nullion/` as the branch prefix for PR work.
+- Keep PR titles and descriptions brief.
+- Do not include local absolute paths, usernames, or machine-specific commands in PR text.
+
 ## Verification Guardrails
 
 - The active pre-commit hook is `.githooks/pre-commit`, selected by `core.hooksPath=.githooks`.
