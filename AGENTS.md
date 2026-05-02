@@ -30,3 +30,14 @@
 - The app pre-commit hook runs the private suite in `../nullion-test/tests` with coverage unless `NULLION_SKIP_PRIVATE_TESTS=1` is set.
 - Docker, installer, GUI, browser, and end-to-end checks should live in `nullion-test` and run inside containers or CI runners, not directly against the host desktop.
 - GitHub Actions Windows and Linux installer checks belong in `nullion-test`.
+
+## Git And CI Workflow
+
+- Do not push directly to `main`. Work on a `codex/...` branch and open a pull request.
+- If the shared checkout has unrelated dirty files, create a separate `git worktree` from `origin/main` and make your changes there.
+- Keep app changes in `nullion` and tests in `nullion-test`; use separate branches/PRs when both repos need changes.
+- After creating a PR, check the PR status checks with GitHub before reporting success.
+- If the user already instructed you to merge or ship, wait for required checks to finish and merge only after they pass.
+- If any check fails, inspect the failing job logs, report the failure, and fix it before merging.
+- For `nullion-test`, the installer checks are `Linux installer Docker` and `Windows installer Docker` in the `Installer Docker` workflow.
+- Do not merge a PR with failing, cancelled, or still-running checks unless the user explicitly overrides that specific failure.
