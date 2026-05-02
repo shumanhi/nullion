@@ -165,7 +165,7 @@ def _doctor_worktree_command_line(action_id: str) -> str | None:
     suffix = action_id.removeprefix("act-")[:12] or "doctor-run"
     return (
         "If this needs code changes, isolate the fix first: "
-        f"git worktree add .worktrees/doctor-{suffix} -b codex/doctor-{suffix}"
+        f"git worktree add .worktrees/doctor-{suffix} -b agent/doctor-{suffix}"
     )
 
 

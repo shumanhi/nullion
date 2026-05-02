@@ -39,7 +39,7 @@
 
 ## Git And CI Workflow
 
-- Do not push directly to `main`. Work on a `codex/...` branch and open a pull request.
+- Do not push directly to `main`. Work on an `agent/...` branch and open a pull request.
 - If the shared checkout has unrelated dirty files, create a separate `git worktree` from `origin/main` and make your changes there.
 - Keep app changes in `nullion` and tests in `nullion-test`; use separate branches/PRs when both repos need changes.
 - After creating a PR, check the PR status checks with GitHub before reporting success.
