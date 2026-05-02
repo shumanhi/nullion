@@ -90,6 +90,29 @@ function Refresh-ProcessPath {
     $env:Path = "$machinePath;$userPath"
 }
 
+function Add-UserPathEntry {
+    param([Parameter(Mandatory=$true)][string]$PathEntry)
+    if (-not $PathEntry) { return }
+    $expandedEntry = [System.Environment]::ExpandEnvironmentVariables($PathEntry).TrimEnd("\")
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $parts = @()
+    if ($userPath) {
+        $parts = @($userPath -split ";" | Where-Object { $_ })
+    }
+    foreach ($part in $parts) {
+        $expandedPart = [System.Environment]::ExpandEnvironmentVariables($part).TrimEnd("\")
+        if ($expandedPart.Equals($expandedEntry, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Refresh-ProcessPath
+            Write-Ok "Nullion command folder is already on your user PATH."
+            return
+        }
+    }
+    $newUserPath = if ($userPath) { "$userPath;$PathEntry" } else { $PathEntry }
+    [System.Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+    Refresh-ProcessPath
+    Write-Ok "Added Nullion commands to your user PATH."
+}
+
 function Invoke-SchtasksCommand {
     param([Parameter(Mandatory=$true)][string[]]$Arguments)
     $previousErrorActionPreference = $ErrorActionPreference
@@ -108,6 +131,320 @@ function Invoke-SchtasksCommand {
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
+}
+
+function Start-NullionScheduledTaskNow {
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$Label
+    )
+    $result = Invoke-SchtasksCommand @("/Run", "/TN", $TaskName)
+    if ($result.ExitCode -eq 0) {
+        Write-Ok "Started $Label from Task Scheduler."
+        return $true
+    }
+    Write-Info "Could not start $Label from Task Scheduler: $($result.Output)"
+    return $false
+}
+
+function Test-NullionEntrypoint {
+    param(
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$Label
+    )
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        throw "$Label was not installed at $ExePath"
+    }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = @(& $ExePath --help 2>&1 | ForEach-Object { [string]$_ })
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Label failed its --help check: $($output -join "`n")"
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+function Test-NullionInstalledEntrypoints {
+    Test-NullionEntrypoint $NULLION_EXE "nullion-web.exe"
+    Test-NullionEntrypoint $NULLION_TRAY_EXE "nullion-tray.exe"
+    Test-NullionEntrypoint (Join-Path $NULLION_SCRIPTS_DIR "nullion-webview.exe") "nullion-webview.exe"
+}
+
+function Start-NullionTrayNow {
+    param([bool]$PreferScheduledTask = $false)
+
+    if ($PreferScheduledTask) {
+        [void](Start-NullionScheduledTaskNow $TRAY_TASK_NAME "Nullion tray")
+        Start-Sleep -Seconds 3
+        if (Get-Process -Name "nullion-tray" -ErrorAction SilentlyContinue) {
+            Write-Ok "Nullion tray process is running."
+            return $true
+        }
+        Write-Info "Tray task started, but the tray process is not visible yet. Trying a direct interactive launch."
+    }
+
+    if ($env:NULLION_INSTALLER_SMOKE -eq "true") {
+        Write-Info "Skipping direct tray launch in installer smoke mode."
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $NULLION_TRAY_EXE)) {
+        Write-Err "Cannot start tray; nullion-tray.exe is missing at $NULLION_TRAY_EXE"
+        return $false
+    }
+
+    $trayLogFile = Join-Path $NULLION_LOG_DIR "tray.log"
+    $trayErrFile = Join-Path $NULLION_LOG_DIR "tray-error.log"
+    try {
+        $proc = Start-Process `
+            -FilePath $NULLION_TRAY_EXE `
+            -ArgumentList "--port", $NULLION_WEB_PORT, "--env-file", "$NULLION_ENV_FILE" `
+            -RedirectStandardOutput $trayLogFile `
+            -RedirectStandardError $trayErrFile `
+            -WindowStyle Hidden `
+            -PassThru
+        Start-Sleep -Seconds 3
+        if ($proc.HasExited) {
+            Write-Err "Nullion tray exited immediately. Check the tray log:"
+            Write-Host "    notepad `"$trayErrFile`"" -ForegroundColor Cyan
+            return $false
+        }
+        Write-Ok "Started Nullion tray icon."
+        return $true
+    } catch {
+        Write-Err "Could not start Nullion tray: $($_.Exception.Message)"
+        Write-Host "    notepad `"$trayErrFile`"" -ForegroundColor Cyan
+        return $false
+    }
+}
+
+function Test-TruthyValue {
+    param([AllowNull()][string]$Value)
+    return ($Value -and $Value -match '^(1|true|yes|y)$')
+}
+
+function Remove-PathIfExists {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Label
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        Write-Ok "Removed $Label."
+    } catch {
+        Write-Err "Could not remove $Label at ${Path}: $($_.Exception.Message)"
+    }
+}
+
+function Stop-NullionProcesses {
+    foreach ($name in @(
+        "nullion-web",
+        "nullion-tray",
+        "nullion-telegram",
+        "nullion-slack",
+        "nullion-discord"
+    )) {
+        $processes = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+        foreach ($proc in $processes) {
+            try {
+                Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                Write-Ok "Stopped $name process $($proc.Id)."
+            } catch {
+                Write-Info "Could not stop $name process $($proc.Id): $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
+function Remove-NullionScheduledTasks {
+    foreach ($task in @(
+        $TASK_NAME,
+        $TRAY_TASK_NAME,
+        $TELEGRAM_TASK_NAME,
+        $SLACK_TASK_NAME,
+        $DISCORD_TASK_NAME,
+        "Nullion Recovery"
+    )) {
+        [void](Invoke-SchtasksCommand @("/End", "/TN", $task))
+        $result = Invoke-SchtasksCommand @("/Delete", "/TN", $task, "/F")
+        if ($result.ExitCode -eq 0) {
+            Write-Ok "Removed scheduled task: $task"
+        }
+    }
+}
+
+function Remove-NullionTempFiles {
+    $tempRoot = $env:TEMP
+    if (-not $tempRoot -or -not (Test-Path -LiteralPath $tempRoot)) { return }
+    $seen = @{}
+    foreach ($pattern in @("nullion-*", "tmp-nullion-*")) {
+        $items = @(Get-ChildItem -LiteralPath $tempRoot -Force -Filter $pattern -ErrorAction SilentlyContinue)
+        foreach ($item in $items) {
+            if ($seen.ContainsKey($item.FullName)) { continue }
+            $seen[$item.FullName] = $true
+            Remove-PathIfExists $item.FullName "temporary installer item $($item.Name)"
+        }
+    }
+}
+
+function Reset-NullionInstallState {
+    param([string]$Reason = "fresh install requested")
+    Write-Header "Fresh install reset"
+    Write-Info "Reason: $Reason"
+    Write-Info "Removing installer-managed tasks, processes, temp files, config, runtime data, source, and virtual environment."
+
+    Remove-NullionScheduledTasks
+    Stop-NullionProcesses
+    Remove-PathIfExists $NULLION_DIR "Nullion install directory"
+
+    if ($env:LOCALAPPDATA) {
+        Remove-PathIfExists (Join-Path $env:LOCALAPPDATA "Nullion") "local Nullion app data"
+    }
+    if ($env:APPDATA) {
+        Remove-PathIfExists (Join-Path $env:APPDATA "Nullion") "roaming Nullion app data"
+    }
+    Remove-NullionTempFiles
+    Write-Ok "Fresh install cleanup complete."
+}
+
+function Get-ExistingInstallHealthIssues {
+    $issues = @()
+    if (-not (Test-Path -LiteralPath $NULLION_DIR)) { return $issues }
+
+    $sourceDir = Join-Path $NULLION_DIR "src"
+    $runtimeDb = Join-Path $NULLION_DIR "runtime.db"
+    $venvPython = Join-Path $NULLION_VENV_DIR "Scripts\python.exe"
+
+    if (Test-Path -LiteralPath $NULLION_VENV_DIR) {
+        if (-not (Test-Path -LiteralPath $venvPython)) {
+            $issues += "The virtual environment exists but Scripts\python.exe is missing."
+        } else {
+            try {
+                $venvVersion = & $venvPython --version 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    $issues += "The virtual environment Python could not start."
+                } elseif (-not (Test-SupportedPythonVersionText $venvVersion)) {
+                    $issues += "The virtual environment uses unsupported Python ($venvVersion)."
+                }
+            } catch {
+                $issues += "The virtual environment Python failed to run."
+            }
+        }
+    }
+
+    if (Test-Path -LiteralPath $sourceDir) {
+        if (-not (Test-Path -LiteralPath (Join-Path $sourceDir "pyproject.toml"))) {
+            $issues += "The app source folder exists but pyproject.toml is missing."
+        }
+        if ((Test-Path -LiteralPath (Join-Path $sourceDir ".git")) -and (Get-Command "git" -ErrorAction SilentlyContinue)) {
+            & git -C $sourceDir rev-parse --is-inside-work-tree *> $null
+            if ($LASTEXITCODE -ne 0) {
+                $issues += "The app source git checkout is not readable."
+            }
+        }
+    }
+
+    if (Test-Path -LiteralPath $NULLION_ENV_FILE) {
+        try {
+            [void](Get-Content -LiteralPath $NULLION_ENV_FILE -TotalCount 1 -ErrorAction Stop)
+        } catch {
+            $issues += "The .env configuration file cannot be read."
+        }
+    }
+
+    if (Test-Path -LiteralPath $runtimeDb) {
+        try {
+            $db = Get-Item -LiteralPath $runtimeDb -ErrorAction Stop
+            if ($db.Length -eq 0) {
+                $issues += "The runtime database exists but is empty."
+            }
+        } catch {
+            $issues += "The runtime database cannot be inspected."
+        }
+    }
+
+    $wrapperPaths = @(
+        "start-nullion.bat",
+        "start-nullion-tray.bat",
+        "start-nullion-telegram.bat",
+        "start-nullion-slack.bat",
+        "start-nullion-discord.bat"
+    ) | ForEach-Object { Join-Path $NULLION_DIR $_ }
+    $hasWrapper = @($wrapperPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+    if ($hasWrapper -and (-not (Test-Path -LiteralPath $venvPython))) {
+        $issues += "Startup wrappers exist but the virtual environment is missing."
+    }
+
+    return $issues
+}
+
+function Invoke-ExistingInstallFreshResetOffer {
+    $forceFresh = (Test-TruthyValue $env:NULLION_FRESH_INSTALL) -or (Test-TruthyValue $env:NULLION_RESET_INSTALL)
+    if ($forceFresh) {
+        Reset-NullionInstallState "NULLION_FRESH_INSTALL/NULLION_RESET_INSTALL was set"
+        return
+    }
+
+    $issues = @(Get-ExistingInstallHealthIssues)
+    if ($issues.Count -eq 0) { return }
+
+    Write-Header "Previous install check"
+    Write-Err "The existing Nullion install looks damaged or left over from a failed setup."
+    foreach ($issue in $issues) {
+        Write-Host "  - $issue" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Info "A fresh reset removes $NULLION_DIR, scheduled tasks, temp installer files, logs, runtime DB, .env, source, and venv."
+    if (Confirm-PromptDefaultYes "Start completely fresh and let setup clean this machine first?") {
+        Reset-NullionInstallState "previous install health check failed"
+    } else {
+        Write-Info "Continuing without a full reset."
+    }
+}
+
+function Invoke-FreshResetAfterInstallFailure {
+    param([Parameter(Mandatory=$true)][string]$Reason)
+    if ($env:NULLION_FRESH_RESET_ALREADY_TRIED -eq "true") { return $false }
+
+    Write-Host ""
+    Write-Err $Reason
+    Write-Info "This can happen when a previous setup left a broken source checkout, venv, config, or runtime state behind."
+    if (-not (Confirm-PromptDefaultYes "Clean the old install completely and restart setup?")) {
+        return $false
+    }
+
+    $env:NULLION_FRESH_RESET_ALREADY_TRIED = "true"
+    $currentPath = Get-InstallerScriptPath
+    $restartPath = $currentPath
+    if ($currentPath -and $env:TEMP -and (Test-Path -LiteralPath $currentPath)) {
+        try {
+            $restartPath = Join-Path $env:TEMP ("nullion-reset-restart-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
+            Copy-Item -LiteralPath $currentPath -Destination $restartPath -Force -ErrorAction Stop
+        } catch {
+            $restartPath = $currentPath
+            Write-Info "Could not prepare a temporary restart copy: $($_.Exception.Message)"
+        }
+    }
+
+    Reset-NullionInstallState $Reason
+
+    if ($restartPath -and (Test-Path -LiteralPath $restartPath)) {
+        Write-Info "Restarting installer after cleanup..."
+        $env:NULLION_INSTALLER_NO_SELF_REFRESH = "true"
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $restartPath
+        $restartExitCode = $LASTEXITCODE
+        if ($restartPath -ne $currentPath) {
+            Remove-Item -Force $restartPath -ErrorAction SilentlyContinue
+        }
+        exit $restartExitCode
+    }
+
+    Write-Info "Cleanup is complete. Re-run the install command to continue from a clean state."
+    exit 1
 }
 
 function Read-ModelName {
@@ -1130,6 +1467,8 @@ $pyVersion = Invoke-Python $PYTHON --version 2>&1
 $pythonDisplay = Format-PythonCommand $PYTHON
 Write-Ok "Using $pythonDisplay ($pyVersion)"
 
+Invoke-ExistingInstallFreshResetOffer
+
 # Step 2: Install Nullion
 Write-Header "Step 2 of 4 - Installing Nullion"
 
@@ -1191,22 +1530,31 @@ if (-not (Test-Path $NULLION_VENV_DIR)) {
     Write-Ok "Virtual environment created."
 }
 
-$NULLION_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-web.exe"
-$NULLION_TRAY_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-tray.exe"
-$NULLION_TELEGRAM_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-telegram.exe"
-$NULLION_SLACK_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-slack.exe"
-$NULLION_DISCORD_EXE = Join-Path $NULLION_VENV_DIR "Scripts\nullion-discord.exe"
+$NULLION_SCRIPTS_DIR = Join-Path $NULLION_VENV_DIR "Scripts"
+$NULLION_EXE = Join-Path $NULLION_SCRIPTS_DIR "nullion-web.exe"
+$NULLION_TRAY_EXE = Join-Path $NULLION_SCRIPTS_DIR "nullion-tray.exe"
+$NULLION_TELEGRAM_EXE = Join-Path $NULLION_SCRIPTS_DIR "nullion-telegram.exe"
+$NULLION_SLACK_EXE = Join-Path $NULLION_SCRIPTS_DIR "nullion-slack.exe"
+$NULLION_DISCORD_EXE = Join-Path $NULLION_SCRIPTS_DIR "nullion-discord.exe"
 
-Write-Info "Installing dependencies (this may take a minute)..."
-& $VENV_PYTHON -m ensurepip --upgrade
-if ($LASTEXITCODE -ne 0) { throw "Could not bootstrap pip in the virtual environment." }
-& $VENV_PYTHON -m pip install --quiet --no-cache-dir --upgrade pip
-if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip in the virtual environment." }
-& $VENV_PYTHON -m pip install --quiet --no-cache-dir -e $SOURCE_DIR
-if ($LASTEXITCODE -ne 0) { throw "Nullion dependency install failed." }
-& $VENV_PYTHON -c "import PIL; import pypdf"
-if ($LASTEXITCODE -ne 0) { throw "PDF runtime dependency check failed." }
+try {
+    Write-Info "Installing dependencies (this may take a minute)..."
+    & $VENV_PYTHON -m ensurepip --upgrade
+    if ($LASTEXITCODE -ne 0) { throw "Could not bootstrap pip in the virtual environment." }
+    & $VENV_PYTHON -m pip install --quiet --no-cache-dir --upgrade pip
+    if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip in the virtual environment." }
+    & $VENV_PYTHON -m pip install --quiet --no-cache-dir -e $SOURCE_DIR
+    if ($LASTEXITCODE -ne 0) { throw "Nullion dependency install failed." }
+    & $VENV_PYTHON -c "import PIL; import pypdf"
+    if ($LASTEXITCODE -ne 0) { throw "PDF runtime dependency check failed." }
+} catch {
+    if (-not (Invoke-FreshResetAfterInstallFailure $_.Exception.Message)) {
+        throw
+    }
+}
+Test-NullionInstalledEntrypoints
 Write-Ok "Nullion installed."
+Add-UserPathEntry $NULLION_SCRIPTS_DIR
 
 [void](Install-PlaywrightRuntime)
 
@@ -2424,6 +2772,8 @@ Write-Host "  This uses Task Scheduler - no admin rights required."
 Write-Host ""
 
 $AUTOSTART_CONFIGURED = $false
+$TRAY_AUTOSTART_CONFIGURED = $false
+$NULLION_STARTED_NOW = $false
 
 if (Confirm-PromptDefaultYes "Set up auto-start at login?") {
     # Build a wrapper bat that sources the env file then launches the bot
@@ -2518,6 +2868,7 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
     $trayResult = Invoke-SchtasksCommand $trayTaskArgs
     if ($trayResult.ExitCode -eq 0) {
         Write-Ok "Tray icon auto-start task registered in Task Scheduler."
+        $TRAY_AUTOSTART_CONFIGURED = $true
     } else {
         Write-Err "Tray schtasks failed: $($trayResult.Output)"
     }
@@ -2574,10 +2925,18 @@ for /f "usebackq tokens=1,* delims==" %%A in ("$NULLION_ENV_FILE") do (
     }
 }
 
+if ($AUTOSTART_CONFIGURED) {
+    $NULLION_STARTED_NOW = Start-NullionScheduledTaskNow $TASK_NAME "Nullion web dashboard"
+    if ($TRAY_AUTOSTART_CONFIGURED) {
+        [void](Start-NullionTrayNow -PreferScheduledTask $true)
+    }
+}
+
 if (-not $AUTOSTART_CONFIGURED) {
     Write-Info "Skipped auto-start. To start manually, run:"
     Write-Host ""
     Write-Host "    $NULLION_EXE --port $NULLION_WEB_PORT --checkpoint $NULLION_DIR\runtime.db" -ForegroundColor Cyan
+    Write-Host "    $NULLION_TRAY_EXE --port $NULLION_WEB_PORT --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
     if ($TELEGRAM_ENABLED) {
         Write-Host ""
         Write-Info "Telegram was configured. Start it manually with:"
@@ -2607,37 +2966,45 @@ Write-Ok "Nullion v$NULLION_VERSION is installed."
 Write-Host ""
 
 if (Confirm-Prompt "Open Nullion in your browser now?") {
-    Write-Info "Starting Nullion..."
-    # Load env vars into current session
-    Get-Content $NULLION_ENV_FILE | ForEach-Object {
-        if ($_ -match '^([^#=]+)="?([^"]*)"?$') {
-            [System.Environment]::SetEnvironmentVariable($Matches[1].Trim(), $Matches[2].Trim(), "Process")
-        }
-    }
-
-    $proc = Start-Process `
-        -FilePath $NULLION_EXE `
-        -ArgumentList "--port", $NULLION_WEB_PORT, "--checkpoint", "$NULLION_DIR\runtime.db" `
-        -RedirectStandardOutput (Join-Path $NULLION_LOG_DIR "nullion.log") `
-        -RedirectStandardError  (Join-Path $NULLION_LOG_DIR "nullion-error.log") `
-        -WindowStyle Hidden `
-        -PassThru
-
-    Start-Sleep -Seconds 2
-    if (-not $proc.HasExited) {
-        Write-Ok "Nullion is running (PID $($proc.Id))"
-        Write-Host ""
-        Write-Host "  --> http://localhost:$NULLION_WEB_PORT" -ForegroundColor Green
-        Write-Host ""
+    if ($NULLION_STARTED_NOW) {
+        Write-Info "Opening the running Nullion dashboard..."
+        Start-Sleep -Seconds 2
         Start-Process "http://localhost:$NULLION_WEB_PORT"
     } else {
-        Write-Err "Nullion exited unexpectedly. Check the log:"
-        Write-Host "    notepad `"$(Join-Path $NULLION_LOG_DIR 'nullion-error.log')`""
+        Write-Info "Starting Nullion..."
+        # Load env vars into current session
+        Get-Content $NULLION_ENV_FILE | ForEach-Object {
+            if ($_ -match '^([^#=]+)="?([^"]*)"?$') {
+                [System.Environment]::SetEnvironmentVariable($Matches[1].Trim(), $Matches[2].Trim(), "Process")
+            }
+        }
+
+        $proc = Start-Process `
+            -FilePath $NULLION_EXE `
+            -ArgumentList "--port", $NULLION_WEB_PORT, "--checkpoint", "$NULLION_DIR\runtime.db" `
+            -RedirectStandardOutput (Join-Path $NULLION_LOG_DIR "nullion.log") `
+            -RedirectStandardError  (Join-Path $NULLION_LOG_DIR "nullion-error.log") `
+            -WindowStyle Hidden `
+            -PassThru
+
+        Start-Sleep -Seconds 2
+        if (-not $proc.HasExited) {
+            Write-Ok "Nullion is running (PID $($proc.Id))"
+            [void](Start-NullionTrayNow -PreferScheduledTask $false)
+            Write-Host ""
+            Write-Host "  --> http://localhost:$NULLION_WEB_PORT" -ForegroundColor Green
+            Write-Host ""
+            Start-Process "http://localhost:$NULLION_WEB_PORT"
+        } else {
+            Write-Err "Nullion exited unexpectedly. Check the log:"
+            Write-Host "    notepad `"$(Join-Path $NULLION_LOG_DIR 'nullion-error.log')`""
+        }
     }
 } else {
     Write-Host ""
     Write-Info "To start manually:"
     Write-Host "    $NULLION_EXE --port $NULLION_WEB_PORT --checkpoint $NULLION_DIR\runtime.db" -ForegroundColor Cyan
+    Write-Host "    $NULLION_TRAY_EXE --port $NULLION_WEB_PORT --env-file $NULLION_ENV_FILE" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Then open:  http://localhost:$NULLION_WEB_PORT" -ForegroundColor Green
     Write-Host ""
@@ -2651,6 +3018,7 @@ if ($BrowserNote) {
 }
 
 Write-Host "  Logs:    $NULLION_LOG_DIR\nullion.log" -ForegroundColor Cyan
+Write-Host "  Tray:    $NULLION_LOG_DIR\tray-error.log" -ForegroundColor Cyan
 Write-Host "  Config:  $NULLION_ENV_FILE" -ForegroundColor Cyan
 if ($AUTOSTART_CONFIGURED) {
     Write-Host "  To stop: Open Task Scheduler and disable the '$TASK_NAME' task" -ForegroundColor Cyan

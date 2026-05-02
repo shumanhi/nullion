@@ -959,10 +959,12 @@ def _install_tray_autostart(*, port: int = 8742, start: bool = True) -> bool:
             return _start_tray_service()
         return True
     if os.name == "nt":
-        _install_tray_windows_task(exe=exe, port=port)
+        installed = _install_tray_windows_task(exe=exe, port=port)
         if start:
-            return _start_tray_service()
-        return True
+            if installed:
+                return _start_tray_service()
+            return _start_tray_directly(port=port)
+        return installed
     print("  Tray auto-start installer is currently supported on macOS and Windows.")
     print(f"  You can run manually with: {exe} --port {port}")
     return False
@@ -1055,8 +1057,17 @@ def _install_tray_launchd(*, exe: Path, port: int) -> None:
     print(f"  Installed tray LaunchAgent: {plist}")
 
 
-def _install_tray_windows_task(*, exe: Path, port: int) -> None:
+def _summarize_subprocess_error(result: subprocess.CompletedProcess[str]) -> str:
+    detail = (result.stderr or result.stdout or "").strip()
+    if not detail:
+        return f"exit code {result.returncode}"
+    return detail.splitlines()[0].strip()
+
+
+def _install_tray_windows_task(*, exe: Path, port: int) -> bool:
     wrapper = _NULLION_HOME / "start-nullion-tray.bat"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
     wrapper.write_text(
         textwrap.dedent(
             f"""\
@@ -1068,24 +1079,31 @@ def _install_tray_windows_task(*, exe: Path, port: int) -> None:
             """
         )
     )
-    subprocess.run(
-        [
-            "schtasks",
-            "/Create",
-            "/F",
-            "/TN",
-            "Nullion Tray",
-            "/SC",
-            "ONLOGON",
-            "/TR",
-            str(wrapper),
-            "/RL",
-            "LIMITED",
-            "/IT",
-        ],
-        check=False,
-    )
-    print("  Installed tray scheduled task: Nullion Tray")
+    base_command = [
+        "schtasks",
+        "/Create",
+        "/F",
+        "/TN",
+        "Nullion Tray",
+        "/SC",
+        "ONLOGON",
+        "/TR",
+        f'"{wrapper}"',
+        "/RL",
+        "LIMITED",
+    ]
+    for command in (base_command + ["/IT"], base_command):
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("  Installed tray scheduled task: Nullion Tray")
+            return True
+        if "/IT" in command:
+            print(f"  Task Scheduler interactive mode was refused: {_summarize_subprocess_error(result)}")
+            print("  Retrying tray task without interactive-only mode.")
+            continue
+        print(f"  Could not install tray scheduled task: {_summarize_subprocess_error(result)}")
+    print(f"  Tray can still be started manually with: {exe} --port {port} --env-file {_ENV_FILE}")
+    return False
 
 
 def _start_tray_service() -> bool:
@@ -1139,18 +1157,47 @@ def _start_tray_service() -> bool:
         print("  Tray icon did not start.")
         return False
     elif os.name == "nt":
-        result = subprocess.run(["schtasks", "/Run", "/TN", "Nullion Tray"], check=False)
+        result = subprocess.run(
+            ["schtasks", "/Run", "/TN", "Nullion Tray"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
         if result.returncode == 0:
             print("  Started tray icon.")
             return True
-        print("  Tray icon did not start.")
-        return False
+        print(f"  Task Scheduler could not start the tray: {_summarize_subprocess_error(result)}")
+        print("  Trying direct tray launch.")
+        return _start_tray_directly(port=_default_web_port())
     else:
         exe = _tray_executable()
         if exe:
             subprocess.Popen([str(exe)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print("  Started tray icon.")
             return True
+    return False
+
+
+def _start_tray_directly(*, port: int | None = None) -> bool:
+    exe = _tray_executable()
+    if not exe:
+        print("  Could not find nullion-tray. Run the installer/update again.")
+        return False
+    if not exe.exists():
+        print(f"  Tray executable is missing: {exe}")
+        return False
+    port = port or _default_web_port()
+    command = [str(exe), "--port", str(port), "--env-file", str(_ENV_FILE)]
+    try:
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("  Started tray icon directly.")
+        return True
+    except FileNotFoundError:
+        print(f"  Tray executable is missing: {exe}")
+    except PermissionError as exc:
+        print(f"  Windows blocked the tray launch: {exc}")
+    except OSError as exc:
+        print(f"  Direct tray launch failed: {exc}")
     return False
 
 
