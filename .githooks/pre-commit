@@ -20,6 +20,23 @@ if [ -n "$staged_test_files" ]; then
     exit 1
 fi
 
+test_artifacts="$(
+    find . \
+        -path ./.git -prune -o \
+        -path ./.venv -prune -o \
+        -path ./.mypy_cache -prune -o \
+        -path ./.pytest_cache -prune -o \
+        -path ./__pycache__ -prune -o \
+        -path './src/*.egg-info' -prune -o \
+        -type d \( -name tests -o -name test \) -print -prune -o \
+        -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print
+)"
+if [ -n "$test_artifacts" ]; then
+    echo "Do not keep test files or test folders in this repo. Move them to ../nullion-test:" >&2
+    echo "$test_artifacts" >&2
+    exit 1
+fi
+
 if [ -x ".venv/bin/python" ]; then
     python_cmd=".venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
