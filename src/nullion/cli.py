@@ -1514,8 +1514,13 @@ def _schedule_windows_tree_removal(path: Path) -> None:
     script = Path(tempfile.gettempdir()) / f"nullion-uninstall-{os.getpid()}.cmd"
     script.write_text(
         "@echo off\r\n"
-        "ping 127.0.0.1 -n 3 > nul\r\n"
-        f'rmdir /s /q "{target}"' + "\r\n"
+        "for /l %%i in (1,1,60) do (\r\n"
+        f'  if not exist "{target}" goto done' + "\r\n"
+        f'  rmdir /s /q "{target}" > nul 2> nul' + "\r\n"
+        f'  if not exist "{target}" goto done' + "\r\n"
+        "  ping 127.0.0.1 -n 2 > nul\r\n"
+        ")\r\n"
+        ":done\r\n"
         'del "%~f0" > nul 2> nul\r\n',
         encoding="utf-8",
     )
