@@ -3219,6 +3219,7 @@ def _build_terminal_exec_handler(
     terminal_attestation_verifier: TerminalAttestationVerifier | None = None,
 ) -> ToolHandler:
     cwd = Path(workspace_root).resolve() if workspace_root is not None else None
+    execution_cwd = cwd if cwd is not None and cwd.is_dir() else None
     resolved_allowed_roots = (
         tuple(Path(root).expanduser().resolve() for root in allowed_roots)
         if allowed_roots is not None
@@ -3354,7 +3355,7 @@ def _build_terminal_exec_handler(
         try:
             completed = backend.run(
                 raw_command,
-                cwd=str(cwd) if cwd is not None else None,
+                cwd=str(execution_cwd) if execution_cwd is not None else None,
                 timeout=20,
                 policy=policy,
             )
