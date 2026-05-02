@@ -847,11 +847,14 @@ details = run_post_update_migrations(
 )
 print(json.dumps({"ok": True, "warnings": details.get("warnings") or []}, sort_keys=True))
 '@
+    $tmpCode = $null
     try {
         $env:NULLION_ENV_FILE = $NULLION_ENV_FILE
         $env:NULLION_INSTALL_DIR = $NULLION_DIR
         $env:NULLION_CHECKPOINT_PATH = $checkpointPath
-        & $VENV_PYTHON -c $code $NULLION_ENV_FILE $checkpointPath $NULLION_DIR | Out-Null
+        $tmpCode = [System.IO.Path]::GetTempFileName()
+        Set-Content -Path $tmpCode -Value $code -Encoding UTF8
+        & $VENV_PYTHON $tmpCode $NULLION_ENV_FILE $checkpointPath $NULLION_DIR | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "Local runtime database is ready."
         } else {
@@ -859,6 +862,10 @@ print(json.dumps({"ok": True, "warnings": details.get("warnings") or []}, sort_k
         }
     } catch {
         Write-Err "Could not finalize the local runtime database. Setup can continue; run Nullion once to retry migrations."
+    } finally {
+        if ($tmpCode) {
+            Remove-Item -Force $tmpCode -ErrorAction SilentlyContinue
+        }
     }
 }
 
