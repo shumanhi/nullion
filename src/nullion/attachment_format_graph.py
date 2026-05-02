@@ -44,23 +44,27 @@ class AttachmentFormatPlan:
 
 class AttachmentFormatState(TypedDict, total=False):
     text: str
-    tokens: list[str]
+    extensions: list[str]
     plan: AttachmentFormatPlan
 
 
-def _word_tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+def _explicit_extensions(text: str) -> list[str]:
+    seen: list[str] = []
+    for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(text or "")):
+        extension = ATTACHMENT_TOKEN_EXTENSIONS.get(match.group(1).lower())
+        if extension is not None and extension not in seen:
+            seen.append(extension)
+    return seen
 
 
 def _normalize_node(state: AttachmentFormatState) -> dict[str, object]:
-    return {"tokens": _word_tokens(state.get("text") or "")}
+    return {"extensions": _explicit_extensions(state.get("text") or "")}
 
 
 def _extension_token_node(state: AttachmentFormatState) -> dict[str, object]:
-    for token in state.get("tokens") or []:
-        extension = ATTACHMENT_TOKEN_EXTENSIONS.get(token)
-        if extension is not None:
-            return {"plan": AttachmentFormatPlan(extension=extension, evidence="extension_token")}
+    extensions = state.get("extensions") or []
+    if extensions:
+        return {"plan": AttachmentFormatPlan(extension=extensions[0], evidence="literal_extension")}
     return {}
 
 

@@ -2982,6 +2982,16 @@ def update_active_task_frame_from_outcomes(
     ]
     updated_frame = frame
     now = datetime.now(UTC)
+    outcome_metadata = {
+        **dict(getattr(updated_frame, "metadata", {}) or {}),
+        "last_outcome": {
+            "updated_at": now.isoformat(),
+            "completion_turn_id": completion_turn_id,
+            "rendered_reply": rendered_reply,
+            "tool_results": _compact_task_frame_tool_results(tool_results),
+        },
+    }
+    updated_frame = replace(updated_frame, metadata=outcome_metadata, updated_at=now)
 
     for result, normalized_status in normalized_results:
         if normalized_status != "denied":
@@ -3027,6 +3037,33 @@ def update_active_task_frame_from_outcomes(
 
     store.add_task_frame(updated_frame)
     return updated_frame
+
+
+def _compact_task_frame_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+) -> list[dict[str, object]]:
+    compact: list[dict[str, object]] = []
+    for result in tool_results:
+        output = result.output if isinstance(result.output, dict) else {}
+        summary: dict[str, object] = {}
+        for key in ("summary", "message", "path", "artifact_path", "url", "title"):
+            value = output.get(key)
+            if value:
+                summary[key] = str(value)[:1200]
+        for key in ("artifact_paths", "artifacts", "results"):
+            value = output.get(key)
+            if isinstance(value, list):
+                summary[key] = value[:10]
+        if result.error:
+            summary["error"] = str(result.error)[:1200]
+        compact.append(
+            {
+                "tool_name": result.tool_name,
+                "status": result.status,
+                "output": summary,
+            }
+        )
+    return compact
 
 
 def _rendered_reply_has_existing_media_attachment(rendered_reply: str) -> bool:
@@ -3115,7 +3152,11 @@ def process_conversation_message(
     if disposition_reason == "ambiguity_classifier" and ambiguity_classifier_reason:
         disposition_reason = f"ambiguity_classifier:{ambiguity_classifier_reason}"
     should_continue = disposition is ConversationTurnDisposition.CONTINUE and active_branch is not None
-    task_frame_branch_continuous = active_branch is not None
+    task_frame_branch_continuous = (
+        active_branch is not None
+        and active_task_frame is not None
+        and active_branch.branch_id == active_task_frame.branch_id
+    )
     task_frame_continuation = (
         resolve_task_frame_continuation(
             text=user_message,
@@ -6039,42 +6080,18 @@ def transition_skill_execution_plan_for_step_completion(
     return updated
 
 
-def _skill_matching_tokens(value: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", value.lower()))
-
-
 def _recommend_skills_with_scores(
     store: RuntimeStore,
     text: str,
     *,
     limit: int = 3,
 ) -> list[tuple[int, SkillRecord]]:
-    if limit <= 0:
-        return []
-    normalized_text = text.strip().lower()
-    if not normalized_text:
-        return []
-    query_tokens = _skill_matching_tokens(normalized_text)
-    if not query_tokens:
-        return []
+    """Return no free-text skill matches.
 
-    scored: list[tuple[int, SkillRecord]] = []
-    for skill in list_skills(store):
-        title_tokens = _skill_matching_tokens(skill.title)
-        trigger_tokens = _skill_matching_tokens(skill.trigger)
-        tag_tokens = {_tag.lower() for _tag in skill.tags}
-        score = 0
-        score += len(query_tokens & title_tokens) * 3
-        score += len(query_tokens & trigger_tokens) * 2
-        score += len(query_tokens & tag_tokens)
-        if skill.title.lower() in normalized_text:
-            score += 4
-        if score <= 0:
-            continue
-        scored.append((score, skill))
-
-    scored.sort(key=lambda item: (-item[0], item[1].title.lower(), item[1].skill_id))
-    return scored[:limit]
+    Learned-skill application is now driven by explicit structured signals
+    instead of word or phrase matches over user prompts.
+    """
+    return []
 
 
 

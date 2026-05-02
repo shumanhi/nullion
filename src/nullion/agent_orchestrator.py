@@ -368,11 +368,10 @@ def _repeated_tool_failure_message(
     result: ToolResult,
     repeated_count: int,
 ) -> str:
-    output = result.output if isinstance(result.output, dict) else {}
-    detail = result.error or output.get("reason") or result.status
+    tool_label = str(result.tool_name or "tool").replace("_", " ").strip() or "tool"
     return (
-        f"I stopped after `{result.tool_name}` returned the same non-completing result "
-        f"{repeated_count} time(s). Last detail: {detail}"
+        f"I stopped because the same {tool_label} step failed {repeated_count} times in a row. "
+        "I did not keep retrying the same action."
     )
 
 

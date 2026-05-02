@@ -148,7 +148,7 @@ def detect_patterns(
     groups: dict[tuple[str, ...], list[TurnSignal]] = {}
     for signal in tool_turns:
         key = _canonical_tool_sequence(signal.tool_names)
-        if not key:
+        if not key or len(set(key)) < 2:
             continue
         groups.setdefault(key, []).append(signal)
 

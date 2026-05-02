@@ -781,6 +781,17 @@ ToolHandler = Callable[[ToolInvocation], ToolResult]
 ToolCleanupHook = Callable[[str | None], None]
 
 
+_TEXT_FILE_WRITE_BLOCKED_EXTENSIONS = frozenset({
+    ".doc",
+    ".docx",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+})
+
+
 def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
     schemas: dict[str, dict[str, object]] = {
         "file_read": {
@@ -2569,6 +2580,17 @@ def _build_file_write_handler(
                 output={},
                 error=f"Path is outside workspace root: {path}",
             )
+        if path.suffix.lower() in _TEXT_FILE_WRITE_BLOCKED_EXTENSIONS:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"path": str(path)},
+                error=(
+                    f"file_write is text-only and cannot create {path.suffix.lower()} artifacts. "
+                    "Use a dedicated artifact tool or verified generator for that file type."
+                ),
+            )
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(raw_content, encoding="utf-8")
@@ -4203,6 +4225,7 @@ def _build_file_search_handler(
 
         pattern = raw_pattern.lower()
         matches: list[str] = []
+        seen_matches: set[str] = set()
         for root in search_roots:
             for current_dir, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
                 current_path = Path(current_dir)
@@ -4238,7 +4261,11 @@ def _build_file_search_handler(
                         continue
                     if resolved_root is not None and not _is_within_allowed_root(resolved_path, resolved_root):
                         continue
-                    matches.append(str(resolved_path))
+                    resolved_text = str(resolved_path)
+                    if resolved_text in seen_matches:
+                        continue
+                    seen_matches.add(resolved_text)
+                    matches.append(resolved_text)
                     if len(matches) >= limit:
                         break
                 if len(matches) >= limit:

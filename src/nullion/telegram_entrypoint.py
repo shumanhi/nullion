@@ -457,8 +457,11 @@ async def _send_operator_telegram_message(bot_token: str, chat_id: str, text: st
     """Fire-and-forget: send a single Telegram message to the operator chat."""
     try:
         from telegram import Bot  # type: ignore[import]
+        from nullion.telegram_formatting import format_telegram_text
+
+        formatted_text, message_kwargs = format_telegram_text(text)
         async with Bot(bot_token) as bot:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, formatted_text, **message_kwargs)
     except Exception:
         logger.warning("Failed to deliver operator notification message", exc_info=True)
 
@@ -483,17 +486,23 @@ async def _send_operator_telegram_delivery(
             prepare_reply_for_platform_delivery,
             record_platform_delivery_receipt,
         )
+        from nullion.telegram_formatting import format_telegram_text
 
         delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
         async with Bot(bot_token) as bot:
             if delivery.attachments:
                 caption = delivery.text
                 for index, attachment_path in enumerate(delivery.attachments):
+                    caption_text = caption[:1024] if caption and index == 0 else None
+                    caption_kwargs = {}
+                    if caption_text:
+                        caption_text, caption_kwargs = format_telegram_text(caption_text)
                     with attachment_path.open("rb") as document:
                         await bot.send_document(
                             chat_id,
                             document,
-                            caption=caption[:1024] if caption and index == 0 else None,
+                            caption=caption_text,
+                            **caption_kwargs,
                         )
                 record_platform_delivery_receipt(
                     build_platform_delivery_receipt(
@@ -511,7 +520,10 @@ async def _send_operator_telegram_delivery(
                 message_kwargs["disable_web_page_preview"] = True
             if parse_mode:
                 message_kwargs["parse_mode"] = parse_mode
-            message_text = text if parse_mode else (delivery.text or "")
+                message_text = text
+            else:
+                message_text, formatting_kwargs = format_telegram_text(delivery.text or "")
+                message_kwargs.update(formatting_kwargs)
             await bot.send_message(chat_id, message_text, **message_kwargs)
             record_platform_delivery_receipt(
                 build_platform_delivery_receipt(

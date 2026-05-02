@@ -35,6 +35,7 @@ from nullion.messaging_adapters import (
     prepare_reply_for_platform_delivery,
     record_platform_delivery_receipt,
     retry_messaging_delivery_operation,
+    sanitize_external_inline_markup,
     save_messaging_attachment,
     split_reply_for_platform_delivery,
 )
@@ -48,7 +49,12 @@ from nullion.chat_streaming import (
     iter_chat_text_chunks,
     select_chat_streaming_mode,
 )
-from nullion.doctor_actions import PENDING as DOCTOR_ACTION_PENDING
+from nullion.doctor_actions import (
+    CANCELLED as DOCTOR_ACTION_CANCELLED,
+    COMPLETED as DOCTOR_ACTION_COMPLETED,
+    FAILED as DOCTOR_ACTION_FAILED,
+    PENDING as DOCTOR_ACTION_PENDING,
+)
 from nullion.run_activity import RunActivityPhase, classify_run_activity_phase
 from nullion.health import HealthIssueType
 from nullion.operator_commands import (
@@ -311,6 +317,35 @@ async def _reply_text_in_chunks_with_plain_fallback(
     do_quote: bool,
     **kwargs,
 ) -> None:
+    if "parse_mode" in kwargs and len(formatted_text) > _TELEGRAM_MESSAGE_CHUNK_SIZE:
+        reply_text = getattr(message, "reply_text", None)
+        if reply_text is None:
+            raise AttributeError("Telegram message object has no reply_text method")
+        plain_chunks = _split_telegram_message_chunks(plain_text, limit=3000)
+        index = 0
+        while index < len(plain_chunks):
+            plain_chunk = plain_chunks[index]
+            chunk_text, chunk_kwargs = format_telegram_text(plain_chunk)
+            if len(chunk_text) > _TELEGRAM_MESSAGE_CHUNK_SIZE and len(plain_chunk) > 1:
+                plain_chunks[index:index + 1] = _split_telegram_message_chunks(plain_chunk, limit=max(1, len(plain_chunk) // 2))
+                continue
+            chunk_kwargs = {
+                **_without_parse_mode(kwargs),
+                **chunk_kwargs,
+            }
+            try:
+                await reply_text(chunk_text, do_quote=do_quote if index == 0 else False, **chunk_kwargs)
+            except Exception as exc:
+                if "parse_mode" not in chunk_kwargs or not _is_telegram_parse_error(exc):
+                    raise
+                logger.warning("Telegram rejected formatted chunk; retrying as plain text.", exc_info=True)
+                await reply_text(
+                    sanitize_external_inline_markup(plain_chunk),
+                    do_quote=do_quote if index == 0 else False,
+                    **_without_parse_mode(chunk_kwargs),
+                )
+            index += 1
+        return
     try:
         await _reply_text_in_chunks(message, formatted_text, do_quote=do_quote, **kwargs)
     except Exception as exc:
@@ -403,6 +438,14 @@ class DecisionCard:
     # than replacing it.  Use for doctor-action notifications so that the agent's
     # actual answer is never silently discarded.
     supplemental: bool = False
+
+
+_CLOSED_DOCTOR_ACTION_STATUSES = {
+    DOCTOR_ACTION_COMPLETED,
+    DOCTOR_ACTION_CANCELLED,
+    DOCTOR_ACTION_FAILED,
+}
+_TELEGRAM_NOTIFIED_DOCTOR_ACTION_IDS: set[str] = set()
 
 
 def _capture_decision_snapshot(runtime: PersistentRuntime) -> DecisionSnapshot:
@@ -529,6 +572,10 @@ def _doctor_decision_actions(action: dict[str, object]) -> tuple[tuple[str, str]
     if remediation_actions:
         return remediation_actions + (("Mark resolved", "complete"), ("Dismiss", "cancel"))
     return (("Mark in progress", "start"), ("Mark resolved", "complete"), ("Dismiss", "cancel"))
+
+
+def _doctor_action_is_closed(action: dict[str, object] | None) -> bool:
+    return str((action or {}).get("status") or "").lower() in _CLOSED_DOCTOR_ACTION_STATUSES
 
 
 _HELP_NAV_CATEGORIES = [
@@ -1067,9 +1114,13 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
         if str(action.get("status")) == DOCTOR_ACTION_PENDING
     }
     new_doctor_action_ids = sorted(set(pending_doctor_actions) - set(before.pending_doctor_action_ids))
+    new_doctor_action_ids = [
+        action_id for action_id in new_doctor_action_ids if action_id not in _TELEGRAM_NOTIFIED_DOCTOR_ACTION_IDS
+    ]
     if new_doctor_action_ids:
         action = pending_doctor_actions[new_doctor_action_ids[0]]
         action_id = str(action["action_id"])
+        _TELEGRAM_NOTIFIED_DOCTOR_ACTION_IDS.add(action_id)
         return DecisionCard(
             text=_doctor_card_text(action),
             reply_markup=_build_decision_markup(
@@ -1453,7 +1504,8 @@ async def _send_operator_telegram_message(
                         )
                 return
             if delivery.text:
-                await bot.send_message(chat_id=chat_id, text=delivery.text)
+                formatted, kwargs = format_telegram_text(delivery.text)
+                await bot.send_message(chat_id=chat_id, text=formatted, **kwargs)
     except Exception:
         logger.debug("Failed to deliver Telegram operator message", exc_info=True)
 
@@ -2017,6 +2069,25 @@ def _approval_resume_fallback_reply(approval, reply: str) -> str:
     return f"{text}\nPlease resend your message if it does not continue automatically."
 
 
+def _resume_delivery_channel_for_approval(runtime, approval) -> str:
+    if approval is None:
+        return "telegram"
+    suspended_turn = runtime.store.get_suspended_turn(getattr(approval, "approval_id", ""))
+    conversation_id = getattr(suspended_turn, "conversation_id", None)
+    if isinstance(conversation_id, str) and ":" in conversation_id:
+        channel, _, _ = conversation_id.partition(":")
+        channel = channel.strip().lower()
+        if channel:
+            return channel
+    requested_by = getattr(approval, "requested_by", None)
+    if isinstance(requested_by, str) and ":" in requested_by:
+        channel, _, _ = requested_by.partition(":")
+        channel = channel.strip().lower()
+        if channel:
+            return channel
+    return "telegram"
+
+
 def _execute_decision_action(
     service: "ChatOperatorService",
     *,
@@ -2109,6 +2180,15 @@ def _execute_decision_action(
         return acknowledgement, reply
 
     if kind == "doctor":
+        current = service.runtime.store.get_doctor_action(record_id)
+        if current is None:
+            _refresh_runtime_from_checkpoint(service.runtime)
+            current = service.runtime.store.get_doctor_action(record_id)
+        if current is None:
+            return "Expired", "That Doctor action is no longer active."
+        if _doctor_action_is_closed(current):
+            status = str(current.get("status") or "closed").replace("_", " ")
+            return "Already closed", f"{_doctor_card_text(current)}\n\nThis card is already {status}."
         if action == "start":
             updated = service.runtime.start_doctor_action(record_id)
             logger.info("Started Doctor action %s, status=%s", record_id, updated.get("status"))
@@ -2512,6 +2592,7 @@ class ChatOperatorService:
             conversation_id or f"telegram:{inflight_key}",
             text_for_ack or "",
             turn_id=dedupe_key or message_id or request_id,
+            model_client=self.model_client,
         )
 
         busy_ack = None
@@ -2590,7 +2671,7 @@ class ChatOperatorService:
                 _help_text_raw = _message_text_or_caption(
                     getattr(update, "message", None) or getattr(update, "effective_message", None)
                 )
-                if isinstance(_help_text_raw, str) and _help_text_raw.strip().lower() in {"/help", "help"}:
+                if isinstance(_help_text_raw, str) and _help_text_raw.strip().lower() == "/help":
                     _help_card = _build_help_menu_card()
                     if _help_card is not None:
                         if dedupe_key is not None and conversation_id is not None:
@@ -2668,9 +2749,10 @@ class ChatOperatorService:
                         self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
                         self.runtime.checkpoint()
                     return
-                suppress_primary_reply_delivery = (
-                    handler_error is None
-                    and _should_suppress_planner_status_ack(
+                turn_superseded = handler_error is None and await turn_registration.is_superseded()
+                suppress_primary_reply_delivery = handler_error is None and (
+                    turn_superseded
+                    or _should_suppress_planner_status_ack(
                         self.runtime,
                         chat_id=chat_id_text,
                         reply=reply,
@@ -2920,6 +3002,7 @@ class ChatOperatorService:
             should_resume_approval = kind == "approval" and action in {"approve", "allow_session", "allow_once", "always_allow"}
             if should_resume_approval:
                 approval = self.runtime.store.get_approval_request(record_id)
+                resume_delivery_channel = _resume_delivery_channel_for_approval(self.runtime, approval)
                 resumed_principal_id = (
                     approval.requested_by
                     if approval is not None
@@ -2977,8 +3060,14 @@ class ChatOperatorService:
                                 "Approval required. Open /approvals to continue.",
                                 principal_id=resumed_principal_id,
                             )
-                    else:
+                    elif resume_delivery_channel == "telegram":
                         await _send_callback_follow_up(message, resumed_reply, principal_id=resumed_principal_id)
+                    else:
+                        logger.info(
+                            "Skipped Telegram resumed reply for approval_id=%s because origin channel is %s",
+                            record_id,
+                            resume_delivery_channel,
+                        )
                 else:
                     # Resume produced no output — notify the user so they know to retry.
                     logger.warning(
@@ -2987,11 +3076,12 @@ class ChatOperatorService:
                         record_id,
                         chat_id_text,
                     )
-                    await _send_callback_follow_up(
-                        message,
-                        _approval_resume_fallback_reply(approval, reply),
-                        principal_id=resumed_principal_id,
-                    )
+                    if resume_delivery_channel == "telegram":
+                        await _send_callback_follow_up(
+                            message,
+                            _approval_resume_fallback_reply(approval, reply),
+                            principal_id=resumed_principal_id,
+                        )
         finally:
             await _stop_typing_keepalive(typing_keepalive_task)
 

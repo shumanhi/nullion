@@ -548,7 +548,7 @@ class ChatStore:
     def import_runtime_chat_turns(self, turns: Iterable[dict]) -> int:
         """Import messaging chat turns from the runtime event log.
 
-        Older Slack/Discord/Telegram turns may exist in ``runtime-store.json``
+        Older web/Slack/Discord/Telegram turns may exist in ``runtime-store.json``
         but predate the unified web history database. This importer backfills
         those turns while avoiding obvious duplicates from adapters that already
         persisted directly to ``chat_history.db``.
@@ -562,7 +562,7 @@ class ChatStore:
         with self._connect() as conn:
             for turn in sorted_turns:
                 conversation_id = str(turn.get("conversation_id") or "").strip()
-                if not conversation_id.startswith(("telegram:", "slack:", "discord:")):
+                if not conversation_id.startswith(("web:", "telegram:", "slack:", "discord:")):
                     continue
                 created_at = str(turn.get("created_at") or "").strip() or _now()
                 user_message = str(turn.get("user_message") or "").strip()

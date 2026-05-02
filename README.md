@@ -28,7 +28,39 @@ curl -fsSL "https://raw.githubusercontent.com/shumanhi/nullion/main/install.sh?$
 irm https://raw.githubusercontent.com/shumanhi/nullion/main/install.ps1 | iex
 ```
 
-The installer sets everything up, walks you through connecting your API keys, and starts Nullion automatically. Takes about a minute.
+Nullion needs Python 3.11 through 3.13. The installer checks for Python first and
+tries to install it automatically when it is missing:
+
+- Windows: installs Python 3.12 with `winget`
+- macOS: installs Python 3.12 with Homebrew
+- Linux: installs Python with `apt`, `dnf`, `pacman`, or `zypper`
+
+If the automatic Python install is blocked, install Python manually and rerun
+the Nullion installer:
+
+```powershell
+# Windows PowerShell
+winget install --id Python.Python.3.12 --source winget -e
+py -3.12 --version
+```
+
+```bash
+# macOS
+brew install python@3.12
+python3.12 --version
+```
+
+Avoid Python 3.14 for now on Windows; some tray/webview dependencies do not
+publish compatible wheels yet.
+
+```bash
+# Debian/Ubuntu
+sudo apt-get update
+sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
+python3.12 --version
+```
+
+The installer sets everything else up, walks you through connecting your API keys, and starts Nullion automatically. Takes about a minute.
 
 On macOS and Windows, Nullion also includes an optional tray/menu-bar companion:
 
@@ -77,7 +109,10 @@ bash install.sh
 - Pluggable chat adapters — Telegram, Slack, Discord, and Web UI
 - Clear everyday wording
 - Parallel mini-agent execution through a warm pool
-- LangGraph-backed routing for parallel turns and dependent follow-ups
+- LangChain model/tool adapters for provider-agnostic execution
+- LangGraph-backed routing for parallel turns, dependent follow-ups, approvals,
+  and delivery workflows
+- Deep Agents harness for scoped mini-agent tasks
 - Contract-based file, PDF, image, and document delivery across web and messaging
 - Global Doctor for health checks and safe recovery
 - Global Sentinel for approval, boundary policy, and grant management
@@ -87,8 +122,16 @@ bash install.sh
 
 ## Launch feature summary
 
+- **LangChain-native integration** — Nullion exposes its scoped tools as
+  LangChain structured tools and wraps configured model clients as LangChain chat
+  models, so orchestration can use standard interfaces without bypassing
+  Sentinel policy.
+- **LangGraph workflows** — turn routing, Telegram delivery planning, artifact
+  finalization, attachment formatting, and approval decisions run through typed
+  state graphs instead of prompt-string branching.
 - **Parallel work** — complex requests can be decomposed into bounded subtasks,
-  dispatched to warm mini-agents, and merged by a result aggregator.
+  dispatched through Deep Agents/warm mini-agents, and merged by a result
+  aggregator.
 - **Two-layer safety** — Sentinel separates tool capability grants from boundary
   policy for domains, file roots, accounts, workspaces, and other scoped
   resources.

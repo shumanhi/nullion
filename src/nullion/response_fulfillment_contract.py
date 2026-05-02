@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -48,6 +50,18 @@ def _text_from_value(value: object) -> str:
 def user_visible_text_from_output(output: object) -> str:
     """Extract deliverable text from provider/tool output without assuming a concrete result type."""
     return _text_from_value(output)
+
+
+def _clean_tool_evidence_text(value: object) -> str:
+    text = html.unescape(str(value or "")).strip()
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _needs_tool_evidence_fallback(reply: str) -> bool:
+    return _text_from_value(reply) == ""
 
 
 def guaranteed_user_visible_text(*, subject: object, output: object, kind: str = "task") -> str:
@@ -169,6 +183,34 @@ def _active_frame_for_contract(store, conversation_id: str):
     return frame
 
 
+def _completed_tool_evidence_reply(tool_results: Iterable[ToolResult] | None) -> str | None:
+    fetch_lines: list[str] = []
+    search_fallback_text: str | None = None
+    saw_search_output = False
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name == "web_search":
+            saw_search_output = bool(output) or saw_search_output
+            text = _clean_tool_evidence_text(user_visible_text_from_output(output))
+            if text:
+                search_fallback_text = text
+        elif result.tool_name == "web_fetch":
+            title = _clean_tool_evidence_text(output.get("title"))
+            url = _clean_tool_evidence_text(output.get("url"))
+            if title or url:
+                fetch_lines.append(f"- **{title or url}**" + (f" — {url}" if title and url else ""))
+
+    if search_fallback_text:
+        return search_fallback_text
+    if fetch_lines:
+        return "I fetched the requested page:\n\n" + "\n".join(fetch_lines)
+    if saw_search_output:
+        return "The search completed, but it did not return a clean user-visible summary."
+    return None
+
+
 def evaluate_response_fulfillment(
     *,
     store,
@@ -247,6 +289,14 @@ def evaluate_response_fulfillment(
                 f"I can’t mark this complete yet — this task still needs {', '.join(missing)}."
             )
         return ResponseFulfillmentDecision(False, response, tuple(missing))
+
+    evidence_reply = (
+        _completed_tool_evidence_reply(result for result, _status in normalized_results)
+        if _needs_tool_evidence_fallback(reply)
+        else None
+    )
+    if evidence_reply:
+        return ResponseFulfillmentDecision(True, evidence_reply)
 
     return ResponseFulfillmentDecision(True, reply)
 

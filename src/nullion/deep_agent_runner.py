@@ -296,35 +296,16 @@ def _artifact_delivery_failure_for_task(config, artifact_paths: list[str], deliv
 
 
 def _task_requires_user_file_delivery(task) -> bool:
-    text = f"{getattr(task, 'title', '')} {getattr(task, 'description', '')}".lower()
-    action_terms = (
-        "send",
-        "attach",
-        "download",
-        "deliver",
-        "save",
-        "write",
-        "create",
-        "generate",
-        "export",
-        "compile",
-    )
-    file_terms = (
-        " file",
-        "pdf",
-        "txt",
-        " text",
-        "text file",
-        "csv",
-        "xlsx",
-        "xls",
-        "spreadsheet",
-        "docx",
-        "document",
-        "html",
-        "report",
-    )
-    return any(term in text for term in action_terms) and any(term in text for term in file_terms)
+    finish = getattr(task, "finish", None)
+    if bool(getattr(finish, "requires_artifact_delivery", False)):
+        return True
+    output = getattr(task, "output", None)
+    if getattr(output, "artifact_kind", None):
+        return True
+    metadata = getattr(task, "metadata", None)
+    if isinstance(metadata, dict):
+        return bool(metadata.get("requires_artifact_delivery") or metadata.get("required_artifact_kind"))
+    return False
 
 
 def _completion_progress_kind(result: TaskResult) -> str:

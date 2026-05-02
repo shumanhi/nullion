@@ -23,6 +23,7 @@ from nullion.messaging_adapters import (
     record_platform_delivery_receipt,
     require_authorized_ingress,
     retry_messaging_delivery_operation,
+    sanitize_external_inline_markup,
     save_messaging_attachment,
     split_reply_for_platform,
 )
@@ -112,6 +113,7 @@ def _discord_file_for_path(path: Path):
 
 
 def _discord_plain_format_fallback_text(plain_text: str) -> str:
+    plain_text = sanitize_external_inline_markup(plain_text)
     return (
         "Discord could not send the formatted reply, so here is the same text as plain output:\n\n"
         "```text\n"
@@ -121,15 +123,16 @@ def _discord_plain_format_fallback_text(plain_text: str) -> str:
 
 
 async def _send_discord_text_with_plain_fallback(channel, text: str) -> None:
+    text = sanitize_external_inline_markup(text or "")
     try:
         await channel.send(text)
     except Exception:
         logger.warning("Discord message delivery failed; retrying as plain text.", exc_info=True)
-        await channel.send(_discord_plain_format_fallback_text(text or ""))
+        await channel.send(_discord_plain_format_fallback_text(text))
 
 
 async def _send_discord_chunks_with_plain_fallback(channel, text: str | None, *, limit: int = 1900) -> None:
-    for chunk in split_reply_for_platform(text or "", limit=limit):
+    for chunk in split_reply_for_platform(sanitize_external_inline_markup(text or ""), limit=limit):
         await _send_discord_text_with_plain_fallback(channel, chunk)
 
 
@@ -297,12 +300,15 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         ingress.operator_chat_id,
         ingress.text,
         turn_id=ingress.message_id or ingress.request_id,
+        model_client=getattr(service, "model_client", None),
     )
     try:
         await turn_registration.wait_for_dependencies()
         async with _discord_typing(message.channel):
             turn_result = await asyncio.to_thread(handle_messaging_ingress_result, service, ingress)
             reply = turn_result.reply
+        if await turn_registration.is_superseded():
+            return
         principal_id = principal_id_for_messaging_identity("discord", user_id, settings)
         delivery = prepare_reply_for_platform_delivery(
             reply,

@@ -311,18 +311,16 @@ def _task_frame_actionable_new_task_node(state: _TaskFrameContinuationState) -> 
     return {}
 
 
-def _task_frame_continue_node(state: _TaskFrameContinuationState) -> dict[str, object]:
+def _task_frame_fallback_node(state: _TaskFrameContinuationState) -> dict[str, object]:
     if state.get("decision") is not None:
         return {}
-    active_frame = state["active_frame"]
-    assert active_frame is not None
     return {"decision": TaskFrameContinuationDecision(
-        mode=TaskFrameContinuationMode.CONTINUE,
-        operation=active_frame.operation,
-        target=active_frame.target,
-        output=active_frame.output,
-        execution=active_frame.execution,
-        finish=active_frame.finish,
+        mode=TaskFrameContinuationMode.START_NEW,
+        operation=None,
+        target=None,
+        output=None,
+        execution=None,
+        finish=None,
     )}
 
 
@@ -333,13 +331,13 @@ def _compiled_task_frame_continuation_graph():
     graph.add_node("output_override", _task_frame_output_override_node)
     graph.add_node("substitute_target", _task_frame_substitute_target_node)
     graph.add_node("actionable_new_task", _task_frame_actionable_new_task_node)
-    graph.add_node("continue", _task_frame_continue_node)
+    graph.add_node("fallback", _task_frame_fallback_node)
     graph.add_edge(START, "start_or_continue")
     graph.add_edge("start_or_continue", "output_override")
     graph.add_edge("output_override", "substitute_target")
     graph.add_edge("substitute_target", "actionable_new_task")
-    graph.add_edge("actionable_new_task", "continue")
-    graph.add_edge("continue", END)
+    graph.add_edge("actionable_new_task", "fallback")
+    graph.add_edge("fallback", END)
     return graph.compile()
 
 

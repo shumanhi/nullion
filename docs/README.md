@@ -5,8 +5,9 @@ to the model provider you choose, and can use approved tools for web research,
 local files, browser automation, media processing, scheduled work, and preview
 account connectors. Current builds include workspace-scoped approvals and
 scheduled jobs, platform-aware delivery routing, validated planner task cards,
-thinking-summary controls, LangGraph turn routing, model fallback settings,
-default PDF/document skill packs, and cleaner activity traces.
+thinking-summary controls, LangChain model/tool adapters, LangGraph turn routing
+and delivery workflows, Deep Agents mini-agent execution, model fallback
+settings, default PDF/document skill packs, and cleaner activity traces.
 
 This docs folder is written for a mixed audience:
 
@@ -40,8 +41,12 @@ Core systems:
 - Recovery control plane for service restart, config snapshots, runtime restore,
   and Telegram takeover when the normal adapter is down
 - Builder skill proposals, learned skills, and memory compaction
-- Warm mini-agents for bounded parallel work
+- LangChain adapters that expose Nullion tools as structured tools and wrap
+  configured model clients as chat models
+- Warm mini-agents and Deep Agents for bounded parallel work
 - LangGraph-backed turn routing for independent parallel work versus dependent follow-ups
+- LangGraph workflows for approval decisions, artifact handling, attachment
+  formatting, and platform delivery
 - File/PDF delivery contracts across web, Telegram, Slack, and Discord
 - Validated DAG planning with optional planner task cards in chat surfaces
 - User-facing observability controls for Verbose modes, compact tool outcomes,
@@ -70,6 +75,35 @@ Windows PowerShell:
 ```powershell
 irm https://raw.githubusercontent.com/shumanhi/nullion/main/install.ps1 | iex
 ```
+
+Nullion requires Python 3.11 through 3.13. The installer checks for Python and tries
+to install it automatically when it is missing: `winget` on Windows, Homebrew on
+macOS, and `apt`, `dnf`, `pacman`, or `zypper` on Linux.
+
+If automatic Python install is blocked, install Python first and rerun the
+Nullion installer:
+
+```powershell
+# Windows PowerShell
+winget install --id Python.Python.3.12 --source winget -e
+py -3.12 --version
+```
+
+```bash
+# macOS
+brew install python@3.12
+python3.12 --version
+```
+
+```bash
+# Debian/Ubuntu
+sudo apt-get update
+sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
+python3.12 --version
+```
+
+Avoid Python 3.14 for now on Windows; some tray/webview dependencies do not
+publish compatible wheels yet.
 
 Already cloned the repo:
 

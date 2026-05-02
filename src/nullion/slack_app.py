@@ -23,6 +23,7 @@ from nullion.messaging_adapters import (
     record_platform_delivery_receipt,
     require_authorized_ingress,
     retry_messaging_delivery_operation,
+    sanitize_external_inline_markup,
     save_messaging_attachment,
     split_reply_for_platform,
 )
@@ -95,12 +96,19 @@ def _normalize_slack_text(text: str) -> str:
 
 def _format_slack_reply(text: str) -> str:
     """Adapt Nullion's Markdown-ish replies to Slack mrkdwn."""
+    text = sanitize_external_inline_markup(text)
     text = _RE_MARKDOWN_LINK.sub(lambda m: f"<{m.group(2)}|{m.group(1)}>", text)
     text = _RE_MARKDOWN_BOLD.sub(lambda m: f"*{m.group(1)}*", text)
     return text
 
 
+def _slack_reply_chunks(text: str | None, *, limit: int = 39000) -> list[tuple[str, str]]:
+    plain_chunks = split_reply_for_platform(sanitize_external_inline_markup(text or ""), limit=limit)
+    return [(_format_slack_reply(chunk), chunk) for chunk in plain_chunks]
+
+
 def _slack_plain_format_fallback_text(plain_text: str) -> str:
+    plain_text = sanitize_external_inline_markup(plain_text)
     return (
         "Slack could not send the formatted reply, so here is the same text as plain output:\n\n"
         "```text\n"
@@ -213,7 +221,8 @@ async def send_slack_platform_delivery(
 
         client = AsyncWebClient(token=bot_token)
         delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
-        formatted_reply = _format_slack_reply(delivery.text or "")
+        reply_source = delivery.text or ""
+        formatted_reply = _format_slack_reply(reply_source)
         if delivery.attachments:
             uploaded = await _upload_slack_reply_files(
                 client,
@@ -347,10 +356,15 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         ingress.operator_chat_id,
         ingress.text,
         turn_id=ingress.message_id or ingress.request_id,
+        model_client=getattr(service, "model_client", None),
     )
     try:
         await turn_registration.wait_for_dependencies()
         turn_result = await asyncio.to_thread(handle_messaging_ingress_result, service, ingress)
+        if await turn_registration.is_superseded():
+            if working_ts:
+                await _update_slack_message(client, channel=working_channel, ts=working_ts, text="Updated by your follow-up.")
+            return
         reply = turn_result.reply
         principal_id = principal_id_for_messaging_identity("slack", user_id, settings)
         delivery = prepare_reply_for_platform_delivery(
@@ -358,6 +372,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
         )
+        reply_source = delivery.text or ""
         formatted_reply = _format_slack_reply(delivery.text or "")
         delivery_receipt_recorded = False
         if delivery.attachments:
@@ -382,13 +397,13 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
                 error="attachment_upload_failed",
             )
             delivery_receipt_recorded = True
-            formatted_reply = _format_slack_reply(platform_delivery_failure_reply(delivery))
-        chunks = split_reply_for_platform(formatted_reply, limit=39000)
-        first_chunk = chunks[0] if chunks else ""
-        if working_ts and first_chunk and await _update_slack_message(client, channel=working_channel, ts=working_ts, text=first_chunk):
+            reply_source = platform_delivery_failure_reply(delivery)
+        chunks = _slack_reply_chunks(reply_source, limit=39000)
+        first_formatted = chunks[0][0] if chunks else ""
+        if working_ts and first_formatted and await _update_slack_message(client, channel=working_channel, ts=working_ts, text=first_formatted):
             chunks = chunks[1:]
-        for chunk in chunks:
-            await _send_slack_callable_with_plain_fallback(say, formatted_text=chunk, plain_text=chunk)
+        for formatted_chunk, plain_chunk in chunks:
+            await _send_slack_callable_with_plain_fallback(say, formatted_text=formatted_chunk, plain_text=plain_chunk)
         if not delivery_receipt_recorded:
             _record_slack_delivery_receipt(
                 channel=working_channel,
@@ -420,13 +435,12 @@ async def handle_slack_command(service, settings: NullionSettings, *, command: d
 
     turn_result = await asyncio.to_thread(handle_messaging_ingress_result, service, ingress)
     reply = turn_result.reply
-    formatted_reply = _format_slack_reply(reply or "")
-    chunks = split_reply_for_platform(formatted_reply, limit=39000)
+    chunks = _slack_reply_chunks(reply or "", limit=39000)
     if not chunks:
         await respond("Done.")
         return
-    for chunk in chunks:
-        await _send_slack_callable_with_plain_fallback(respond, formatted_text=chunk, plain_text=chunk)
+    for formatted_chunk, plain_chunk in chunks:
+        await _send_slack_callable_with_plain_fallback(respond, formatted_text=formatted_chunk, plain_text=plain_chunk)
 
 
 async def run_slack_app(

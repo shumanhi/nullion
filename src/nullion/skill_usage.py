@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TypedDict
@@ -19,50 +20,29 @@ class LearnedSkillUsageHint:
 
 
 class _SkillUsageState(TypedDict, total=False):
-    user_message: str
-    skill_text: str
-    message_requests_artifact: bool
-    skill_produces_artifact: bool
+    skill_id: str
+    explicitly_selected: bool
     should_include: bool
 
 
-def _skill_usage_artifact_signal_node(state: _SkillUsageState) -> dict[str, object]:
+def _skill_usage_selection_node(state: _SkillUsageState) -> dict[str, object]:
     return {
-        "message_requests_artifact": False,
-        "skill_produces_artifact": False,
-    }
-
-
-def _skill_usage_decision_node(state: _SkillUsageState) -> dict[str, object]:
-    return {
-        "should_include": bool(
-            state.get("message_requests_artifact") or not state.get("skill_produces_artifact")
-        )
+        "should_include": bool(state.get("explicitly_selected") and state.get("skill_id")),
     }
 
 
 @lru_cache(maxsize=1)
 def _compiled_skill_usage_graph():
     graph = StateGraph(_SkillUsageState)
-    graph.add_node("artifact_signals", _skill_usage_artifact_signal_node)
-    graph.add_node("decision", _skill_usage_decision_node)
-    graph.add_edge(START, "artifact_signals")
-    graph.add_edge("artifact_signals", "decision")
-    graph.add_edge("decision", END)
+    graph.add_node("selection", _skill_usage_selection_node)
+    graph.add_edge(START, "selection")
+    graph.add_edge("selection", END)
     return graph.compile()
 
 
-def _skill_usage_decision(user_message: str, skill) -> bool:
-    skill_text = " ".join(
-        [
-            str(getattr(skill, "title", "") or ""),
-            str(getattr(skill, "trigger", "") or ""),
-            str(getattr(skill, "summary", "") or ""),
-            " ".join(str(step or "") for step in getattr(skill, "steps", ()) or ()),
-        ]
-    )
+def _skill_usage_decision(skill_id: str) -> bool:
     final_state = _compiled_skill_usage_graph().invoke(
-        {"user_message": user_message or "", "skill_text": skill_text},
+        {"skill_id": skill_id, "explicitly_selected": True},
         config={"configurable": {"thread_id": "learned-skill-usage"}},
     )
     return bool(final_state.get("should_include"))
@@ -72,31 +52,47 @@ def build_learned_skill_usage_hint(
     store,
     user_message: str,
     *,
+    skill_ids: Iterable[str] | None = None,
     min_score: int = LEARNED_SKILL_INJECT_MIN_SCORE,
     limit: int | None = DEFAULT_LEARNED_SKILL_USAGE_LIMIT,
 ) -> LearnedSkillUsageHint | None:
-    from nullion.runtime import _recommend_skills_with_scores
+    """Build a learned-skill prompt only from explicit structured skill IDs.
 
+    Free-form user prompts are intentionally not token-matched here. Callers that
+    want a learned skill to influence routing must pass IDs selected by a typed
+    UI action, command, runtime plan, or another verified structured signal.
+    """
+    if not skill_ids:
+        return None
     stored_skills = getattr(store, "skills", None)
-    recommendation_limit = len(stored_skills) if limit is None and stored_skills is not None else limit
-    if recommendation_limit is None:
-        recommendation_limit = 1000
-    scored = [
-        (score, skill)
-        for score, skill in _recommend_skills_with_scores(store, user_message, limit=recommendation_limit)
-        if score >= min_score and _skill_usage_decision(user_message, skill)
-    ]
-    if not scored:
+    if not isinstance(stored_skills, dict):
+        return None
+    selected = []
+    seen: set[str] = set()
+    for skill_id in skill_ids:
+        normalized_id = str(skill_id or "").strip()
+        if not normalized_id or normalized_id in seen:
+            continue
+        skill = stored_skills.get(normalized_id)
+        if skill is None:
+            continue
+        if not _skill_usage_decision(normalized_id):
+            continue
+        selected.append(skill)
+        seen.add(normalized_id)
+        if limit is not None and len(selected) >= limit:
+            break
+    if not selected:
         return None
     prompt_sections: list[str] = ["Relevant learned skills:"]
-    for skill_index, (_score, skill) in enumerate(scored, start=1):
+    for skill_index, skill in enumerate(selected, start=1):
         steps_text = "\n".join(f"    {index + 1}. {step}" for index, step in enumerate(skill.steps))
         prompt_sections.append(
             f"{skill_index}. {skill.title}\n"
             f"   Trigger: {skill.trigger}\n"
             f"   Follow these steps:\n{steps_text}"
         )
-    titles = tuple(skill.title for _score, skill in scored)
+    titles = tuple(skill.title for skill in selected)
     return LearnedSkillUsageHint(
         title=titles[0],
         titles=titles,

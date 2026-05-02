@@ -29,7 +29,7 @@ from nullion.builder_observer import PatternSignal, TurnSignal
 
 logger = logging.getLogger(__name__)
 
-_MIN_TOOLS_FOR_REFLECTION = 2     # don't reflect on single-tool turns
+_MIN_DISTINCT_TOOLS_FOR_REFLECTION = 2     # don't reflect on single-tool turns
 _MAX_REPLY_TOKENS = 350
 
 _REFLECTION_SYSTEM_PROMPT = """\
@@ -117,7 +117,10 @@ def reflect_on_turn(
 
 def _reflection_precheck_node(state: _BuilderReflectionState) -> dict[str, object]:
     turn_signal = state["turn_signal"]
-    should_call = turn_signal.tool_count >= _MIN_TOOLS_FOR_REFLECTION and turn_signal.outcome.value == "success"
+    should_call = (
+        _distinct_tool_count(turn_signal.tool_names) >= _MIN_DISTINCT_TOOLS_FOR_REFLECTION
+        and turn_signal.outcome.value == "success"
+    )
     if not should_call:
         return {"should_call_model": False, "result": ReflectionResult(should_propose=False)}
     return {"should_call_model": True}
@@ -188,6 +191,10 @@ def _compiled_builder_reflection_graph():
     return graph.compile()
 
 
+def _distinct_tool_count(tool_names) -> int:
+    return len({str(name) for name in tool_names if str(name or "").strip()})
+
+
 def reflect_on_pattern(
     *,
     model_client,
@@ -197,6 +204,9 @@ def reflect_on_pattern(
 
     Called when the Pattern Detector finds a sequence used ≥N times.
     """
+    if _distinct_tool_count(pattern.tool_sequence) < _MIN_DISTINCT_TOOLS_FOR_REFLECTION:
+        return ReflectionResult(should_propose=False)
+
     tool_list = " → ".join(pattern.tool_sequence)
     examples = "\n".join(f"- {msg}" for msg in pattern.example_user_messages)
     confidence_pct = int(pattern.confidence * 100)
