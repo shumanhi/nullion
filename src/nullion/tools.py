@@ -19,11 +19,13 @@ import re
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import tempfile
 import textwrap
 import threading
 from typing import Callable, Iterable, Protocol
+import urllib.error
 import urllib.request
 from urllib.parse import urlencode, urlparse
 
@@ -3388,7 +3390,24 @@ def _build_terminal_exec_handler(
 
 
 
-def _default_web_fetcher(url: str, timeout_seconds: int) -> dict[str, object]:
+def _http_retry_url_for_https_transport_failure(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port is not None:
+        return None
+    return parsed._replace(scheme="http").geturl()
+
+
+def _is_https_transport_eof(exc: Exception) -> bool:
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, ssl.SSLEOFError):
+        return True
+    if isinstance(reason, ssl.SSLError):
+        library, reason_text = reason.args[:2] if len(reason.args) >= 2 else ("", "")
+        return "UNEXPECTED_EOF_WHILE_READING" in str(library) or "UNEXPECTED_EOF_WHILE_READING" in str(reason_text)
+    return False
+
+
+def _fetch_web_url_once(url: str, timeout_seconds: int) -> dict[str, object]:
     resolution = _resolve_web_fetch_resolution(url)
     parsed = urlparse(url)
     host = parsed.hostname
@@ -3428,6 +3447,23 @@ def _default_web_fetcher(url: str, timeout_seconds: int) -> dict[str, object]:
         "text": text,
         "body": body,
     }
+
+
+def _default_web_fetcher(url: str, timeout_seconds: int) -> dict[str, object]:
+    try:
+        return _fetch_web_url_once(url, timeout_seconds)
+    except Exception as exc:
+        retry_url = _http_retry_url_for_https_transport_failure(url)
+        if retry_url is None or not _is_https_transport_eof(exc):
+            raise
+        response = _fetch_web_url_once(retry_url, timeout_seconds)
+        response["requested_url"] = url
+        response["transport_fallback"] = {
+            "from_scheme": "https",
+            "to_scheme": "http",
+            "reason": "https_transport_eof",
+        }
+        return response
 
 
 
