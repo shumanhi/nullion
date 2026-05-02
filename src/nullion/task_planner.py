@@ -14,8 +14,9 @@ from nullion.deep_agent_profiles import (
     deep_agent_skills_for_task,
     deep_agent_subagents_for_task,
 )
+from nullion.attachment_format_graph import plan_attachment_format
 from nullion.missions import MissionContinuationPolicy, MissionRecord, MissionStatus, MissionStep
-from nullion.task_frames import TaskFrame
+from nullion.task_frames import TaskFrame, extract_url_target
 
 
 _COMPOSER_MODE_INSTRUCTION_RE = re.compile(
@@ -285,17 +286,8 @@ def _contains_checkpoint_phrase(text: str) -> bool:
     return False
 
 
-def _normalized_clause_words(clause: str) -> tuple[str, ...]:
-    return tuple(re.findall(r"[a-z0-9]+", clause.lower()))
-
-
 def _clause_has_url_target(clause: str) -> bool:
-    lowered = clause.lower()
-    return bool(
-        "http://" in lowered
-        or "https://" in lowered
-        or re.search(r"\bwww\.[a-z0-9.-]+\.[a-z]{2,}\b", lowered)
-    )
+    return extract_url_target(clause) is not None
 
 
 def _tool_scope_decision_for_clause(clause: str) -> ToolScopeDecision:
@@ -304,9 +296,10 @@ def _tool_scope_decision_for_clause(clause: str) -> ToolScopeDecision:
     if _clause_has_url_target(clause):
         scope.append("web_fetch")
         evidence.append("url_target")
-    if any(word == "pdf" for word in _normalized_clause_words(clause)):
+    requested_extension = plan_attachment_format(clause).extension
+    if requested_extension == ".pdf":
         scope.append("pdf_create")
-        evidence.append("extension_token")
+        evidence.append("literal_extension")
     return ToolScopeDecision(
         tool_scope=tuple(dict.fromkeys(scope)),
         evidence=tuple(dict.fromkeys(evidence)),
