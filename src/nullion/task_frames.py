@@ -216,6 +216,12 @@ def _extract_url_target(text: str) -> TaskFrameTarget | None:
     return None
 
 
+def extract_url_target(text: str) -> TaskFrameTarget | None:
+    """Extract a URL/domain target as structured evidence, without prose intent."""
+
+    return _extract_url_target(text)
+
+
 
 
 def _detect_output_override(text: str, current: TaskFrameOutputContract) -> TaskFrameOutputContract | None:
@@ -385,5 +391,6 @@ __all__ = [
     "ATTACHMENT_DELIVERY_MODES",
     "normalize_delivery_mode",
     "is_attachment_delivery_mode",
+    "extract_url_target",
     "resolve_task_frame_continuation",
 ]

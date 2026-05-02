@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from urllib.parse import urlparse
+
+from nullion.task_frames import extract_url_target
 
 
 class LiveInformationRoute(str, Enum):
@@ -45,49 +46,8 @@ class LiveInformationResolutionDecision:
     missing_plugins: tuple[str, ...]
 
 
-def _looks_like_domain(value: str) -> bool:
-    if "." not in value:
-        return False
-    host = value.strip(".,;:!?()[]{}<>'\"").lower()
-    if not host or host.startswith(".") or host.endswith("."):
-        return False
-    parts = host.split(".")
-    if len(parts) < 2 or any(not part or not part.replace("-", "").isalnum() for part in parts):
-        return False
-    top_level = parts[-1]
-    return len(top_level) >= 2 and top_level.isalpha()
-
-
-def _looks_like_zip_code(value: str) -> bool:
-    cleaned = value.strip(".,;:!?()[]{}<>'\"")
-    if len(cleaned) == 5 and cleaned.isdigit():
-        return True
-    if len(cleaned) == 10 and cleaned[:5].isdigit() and cleaned[5] == "-" and cleaned[6:].isdigit():
-        return True
-    return False
-
-
-def _is_url_only_prompt(stripped_message: str) -> bool:
-    if not stripped_message or any(char.isspace() for char in stripped_message):
-        return False
-    candidate = stripped_message if "://" in stripped_message else f"https://{stripped_message}"
-    parsed = urlparse(candidate)
-    return _looks_like_domain(parsed.hostname or "")
-
-
-def _contains_live_lookup_target(lowered_message: str, message: str) -> bool:
-    if "http://" in lowered_message or "https://" in lowered_message:
-        return True
-    parts = tuple(part for part in message.split() if part)
-    return any(_looks_like_domain(part) or _looks_like_zip_code(part) for part in parts)
-
-
 def classify_live_information_route(message: str) -> LiveInformationRoute:
-    stripped = message.strip()
-    lowered_message = message.lower()
-    if _is_url_only_prompt(stripped):
-        return LiveInformationRoute.LIVE_LOOKUP
-    if _contains_live_lookup_target(lowered_message, message):
+    if extract_url_target(message) is not None:
         return LiveInformationRoute.LIVE_LOOKUP
     return LiveInformationRoute.NONE
 
