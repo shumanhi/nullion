@@ -2,12 +2,15 @@
 
 ![Nullion local operator console with chat, generated artifacts, approvals, tasks, and control center](https://www.nullion.ai/assets/nullion-web-console-real.png)
 
-A local-first AI operator console with parallel mini-agents, Sentinel approvals,
-Doctor health checks, Builder skill learning, plugin integrations, and
-Telegram/Slack/Discord operator control. Recent builds add workspace-scoped
-approvals and schedules, LangGraph-backed turn routing, platform-aware file and
-PDF delivery contracts, validated task planning, cleaner activity traces, and
-model fallback configuration.
+Nulliøn is an AI assistant that runs from your own computer, connects to the
+tools and chat apps you use, and keeps you in control of what it can do. It can
+help with work across your files, browser, apps, and messages while keeping
+approvals, settings, and local data under your control.
+
+Under the hood, Nullion uses LangGraph workflows to route tasks, approvals, file
+delivery, and follow-ups through predictable steps. Its security model keeps
+tool access, workspace boundaries, provider accounts, and human approvals
+separate, so powerful actions stay scoped and reviewable.
 
 Online docs: https://www.nullion.ai/docs/
 
