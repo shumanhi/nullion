@@ -4,6 +4,7 @@ __pycache__/
 .coverage.*
 htmlcov/
 *.py[cod]
+tests/
 .venv/
 .env
 .env.*

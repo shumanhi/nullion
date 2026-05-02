@@ -13,6 +13,13 @@ for lock in \
     [ -f "$lock" ] && rm -f "$lock" 2>/dev/null || true
 done
 
+staged_test_files="$(git diff --cached --name-only --diff-filter=ACMR -- 'tests/**' || true)"
+if [ -n "$staged_test_files" ]; then
+    echo "Do not commit tests/ in this repo. Put tests in the private nullion-test repo instead:" >&2
+    echo "$staged_test_files" >&2
+    exit 1
+fi
+
 if [ -x ".venv/bin/python" ]; then
     python_cmd=".venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
