@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -1429,7 +1430,13 @@ def _remove_path(path: Path, *, dry_run: bool) -> str:
         return f"Skipped missing {resolved}"
     if not dry_run:
         if resolved.is_dir() and not resolved.is_symlink():
-            _remove_tree(resolved)
+            try:
+                _remove_tree(resolved)
+            except OSError as exc:
+                if os.name != "nt" or not _retryable_rmtree_error(exc):
+                    raise
+                _schedule_windows_tree_removal(resolved)
+                return f"Scheduled removal of {resolved}"
         else:
             try:
                 resolved.unlink()
@@ -1500,6 +1507,26 @@ def _handle_rmtree_path_error(function: object, path: str, exc_info: tuple[type[
         except Exception:
             pass
     raise exc
+
+
+def _schedule_windows_tree_removal(path: Path) -> None:
+    target = str(Path(path).resolve()).replace('"', '""')
+    script = Path(tempfile.gettempdir()) / f"nullion-uninstall-{os.getpid()}.cmd"
+    script.write_text(
+        "@echo off\r\n"
+        "ping 127.0.0.1 -n 3 > nul\r\n"
+        f'rmdir /s /q "{target}"' + "\r\n"
+        'del "%~f0" > nul 2> nul\r\n',
+        encoding="utf-8",
+    )
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(
+        ["cmd.exe", "/d", "/c", str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
 
 
 def _path_is_inside(path: Path, parent: Path) -> bool:
