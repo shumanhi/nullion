@@ -23,6 +23,14 @@
 - Website, marketing, and docs-site work belongs in `/Users/himanc/Projects/nullion-website`, or the sibling checkout at `../nullion-website`, not in this app repo.
 - If a change needs app, test, and website updates, edit each repo in its own checkout and preserve unrelated dirty files.
 
+## Running Instance Safety
+
+- Do not touch the running Nullion instance unless the user explicitly asks for it.
+- Treat `~/.nullion`, installed editable-package pointers, launchd services, tray/web/Telegram processes, live config, credentials, and runtime databases as running-instance state.
+- Do not restart services, call restart endpoints, run `pip install -e` into the installed Nullion venv, edit `~/.nullion/.env`, mutate encrypted credentials, or repoint the installed package as part of ordinary debugging or code changes.
+- Inspecting logs, process lists, package metadata, and config read-only endpoints is allowed when debugging, but do not mutate live state without explicit permission.
+- If a fix needs the running instance to pick up code, report the exact command or checkout the user should run rather than applying it yourself.
+
 ## Pull Requests
 
 - Use `nullion/` as the branch prefix for PR work.

@@ -148,6 +148,19 @@ def _required_extension_for_artifact_kind(artifact_kind: str | None) -> str | No
     return None
 
 
+def _normalize_required_extensions(required_attachment_extensions: Iterable[str] | None) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for extension in required_attachment_extensions or ():
+        normalized = str(extension or "").strip().lower()
+        if not normalized:
+            continue
+        if not normalized.startswith("."):
+            normalized = f".{normalized}"
+        if normalized not in extensions:
+            extensions.append(normalized)
+    return tuple(extensions)
+
+
 def _paths_matching_required_extension(paths: Iterable[str], required_extension: str | None) -> list[str]:
     if required_extension is None:
         return list(paths)
@@ -221,6 +234,7 @@ def evaluate_response_fulfillment(
     artifact_paths: Iterable[str] | None = None,
     artifact_roots: Iterable[Path] = (),
     platform_artifact_count: int = 0,
+    required_attachment_extensions: Iterable[str] | None = None,
 ) -> ResponseFulfillmentDecision:
     """Validate that a final response is backed by required runtime evidence."""
     frame = _active_frame_for_contract(store, conversation_id)
@@ -231,14 +245,19 @@ def evaluate_response_fulfillment(
     completed_tool_names = {result.tool_name for result, status in normalized_results if status == "completed"}
     attempted_tool_names = {result.tool_name for result, _status in normalized_results}
 
+    explicit_required_extensions = _normalize_required_extensions(required_attachment_extensions)
     required_tools: set[str] = set()
     requires_artifact = False
-    artifact_kind = "file"
+    artifact_kind = explicit_required_extensions[0].removeprefix(".") if explicit_required_extensions else "file"
     if frame is not None:
         required_tools.update(frame.finish.required_tool_completion)
         requires_artifact = bool(frame.finish.requires_artifact_delivery)
         artifact_kind = frame.finish.required_artifact_kind or frame.output.artifact_kind or artifact_kind
     required_extension = _required_extension_for_artifact_kind(artifact_kind)
+    if required_extension is None and explicit_required_extensions:
+        required_extension = explicit_required_extensions[0]
+    if explicit_required_extensions:
+        requires_artifact = True
 
     combined_artifact_paths = [
         *(artifact_paths or ()),
@@ -249,7 +268,10 @@ def evaluate_response_fulfillment(
         reply=reply,
         artifact_paths=combined_artifact_paths,
         requires_attachment_delivery=requires_artifact,
-        required_attachment_extensions=(required_extension,) if required_extension else (),
+        required_attachment_extensions=(
+            *explicit_required_extensions,
+            *((required_extension,) if required_extension else ()),
+        ),
     )
     if not requires_artifact and delivery_contract.requires_attachment_delivery:
         requires_artifact = True
@@ -267,7 +289,11 @@ def evaluate_response_fulfillment(
         _reply_valid_media_paths(reply, artifact_roots=artifact_roots),
         required_extension,
     )
-    has_deliverable = platform_artifact_count > 0 or bool(valid_artifacts) or bool(valid_reply_media)
+    has_deliverable = (
+        (platform_artifact_count > 0 and required_extension is None)
+        or bool(valid_artifacts)
+        or bool(valid_reply_media)
+    )
     if requires_artifact and not has_deliverable:
         missing.append(f"{artifact_kind} attachment")
 

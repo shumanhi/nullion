@@ -231,10 +231,19 @@ def _chat_reasoning_kwargs(provider: str | None, model: str, effort: str | None)
     model_key = model.strip().lower()
 
     if provider_key in {"openrouter", "openrouter-key"}:
-        return {"extra_body": {"reasoning": {"effort": effort}}}
-    if provider_key in {"openai", "gemini", "groq", "together"}:
+        return {}
+    if provider_key in {"openai", "gemini", "ollama"}:
         return {"reasoning_effort": effort}
-    if provider_key == "mistral" and model_key == "mistral-small-latest":
+    if provider_key == "groq" and model_key in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+        return {"reasoning_effort": effort}
+    if provider_key == "together" and (
+        model_key.startswith("openai/gpt-oss-")
+        or model_key == "deepseek-ai/deepseek-v4-pro"
+    ):
+        return {"reasoning_effort": effort}
+    if provider_key == "deepseek" and model_key in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+        return {"reasoning_effort": effort}
+    if provider_key == "mistral" and model_key in {"mistral-small-latest", "mistral-medium-3-5"}:
         return {"reasoning_effort": effort}
     return {}
 

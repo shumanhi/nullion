@@ -1986,7 +1986,13 @@ def chat_model_options(*, current_provider: str | None = None, current_model: st
         if not configured and provider != current_provider:
             continue
         models = _split_model_entries(provider_models.get(provider, ""))
-        if provider == current_provider and current_model and current_model != "unknown" and current_model not in models:
+        if (
+            provider == current_provider
+            and current_model
+            and current_model != "unknown"
+            and current_model not in models
+            and not models
+        ):
             models.insert(0, current_model)
         for model in models:
             options.append({"provider": provider, "model": model})

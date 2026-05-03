@@ -1,8 +1,9 @@
 """Local encryption-key storage for Nullion data.
 
-The encrypted databases use Fernet keys. On macOS, users can choose to keep the
-data key in Keychain; otherwise Nullion keeps the same 0600 local key file used
-by earlier releases.
+The encrypted databases use Fernet keys. Users can choose OS-backed key storage
+through ``NULLION_KEY_STORAGE=system``. On macOS, ``keychain`` remains supported
+as an explicit Keychain alias; otherwise Nullion keeps the same 0600 local key
+file used by earlier releases.
 """
 from __future__ import annotations
 
@@ -30,9 +31,15 @@ class KeyStorageError(RuntimeError):
 
 def configured_key_storage() -> str:
     raw = os.environ.get(KEY_STORAGE_ENV, DEFAULT_KEY_STORAGE)
+    return _normalize_key_storage(raw)
+
+
+def _normalize_key_storage(raw: str | None) -> str:
     value = str(raw or DEFAULT_KEY_STORAGE).strip().lower()
     if value in {"keychain", "macos-keychain", "macos_keychain"}:
         return "keychain"
+    if value in {"system", "native", "os", "keyring", "credential-manager", "secret-service"}:
+        return "system"
     if value in {"local", "file"}:
         return "local"
     log.warning("Unknown %s=%r; using local key storage.", KEY_STORAGE_ENV, raw)
@@ -47,7 +54,13 @@ def load_or_create_fernet_key(
     keychain_account: str = KEYCHAIN_ACCOUNT,
 ) -> bytes:
     """Return a valid Fernet key from the selected storage backend."""
-    selected = (storage or configured_key_storage()).strip().lower()
+    selected = _normalize_key_storage(storage) if storage is not None else configured_key_storage()
+    if selected == "system":
+        return _load_or_create_system_key(
+            local_key_path,
+            service=keychain_service,
+            account=keychain_account,
+        )
     if selected == "keychain":
         return _load_or_create_keychain_key(
             local_key_path,
@@ -64,7 +77,7 @@ def initialize_key_storage(
 ) -> str:
     """Create or migrate the configured key and return the backend actually used."""
     path = local_key_path or (Path.home() / ".nullion" / "chat_history.key")
-    selected = (storage or configured_key_storage()).strip().lower()
+    selected = _normalize_key_storage(storage) if storage is not None else configured_key_storage()
     load_or_create_fernet_key(path, storage=selected)
     return selected
 
@@ -114,6 +127,56 @@ def _load_or_create_keychain_key(path: Path, *, service: str, account: str) -> b
     return key
 
 
+def _load_or_create_system_key(path: Path, *, service: str, account: str) -> bytes:
+    if sys.platform == "darwin":
+        return _load_or_create_keychain_key(path, service=service, account=account)
+
+    existing = _system_key_get(service=service, account=account)
+    if existing:
+        return _validate_key(existing.encode("ascii"))
+
+    if path.exists():
+        key = _load_or_create_local_key(path)
+        _system_key_set(service=service, account=account, value=key.decode("ascii"))
+        try:
+            path.unlink()
+            log.info("Migrated local Nullion encryption key into system keyring.")
+        except OSError:
+            log.warning("Migrated key into system keyring but could not remove local key file: %s", path)
+        return key
+
+    key = Fernet.generate_key()
+    _system_key_set(service=service, account=account, value=key.decode("ascii"))
+    return key
+
+
+def _system_key_get(*, service: str, account: str) -> str | None:
+    keyring = _import_keyring()
+    try:
+        return keyring.get_password(service, account)
+    except Exception as exc:
+        raise KeyStorageError(f"Could not read Nullion data key from system keyring: {exc}") from exc
+
+
+def _system_key_set(*, service: str, account: str, value: str) -> None:
+    keyring = _import_keyring()
+    try:
+        keyring.set_password(service, account, value)
+    except Exception as exc:
+        raise KeyStorageError(f"Could not store Nullion data key in system keyring: {exc}") from exc
+
+
+def _import_keyring():
+    try:
+        import keyring
+    except ImportError as exc:
+        raise KeyStorageError(
+            "NULLION_KEY_STORAGE=system requires the 'keyring' package. "
+            "Install Nullion with current dependencies or use NULLION_KEY_STORAGE=local."
+        ) from exc
+    return keyring
+
+
 def _keychain_get(*, service: str, account: str) -> str | None:
     result = subprocess.run(
         [
@@ -159,7 +222,7 @@ def _keychain_set(*, service: str, account: str, value: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m nullion.secure_storage")
     parser.add_argument("--init", action="store_true", help="initialize configured key storage")
-    parser.add_argument("--storage", choices=("local", "keychain"), default=None)
+    parser.add_argument("--storage", choices=("local", "keychain", "system"), default=None)
     args = parser.parse_args(argv)
     if args.init:
         used = initialize_key_storage(storage=args.storage)

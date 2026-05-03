@@ -276,8 +276,8 @@ def _contains_file_reference(reply: str) -> bool:
 
 
 
-def _requested_attachment_extension(prompt: str) -> str | None:
-    return plan_attachment_format(prompt).extension
+def _requested_attachment_extension(prompt: str, *, model_client: object | None = None) -> str | None:
+    return plan_attachment_format(prompt, model_client=model_client).extension
 
 
 
@@ -1454,8 +1454,13 @@ def _artifact_delivery_label(
     return "files"
 
 
-def _filter_artifact_descriptors_for_requested_format(prompt: str, descriptors):
-    requested_extension = _requested_attachment_extension(prompt)
+def _filter_artifact_descriptors_for_requested_format(
+    prompt: str,
+    descriptors,
+    *,
+    requested_extension: str | None = None,
+):
+    requested_extension = requested_extension or _requested_attachment_extension(prompt)
     if requested_extension is None:
         return descriptors
     matching_descriptors = [
@@ -1557,6 +1562,47 @@ def _artifact_paths_mentioned_in_reply(
     return list(dict.fromkeys(paths))
 
 
+def _artifact_paths_created_since(
+    runtime: PersistentRuntime,
+    *,
+    since: datetime,
+    principal_id: str | None = None,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
+) -> list[str]:
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    required = tuple(
+        ext.lower() if str(ext).startswith(".") else f".{str(ext).lower()}"
+        for ext in (required_attachment_extensions or ())
+        if str(ext or "").strip()
+    )
+    threshold = since.timestamp() - 1.0
+    paths: list[str] = []
+    for artifact_root in (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)):
+        try:
+            candidates = [path for path in artifact_root.iterdir() if path.is_file()]
+        except OSError:
+            continue
+        candidates.sort(key=_mtime, reverse=True)
+        for path in candidates:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < threshold:
+                break
+            if required and path.suffix.lower() not in required:
+                continue
+            descriptor = artifact_descriptor_for_path(path, artifact_root=artifact_root)
+            if descriptor is not None:
+                paths.append(descriptor.path)
+    return list(dict.fromkeys(paths))
+
+
 def _append_chat_artifacts_to_reply(
     runtime: PersistentRuntime,
     *,
@@ -1565,6 +1611,7 @@ def _append_chat_artifacts_to_reply(
     prompt: str,
     principal_id: str | None = None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
 ) -> str:
     if _reply_has_deliverable_media(runtime, reply, principal_id=principal_id):
         return reply
@@ -1580,7 +1627,12 @@ def _append_chat_artifacts_to_reply(
                 continue
             seen_ids.add(descriptor.artifact_id)
             descriptors.append(descriptor)
-    descriptors = _filter_artifact_descriptors_for_requested_format(prompt, descriptors)
+    requested_extension = (tuple(required_attachment_extensions or ()) or (None,))[0]
+    descriptors = _filter_artifact_descriptors_for_requested_format(
+        prompt,
+        descriptors,
+        requested_extension=requested_extension,
+    )
     if not descriptors:
         return reply
     attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
@@ -1641,6 +1693,7 @@ def _enforce_chat_response_fulfillment(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     artifact_paths: list[str] | tuple[str, ...] | None = None,
     principal_id: str | None = None,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
 ) -> str:
     decision = evaluate_response_fulfillment(
         store=runtime.store,
@@ -1650,8 +1703,48 @@ def _enforce_chat_response_fulfillment(
         tool_results=tool_results,
         artifact_paths=artifact_paths,
         artifact_roots=(artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)),
+        required_attachment_extensions=required_attachment_extensions,
     )
     return decision.reply
+
+
+def _needs_required_attachment_repair(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    prompt: str,
+    reply: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    artifact_paths: list[str] | tuple[str, ...] | None = None,
+    principal_id: str | None = None,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
+) -> bool:
+    if not required_attachment_extensions:
+        return False
+    decision = evaluate_response_fulfillment(
+        store=runtime.store,
+        conversation_id=conversation_id,
+        user_message=prompt,
+        reply=reply,
+        tool_results=tool_results,
+        artifact_paths=artifact_paths,
+        artifact_roots=(artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)),
+        required_attachment_extensions=required_attachment_extensions,
+    )
+    return (
+        not decision.satisfied
+        and any("attachment" in requirement for requirement in decision.missing_requirements)
+    )
+
+
+def _required_attachment_repair_prompt(required_attachment_extensions: tuple[str, ...] | list[str]) -> str:
+    required = ", ".join(required_attachment_extensions) or "the requested attachment"
+    return (
+        f"Your previous response did not create the required {required} attachment. "
+        "Continue the same user request now. Use the available tools to create and save the real requested "
+        "artifact in the workspace artifact directory, then finish with the artifact attached. "
+        "Do not switch models. Do not ask a clarification unless the artifact is impossible without the missing detail."
+    )
 
 
 def _sanitize_chat_reply(
@@ -2034,6 +2127,11 @@ def _execute_compound_chat_turn(
         )
 
     combined_reply = "\n\n".join(replies)
+    requested_attachment_extensions = tuple(
+        extension
+        for extension in (_requested_attachment_extension(prompt, model_client=model_client),)
+        if extension
+    )
     contract = _build_chat_response_contract(
         runtime,
         prompt=prompt,
@@ -2059,6 +2157,7 @@ def _execute_compound_chat_turn(
         prompt=prompt,
         principal_id=principal_id,
         tool_results=tool_results,
+        required_attachment_extensions=requested_attachment_extensions,
     )
     combined_reply = _enforce_chat_response_fulfillment(
         runtime,
@@ -2067,6 +2166,7 @@ def _execute_compound_chat_turn(
         reply=combined_reply,
         tool_results=tool_results,
         principal_id=principal_id,
+        required_attachment_extensions=requested_attachment_extensions,
     )
     combined_reply = _sanitize_chat_reply(
         prompt=prompt,
@@ -2388,6 +2488,11 @@ def _render_chat_turn(
     )
     deferred_prompt = _deferred_runtime_follow_up_source_prompt(thread, prompt)
     effective_prompt = task_frame_prompt or deferred_prompt or prompt
+    requested_attachment_extensions = tuple(
+        extension
+        for extension in (_requested_attachment_extension(effective_prompt, model_client=model_client),)
+        if extension
+    )
     normalized_attachments = normalize_chat_attachments(attachments or [])
     user_content_blocks = (
         chat_attachment_content_blocks(effective_prompt, normalized_attachments)
@@ -2441,6 +2546,7 @@ def _render_chat_turn(
                 prompt=effective_prompt,
                 principal_id=principal_id,
                 tool_results=artifact_result.tool_results,
+                required_attachment_extensions=requested_attachment_extensions,
             )
         else:
             detail = artifact_result.error or "Image generation provider failed."
@@ -2454,6 +2560,7 @@ def _render_chat_turn(
                 tool_results=artifact_result.tool_results,
                 artifact_paths=artifact_result.artifact_paths,
                 principal_id=principal_id,
+                required_attachment_extensions=requested_attachment_extensions,
             )
         update_active_task_frame_from_outcomes(
             runtime.store,
@@ -2769,6 +2876,7 @@ def _render_chat_turn(
                         prompt=effective_prompt,
                         principal_id=principal_id,
                         tool_results=mission_result.tool_results,
+                        required_attachment_extensions=requested_attachment_extensions,
                     )
                     mission_outcome = TurnOutcome.SUCCESS
                 update_active_task_frame_from_outcomes(
@@ -2787,6 +2895,7 @@ def _render_chat_turn(
                         tool_results=mission_result.tool_results,
                         artifact_paths=mission_result.artifacts,
                         principal_id=principal_id,
+                        required_attachment_extensions=requested_attachment_extensions,
                     )
                     attachment_failure = attachment_processing_failure_reply(
                         effective_prompt,
@@ -2810,6 +2919,7 @@ def _render_chat_turn(
                 )
             elif not handled_by_mini_agents:
                 # Single-step: run directly as an orchestrator turn so the LLM decides
+                turn_started_at = datetime.now(UTC)
                 turn_result = agent_orchestrator.run_turn(
                     conversation_id=conversation_id,
                     principal_id=principal_id,
@@ -2828,6 +2938,16 @@ def _render_chat_turn(
                     reply = f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
                     turn_outcome = TurnOutcome.SUSPENDED
                 else:
+                    turn_result.artifacts.extend(
+                        path
+                        for path in _artifact_paths_created_since(
+                            runtime,
+                            since=turn_started_at,
+                            principal_id=principal_id,
+                            required_attachment_extensions=requested_attachment_extensions,
+                        )
+                        if path not in turn_result.artifacts
+                    )
                     reply = turn_result.final_text or "Done."
                     reply = _append_chat_artifacts_to_reply(
                         runtime,
@@ -2836,6 +2956,7 @@ def _render_chat_turn(
                         prompt=effective_prompt,
                         principal_id=principal_id,
                         tool_results=turn_result.tool_results,
+                        required_attachment_extensions=requested_attachment_extensions,
                     )
                     turn_outcome = TurnOutcome.SUCCESS
                 update_active_task_frame_from_outcomes(
@@ -2846,7 +2967,7 @@ def _render_chat_turn(
                     completion_turn_id=conversation_result.turn.turn_id,
                 )
                 if turn_outcome is TurnOutcome.SUCCESS:
-                    reply = _enforce_chat_response_fulfillment(
+                    if _needs_required_attachment_repair(
                         runtime,
                         conversation_id=conversation_id,
                         prompt=effective_prompt,
@@ -2854,7 +2975,72 @@ def _render_chat_turn(
                         tool_results=turn_result.tool_results,
                         artifact_paths=turn_result.artifacts,
                         principal_id=principal_id,
-                    )
+                        required_attachment_extensions=requested_attachment_extensions,
+                    ):
+                        repair_history = [
+                            *orchestrator_conversation_history,
+                            {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
+                            {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+                        ]
+                        repair_started_at = datetime.now(UTC)
+                        repair_result = agent_orchestrator.run_turn(
+                            conversation_id=conversation_id,
+                            principal_id=principal_id,
+                            user_message=_required_attachment_repair_prompt(requested_attachment_extensions),
+                            conversation_history=repair_history,
+                            tool_registry=runtime.active_tool_registry or ToolRegistry(),
+                            policy_store=runtime.store,
+                            approval_store=runtime.store,
+                            tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                        )
+                        activity_tool_results.extend(list(repair_result.tool_results))
+                        if repair_result.suspended_for_approval:
+                            approval_id = repair_result.approval_id
+                            reply = f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
+                            turn_outcome = TurnOutcome.SUSPENDED
+                        else:
+                            turn_result.tool_results.extend(list(repair_result.tool_results))
+                            turn_result.artifacts.extend(list(repair_result.artifacts))
+                            turn_result.artifacts.extend(
+                                path
+                                for path in _artifact_paths_created_since(
+                                    runtime,
+                                    since=repair_started_at,
+                                    principal_id=principal_id,
+                                    required_attachment_extensions=requested_attachment_extensions,
+                                )
+                                if path not in turn_result.artifacts
+                            )
+                            reply = repair_result.final_text or reply
+                            reply = _append_chat_artifacts_to_reply(
+                                runtime,
+                                reply=reply,
+                                artifact_paths=turn_result.artifacts,
+                                prompt=effective_prompt,
+                                principal_id=principal_id,
+                                tool_results=turn_result.tool_results,
+                                required_attachment_extensions=requested_attachment_extensions,
+                            )
+                            thinking_text = thinking_text or getattr(repair_result, "thinking_text", None)
+                    if turn_outcome is TurnOutcome.SUCCESS:
+                        reply = _enforce_chat_response_fulfillment(
+                            runtime,
+                            conversation_id=conversation_id,
+                            prompt=effective_prompt,
+                            reply=reply,
+                            tool_results=turn_result.tool_results,
+                            artifact_paths=turn_result.artifacts,
+                            principal_id=principal_id,
+                            required_attachment_extensions=requested_attachment_extensions,
+                        )
+                        update_active_task_frame_from_outcomes(
+                            runtime.store,
+                            conversation_id=conversation_id,
+                            tool_results=turn_result.tool_results,
+                            rendered_reply=reply,
+                            completion_turn_id=conversation_result.turn.turn_id,
+                        )
+                if turn_outcome is TurnOutcome.SUCCESS:
                     attachment_failure = attachment_processing_failure_reply(
                         effective_prompt,
                         normalized_attachments,
@@ -2990,6 +3176,7 @@ def _render_chat_turn(
                     prompt=prompt,
                     principal_id=principal_id,
                     tool_results=live_tool_results,
+                    required_attachment_extensions=requested_attachment_extensions,
                 )
                 reply = _enforce_chat_response_fulfillment(
                     runtime,
@@ -2998,6 +3185,7 @@ def _render_chat_turn(
                     reply=reply,
                     tool_results=live_tool_results,
                     principal_id=principal_id,
+                    required_attachment_extensions=requested_attachment_extensions,
                 )
                 attachment_failure = attachment_processing_failure_reply(
                     effective_prompt,
@@ -3115,6 +3303,7 @@ def _render_chat_turn(
             prompt=prompt,
             principal_id=principal_id,
             tool_results=live_tool_results,
+            required_attachment_extensions=requested_attachment_extensions,
         )
         reply = _enforce_chat_response_fulfillment(
             runtime,
@@ -3123,6 +3312,7 @@ def _render_chat_turn(
             reply=reply,
             tool_results=live_tool_results,
             principal_id=principal_id,
+            required_attachment_extensions=requested_attachment_extensions,
         )
         attachment_failure = attachment_processing_failure_reply(
             effective_prompt,

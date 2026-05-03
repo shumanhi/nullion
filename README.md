@@ -319,8 +319,14 @@ nullion-telegram --checkpoint runtime.db --env-file .env
 
 Runtime state is stored in SQLite by default at `~/.nullion/runtime.db`.
 Legacy `runtime-store.json` checkpoints are still readable as an import fallback.
-Chat-history fields are encrypted locally; on macOS, setup can store the chat
-history data key in Keychain instead of `~/.nullion/chat_history.key`.
+Chat-history and saved provider credentials are encrypted locally. By default,
+Nullion stores the local Fernet data keys at `~/.nullion/chat_history.key` and
+`~/.nullion/credentials.key` with owner-only file permissions. Set
+`NULLION_KEY_STORAGE=system` to store those data keys in the operating system
+secret store instead: macOS Keychain, Windows Credential Manager, or the Linux
+Secret Service keyring such as GNOME Keyring or KWallet. The older
+`NULLION_KEY_STORAGE=keychain` value remains supported as a macOS-specific
+alias.
 
 ```bash
 nullion-telegram --help   # inspect all CLI flags

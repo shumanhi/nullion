@@ -1,0 +1,311 @@
+name: PR Suite
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      test_ref:
+        description: "nullion-test branch, tag, or SHA"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-suite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NULLION_TEST_REPOSITORY: shumanhi/nullion-test
+
+jobs:
+  private-tests:
+    name: Private tests and coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Nullion app
+        uses: actions/checkout@v4
+        with:
+          path: nullion
+
+      - name: Require private test suite key
+        shell: bash
+        env:
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+        run: |
+          if [[ -z "${NULLION_TEST_REPO_SSH_KEY}" ]]; then
+            echo "::error title=Missing NULLION_TEST_REPO_SSH_KEY::Add a repository secret named NULLION_TEST_REPO_SSH_KEY using the read-only deploy key for shumanhi/nullion-test."
+            exit 1
+          fi
+
+      - name: Resolve private test suite checkout
+        id: test-checkout
+        shell: bash
+        env:
+          INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          test_ref="${INPUT_TEST_REF}"
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
+            test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" ]]; then
+            test_ref="main"
+          fi
+
+          echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private test suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NULLION_TEST_REPOSITORY }}
+          ssh-key: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+          ref: ${{ steps.test-checkout.outputs.ref }}
+          path: nullion-test
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: nullion/pyproject.toml
+
+      - name: Install app and test runner
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./nullion coverage pytest pytest-asyncio
+
+      - name: Run private suite with coverage
+        shell: bash
+        env:
+          NULLION_APP_REPO: ${{ github.workspace }}/nullion
+        run: |
+          python -m coverage erase
+          python -m coverage run --source=nullion/src/nullion -m pytest -q nullion-test/tests
+          python -m coverage report --fail-under=70
+
+  docker-e2e:
+    name: Docker e2e suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Nullion app
+        uses: actions/checkout@v4
+        with:
+          path: nullion
+
+      - name: Require private test suite key
+        shell: bash
+        env:
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+        run: |
+          if [[ -z "${NULLION_TEST_REPO_SSH_KEY}" ]]; then
+            echo "::error title=Missing NULLION_TEST_REPO_SSH_KEY::Add a repository secret named NULLION_TEST_REPO_SSH_KEY using the read-only deploy key for shumanhi/nullion-test."
+            exit 1
+          fi
+
+      - name: Resolve private test suite checkout
+        id: test-checkout
+        shell: bash
+        env:
+          INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          test_ref="${INPUT_TEST_REF}"
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
+            test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" ]]; then
+            test_ref="main"
+          fi
+
+          echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private test suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NULLION_TEST_REPOSITORY }}
+          ssh-key: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+          ref: ${{ steps.test-checkout.outputs.ref }}
+          path: nullion-test
+
+      - name: Run Docker e2e suite
+        shell: bash
+        env:
+          NULLION_APP_REPO: ${{ github.workspace }}/nullion
+        run: ./scripts/e2e-docker.sh
+        working-directory: nullion-test
+
+  linux-installer:
+    name: Linux installer Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Nullion app
+        uses: actions/checkout@v4
+        with:
+          path: nullion
+
+      - name: Require private test suite key
+        shell: bash
+        env:
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+        run: |
+          if [[ -z "${NULLION_TEST_REPO_SSH_KEY}" ]]; then
+            echo "::error title=Missing NULLION_TEST_REPO_SSH_KEY::Add a repository secret named NULLION_TEST_REPO_SSH_KEY using the read-only deploy key for shumanhi/nullion-test."
+            exit 1
+          fi
+
+      - name: Resolve private test suite checkout
+        id: test-checkout
+        shell: bash
+        env:
+          INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          test_ref="${INPUT_TEST_REF}"
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
+            test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" ]]; then
+            test_ref="main"
+          fi
+
+          echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private test suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NULLION_TEST_REPOSITORY }}
+          ssh-key: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+          ref: ${{ steps.test-checkout.outputs.ref }}
+          path: nullion-test
+
+      - name: Run Linux installer smoke
+        shell: bash
+        env:
+          NULLION_APP_REPO: ${{ github.workspace }}/nullion
+          NULLION_INSTALLER_SMOKE_TIMEOUT: 45m
+        run: ./scripts/installer-docker-linux.sh
+        working-directory: nullion-test
+
+  windows-installer:
+    name: Windows installer Docker
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Nullion app
+        uses: actions/checkout@v4
+        with:
+          path: nullion
+
+      - name: Require private test suite key
+        shell: bash
+        env:
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+        run: |
+          if [[ -z "${NULLION_TEST_REPO_SSH_KEY}" ]]; then
+            echo "::error title=Missing NULLION_TEST_REPO_SSH_KEY::Add a repository secret named NULLION_TEST_REPO_SSH_KEY using the read-only deploy key for shumanhi/nullion-test."
+            exit 1
+          fi
+
+      - name: Resolve private test suite checkout
+        id: test-checkout
+        shell: bash
+        env:
+          INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          test_ref="${INPUT_TEST_REF}"
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
+            test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" ]]; then
+            test_ref="main"
+          fi
+
+          echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private test suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NULLION_TEST_REPOSITORY }}
+          ssh-key: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+          ref: ${{ steps.test-checkout.outputs.ref }}
+          path: nullion-test
+
+      - name: Run Windows installer smoke
+        shell: pwsh
+        env:
+          NULLION_APP_REPO: ${{ github.workspace }}\nullion
+        run: .\scripts\installer-docker-windows.ps1
+        working-directory: nullion-test
+
+  macos-installer:
+    name: macOS installer
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Nullion app
+        uses: actions/checkout@v4
+        with:
+          path: nullion
+
+      - name: Require private test suite key
+        shell: bash
+        env:
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+        run: |
+          if [[ -z "${NULLION_TEST_REPO_SSH_KEY}" ]]; then
+            echo "::error title=Missing NULLION_TEST_REPO_SSH_KEY::Add a repository secret named NULLION_TEST_REPO_SSH_KEY using the read-only deploy key for shumanhi/nullion-test."
+            exit 1
+          fi
+
+      - name: Resolve private test suite checkout
+        id: test-checkout
+        shell: bash
+        env:
+          INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          test_ref="${INPUT_TEST_REF}"
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
+            test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" ]]; then
+            test_ref="main"
+          fi
+
+          echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private test suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.NULLION_TEST_REPOSITORY }}
+          ssh-key: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
+          ref: ${{ steps.test-checkout.outputs.ref }}
+          path: nullion-test
+
+      - name: Run macOS installer smoke
+        shell: bash
+        env:
+          NULLION_APP_REPO: ${{ github.workspace }}/nullion
+          NULLION_INSTALLER_SMOKE_TIMEOUT_SECONDS: "2700"
+        run: ./scripts/installer-macos.sh
+        working-directory: nullion-test

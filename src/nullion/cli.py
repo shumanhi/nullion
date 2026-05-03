@@ -738,6 +738,7 @@ def _nullion_ctl_impl() -> None:
             examples:
               nullion --logs          tail live log output
               nullion --errors        tail error log
+              nullion --dashboard     open the dashboard
               nullion --config        open .env in $EDITOR
               nullion --stop          stop the background service and tray icon
               nullion --restart       restart the service, tray icon, and Web UI
@@ -751,6 +752,7 @@ def _nullion_ctl_impl() -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--logs",    action="store_true", help="Tail the live log")
     group.add_argument("--errors",  action="store_true", help="Tail the error log")
+    group.add_argument("--dashboard", "--web", action="store_true", help="Open the Nullion dashboard")
     group.add_argument("--config",  action="store_true", help="Open ~/.nullion/.env in $EDITOR")
     group.add_argument("--stop",    action="store_true", help="Stop the background service and tray icon")
     group.add_argument("--restart", action="store_true", help="Restart the service, tray icon, and Web UI")
@@ -818,6 +820,9 @@ def _nullion_ctl_impl() -> None:
             print(f"Log not found: {log}")
             sys.exit(1)
         os.execvp("tail", ["tail", "-f", str(log)])
+
+    elif args.dashboard:
+        _open_desktop_entrypoint(port=_default_web_port(), force_reload=False)
 
     elif args.errors:
         log = _LOG_DIR / "nullion-error.log"

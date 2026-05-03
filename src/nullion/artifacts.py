@@ -31,6 +31,11 @@ _MEDIA_DIRECTIVE_PREFIX = "MEDIA:"
 _ARTIFACT_DIRECTIVE_PREFIX = "ARTIFACT:"
 _ATTACHMENT_DIRECTIVE_PREFIXES = (_MEDIA_DIRECTIVE_PREFIX, _ARTIFACT_DIRECTIVE_PREFIX)
 _MEDIA_DIRECTIVE_STRIP_CHARS = "\ufeff\u200b\u200c\u200d"
+_ARTIFACT_MEDIA_TYPES_BY_SUFFIX = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +112,11 @@ def artifact_descriptor_for_path(path: Path, *, artifact_root: Path) -> Artifact
         artifact_id=artifact_id,
         name=resolved_path.name,
         path=str(resolved_path),
-        media_type=mimetypes.guess_type(resolved_path.name)[0] or "application/octet-stream",
+        media_type=(
+            _ARTIFACT_MEDIA_TYPES_BY_SUFFIX.get(resolved_path.suffix.lower())
+            or mimetypes.guess_type(resolved_path.name)[0]
+            or "application/octet-stream"
+        ),
         size_bytes=stat.st_size,
     )
 

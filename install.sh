@@ -375,9 +375,26 @@ choose_key_storage() {
         else
             NULLION_KEY_STORAGE="local"
         fi
+    elif [[ "$PLATFORM" == "linux" ]]; then
+        echo "  Nullion encrypts local chat history and saved provider credentials."
+        echo "  On Linux, Nullion can use the Secret Service keyring when an unlocked"
+        echo "  GNOME Keyring, KWallet, or compatible provider is available."
+        echo
+        if confirm "Protect local data encryption key with the Linux system keyring?"; then
+            NULLION_KEY_STORAGE="system"
+        else
+            NULLION_KEY_STORAGE="local"
+        fi
     else
-        echo "  Nullion will store the local data encryption key at ~/.nullion/chat_history.key."
-        NULLION_KEY_STORAGE="local"
+        echo "  Nullion encrypts local chat history and saved provider credentials."
+        echo "  Nullion can protect the encryption key with the operating system secret store,"
+        echo "  or store it locally beside your Nullion data."
+        echo
+        if confirm_yes "Protect local data encryption key with the operating system secret store?"; then
+            NULLION_KEY_STORAGE="system"
+        else
+            NULLION_KEY_STORAGE="local"
+        fi
     fi
 }
 
@@ -386,6 +403,8 @@ initialize_key_storage() {
     if NULLION_KEY_STORAGE="$requested" "$VENV_DIR/bin/python" -m nullion.secure_storage --init --storage "$requested" >/tmp/nullion_key_storage.out 2>/tmp/nullion_key_storage.err; then
         if [[ "$requested" == "keychain" ]]; then
             print_ok "Local data key protected with macOS Keychain."
+        elif [[ "$requested" == "system" ]]; then
+            print_ok "Local data key protected with the operating system secret store."
         else
             print_ok "Local data key stored at $NULLION_INSTALL_DIR/chat_history.key."
         fi
@@ -401,6 +420,12 @@ initialize_key_storage() {
         NULLION_KEY_STORAGE="local" "$VENV_DIR/bin/python" -m nullion.secure_storage --init --storage local >/dev/null
         print_ok "Local data key stored at $NULLION_INSTALL_DIR/chat_history.key."
         return 0
+    fi
+
+    if [[ "$requested" == "system" ]]; then
+        print_err "Could not initialize operating system key storage: ${err:-unknown error}"
+        print_info "Choose local key storage or configure a supported OS keyring, then rerun setup."
+        exit 1
     fi
 
     print_err "Could not initialize local key storage: ${err:-unknown error}"
@@ -1044,7 +1069,7 @@ fi
 print_header "Step 1 of 4 — Python"
 
 PYTHON=""
-for candidate in python3.13 python3.12 python3.11 python3; do
+for candidate in python3.11 python3.12 python3.13 python3; do
     if command_exists "$candidate"; then
         version=$("$candidate" --version 2>&1 | awk '{print $2}')
         if python_version_supported "Python $version"; then
@@ -1173,13 +1198,48 @@ print_info "Installing dependencies (this may take a minute)..."
 "$VENV_DIR/bin/python" -m ensurepip --upgrade
 "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --upgrade pip
 "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir -e "$SOURCE_DIR"
+
+verify_python_runtime() {
+    "$VENV_DIR/bin/python" - <<'PY'
+import pydantic_core._pydantic_core
+import nullion.builder
+import nullion.web_app
+PY
+    return $?
+}
+
+repair_pydantic_runtime() {
+    if [[ "$PLATFORM" == "macos" ]]; then
+        print_info "Refreshing macOS pydantic runtime..."
+    else
+        print_info "Repairing pydantic runtime..."
+    fi
+    "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --force-reinstall --only-binary=:all: "pydantic>=2,<3" "pydantic-core>=2,<3"
+}
+
+if [[ "$PLATFORM" == "macos" ]] || ! verify_python_runtime; then
+    repair_pydantic_runtime
+fi
+if ! verify_python_runtime; then
+    print_err "Python runtime is still broken after repair."
+    print_err "This usually points to an incomplete dependency install in the ephemeral installer environment."
+    exit 1
+fi
 "$VENV_DIR/bin/python" - <<'PY'
 import PIL
 import pypdf
 PY
-print_ok "Nullion installed."
+verify_python_runtime
 
 install_playwright_runtime || true
+if ! verify_python_runtime; then
+    repair_pydantic_runtime
+    if ! verify_python_runtime; then
+        print_err "Python runtime is still broken after Playwright refresh."
+        exit 1
+    fi
+fi
+print_ok "Nullion installed."
 
 EXISTING_KEY_STORAGE="$(env_value NULLION_KEY_STORAGE)"
 choose_key_storage "$EXISTING_KEY_STORAGE"
