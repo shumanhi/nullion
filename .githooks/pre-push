@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON_CMD=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_CMD="python3"
+else
+  PYTHON_CMD="python"
+fi
+
+TEST_REPO="${NULLION_TEST_REPO:-"$(dirname "$ROOT")/nullion-test"}"
+TEST_PATH="$TEST_REPO/tests"
+
+if [[ "${NULLION_SKIP_PRIVATE_TESTS:-0}" == "1" ]]; then
+  echo "pre-push: skipping private coverage gate because NULLION_SKIP_PRIVATE_TESTS=1"
+else
+  if [[ ! -d "$TEST_PATH" ]]; then
+    echo "pre-push: private test repo not found at: $TEST_REPO" >&2
+    echo "pre-push: set NULLION_TEST_REPO to the private nullion-test checkout." >&2
+    exit 1
+  fi
+
+  COVERAGE_FILE="$(mktemp "${TMPDIR:-/tmp}/nullion-coverage.XXXXXX")"
+  export COVERAGE_FILE
+  cleanup_coverage() {
+    rm -f "$COVERAGE_FILE"
+  }
+  trap cleanup_coverage EXIT
+
+  echo "pre-push: running private test suite with coverage; overall coverage must be at least 70%..."
+  export NULLION_APP_REPO="$ROOT"
+  "$PYTHON_CMD" -m coverage erase
+  "$PYTHON_CMD" -m coverage run --source=src/nullion -m pytest -q "$TEST_PATH"
+  "$PYTHON_CMD" -m coverage report --fail-under=70
+fi
+
+IMPORTANT_CHECK="$ROOT/.local-release-e2e/run-important-checks.sh"
+if [[ "${NULLION_SKIP_IMPORTANT_CHECKS:-0}" == "1" ]]; then
+  echo "pre-push: skipping Nullion important/e2e checks because NULLION_SKIP_IMPORTANT_CHECKS=1"
+elif [[ -x "$IMPORTANT_CHECK" ]]; then
+  echo "pre-push: running Nullion important/e2e checks..."
+  "$IMPORTANT_CHECK"
+  echo "pre-push: Nullion important/e2e checks passed."
+else
+  echo "pre-push: local important/e2e check harness not found; skipping $IMPORTANT_CHECK"
+fi

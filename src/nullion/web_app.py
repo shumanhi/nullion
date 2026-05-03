@@ -442,28 +442,6 @@ def _media_model_options(
                 )
     if options:
         return options
-    for provider, raw_models in provider_models.items():
-        if media_enabled.get(provider) is not True:
-            continue
-        if providers_enabled.get(provider) is False:
-            continue
-        if not providers_configured.get(provider, False):
-            continue
-        for model in _split_model_entries(raw_models):
-            if _media_model_supports(capability, provider, model):
-                connected = provider == active_provider and model == active_model
-                options.append(
-                    {
-                        "provider": provider,
-                        "model": model,
-                        "label": (
-                            f"Connected provider/model: {provider} · {model}"
-                            if connected
-                            else f"{provider} · {model}"
-                        ),
-                        "connected": "true" if connected else "false",
-                    }
-                )
     return options
 
 
@@ -1600,6 +1578,7 @@ _HTML = r"""<!DOCTYPE html>
     flex: 1.2; display: flex; flex-direction: column;
     border-right: 1px solid var(--border); min-width: 0;
     background: rgba(11,11,13,0.72);
+    position: relative; isolation: isolate;
   }
   #mission-strip {
     display: grid; grid-template-columns: minmax(220px, 1fr) auto; align-items: center;
@@ -2151,10 +2130,25 @@ _HTML = r"""<!DOCTYPE html>
 
   #input-row {
     padding: 12px 16px; border-top: 1px solid var(--border);
-    display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto auto; gap: 9px; align-items: center;
+    display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto auto auto; gap: 9px; align-items: center;
     background: linear-gradient(180deg, #17171d, #121218);
     box-shadow: 0 -14px 30px rgba(0,0,0,0.26), var(--inset-highlight);
   }
+  #input-wrap { position: relative; }
+  #input-wrap.drag-over #input-row {
+    border-top-color: var(--accent2);
+    box-shadow: 0 -14px 30px rgba(0,0,0,0.26), 0 0 0 1px rgba(167,139,250,0.34), var(--inset-highlight);
+  }
+  #drop-overlay {
+    position: fixed; z-index: 240;
+    display: none; align-items: center; justify-content: center;
+    border: 1px dashed rgba(167,139,250,0.82); border-radius: 10px;
+    background: rgba(18,18,24,0.88); color: var(--text);
+    font-size: 13px; font-weight: 800; letter-spacing: 0;
+    pointer-events: none;
+    box-shadow: 0 18px 38px rgba(0,0,0,0.34), inset 0 1px 0 rgba(255,255,255,0.06);
+  }
+  #chat-panel.drag-over #drop-overlay { display: flex; }
   #user-input {
     flex: 1; background: linear-gradient(180deg, #23232b, #1d1d25); border: 1px solid var(--border);
     color: var(--text); border-radius: var(--radius);
@@ -2926,14 +2920,56 @@ _HTML = r"""<!DOCTYPE html>
   .model-test-row {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   }
-  .provider-test-row {
-    margin-top:14px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.06);
-  }
   #model-test-feedback {
     min-height: 18px; font-size: 11px; color: var(--muted);
   }
   #model-test-feedback.ok { color: var(--green); }
   #model-test-feedback.err { color: var(--red); }
+  .field-label-row {
+    display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:5px;
+  }
+  .field-label-row label { margin-bottom:0; }
+  .field-badge {
+    color:var(--muted); font-size:10px; font-weight:700; letter-spacing:0.04em;
+    text-transform:uppercase; white-space:nowrap;
+  }
+  .inline-field-action {
+    display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:stretch;
+  }
+  .inline-field-action input { min-width:0; }
+  .inline-field-action .card-btn {
+    min-height:40px; white-space:nowrap; align-self:stretch;
+  }
+  .chat-model-form-grid {
+    display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:stretch;
+  }
+  .chat-model-form-grid .card-btn { min-height:40px; white-space:nowrap; align-self:stretch; }
+  .chat-model-list { display:grid; gap:8px; margin-top:10px; }
+  .chat-model-item { border-color:rgba(255,255,255,0.08); }
+  .chat-model-item:first-child { border-color:rgba(52,211,153,0.28); background:rgba(52,211,153,0.045); }
+  .chat-model-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+  .chat-model-test-btn {
+    min-height:30px; padding:0 11px; white-space:nowrap;
+  }
+  .chat-model-remove-btn {
+    width:30px; height:30px; border-radius:7px; border:1px solid var(--border); background:var(--surface);
+    color:var(--muted); cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+  }
+  .chat-model-remove-btn:hover { border-color:var(--red); color:var(--red); }
+  .field-feedback {
+    display:block; min-height:18px; margin-top:6px; font-size:11px; color:var(--muted);
+  }
+  .field-feedback.ok { color:var(--green); }
+  .field-feedback.err { color:var(--red); }
+  .model-settings-stack { display:grid; gap:14px; }
+  .model-default-row {
+    display:grid; grid-template-columns:auto minmax(0,1fr); gap:12px; align-items:center;
+    padding-top:2px;
+  }
+  .model-default-copy { min-width:0; }
+  .model-default-title { color:var(--text); font-size:12px; font-weight:750; }
+  .model-default-hint { color:var(--muted); font-size:11px; line-height:1.4; margin-top:2px; }
+  .model-default-row .card-btn { white-space:nowrap; }
   .oauth-actions { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
   .oauth-action-btn {
     font-size:12px; padding:5px 12px; border-radius:6px; border:1px solid var(--border);
@@ -2983,6 +3019,10 @@ _HTML = r"""<!DOCTYPE html>
   @media (max-width: 720px) {
     .model-section-header { flex-direction:column; }
     .model-section-toggle { width:100%; justify-content:space-between; }
+    .inline-field-action { grid-template-columns:1fr; }
+    .chat-model-form-grid { grid-template-columns:1fr; }
+    .chat-model-actions { justify-content:flex-start; }
+    .model-default-row { grid-template-columns:1fr; }
   }
   .media-model-panel {
     margin-top:14px;
@@ -3188,9 +3228,11 @@ _HTML = r"""<!DOCTYPE html>
     #dash-panel { display: none; }
     #chat-panel { border-right: none; }
     .header-subtitle, #model-pill { display: none; }
-    #input-row { grid-template-columns: auto auto auto 1fr auto; }
-    #composer-mode { grid-column: 4 / 5; width: 100%; }
-    #send-btn { grid-column: 5 / 6; grid-row: 1 / 3; height: 42px; align-self: end; }
+    #input-row { grid-template-columns: auto auto minmax(0, 1fr) auto; }
+    #user-input { grid-column: 3 / 4; }
+    #attach-btn { grid-column: 4 / 5; }
+    #composer-mode { grid-column: 1 / 4; width: 100%; }
+    #send-btn { grid-column: 4 / 5; grid-row: 2 / 3; height: 42px; align-self: end; }
   }
 </style>
 </head>
@@ -3252,13 +3294,14 @@ _HTML = r"""<!DOCTYPE html>
     </section>
     <div id="messages">
     </div>
-    <div id="input-wrap" style="position:relative">
+    <div id="drop-overlay" aria-hidden="true">Drop file to attach</div>
+    <div id="input-wrap">
       <div id="slash-suggestions"></div>
     <div id="input-row">
-      <label id="attach-btn" title="Attach file" aria-label="Attach file" data-tooltip="Attach file" data-tooltip-side="bottom"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg><input type="file" id="file-input" style="display:none" multiple></label>
       <button id="composer-archive-btn" class="composer-icon-btn" title="Archive this conversation" aria-label="Archive this conversation" data-tooltip="Archive this conversation" data-tooltip-side="bottom" onclick="archiveConversation()"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6z"/><path d="M4 6l2-3h12l2 3"/><path d="M9 12h6"/></svg></button>
       <button id="composer-clear-btn" class="composer-icon-btn" title="Clear this conversation" aria-label="Clear this conversation" data-tooltip="Clear this conversation" data-tooltip-side="bottom" onclick="clearConversation()"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg></button>
-      <textarea id="user-input" placeholder="Ask Nullion, assign a mission, or type / for commands…" rows="1"></textarea>
+      <textarea id="user-input" placeholder="Ask Nullion, paste or drag an image, or type / for commands…" rows="1" autofocus></textarea>
+      <label id="attach-btn" title="Attach file" aria-label="Attach file" data-tooltip="Attach file" data-tooltip-side="bottom"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg><input type="file" id="file-input" style="display:none" multiple></label>
       <select id="composer-mode" title="Interaction mode">
         <option value="chat">Chat</option>
         <option value="build">Build</option>
@@ -4476,7 +4519,7 @@ _HTML = r"""<!DOCTYPE html>
 
             <div class="form-group" id="api-key-row">
               <label>API Key</label>
-              <input type="password" id="cfg-api-key" placeholder="sk-..." autocomplete="off">
+              <input type="password" id="cfg-api-key" placeholder="sk-..." autocomplete="off" oninput="onModelApiKeyInput()">
             </div>
 
             <div id="oauth-status-row" style="display:none;margin-bottom:0">
@@ -4502,7 +4545,7 @@ _HTML = r"""<!DOCTYPE html>
             <div class="model-section-header">
               <div>
                 <div class="model-section-title" id="chat-model-section-title">Chat model</div>
-                <div class="model-section-copy">Used for conversations, planning, tool calls, and delegated work. Add more saved options with commas.</div>
+                <div class="model-section-copy">Used for conversations, planning, tool calls, and delegated work. Add saved options as model rows.</div>
               </div>
               <div class="model-section-toggle">
                 <span class="form-hint" id="provider-enabled-label-text" style="margin:0">Chat provider</span>
@@ -4510,31 +4553,49 @@ _HTML = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="form-group">
-              <label>Models</label>
-              <input type="text" id="cfg-model-name" placeholder="gpt-5.5, gpt-5.4, gpt-5.4-mini">
-              <div class="form-hint" id="model-hint">Comma-separated model IDs are saved for this provider; the first one is the active default.</div>
-            </div>
+            <div class="model-settings-stack">
+              <div class="form-group">
+                <div class="field-label-row">
+                  <label for="cfg-chat-model-name">Chat model</label>
+                  <span class="field-badge">First is active</span>
+                </div>
+                <input type="hidden" id="cfg-model-name">
+                <div class="chat-model-form-grid">
+                  <div class="inline-field-action">
+                    <input type="text" id="cfg-chat-model-name" placeholder="gpt-5.5" onkeydown="handleChatModelInputKey(event)">
+                    <button class="card-btn secondary" type="button" id="model-add-btn" onclick="addChatModelRow()">Add</button>
+                  </div>
+                  <button class="card-btn secondary" type="button" id="model-test-btn" onclick="testModelConnection()">Test all</button>
+                </div>
+                <div id="chat-model-list" class="chat-model-list" aria-label="Chat model options"></div>
+                <div class="form-hint" id="model-hint">Rows save top-to-bottom as the comma-separated fallback order; the first model is active.</div>
+                <span id="model-test-feedback" class="field-feedback"></span>
+                <div id="model-test-results" class="model-test-results" style="display:none"></div>
+              </div>
 
-            <div class="form-group">
-              <label>Thinking level</label>
-              <select id="cfg-reasoning-effort">
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select>
-              <div class="form-hint">Applied when the selected provider/model supports explicit reasoning controls.</div>
-            </div>
+              <div class="form-group">
+                <label>Thinking level</label>
+                <select id="cfg-reasoning-effort">
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+                <div class="form-hint">Applied only when this provider/model supports explicit reasoning controls.</div>
+              </div>
 
-            <div class="model-test-row">
-              <button class="card-btn secondary" type="button" onclick="forceModelToAllSessions()">↗ Set as default for all sessions</button>
-            </div>
-
-            <div id="admin-forced-strip" class="admin-model-strip" style="display:none">
-              <span class="ams-label">Default chat model:</span>
-              <span class="ams-value" id="admin-forced-value">—</span>
-              <span id="model-force-feedback" style="flex:1;font-size:11px;color:var(--green)"></span>
-              <button class="ams-clear" type="button" onclick="clearAdminForcedModel()">Clear ×</button>
+              <div class="model-default-row">
+                <button class="card-btn secondary" type="button" onclick="forceModelToAllSessions()">Set default</button>
+                <div class="model-default-copy">
+                  <div class="model-default-title">Use the first chat model above for every new session.</div>
+                  <div class="model-default-hint">Clear it to return sessions to their saved provider settings.</div>
+                </div>
+              </div>
+              <div id="admin-forced-strip" class="admin-model-strip" style="display:none">
+                <span class="ams-label">Current:</span>
+                <span class="ams-value" id="admin-forced-value">—</span>
+                <span id="model-force-feedback" style="flex:1;font-size:11px;color:var(--green)"></span>
+                <button class="ams-clear" type="button" onclick="clearAdminForcedModel()">Clear ×</button>
+              </div>
             </div>
           </section>
 
@@ -4552,8 +4613,11 @@ _HTML = r"""<!DOCTYPE html>
             <div class="form-hint" id="media-provider-status" style="margin:-4px 0 12px"></div>
             <div class="media-model-form-grid">
               <div class="form-group">
-                <label>Media model</label>
-                <input type="text" id="cfg-media-model-name" placeholder="gpt-4o, gpt-image-1, whisper-1" oninput="updateMediaModelCapabilityFeedback()">
+                <label for="cfg-media-model-name">Media model</label>
+                <div class="inline-field-action">
+                  <input type="text" id="cfg-media-model-name" placeholder="gpt-4o, gpt-image-1, whisper-1" oninput="updateMediaModelCapabilityFeedback()">
+                  <button class="card-btn secondary" type="button" onclick="addMediaModel()">Add</button>
+                </div>
               </div>
               <div class="form-group">
                 <label>Model type</label>
@@ -4566,18 +4630,9 @@ _HTML = r"""<!DOCTYPE html>
                 </select>
               </div>
             </div>
-            <div class="media-model-actions">
-              <button class="card-btn secondary" type="button" onclick="addMediaModel()">Add media model</button>
-              <span id="media-model-feedback"></span>
-            </div>
+            <div class="media-model-actions"><span id="media-model-feedback"></span></div>
             <div id="media-model-list" class="media-model-list"></div>
           </section>
-
-          <div class="model-test-row provider-test-row">
-            <button class="card-btn secondary" type="button" id="model-test-btn" onclick="testModelConnection()">Test selected provider</button>
-            <span id="model-test-feedback"></span>
-          </div>
-          <div id="model-test-results" class="model-test-results" style="display:none"></div>
         </div>
       </div>
 
@@ -5820,8 +5875,23 @@ function withModeInstruction(text, mode) {
 function usePrompt(text) {
   const input = document.getElementById('user-input');
   input.value = text;
-  input.focus();
+  focusComposer();
   input.dispatchEvent(new Event('input'));
+}
+
+function focusComposer({ force = false } = {}) {
+  const input = document.getElementById('user-input');
+  if (!input) return;
+  const active = document.activeElement;
+  const activeTag = String(active?.tagName || '').toLowerCase();
+  const activeIsTypingField = ['input', 'textarea', 'select'].includes(activeTag) || active?.isContentEditable;
+  const overlayOpen = Array.from(document.querySelectorAll('.modal-overlay, .settings-overlay, #confirm-overlay'))
+    .some((el) => {
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    });
+  if (!force && (overlayOpen || (active && active !== document.body && active !== input && activeIsTypingField))) return;
+  input.focus({ preventScroll: true });
 }
 
 function addMessage(role, text, isError = false, metadata = null) {
@@ -8350,6 +8420,105 @@ function splitModelEntries(value) {
     .filter(Boolean);
 }
 
+function currentChatModelEntries() {
+  const rows = Array.from(document.querySelectorAll('#chat-model-list .chat-model-item'));
+  const values = rows
+    .map(row => String(row.getAttribute('data-model-name') || '').trim())
+    .filter(Boolean);
+  if (values.length) return values;
+  return splitModelEntries(document.getElementById('cfg-model-name')?.value || '');
+}
+
+function syncChatModelRowsToHidden() {
+  const hidden = document.getElementById('cfg-model-name');
+  const provider = document.getElementById('cfg-model-provider')?.value || '';
+  const value = currentChatModelEntries().join(', ');
+  if (hidden) hidden.value = value;
+  if (provider) _providerModels[provider] = value;
+  const resultsEl = document.getElementById('model-test-results');
+  if (resultsEl) { resultsEl.innerHTML = ''; resultsEl.style.display = 'none'; }
+  const fb = document.getElementById('model-test-feedback');
+  if (fb) { fb.textContent = ''; fb.className = ''; }
+  return value;
+}
+
+function renderChatModelRows(modelValue) {
+  const root = document.getElementById('chat-model-list');
+  const hidden = document.getElementById('cfg-model-name');
+  const provider = document.getElementById('cfg-model-provider')?.value || '';
+  if (!root) {
+    if (hidden) hidden.value = modelValue || '';
+    return;
+  }
+  const entries = Array.isArray(modelValue)
+    ? modelValue.map(item => String(item || '').trim())
+    : splitModelEntries(modelValue);
+  const models = entries.filter(Boolean);
+  if (!models.length) {
+    root.innerHTML = '<div class="empty">No chat models added for this provider.</div>';
+    if (hidden) hidden.value = '';
+    if (provider) _providerModels[provider] = '';
+    const resultsEl = document.getElementById('model-test-results');
+    if (resultsEl) { resultsEl.innerHTML = ''; resultsEl.style.display = 'none'; }
+    const fb = document.getElementById('model-test-feedback');
+    if (fb) { fb.textContent = ''; fb.className = ''; }
+    return;
+  }
+  root.innerHTML = models.map((model, index) => `
+    <div class="chat-model-item media-model-item" data-model-index="${index}" data-model-name="${escAttr(model)}">
+      <div class="media-model-copy">
+        <div class="media-model-title">${escHtml(model)}</div>
+        <div class="media-model-meta">
+          <span class="pill">${index === 0 ? 'Active default' : `Fallback ${index}`}</span>
+        </div>
+      </div>
+      <div class="chat-model-actions">
+        ${index === 0 ? '' : `<button class="media-default-btn chat-model-default-btn" type="button" onclick="makeChatModelDefault(${index})">Make default</button>`}
+        <button class="media-default-btn chat-model-test-btn" type="button" onclick="testModelConnection(${index})">Test</button>
+        <button class="chat-model-remove-btn" type="button" title="Remove chat model" onclick="removeChatModelRow(${index})">×</button>
+      </div>
+    </div>
+  `).join('');
+  syncChatModelRowsToHidden();
+}
+
+function addChatModelRow(value = '') {
+  const input = document.getElementById('cfg-chat-model-name');
+  const fb = document.getElementById('model-test-feedback');
+  const model = String(value || input?.value || '').trim();
+  if (!model) {
+    if (fb) { fb.textContent = 'Enter a chat model name.'; fb.className = 'err'; }
+    return;
+  }
+  const values = currentChatModelEntries().filter(existing => existing !== model);
+  values.push(model);
+  renderChatModelRows(values);
+  if (input) input.value = '';
+  if (fb) { fb.textContent = 'Added. Save settings to persist.'; fb.className = 'ok'; }
+}
+
+function removeChatModelRow(index) {
+  const values = currentChatModelEntries();
+  values.splice(index, 1);
+  renderChatModelRows(values);
+}
+
+function makeChatModelDefault(index) {
+  const values = currentChatModelEntries();
+  if (index <= 0 || index >= values.length) return;
+  const [model] = values.splice(index, 1);
+  values.unshift(model);
+  renderChatModelRows(values);
+  const fb = document.getElementById('model-test-feedback');
+  if (fb) { fb.textContent = `${model} moved to the top of the fallback order. Save settings to persist.`; fb.className = 'ok'; }
+}
+
+function handleChatModelInputKey(event) {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  addChatModelRow();
+}
+
 function mediaCapabilitiesForName(provider, model) {
   const name = String(model || '').toLowerCase();
   const providerKey = String(provider || '').toLowerCase();
@@ -8429,7 +8598,10 @@ function providerHasMediaModels(provider) {
 }
 
 function providerHasMediaAccess(provider) {
-  return !!(_mediaProviderConfigured[provider] || _providerConfigured[provider]);
+  if (_mediaProviderConfigured[provider] || _providerConfigured[provider]) return true;
+  const selectedProvider = document.getElementById('cfg-model-provider')?.value || '';
+  const apiKey = document.getElementById('cfg-api-key')?.value || '';
+  return provider === selectedProvider && !!apiKey && !apiKey.startsWith('•');
 }
 
 function mediaProviderEnabled(provider) {
@@ -8489,7 +8661,6 @@ function refreshMediaHelperOptionsFromInventory() {
 function mediaModelOptionsForCapability(capability) {
   const options = [];
   const seen = new Set();
-  const activeProvider = document.getElementById('cfg-model-provider')?.value || '';
   const addOption = (provider, model, label) => {
     const key = mediaOptionValue(provider, model);
     if (!provider || !model || seen.has(key)) return;
@@ -8505,17 +8676,6 @@ function mediaModelOptionsForCapability(capability) {
       if (model && caps.includes(capability)) {
         addOption(provider, model, `${providerLabel(provider)} · ${model}`);
       }
-    });
-  });
-  Object.entries(_providerModels || {}).forEach(([provider, rawModels]) => {
-    if (_providersEnabled[provider] === false) return;
-    if (_providerConfigured[provider] === false) return;
-    splitModelEntries(rawModels).forEach(model => {
-      if (!mediaCapabilityIsValid(provider, model, capability)) return;
-      const label = provider === activeProvider
-        ? `Connected provider/model: ${providerLabel(provider)} · ${model}`
-        : `${providerLabel(provider)} · ${model}`;
-      addOption(provider, model, label);
     });
   });
   return options;
@@ -8635,6 +8795,17 @@ function onChatProviderEnabledChange() {
   const provider = document.getElementById('cfg-model-provider')?.value || '';
   if (!provider) return;
   _providersEnabled[provider] = document.getElementById('cfg-model-provider-enabled')?.checked === true;
+  updateProviderStatusHeader();
+  refreshMediaHelperOptionsFromInventory();
+}
+
+function onModelApiKeyInput() {
+  const provider = document.getElementById('cfg-model-provider')?.value || '';
+  const apiKey = document.getElementById('cfg-api-key')?.value || '';
+  const toggle = document.getElementById('cfg-model-provider-enabled');
+  if (!provider || !toggle || !apiKey || apiKey.startsWith('•')) return;
+  toggle.checked = true;
+  _providersEnabled[provider] = true;
   updateProviderStatusHeader();
   refreshMediaHelperOptionsFromInventory();
 }
@@ -8761,20 +8932,20 @@ function onProviderChange() {
       placeholders[prov] || 'sk-...';
   }
   const hints = {
-    openai:     'Comma-separated OpenAI model IDs; first becomes active. e.g. gpt-5.5, gpt-5, gpt-4o',
-    anthropic:  'Comma-separated Anthropic model IDs; first becomes active. e.g. claude-opus-4-6, claude-sonnet-4-6',
-    codex:      'Comma-separated Codex model IDs; first becomes active. e.g. codex-mini-latest',
-    openrouter: 'Comma-separated OpenRouter slugs; first becomes active. e.g. openai/gpt-4o, google/gemini-2.5-flash',
-    gemini:     'Comma-separated Gemini model IDs; first becomes active. e.g. models/gemini-2.5-flash, models/gemini-2.5-pro',
-    ollama:     'Comma-separated local model names; first becomes active. e.g. llama3.3, qwen3.5:latest, gemma3',
-    groq:       'Comma-separated Groq model IDs; first becomes active. e.g. llama-3.3-70b-versatile, openai/gpt-oss-120b',
-    mistral:    'Comma-separated Mistral model IDs; first becomes active. e.g. mistral-large-latest, pixtral-large-latest',
-    deepseek:   'Comma-separated DeepSeek model IDs; first becomes active. e.g. deepseek-chat, deepseek-reasoner',
-    xai:        'Comma-separated xAI model IDs; first becomes active. e.g. grok-4, grok-3-mini',
-    together:   'Comma-separated Together AI model IDs; first becomes active. e.g. meta-llama/Llama-3.3-70B-Instruct-Turbo',
-    custom:     'Comma-separated model IDs exposed by your endpoint; first becomes active.',
+    openai:     'OpenAI model IDs. First row is active. e.g. gpt-5.5, gpt-5, gpt-4o',
+    anthropic:  'Anthropic model IDs. First row is active. e.g. claude-opus-4-6, claude-sonnet-4-6',
+    codex:      'Codex model IDs. First row is active. e.g. codex-mini-latest',
+    openrouter: 'OpenRouter slugs. First row is active. e.g. openai/gpt-4o, google/gemini-2.5-flash',
+    gemini:     'Gemini model IDs. First row is active. e.g. models/gemini-2.5-flash, models/gemini-2.5-pro',
+    ollama:     'Local model names. First row is active. e.g. llama3.3, qwen3.5:latest, gemma3',
+    groq:       'Groq model IDs. First row is active. e.g. llama-3.3-70b-versatile, openai/gpt-oss-120b',
+    mistral:    'Mistral model IDs. First row is active. e.g. mistral-large-latest, pixtral-large-latest',
+    deepseek:   'DeepSeek model IDs. First row is active. e.g. deepseek-chat, deepseek-reasoner',
+    xai:        'xAI model IDs. First row is active. e.g. grok-4, grok-3-mini',
+    together:   'Together AI model IDs. First row is active. e.g. meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    custom:     'Model IDs exposed by your endpoint. First row is active.',
   };
-  document.getElementById('model-hint').textContent = hints[prov] || 'Comma-separated model IDs are saved for this provider; the first one is active.';
+  document.getElementById('model-hint').textContent = hints[prov] || 'Rows save top-to-bottom as the comma-separated fallback order; the first model is active.';
   // Clear stale test results when provider changes
   const resultsEl = document.getElementById('model-test-results');
   if (resultsEl) { resultsEl.innerHTML = ''; resultsEl.style.display = 'none'; }
@@ -8786,9 +8957,9 @@ function onProviderChange() {
   const modelEl = document.getElementById('cfg-model-name');
   if (modelEl) {
     if (_modelFieldProvider && _modelFieldProvider !== prov) {
-      _providerModels[_modelFieldProvider] = modelEl.value;
+      _providerModels[_modelFieldProvider] = currentChatModelEntries().join(', ');
     }
-    modelEl.value = _providerModels[prov] || '';
+    renderChatModelRows(_providerModels[prov] || '');
     _modelFieldProvider = prov;
   }
   // Per-provider enabled toggle: during initial load honour the saved value;
@@ -10562,7 +10733,7 @@ async function saveConfig() {
   // Make sure the current model field is captured for its provider before
   // building the payload (in case the user typed without changing provider).
   const _currentProvider = document.getElementById('cfg-model-provider').value;
-  const _currentModel    = document.getElementById('cfg-model-name').value.trim();
+  const _currentModel    = syncChatModelRowsToHidden().trim();
   const _currentEnabled  = document.getElementById('cfg-model-provider-enabled')?.checked === true;
   if (_currentProvider) {
     _providerModels[_currentProvider] = _currentModel;
@@ -10690,24 +10861,26 @@ const _PROVIDER_MODELS = {
   together:   ['meta-llama/Llama-3.3-70B-Instruct-Turbo'],
 };
 
-async function testModelConnection() {
+async function testModelConnection(modelIndex = null) {
   const btn        = document.getElementById('model-test-btn');
   const fb         = document.getElementById('model-test-feedback');
   const resultsEl  = document.getElementById('model-test-results');
   const provider   = document.getElementById('cfg-model-provider').value;
   const apiKey     = document.getElementById('cfg-api-key').value;
-  const modelInput = document.getElementById('cfg-model-name').value.trim();
+  const allModels  = currentChatModelEntries();
 
-  // Split comma/newline-separated model names; never silently fall back to provider defaults.
-  const modelsToTest = modelInput
-    ? splitModelEntries(modelInput)
-    : [];
+  // Use only the configured model rows; never silently fall back to provider defaults.
+  const rowIndex = Number.isInteger(modelIndex) ? modelIndex : null;
+  const modelsToTest = rowIndex === null
+    ? allModels
+    : [allModels[rowIndex]].filter(Boolean);
   if (!modelsToTest.length) {
     if (fb) { fb.textContent = 'Enter at least one chat model for the selected provider.'; fb.className = 'err'; }
     return;
   }
 
   if (btn) btn.disabled = true;
+  document.querySelectorAll('.chat-model-test-btn').forEach(button => { button.disabled = true; });
   if (fb) { fb.textContent = `Testing ${modelsToTest.length} configured model${modelsToTest.length === 1 ? '' : 's'}…`; fb.className = ''; }
 
   // Render a loading placeholder row for each model. Use generated row ids:
@@ -10777,6 +10950,7 @@ async function testModelConnection() {
     }
   }
   if (btn) btn.disabled = false;
+  document.querySelectorAll('.chat-model-test-btn').forEach(button => { button.disabled = false; });
 }
 
 function _updateAdminForcedStrip(forcedModel, forcedProvider) {
@@ -10793,7 +10967,7 @@ function _updateAdminForcedStrip(forcedModel, forcedProvider) {
 }
 
 async function forceModelToAllSessions() {
-  const model    = document.getElementById('cfg-model-name').value.trim();
+  const model    = currentChatModelEntries()[0] || '';
   const provider = document.getElementById('cfg-model-provider').value;
   const strip = document.getElementById('admin-forced-strip');
   const fb    = (strip && strip.style.display !== 'none')
@@ -10972,7 +11146,7 @@ function _slashPick(cmd) {
   const hasArg = cmd.includes('<');
   input.value = hasArg ? cmd.replace(/<.*>/, '').trimEnd() + ' ' : cmd + ' ';
   input.style.height = 'auto';
-  input.focus();
+  focusComposer({ force: true });
   _slashClose();
 }
 
@@ -10986,6 +11160,16 @@ function _slashMove(dir) {
 }
 
 // ── Input handling ────────────────────────────────────────────────────────────
+
+function addPendingFiles(files) {
+  const incoming = Array.from(files || []).filter(Boolean);
+  if (!incoming.length) return false;
+  _chatUserInteractedSinceLoad = true;
+  _pendingFiles.push(...incoming);
+  renderAttachments();
+  focusComposer({ force: true });
+  return true;
+}
 
 document.getElementById('user-input').addEventListener('keydown', (e) => {
   if (document.getElementById('slash-suggestions').classList.contains('open')) {
@@ -11011,21 +11195,97 @@ document.getElementById('user-input').addEventListener('input', function() {
     _slashClose();
   }
 });
+document.getElementById('user-input').addEventListener('paste', (event) => {
+  const clipboard = event.clipboardData;
+  if (!clipboard) return;
+  const pastedFiles = [];
+  for (const item of Array.from(clipboard.items || [])) {
+    if (item.kind !== 'file' || !String(item.type || '').startsWith('image/')) continue;
+    const blob = item.getAsFile();
+    if (!blob) continue;
+    const extension = String(blob.type || 'image/png').split('/')[1] || 'png';
+    const name = blob.name && blob.name !== 'image.png'
+      ? blob.name
+      : `clipboard-image-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`;
+    pastedFiles.push(new File([blob], name, { type: blob.type || 'image/png', lastModified: Date.now() }));
+  }
+  if (!pastedFiles.length) return;
+  event.preventDefault();
+  const text = clipboard.getData('text/plain');
+  if (text) document.execCommand('insertText', false, text);
+  addPendingFiles(pastedFiles);
+});
 document.getElementById('user-input').addEventListener('blur', () => {
   // Delay so mousedown on an item fires first
   setTimeout(_slashClose, 150);
 });
 document.getElementById('send-btn').addEventListener('click', () => sendMessage());
+window.addEventListener('DOMContentLoaded', () => setTimeout(() => focusComposer(), 0));
+window.addEventListener('focus', () => setTimeout(() => focusComposer(), 0));
+
+const chatDropZone = document.getElementById('chat-panel');
+if (chatDropZone) {
+  let chatDragDepth = 0;
+  const dragHasFiles = (dataTransfer) => {
+    if (!dataTransfer) return false;
+    if (Array.from(dataTransfer.items || []).some((item) => item.kind === 'file')) return true;
+    return Array.from(dataTransfer.types || []).includes('Files');
+  };
+  const showDropOverlay = () => {
+    const overlay = document.getElementById('drop-overlay');
+    const rect = chatDropZone.getBoundingClientRect();
+    if (overlay) {
+      overlay.style.left = `${Math.round(rect.left + 16)}px`;
+      overlay.style.top = `${Math.round(rect.top + 16)}px`;
+      overlay.style.width = `${Math.max(0, Math.round(rect.width - 32))}px`;
+      overlay.style.height = `${Math.max(0, Math.round(rect.height - 32))}px`;
+    }
+    chatDropZone.classList.add('drag-over');
+    document.getElementById('input-wrap')?.classList.add('drag-over');
+  };
+  const hideDropOverlay = () => {
+    const overlay = document.getElementById('drop-overlay');
+    if (overlay) {
+      overlay.style.left = '';
+      overlay.style.top = '';
+      overlay.style.width = '';
+      overlay.style.height = '';
+    }
+    chatDropZone.classList.remove('drag-over');
+    document.getElementById('input-wrap')?.classList.remove('drag-over');
+  };
+  ['dragenter', 'dragover'].forEach((type) => {
+    chatDropZone.addEventListener(type, (event) => {
+      if (!dragHasFiles(event.dataTransfer)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      if (type === 'dragenter') chatDragDepth += 1;
+      showDropOverlay();
+    });
+  });
+  ['dragleave', 'dragend'].forEach((type) => {
+    chatDropZone.addEventListener(type, (event) => {
+      if (type === 'dragleave') chatDragDepth = Math.max(0, chatDragDepth - 1);
+      if (type === 'dragend' || chatDragDepth === 0) hideDropOverlay();
+    });
+  });
+  chatDropZone.addEventListener('drop', (event) => {
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (!files.length) return;
+    event.preventDefault();
+    chatDragDepth = 0;
+    hideDropOverlay();
+    addPendingFiles(files);
+  });
+}
 
 // ── Attachment handling ───────────────────────────────────────────────────────
 let _pendingFiles = [];
 window._pendingMessageAttachments = [];
 let _chatUserInteractedSinceLoad = false;
 document.getElementById('file-input').addEventListener('change', function() {
-  _chatUserInteractedSinceLoad = true;
-  for (const f of this.files) _pendingFiles.push(f);
+  addPendingFiles(this.files);
   this.value = '';
-  renderAttachments();
 });
 function renderAttachments() {
   const bar = document.getElementById('attachments-bar');
@@ -11039,7 +11299,7 @@ function renderAttachments() {
     bar.appendChild(chip);
   });
 }
-function removeAttachment(i) { _pendingFiles.splice(i, 1); renderAttachments(); }
+function removeAttachment(i) { _pendingFiles.splice(i, 1); renderAttachments(); focusComposer({ force: true }); }
 async function uploadFiles(files) {
   const results = [];
   for (const f of files) {
@@ -11075,6 +11335,7 @@ sendMessage = async function() {
     renderAttachments();
   }
   await _origSendMessage();
+  focusComposer();
 };
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
@@ -11937,6 +12198,12 @@ def _web_plain_artifact_paths_from_reply(reply: str | None) -> list[str]:
 
 
 def _filter_web_artifact_paths_for_requested_format(prompt: str, paths: list[str]) -> list[str]:
+    explicit_extensions = {
+        f".{match.group(1).lower()}"
+        for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(prompt or ""))
+    }
+    if len(explicit_extensions) > 1:
+        return paths
     requested_extension = plan_attachment_format(prompt or "").extension
     if not requested_extension:
         return paths
@@ -12051,6 +12318,7 @@ def _enforce_web_response_fulfillment(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     artifact_paths: list[str] | tuple[str, ...] | None = None,
     artifact_count: int = 0,
+    required_attachment_extensions: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[str, bool]:
     roots = [artifact_root_for_principal(conversation_id), *_web_artifact_roots(runtime)]
     decision = evaluate_response_fulfillment(
@@ -12062,6 +12330,7 @@ def _enforce_web_response_fulfillment(
         artifact_paths=artifact_paths,
         artifact_roots=roots,
         platform_artifact_count=artifact_count,
+        required_attachment_extensions=required_attachment_extensions,
     )
     return decision.reply, decision.satisfied
 
@@ -14806,7 +15075,11 @@ def create_app(runtime, orchestrator, registry):
             if effective_key:
                 env_overrides["NULLION_OPENAI_API_KEY"] = effective_key
                 env_overrides["ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY"] = effective_key
-            if provider in {"openrouter", "openrouter-key"}:
+            if (
+                provider in {"openrouter", "openrouter-key"}
+                and not os.environ.get("NULLION_OPENAI_BASE_URL")
+                and not os.environ.get("OPENAI_BASE_URL")
+            ):
                 env_overrides.setdefault("NULLION_OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
             settings = load_settings(env={**os.environ, **env_overrides})
             settings.model.provider = provider
@@ -14852,6 +15125,43 @@ def create_app(runtime, orchestrator, registry):
         except Exception as exc:
             return JSONResponse({"ok": False, "error": _short_error_text(exc)}, status_code=400)
 
+    def _hot_swap_live_model_client(
+        *,
+        provider: str | None = None,
+        model_name: str | None = None,
+        reason: str = "settings change",
+    ) -> bool:
+        from nullion.agent_orchestrator import AgentOrchestrator as _AgentOrchestrator
+        from nullion.config import load_settings as _reload_settings
+        from nullion.model_clients import build_model_client_from_settings
+
+        env = dict(os.environ)
+        provider_s = str(provider or "").strip()
+        model_s = str(model_name or "").strip()
+        if provider_s:
+            env["NULLION_MODEL_PROVIDER"] = provider_s
+        if model_s:
+            env["NULLION_MODEL"] = model_s
+        _new_settings = _reload_settings(env=env)
+        if provider_s:
+            _new_settings.model.provider = provider_s
+        if model_s:
+            _new_settings.model.openai_model = model_s
+        _new_client = build_model_client_from_settings(_new_settings)
+        _replacement = _AgentOrchestrator(model_client=_new_client)
+        orchestrator.__dict__.update(_replacement.__dict__)
+        try:
+            runtime.model_client = _new_client
+        except Exception:
+            pass
+        logger.info(
+            "Model client hot-swapped after %s (provider=%s model=%s)",
+            reason,
+            getattr(getattr(_new_settings, "model", None), "provider", "?"),
+            getattr(getattr(_new_settings, "model", None), "openai_model", "?"),
+        )
+        return True
+
     @app.post("/api/config/model-force")
     async def post_model_force(request: Request):
         """Set the admin-forced model — broadcast default for all sessions."""
@@ -14875,7 +15185,24 @@ def create_app(runtime, orchestrator, registry):
                     os.environ["NULLION_ADMIN_FORCED_PROVIDER"] = model_provider
                 except Exception:
                     pass  # provider label is cosmetic; don't fail the whole call
-            return JSONResponse({"ok": True, "admin_forced_model": model_name, "admin_forced_provider": model_provider or None})
+            swap_error = None
+            try:
+                _hot_swap_live_model_client(
+                    provider=model_provider or None,
+                    model_name=model_name,
+                    reason="default model change",
+                )
+            except Exception as exc:
+                swap_error = _short_error_text(exc)
+                logger.warning("Live model client swap failed after default model change: %s", exc)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "admin_forced_model": model_name,
+                    "admin_forced_provider": model_provider or None,
+                    **({"live_swap_error": swap_error} if swap_error else {}),
+                }
+            )
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -14893,7 +15220,13 @@ def create_app(runtime, orchestrator, registry):
                 os.environ.pop("NULLION_ADMIN_FORCED_PROVIDER", None)
             except Exception:
                 pass
-            return JSONResponse({"ok": True})
+            swap_error = None
+            try:
+                _hot_swap_live_model_client(reason="default model clear")
+            except Exception as exc:
+                swap_error = _short_error_text(exc)
+                logger.warning("Live model client swap failed after default model clear: %s", exc)
+            return JSONResponse({"ok": True, **({"live_swap_error": swap_error} if swap_error else {})})
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -14986,6 +15319,7 @@ def create_app(runtime, orchestrator, registry):
         provider_sent = "model_provider" in body
         provider = body.get("model_provider") if provider_sent else os.environ.get("NULLION_MODEL_PROVIDER", "openai")
         api_key  = body.get("api_key", "")
+        model_sent = "model_name" in body
         model    = body.get("model_name", "")
         reasoning_effort = normalize_reasoning_effort(str(body.get("reasoning_effort") or ""))
         media_models_body = body.get("media_models")
@@ -15036,7 +15370,7 @@ def create_app(runtime, orchestrator, registry):
         model_config_sent = (
             provider_sent
             or bool(api_key)
-            or bool(model)
+            or model_sent
             or bool(reasoning_effort)
             or media_models_body is not None
             or media_providers_enabled_body is not None
@@ -15070,7 +15404,7 @@ def create_app(runtime, orchestrator, registry):
                         creds["api_key"] = saved_provider_key
                         active_provider_key_for_env = saved_provider_key
                 active_model = _primary_model_entry(model)
-                if model:
+                if model_sent:
                     # Per-provider model storage. Each provider has its own
                     # saved model list so switching providers doesn't bleed
                     # model strings (e.g. OpenRouter slugs leaking into Codex).
@@ -15078,12 +15412,21 @@ def create_app(runtime, orchestrator, registry):
                     if not isinstance(models_map, dict):
                         models_map = {}
                     if provider:
-                        models_map[provider] = model
-                    creds["models"] = models_map
+                        if model:
+                            models_map[provider] = model
+                        else:
+                            models_map.pop(provider, None)
+                    if models_map:
+                        creds["models"] = models_map
+                    else:
+                        creds.pop("models", None)
                     # Keep legacy `model` in sync only with the active provider's
                     # current concrete model — same reasoning as above.
                     if not is_disabling and (creds.get("provider") == provider):
-                        creds["model"] = active_model
+                        if active_model:
+                            creds["model"] = active_model
+                        else:
+                            creds.pop("model", None)
                 if reasoning_effort:
                     creds["reasoning_effort"] = reasoning_effort
                 if media_models_body is not None:
@@ -15140,7 +15483,7 @@ def create_app(runtime, orchestrator, registry):
         # Persist the base URL so that load_settings() builds a correct client
         # without a restart.  Always overwrite — setdefault would leave a stale
         # vendor URL in place when the user switches providers.
-        if provider_sent and provider in provider_base_urls:
+        if provider_sent and not is_disabling and provider in provider_base_urls:
             provider_base_url = provider_base_urls[provider]
             os.environ["NULLION_OPENAI_BASE_URL"] = provider_base_url  # always overwrite
             try:
@@ -15149,7 +15492,7 @@ def create_app(runtime, orchestrator, registry):
                 _write_credentials_json(_creds_or)
             except Exception:
                 pass
-        elif provider_sent and provider and provider not in provider_base_urls:
+        elif provider_sent and not is_disabling and provider and provider not in provider_base_urls:
             # Switching away from OpenAI-compatible proxies — clear the base URL so it doesn't
             # bleed into the new provider.
             os.environ.pop("NULLION_OPENAI_BASE_URL", None)
@@ -15194,10 +15537,11 @@ def create_app(runtime, orchestrator, registry):
 
         updates: dict[str, str] = {}
         # Persist base URL to .env so it's available after restart.
-        if provider in provider_base_urls:
-            updates["NULLION_OPENAI_BASE_URL"] = provider_base_urls[provider]
-        elif provider and provider not in provider_base_urls:
-            updates["NULLION_OPENAI_BASE_URL"] = ""  # clear it
+        if not is_disabling:
+            if provider in provider_base_urls:
+                updates["NULLION_OPENAI_BASE_URL"] = provider_base_urls[provider]
+            elif provider and provider not in provider_base_urls:
+                updates["NULLION_OPENAI_BASE_URL"] = ""  # clear it
         clearable_env_keys = {
             "audio_transcribe_command",
             "image_ocr_command",
@@ -15237,7 +15581,7 @@ def create_app(runtime, orchestrator, registry):
             if val and env_name and not str(val).startswith("•"):
                 updates[env_name] = val
                 os.environ[env_name] = val  # apply live immediately
-            elif key in clearable_env_keys and env_name:
+            elif (key == "model_name" or key in clearable_env_keys) and env_name:
                 updates[env_name] = ""
                 os.environ.pop(env_name, None)
 
@@ -15425,24 +15769,7 @@ def create_app(runtime, orchestrator, registry):
         _model_keys = {"model_provider", "api_key", "model_name", "reasoning_effort"}
         if _model_keys.intersection(body) and not is_disabling:
             try:
-                from nullion.config import load_settings as _reload_settings
-                from nullion.model_clients import build_model_client_from_settings
-                from nullion.agent_orchestrator import AgentOrchestrator as _AgentOrchestrator
-                _new_settings = _reload_settings()
-                _new_client = build_model_client_from_settings(_new_settings)
-                # Replace the orchestrator's internals in-place so all closures
-                # that captured the same orchestrator object see the new client.
-                _replacement = _AgentOrchestrator(model_client=_new_client)
-                orchestrator.__dict__.update(_replacement.__dict__)
-                try:
-                    runtime.model_client = _new_client
-                except Exception:
-                    pass
-                logger.info(
-                    "Model client hot-swapped after settings save (provider=%s model=%s)",
-                    getattr(getattr(_new_settings, "model", None), "provider", "?"),
-                    getattr(getattr(_new_settings, "model", None), "openai_model", "?"),
-                )
+                _hot_swap_live_model_client(reason="settings save")
             except Exception as _swap_exc:
                 logger.warning("Live model client swap failed after settings save: %s", _swap_exc)
 
@@ -17647,12 +17974,25 @@ def _orchestrator_for_admin_forced_model(orchestrator, runtime):
             from nullion.config import load_settings
             from nullion.model_clients import build_model_client_from_settings
 
+            env = {
+                **os.environ,
+                "NULLION_MODEL_PROVIDER": forced_provider,
+                "NULLION_MODEL": forced_model,
+            }
+            try:
+                _creds = _read_credentials_json()
+                _keys = _creds.get("keys")
+                if not isinstance(_keys, dict):
+                    _keys = {}
+                _provider_key = str(_keys.get(forced_provider) or "")
+                if not _provider_key and str(_creds.get("provider") or "").strip().lower() == forced_provider:
+                    _provider_key = str(_creds.get("api_key") or "")
+                if _provider_key.strip():
+                    env["NULLION_OPENAI_API_KEY"] = _provider_key.strip()
+            except Exception:
+                pass
             settings = load_settings(
-                env={
-                    **os.environ,
-                    "NULLION_MODEL_PROVIDER": forced_provider,
-                    "NULLION_MODEL": forced_model,
-                }
+                env=env
             )
             new_client = build_model_client_from_settings(settings)
             return AgentOrchestrator(model_client=new_client)
@@ -17745,6 +18085,13 @@ def _run_turn_sync(
         conversation_id=conv_id,
         user_text=user_text,
     )
+    requested_attachment_extension = plan_attachment_format(
+        user_text,
+        model_client=getattr(turn_orchestrator, "model_client", None),
+    ).extension
+    required_attachment_extensions = (
+        (requested_attachment_extension,) if requested_attachment_extension else ()
+    )
 
     # Build system context: preferences + profile
     history_prefix: list[dict] = []
@@ -17833,10 +18180,16 @@ def _run_turn_sync(
             "type": "text",
             "text": (
                 "Web delivery contract: when the user asks for a downloadable file, attachment, or saved artifact, "
-                f"write it with file_write under this workspace artifact directory: {workspace_artifact_root}. "
+                f"create it under this workspace artifact directory: {workspace_artifact_root}. "
+                "For text-like files, use file_write. "
                 "When the user asks for a PDF, use pdf_create for new PDFs or pdf_edit for PDF changes; "
                 "do not ask to install PDF tools or use terminal_exec for normal PDF creation/editing. "
-                "For ordinary saved files, use this user's workspace file folder.\n\n"
+                "For binary Office artifacts such as spreadsheets, slide decks, and documents, create the real "
+                "requested file format under the workspace artifact directory with the available artifact or "
+                "terminal tooling; do not substitute Markdown tables or prose. For ordinary saved files, use this "
+                "user's workspace file folder. If an artifact request omits optional content details, pick a "
+                "reasonable neutral default and continue; ask a clarification only when the artifact cannot be "
+                "created without that missing detail.\n\n"
                 f"{workspace_storage_text}\n\n"
                 "Do not say a file was saved, attached, or sent "
                 "unless file_write completed successfully. Do not create helper scripts, diagnostic scripts, or "
@@ -18040,6 +18393,7 @@ def _run_turn_sync(
         tool_results=tool_results,
         artifact_paths=artifact_paths,
         artifact_count=len(artifacts),
+        required_attachment_extensions=required_attachment_extensions,
     )
     if attachment_failure is not None:
         fulfilled = False

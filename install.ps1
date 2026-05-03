@@ -605,6 +605,54 @@ function Format-BoolText {
     return "false"
 }
 
+function Choose-KeyStorage {
+    $existing = Get-EnvValue "NULLION_KEY_STORAGE"
+    if ($existing) {
+        Write-Info "Found existing local data key storage: $existing"
+        if (Confirm-PromptDefaultYes "Keep existing encryption key storage setting?") {
+            return $existing
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  Local data encryption" -ForegroundColor White
+    Write-Host "  Nullion encrypts local chat history and saved provider credentials."
+    Write-Host "  On Windows, Nullion can protect the encryption key with Windows Credential Manager,"
+    Write-Host "  or store it locally beside your Nullion data."
+    Write-Host ""
+    if (Confirm-PromptDefaultYes "Protect local data encryption key with Windows Credential Manager?") {
+        return "system"
+    }
+    return "local"
+}
+
+function Initialize-KeyStorage {
+    param([Parameter(Mandatory=$true)][string]$Storage)
+
+    $env:NULLION_KEY_STORAGE = $Storage
+    $outputFile = [System.IO.Path]::GetTempFileName()
+    $errorFile = [System.IO.Path]::GetTempFileName()
+    try {
+        & $VENV_PYTHON -m nullion.secure_storage --init --storage $Storage 1> $outputFile 2> $errorFile
+        if ($LASTEXITCODE -eq 0) {
+            if ($Storage -eq "system") {
+                Write-Ok "Local data key protected with Windows Credential Manager."
+            } else {
+                Write-Ok "Local data key stored at $NULLION_DIR\chat_history.key."
+            }
+            return
+        }
+        $detail = (Get-Content $errorFile -Raw -ErrorAction SilentlyContinue).Trim()
+        if (-not $detail) { $detail = "unknown error" }
+        if ($Storage -eq "system") {
+            throw "Could not initialize Windows Credential Manager storage: $detail"
+        }
+        throw "Could not initialize local key storage: $detail"
+    } finally {
+        Remove-Item -Force $outputFile, $errorFile -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-SetupValue {
     param(
         [Parameter(Mandatory=$true)][string]$Name,
@@ -1069,6 +1117,138 @@ function Install-PlaywrightRuntime {
         Write-Err "Could not install Playwright Chromium: $_"
         return $false
     }
+}
+
+function Install-WindowsProxyToolsWheel {
+    $wheelDir = Join-Path ([System.IO.Path]::GetTempPath()) "nullion-proxy-tools-wheel"
+    New-Item -ItemType Directory -Force -Path $wheelDir | Out-Null
+    $builder = Join-Path $wheelDir "build_proxy_tools_wheel.py"
+    @'
+from __future__ import annotations
+
+import base64
+import hashlib
+from pathlib import Path
+import sys
+import zipfile
+
+wheel_dir = Path(sys.argv[1])
+wheel_path = wheel_dir / "proxy_tools-0.1.0-py2.py3-none-any.whl"
+
+files = {
+    "proxy_tools/__init__.py": r'''"""
+Proxy helpers used by pywebview. Vendored from proxy_tools 0.1.0 for
+Windows installers where the legacy source distribution cannot build a wheel.
+"""
+import sys
+
+PY2 = sys.version_info[0] == 2
+_identity = lambda x: x
+
+if PY2:
+    def implements_bool(cls):
+        cls.__nonzero__ = cls.__bool__
+        del cls.__bool__
+        return cls
+else:
+    implements_bool = _identity
+
+@implements_bool
+class Proxy(object):
+    __slots__ = ("__local", "__dict__", "__name__")
+
+    def __init__(self, local, name=None):
+        object.__setattr__(self, "_Proxy__local", local)
+        object.__setattr__(self, "__name__", name)
+
+    def _get_current_object(self):
+        if not hasattr(self.__local, "__release_local__"):
+            return self.__local()
+        try:
+            return getattr(self.__local, self.__name__)
+        except AttributeError:
+            raise RuntimeError("no object bound to %s" % self.__name__)
+
+    @property
+    def __dict__(self):
+        try:
+            return self._get_current_object().__dict__
+        except RuntimeError:
+            raise AttributeError("__dict__")
+
+    def __repr__(self):
+        try:
+            obj = self._get_current_object()
+        except RuntimeError:
+            return "<%s unbound>" % self.__class__.__name__
+        return repr(obj)
+
+    def __bool__(self):
+        try:
+            return bool(self._get_current_object())
+        except RuntimeError:
+            return False
+
+    def __unicode__(self):
+        try:
+            return unicode(self._get_current_object())
+        except RuntimeError:
+            return repr(self)
+
+    def __dir__(self):
+        try:
+            return dir(self._get_current_object())
+        except RuntimeError:
+            return []
+
+    def __getattr__(self, name):
+        if name == "__members__":
+            return dir(self._get_current_object())
+        return getattr(self._get_current_object(), name)
+
+    __setattr__ = lambda x, n, v: setattr(x._get_current_object(), n, v)
+    __delattr__ = lambda x, n: delattr(x._get_current_object(), n)
+    __str__ = lambda x: str(x._get_current_object())
+    __call__ = lambda x, *a, **kw: x._get_current_object()(*a, **kw)
+    __len__ = lambda x: len(x._get_current_object())
+    __getitem__ = lambda x, i: x._get_current_object()[i]
+    __iter__ = lambda x: iter(x._get_current_object())
+    __contains__ = lambda x, i: i in x._get_current_object()
+
+module_property = Proxy
+proxy = Proxy
+''',
+    "proxy_tools-0.1.0.dist-info/METADATA": """Metadata-Version: 2.1
+Name: proxy-tools
+Version: 0.1.0
+Summary: Proxy Implementation
+License: MIT
+""",
+    "proxy_tools-0.1.0.dist-info/WHEEL": """Wheel-Version: 1.0
+Generator: nullion-installer
+Root-Is-Purelib: true
+Tag: py2.py3-none-any
+""",
+}
+
+def digest(data: bytes) -> str:
+    return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+records = []
+with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for name, text in files.items():
+        data = text.encode("utf-8")
+        archive.writestr(name, data)
+        records.append((name, digest(data), str(len(data))))
+    record_name = "proxy_tools-0.1.0.dist-info/RECORD"
+    record = "".join(f"{name},{hash_value},{size}\n" for name, hash_value, size in records)
+    record += f"{record_name},,\n"
+    archive.writestr(record_name, record)
+'@ | Set-Content -Path $builder -Encoding UTF8
+    & $VENV_PYTHON $builder $wheelDir
+    if ($LASTEXITCODE -ne 0) { throw "Could not build local proxy-tools wheel." }
+    & $VENV_PYTHON -m pip install --quiet --no-cache-dir --find-links $wheelDir proxy-tools==0.1.0
+    if ($LASTEXITCODE -ne 0) { throw "Could not install local proxy-tools wheel." }
 }
 
 function Test-MediaModelSupport {
@@ -1550,6 +1730,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Could not bootstrap pip in the virtual environment." }
     & $VENV_PYTHON -m pip install --quiet --no-cache-dir --upgrade pip
     if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip in the virtual environment." }
+    Install-WindowsProxyToolsWheel
     & $VENV_PYTHON -m pip install --quiet --no-cache-dir -e $SOURCE_DIR
     if ($LASTEXITCODE -ne 0) { throw "Nullion dependency install failed." }
     & $VENV_PYTHON -c "import PIL; import pypdf"
@@ -1564,6 +1745,9 @@ Write-Ok "Nullion installed."
 Add-UserPathEntry $NULLION_SCRIPTS_DIR
 
 [void](Install-PlaywrightRuntime)
+
+$NULLION_KEY_STORAGE = Choose-KeyStorage
+Initialize-KeyStorage $NULLION_KEY_STORAGE
 
 # Step 3: Capabilities
 Write-Header "Step 3 of 4 - Capabilities (optional)"
@@ -2660,7 +2844,7 @@ Save-SkillCheckpoint
 $envLines = @(
     "# Nullion configuration - generated by install.ps1 on $(Get-Date)"
     "NULLION_WEB_PORT=$NULLION_WEB_PORT"
-    "NULLION_KEY_STORAGE=local"
+    "NULLION_KEY_STORAGE=$NULLION_KEY_STORAGE"
     "NULLION_SETUP_MESSAGING_DONE=true"
     "NULLION_SETUP_PROVIDER_DONE=true"
     "NULLION_SETUP_BROWSER_DONE=true"

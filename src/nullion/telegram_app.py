@@ -2374,12 +2374,23 @@ class ChatOperatorService:
     def swap_provider_model_client(self, provider: str, model_name: str) -> None:
         """Hot-swap the live model client to a provider/model pair."""
         from nullion.agent_orchestrator import AgentOrchestrator
+        from nullion.auth import load_stored_credentials
         from nullion.config import load_settings
         from nullion.model_clients import build_model_client_from_settings
 
         env = dict(os.environ)
+        provider = provider.strip().lower()
         env["NULLION_MODEL_PROVIDER"] = provider
         env["NULLION_MODEL"] = model_name
+        stored = load_stored_credentials() or {}
+        stored_keys = stored.get("keys")
+        if not isinstance(stored_keys, dict):
+            stored_keys = {}
+        stored_key = str(stored_keys.get(provider) or "")
+        if not stored_key and str(stored.get("provider") or "").strip().lower() == provider:
+            stored_key = str(stored.get("api_key") or "")
+        if stored_key.strip():
+            env["NULLION_OPENAI_API_KEY"] = stored_key.strip()
         if provider in {"openrouter", "openrouter-key"}:
             env.setdefault("NULLION_OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
         settings = load_settings(env=env)
@@ -2388,6 +2399,20 @@ class ChatOperatorService:
         new_client = build_model_client_from_settings(settings)
         self.model_client = new_client
         self.agent_orchestrator = AgentOrchestrator(model_client=new_client)
+
+    def refresh_model_client_from_saved_settings(self) -> None:
+        """Refresh the live model client from the persisted runtime model choice."""
+        from nullion.runtime_config import current_runtime_config
+
+        cfg = current_runtime_config(model_client=self.model_client)
+        provider = (cfg.admin_forced_provider or cfg.provider or "").strip().lower()
+        model_name = (cfg.admin_forced_model or cfg.model or "").strip()
+        if not model_name:
+            return
+        if provider:
+            self.swap_provider_model_client(provider, model_name)
+            return
+        self.swap_model_client(model_name)
 
     def _media_model_for_attachments(
         self,
