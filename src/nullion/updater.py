@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import tomllib
@@ -383,6 +384,40 @@ def _runtime_dependency_requirements(src: Path) -> list[str]:
     return [str(item).strip() for item in dependencies if str(item).strip()]
 
 
+def _site_packages_dir() -> Path:
+    paths = sysconfig.get_paths()
+    for key in ("purelib", "platlib"):
+        value = paths.get(key)
+        if value:
+            return Path(value)
+    raise RuntimeError("Could not resolve Python site-packages directory.")
+
+
+def _ensure_windows_editable_source_path(src: Path) -> None:
+    """Make the checked-out source importable without rewriting locked .exe launchers."""
+    package_src = (src / "src").resolve()
+    if not (package_src / "nullion").exists():
+        raise RuntimeError(f"Nullion package source is missing at {package_src}")
+
+    site_packages = _site_packages_dir()
+    site_packages.mkdir(parents=True, exist_ok=True)
+    pth_path = site_packages / "nullion-editable-src.pth"
+    desired = str(package_src)
+    existing = pth_path.read_text(encoding="utf-8").splitlines() if pth_path.exists() else []
+    if desired not in [line.strip() for line in existing]:
+        pth_path.write_text(desired + "\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import nullion, nullion.cli, nullion.updater"],
+        capture_output=True,
+        text=True,
+        cwd=_subprocess_cwd(src),
+    )
+    if result.returncode != 0:
+        details = result.stderr.strip() or result.stdout.strip() or "import failed"
+        raise RuntimeError(f"Nullion import check failed after editable path repair: {details}")
+
+
 def _install_runtime_dependencies_from_pyproject(src: Path) -> subprocess.CompletedProcess[str]:
     try:
         requirements = _runtime_dependency_requirements(src)
@@ -411,7 +446,28 @@ def _install_runtime_dependencies_from_pyproject(src: Path) -> subprocess.Comple
 
 def _install_updated_dependencies(src: Path) -> subprocess.CompletedProcess[str]:
     if _is_windows():
-        return _install_runtime_dependencies_from_pyproject(src)
+        result = _install_runtime_dependencies_from_pyproject(src)
+        if result.returncode == 0 or _is_windows_locked_entrypoint_restore_error(result.stderr):
+            try:
+                _ensure_windows_editable_source_path(src)
+            except Exception as exc:
+                return subprocess.CompletedProcess(
+                    args=[*_pip_command(), "install", "-r", "<pyproject dependencies>"],
+                    returncode=1,
+                    stdout=result.stdout,
+                    stderr=str(exc),
+                )
+            if result.returncode != 0:
+                log.warning(
+                    "pip dependency install hit a locked Windows Nullion launcher; source import path repaired."
+                )
+                return subprocess.CompletedProcess(
+                    args=getattr(result, "args", [*_pip_command(), "install", "-r", "<pyproject dependencies>"]),
+                    returncode=0,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+        return result
     return subprocess.run(
         [*_pip_command(), "install", "--quiet", "-e", str(src)],
         capture_output=True,

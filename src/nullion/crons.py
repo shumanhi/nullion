@@ -35,6 +35,7 @@ _RUNTIME_DB_PATH: Path | None = None
 _DEFAULT_WORKSPACE_ID = "workspace_admin"
 _CRON_COLLECTION = "cron_jobs"
 _CRON_TABLE = "reminders_crons"
+_STORE_FRESHNESS_SKEW = timedelta(seconds=1)
 
 # ── Data model ─────────────────────────────────────────────────────────────────
 
@@ -161,6 +162,28 @@ def _runtime_db_path() -> Path:
     return _CRONS_PATH.with_name("runtime.db")
 
 
+def _parse_store_timestamp(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _crons_json_mtime() -> datetime | None:
+    try:
+        return datetime.fromtimestamp(_CRONS_PATH.stat().st_mtime, tz=timezone.utc)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log.warning("Failed to stat crons JSON mirror %s: %s", _CRONS_PATH, exc)
+        return None
+
+
 def _ensure_cron_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"""
@@ -189,7 +212,7 @@ def _load_crons_json() -> list[CronJob]:
         return []
 
 
-def _load_crons_db() -> list[CronJob] | None:
+def _load_crons_db_snapshot() -> tuple[list[CronJob], datetime | None] | None:
     db_path = _runtime_db_path()
     if not db_path.exists():
         return None
@@ -198,25 +221,43 @@ def _load_crons_db() -> list[CronJob] | None:
             conn.row_factory = sqlite3.Row
             _ensure_cron_table(conn)
             rows = conn.execute(
-                f"SELECT payload FROM {_CRON_TABLE} WHERE collection = ? ORDER BY rowid",
+                f"SELECT payload, updated_at FROM {_CRON_TABLE} WHERE collection = ? ORDER BY rowid",
                 (_CRON_COLLECTION,),
             ).fetchall()
     except sqlite3.Error as exc:
         log.warning("Failed to load crons from runtime DB %s: %s", db_path, exc)
         return None
-    return [CronJob.from_dict(json.loads(str(row["payload"]))) for row in rows]
+    jobs = [CronJob.from_dict(json.loads(str(row["payload"]))) for row in rows]
+    updated_at = max(
+        (dt for dt in (_parse_store_timestamp(row["updated_at"]) for row in rows) if dt is not None),
+        default=None,
+    )
+    return jobs, updated_at
+
+
+def _load_crons_db() -> list[CronJob] | None:
+    snapshot = _load_crons_db_snapshot()
+    if snapshot is None:
+        return None
+    return snapshot[0]
 
 
 def load_crons() -> list[CronJob]:
-    db_jobs = _load_crons_db()
-    if db_jobs is not None:
-        if db_jobs:
-            return db_jobs
-        legacy_jobs = _load_crons_json()
-        if legacy_jobs:
+    db_snapshot = _load_crons_db_snapshot()
+    if db_snapshot is not None:
+        db_jobs, db_updated_at = db_snapshot
+        json_updated_at = _crons_json_mtime()
+        if json_updated_at is not None and (
+            db_updated_at is None or json_updated_at > db_updated_at + _STORE_FRESHNESS_SKEW
+        ):
+            legacy_jobs = _load_crons_json()
             save_crons(legacy_jobs)
+            log.info(
+                "Imported %d cron(s) from newer legacy JSON mirror into runtime DB.",
+                len(legacy_jobs),
+            )
             return legacy_jobs
-        return []
+        return db_jobs
     legacy_jobs = _load_crons_json()
     if legacy_jobs:
         save_crons(legacy_jobs)

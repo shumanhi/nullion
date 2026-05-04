@@ -15974,7 +15974,7 @@ def create_app(runtime, orchestrator, registry):
         activity_trace = os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED", "true").lower() not in ("0", "false", "no", "off")
         planner_feed_mode = task_planner_feed_mode()
         show_thinking = os.environ.get("NULLION_SHOW_THINKING_ENABLED", "false").lower() not in ("0", "false", "no", "off")
-        browser_backend = os.environ.get("NULLION_BROWSER_BACKEND", "") or (creds.get("browser_backend", "") if creds else "")
+        browser_backend = (creds.get("browser_backend", "") if creds else "") or os.environ.get("NULLION_BROWSER_BACKEND", "")
         provider_bindings = os.environ.get("NULLION_PROVIDER_BINDINGS", "")
         search_provider = "builtin_search_provider"
         for part in provider_bindings.split(","):
@@ -16826,6 +16826,7 @@ def create_app(runtime, orchestrator, registry):
             or browser_backend_val is not None
             or provider_enabled is not None
         )
+        updates: dict[str, str] = {}
         if model_config_sent:
             try:
                 creds = _read_credentials_json()
@@ -16910,9 +16911,11 @@ def create_app(runtime, orchestrator, registry):
                     if browser_backend_val:
                         creds["browser_backend"] = browser_backend_val
                         os.environ["NULLION_BROWSER_BACKEND"] = browser_backend_val
+                        updates["NULLION_BROWSER_BACKEND"] = str(browser_backend_val)
                     else:
                         creds.pop("browser_backend", None)
                         os.environ.pop("NULLION_BROWSER_BACKEND", None)
+                        updates["NULLION_BROWSER_BACKEND"] = ""
                 _write_credentials_json(creds)
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Could not write credentials: {exc}"}, status_code=500)
@@ -16984,7 +16987,6 @@ def create_app(runtime, orchestrator, registry):
             "web_session_allow_duration": "NULLION_WEB_SESSION_ALLOW_DURATION",
         }
 
-        updates: dict[str, str] = {}
         # Persist base URL to .env so it's available after restart.
         if not is_disabling:
             if provider in provider_base_urls:
@@ -20032,25 +20034,14 @@ def _resolve_browser_backend() -> str | None:
     """Return the browser backend name if the browser plugin should be loaded.
 
     Resolution order:
-    1. NULLION_BROWSER_BACKEND env var (explicit, set by installer or user)
-    2. NULLION_PLUGINS env var containing 'browser'
-    3. encrypted credential key 'browser_backend'
+    1. encrypted credential key 'browser_backend' from Settings
+    2. NULLION_BROWSER_BACKEND env var
+    3. NULLION_PLUGINS env var containing 'browser'
     Returns None if the browser plugin is not configured.
     """
     if os.environ.get("NULLION_BROWSER_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
         return None
 
-    # 1. Explicit env var
-    be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip()
-    if be:
-        return be
-
-    # 2. NULLION_PLUGINS list
-    plugins_env = os.environ.get("NULLION_PLUGINS", "")
-    if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):
-        return "auto"
-
-    # 3. encrypted credentials
     try:
         from nullion.auth import load_stored_credentials
         creds = load_stored_credentials() or {}
@@ -20059,6 +20050,14 @@ def _resolve_browser_backend() -> str | None:
             return be
     except Exception:
         pass
+
+    be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip().lower()
+    if be:
+        return be
+
+    plugins_env = os.environ.get("NULLION_PLUGINS", "")
+    if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):
+        return "auto"
 
     return None
 
@@ -20156,7 +20155,7 @@ def _build_runtime():
     _browser_backend = _resolve_browser_backend()
     if _browser_backend:
         try:
-            os.environ.setdefault("NULLION_BROWSER_BACKEND", _browser_backend)
+            os.environ["NULLION_BROWSER_BACKEND"] = _browser_backend
             from nullion.plugins.browser_plugin import register_browser_tools
             register_browser_tools(registry)
             logger.info("Browser plugin registered (backend=%s)", _browser_backend)

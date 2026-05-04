@@ -71,6 +71,10 @@ try:  # pragma: no cover - exercised on POSIX platforms
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
+try:  # pragma: no cover - exercised on Windows platforms
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX fallback
+    msvcrt = None
 
 
 @contextmanager
@@ -80,11 +84,21 @@ def _runtime_store_file_lock(target: Path):
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            lock_file.seek(0)
+            if not lock_file.read(1):
+                lock_file.write("0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
         try:
             yield
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 RUNTIME_SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 
 _BUILDER_PROPOSAL_FALLBACK_CREATED_AT = datetime.fromtimestamp(0, tz=UTC)
@@ -1801,7 +1815,8 @@ def render_runtime_store_payload_json(store: RuntimeStore) -> str:
 def save_runtime_store(store: RuntimeStore, path: str | Path) -> Path:
     target = Path(path)
     if _is_sqlite_runtime_path(target):
-        return _save_runtime_store_sqlite(store, target)
+        with _runtime_store_file_lock(target):
+            return _save_runtime_store_sqlite(store, target)
     with _runtime_store_file_lock(target):
         previous_payload = target.read_text(encoding="utf-8") if target.exists() else None
         if previous_payload is not None:
@@ -1997,21 +2012,22 @@ def get_latest_runtime_restore_metadata(store: RuntimeStore) -> dict[str, object
 
 def restore_runtime_store_backup(path: str | Path, *, generation: int | str = 0) -> Path:
     target = Path(path)
-    backup_target = _restore_candidate_for_token(target, generation)
-    if not backup_target.exists():
-        raise FileNotFoundError(backup_target)
-    integrity = _sqlite_quick_check(backup_target)
-    if integrity not in {None, "ok"}:
-        raise ValueError(f"Runtime backup failed integrity check: {backup_target.name} ({integrity})")
+    with _runtime_store_file_lock(target):
+        backup_target = _restore_candidate_for_token(target, generation)
+        if not backup_target.exists():
+            raise FileNotFoundError(backup_target)
+        integrity = _sqlite_quick_check(backup_target)
+        if integrity not in {None, "ok"}:
+            raise ValueError(f"Runtime backup failed integrity check: {backup_target.name} ({integrity})")
 
-    temp_target = target.with_name(f"{target.name}.restore.tmp")
-    try:
-        temp_target.write_bytes(backup_target.read_bytes())
-        temp_target.replace(target)
-    except Exception:
-        if temp_target.exists():
-            temp_target.unlink()
-        raise
+        temp_target = target.with_name(f"{target.name}.restore.tmp")
+        try:
+            temp_target.write_bytes(backup_target.read_bytes())
+            temp_target.replace(target)
+        except Exception:
+            if temp_target.exists():
+                temp_target.unlink()
+            raise
     return target
 
 
