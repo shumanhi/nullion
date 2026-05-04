@@ -90,16 +90,6 @@ def _words(normalized_text: str) -> list[str]:
     return normalized_text.split()
 
 
-def _starts_with_phrase(words: list[str], phrase: tuple[str, ...]) -> bool:
-    if len(words) < len(phrase):
-        return False
-    return tuple(words[: len(phrase)]) == phrase
-
-
-def _starts_with_any_phrase(words: list[str], phrases: tuple[tuple[str, ...], ...]) -> bool:
-    return any(_starts_with_phrase(words, phrase) for phrase in phrases)
-
-
 def _intent_signals(normalized_text: str) -> IntentSignals:
     words = tuple(_words(normalized_text))
     word_set = set(words)
@@ -205,47 +195,6 @@ def _is_short_social_message(normalized_text: str) -> bool:
     return False
 
 
-def _looks_like_short_follow_up_answer(normalized_text: str) -> bool:
-    if not normalized_text:
-        return False
-    if len(normalized_text) > 80:
-        return False
-    words = normalized_text.split()
-    return 1 <= len(words) <= 4
-
-
-def _continues_previous_assistant_question(
-    normalized_text: str,
-    *,
-    active_branch_exists: bool,
-    previous_assistant_message: str | None,
-) -> bool:
-    if not active_branch_exists:
-        return False
-    if not isinstance(previous_assistant_message, str) or not previous_assistant_message.strip():
-        return False
-    if not previous_assistant_message.rstrip().endswith("?"):
-        return False
-    return _looks_like_short_follow_up_answer(normalized_text)
-
-
-def _continues_previous_assistant_statement_by_reference(
-    normalized_text: str,
-    *,
-    active_branch_exists: bool,
-    previous_assistant_message: str | None,
-) -> bool:
-    if not active_branch_exists:
-        return False
-    if not isinstance(previous_assistant_message, str) or not previous_assistant_message.strip():
-        return False
-    if previous_assistant_message.rstrip().endswith("?"):
-        return False
-    if not _looks_like_short_follow_up_answer(normalized_text):
-        return False
-    return _is_referential_follow_up(normalized_text)
-
-
 def classify_turn_disposition(
     text: str,
     active_branch_exists: bool,
@@ -310,30 +259,11 @@ def _turn_disposition_social_node(state: _TurnDispositionState) -> dict[str, obj
 def _turn_disposition_followup_node(state: _TurnDispositionState) -> dict[str, object]:
     if state.get("decision") is not None:
         return {}
-    text = state.get("text") or ""
     normalized = state.get("normalized") or ""
     active_branch_exists = bool(state.get("active_branch_exists"))
-    previous_assistant_message = state.get("previous_assistant_message")
-    if _continues_previous_assistant_question(
-        normalized,
-        active_branch_exists=active_branch_exists,
-        previous_assistant_message=previous_assistant_message,
-    ) and "?" not in text:
-        return {"decision": ConversationTurnDispositionDecision(
-            disposition=ConversationTurnDisposition.CONTINUE,
-            reason="question_follow_up",
-        )}
-
-    if _continues_previous_assistant_statement_by_reference(
-        normalized,
-        active_branch_exists=active_branch_exists,
-        previous_assistant_message=previous_assistant_message,
-    ):
-        return {"decision": ConversationTurnDispositionDecision(
-            disposition=ConversationTurnDisposition.CONTINUE,
-            reason="referential_follow_up",
-        )}
-
+    # Free-form continuity is ambiguous. Do not infer follow-up intent from
+    # short answers, punctuation, or previous assistant prose; let task-frame
+    # evidence or the structured ambiguity classifier decide later in the graph.
     if active_branch_exists and _is_referential_follow_up(normalized):
         return {"decision": ConversationTurnDispositionDecision(
             disposition=ConversationTurnDisposition.CONTINUE,

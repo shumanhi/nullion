@@ -632,7 +632,9 @@ function Initialize-KeyStorage {
     $env:NULLION_KEY_STORAGE = $Storage
     $outputFile = [System.IO.Path]::GetTempFileName()
     $errorFile = [System.IO.Path]::GetTempFileName()
+    $oldPythonWarnings = $env:PYTHONWARNINGS
     try {
+        $env:PYTHONWARNINGS = "ignore::RuntimeWarning"
         & $VENV_PYTHON -m nullion.secure_storage --init --storage $Storage 1> $outputFile 2> $errorFile
         if ($LASTEXITCODE -eq 0) {
             if ($Storage -eq "system") {
@@ -649,6 +651,11 @@ function Initialize-KeyStorage {
         }
         throw "Could not initialize local key storage: $detail"
     } finally {
+        if ($null -eq $oldPythonWarnings) {
+            Remove-Item Env:\PYTHONWARNINGS -ErrorAction SilentlyContinue
+        } else {
+            $env:PYTHONWARNINGS = $oldPythonWarnings
+        }
         Remove-Item -Force $outputFile, $errorFile -ErrorAction SilentlyContinue
     }
 }

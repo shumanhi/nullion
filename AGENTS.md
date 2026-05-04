@@ -13,6 +13,7 @@
 - LangChain/tool adapters should expose structured tool metadata and outputs so downstream code avoids parsing prose.
 - Keep safety/security detectors separate from product routing. Security filters may inspect text, but must not decide task decomposition or artifact delivery.
 - Add tests proving equivalent behavior works without English-specific trigger words.
+- Activity/status summaries should show that a tool was used, including tools like `list_crons`, without exposing the tool's full output when that output contains internal task prose, paths, files, artifacts, credentials, connector payloads, or other non-deliverable state.
 
 ## Repo Boundaries
 
@@ -48,6 +49,7 @@
 ## Git And CI Workflow
 
 - Do not push directly to `main`. Work on an `agent/...` branch and open a pull request.
+- Before making changes on an existing branch, fetch/prune remotes and verify the branch still exists upstream and is not already merged into `origin/main`. If the upstream branch is gone, merged, or replaced by a squash merge on `origin/main`, stop using that branch and start any follow-up work from fresh `origin/main`.
 - If the shared checkout has unrelated dirty files, create a separate `git worktree` from `origin/main` and make your changes there.
 - Keep app changes in `nullion` and tests in `nullion-test`; use separate branches/PRs when both repos need changes.
 - After creating a PR, check the PR status checks with GitHub before reporting success.

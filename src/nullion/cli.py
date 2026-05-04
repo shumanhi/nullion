@@ -109,7 +109,7 @@ def _cli_impl() -> None:
         runtime, orchestrator, registry = _build_runtime()
     except Exception as exc:
         print(f"\n  ✗  Could not start Nullion: {exc}", file=sys.stderr)
-        print("  →  Check your .env file and API keys.", file=sys.stderr)
+        print("  →  Check the Nullion logs for startup details.", file=sys.stderr)
         sys.exit(1)
 
     if args.one_shot:

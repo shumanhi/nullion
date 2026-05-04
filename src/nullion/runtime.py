@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 import re
+from time import perf_counter
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, TypedDict
 from uuid import uuid4
@@ -135,6 +136,7 @@ from nullion.intent_router import (
 )
 from nullion.runtime_store import RuntimeStore
 from nullion.runtime_persistence import (
+    list_runtime_store_backups as _list_runtime_store_backups,
     load_runtime_store,
     render_runtime_store_payload_json,
     restore_runtime_store_backup,
@@ -203,7 +205,9 @@ from nullion.tool_boundaries import extract_boundary_facts
 logger = logging.getLogger(__name__)
 
 BUILDER_PROPOSAL_COOLDOWN = timedelta(hours=1)
-TRUSTED_MUTATION_ACTORS = frozenset({"runtime", "operator", "builder_reflector", "builder_auto"})
+TRUSTED_MUTATION_ACTORS = frozenset(
+    {"runtime", "operator", "builder_reflector", "builder_auto", "auto-skill", "web-auto-skill"}
+)
 SKILL_RECOMMENDATION_SCORE = 4
 STRONG_SKILL_APPLICATION_SCORE = 6
 MISSION_STEP_STATUSES = frozenset({"pending", "running", "completed", "blocked", "failed", "skipped"})
@@ -279,11 +283,31 @@ class PersistentRuntime:
         self.live_tool_registry = value
 
     def checkpoint(self) -> Path:
+        measure_sqlite = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
+        started_at = perf_counter()
         fingerprint = render_runtime_store_payload_json(self.store)
+        fingerprint_ms = (perf_counter() - started_at) * 1000
         if fingerprint == self.last_checkpoint_fingerprint and self.checkpoint_path.exists():
+            if measure_sqlite:
+                logger.debug(
+                    "runtime checkpoint skipped path=%s fingerprint_ms=%.1f",
+                    self.checkpoint_path.name,
+                    fingerprint_ms,
+                )
             return self.checkpoint_path
+        save_started_at = perf_counter()
         saved_path = checkpoint_runtime_store(self.store, self.checkpoint_path)
-        self.last_checkpoint_fingerprint = render_runtime_store_payload_json(self.store)
+        save_ms = (perf_counter() - save_started_at) * 1000
+        self.last_checkpoint_fingerprint = fingerprint
+        total_ms = (perf_counter() - started_at) * 1000
+        if measure_sqlite:
+            logger.info(
+                "runtime checkpoint saved path=%s fingerprint_ms=%.1f save_ms=%.1f total_ms=%.1f",
+                saved_path.name,
+                fingerprint_ms,
+                save_ms,
+                total_ms,
+            )
         return saved_path
 
     def list_backups(self) -> list[dict[str, object]]:
@@ -321,7 +345,7 @@ class PersistentRuntime:
             checkpoint_path=self.checkpoint_path,
         )
 
-    def restore_from_backup(self, *, generation: int = 0) -> RuntimeStore:
+    def restore_from_backup(self, *, generation: int | str = 0) -> RuntimeStore:
         self.store = restore_runtime_store_checkpoint(self.checkpoint_path, generation=generation)
         self.checkpoint()
         return self.store
@@ -2586,7 +2610,9 @@ def run_request(
                 ";".join(packet.recent_sentinel_signals),
             ]
         )
-        store_builder_proposal(store, proposal, context_key=context_key, actor="runtime")
+        record = store_builder_proposal(store, proposal, context_key=context_key, actor="runtime")
+        if record.status == "pending" and _builder_proposal_is_auto_acceptable_skill(record.proposal):
+            accept_stored_builder_skill_proposal(store, record.proposal_id, actor="builder_auto")
 
     return RuntimeResult(turn=turn, store=store)
 
@@ -3778,24 +3804,7 @@ def checkpoint_runtime_store(store: RuntimeStore, path: str | Path) -> Path:
 
 
 def list_runtime_store_backups(path: str | Path) -> list[dict[str, object]]:
-    checkpoint_path = Path(path)
-    backups: list[dict[str, object]] = []
-    generation = 0
-    while True:
-        candidate = checkpoint_path.with_name(
-            f"{checkpoint_path.name}.bak" if generation == 0 else f"{checkpoint_path.name}.bak.{generation}"
-        )
-        if not candidate.exists():
-            break
-        backups.append(
-            {
-                "generation": generation,
-                "name": candidate.name,
-                "path": str(candidate),
-            }
-        )
-        generation += 1
-    return backups
+    return _list_runtime_store_backups(path)
 
 
 
@@ -3813,18 +3822,22 @@ def get_latest_runtime_restore_metadata(store: RuntimeStore) -> dict[str, object
 
 
 
-def _restore_source_name(*, generation: int) -> str:
-    return "backup" if generation == 0 else f"backup.{generation}"
+def _restore_source_name(*, generation: int | str) -> str:
+    if generation == 0 or generation == "0":
+        return "backup"
+    if isinstance(generation, int) or str(generation).isdigit():
+        return f"backup.{generation}"
+    return str(generation)
 
 
-def restore_runtime_store_checkpoint(path: str | Path, *, generation: int = 0) -> RuntimeStore:
+def restore_runtime_store_checkpoint(path: str | Path, *, generation: int | str = 0) -> RuntimeStore:
     checkpoint_path = Path(path)
     restore_runtime_store_backup(checkpoint_path, generation=generation)
     restored_store = load_runtime_store(checkpoint_path)
     details = {
         "checkpoint_path": str(checkpoint_path),
         "source": _restore_source_name(generation=generation),
-        "generation": generation,
+            "generation": str(generation),
     }
     restored_store.add_event(
         make_event(
@@ -5394,6 +5407,24 @@ def _append_skill_workflow_signal(
 
 
 AUTO_SKILL_ACTORS = frozenset({"auto-skill", "web-auto-skill", "builder_reflector", "builder_auto"})
+
+
+def builder_auto_approve_skill_proposals_enabled() -> bool:
+    raw = os.environ.get("NULLION_BUILDER_AUTO_APPROVE_SKILLS")
+    if raw is None or raw.strip() == "":
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _builder_proposal_is_auto_acceptable_skill(proposal: BuilderProposal) -> bool:
+    return (
+        builder_auto_approve_skill_proposals_enabled()
+        and proposal.decision_type is BuilderDecisionType.SKILL_PROPOSAL
+        and str(proposal.approval_mode or "").strip().lower() == "skill"
+        and bool(str(proposal.suggested_skill_title or "").strip())
+        and bool(str(proposal.suggested_trigger or "").strip())
+        and bool(tuple(step for step in proposal.suggested_steps if str(step or "").strip()))
+    )
 
 
 def _normalized_skill_text(value: str) -> str:

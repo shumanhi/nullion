@@ -34,7 +34,6 @@ from nullion.messaging_adapters import (
     principal_id_for_messaging_identity,
     prepare_reply_for_platform_delivery,
     record_platform_delivery_receipt,
-    retry_messaging_delivery_operation,
     sanitize_external_inline_markup,
     save_messaging_attachment,
     split_reply_for_platform_delivery,
@@ -182,18 +181,11 @@ def _principal_id_for_telegram_message(message, settings: NullionSettings | None
 
 
 _TELEGRAM_ATTACHMENT_CAPTION_LIMIT = 1024
-_TELEGRAM_ATTACHMENT_UPLOAD_RETRY_DELAY_SECONDS = 0.5
 
 
 async def _reply_document_attachment(message, attachment_path: Path, **kwargs) -> None:
-    async def operation():
-        with attachment_path.open("rb") as document:
-            await message.reply_document(document, **kwargs)
-
-    await retry_messaging_delivery_operation(
-        operation,
-        retry_delay_seconds=_TELEGRAM_ATTACHMENT_UPLOAD_RETRY_DELAY_SECONDS,
-    )
+    with attachment_path.open("rb") as document:
+        await message.reply_document(document, **kwargs)
 
 
 def _telegram_attachment_caption_kwargs(caption: str | None) -> tuple[str | None, dict[str, Any], bool]:
@@ -446,6 +438,12 @@ _CLOSED_DOCTOR_ACTION_STATUSES = {
     DOCTOR_ACTION_FAILED,
 }
 _TELEGRAM_NOTIFIED_DOCTOR_ACTION_IDS: set[str] = set()
+_TELEGRAM_DOCTOR_NOTIFICATION_SEVERITIES = frozenset({"medium", "high", "critical"})
+
+
+def _should_notify_telegram_doctor_action(action: dict[str, object]) -> bool:
+    severity = str(action.get("severity") or "").strip().lower()
+    return severity in _TELEGRAM_DOCTOR_NOTIFICATION_SEVERITIES
 
 
 def _capture_decision_snapshot(runtime: PersistentRuntime) -> DecisionSnapshot:
@@ -1112,6 +1110,7 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
         str(action["action_id"]): action
         for action in runtime.store.list_doctor_actions()
         if str(action.get("status")) == DOCTOR_ACTION_PENDING
+        and _should_notify_telegram_doctor_action(action)
     }
     new_doctor_action_ids = sorted(set(pending_doctor_actions) - set(before.pending_doctor_action_ids))
     new_doctor_action_ids = [

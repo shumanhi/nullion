@@ -21,7 +21,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
@@ -37,12 +39,13 @@ log = logging.getLogger(__name__)
 def _install_dir() -> Path:
     return Path(os.environ.get("NULLION_INSTALL_DIR", Path.home() / ".nullion"))
 
-def _venv_pip() -> Path:
-    d = _install_dir()
-    for candidate in [d / "venv/bin/pip", d / "venv/Scripts/pip.exe"]:
-        if candidate.exists():
-            return candidate
-    return Path(sys.executable).parent / "pip"
+def _pip_command() -> list[str]:
+    """Run pip through Python so Windows does not lock pip.exe during updates."""
+    return [sys.executable, "-m", "pip"]
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 def _src_dir() -> Path:
     """Location of the cloned/checked-out source (git repo root).
@@ -242,10 +245,8 @@ def snapshot() -> Path:
     snap = _backup_dir() / tag
     snap.mkdir(parents=True)
 
-    # pip freeze
-    pip    = _venv_pip()
     result = subprocess.run(
-        [str(pip), "freeze"],
+        [*_pip_command(), "freeze"],
         capture_output=True, text=True,
         cwd=_subprocess_cwd(),
     )
@@ -313,12 +314,135 @@ def _validate_requirements_content(content: str) -> None:
             )
 
 
+_EDITABLE_SELF_RE = re.compile(
+    r"^\s*-e\s+(?:(?:git\+)?(?:file://)?[^\s#]*(?:nullion|project-nullion)[^\s#]*|[^\s#]+#egg=(?:nullion|project-nullion))\s*$",
+    re.IGNORECASE,
+)
+_DIRECT_SELF_RE = re.compile(
+    r"^\s*(?:nullion|project-nullion)\s*@\s+(?:git\+)?(?:file://)?[^\s]*(?:nullion|project-nullion)[^\s]*\s*$",
+    re.IGNORECASE,
+)
+_PINNED_SELF_RE = re.compile(
+    r"^\s*(?:nullion|project-nullion)\s*(?:==|===|~=|!=|<=|>=|<|>)",
+    re.IGNORECASE,
+)
+
+
+def _requirements_without_editable_self(content: str) -> str:
+    """Return requirements with Nullion's own install entry removed."""
+    kept: list[str] = []
+    for line in content.splitlines():
+        if (
+            _EDITABLE_SELF_RE.match(line)
+            or _DIRECT_SELF_RE.match(line)
+            or _PINNED_SELF_RE.match(line)
+        ):
+            continue
+        kept.append(line)
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def _is_windows_locked_entrypoint_restore_error(stderr: str) -> bool:
+    normalized = stderr.lower()
+    return (
+        _is_windows()
+        and "winerror 32" in normalized
+        and ".exe" in normalized
+        and (".deleteme" in normalized or "being used by another process" in normalized)
+        and ("nullion" in normalized or "project-nullion" in normalized)
+    )
+
+
+def _editable_source_imports(src: Path) -> bool:
+    env = os.environ.copy()
+    source_paths = [src]
+    package_src = src / "src"
+    if package_src.exists():
+        source_paths.insert(0, package_src)
+    source_path = os.pathsep.join(str(path) for path in source_paths)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = source_path if not existing_pythonpath else f"{source_path}{os.pathsep}{existing_pythonpath}"
+    result = subprocess.run(
+        [sys.executable, "-c", "import nullion, nullion.cli, nullion.updater"],
+        capture_output=True,
+        text=True,
+        cwd=_subprocess_cwd(src),
+        env=env,
+    )
+    if result.returncode != 0:
+        log.error("Restored source import check failed: %s", result.stderr or result.stdout)
+        return False
+    return True
+
+
+def _runtime_dependency_requirements(src: Path) -> list[str]:
+    pyproject_path = src / "pyproject.toml"
+    data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    project = data.get("project") if isinstance(data, dict) else {}
+    dependencies = project.get("dependencies") if isinstance(project, dict) else []
+    return [str(item).strip() for item in dependencies if str(item).strip()]
+
+
+def _install_runtime_dependencies_from_pyproject(src: Path) -> subprocess.CompletedProcess[str]:
+    try:
+        requirements = _runtime_dependency_requirements(src)
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=[*_pip_command(), "install", "-r", "<pyproject dependencies>"],
+            returncode=1,
+            stdout="",
+            stderr=f"Could not read runtime dependencies from pyproject.toml: {exc}",
+        )
+    if not requirements:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as tmp:
+        tmp.write("\n".join(requirements) + "\n")
+        tmp_path = Path(tmp.name)
+    try:
+        return subprocess.run(
+            [*_pip_command(), "install", "--quiet", "-r", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            cwd=_subprocess_cwd(src),
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _install_updated_dependencies(src: Path) -> subprocess.CompletedProcess[str]:
+    if _is_windows():
+        return _install_runtime_dependencies_from_pyproject(src)
+    return subprocess.run(
+        [*_pip_command(), "install", "--quiet", "-e", str(src)],
+        capture_output=True,
+        text=True,
+        cwd=_subprocess_cwd(src),
+    )
+
+
+def _restore_snapshot_requirements(req_file: Path) -> subprocess.CompletedProcess[str]:
+    content = req_file.read_text()
+    _validate_requirements_content(content)
+    restored = _requirements_without_editable_self(content)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as tmp:
+        tmp.write(restored)
+        tmp_path = Path(tmp.name)
+    try:
+        return subprocess.run(
+            [*_pip_command(), "install", "--quiet", "-r", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            cwd=_subprocess_cwd(),
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def rollback(snap: Path) -> bool:
     """Restore pip state and git commit from snapshot. Returns True on success."""
     try:
         commit_file = snap / "git_commit.txt"
         req_file    = snap / "requirements.txt"
-
         if commit_file.exists():
             try:
                 commit_hash = _validate_commit_hash(commit_file.read_text())
@@ -332,17 +456,16 @@ def rollback(snap: Path) -> bool:
 
         if req_file.exists():
             try:
-                _validate_requirements_content(req_file.read_text())
+                result = _restore_snapshot_requirements(req_file)
             except ValueError as exc:
                 log.error("Rollback aborted: %s", exc)
                 return False
-            pip = _venv_pip()
-            result = subprocess.run(
-                [str(pip), "install", "--quiet", "-r", str(req_file)],
-                capture_output=True, text=True,
-                cwd=_subprocess_cwd(),
-            )
             if result.returncode != 0:
+                if _is_windows_locked_entrypoint_restore_error(result.stderr) and _editable_source_imports(_src_dir()):
+                    log.warning(
+                        "pip restore hit a locked Windows Nullion launcher; restored source imports successfully."
+                    )
+                    return True
                 log.error("pip restore failed: %s", result.stderr)
                 return False
 
@@ -409,8 +532,9 @@ def run_post_update_migrations(
             from nullion.config import load_env_file_into_environ
 
             loaded_env_values = load_env_file_into_environ(resolved_env_path)
-        except Exception:
-            log.warning("Could not load env file before migration: %s", resolved_env_path, exc_info=True)
+        except Exception as exc:
+            log.warning("Could not load env file before migration; continuing with existing environment.")
+            log.debug("Could not load env file before migration: %s", resolved_env_path, exc_info=True)
 
     details: dict[str, object] = {
         "checkpoint_path": str(checkpoint),
@@ -420,6 +544,9 @@ def run_post_update_migrations(
         "credentials_json_deleted": False,
         "runtime_json_path": str(checkpoint.with_name("runtime-store.json")),
         "runtime_imported": False,
+        "memory_migrated": False,
+        "memory_rows_encrypted": 0,
+        "memory_rows_quarantined": 0,
         "warnings": [],
     }
 
@@ -443,8 +570,29 @@ def run_post_update_migrations(
         details["env_credentials_imported"] = bool(migrated_credentials and migrated_credentials != before_env)
         details["credentials_json_deleted"] = bool(had_credentials_json and not credentials_json.exists())
     except Exception as exc:
-        details["warnings"].append(f"credential migration skipped: {exc}")
-        log.warning("Credential migration skipped: %s", exc, exc_info=True)
+        details["warnings"].append("credential migration skipped; existing credentials were left unchanged")
+        log.warning("Credential migration skipped; existing credentials were left unchanged.")
+        log.debug("Credential migration skipped: %s", exc, exc_info=True)
+
+    try:
+        from nullion.runtime_persistence import migrate_sqlite_runtime_memory_payloads
+
+        memory_migration = migrate_sqlite_runtime_memory_payloads(checkpoint)
+        details["memory_migrated"] = bool(memory_migration.get("encrypted_rows") or memory_migration.get("quarantined_rows"))
+        details["memory_rows_encrypted"] = int(memory_migration.get("encrypted_rows") or 0)
+        details["memory_rows_quarantined"] = int(memory_migration.get("quarantined_rows") or 0)
+        quarantined = int(memory_migration.get("quarantined_rows") or 0)
+        if quarantined:
+            details["warnings"].append(
+                f"{quarantined} old memory row(s) could not be imported and were moved aside. "
+                "You can continue by deleting old memories if you do not need them."
+            )
+    except Exception as exc:
+        details["warnings"].append(
+            "memory encryption migration skipped; existing memories were left unchanged"
+        )
+        log.warning("Memory encryption migration skipped; existing memories were left unchanged.")
+        log.debug("Memory encryption migration skipped: %s", exc, exc_info=True)
 
     try:
         from nullion.runtime import bootstrap_persistent_runtime
@@ -455,8 +603,9 @@ def run_post_update_migrations(
         runtime.checkpoint()
         details["runtime_imported"] = bool(had_runtime_json and checkpoint.exists())
     except Exception as exc:
-        details["warnings"].append(f"runtime migration skipped: {exc}")
-        log.warning("Runtime migration skipped: %s", exc, exc_info=True)
+        details["warnings"].append("runtime migration skipped; existing runtime data was left unchanged")
+        log.warning("Runtime migration skipped; existing runtime data was left unchanged.")
+        log.debug("Runtime migration skipped: %s", exc, exc_info=True)
 
     return details
 
@@ -847,15 +996,8 @@ async def _update_apply_node(state: _UpdateWorkflowState) -> dict[str, object]:
 
         state = {**state, "steps": steps}
         steps = _update_emit(state, "apply", "Installing updated dependencies...")
-        pip    = _venv_pip()
         src    = _src_dir()
-        install_result = await _update_run_blocking(
-            lambda: subprocess.run(
-                [str(pip), "install", "--quiet", "-e", str(src)],
-                capture_output=True, text=True,
-                cwd=_subprocess_cwd(src),
-            ),
-        )
+        install_result = await _update_run_blocking(lambda: _install_updated_dependencies(src))
         if install_result.returncode != 0:
             raise RuntimeError(f"pip install failed: {install_result.stderr}")
         await _update_run_blocking(_verify_pdf_runtime_dependencies)
@@ -934,6 +1076,8 @@ async def _update_migrate_node(state: _UpdateWorkflowState) -> dict[str, object]
         migrated_bits.append("credentials")
     if migration.get("runtime_imported"):
         migrated_bits.append("runtime")
+    if migration.get("memory_migrated"):
+        migrated_bits.append("memory")
     deleted_credentials = bool(migration.get("credentials_json_deleted"))
     message = "Migration complete"
     if migrated_bits:

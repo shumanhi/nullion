@@ -203,6 +203,8 @@ def _tool_result_completion_text(tool_results: list[ToolResult], *, include_untr
         if result.status != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
+        if output.get("foreground_reply_suppressed") is True:
+            continue
         if is_untrusted_tool_name(result.tool_name):
             if not include_untrusted_fallback:
                 continue
@@ -225,6 +227,8 @@ def _authoritative_tool_completion_text(tool_results: list[ToolResult]) -> str |
         if result.status != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
+        if output.get("foreground_reply_suppressed") is True:
+            continue
         value = output.get("delivery_text") or output.get("final_text") or output.get("result_text")
         if isinstance(value, str) and value.strip():
             return value.strip()[:8000]
@@ -236,6 +240,8 @@ def _tool_result_structured_text(tool_results: list[ToolResult]) -> str | None:
         if result.status != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
+        if output.get("foreground_reply_suppressed") is True:
+            continue
         if is_untrusted_tool_name(result.tool_name):
             continue
         if output:
@@ -319,12 +325,15 @@ def _conversation_visible_content(content: list[dict[str, Any]]) -> list[dict[st
     ]
 
 
+DEFAULT_TOOL_LOOP_DOCTOR_THRESHOLD = 60
+
+
 def _tool_loop_doctor_threshold() -> int:
-    raw_value = os.environ.get("NULLION_TOOL_LOOP_DOCTOR_THRESHOLD", "12").strip()
+    raw_value = os.environ.get("NULLION_TOOL_LOOP_DOCTOR_THRESHOLD", str(DEFAULT_TOOL_LOOP_DOCTOR_THRESHOLD)).strip()
     try:
         threshold = int(raw_value)
     except ValueError:
-        return 20
+        return DEFAULT_TOOL_LOOP_DOCTOR_THRESHOLD
     return max(1, threshold)
 
 

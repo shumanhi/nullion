@@ -439,8 +439,11 @@ finalize_runtime_database() {
        NULLION_CHECKPOINT_PATH="${NULLION_INSTALL_DIR}/runtime.db" \
        "$VENV_DIR/bin/python" - "$NULLION_ENV_FILE" "${NULLION_INSTALL_DIR}/runtime.db" "$NULLION_INSTALL_DIR" >/tmp/nullion_runtime_finalize.out 2>/tmp/nullion_runtime_finalize.err <<'PY'
 import json
+import logging
 import sys
 from pathlib import Path
+
+logging.disable(logging.CRITICAL)
 
 from nullion.updater import run_post_update_migrations
 
@@ -458,7 +461,10 @@ PY
     else
         local err
         err="$(cat /tmp/nullion_runtime_finalize.err 2>/dev/null || true)"
-        print_err "Could not finalize the local runtime database. Setup can continue; run Nullion once to retry migrations.${err:+ ${err}}"
+        print_err "Could not finalize the local runtime database. Setup can continue; run Nullion once to retry migrations."
+        if [[ -n "$err" ]]; then
+            print_info "Migration details were saved to /tmp/nullion_runtime_finalize.err"
+        fi
     fi
 }
 

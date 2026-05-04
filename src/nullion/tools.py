@@ -5213,20 +5213,20 @@ def _build_list_crons_handler():
         for j in jobs:
             status = "✓ enabled" if j.enabled else "✗ disabled"
             next_r = f"  next={j.next_run}" if j.next_run else ""
-            lines.append(f"  [{j.id}] {j.name} | workspace={j.workspace_id} | {j.schedule} | {status}{next_r}\n    task: {j.task}")
+            lines.append(f"  [{j.id}] {j.name} | workspace={j.workspace_id} | {j.schedule} | {status}{next_r}")
             crons.append(
                 {
                     "id": j.id,
                     "name": j.name,
                     "schedule": j.schedule,
-                    "task": j.task,
                     "workspace_id": j.workspace_id,
                     "delivery_channel": j.delivery_channel,
                     "delivery_target": j.delivery_target,
                     "enabled": j.enabled,
                     "next_run": j.next_run,
                     "last_run": j.last_run,
-                    "last_result": j.last_result,
+                    "has_task": bool(str(j.task or "").strip()),
+                    "has_last_result": bool(str(j.last_result or "").strip()),
                 }
             )
         return ToolResult(
@@ -5334,6 +5334,11 @@ def _build_toggle_cron_handler():
 
 
 def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, object] | None] | None):
+    def _foreground_cron_no_output_text() -> str:
+        from nullion.cron_delivery import DEFAULT_CRON_NO_OUTPUT_MESSAGE
+
+        return DEFAULT_CRON_NO_OUTPUT_MESSAGE
+
     def _cron_lookup_parts(value: object) -> tuple[str, tuple[str, ...]]:
         text = str(value or "").casefold()
         tokens: list[str] = []
@@ -5384,49 +5389,61 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
             return matches[0], matches
         return None, matches
 
-    def _path_from_runner_artifact(value: object) -> str | None:
-        if isinstance(value, str) and value.strip():
-            return value
-        if isinstance(value, dict):
-            for key in ("path", "file_path", "artifact_path"):
-                path = value.get(key)
-                if isinstance(path, str) and path.strip():
-                    return path
-        return None
+    def _foreground_cron_result_view(text: str) -> tuple[str, int]:
+        from nullion.artifacts import parse_media_directive_line
 
-    def _artifact_paths_from_runner_output(runner_output: str | dict[str, object] | None) -> list[str]:
-        paths: list[str] = []
-        raw_paths: list[object] = []
-        if isinstance(runner_output, dict):
-            for key in ("artifact_paths", "artifacts"):
-                value = runner_output.get(key)
-                if isinstance(value, list | tuple):
-                    raw_paths.extend(value)
+        removed_media_count = 0
+        kept_lines: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            directive = parse_media_directive_line(raw_line)
+            if directive is not None:
+                removed_media_count += 1
+                continue
+            kept_lines.append(raw_line)
+        if removed_media_count:
+            return "", removed_media_count
+        return "\n".join(kept_lines).strip(), 0
+
+    def _foreground_cron_result_text(text: str) -> str:
+        return _foreground_cron_result_view(text)[0]
+
+    def _foreground_cron_status_text(job: object, status: object) -> str:
+        normalized = str(status or "").strip()
+        name = str(getattr(job, "name", "") or "cron").strip()
+        if normalized == "silent":
+            return "Cron ran successfully; no output was produced."
+        return ""
+
+    def _foreground_cron_runner_output(runner_output: str | dict[str, object] | None) -> str | dict[str, object] | None:
+        if not isinstance(runner_output, dict):
+            return runner_output
+        delivery_status = str(runner_output.get("cron_delivery_status") or "").strip()
+        if delivery_status:
+            return {
+                key: value
+                for key, value in runner_output.items()
+                if key
+                in {
+                    "cron_delivery_status",
+                    "cron_delivery_failed",
+                    "cron_run_failed",
+                    "reached_iteration_limit",
+                    "suspended_for_approval",
+                    "reason",
+                }
+            }
+        sanitized = dict(runner_output)
+        sanitized.pop("artifact_paths", None)
+        sanitized.pop("artifacts", None)
+        for key in ("text", "result_text", "message", "final_text"):
+            value = sanitized.get(key)
+            if isinstance(value, str):
+                sanitized_value = _foreground_cron_result_text(value)
+                if sanitized_value:
+                    sanitized[key] = sanitized_value
                 else:
-                    raw_paths.append(value)
-            text = str(runner_output.get("text") or runner_output.get("result_text") or "")
-        else:
-            text = runner_output if isinstance(runner_output, str) else ""
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("MEDIA:"):
-                raw_paths.append(stripped.removeprefix("MEDIA:").strip())
-        for raw_artifact in raw_paths:
-            raw_path = _path_from_runner_artifact(raw_artifact)
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                continue
-            path = Path(raw_path).expanduser()
-            try:
-                from nullion.artifacts import is_safe_artifact_path
-
-                if not is_safe_artifact_path(path):
-                    continue
-            except Exception:
-                continue
-            normalized = str(path.resolve(strict=False))
-            if normalized not in paths:
-                paths.append(normalized)
-        return paths
+                    sanitized.pop(key, None)
+        return sanitized
 
     def handle(invocation: ToolInvocation) -> ToolResult:
         from datetime import timezone
@@ -5489,7 +5506,7 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
                 output={
                     "id": job.id,
                     "name": job.name,
-                    "task": job.task,
+                    "has_task": bool(str(job.task or "").strip()),
                     "reason": "cron_runner_not_configured",
                 },
                 error="This runtime can list crons but cannot run them on demand.",
@@ -5520,7 +5537,15 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         from nullion.response_fulfillment_contract import guaranteed_user_visible_text
 
-        result_text = guaranteed_user_visible_text(subject=job, output=runner_output, kind="cron")
+        delivery_status = runner_output.get("cron_delivery_status") if isinstance(runner_output, dict) else ""
+        foreground_reply_suppressed = str(delivery_status or "").strip() in {"sent", "saved"}
+        result_text = "" if foreground_reply_suppressed else _foreground_cron_status_text(job, delivery_status)
+        removed_media_count = 0
+        if not result_text and not foreground_reply_suppressed:
+            raw_result_text = guaranteed_user_visible_text(subject=job, output=runner_output, kind="cron")
+            result_text, removed_media_count = _foreground_cron_result_view(raw_result_text)
+            if not result_text:
+                result_text = _foreground_cron_no_output_text()
         for stored in jobs:
             if stored.id == job.id:
                 stored.last_run = now
@@ -5534,17 +5559,22 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
         output: dict[str, object] = {
             "id": job.id,
             "name": job.name,
-            "task": job.task,
+            "has_task": bool(str(job.task or "").strip()),
             "workspace_id": job.workspace_id,
             "last_run": now,
             "message": f"Ran cron '{job.name}' ({job.id}) now.",
-            "result_text": result_text,
+            "foreground_auto_attach_created_artifacts": False,
         }
+        if result_text:
+            output["result_text"] = result_text
+        if foreground_reply_suppressed:
+            output["foreground_reply_suppressed"] = True
+        if delivery_status:
+            output["delivery_status"] = str(delivery_status)
+        if removed_media_count:
+            output["foreground_media_directive_count"] = removed_media_count
         if isinstance(runner_output, dict):
-            output["result"] = runner_output
-        artifact_paths = _artifact_paths_from_runner_output(runner_output)
-        if artifact_paths:
-            output["artifact_paths"] = artifact_paths
+            output["result"] = _foreground_cron_runner_output(runner_output)
         if runner_failed:
             output["reason"] = runner_failure_reason
             return ToolResult(
