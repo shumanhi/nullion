@@ -197,7 +197,7 @@ _UNKNOWN_COMMAND = (
 
 def _humanize_operator_label(value: object) -> str:
     return str(value or "").replace("_", " ").strip().capitalize()
-_INVALID_RESTORE_GENERATION = "Invalid backup generation. Use /restore <generation|latest>."
+_INVALID_RESTORE_GENERATION = "Invalid restore id. Use /restore <id|latest>."
 _EXTRA_STATUS_ARGS = "Too many arguments for /status. Use /status, /status active, or /status <capsule_id>."
 _EXTRA_RESTORE_ARGS = "Too many arguments for /restore. Use /restore, /restore latest, or /restore <generation>."
 _HELP_TEXT = _render_command_reference("Nullion operator commands", _OPERATOR_COMMAND_SPECS)
@@ -624,23 +624,46 @@ def _backup_human_label(backup: dict) -> str:
     return stem or backup_name
 
 
+def _format_backup_size(size_bytes: object) -> str:
+    try:
+        size = int(size_bytes)
+    except (TypeError, ValueError):
+        return "unknown size"
+    units = ("B", "KB", "MB", "GB")
+    value = float(size)
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{size} B"
+    return f"{value:.1f} {unit}"
+
+
 def _render_backups(runtime: PersistentRuntime) -> str:
     backups = runtime.list_backups()
     if not backups:
         return "💾 Backups\n\nNo restore points saved yet."
 
-    lines = [f"💾 Backups — {len(backups)} restore point(s) available", ""]
+    restorable_count = sum(1 for backup in backups if backup.get("restorable", True))
+    lines = [f"💾 Backups — {restorable_count}/{len(backups)} restore point(s) restorable", ""]
     for index, backup in enumerate(backups):
         label = _backup_human_label(backup)
         prefix = "→ Most recent: " if index == 0 else f"  {index}. "
-        restore_cmd = f"/restore {backup['generation']}"
-        lines.append(f"{prefix}{label}  ({restore_cmd})")
+        restore_id = str(backup.get("restore_id") or backup.get("generation") or index)
+        restore_cmd = f"/restore {restore_id}"
+        kind = str(backup.get("kind") or "backup")
+        size = _format_backup_size(backup.get("size_bytes"))
+        integrity = backup.get("integrity")
+        health = "ok" if integrity in {None, "ok"} else f"not restorable: {integrity}"
+        lines.append(f"{prefix}{label}  [{restore_id}] {kind}, {size}, {health}  ({restore_cmd})")
 
     latest_restore = runtime.latest_restore_metadata()
     if latest_restore is not None:
         source = latest_restore.get("source", "backup")
         lines.extend(["", f"Last restored from: {source}"])
-    _append_next(lines, "Use /restore <n> to restore a numbered generation, or /restore latest.")
+    _append_next(lines, "Use /restore <id> to restore one row, or /restore latest for generation 0.")
     return "\n".join(lines)
 
 
@@ -945,22 +968,30 @@ def _render_restore(runtime: PersistentRuntime, token: str | None) -> str:
     normalized_token = _normalize_mention_suffix(token) if token is not None else None
     latest_requested = normalized_token is None or normalized_token == "latest"
     if latest_requested:
-        generation = 0
+        generation: int | str = 0
     else:
-        try:
+        if normalized_token is None:
+            return _INVALID_RESTORE_GENERATION
+        if normalized_token.isdigit():
             generation = int(normalized_token)
-        except ValueError:
+        elif normalized_token.startswith(("corrupt-", "pre-smart-restore-")):
+            generation = normalized_token
+        else:
             return _INVALID_RESTORE_GENERATION
 
     try:
         runtime.restore_from_backup(generation=generation)
     except FileNotFoundError:
         return f"Backup generation {generation} is unavailable."
+    except ValueError as exc:
+        return f"Backup generation {generation} is not restorable: {exc}"
 
     if latest_requested:
         prefix = "Restored latest backup (generation 0)."
-    else:
+    elif isinstance(generation, int):
         prefix = f"Restored backup generation {generation}."
+    else:
+        prefix = f"Restored {generation}."
     return f"{prefix}\nUse /status to review the recovered runtime state."
 
 

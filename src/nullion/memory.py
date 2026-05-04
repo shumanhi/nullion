@@ -31,6 +31,9 @@ class UserMemoryEntry:
     source: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    use_count: int = 0
+    use_score: float = 0.0
+    last_used_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,13 +131,6 @@ def _memory_normalize_node(state: _MemoryCaptureState) -> dict[str, object]:
     if not state.get("text") or not state.get("owner"):
         return {"stripped": "", "written": []}
     stripped = " ".join(str(state.get("text") or "").strip().split())
-    mode_match = re.match(
-        r"^Mode:\s*Remember\.\s*Extract durable preferences or project context if appropriate\.\s*(?P<body>.+)$",
-        stripped,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if mode_match is not None:
-        stripped = mode_match.group("body").strip()
     return {"stripped": stripped, "written": []}
 
 
@@ -225,7 +221,7 @@ def _compiled_memory_capture_graph():
 
 
 def capture_explicit_user_memory(store, *, owner: str, text: str, source: str) -> list[UserMemoryEntry]:
-    """Persist explicit user memories from direct "remember..." style requests."""
+    """Compatibility wrapper; Builder owns structured workspace memory writes."""
     final_state = _compiled_memory_capture_graph().invoke(
         {
             "store": store,

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import threading
+from time import perf_counter
 from datetime import UTC, datetime
 from pathlib import Path
+
+from cryptography.fernet import Fernet
 
 from nullion.approvals import ApprovalRequest, ApprovalStatus, BoundaryPermit, PermissionGrant
 from nullion.audit import AuditRecord
@@ -33,6 +37,7 @@ from nullion.reminders import ReminderRecord
 from nullion.suspended_turns import SuspendedTurn
 from nullion.runtime_store import ConversationBranch, ConversationTurn, RuntimeStore
 from nullion.scheduler import ScheduleKind, ScheduledTask
+from nullion.secure_storage import load_or_create_fernet_key
 from nullion.sentinel_escalations import EscalationStatus, SentinelEscalationArtifact
 from nullion.signals import SignalRoute, SignalTarget
 from nullion.skill_planner import SkillExecutionPlan
@@ -51,6 +56,16 @@ from nullion.task_frames import (
 RUNTIME_STORE_FORMAT_VERSION = 1
 SUPPORTED_RUNTIME_STORE_FORMAT_VERSIONS = frozenset({RUNTIME_STORE_FORMAT_VERSION})
 RUNTIME_STORE_BACKUP_DEPTH = 3
+RUNTIME_SQLITE_MEASURE_ENABLED = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
+RUNTIME_SQLITE_SLOW_MS = float(os.environ.get("NULLION_SQLITE_SLOW_MS", "250"))
+DEFAULT_NULLION_HOME = Path.home() / ".nullion"
+DEFAULT_MEMORY_KEY_PATH = DEFAULT_NULLION_HOME / "memory.key"
+MEMORY_KEYCHAIN_SERVICE = "Nullion Runtime Memory Key"
+MEMORY_KEYCHAIN_ACCOUNT = "runtime_memory"
+_ENCRYPTED_RUNTIME_MEMORY_PREFIX = "fernet:v1:"
+_MEMORY_MIGRATION_FAILURES_TABLE = "memory_migration_failures"
+
+logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - exercised on POSIX platforms
     import fcntl
@@ -243,6 +258,7 @@ _SQLITE_RUNTIME_TABLES: dict[str, str] = {
 }
 
 _SQLITE_TABLE_NAMES = tuple(dict.fromkeys(_SQLITE_RUNTIME_TABLES.values()))
+_ENCRYPTED_SQLITE_COLLECTIONS = frozenset({"user_facts", "preferences", "environment_facts"})
 
 
 def _is_sqlite_runtime_path(path: Path) -> bool:
@@ -253,6 +269,203 @@ def _runtime_sqlite_path_for(path: Path) -> Path:
     if _is_sqlite_runtime_path(path):
         return path
     return path.with_name("runtime.db")
+
+
+def _runtime_memory_key_path(db_path: Path) -> Path:
+    explicit = os.environ.get("NULLION_MEMORY_KEY_PATH")
+    if explicit:
+        return Path(explicit).expanduser()
+    if db_path.parent != DEFAULT_NULLION_HOME:
+        return db_path.with_name("memory.key")
+    return DEFAULT_MEMORY_KEY_PATH
+
+
+def _runtime_memory_key_storage(db_path: Path) -> str | None:
+    raw = os.environ.get("NULLION_KEY_STORAGE")
+    if raw:
+        return raw
+    if db_path.parent != DEFAULT_NULLION_HOME:
+        return None
+    env_path = DEFAULT_NULLION_HOME / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.strip() == "NULLION_KEY_STORAGE":
+                return value.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    return None
+
+
+def _runtime_memory_cipher_for(db_path: Path) -> Fernet:
+    key = load_or_create_fernet_key(
+        _runtime_memory_key_path(db_path),
+        storage=_runtime_memory_key_storage(db_path),
+        keychain_service=MEMORY_KEYCHAIN_SERVICE,
+        keychain_account=MEMORY_KEYCHAIN_ACCOUNT,
+    )
+    return Fernet(key)
+
+
+def _encode_sqlite_runtime_payload(collection: str, checkpoint_path: Path, payload: dict[str, object]) -> str:
+    text = json.dumps(payload, sort_keys=True)
+    if collection not in _ENCRYPTED_SQLITE_COLLECTIONS:
+        return text
+    encrypted = _runtime_memory_cipher_for(checkpoint_path).encrypt(text.encode("utf-8")).decode("ascii")
+    return _ENCRYPTED_RUNTIME_MEMORY_PREFIX + encrypted
+
+
+def _encrypt_sqlite_runtime_memory_text(checkpoint_path: Path, text: str) -> str:
+    encrypted = _runtime_memory_cipher_for(checkpoint_path).encrypt(text.encode("utf-8")).decode("ascii")
+    return _ENCRYPTED_RUNTIME_MEMORY_PREFIX + encrypted
+
+
+def _decode_sqlite_runtime_payload(collection: str, checkpoint_path: Path, payload: str) -> dict[str, object]:
+    if collection not in _ENCRYPTED_SQLITE_COLLECTIONS:
+        return json.loads(payload)
+    if not payload.startswith(_ENCRYPTED_RUNTIME_MEMORY_PREFIX):
+        raise ValueError("Runtime memory payload is not encrypted")
+    encrypted = payload.removeprefix(_ENCRYPTED_RUNTIME_MEMORY_PREFIX).encode("ascii")
+    decrypted = _runtime_memory_cipher_for(checkpoint_path).decrypt(encrypted).decode("utf-8")
+    return json.loads(decrypted)
+
+
+def _sqlite_memory_migration_failure_ddl() -> str:
+    return f"""
+CREATE TABLE IF NOT EXISTS {_MEMORY_MIGRATION_FAILURES_TABLE} (
+    failure_id     TEXT PRIMARY KEY,
+    collection     TEXT NOT NULL,
+    original_key   TEXT NOT NULL,
+    payload        TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL
+);
+"""
+
+
+def _quarantine_sqlite_runtime_row(
+    conn: sqlite3.Connection,
+    *,
+    checkpoint_path: Path,
+    table_name: str,
+    rowid: int,
+    collection: str,
+    item_key: str,
+    payload: str,
+    reason: str,
+) -> None:
+    """Move an unreadable runtime row aside so runtime startup can continue."""
+    if table_name not in _SQLITE_TABLE_NAMES:
+        raise ValueError(f"Unknown runtime table: {table_name}")
+    now = datetime.now(UTC).isoformat()
+    conn.execute("PRAGMA secure_delete=ON")
+    conn.executescript(_sqlite_memory_migration_failure_ddl())
+    quarantine_payload = payload
+    if not payload.startswith(_ENCRYPTED_RUNTIME_MEMORY_PREFIX):
+        quarantine_payload = _encrypt_sqlite_runtime_memory_text(checkpoint_path, payload)
+    conn.execute(
+        f"""INSERT OR REPLACE INTO {_MEMORY_MIGRATION_FAILURES_TABLE}
+            (failure_id, collection, original_key, payload, reason, quarantined_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+        (f"{collection}:{rowid}", collection, item_key, quarantine_payload, reason, now),
+    )
+    conn.execute(f"DELETE FROM {table_name} WHERE rowid = ?", (rowid,))
+
+
+def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object]:
+    """Encrypt legacy plaintext memory rows before the runtime loads them.
+
+    Valid legacy rows are rewritten in place as Fernet payloads. Malformed rows
+    are encrypted into a quarantine table and removed from active memory so the
+    runtime can still start and the updater can tell the user what happened.
+    """
+    checkpoint_path = Path(path).expanduser()
+    result: dict[str, object] = {
+        "attempted": False,
+        "encrypted_rows": 0,
+        "already_encrypted_rows": 0,
+        "quarantined_rows": 0,
+        "failures": [],
+    }
+    if not _is_sqlite_runtime_path(checkpoint_path) or not checkpoint_path.exists():
+        return result
+
+    with sqlite3.connect(str(checkpoint_path), timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(_sqlite_runtime_ddl())
+        rows = conn.execute(
+            "SELECT rowid, collection, item_key, payload FROM memory "
+            "WHERE collection IN (?, ?, ?) ORDER BY rowid",
+            tuple(sorted(_ENCRYPTED_SQLITE_COLLECTIONS)),
+        ).fetchall()
+    if not rows:
+        return result
+
+    result["attempted"] = True
+    updates: list[tuple[int, str]] = []
+    quarantines: list[tuple[int, str, str, str, str]] = []
+    failures: list[dict[str, str]] = []
+    for row in rows:
+        rowid = int(row["rowid"])
+        collection = str(row["collection"])
+        item_key = str(row["item_key"])
+        payload = str(row["payload"])
+        if payload.startswith(_ENCRYPTED_RUNTIME_MEMORY_PREFIX):
+            result["already_encrypted_rows"] = int(result["already_encrypted_rows"]) + 1
+            continue
+        try:
+            decoded = json.loads(payload)
+            if not isinstance(decoded, dict):
+                raise ValueError("memory payload is not a JSON object")
+            updates.append((rowid, _encode_sqlite_runtime_payload(collection, checkpoint_path, decoded)))
+        except Exception as exc:
+            reason = str(exc) or exc.__class__.__name__
+            failures.append({"collection": collection, "row": str(rowid), "reason": reason})
+            quarantines.append(
+                (
+                    rowid,
+                    collection,
+                    f"row:{rowid}",
+                    _encrypt_sqlite_runtime_memory_text(checkpoint_path, payload),
+                    reason,
+                )
+            )
+
+    if not updates and not quarantines:
+        result["failures"] = failures
+        return result
+
+    now = datetime.now(UTC).isoformat()
+    with sqlite3.connect(str(checkpoint_path), timeout=10) as conn:
+        conn.execute("PRAGMA secure_delete=ON")
+        conn.executescript(_sqlite_runtime_ddl())
+        conn.executescript(_sqlite_memory_migration_failure_ddl())
+        for rowid, encrypted_payload in updates:
+            conn.execute(
+                "UPDATE memory SET item_key = ?, payload = ?, updated_at = ? WHERE rowid = ?",
+                (f"encrypted:{rowid}", encrypted_payload, now, rowid),
+            )
+        for rowid, collection, item_key, encrypted_payload, reason in quarantines:
+            _quarantine_sqlite_runtime_row(
+                conn,
+                checkpoint_path=checkpoint_path,
+                table_name="memory",
+                rowid=rowid,
+                collection=collection,
+                item_key=item_key,
+                payload=encrypted_payload,
+                reason=reason,
+            )
+    with sqlite3.connect(str(checkpoint_path), timeout=10) as conn:
+        conn.execute("VACUUM")
+
+    result["encrypted_rows"] = len(updates)
+    result["quarantined_rows"] = len(quarantines)
+    result["failures"] = failures
+    return result
 
 
 def _dt(value):
@@ -940,6 +1153,9 @@ def _serialize_user_memory_entry(entry: UserMemoryEntry) -> dict[str, object]:
         "source": entry.source,
         "created_at": _dt(entry.created_at),
         "updated_at": _dt(entry.updated_at),
+        "use_count": int(getattr(entry, "use_count", 0) or 0),
+        "use_score": float(getattr(entry, "use_score", 0.0) or 0.0),
+        "last_used_at": _dt(getattr(entry, "last_used_at", None)),
     }
 
 
@@ -954,6 +1170,9 @@ def _deserialize_user_memory_entry(payload: dict[str, object]) -> UserMemoryEntr
         source=payload.get("source"),
         created_at=_parse_dt(payload.get("created_at")),
         updated_at=_parse_dt(payload.get("updated_at")),
+        use_count=int(payload.get("use_count") or 0),
+        use_score=float(payload.get("use_score") or 0.0),
+        last_used_at=_parse_dt(payload.get("last_used_at")),
     )
 
 
@@ -1201,6 +1420,74 @@ def _backup_path_for(target: Path, generation: int) -> Path:
     return target.with_name(f"{target.name}{suffix}")
 
 
+def _looks_like_sqlite_runtime_file(path: Path) -> bool:
+    name = path.name.lower()
+    return (
+        path.suffix.lower() in RUNTIME_SQLITE_SUFFIXES
+        or ".db." in name
+        or ".sqlite." in name
+        or ".sqlite3." in name
+    )
+
+
+def _sqlite_quick_check(path: Path) -> str | None:
+    if not _looks_like_sqlite_runtime_file(path):
+        return None
+    try:
+        with sqlite3.connect(str(path), timeout=10) as conn:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+    except sqlite3.Error as exc:
+        return str(exc) or exc.__class__.__name__
+    return str(row[0]) if row else "no result"
+
+
+def _runtime_backup_record(
+    checkpoint_path: Path,
+    candidate: Path,
+    *,
+    restore_id: str,
+    generation: int | None,
+    kind: str,
+) -> dict[str, object]:
+    try:
+        stat = candidate.stat()
+        size_bytes = stat.st_size
+        modified_at = stat.st_mtime
+    except OSError:
+        size_bytes = 0
+        modified_at = None
+    integrity = _sqlite_quick_check(candidate)
+    return {
+        "generation": generation,
+        "restore_id": restore_id,
+        "name": candidate.name,
+        "path": str(candidate),
+        "kind": kind,
+        "size_bytes": size_bytes,
+        "modified_at": modified_at,
+        "integrity": integrity,
+        "restorable": candidate.exists() and (integrity in {None, "ok"}),
+        "checkpoint": checkpoint_path.name,
+    }
+
+
+def _restore_candidate_for_token(target: Path, token: int | str) -> Path:
+    if isinstance(token, int):
+        return _backup_path_for(target, token)
+    normalized = str(token).strip()
+    if not normalized:
+        raise FileNotFoundError(target.with_name(f"{target.name}."))
+    if normalized.isdigit():
+        return _backup_path_for(target, int(normalized))
+    allowed_prefixes = ("corrupt-", "pre-smart-restore-")
+    if not normalized.startswith(allowed_prefixes):
+        raise FileNotFoundError(target.with_name(f"{target.name}.{normalized}"))
+    candidate = target.with_name(f"{target.name}.{normalized}")
+    if candidate.name != f"{target.name}.{normalized}":
+        raise FileNotFoundError(candidate)
+    return candidate
+
+
 
 def _rotate_runtime_store_backups(target: Path) -> None:
     for generation in range(RUNTIME_STORE_BACKUP_DEPTH - 1, -1, -1):
@@ -1228,15 +1515,73 @@ CREATE INDEX IF NOT EXISTS idx_{table_name}_collection
 """
         for table_name in _SQLITE_TABLE_NAMES
     ]
+    runtime_event_indexes = """
+CREATE INDEX IF NOT EXISTS idx_runtime_events_collection_updated
+    ON runtime_events (collection, updated_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_type_created
+    ON runtime_events (
+        json_extract(payload, '$.event_type'),
+        json_extract(payload, '$.created_at')
+    );
+CREATE INDEX IF NOT EXISTS idx_runtime_events_conversation_created
+    ON runtime_events (
+        json_extract(payload, '$.payload.conversation_id'),
+        json_extract(payload, '$.created_at')
+    );
+CREATE INDEX IF NOT EXISTS idx_runtime_events_tool_created
+    ON runtime_events (
+        json_extract(payload, '$.payload.tool_name'),
+        json_extract(payload, '$.created_at')
+    );
+CREATE INDEX IF NOT EXISTS idx_conversation_events_conversation_created
+    ON conversation_events (
+        json_extract(payload, '$.conversation_id'),
+        json_extract(payload, '$.created_at')
+    );
+CREATE INDEX IF NOT EXISTS idx_conversation_events_type_created
+    ON conversation_events (
+        json_extract(payload, '$.event_type'),
+        json_extract(payload, '$.created_at')
+    );
+"""
     return """
 CREATE TABLE IF NOT EXISTS runtime_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-""" + "\n".join(table_blocks)
+""" + "\n".join(table_blocks) + runtime_event_indexes
+
+
+def _log_runtime_sqlite_timing(
+    operation: str,
+    started_at: float,
+    path: Path,
+    *,
+    records: int | None = None,
+) -> None:
+    if not RUNTIME_SQLITE_MEASURE_ENABLED:
+        return
+    elapsed_ms = (perf_counter() - started_at) * 1000
+    extra = ""
+    if records is not None:
+        extra += " records=%s" % records
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    message = (
+        "runtime SQLite %s took %.1fms path=%s size_bytes=%s%s"
+        % (operation, elapsed_ms, path.name, size, extra)
+    )
+    if elapsed_ms >= RUNTIME_SQLITE_SLOW_MS:
+        logger.warning(message)
+    else:
+        logger.debug(message)
 
 
 def _sqlite_collection_item_key(collection: str, index: int, item: object) -> str:
+    if collection in _ENCRYPTED_SQLITE_COLLECTIONS:
+        return f"{index:012d}"
     if isinstance(item, dict):
         for key in (
             "approval_id",
@@ -1264,8 +1609,18 @@ def _sqlite_collection_item_key(collection: str, index: int, item: object) -> st
     return f"{index:012d}"
 
 
+def _validate_sqlite_runtime_row(collection: str, decoded: dict[str, object]) -> None:
+    payload: dict[str, object] = {
+        "format_version": RUNTIME_STORE_FORMAT_VERSION,
+        **{key: [] for key in _RUNTIME_STORE_COLLECTION_KEYS},
+    }
+    payload[collection] = [decoded]
+    _runtime_store_from_payload(payload)
+
+
 def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path) -> Path:
     target = Path(path)
+    started_at = perf_counter()
     if target.exists():
         try:
             previous_store = _load_runtime_store_sqlite(target)
@@ -1303,15 +1658,21 @@ def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path) -> Path:
                     (
                         collection,
                         _sqlite_collection_item_key(collection, index, row),
-                        json.dumps(row, sort_keys=True),
+                        _encode_sqlite_runtime_payload(collection, target, row),
                         now,
                     ),
                 )
+    record_count = sum(
+        len(rows) if isinstance(rows, list) else 0
+        for rows in payload.values()
+    )
+    _log_runtime_sqlite_timing("save", started_at, target, records=record_count)
     return target
 
 
 def _load_runtime_store_sqlite(path: str | Path) -> RuntimeStore:
     source = Path(path)
+    started_at = perf_counter()
     payload: dict[str, object] = {
         "format_version": RUNTIME_STORE_FORMAT_VERSION,
         **{key: [] for key in _RUNTIME_STORE_COLLECTION_KEYS},
@@ -1329,11 +1690,34 @@ def _load_runtime_store_sqlite(path: str | Path) -> RuntimeStore:
         for collection in _RUNTIME_STORE_COLLECTION_KEYS:
             table_name = _SQLITE_RUNTIME_TABLES[collection]
             rows = conn.execute(
-                f"SELECT payload FROM {table_name} WHERE collection = ? ORDER BY rowid",
+                f"SELECT rowid, item_key, payload FROM {table_name} WHERE collection = ? ORDER BY rowid",
                 (collection,),
             ).fetchall()
-            payload[collection] = [json.loads(row["payload"]) for row in rows]
-    return _runtime_store_from_payload(payload)
+            decoded_rows: list[dict[str, object]] = []
+            for row in rows:
+                try:
+                    decoded = _decode_sqlite_runtime_payload(collection, source, str(row["payload"]))
+                    _validate_sqlite_runtime_row(collection, decoded)
+                    decoded_rows.append(decoded)
+                except Exception as exc:
+                    _quarantine_sqlite_runtime_row(
+                        conn,
+                        checkpoint_path=source,
+                        table_name=table_name,
+                        rowid=int(row["rowid"]),
+                        collection=collection,
+                        item_key=str(row["item_key"]),
+                        payload=str(row["payload"]),
+                        reason=str(exc) or exc.__class__.__name__,
+                    )
+            payload[collection] = decoded_rows
+    store = _runtime_store_from_payload(payload)
+    record_count = sum(
+        len(rows) if isinstance(rows, list) else 0
+        for rows in payload.values()
+    )
+    _log_runtime_sqlite_timing("load", started_at, source, records=record_count)
+    return store
 
 
 
@@ -1526,6 +1910,7 @@ def _runtime_store_from_payload(payload: dict[str, object]) -> RuntimeStore:
 def load_runtime_store(path: str | Path) -> RuntimeStore:
     source = Path(path)
     if _is_sqlite_runtime_path(source):
+        migrate_sqlite_runtime_memory_payloads(source)
         return _load_runtime_store_sqlite(source)
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
@@ -1546,13 +1931,43 @@ def list_runtime_store_backups(path: str | Path) -> list[dict[str, object]]:
         if not candidate.exists():
             break
         backups.append(
-            {
-                "generation": generation,
-                "name": candidate.name,
-                "path": str(candidate),
-            }
+            _runtime_backup_record(
+                checkpoint_path,
+                candidate,
+                restore_id=str(generation),
+                generation=generation,
+                kind="backup",
+            )
         )
         generation += 1
+    for candidate in sorted(
+        checkpoint_path.parent.glob(f"{checkpoint_path.name}.corrupt-*"),
+        key=lambda item: item.stat().st_mtime if item.exists() else 0,
+        reverse=True,
+    ):
+        backups.append(
+            _runtime_backup_record(
+                checkpoint_path,
+                candidate,
+                restore_id=candidate.name.removeprefix(f"{checkpoint_path.name}."),
+                generation=None,
+                kind="recovered",
+            )
+        )
+    for candidate in sorted(
+        checkpoint_path.parent.glob(f"{checkpoint_path.name}.pre-smart-restore-*"),
+        key=lambda item: item.stat().st_mtime if item.exists() else 0,
+        reverse=True,
+    ):
+        backups.append(
+            _runtime_backup_record(
+                checkpoint_path,
+                candidate,
+                restore_id=candidate.name.removeprefix(f"{checkpoint_path.name}."),
+                generation=None,
+                kind="manual-snapshot",
+            )
+        )
     return backups
 
 
@@ -1571,11 +1986,14 @@ def get_latest_runtime_restore_metadata(store: RuntimeStore) -> dict[str, object
 
 
 
-def restore_runtime_store_backup(path: str | Path, *, generation: int = 0) -> Path:
+def restore_runtime_store_backup(path: str | Path, *, generation: int | str = 0) -> Path:
     target = Path(path)
-    backup_target = _backup_path_for(target, generation)
+    backup_target = _restore_candidate_for_token(target, generation)
     if not backup_target.exists():
         raise FileNotFoundError(backup_target)
+    integrity = _sqlite_quick_check(backup_target)
+    if integrity not in {None, "ok"}:
+        raise ValueError(f"Runtime backup failed integrity check: {backup_target.name} ({integrity})")
 
     temp_target = target.with_name(f"{target.name}.restore.tmp")
     try:
@@ -1607,6 +2025,7 @@ __all__ = [
     "save_runtime_store",
     "load_runtime_store",
     "migrate_runtime_store_payload",
+    "migrate_sqlite_runtime_memory_payloads",
     "list_runtime_store_backups",
     "get_latest_runtime_restore_metadata",
     "restore_runtime_store_backup",

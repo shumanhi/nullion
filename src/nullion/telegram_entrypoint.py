@@ -10,8 +10,10 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import time
 import inspect
+import threading
 
 from nullion.config import ProviderBinding, load_env_file_into_environ, load_settings
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
@@ -40,6 +42,28 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
 _DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
+
+
+def _run_async_sync(factory) -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return bool(asyncio.run(factory()))
+    result: list[object] = []
+    errors: list[BaseException] = []
+
+    def _runner() -> None:
+        try:
+            result.append(asyncio.run(factory()))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=_runner, name="nullion-telegram-cron-delivery", daemon=True)
+    thread.start()
+    thread.join()
+    if errors:
+        raise errors[0]
+    return bool(result[0]) if result else False
 
 
 def _resolve_browser_backend() -> str | None:
@@ -71,8 +95,28 @@ def _is_transient_telegram_polling_timeout(error: BaseException) -> bool:
     return False
 
 
+def _checkpoint_is_valid_sqlite(checkpoint: Path) -> bool:
+    if checkpoint.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
+        return False
+    try:
+        with sqlite3.connect(str(checkpoint), timeout=10) as conn:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row and row[0] == "ok")
+
+
 def _recover_runtime_from_corrupt_checkpoint(checkpoint: Path, error: ValueError):
     if not checkpoint.exists():
+        raise error
+
+    if _checkpoint_is_valid_sqlite(checkpoint):
+        logger.error(
+            "Runtime checkpoint load failed, but SQLite integrity check passed; "
+            "leaving checkpoint in place for row-level repair (checkpoint=%s, error=%s)",
+            checkpoint,
+            error,
+        )
         raise error
 
     suffix = int(time.time() * 1000)
@@ -409,11 +453,167 @@ def _build_runtime_service_from_settings(
     runtime.active_tool_registry = active_tool_registry
     service = service_factory(runtime, settings=settings)
 
+    def _record_cron_delivery_event(event_type: str, job, channel: str, target: str, conv_id: str, **extra) -> None:
+        try:
+            from nullion.audit import make_audit_record
+            from nullion.events import make_event
+
+            payload = {
+                "cron_id": getattr(job, "id", ""),
+                "cron_name": getattr(job, "name", ""),
+                "workspace_id": getattr(job, "workspace_id", "workspace_admin"),
+                "delivery_channel": channel,
+                "delivery_target": target,
+                "conversation_id": conv_id,
+            }
+            payload.update(extra)
+            runtime.store.add_event(make_event(event_type, "cron_scheduler", payload))
+            runtime.store.add_audit_record(make_audit_record(event_type, "cron_scheduler", payload))
+            runtime.checkpoint()
+        except Exception:
+            logger.debug("Could not record Telegram cron delivery event", exc_info=True)
+
+    def _effective_cron_delivery_channel(job) -> str:
+        from nullion.cron_delivery import effective_cron_delivery_channel
+        from nullion.config import load_settings as _load_settings
+
+        try:
+            current_settings = _load_settings()
+        except Exception:
+            current_settings = settings
+        return effective_cron_delivery_channel(job, settings=current_settings)
+
+    def _cron_delivery_target(job, channel: str) -> str:
+        from nullion.cron_delivery import cron_delivery_target
+        from nullion.config import load_settings as _load_settings
+
+        try:
+            current_settings = _load_settings()
+        except Exception:
+            current_settings = settings
+        return cron_delivery_target(job, channel, settings=current_settings)
+
+    def _cron_result_block_reason(result: dict, text: str, artifacts: object) -> str | None:
+        if result.get("reached_iteration_limit"):
+            return "cron_run_reached_iteration_limit"
+        if result.get("suspended_for_approval"):
+            return "waiting_for_approval"
+        _ = (text, artifacts)
+        return None
+
+    def _cron_agent_history(conv_id: str) -> list[dict]:
+        from nullion.artifacts import artifact_root_for_principal
+        from nullion.connections import format_workspace_connections_for_prompt
+        from nullion.runtime_config import format_runtime_config_for_prompt
+        from nullion.skill_pack_catalog import skill_pack_access_prompt
+        from nullion.skill_pack_installer import format_enabled_skill_packs_for_prompt
+        from nullion.system_context import build_system_context_snapshot, format_system_context_for_prompt
+        from nullion.workspace_storage import format_workspace_storage_for_prompt
+
+        history: list[dict] = []
+        caps_text = format_system_context_for_prompt(build_system_context_snapshot(tool_registry=active_tool_registry))
+        if caps_text:
+            history.append({
+                "role": "system",
+                "content": [{"type": "text", "text": (
+                    "You are Nullion, a security-first AI agent. Use only registered tools. "
+                    "Below is the live inventory of tools registered in this session.\n\n"
+                    + caps_text
+                )}],
+            })
+        config_text = format_runtime_config_for_prompt(model_client=getattr(service, "model_client", None))
+        if config_text:
+            history.append({"role": "system", "content": [{"type": "text", "text": config_text}]})
+        connections_text = format_workspace_connections_for_prompt(principal_id=conv_id)
+        if connections_text:
+            history.append({"role": "system", "content": [{"type": "text", "text": connections_text}]})
+        skill_text = format_enabled_skill_packs_for_prompt(settings.enabled_skill_packs)
+        access_text = skill_pack_access_prompt(settings.enabled_skill_packs, principal_id=conv_id)
+        if access_text:
+            skill_text = (skill_text + "\n\n" + access_text).strip()
+        if skill_text:
+            history.append({"role": "system", "content": [{"type": "text", "text": skill_text}]})
+        artifact_root = artifact_root_for_principal(conv_id)
+        storage_text = format_workspace_storage_for_prompt(principal_id=conv_id)
+        history.append({
+            "role": "system",
+            "content": [{"type": "text", "text": (
+                "Cron delivery contract: create requested deliverable files under this artifact directory "
+                f"and attach them with explicit MEDIA lines: {artifact_root}. "
+                "Keep scratch, checkpoint, and state files in the workspace unless they are requested deliverables.\n\n"
+                f"{storage_text}"
+            )}],
+        })
+        return history
+
+    def _run_cron_agent_turn(job, conv_id: str, *, label: str) -> dict:
+        from nullion.cron_delivery import cron_agent_prompt
+
+        orchestrator = getattr(service, "agent_orchestrator", None)
+        if orchestrator is None:
+            return {"cron_run_failed": True, "reason": "agent_orchestrator_unavailable", "text": ""}
+        result = orchestrator.run_turn(
+            conversation_id=conv_id,
+            principal_id=conv_id,
+            user_message=cron_agent_prompt(job, label=label),
+            conversation_history=_cron_agent_history(conv_id),
+            tool_registry=active_tool_registry,
+            policy_store=runtime.store,
+            approval_store=runtime.store,
+        )
+        payload = {
+            "text": result.final_text or "",
+            "tool_results": list(result.tool_results),
+            "artifacts": list(result.artifacts),
+            "suspended_for_approval": result.suspended_for_approval,
+            "approval_id": result.approval_id,
+            "reached_iteration_limit": result.reached_iteration_limit,
+        }
+        return payload
+
+    def _send_cron_platform_delivery(job, channel: str, text: str, *, run_label: str = "Scheduled task") -> bool:
+        from nullion.cron_delivery import scheduled_task_delivery_text
+
+        if channel != "telegram":
+            return False
+        target = _cron_delivery_target(job, channel)
+        if not target or not settings.telegram.bot_token:
+            return False
+        message = scheduled_task_delivery_text(job, text, run_label=run_label)
+        return _run_async_sync(lambda: _send_operator_telegram_delivery(
+            settings.telegram.bot_token,
+            target,
+            message,
+            principal_id=f"telegram:{target}",
+            suppress_link_preview=True,
+        ))
+
+    def _save_cron_web_delivery(job, conv_id: str, text: str, artifacts: object, result: dict) -> bool:
+        _ = (job, conv_id, text, artifacts, result)
+        return False
+
     def _cron_tool_runner(job):
-        return service.handle_text_message(
-            text=f"[Manual scheduled task run: {job.name}] {job.task}",
-            chat_id=_operator_chat_id,
-            allow_mini_agents=False,
+        from nullion.cron_delivery import CronRunDeliveryCallbacks, run_cron_delivery_workflow
+
+        return run_cron_delivery_workflow(
+            job,
+            label="Manual scheduled task run",
+            callbacks=CronRunDeliveryCallbacks(
+                effective_channel=_effective_cron_delivery_channel,
+                delivery_target=_cron_delivery_target,
+                run_agent_turn=lambda cron_job, conv_id: _run_cron_agent_turn(cron_job, conv_id, label="Manual scheduled task run"),
+                record_event=_record_cron_delivery_event,
+                block_reason=_cron_result_block_reason,
+                save_web_delivery=_save_cron_web_delivery,
+                send_platform_delivery=lambda cron_job, channel, text: _send_cron_platform_delivery(
+                    cron_job,
+                    channel,
+                    text,
+                    run_label="Manual scheduled task run",
+                ),
+                start_background_delivery=None,
+                clear_background_delivery=None,
+            ),
         )
 
     register_cron_tools(

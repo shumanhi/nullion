@@ -1101,6 +1101,14 @@ def _memory_context_for_chat(
             for entry in memory_entries_for_owner(runtime.store, legacy_owner)
             if entry.key not in {existing.key for existing in entries}
         )
+    try:
+        from nullion.builder_memory import reinforce_memory_entries, select_memory_entries_for_prompt
+
+        entries = select_memory_entries_for_prompt(entries)
+        if reinforce_memory_entries(runtime.store, entries):
+            runtime.checkpoint()
+    except Exception:
+        logger.debug("Unable to reinforce chat memory entries", exc_info=True)
     return format_memory_context(entries)
 
 
@@ -1287,6 +1295,32 @@ def _chat_ambiguity_fallback(thread: list[dict[str, str]], prompt: str):
         return None
 
     return fallback, ambiguity_reason
+
+
+def _chat_ambiguity_classifier(thread: list[dict[str, str]], *, model_client: object | None):
+    previous_user_message = _previous_user_message(thread)
+    if model_client is None or not isinstance(previous_user_message, str) or not previous_user_message.strip():
+        return None, None
+
+    def classifier(text: str, ctx):
+        if not getattr(ctx, "active_branch_exists", False):
+            return None
+        try:
+            from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
+
+            decision = route_turn_dispatch_with_context(
+                text,
+                active_turn_ids=("active-branch",),
+                active_turn_texts=(previous_user_message,),
+                model_client=model_client,
+            )
+        except Exception:
+            return None
+        if str(decision.reason or "").startswith("model_structured_"):
+            return decision.disposition
+        return None
+
+    return classifier, "model_structured_turn_relationship"
 
 
 
@@ -1601,6 +1635,22 @@ def _artifact_paths_created_since(
             if descriptor is not None:
                 paths.append(descriptor.path)
     return list(dict.fromkeys(paths))
+
+
+def _should_auto_attach_created_artifacts(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
+    for result in tool_results or ():
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("foreground_auto_attach_created_artifacts") is False:
+            return False
+    return True
+
+
+def _should_suppress_foreground_reply(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
+    for result in tool_results or ():
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("foreground_reply_suppressed") is True:
+            return True
+    return False
 
 
 def _append_chat_artifacts_to_reply(
@@ -2266,6 +2316,7 @@ def _try_builder_reflection(
     tool_error_count: int,
     outcome: TurnOutcome,
     conversation_id: str,
+    memory_owner: str | None = None,
 ) -> None:
     """Fire-and-forget Builder reflection after a completed turn.
 
@@ -2273,8 +2324,6 @@ def _try_builder_reflection(
     repeated patterns, and asks the LLM to propose a skill when warranted.
     Errors are caught and logged at DEBUG level — never blocks the main turn.
     """
-    if not _feature_enabled("NULLION_SKILL_LEARNING_ENABLED"):
-        return
     try:
         from uuid import uuid4 as _uuid4
 
@@ -2296,6 +2345,27 @@ def _try_builder_reflection(
 
         model_client = getattr(agent_orchestrator, "model_client", None)
         if model_client is None:
+            return
+
+        if (
+            outcome is TurnOutcome.SUCCESS
+            and memory_owner
+            and _feature_enabled("NULLION_MEMORY_ENABLED")
+        ):
+            try:
+                from nullion.builder_memory import manage_turn_memory
+
+                manage_turn_memory(
+                    runtime,
+                    model_client,
+                    owner=memory_owner,
+                    user_message=user_message,
+                    assistant_reply=assistant_reply,
+                )
+            except Exception:
+                logger.debug("Builder memory management failed (non-fatal)", exc_info=True)
+
+        if not _feature_enabled("NULLION_SKILL_LEARNING_ENABLED"):
             return
 
         # 1. Pattern-first: if a high-confidence repeated pattern exists, reflect on it
@@ -2467,6 +2537,7 @@ def _render_chat_turn(
     thread = _get_chat_thread(runtime, chat_id)
     previous_assistant_message = _previous_assistant_message(thread)
     ambiguity_fallback, ambiguity_fallback_reason = _chat_ambiguity_fallback(thread, prompt)
+    ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(thread, model_client=model_client)
     conversation_result = runtime.process_conversation_message(
         conversation_id=_conversation_id_for_chat(chat_id),
         chat_id=chat_id,
@@ -2476,6 +2547,8 @@ def _render_chat_turn(
         previous_assistant_message=previous_assistant_message,
         ambiguity_fallback=ambiguity_fallback,
         ambiguity_fallback_reason=ambiguity_fallback_reason,
+        ambiguity_classifier=ambiguity_classifier,
+        ambiguity_classifier_reason=ambiguity_classifier_reason,
     )
 
     conversation_context = _build_conversation_context(thread) if _should_include_conversation_context(conversation_result, thread) else None
@@ -2759,6 +2832,9 @@ def _render_chat_turn(
 
             handled_by_mini_agents = False
             suppress_runtime_nudges = False
+            activity_tool_results: list[ToolResult] = []
+            reply = "Done."
+            turn_outcome = TurnOutcome.SUCCESS
             thinking_text: str | None = None
             if (
                 execution_plan.can_dispatch_mini_agents
@@ -2879,6 +2955,7 @@ def _render_chat_turn(
                         required_attachment_extensions=requested_attachment_extensions,
                     )
                     mission_outcome = TurnOutcome.SUCCESS
+                turn_outcome = mission_outcome
                 update_active_task_frame_from_outcomes(
                     runtime.store,
                     conversation_id=conversation_id,
@@ -2938,26 +3015,29 @@ def _render_chat_turn(
                     reply = f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
                     turn_outcome = TurnOutcome.SUSPENDED
                 else:
-                    turn_result.artifacts.extend(
-                        path
-                        for path in _artifact_paths_created_since(
+                    if _should_auto_attach_created_artifacts(turn_result.tool_results):
+                        turn_result.artifacts.extend(
+                            path
+                            for path in _artifact_paths_created_since(
+                                runtime,
+                                since=turn_started_at,
+                                principal_id=principal_id,
+                                required_attachment_extensions=requested_attachment_extensions,
+                            )
+                            if path not in turn_result.artifacts
+                        )
+                    suppress_foreground_reply = _should_suppress_foreground_reply(turn_result.tool_results)
+                    reply = "" if suppress_foreground_reply else turn_result.final_text or "Done."
+                    if not suppress_foreground_reply:
+                        reply = _append_chat_artifacts_to_reply(
                             runtime,
-                            since=turn_started_at,
+                            reply=reply,
+                            artifact_paths=turn_result.artifacts,
+                            prompt=effective_prompt,
                             principal_id=principal_id,
+                            tool_results=turn_result.tool_results,
                             required_attachment_extensions=requested_attachment_extensions,
                         )
-                        if path not in turn_result.artifacts
-                    )
-                    reply = turn_result.final_text or "Done."
-                    reply = _append_chat_artifacts_to_reply(
-                        runtime,
-                        reply=reply,
-                        artifact_paths=turn_result.artifacts,
-                        prompt=effective_prompt,
-                        principal_id=principal_id,
-                        tool_results=turn_result.tool_results,
-                        required_attachment_extensions=requested_attachment_extensions,
-                    )
                     turn_outcome = TurnOutcome.SUCCESS
                 update_active_task_frame_from_outcomes(
                     runtime.store,
@@ -2966,7 +3046,7 @@ def _render_chat_turn(
                     rendered_reply=reply,
                     completion_turn_id=conversation_result.turn.turn_id,
                 )
-                if turn_outcome is TurnOutcome.SUCCESS:
+                if turn_outcome is TurnOutcome.SUCCESS and not _should_suppress_foreground_reply(turn_result.tool_results):
                     if _needs_required_attachment_repair(
                         runtime,
                         conversation_id=conversation_id,
@@ -3001,16 +3081,17 @@ def _render_chat_turn(
                         else:
                             turn_result.tool_results.extend(list(repair_result.tool_results))
                             turn_result.artifacts.extend(list(repair_result.artifacts))
-                            turn_result.artifacts.extend(
-                                path
-                                for path in _artifact_paths_created_since(
-                                    runtime,
-                                    since=repair_started_at,
-                                    principal_id=principal_id,
-                                    required_attachment_extensions=requested_attachment_extensions,
+                            if _should_auto_attach_created_artifacts(repair_result.tool_results):
+                                turn_result.artifacts.extend(
+                                    path
+                                    for path in _artifact_paths_created_since(
+                                        runtime,
+                                        since=repair_started_at,
+                                        principal_id=principal_id,
+                                        required_attachment_extensions=requested_attachment_extensions,
+                                    )
+                                    if path not in turn_result.artifacts
                                 )
-                                if path not in turn_result.artifacts
-                            )
                             reply = repair_result.final_text or reply
                             reply = _append_chat_artifacts_to_reply(
                                 runtime,
@@ -3061,6 +3142,7 @@ def _render_chat_turn(
                     ),
                     outcome=turn_outcome,
                     conversation_id=conversation_id,
+                    memory_owner=_memory_owner_for_chat(chat_id, settings),
                 )
             # Only persist the turn when it has a real result.  Storing
             # "Tool approval requested: …" as the assistant reply pollutes the
@@ -3082,6 +3164,10 @@ def _render_chat_turn(
                     "status": "blocked" if _turn_is_suspended else "done",
                     "detail": result_detail,
                 })
+            if turn_outcome is TurnOutcome.SUCCESS and _should_suppress_foreground_reply(activity_tool_results):
+                runtime.checkpoint()
+                _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+                return None
             visible_reply = append_activity_trace_to_reply(
                 reply,
                 tool_results=activity_tool_results,

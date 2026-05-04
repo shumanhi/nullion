@@ -65,10 +65,12 @@ from nullion.config import (
 )
 from nullion.cron_delivery import (
     CronRunDeliveryCallbacks,
+    cron_agent_prompt,
     cron_delivery_target,
     cron_delivery_text,
     effective_cron_delivery_channel,
     run_cron_delivery_workflow,
+    scheduled_task_delivery_text,
 )
 from nullion.doctor_playbooks import execute_doctor_playbook_command
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
@@ -78,12 +80,17 @@ from nullion.memory import (
     format_memory_context,
     memory_entries_for_owner,
     memory_owner_for_web_admin,
+    memory_owner_for_workspace,
 )
 from nullion.mini_agent_routing import should_route_without_mini_agents
 from nullion.messaging_adapters import list_platform_delivery_receipts, messaging_file_allowed_roots, messaging_upload_root
 from nullion.operator_commands import operator_command_suggestions
 from nullion.prompt_injection import is_untrusted_tool_name, safe_untrusted_tool_metadata
-from nullion.workspace_storage import format_workspace_storage_for_prompt, workspace_storage_roots_for_principal
+from nullion.workspace_storage import (
+    format_workspace_storage_for_prompt,
+    workspace_storage_roots_for_principal,
+    workspace_storage_roots_for_workspace,
+)
 from nullion.redaction import redact_text, redact_value
 from nullion.response_fulfillment_contract import (
     artifact_paths_from_tool_results,
@@ -122,6 +129,7 @@ from nullion.tools import ToolInvocation, ToolResult, normalize_tool_status
 
 logger = logging.getLogger(__name__)
 
+CRON_EXECUTION_BLOCKED_TOOLS = frozenset({"create_cron", "delete_cron", "toggle_cron", "run_cron"})
 _WEB_ARTIFACTS: dict[str, Path] = {}
 _LOG_BUFFER: deque[dict[str, str]] = deque(maxlen=500)
 _SERVER_STARTED_AT = datetime.now(UTC).isoformat()
@@ -141,6 +149,65 @@ _NULLION_CHAT_SERVICE_COMMANDS = {
 }
 
 
+class CronExecutionToolRegistry:
+    """Read-through registry view for an already-running scheduled task."""
+
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
+    def get_spec(self, name: str):
+        if name in CRON_EXECUTION_BLOCKED_TOOLS:
+            raise KeyError(f"Unknown tool: {name}")
+        return self._delegate.get_spec(name)
+
+    def list_specs(self) -> list[object]:
+        return [
+            spec
+            for spec in self._delegate.list_specs()
+            if getattr(spec, "name", None) not in CRON_EXECUTION_BLOCKED_TOOLS
+        ]
+
+    def list_tool_definitions(self, *args, **kwargs) -> list[dict[str, object]]:
+        definitions = self._delegate.list_tool_definitions(*args, **kwargs)
+        return [
+            definition
+            for definition in definitions
+            if str(definition.get("name") or "") not in CRON_EXECUTION_BLOCKED_TOOLS
+        ]
+
+    def filesystem_allowed_roots(self):
+        return self._delegate.filesystem_allowed_roots()
+
+    def list_installed_plugins(self) -> list[str]:
+        return self._delegate.list_installed_plugins()
+
+    def is_plugin_installed(self, plugin_name: str) -> bool:
+        return self._delegate.is_plugin_installed(plugin_name)
+
+    def invoke(self, invocation: ToolInvocation) -> ToolResult:
+        if invocation.tool_name in CRON_EXECUTION_BLOCKED_TOOLS:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="denied",
+                output={
+                    "reason": "cron_execution_capability_denied",
+                    "denied_tools": sorted(CRON_EXECUTION_BLOCKED_TOOLS),
+                },
+                error=f"Capability denied during scheduled task execution: {invocation.tool_name}",
+            )
+        return self._delegate.invoke(invocation)
+
+    def register_cleanup_hook(self, hook) -> None:
+        self._delegate.register_cleanup_hook(hook)
+
+    def run_cleanup_hooks(self, *, scope_id: str | None = None) -> None:
+        self._delegate.run_cleanup_hooks(scope_id=scope_id)
+
+    def __getattr__(self, name: str):
+        return getattr(self._delegate, name)
+
+
 def _default_workspace_root() -> str:
     try:
         root = Path.cwd().resolve()
@@ -149,6 +216,31 @@ def _default_workspace_root() -> str:
     if root.parent == root:
         return ""
     return str(root)
+
+
+def _configured_workspace_root() -> Path | None:
+    raw_root = os.environ.get("NULLION_WORKSPACE_ROOT", "").strip() or _default_workspace_root()
+    if not raw_root:
+        return None
+    try:
+        return Path(raw_root).expanduser().resolve()
+    except Exception:
+        return Path(raw_root).expanduser()
+
+
+def _web_operator_workspace_folder() -> Path:
+    return workspace_storage_roots_for_workspace("workspace_admin").root
+
+
+def _open_local_directory(path: Path) -> None:
+    if sys.platform == "darwin":
+        command = ["open", str(path)]
+    elif os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return
+    else:
+        command = ["xdg-open", str(path)]
+    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 _RUNTIME_HISTORY_SYNC_MTIMES: dict[str, float] = {}
@@ -603,7 +695,8 @@ _HTML = r"""<!DOCTYPE html>
   #settings-btn .ni,
   .composer-icon-btn .ni,
   #attach-btn .ni { width:30px; height:30px; }
-  #browser-btn .ni { width:26px; height:26px; }
+  #browser-btn .ni,
+  #workspace-folder-btn .ni { width:26px; height:26px; }
   #allhistory-btn .ni,
   #history-btn .ni { width:30px; height:30px; }
   .composer-icon-btn .ni,
@@ -728,7 +821,8 @@ _HTML = r"""<!DOCTYPE html>
     display: flex; align-items: center; justify-content: center;
     transition: border-color 0.15s, color 0.15s, transform 0.15s;
   }
-  #browser-btn {
+  #browser-btn,
+  #workspace-folder-btn {
     width: 34px;
     height: 34px;
     font-size: 18px;
@@ -1811,6 +1905,32 @@ _HTML = r"""<!DOCTYPE html>
   .bubble li { padding-left: 2px; }
   .bubble li.message-list-depth-2 { margin-left: 18px; }
   .bubble li.message-list-depth-3 { margin-left: 36px; }
+  .builder-notice {
+    margin-top: 13px;
+    padding-top: 9px;
+    border-top: 1px solid rgba(255,255,255,0.075);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.35;
+    white-space: normal;
+  }
+  .builder-notice-head {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--faint); font-weight: 800; text-transform: uppercase;
+    letter-spacing: 0; margin-bottom: 5px;
+  }
+  .builder-notice-icon {
+    width: 15px; height: 15px; display: inline-flex; flex: 0 0 auto;
+  }
+  .builder-notice-icon .ni {
+    width: 15px; height: 15px; display: block;
+  }
+  .builder-notice-list {
+    display: grid; gap: 3px;
+  }
+  .builder-notice-item {
+    color: var(--muted); overflow-wrap: anywhere;
+  }
   .message-table-wrap {
     max-width: 100%; overflow-x: auto; margin: 8px 0 10px;
     border: 1px solid rgba(255,255,255,0.08); border-radius: 8px;
@@ -2197,10 +2317,16 @@ _HTML = r"""<!DOCTYPE html>
     box-shadow: inset 1px 0 0 rgba(255,255,255,0.025);
   }
   .dash-section { border-bottom: 1px solid var(--border); padding: 14px 16px; }
+  .dash-section.memory-section { padding: 14px 20px 18px; }
+  .memory-section #memory-list { padding: 2px 4px 6px; }
   .dash-section h3 {
     font-size: 11px; font-weight: 700; text-transform: uppercase;
     letter-spacing: 0.08em; color: var(--muted); margin-bottom: 10px;
     display: flex; align-items: center; gap: 6px;
+  }
+  .dash-section h3 .dash-note {
+    margin-left: auto; color: var(--faint); font-size: 9px; font-weight: 800;
+    letter-spacing: 0.08em; white-space: nowrap;
   }
   .badge {
     background: var(--surface2); border: 1px solid var(--border);
@@ -2312,6 +2438,101 @@ _HTML = r"""<!DOCTYPE html>
   .full-list-count {
     margin: 0 0 8px; text-align: center; color: var(--faint); font-size: 11px;
   }
+  .full-list-modal.memory-modal { max-width: 780px; width: min(780px, 96vw); }
+  .full-list-modal.memory-modal .full-list-body { padding-top: 12px; }
+  .attention-modal { max-width: 720px; width: min(720px, 94vw); }
+  .attention-body { padding: 14px 18px 18px; max-height: min(70vh, 760px); overflow-y: auto; }
+  .attention-summary {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 10px 12px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: rgba(255,255,255,0.025); color: var(--muted); font-size: 13px; font-weight: 760;
+  }
+  .attention-summary strong { color: var(--text); font-size: 20px; }
+  .attention-section { margin-top: 14px; }
+  .attention-section-head {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    color: var(--muted); font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 1.6px;
+  }
+  .attention-section-head .badge { transform: translateY(-1px); }
+  .memory-map { display: grid; gap: 12px; }
+  .memory-map-topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; max-width: 100%;
+  }
+  .memory-map-toolbar { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+  .memory-map-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+  .memory-map-tab {
+    border: 1px solid rgba(124,106,255,0.26); background: rgba(124,106,255,0.07);
+    color: var(--muted); border-radius: 999px; padding: 5px 9px;
+    font-size: 10px; font-weight: 800; line-height: 1; text-transform: uppercase;
+  }
+  .memory-map-tab strong { color: var(--text); font-weight: 850; }
+  .memory-map-legend {
+    display: inline-grid; grid-template-columns: auto minmax(116px, 148px) auto;
+    align-items: center; column-gap: 8px; max-width: 100%; margin-left: auto;
+    color: var(--faint); font-size: 9px; font-weight: 850; text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .memory-legend-label { white-space: nowrap; }
+  .memory-legend-gradient {
+    width: 100%; height: 9px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.18);
+    background: linear-gradient(90deg, #20202a, #777485, #ebe7f6);
+    box-shadow: var(--inset-highlight);
+  }
+  @media (max-width: 560px) {
+    .memory-map-topbar { align-items: flex-start; flex-direction: column; }
+    .memory-map-legend {
+      grid-template-columns: auto minmax(82px, 1fr) auto;
+      width: 100%; margin-left: 0; font-size: 8.5px;
+    }
+  }
+  .memory-brain {
+    position: relative;
+    border: 1px solid rgba(124,106,255,0.28);
+    background:
+      radial-gradient(circle at 72% 32%, rgba(124,106,255,0.16), transparent 34%),
+      radial-gradient(circle at 24% 55%, rgba(52,211,153,0.11), transparent 36%),
+      linear-gradient(180deg, rgba(19,18,28,0.94), rgba(8,8,14,0.98));
+    border-radius: 11px; min-height: 420px; padding: 0; overflow: hidden;
+    box-shadow: var(--shadow-sm), var(--inset-highlight);
+  }
+  .memory-brain-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .memory-brain-regions { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
+  .memory-brain-region {
+    position: absolute; transform: translate(-50%, -50%);
+    padding: 4px 8px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.08); background: rgba(10,10,16,0.38);
+    color: rgba(244,241,255,0.48); font-size: 9px; font-weight: 900;
+    line-height: 1; text-transform: uppercase; letter-spacing: 0.09em;
+    box-shadow: var(--inset-highlight);
+  }
+  .memory-brain-region.long { left: 72%; top: 18%; border-color: rgba(124,106,255,0.2); }
+  .memory-brain-region.mid { left: 22%; top: 26%; border-color: rgba(52,211,153,0.18); }
+  .memory-brain-region.short { left: 55%; top: 68%; border-color: rgba(245,158,11,0.2); }
+  .memory-brain-cluster {
+    position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  }
+  .memory-brain-node {
+    position: absolute; transform: translate(-50%, -50%);
+    display: inline-flex; align-items: center; gap: 8px; max-width: min(100%, 230px);
+    min-height: 30px; border-radius: 999px; border: 1px solid rgba(141,120,255,0.35);
+    background: rgba(141,120,255,0.13); color: var(--text);
+    padding: 6px 6px 6px 12px; box-shadow: 0 10px 22px rgba(0,0,0,0.3), var(--inset-highlight);
+    pointer-events: auto;
+  }
+  .memory-brain-node.soft { color: rgba(244,241,255,0.7); }
+  .memory-brain-copy { min-width: 0; flex: 1 1 auto; display: inline-flex; }
+  .memory-brain-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 850; line-height: 1.1; }
+  .memory-brain-meta { display: none; }
+  .memory-node-delete {
+    border: 0; background: rgba(255,255,255,0.07); color: var(--muted);
+    border-radius: 999px; width: 26px; height: 26px; display: inline-flex;
+    align-items: center; justify-content: center; cursor: pointer; font: inherit;
+    font-size: 17px; font-weight: 850; line-height: 1; padding: 0; flex-shrink: 0;
+    margin: -3px -3px -3px 0; position: relative; z-index: 3; pointer-events: auto;
+  }
+  .memory-node-delete:hover { color: var(--text); background: rgba(248,113,113,0.2); }
   .control-center-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 10px; }
   .control-tab {
     border: 1px solid var(--border); background: linear-gradient(180deg, #19191f, #121218);
@@ -2336,20 +2557,65 @@ _HTML = r"""<!DOCTYPE html>
   .control-icon { width: 24px; height: 24px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center; background: rgba(52,211,153,0.1); flex-shrink: 0; }
   .control-title { color: var(--text); font-weight: 650; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .control-meta { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 7px 0 0 32px; word-break: break-word; }
-  .memory-chip-list { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+  .memory-preview {
+    position: relative; min-height: 222px; margin: 2px 0 10px;
+    border: 1px solid rgba(124,106,255,0.16);
+    background:
+      radial-gradient(circle at 72% 34%, rgba(124,106,255,0.12), transparent 30%),
+      radial-gradient(circle at 24% 58%, rgba(52,211,153,0.08), transparent 32%),
+      linear-gradient(180deg, rgba(24,23,34,0.6), rgba(16,16,22,0.78));
+    border-radius: 8px; overflow: hidden; box-shadow: var(--inset-highlight);
+  }
+  .memory-preview-canvas,
+  .memory-preview-label-layer { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .memory-preview-label-layer { pointer-events: none; z-index: 2; }
+  .memory-preview-regions { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
+  .memory-preview-region {
+    position: absolute; transform: translate(-50%, -50%);
+    color: rgba(244,241,255,0.38); font-size: 8.5px; font-weight: 900;
+    line-height: 1; text-transform: uppercase; letter-spacing: 0.11em;
+    text-shadow: 0 6px 18px rgba(0,0,0,0.42);
+  }
+  .memory-preview-region.long { left: 72%; top: 16%; }
+  .memory-preview-region.mid { left: 24%; top: 18%; }
+  .memory-preview-region.short { left: 55%; top: 60%; }
+  .memory-preview-callout {
+    position: absolute; transform: translate(-50%, -50%);
+    max-width: 136px; padding: 4px 8px; border-radius: 999px;
+    border: 1px solid rgba(141,120,255,0.35);
+    background: rgba(141,120,255,0.13); color: var(--text);
+    font-size: 10px; font-weight: 680; line-height: 1.1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    box-shadow: 0 10px 22px rgba(0,0,0,0.3), var(--inset-highlight);
+    pointer-events: auto;
+  }
+  .memory-preview-callout.soft { color: rgba(244,241,255,0.72); opacity: 0.82; }
+  .memory-preview-legend {
+    position: absolute; left: 13px; right: 13px; bottom: 10px; z-index: 3;
+    display: grid; grid-template-columns: auto minmax(70px, 1fr) auto;
+    align-items: center; gap: 8px; color: var(--faint);
+    font-size: 8.5px; font-weight: 850; text-transform: uppercase;
+    letter-spacing: 0.08em; pointer-events: none;
+  }
+  .memory-preview-gradient {
+    height: 7px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.18);
+    background: linear-gradient(90deg, #20202a, #777485, #ebe7f6);
+    box-shadow: var(--inset-highlight);
+  }
+  .memory-chip-list { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; padding: 4px 4px 6px; }
   .memory-chip-list.full { gap: 10px; }
   .memory-chip {
-    display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
-    border: 1px solid rgba(124,106,255,0.26); background: rgba(124,106,255,0.08);
-    color: var(--text); border-radius: 999px; padding: 6px 6px 6px 11px;
-    font-size: 12px; font-weight: 750; line-height: 1.1; min-height: 30px;
+    display: inline-flex; align-items: center; gap: 7px; max-width: min(100%, 260px);
+    border: 1px solid rgba(141,120,255,0.35); background: rgba(141,120,255,0.13);
+    color: var(--text); border-radius: 999px; padding: 5px 5px 5px 10px;
+    font-size: 10.5px; font-weight: 720; line-height: 1.1; min-height: 26px;
   }
-  .memory-chip.full { border-color: rgba(255,255,255,0.08); background: rgba(255,255,255,0.035); }
-  .memory-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .memory-chip.full { max-width: 100%; border-color: rgba(141,120,255,0.35); background: rgba(141,120,255,0.13); }
+  .memory-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .memory-chip-value { color: var(--muted); font-weight: 650; }
   .memory-chip-x {
     border: 0; background: rgba(255,255,255,0.06); color: var(--muted);
-    border-radius: 999px; width: 18px; height: 18px; display: inline-flex;
+    border-radius: 999px; width: 17px; height: 17px; display: inline-flex;
     align-items: center; justify-content: center; cursor: pointer; font: inherit;
     line-height: 1; padding: 0; flex-shrink: 0;
   }
@@ -3235,6 +3501,7 @@ _HTML = r"""<!DOCTYPE html>
     #send-btn { grid-column: 4 / 5; grid-row: 2 / 3; height: 42px; align-self: end; }
   }
 </style>
+<script src="/assets/d3-force.bundle.min.js"></script>
 </head>
 <body>
 <div id="tooltip-layer" role="presentation" aria-hidden="true"></div>
@@ -3253,6 +3520,7 @@ _HTML = r"""<!DOCTYPE html>
       </select>
     </div>
     <div class="status-pill"><div id="status-dot"></div><span id="status-label">Connecting…</span></div>
+    <button id="workspace-folder-btn" class="header-icon-btn" title="Open workspace folder" aria-label="Open workspace folder" data-tooltip="Open workspace folder" onclick="openWorkspaceFolder()"><svg class="ni" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path d="M3 7.5A2.5 2.5 0 015.5 5H10l2 2h6.5A2.5 2.5 0 0121 9.5v7A2.5 2.5 0 0118.5 19h-13A2.5 2.5 0 013 16.5z"/></svg></button>
     <button id="browser-btn" class="header-icon-btn" title="Open agent browser" aria-label="Open agent browser" data-tooltip="Open agent browser" onclick="launchAgentBrowser()">🌐</button>
     <button id="allhistory-btn" class="header-icon-btn" title="All channels history" aria-label="All channels history" data-tooltip="All channels history" onclick="openAllHistory()" style="font-size:15px">📋</button>
     <button id="history-btn" class="header-icon-btn" title="Chat history" aria-label="Chat history" data-tooltip="Chat history" onclick="openHistory()">🗂</button>
@@ -3316,7 +3584,7 @@ _HTML = r"""<!DOCTYPE html>
   </div>
 
   <div id="dash-panel">
-    <div class="dash-section">
+    <div class="dash-section memory-section">
       <h3>Attention</h3>
       <div class="metric-grid">
         <div class="metric"><div class="metric-value" id="metric-approvals">0</div><div class="metric-label">Approvals</div></div>
@@ -3389,9 +3657,7 @@ _HTML = r"""<!DOCTYPE html>
 
     <!-- Memory -->
     <div class="dash-section">
-      <h3>Memory <span class="badge" id="memory-count">0</span>
-        <button class="badge" onclick="deleteAllMemory()" style="cursor:pointer;margin-left:auto;background:none;border:none;color:var(--muted);font-size:11px;padding:0">Clear</button>
-      </h3>
+      <h3>Recent Memory <span class="badge" id="memory-count">0</span><span class="dash-note" id="memory-preview-note"></span></h3>
       <div id="memory-list"><div class="empty">No memory entries</div></div>
     </div>
 
@@ -3526,6 +3792,16 @@ _HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="attention-overlay" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeAttentionModal()">
+  <div class="modal attention-modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2>Attention</h2>
+      <button class="modal-close" onclick="closeAttentionModal()">✕</button>
+    </div>
+    <div id="attention-body" class="attention-body"></div>
+  </div>
+</div>
+
 <div id="image-preview-overlay" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeImagePreview()">
   <div id="image-preview-modal" class="modal" onclick="event.stopPropagation()">
     <div class="modal-header">
@@ -3587,6 +3863,28 @@ _HTML = r"""<!DOCTYPE html>
             </div>
             <label class="toggle-switch"><input type="checkbox" id="cfg-memory-enabled" checked><span class="toggle-slider"></span></label>
           </div>
+          <div class="feat-row" style="margin-top:12px">
+            <div class="feat-info">
+              <div class="feat-name">Smart cleanup</div>
+              <div class="feat-desc">Let Builder prune lower-strength memories automatically when a bucket fills up</div>
+            </div>
+            <label class="toggle-switch"><input type="checkbox" id="cfg-memory-smart-cleanup"><span class="toggle-slider"></span></label>
+          </div>
+          <div class="pref-three-col" style="margin-top:14px">
+            <div class="form-group" style="margin-bottom:0">
+              <label>Long-term</label>
+              <input type="number" id="cfg-memory-long-term-limit" min="0" max="50" step="1" placeholder="25">
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Mid-term</label>
+              <input type="number" id="cfg-memory-mid-term-limit" min="0" max="50" step="1" placeholder="15">
+            </div>
+            <div class="form-group" style="margin-bottom:0">
+              <label>Short-term</label>
+              <input type="number" id="cfg-memory-short-term-limit" min="0" max="50" step="1" placeholder="10">
+            </div>
+          </div>
+          <div class="form-hint">Maximum saved memories per workspace. Recalled memories are kept longer.</div>
         </div>
 
         <!-- ── Runtime presentation ── -->
@@ -4091,6 +4389,13 @@ _HTML = r"""<!DOCTYPE html>
                     <div class="pref-row-desc">Detect failed work, explain what happened, and offer safe recovery actions.</div>
                   </div>
                   <label class="toggle-switch"><input type="checkbox" id="cfg-doctor-enabled" checked><span class="toggle-slider"></span></label>
+                </div>
+                <div class="pref-row">
+                  <div>
+                    <div class="pref-row-title">Smart cleanup</div>
+                    <div class="pref-row-desc">Automatically clear stale approval waits when no pending approval or suspended turn backs them.</div>
+                  </div>
+                  <label class="toggle-switch"><input type="checkbox" id="cfg-smart-cleanup-enabled" checked><span class="toggle-slider"></span></label>
                 </div>
                 <div class="pref-row">
                   <div>
@@ -5700,6 +6005,10 @@ function positionTooltip(target) {
   layer.classList.add('visible');
   const rect = target.getBoundingClientRect();
   const tipRect = layer.getBoundingClientRect();
+  if (target.closest?.('.memory-brain-node, .memory-preview-callout')) {
+    positionMemoryTooltip(layer, rect, tipRect);
+    return;
+  }
   const side = target.getAttribute('data-tooltip-side') || 'top';
   let top = side === 'bottom' ? rect.bottom + 9 : rect.top - tipRect.height - 9;
   let left = rect.left + (rect.width / 2) - (tipRect.width / 2);
@@ -5710,10 +6019,40 @@ function positionTooltip(target) {
   layer.style.top = `${Math.round(top)}px`;
 }
 
+function positionMemoryTooltip(layer, rect, tipRect) {
+  const gap = 18;
+  const fitsRight = rect.right + gap + tipRect.width <= window.innerWidth - 8;
+  const fitsLeft = rect.left - gap - tipRect.width >= 8;
+  let left = fitsRight ? rect.right + gap : (fitsLeft ? rect.left - gap - tipRect.width : rect.left + rect.width / 2 - tipRect.width / 2);
+  let top = rect.top + rect.height / 2 - tipRect.height / 2;
+  if (!fitsRight && !fitsLeft) {
+    const fitsBelow = rect.bottom + gap + tipRect.height <= window.innerHeight - 8;
+    top = fitsBelow ? rect.bottom + gap : rect.top - gap - tipRect.height;
+  }
+  left = Math.max(8, Math.min(left, window.innerWidth - tipRect.width - 8));
+  top = Math.max(8, Math.min(top, window.innerHeight - tipRect.height - 8));
+  layer.style.left = `${Math.round(left)}px`;
+  layer.style.top = `${Math.round(top)}px`;
+}
+
 function hideTooltip() {
   const layer = document.getElementById('tooltip-layer');
   if (!layer) return;
   layer.classList.remove('visible');
+}
+
+function showMemoryHoverTooltip(text, clientX, clientY) {
+  const layer = document.getElementById('tooltip-layer');
+  if (!layer || !text || window.innerWidth <= 768) return;
+  layer.textContent = String(text);
+  layer.classList.add('visible');
+  const tipRect = layer.getBoundingClientRect();
+  let left = clientX + 14;
+  let top = clientY + 14;
+  if (left + tipRect.width > window.innerWidth - 8) left = clientX - tipRect.width - 14;
+  if (top + tipRect.height > window.innerHeight - 8) top = clientY - tipRect.height - 14;
+  layer.style.left = `${Math.round(Math.max(8, left))}px`;
+  layer.style.top = `${Math.round(Math.max(8, top))}px`;
 }
 
 const _tooltipObserver = new MutationObserver((mutations) => {
@@ -6734,14 +7073,37 @@ function collectSkillPackConfig() {
   return value;
 }
 
+const BUILDER_SKILL_MARKER = '::builder-skill::';
+
+function splitBuilderNoticeText(text) {
+  const body = [];
+  const skills = [];
+  String(text || '').split('\n').forEach((line) => {
+    if (line.startsWith(BUILDER_SKILL_MARKER)) {
+      const title = line.slice(BUILDER_SKILL_MARKER.length).trim();
+      if (title) skills.push(title);
+      return;
+    }
+    body.push(line);
+  });
+  return { body: body.join('\n').replace(/\n+$/g, ''), skills };
+}
+
+function renderBuilderNotice(skills) {
+  if (!Array.isArray(skills) || !skills.length) return '';
+  const items = skills.map(title => `<div class="builder-notice-item">${escHtml(title)}</div>`).join('');
+  return `<div class="builder-notice"><div class="builder-notice-head"><span class="builder-notice-icon">${NI.wrench()}</span><span>Builder</span></div><div class="builder-notice-list">${items}</div></div>`;
+}
+
 function renderMessageText(text) {
+  const builder = splitBuilderNoticeText(text);
   const placeholders = [];
   const stash = (html) => {
     const key = `\u0000${placeholders.length}\u0000`;
     placeholders.push(html);
     return key;
   };
-  let html = escHtml(text || '');
+  let html = escHtml(builder.body || '');
   html = html.replace(/```([\s\S]*?)```/g, (_, code) =>
     stash(`<pre><code>${code.replace(/^\n|\n$/g, '')}</code></pre>`)
   );
@@ -6752,7 +7114,7 @@ function renderMessageText(text) {
   placeholders.forEach((value, index) => {
     html = html.replaceAll(`\u0000${index}\u0000`, value);
   });
-  return html;
+  return html + renderBuilderNotice(builder.skills);
 }
 
 function renderMessageBlocks(html) {
@@ -7114,7 +7476,15 @@ function renderFullListPage(key) {
   const body = document.getElementById('full-list-body');
   const titleEl = document.getElementById('full-list-title');
   if (!view || !body || !titleEl) return;
+  const modal = document.querySelector('#full-list-overlay .full-list-modal');
+  if (modal) modal.classList.toggle('memory-modal', key === 'memory');
   const items = view.items || [];
+  if (key === 'memory') {
+    titleEl.textContent = view.title || 'Memory';
+    body.innerHTML = memoryMapHtml(items);
+    requestAnimationFrame(() => applyMemoryForceLayout(body));
+    return;
+  }
   const shown = Math.min(_fullListRenderCounts[key] || FULL_LIST_PAGE_SIZE, items.length);
   _fullListRenderCounts[key] = shown;
   titleEl.textContent = view.title || 'All items';
@@ -7140,6 +7510,10 @@ function closeFullList() {
   document.getElementById('full-list-overlay').style.display = 'none';
 }
 
+function closeAttentionModal() {
+  document.getElementById('attention-overlay').style.display = 'none';
+}
+
 function showControlPane(pane) {
   const target = pane || 'permissions';
   document.querySelectorAll('.control-tab').forEach(btn => {
@@ -7151,18 +7525,102 @@ function showControlPane(pane) {
 }
 
 function openAttentionItems() {
-  const data = _lastDashboardData || {};
+  renderAttentionModal(_lastDashboardData || {});
+  document.getElementById('attention-overlay').style.display = 'flex';
+}
+
+function attentionPayload(data = {}) {
   const pendingApprovals = (data.approvals || []).filter(a => approvalStatusValue(a.status) === 'pending');
+  const builderItems = (data.builder_proposals || []).filter(item => {
+    const status = String(item.status || '').toLowerCase();
+    return String(item.decision_type || '') === 'memory_full' || ['warning', 'needs_action'].includes(status);
+  });
   const doctorItems = [
-    ...(data.doctor_actions || []).filter(item => !['completed', 'cancelled', 'failed'].includes(String(item.status || '').toLowerCase())),
-    ...(data.sentinel_escalations || []).filter(item => String(item.status || '').toLowerCase() !== 'resolved'),
-  ];
-  if (pendingApprovals.length) {
-    document.getElementById('approval-count')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    return;
-  }
-  showControlPane(doctorItems.length ? 'doctor' : 'permissions');
-  document.getElementById('control-pane-doctor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    ...(data.doctor_actions || []),
+    ...(data.sentinel_escalations || []),
+  ].filter(item => !doctorItemIsTerminal(item));
+  const deliveryIssues = (data.delivery_receipts || []).filter(item => ['failed', 'partial'].includes(String(item.status || '').toLowerCase()));
+  const taskItems = [
+    ...(data.task_frames || []).map(item => ({ ...item, attention_kind: 'frame' })),
+    ...(data.mini_agent_tasks || []).map(item => ({ ...item, attention_kind: 'mini-agent' })),
+  ].filter(item => ['waiting_approval', 'waiting_input', 'blocked', 'failed'].includes(String(item.status || '').toLowerCase()));
+  return { pendingApprovals, builderItems, doctorItems, deliveryIssues, taskItems };
+}
+
+function attentionTotal(data = {}) {
+  const payload = attentionPayload(data);
+  return payload.pendingApprovals.length + payload.builderItems.length + payload.doctorItems.length + payload.deliveryIssues.length + payload.taskItems.length;
+}
+
+function attentionSectionHtml(title, items, renderer) {
+  if (!items.length) return '';
+  return `<section class="attention-section">
+    <div class="attention-section-head"><span>${escHtml(title)}</span><span class="badge yellow">${items.length}</span></div>
+    <div class="control-list">${items.map(renderer).join('')}</div>
+  </section>`;
+}
+
+function builderItemCardHtml(p) {
+  const timestamp = dashboardTimeLabel(p.updated_at || p.created_at || p.decided_at);
+  const isMemoryFull = String(p.decision_type || '') === 'memory_full';
+  const status = isMemoryFull ? 'needs action' : (p.status || 'pending');
+  const memoryActions = isMemoryFull ? `<div class="control-actions">
+    ${p.actions?.can_increase ? '<button class="mini-btn" onclick="increaseMemoryLimits(this)">Increase memory</button>' : ''}
+    <button class="mini-btn primary" onclick="runSmartMemoryCleanup(this)">Smart cleanup</button>
+  </div>` : '';
+  return `<div class="control-card">
+    <div class="control-top"><span class="control-icon">${NI.wrench()}</span><span class="control-title">${escHtml(p.title || p.proposal_id)}</span><span class="decision-status ${escHtml(p.status || '')}">${escHtml(status)}</span></div>
+    <div class="control-meta">${escHtml(p.summary || '')}</div>
+    ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
+    ${memoryActions}
+  </div>`;
+}
+
+function deliveryIssueCardHtml(item) {
+  const status = String(item.status || 'unknown').toLowerCase();
+  const timestamp = deliveryReceiptTimestamp(item);
+  return `<div class="control-card">
+    <div class="control-top"><span class="control-icon">📦</span><span class="control-title">${escHtml(deliveryReceiptTitle(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(status)}</span></div>
+    <div class="doctor-body">
+      <div class="doctor-note"><strong>Delivery boundary</strong>${escHtml(deliveryReceiptDetail(item))}</div>
+      ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
+    </div>
+  </div>`;
+}
+
+function attentionTaskCardHtml(item) {
+  const isMiniAgent = item.attention_kind === 'mini-agent';
+  const id = isMiniAgent ? item.task_id : item.frame_id;
+  const title = item.title || item.summary || id || 'Task';
+  const detail = isMiniAgent
+    ? [item.agent_id ? `Agent: ${item.agent_id}` : '', item.group_id ? `Group: ${item.group_id}` : ''].filter(Boolean).join(' · ')
+    : (item.target || id || '');
+  return `<div class="control-card">
+    <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(title)}</span><span class="decision-status ${escHtml(item.status || '')}">${escHtml(String(item.status || '').replaceAll('_', ' '))}</span></div>
+    ${detail ? `<div class="control-meta">${escHtml(detail)}</div>` : ''}
+    <div class="control-actions"><button class="mini-btn danger" onclick="killTask('${isMiniAgent ? 'mini-agent' : 'frame'}','${escAttr(id)}','${escAttr(title)}')">Kill</button></div>
+  </div>`;
+}
+
+function renderAttentionModal(data = {}) {
+  const body = document.getElementById('attention-body');
+  if (!body) return;
+  const payload = attentionPayload(data);
+  const total = attentionTotal(data);
+  const sections = [
+    attentionSectionHtml('Approvals', payload.pendingApprovals, approvalCardHtml),
+    attentionSectionHtml('Builder', payload.builderItems, builderItemCardHtml),
+    attentionSectionHtml('Doctor', payload.doctorItems, item => {
+      const id = item.escalation_id || item.action_id || '';
+      if (id) doctorItemCache.set(String(id), item);
+      return doctorItemHtml(item);
+    }),
+    attentionSectionHtml('Deliveries', payload.deliveryIssues, deliveryIssueCardHtml),
+    attentionSectionHtml('Tasks', payload.taskItems, attentionTaskCardHtml),
+  ].filter(Boolean).join('');
+  body.innerHTML = total
+    ? `<div class="attention-summary"><span><strong>${total}</strong> item${total === 1 ? '' : 's'} need attention</span><span>Review, approve, clean up, or dismiss from here.</span></div>${sections}`
+    : '<div class="empty"><strong>No attention items</strong>Nothing needs a decision right now.</div>';
 }
 
 async function revokePermission(kind, id) {
@@ -7319,15 +7777,52 @@ function renderBuilder(list) {
     el.innerHTML = '<div class="empty"><strong>Builder quiet</strong>Proposals and learned workflows will appear here.</div>';
     return;
   }
-  const builderItemHtml = p => {
-    const timestamp = dashboardTimeLabel(p.updated_at || p.created_at || p.decided_at);
-    return `<div class="control-card">
-      <div class="control-top"><span class="control-icon">${NI.wrench()}</span><span class="control-title">${escHtml(p.title || p.proposal_id)}</span><span class="decision-status ${escHtml(p.status || '')}">${escHtml(p.status || 'pending')}</span></div>
-      <div class="control-meta">${escHtml(p.summary || '')}</div>
-      ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
-    </div>`;
-  };
-  renderDynamicList(el, list, builderItemHtml, { key: 'builder', title: `Builder · ${list.length}` });
+  renderDynamicList(el, list, builderItemCardHtml, { key: 'builder', title: `Builder · ${list.length}` });
+}
+
+async function increaseMemoryLimits(btn) {
+  const ok = await confirmAction({
+    title: 'Increase agent memory?',
+    message: 'This lets Builder keep more memories for this workspace. More saved memory can increase token usage when context is recalled.',
+    confirmText: 'Increase',
+    icon: 'warn',
+  });
+  if (!ok) return;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/memory/increase-limits', { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || 'Could not increase memory');
+    recordActivity('Memory increased', 'Builder can keep more workspace memory. More recalled context may use more tokens.');
+    await loadConfig();
+    await refreshDashboard();
+  } catch (e) {
+    alert(`Could not increase memory: ${e.message || e}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function runSmartMemoryCleanup(btn) {
+  const ok = await confirmAction({
+    title: 'Run smart cleanup?',
+    message: 'Builder will remove lower-strength memories first and keep repeatedly recalled memories longer.',
+    confirmText: 'Clean up',
+    icon: 'trash',
+  });
+  if (!ok) return;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/memory/smart-cleanup', { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || 'Cleanup failed');
+    recordActivity('Memory cleaned', `Builder removed ${data.removed || 0} lower-strength memory item(s).`);
+    await refreshDashboard();
+  } catch (e) {
+    alert(`Cleanup failed: ${e.message || e}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function doctorDetailText(item) {
@@ -7511,6 +8006,34 @@ async function updateDoctorItem(kind, id, action) {
   }
 }
 
+function doctorItemHtml(item) {
+  const isEscalation = Boolean(item.escalation_id);
+  const id = isEscalation ? item.escalation_id : item.action_id;
+  doctorItemCache.set(String(id), item);
+  const status = String(item.status || '');
+  const statusText = doctorStatusText(status);
+  const timestampText = doctorTimestampText(item);
+  const feedback = doctorActionFeedback.get(`${isEscalation ? 'sentinel' : 'doctor'}:${id}`) || item.last_result || item.result_summary || item.completed_message || '';
+  const remediationActions = isEscalation ? [] : doctorRemediationActions(item);
+  const remediationHtml = remediationActions.map(([labelText, actionName]) =>
+    `<button class="mini-btn good" title="Run this Doctor playbook action." onclick="updateDoctorItem('doctor','${escAttr(id)}','${escAttr(actionName)}')">${escHtml(labelText)}</button>`
+  ).join('');
+  const actions = isEscalation
+    ? (status === 'resolved' ? '' : `${status === 'escalated' ? `<button class="mini-btn" title="Mark this Sentinel item as reviewed." onclick="updateDoctorItem('sentinel','${escHtml(id)}','acknowledge')">Mark reviewed</button>` : ''}<button class="mini-btn good" title="Close this Sentinel item after it has been handled." onclick="updateDoctorItem('sentinel','${escHtml(id)}','resolve')">Mark resolved</button>`)
+    : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? `<button class="mini-btn good" title="Ask Doctor to try the known safe repair for this issue." onclick="updateDoctorItem('doctor','${escHtml(id)}','repair')">Apply safe fix</button>` : ''}<button class="mini-btn" title="Close this Doctor item because the issue is no longer happening." onclick="updateDoctorItem('doctor','${escHtml(id)}','complete')">Mark resolved</button><button class="mini-btn" title="Close this Doctor item without marking it resolved." onclick="updateDoctorItem('doctor','${escHtml(id)}','dismiss')">Dismiss</button>`);
+  return `<div class="control-card">
+    <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
+    <div class="doctor-body">
+      <div class="doctor-note"><strong>What Doctor saw</strong>${escHtml(doctorDiagnosisText(item))}</div>
+      <div class="doctor-note"><strong>Suggested fix</strong>${escHtml(doctorSuggestionText(item))}</div>
+      <div class="control-meta">${escHtml(doctorDetailText(item))}</div>
+      ${feedback ? `<div class="control-meta">${escHtml(feedback)}</div>` : ''}
+      ${timestampText ? `<div class="control-time">${escHtml(timestampText)}</div>` : ''}
+    </div>
+    ${actions ? `<div class="control-actions">${actions}</div>` : ''}
+  </div>`;
+}
+
 function renderDoctor(data) {
   const items = [...(data.doctor_actions || []), ...(data.sentinel_escalations || [])]
     .sort((a, b) => Number(doctorItemIsTerminal(a)) - Number(doctorItemIsTerminal(b)) || doctorItemSortTime(b) - doctorItemSortTime(a));
@@ -7616,18 +8139,7 @@ function renderDeliveryReceipts(items) {
     el.innerHTML = '<div class="empty"><strong>Delivery clear</strong>No failed or partial platform deliveries in the latest receipts.</div>';
     return;
   }
-  const htmlForItem = item => {
-    const status = String(item.status || 'unknown').toLowerCase();
-    const timestamp = deliveryReceiptTimestamp(item);
-    return `<div class="control-card">
-      <div class="control-top"><span class="control-icon">📦</span><span class="control-title">${escHtml(deliveryReceiptTitle(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(status)}</span></div>
-      <div class="doctor-body">
-        <div class="doctor-note"><strong>Delivery boundary</strong>${escHtml(deliveryReceiptDetail(item))}</div>
-        ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
-      </div>
-    </div>`;
-  };
-  renderDynamicList(el, failures, htmlForItem, { key: 'deliveries', title: `Delivery issues · ${failures.length}`, className: 'control-list' });
+  renderDynamicList(el, failures, deliveryIssueCardHtml, { key: 'deliveries', title: `Delivery issues · ${failures.length}`, className: 'control-list' });
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -7735,7 +8247,7 @@ function renderMission(data) {
   const health = data.health || {};
   const deliveryHealth = data.delivery_health || {};
   const deliveryIssues = Number(deliveryHealth.issue_count || 0);
-  const attention = (Number(health.attention_needed || approvals.length) || 0) + deliveryIssues;
+  const attention = attentionTotal(data);
   const title = document.getElementById('mission-title');
   const subtitle = document.getElementById('mission-subtitle');
   const attentionChip = document.getElementById('attention-chip');
@@ -7745,7 +8257,7 @@ function renderMission(data) {
     toolChip.title = `${toolCount} registered tool${toolCount === 1 ? '' : 's'} available to Nullion right now.`;
   }
   if (attentionChip) {
-    attentionChip.title = attention > 0 ? 'Open pending approvals, Doctor health items, or delivery issues.' : 'No approvals, Doctor items, or delivery issues need action.';
+    attentionChip.title = attention > 0 ? 'Open everything that needs attention.' : 'Nothing needs attention right now.';
   }
   if (title) title.textContent = 'Waiting for your next instruction';
   if (approvals.length) {
@@ -7874,15 +8386,16 @@ function renderSkills(list) {
 function renderMemory(list) {
   const el = document.getElementById('memory-list');
   const badge = document.getElementById('memory-count');
-  const visibleMemory = uniqueMemoryItems(list);
+  const note = document.getElementById('memory-preview-note');
+  const visibleMemory = sortMemoryByRecentUse(uniqueMemoryItems(list));
   badge.textContent = visibleMemory.length;
+  const previewCount = Math.min(12, visibleMemory.length);
+  if (note) note.textContent = visibleMemory.length ? `Latest ${previewCount} of ${visibleMemory.length}` : '';
   if (!visibleMemory.length) { el.innerHTML = '<div class="empty"><strong>Memory quiet</strong>Facts, preferences, and project context will collect here.</div>'; return; }
-  renderDynamicList(
-    el,
-    visibleMemory,
-    item => memoryChipHtml(item, false),
-    { key: 'memory', title: `Memory · ${visibleMemory.length}`, className: 'memory-chip-list', limit: 8 }
-  );
+  const visible = memoryPreviewHtml(visibleMemory.slice(0, previewCount));
+  const more = `<div class="view-all-row"><button class="view-all-btn" onclick="openFullList('memory')">View all memories</button></div>`;
+  el.innerHTML = `${visible}${more}`;
+  requestAnimationFrame(() => applyMemoryPreviewForceLayout(el));
   _fullListViews.memory = {
     title: `Memory · ${visibleMemory.length}`,
     className: 'memory-chip-list full',
@@ -7890,6 +8403,322 @@ function renderMemory(list) {
     renderItem: item => memoryChipHtml(item, true),
   };
   if (_currentFullListKey === 'memory') renderFullListPage('memory');
+}
+
+function memoryPreviewHtml(items) {
+  const memories = items || [];
+  const maxScore = memories.reduce((max, item) => Math.max(max, memoryScore(item)), 0);
+  const labels = memories.map((item, index) => {
+    const score = memoryScore(item);
+    const kind = String(item.kind || 'fact');
+    const tier = memoryPreviewTier(kind);
+    const value = String(item.value || '');
+    const displayText = value || 'Saved memory';
+    const title = displayText;
+    const shortText = displayText.length > 30 ? `${displayText.slice(0, 27)}...` : displayText;
+    return {
+      index,
+      score,
+      level: memoryScoreLevel(score, maxScore),
+      kind,
+      tier,
+      title,
+      shortText,
+    };
+  });
+  const labelHtml = labels.map(label => (
+    `<span class="memory-preview-callout${label.level <= 1 ? ' soft' : ''}" data-tooltip="${escAttr(label.title)}" data-index="${label.index}" data-kind="${escAttr(label.kind)}" data-tier="${escAttr(label.tier)}" data-score="${label.score}" data-level="${label.level}">${escHtml(label.shortText)}</span>`
+  )).join('');
+  return `<div class="memory-preview" aria-label="Memory preview map" data-max-score="${maxScore}">
+    <canvas class="memory-preview-canvas" aria-hidden="true"></canvas>
+    <div class="memory-preview-regions" aria-hidden="true">
+      <span class="memory-preview-region long">Long-term</span>
+      <span class="memory-preview-region mid">Mid-term</span>
+      <span class="memory-preview-region short">Short-term</span>
+    </div>
+    <div class="memory-preview-label-layer">${labelHtml}</div>
+    <div class="memory-preview-legend" aria-label="Memory permanence color scale"><span>More permanent</span><span class="memory-preview-gradient" aria-hidden="true"></span><span>Recent</span></div>
+  </div>`;
+}
+
+function applyMemoryPreviewForceLayout(root) {
+  const preview = root?.querySelector?.('.memory-preview');
+  if (!preview) return;
+  const canvas = preview.querySelector('.memory-preview-canvas');
+  const elements = [...preview.querySelectorAll('.memory-preview-callout')];
+  if (!canvas || !elements.length) return;
+  if (window._memoryPreviewAnimation) cancelAnimationFrame(window._memoryPreviewAnimation);
+  const width = Math.max(260, preview.clientWidth || 320);
+  const height = Math.max(190, preview.clientHeight || 222);
+  const maxScore = Number(preview.dataset.maxScore || 0);
+  const ctx = canvas.getContext('2d');
+  canvas.width = Math.round(width * 2);
+  canvas.height = Math.round(height * 2);
+  ctx.setTransform(2, 0, 0, 2, 0, 0);
+  const anchors = {
+    long: [width * 0.72, height * 0.36],
+    mid: [width * 0.28, height * 0.54],
+    short: [width * 0.56, height * 0.78],
+  };
+  const nodes = elements.map((el, index) => {
+    const score = Math.max(0, Number(el.dataset.score || 0));
+    const level = Math.max(0, Math.min(4, Number(el.dataset.level || 0)));
+    const tier = String(el.dataset.tier || 'short');
+    const norm = memoryPreviewScoreNorm(score, maxScore);
+    const anchor = anchors[tier] || anchors.short;
+    return {
+      el,
+      index,
+      title: el.getAttribute('data-tooltip') || el.getAttribute('title') || '',
+      score,
+      level,
+      tier,
+      norm,
+      r: 7 + norm * 13,
+      phase: index * 0.83,
+      x: anchor[0] + Math.sin(index) * 10,
+      y: anchor[1] + Math.cos(index) * 10,
+      targetX: anchor[0],
+      targetY: anchor[1],
+    };
+  });
+  const d3 = window.d3Force || null;
+  if (d3?.forceSimulation && d3?.forceX && d3?.forceY && d3?.forceManyBody && d3?.forceCollide) {
+    const simulation = d3.forceSimulation(nodes)
+      .force('x', d3.forceX(node => node.targetX).strength(0.055))
+      .force('y', d3.forceY(node => node.targetY).strength(0.07))
+      .force('charge', d3.forceManyBody().strength(node => -28 - node.r * 4.2))
+      .force('collide', d3.forceCollide(node => node.r + 16).strength(1).iterations(8))
+      .stop();
+    for (let tick = 0; tick < 360; tick += 1) simulation.tick();
+    simulation.stop();
+  } else {
+    const grouped = { long: [], mid: [], short: [] };
+    nodes.forEach(node => (grouped[node.tier] || grouped.short).push(node));
+    Object.entries(grouped).forEach(([tier, group]) => {
+      const anchor = anchors[tier] || anchors.short;
+      group.forEach((node, index) => {
+        node.x = anchor[0] + (index % 2 ? 20 : -20);
+        node.y = anchor[1] + (index - group.length / 2) * 24;
+      });
+    });
+  }
+  nodes.forEach(node => {
+    node.baseX = Math.max(node.r + 12, Math.min(width - node.r - 12, node.x));
+    node.baseY = Math.max(node.r + 12, Math.min(height - node.r - 34, node.y));
+  });
+  const labelNodes = memoryPreviewLayoutLabels(nodes, width, height);
+  const labelByIndex = new Map(labelNodes.map(label => [label.index, label]));
+  let mouse = null;
+  let latestPoints = [];
+  preview.onmousemove = event => {
+    if (event.target?.closest?.('.memory-preview-callout')) {
+      mouse = null;
+      return;
+    }
+    const box = preview.getBoundingClientRect();
+    mouse = { x: event.clientX - box.left, y: event.clientY - box.top };
+    const hovered = latestPoints
+      .map(point => ({ point, distance: Math.hypot(point.x - mouse.x, point.y - mouse.y) }))
+      .sort((a, b) => a.distance - b.distance)[0];
+    if (hovered && hovered.distance <= hovered.point.node.r + 16) {
+      showMemoryHoverTooltip(hovered.point.node.title, event.clientX, event.clientY);
+    } else {
+      hideTooltip();
+    }
+  };
+  preview.onmouseleave = () => {
+    mouse = null;
+    hideTooltip();
+  };
+  const pointFor = (node, tick) => {
+    const motion = 4;
+    let x = node.baseX + Math.sin(tick * 0.0011 + node.phase) * motion;
+    let y = node.baseY + Math.cos(tick * 0.0013 + node.phase) * (motion * 0.8);
+    if (mouse) {
+      const dx = x - mouse.x;
+      const dy = y - mouse.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      if (distance < 118) {
+        const push = (1 - distance / 118) * 28;
+        x += (dx / distance) * push;
+        y += (dy / distance) * push;
+      }
+    }
+    return {
+      x: Math.max(node.r + 10, Math.min(width - node.r - 10, x)),
+      y: Math.max(node.r + 10, Math.min(height - node.r - 32, y)),
+    };
+  };
+  const draw = tick => {
+    ctx.clearRect(0, 0, width, height);
+    const points = nodes.map(node => ({ node, ...pointFor(node, tick) }));
+    latestPoints = points;
+    memoryPreviewDrawLinks(ctx, points, maxScore);
+    memoryPreviewDrawNodes(ctx, points, maxScore, tick);
+    points.forEach(point => {
+      const label = labelByIndex.get(point.node.index);
+      if (!label) return;
+      const x = Math.max(label.w / 2 + 10, Math.min(width - label.w / 2 - 10, point.x + label.dx));
+      const y = Math.max(label.h / 2 + 10, Math.min(height - label.h / 2 - 30, point.y + label.dy));
+      label.el.style.left = `${Math.round(x)}px`;
+      label.el.style.top = `${Math.round(y)}px`;
+    });
+    window._memoryPreviewAnimation = requestAnimationFrame(draw);
+  };
+  window._memoryPreviewAnimation = requestAnimationFrame(draw);
+}
+
+function memoryPreviewTier(kind) {
+  const value = String(kind || '');
+  if (value === 'preference') return 'long';
+  if (value === 'environment_fact') return 'mid';
+  return 'short';
+}
+
+function memoryPreviewScoreNorm(score, maxScore) {
+  if (!maxScore || maxScore <= 0) return 0;
+  return Math.max(0, Math.min(1, Number(score || 0) / maxScore));
+}
+
+function memoryPreviewRgb(tier, norm) {
+  const baseByTier = {
+    long: [124, 106, 255],
+    mid: [52, 211, 153],
+    short: [245, 158, 11],
+  };
+  const base = baseByTier[tier] || baseByTier.short;
+  const light = [226, 222, 255];
+  const dark = base.map(value => Math.round(value * 0.38));
+  const towardLight = Math.max(0, 1 - norm) * 0.55;
+  const towardDark = norm * 0.58;
+  return base.map((value, index) => {
+    const lifted = value + (light[index] - value) * towardLight;
+    return Math.round(lifted + (dark[index] - lifted) * towardDark);
+  });
+}
+
+function memoryPreviewColor(node, alpha, maxScore) {
+  const norm = typeof node.norm === 'number' ? node.norm : memoryPreviewScoreNorm(node.score, maxScore);
+  const rgb = memoryPreviewRgb(node.tier, norm);
+  return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`;
+}
+
+function memoryPreviewBaseColor(node, alpha) {
+  const baseByTier = {
+    long: [124, 106, 255],
+    mid: [52, 211, 153],
+    short: [245, 158, 11],
+  };
+  const rgb = baseByTier[node.tier] || baseByTier.short;
+  return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`;
+}
+
+function memoryPreviewLayoutLabels(nodes, width, height) {
+  const labels = nodes.map((node, index) => {
+    const side = node.tier === 'long' ? 'right' : node.tier === 'mid' ? 'left' : 'bottom';
+    const w = Math.min(156, Math.max(78, node.el.offsetWidth || 112));
+    const h = Math.max(24, node.el.offsetHeight || 26);
+    const targetX = node.baseX + (side === 'right' ? 72 : side === 'left' ? -72 : 0);
+    const targetY = node.baseY + (side === 'bottom' ? 42 : 0);
+    return { ...node, w, h, x: targetX, y: targetY, targetX, targetY, side };
+  });
+  const d3 = window.d3Force || null;
+  if (d3?.forceSimulation && d3?.forceX && d3?.forceY) {
+    const simulation = d3.forceSimulation(labels)
+      .force('x', d3.forceX(label => label.targetX).strength(0.18))
+      .force('y', d3.forceY(label => label.targetY).strength(0.18))
+      .force('collide', memoryPreviewLabelCollide(10))
+      .stop();
+    for (let tick = 0; tick < 260; tick += 1) {
+      simulation.tick();
+      memoryPreviewClampLabels(labels, width, height);
+    }
+    simulation.stop();
+  }
+  labels.forEach(label => {
+    memoryPreviewClampLabel(label, width, height);
+    label.dx = label.x - label.baseX;
+    label.dy = label.y - label.baseY;
+  });
+  return labels;
+}
+
+function memoryPreviewLabelCollide(padding = 10) {
+  let nodes = [];
+  function force(alpha) {
+    for (let i = 0; i < nodes.length; i += 1) {
+      for (let j = i + 1; j < nodes.length; j += 1) {
+        const a = nodes[i];
+        const b = nodes[j];
+        const dx = b.x - a.x || 1e-6;
+        const dy = b.y - a.y || 1e-6;
+        const ox = (a.w + b.w) / 2 + padding - Math.abs(dx);
+        const oy = (a.h + b.h) / 2 + padding - Math.abs(dy);
+        if (ox <= 0 || oy <= 0) continue;
+        if (ox < oy) {
+          const shift = ox * 0.55 * alpha * (dx < 0 ? -1 : 1);
+          a.x -= shift;
+          b.x += shift;
+        } else {
+          const shift = oy * 0.55 * alpha * (dy < 0 ? -1 : 1);
+          a.y -= shift;
+          b.y += shift;
+        }
+      }
+    }
+  }
+  force.initialize = values => { nodes = values; };
+  return force;
+}
+
+function memoryPreviewClampLabels(labels, width, height) {
+  labels.forEach(label => memoryPreviewClampLabel(label, width, height));
+}
+
+function memoryPreviewClampLabel(label, width, height) {
+  label.x = Math.max(label.w / 2 + 10, Math.min(width - label.w / 2 - 10, label.x));
+  label.y = Math.max(label.h / 2 + 10, Math.min(height - label.h / 2 - 30, label.y));
+}
+
+function memoryPreviewDrawLinks(ctx, points, maxScore) {
+  points.forEach((a, index) => {
+    points.slice(index + 1).forEach(b => {
+      const sameTier = a.node.tier === b.node.tier;
+      const scoreClose = Math.abs(a.node.score - b.node.score) <= 3;
+      const distance = Math.hypot(a.x - b.x, a.y - b.y);
+      if ((!sameTier && !scoreClose) || distance > 128) return;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = sameTier ? memoryPreviewColor(a.node, 0.14, maxScore) : 'rgba(180,160,255,0.07)';
+      ctx.lineWidth = sameTier ? 1.05 : 0.8;
+      ctx.stroke();
+    });
+  });
+}
+
+function memoryPreviewDrawNodes(ctx, points, maxScore, tick) {
+  points.forEach(point => {
+    const node = point.node;
+    const pulse = 1 + Math.sin(tick * 0.002 + node.phase) * 0.035;
+    const radius = node.r * pulse;
+    const glow = ctx.createRadialGradient(point.x, point.y, 0, point.x, point.y, radius * 3.4);
+    glow.addColorStop(0, memoryPreviewBaseColor(node, 0.68));
+    glow.addColorStop(0.42, memoryPreviewBaseColor(node, 0.26));
+    glow.addColorStop(1, memoryPreviewColor(node, 0, maxScore));
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius * 3.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = memoryPreviewColor(node, 0.94, maxScore);
+    ctx.fill();
+    ctx.strokeStyle = memoryPreviewBaseColor(node, 0.82);
+    ctx.lineWidth = 1.35;
+    ctx.stroke();
+  });
 }
 
 function uniqueMemoryItems(list) {
@@ -7902,18 +8731,389 @@ function uniqueMemoryItems(list) {
   });
 }
 
+function sortMemoryByRecentUse(list) {
+  return [...(list || [])].sort((a, b) => {
+    const recency = memoryRecencyTime(b) - memoryRecencyTime(a);
+    if (recency) return recency;
+    const score = memoryScore(b) - memoryScore(a);
+    if (score) return score;
+    return String(a.key || '').localeCompare(String(b.key || ''));
+  });
+}
+
+function memoryRecencyTime(item) {
+  for (const field of ['last_used_at', 'updated_at', 'created_at']) {
+    const value = item?.[field];
+    if (!value) continue;
+    const parsed = Date.parse(String(value));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
 function memoryChipHtml(m, full = false) {
     const id = String(m.entry_id || '');
     const key = String(m.key || 'memory');
     const value = String(m.value || '');
     const encodedId = encodeURIComponent(id);
     const valueLimit = full ? 72 : 38;
-    const labelValue = value ? `: ${value.length > valueLimit ? `${value.slice(0, valueLimit - 3)}...` : value}` : '';
-    const title = value ? `${key}: ${value}` : key;
+    const displayText = value ? (value.length > valueLimit ? `${value.slice(0, valueLimit - 3)}...` : value) : key;
+    const title = displayText;
     return `<span class="memory-chip${full ? ' full' : ''}" title="${escAttr(title)}">
-      <span class="memory-chip-text">${escHtml(key)}${labelValue ? `<span class="memory-chip-value">${escHtml(labelValue)}</span>` : ''}</span>
-      <button class="memory-chip-x" title="Delete ${escAttr(key)}" aria-label="Delete ${escAttr(key)} memory" onclick="event.stopPropagation();deleteMemoryItem(decodeURIComponent('${escAttr(encodedId)}'))">×</button>
+      <span class="memory-chip-text">${escHtml(displayText)}</span>
+      <button class="memory-chip-x" title="Delete memory" aria-label="Delete memory" onclick="event.stopPropagation();deleteMemoryItem(decodeURIComponent('${escAttr(encodedId)}'))">×</button>
     </span>`;
+}
+
+function memoryKindLabel(kind) {
+  const value = String(kind || '');
+  if (value === 'preference') return 'Long-term';
+  if (value === 'environment_fact') return 'Mid-term';
+  return 'Short-term';
+}
+
+function memoryScore(m) {
+  const score = Number(m?.use_score ?? m?.use_count ?? 0);
+  return Number.isFinite(score) ? Math.max(0, score) : 0;
+}
+
+function memoryScoreLevel(score, maxScore) {
+  if (score <= 0) return 0;
+  if (maxScore <= 0) return 1;
+  return Math.max(1, Math.min(4, Math.ceil((score / maxScore) * 4)));
+}
+
+function memoryMapHtml(items) {
+  const memories = items || [];
+  const maxScore = memories.reduce((max, item) => Math.max(max, memoryScore(item)), 0);
+  const counts = memories.reduce((acc, item) => {
+    const label = memoryKindLabel(item.kind);
+    acc[label] = (acc[label] || 0) + 1;
+    return acc;
+  }, {});
+  const tabs = ['Long-term', 'Mid-term', 'Short-term'].map(label => (
+    `<span class="memory-map-tab">${escHtml(label)} <strong>${counts[label] || 0}</strong></span>`
+  )).join('');
+  const legend = `<div class="memory-map-legend" aria-label="Memory score color scale">
+    <span class="memory-legend-label">More permanent</span>
+    <span class="memory-legend-gradient" aria-hidden="true"></span>
+    <span class="memory-legend-label" title="Lighter memories are newer or less recalled.">Recent</span>
+  </div>`;
+  const nodes = memories.map((item, index) => {
+    const score = memoryScore(item);
+    return memoryBrainNodeHtml({
+      item,
+      index,
+      score,
+      level: memoryScoreLevel(score, maxScore),
+      kind: String(item.kind || 'fact'),
+      tier: memoryPreviewTier(item.kind),
+    });
+  }).join('');
+  const height = memoryMapHeight(memories.length);
+  return `<div class="memory-map">
+    <div class="memory-map-topbar">
+      <div class="memory-map-toolbar">${tabs}</div>
+      <div class="memory-map-actions">${legend}<button class="mini-btn danger" onclick="deleteAllMemory()">Delete all</button></div>
+    </div>
+    <div class="memory-brain" data-max-score="${maxScore}" style="min-height:${height}px">
+      <canvas class="memory-brain-canvas" aria-hidden="true"></canvas>
+      <div class="memory-brain-regions" aria-hidden="true">
+        <span class="memory-brain-region long">Long-term</span>
+        <span class="memory-brain-region mid">Mid-term</span>
+        <span class="memory-brain-region short">Short-term</span>
+      </div>
+      <div class="memory-brain-cluster">${nodes}</div>
+    </div>
+  </div>`;
+}
+
+function memoryMapHeight(count) {
+  if (count <= 6) return 420;
+  if (count <= 18) return 560;
+  return Math.min(1180, 560 + Math.ceil((count - 18) / 8) * 92);
+}
+
+function memoryNodeLayout(memories, maxScore) {
+  const sorted = [...(memories || [])].sort((a, b) => {
+    const scoreDelta = memoryScore(b) - memoryScore(a);
+    if (scoreDelta) return scoreDelta;
+    return String(a.key || '').localeCompare(String(b.key || ''));
+  });
+  const sparseLayouts = {
+    0: { height: 108, points: [] },
+    1: { height: 106, points: [{ x: 50, y: 24 }] },
+    2: { height: 126, points: [{ x: 34, y: 32 }, { x: 66, y: 22 }] },
+    3: { height: 146, points: [{ x: 50, y: 18 }, { x: 25, y: 56 }, { x: 75, y: 56 }] },
+  };
+  if (sorted.length <= 3) {
+    const sparse = sparseLayouts[sorted.length];
+    const nodes = sorted.map((item, index) => {
+      const score = memoryScore(item);
+      const level = memoryScoreLevel(score, maxScore);
+      return {
+        item,
+        index,
+        x: sparse.points[index].x,
+        y: sparse.points[index].y,
+        score,
+        level,
+        kind: String(item.kind || 'fact'),
+        sparse: true,
+      };
+    });
+    return { nodes, height: sparse.height, maxScore };
+  }
+  const columns = [18, 50, 82];
+  const rowHeight = 78;
+  const height = Math.max(250, 104 + Math.ceil(Math.max(1, sorted.length) / 2) * rowHeight);
+  const columnPattern = [
+    [1, 0, 2],
+    [0, 2, 1],
+    [2, 1, 0],
+  ];
+  const nodes = sorted.map((item, index) => {
+    const row = Math.floor(index / columns.length);
+    const col = columnPattern[row % columnPattern.length][index % columns.length];
+    const score = memoryScore(item);
+    const level = memoryScoreLevel(score, maxScore);
+    const y = 26 + row * rowHeight + (col === 1 ? 0 : 10);
+    return {
+      item,
+      index,
+      x: columns[col],
+      y,
+      score,
+      level,
+      kind: String(item.kind || 'fact'),
+    };
+  });
+  return { nodes, height, maxScore };
+}
+
+function memoryConnectionSvg(layout, links) {
+  if (!links.length) return '';
+  const lines = links.map(link => (
+    `<line class="${escAttr(link.className)}" data-from="${link.from.index}" data-to="${link.to.index}" x1="${link.from.x}" y1="${link.from.y + 18}" x2="${link.to.x}" y2="${link.to.y + 18}"></line>`
+  )).join('');
+  return `<svg class="memory-link-svg" viewBox="0 0 100 ${layout.height}" preserveAspectRatio="none" aria-hidden="true">${lines}</svg>`;
+}
+
+function memoryConnectionLines(nodes) {
+  if ((nodes || []).length < 3) return [];
+  const links = [];
+  const seen = new Set();
+  const addLink = (from, to, className) => {
+    if (!from || !to || from === to) return;
+    const ids = [String(from.item.entry_id || from.index), String(to.item.entry_id || to.index)].sort();
+    const key = `${ids[0]}:${ids[1]}:${className}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    links.push({ from, to, className });
+  };
+  for (const kind of ['preference', 'environment_fact', 'fact']) {
+    const group = nodes.filter(node => node.kind === kind).sort((a, b) => a.y - b.y || a.x - b.x);
+    for (let index = 1; index < group.length; index += 1) {
+      addLink(group[index - 1], group[index], 'memory-link-tier');
+    }
+  }
+  const byScore = [...nodes].sort((a, b) => b.score - a.score);
+  for (let index = 1; index < byScore.length && links.length < Math.max(4, nodes.length + 2); index += 1) {
+    if (Math.abs(byScore[index - 1].score - byScore[index].score) <= 3) {
+      addLink(byScore[index - 1], byScore[index], byScore[index].score <= 1 ? 'memory-link-fresh' : 'memory-link-score');
+    }
+  }
+  return links.slice(0, Math.max(0, nodes.length + 3));
+}
+
+function applyMemoryForceLayout(root) {
+  const brain = root?.querySelector?.('.memory-brain');
+  const cluster = root?.querySelector?.('.memory-brain-cluster');
+  if (!brain || !cluster) return;
+  const canvas = brain.querySelector('.memory-brain-canvas');
+  const elements = [...cluster.querySelectorAll('.memory-brain-node')];
+  if (!canvas || !elements.length) return;
+  if (window._memoryMapAnimation) cancelAnimationFrame(window._memoryMapAnimation);
+  const width = Math.max(320, brain.clientWidth || 720);
+  const height = Math.max(420, brain.clientHeight || Number(brain.style.minHeight?.replace('px', '') || 0));
+  const maxScore = Number(brain.dataset.maxScore || 0);
+  const ctx = canvas.getContext('2d');
+  canvas.width = Math.round(width * 2);
+  canvas.height = Math.round(height * 2);
+  ctx.setTransform(2, 0, 0, 2, 0, 0);
+  const anchors = {
+    long: [width * 0.7, height * 0.32],
+    mid: [width * 0.27, height * 0.5],
+    short: [width * 0.55, height * 0.78],
+  };
+  const nodes = elements.map((el, index) => {
+    const score = Math.max(0, Number(el.dataset.score || 0));
+    const level = Math.max(0, Math.min(4, Number(el.dataset.level || 0)));
+    const tier = String(el.dataset.tier || 'short');
+    const norm = memoryPreviewScoreNorm(score, maxScore);
+    const anchor = anchors[tier] || anchors.short;
+    return {
+      el,
+      index,
+      title: el.getAttribute('data-tooltip') || el.getAttribute('title') || '',
+      score,
+      level,
+      tier,
+      norm,
+      r: 10 + norm * 19,
+      phase: index * 0.71,
+      x: anchor[0] + Math.sin(index * 1.7) * 22,
+      y: anchor[1] + Math.cos(index * 1.3) * 22,
+      targetX: anchor[0],
+      targetY: anchor[1],
+    };
+  });
+  const d3 = window.d3Force || null;
+  if (d3?.forceSimulation && d3?.forceX && d3?.forceY && d3?.forceManyBody && d3?.forceCollide) {
+    const simulation = d3.forceSimulation(nodes)
+      .force('x', d3.forceX(node => node.targetX).strength(0.052))
+      .force('y', d3.forceY(node => node.targetY).strength(0.068))
+      .force('charge', d3.forceManyBody().strength(node => -32 - node.r * 4.5))
+      .force('collide', d3.forceCollide(node => node.r + 22).strength(1).iterations(9))
+      .stop();
+    for (let tick = 0; tick < 420; tick += 1) simulation.tick();
+    simulation.stop();
+  } else {
+    const grouped = { long: [], mid: [], short: [] };
+    nodes.forEach(node => (grouped[node.tier] || grouped.short).push(node));
+    Object.entries(grouped).forEach(([tier, group]) => {
+      const anchor = anchors[tier] || anchors.short;
+      group.forEach((node, index) => {
+        node.x = anchor[0] + (index % 2 ? 28 : -28);
+        node.y = anchor[1] + (index - group.length / 2) * 32;
+      });
+    });
+  }
+  nodes.forEach(node => {
+    node.baseX = Math.max(node.r + 16, Math.min(width - node.r - 16, node.x));
+    node.baseY = Math.max(node.r + 18, Math.min(height - node.r - 18, node.y));
+  });
+  const labelNodes = memoryMapLayoutLabels(nodes, width, height);
+  const labelByIndex = new Map(labelNodes.map(label => [label.index, label]));
+  let mouse = null;
+  let hoveredNodeIndex = null;
+  let latestPoints = [];
+  const pointerOverNode = event => Boolean(event.target?.closest?.('.memory-brain-node, .memory-node-delete'));
+  elements.forEach((el, index) => {
+    el.onmouseenter = () => { hoveredNodeIndex = index; };
+    el.onmouseleave = () => { if (hoveredNodeIndex === index) hoveredNodeIndex = null; };
+  });
+  brain.onmousemove = event => {
+    if (pointerOverNode(event)) {
+      mouse = null;
+      return;
+    }
+    const box = brain.getBoundingClientRect();
+    mouse = { x: event.clientX - box.left, y: event.clientY - box.top };
+    const hovered = latestPoints
+      .map(point => ({ point, distance: Math.hypot(point.x - mouse.x, point.y - mouse.y) }))
+      .sort((a, b) => a.distance - b.distance)[0];
+    if (hovered && hovered.distance <= hovered.point.node.r + 18) {
+      showMemoryHoverTooltip(hovered.point.node.title, event.clientX, event.clientY);
+    } else {
+      hideTooltip();
+    }
+  };
+  brain.onmouseleave = () => {
+    mouse = null;
+    hideTooltip();
+  };
+  const pointFor = (node, tick) => {
+    const motion = 5;
+    const paused = hoveredNodeIndex === node.index;
+    let x = node.baseX + (paused ? 0 : Math.sin(tick * 0.0011 + node.phase) * motion);
+    let y = node.baseY + (paused ? 0 : Math.cos(tick * 0.0013 + node.phase) * (motion * 0.8));
+    if (mouse) {
+      const dx = x - mouse.x;
+      const dy = y - mouse.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      if (distance < 136) {
+        const push = (1 - distance / 136) * 34;
+        x += (dx / distance) * push;
+        y += (dy / distance) * push;
+      }
+    }
+    return {
+      x: Math.max(node.r + 14, Math.min(width - node.r - 14, x)),
+      y: Math.max(node.r + 14, Math.min(height - node.r - 14, y)),
+    };
+  };
+  const draw = tick => {
+    ctx.clearRect(0, 0, width, height);
+    const points = nodes.map(node => ({ node, ...pointFor(node, tick) }));
+    latestPoints = points;
+    memoryPreviewDrawLinks(ctx, points, maxScore);
+    memoryPreviewDrawNodes(ctx, points, maxScore, tick);
+    points.forEach(point => {
+      const label = labelByIndex.get(point.node.index);
+      if (!label) return;
+      const x = Math.max(label.w / 2 + 12, Math.min(width - label.w / 2 - 12, point.x + label.dx));
+      const y = Math.max(label.h / 2 + 12, Math.min(height - label.h / 2 - 12, point.y + label.dy));
+      label.el.style.left = `${Math.round(x)}px`;
+      label.el.style.top = `${Math.round(y)}px`;
+    });
+    window._memoryMapAnimation = requestAnimationFrame(draw);
+  };
+  window._memoryMapAnimation = requestAnimationFrame(draw);
+}
+
+function memoryMapLayoutLabels(nodes, width, height) {
+  const labels = nodes.map((node) => {
+    const side = node.tier === 'long' ? 'right' : node.tier === 'mid' ? 'left' : 'bottom';
+    const w = Math.min(230, Math.max(118, node.el.offsetWidth || 178));
+    const h = Math.max(30, node.el.offsetHeight || 34);
+    const targetX = node.baseX + (side === 'right' ? 104 : side === 'left' ? -104 : 0);
+    const targetY = node.baseY + (side === 'bottom' ? 54 : 0);
+    return { ...node, w, h, x: targetX, y: targetY, targetX, targetY, side };
+  });
+  const d3 = window.d3Force || null;
+  if (d3?.forceSimulation && d3?.forceX && d3?.forceY) {
+    const simulation = d3.forceSimulation(labels)
+      .force('x', d3.forceX(label => label.targetX).strength(0.16))
+      .force('y', d3.forceY(label => label.targetY).strength(0.16))
+      .force('collide', memoryPreviewLabelCollide(16))
+      .stop();
+    for (let tick = 0; tick < 320; tick += 1) {
+      simulation.tick();
+      labels.forEach(label => {
+        label.x = Math.max(label.w / 2 + 12, Math.min(width - label.w / 2 - 12, label.x));
+        label.y = Math.max(label.h / 2 + 12, Math.min(height - label.h / 2 - 12, label.y));
+      });
+    }
+    simulation.stop();
+  }
+  labels.forEach(label => {
+    label.x = Math.max(label.w / 2 + 12, Math.min(width - label.w / 2 - 12, label.x));
+    label.y = Math.max(label.h / 2 + 12, Math.min(height - label.h / 2 - 12, label.y));
+    label.dx = label.x - label.baseX;
+    label.dy = label.y - label.baseY;
+  });
+  return labels;
+}
+
+function memoryBrainNodeHtml(node) {
+  const m = node.item;
+  const id = String(m.entry_id || '');
+  const key = String(m.key || 'memory');
+  const value = String(m.value || '');
+  const encodedId = encodeURIComponent(id);
+  const score = node.score;
+  const level = node.level;
+  const displayText = value || 'Saved memory';
+  const title = displayText;
+  const textLimit = 44 + level * 6;
+  const shortText = displayText.length > textLimit ? `${displayText.slice(0, textLimit - 3)}...` : displayText;
+  return `<span class="memory-brain-node score-${level}${level <= 1 ? ' soft' : ''}" data-tooltip="${escAttr(title)}" data-kind="${escAttr(node.kind)}" data-tier="${escAttr(node.tier)}" data-score="${score}" data-level="${level}">
+    <span class="memory-brain-copy">
+      <span class="memory-brain-text">${escHtml(shortText)}</span>
+    </span>
+    <button class="memory-node-delete" aria-label="Delete memory" onclick="event.stopPropagation();deleteMemoryItem(decodeURIComponent('${escAttr(encodedId)}'))">×</button>
+  </span>`;
 }
 
 async function deleteMemoryItem(id) {
@@ -7938,8 +9138,8 @@ async function deleteMemoryItem(id) {
 
 async function deleteAllMemory() {
   const ok = await confirmAction({
-    title: 'Delete all saved memory shown here?',
-    message: 'All visible memory items will be removed from Nullion.',
+    title: 'Delete all saved memory?',
+    message: 'All memory for this workspace will be removed. This cannot be undone.',
     confirmText: 'Delete all',
     icon: 'trash',
   });
@@ -9156,8 +10356,13 @@ async function loadConfig() {
     _providerChangeIsInitialLoad = false;
     _updateAdminForcedStrip(cfg.admin_forced_model || null, cfg.admin_forced_provider || null);
     document.getElementById('cfg-doctor-enabled').checked = cfg.doctor_enabled !== false;
+    document.getElementById('cfg-smart-cleanup-enabled').checked = cfg.smart_cleanup_enabled !== false;
     document.getElementById('cfg-chat-enabled').checked = cfg.chat_enabled !== false;
     document.getElementById('cfg-memory-enabled').checked = cfg.memory_enabled !== false;
+    document.getElementById('cfg-memory-smart-cleanup').checked = cfg.memory_smart_cleanup === true;
+    document.getElementById('cfg-memory-long-term-limit').value = cfg.memory_long_term_limit ?? 25;
+    document.getElementById('cfg-memory-mid-term-limit').value = cfg.memory_mid_term_limit ?? 15;
+    document.getElementById('cfg-memory-short-term-limit').value = cfg.memory_short_term_limit ?? 10;
     document.getElementById('cfg-skill-learning').checked = cfg.skill_learning !== false;
     document.getElementById('cfg-web-search').checked = cfg.web_access !== false;
     document.getElementById('cfg-browser-enabled').checked = cfg.browser_enabled !== false;
@@ -9601,6 +10806,29 @@ async function launchAgentBrowser() {
     alert(`Could not open agent browser: ${e.message || e}`);
   } finally {
     await loadHeaderConfig();
+  }
+}
+
+async function openWorkspaceFolder() {
+  const btn = document.getElementById('workspace-folder-btn');
+  if (btn && btn.disabled) return;
+  const previous = document.getElementById('status-label').textContent;
+  if (btn) btn.disabled = true;
+  setStatus(true, 'Opening workspace…');
+  try {
+    const res = await fetch('/api/workspace/open', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      throw new Error(data.error || 'Could not open the workspace folder.');
+    }
+    recordActivity('Opened workspace folder', data.path || 'Workspace folder');
+    setStatus(true, 'Workspace opened');
+    setTimeout(() => setStatus(true, previous || 'Connected'), 1800);
+  } catch (e) {
+    setStatus(true, previous || 'Connected');
+    alert(`Could not open workspace folder: ${e.message || e}`);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -10758,8 +11986,13 @@ async function saveConfig() {
     media_models:           _providerMediaModels,
     media_providers_enabled: _mediaProvidersEnabled,
     doctor_enabled:  document.getElementById('cfg-doctor-enabled').checked,
+    smart_cleanup_enabled: document.getElementById('cfg-smart-cleanup-enabled').checked,
     chat_enabled:    document.getElementById('cfg-chat-enabled').checked,
     memory_enabled:  document.getElementById('cfg-memory-enabled').checked,
+    memory_smart_cleanup: document.getElementById('cfg-memory-smart-cleanup').checked,
+    memory_long_term_limit: Number(document.getElementById('cfg-memory-long-term-limit').value || 0),
+    memory_mid_term_limit: Number(document.getElementById('cfg-memory-mid-term-limit').value || 0),
+    memory_short_term_limit: Number(document.getElementById('cfg-memory-short-term-limit').value || 0),
     skill_learning:  document.getElementById('cfg-skill-learning').checked,
     web_access:      document.getElementById('cfg-web-search').checked,
     browser_enabled: document.getElementById('cfg-browser-enabled').checked,
@@ -11308,6 +12541,9 @@ async function uploadFiles(files) {
     try {
       const r = await fetch('/api/upload', { method: 'POST', body: fd });
       const d = await r.json();
+      if (!r.ok || d.ok === false) {
+        throw new Error(d.error || `Upload failed (${r.status})`);
+      }
       if (d.path) {
         const artifact = d.artifact && typeof d.artifact === 'object' ? d.artifact : {};
         results.push({
@@ -11319,7 +12555,9 @@ async function uploadFiles(files) {
           url: artifact.url || '',
         });
       }
-    } catch(e) { /* skip failed */ }
+    } catch(e) {
+      throw new Error(`${f.name}: ${e.message || e}`);
+    }
   }
   return results;
 }
@@ -11327,7 +12565,17 @@ const _origSendMessage = sendMessage;
 sendMessage = async function() {
   _chatUserInteractedSinceLoad = true;
   if (_pendingFiles.length) {
-    const uploaded = await uploadFiles(_pendingFiles);
+    let uploaded = [];
+    try {
+      uploaded = await uploadFiles(_pendingFiles);
+    } catch (e) {
+      setBotStatus(`Upload failed: ${e.message || e}`);
+      reportClientIssue('error', 'Attachment upload failed.', {
+        error: e.message || String(e),
+      });
+      focusComposer({ force: true });
+      return;
+    }
     if (uploaded.length) {
       window._pendingMessageAttachments = uploaded;
     }
@@ -11625,11 +12873,35 @@ async function _maybeAutoSkill() {
   try {
     const data = await fetch(`/api/chat/analyze/${encodeURIComponent(conversationId)}`, { method: 'POST' })
       .then(r => r.json());
-    if (data.ok && data.proposals && data.proposals.length) {
+    if (data.ok && data.auto_accepted && data.accepted && data.accepted.length) {
+      _showAutoSkillAcceptedBanner(data.accepted);
+    } else if (data.ok && data.proposals && data.proposals.length) {
       _showAutoSkillBanner(data.proposals);
     }
   } catch (_) { /* best-effort */ }
   _autoSkillRunning = false;
+}
+
+function _showAutoSkillAcceptedBanner(skills) {
+  let banner = document.getElementById('auto-skill-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'auto-skill-banner';
+    banner.style.cssText = (
+      'background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);border-radius:8px;'
+      + 'padding:10px 14px;margin:6px 0;font-size:12px;color:var(--text);display:flex;'
+      + 'align-items:center;gap:10px;flex-wrap:wrap;'
+    );
+    const inputRow = document.getElementById('input-row');
+    if (inputRow) inputRow.parentNode.insertBefore(banner, inputRow);
+  }
+  const names = skills.map(skill => skill.title).filter(Boolean);
+  const label = names.length === 1 ? `Skill saved: ${names[0]}` : `${names.length} skills saved`;
+  banner.innerHTML =
+    `${NI.check()} <strong>Builder</strong> ${escHtml(label)} ` +
+    `<button onclick="this.parentNode.remove()" style="margin-left:auto;background:none;border:none;` +
+    `cursor:pointer;color:var(--muted);font-size:14px;">✕</button>`;
+  setTimeout(() => banner && banner.remove(), 5000);
 }
 
 function _showAutoSkillBanner(proposals) {
@@ -13077,9 +14349,25 @@ def create_app(runtime, orchestrator, registry):
             media_type="image/svg+xml",
         )
 
+    @app.get("/assets/d3-force.bundle.min.js")
+    async def _d3_force_asset():
+        path = Path(__file__).resolve().parent / "assets" / "d3-force.bundle.min.js"
+        if path.exists():
+            return FileResponse(path, media_type="application/javascript")
+        return Response(content="window.d3Force=null;", media_type="application/javascript")
+
     # Max upload size for the file upload endpoint. The chat pipeline accepts
     # arbitrary files and describes non-media uploads by local path for tools.
-    _MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+    def _max_upload_bytes() -> int:
+        raw = os.environ.get("NULLION_MAX_UPLOAD_MB", "").strip()
+        if raw:
+            try:
+                return max(1, int(raw)) * 1024 * 1024
+            except ValueError:
+                pass
+        return 512 * 1024 * 1024
+
+    _MAX_UPLOAD_BYTES = _max_upload_bytes()
 
     class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: StarletteRequest, call_next):
@@ -13144,7 +14432,6 @@ def create_app(runtime, orchestrator, registry):
         return effective_cron_delivery_channel(job, settings=settings)
 
     cron_background_deliveries: dict[str, Any] = {}
-
     def _record_cron_delivery_event(event_type: str, job, channel: str, target: str, conv_id: str, **extra: Any) -> None:
         try:
             from .audit import make_audit_record
@@ -13194,7 +14481,7 @@ def create_app(runtime, orchestrator, registry):
             return "cron_run_unfinished_untrusted_web_fetch"
         return None
 
-    def _send_cron_telegram_delivery(job, text: str) -> bool:
+    def _send_cron_telegram_delivery(job, text: str, *, run_label: str = "Scheduled task") -> bool:
         target = _cron_delivery_target(job, "telegram")
         if not target:
             return False
@@ -13206,7 +14493,7 @@ def create_app(runtime, orchestrator, registry):
             bot_token = settings.telegram.bot_token
             if not bot_token:
                 return False
-            message = f"Scheduled task: {job.name}\n\n{text}"
+            message = scheduled_task_delivery_text(job, text, run_label=run_label)
             return _run_cron_platform_delivery(
                 lambda: _send_operator_telegram_delivery(
                     bot_token,
@@ -13220,9 +14507,9 @@ def create_app(runtime, orchestrator, registry):
             logger.warning("Cron Telegram delivery failed [%s]", getattr(job, "id", ""), exc_info=True)
             return False
 
-    def _send_cron_platform_delivery(job, channel: str, text: str) -> bool:
+    def _send_cron_platform_delivery(job, channel: str, text: str, *, run_label: str = "Scheduled task") -> bool:
         if channel == "telegram":
-            return _send_cron_telegram_delivery(job, text)
+            return _send_cron_telegram_delivery(job, text, run_label=run_label)
         target = _cron_delivery_target(job, channel)
         if not target:
             return False
@@ -13230,7 +14517,7 @@ def create_app(runtime, orchestrator, registry):
             from nullion.config import load_settings
 
             settings = load_settings()
-            message = f"Scheduled task: {job.name}\n\n{text}"
+            message = scheduled_task_delivery_text(job, text, run_label=run_label)
             if channel == "slack":
                 from nullion.slack_app import send_slack_platform_delivery
 
@@ -13259,12 +14546,20 @@ def create_app(runtime, orchestrator, registry):
             logger.warning("Cron %s delivery failed [%s]", channel, getattr(job, "id", ""), exc_info=True)
         return False
 
-    def _save_cron_web_delivery(job, conv_id: str, text: str, artifacts: object, result: dict[str, object]) -> bool:
+    def _save_cron_web_delivery(
+        job,
+        conv_id: str,
+        text: str,
+        artifacts: object,
+        result: dict[str, object],
+        *,
+        run_label: str = "Scheduled task",
+    ) -> bool:
         if result.get("mini_agent_dispatch"):
             return True
         if user_visible_text_from_output({"text": result.get("text")}):
             return True
-        fallback = cron_delivery_text(text, artifacts)
+        fallback = scheduled_task_delivery_text(job, cron_delivery_text(text, artifacts), run_label=run_label)
         try:
             from nullion.chat_store import get_chat_store
             get_chat_store().save_message(conv_id, "bot", fallback, is_error=False)
@@ -13289,17 +14584,31 @@ def create_app(runtime, orchestrator, registry):
                 effective_channel=_effective_cron_delivery_channel,
                 delivery_target=_cron_delivery_target,
                 run_agent_turn=lambda cron_job, conv_id: _run_guarded_turn_sync(
-                    f"[{label}: {cron_job.name}] {cron_job.task}",
+                    cron_agent_prompt(cron_job, label=label),
                     conv_id,
                     orchestrator,
-                    registry,
+                    CronExecutionToolRegistry(registry),
                     runtime,
                     allow_mini_agents=allow_mini_agents,
+                    memory_owner=memory_owner_for_workspace(getattr(cron_job, "workspace_id", "workspace_admin")),
+                    reinforce_memory_context=False,
                 ),
                 record_event=_record_cron_delivery_event,
                 block_reason=_cron_result_block_reason,
-                save_web_delivery=_save_cron_web_delivery,
-                send_platform_delivery=_send_cron_platform_delivery,
+                save_web_delivery=lambda cron_job, conv_id, text, artifacts, result: _save_cron_web_delivery(
+                    cron_job,
+                    conv_id,
+                    text,
+                    artifacts,
+                    result,
+                    run_label=label,
+                ),
+                send_platform_delivery=lambda cron_job, channel, text: _send_cron_platform_delivery(
+                    cron_job,
+                    channel,
+                    text,
+                    run_label=label,
+                ),
                 start_background_delivery=lambda conv_id, cron_job: cron_background_deliveries.__setitem__(conv_id, cron_job),
                 clear_background_delivery=lambda conv_id: cron_background_deliveries.pop(conv_id, None),
             ),
@@ -13575,8 +14884,8 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
     @app.post("/api/chat/analyze/{conv_id}")
-    async def analyze_conversation_for_skills(conv_id: str):
-        """Run conversation analyser and return skill proposals (JSON, no side-effects)."""
+    async def analyze_conversation_for_skills(conv_id: str, auto_accept: bool = True):
+        """Run conversation analyser and save detected skills by default."""
         import asyncio
         from nullion.chat_store import get_chat_store as _get_chat_store2
         from nullion.conversation_analyzer import (
@@ -13594,9 +14903,24 @@ def create_app(runtime, orchestrator, registry):
                 lambda: _analyze_conv(store, model_client, conv_id, existing_skill_titles=existing_titles),
             )
             _cache_props(conv_id, proposals)
+            accepted = []
+            if auto_accept and os.environ.get("NULLION_SKILL_LEARNING_ENABLED", "true").lower() not in ("0", "false", "no", "off"):
+                for proposal in proposals:
+                    try:
+                        skill = runtime.create_skill(**proposal.to_skill_kwargs(), actor="web-auto-skill")
+                    except Exception:
+                        logger.debug("Unable to auto-accept Builder skill proposal %r", proposal.title, exc_info=True)
+                        continue
+                    accepted.append({
+                        "skill_id": skill.skill_id,
+                        "title": skill.title,
+                        "summary": skill.summary,
+                    })
             return JSONResponse({
                 "ok": True,
                 "conv_id": conv_id,
+                "auto_accepted": bool(accepted),
+                "accepted": accepted,
                 "proposals": [
                     {
                         "title": p.title,
@@ -13868,7 +15192,8 @@ def create_app(runtime, orchestrator, registry):
             })
 
         # Task frames
-        _cleanup_dead_task_frames(runtime)
+        if _smart_cleanup_enabled():
+            _cleanup_dead_task_frames(runtime)
         task_frames = []
         for frame in store.task_frames.values():
             task_frames.append({
@@ -13951,11 +15276,17 @@ def create_app(runtime, orchestrator, registry):
         # Memory
         memory = []
         dashboard_memory_owner = memory_owner_for_web_admin()
+        try:
+            from nullion.builder_memory import is_durable_memory_entry
+        except Exception:
+            is_durable_memory_entry = lambda entry: True  # noqa: E731
         for entry in sorted(
             memory_entries_for_owner(store, dashboard_memory_owner),
             key=lambda item: (item.updated_at or item.created_at or datetime.min.replace(tzinfo=UTC), item.entry_id),
             reverse=True,
         ):
+            if not is_durable_memory_entry(entry):
+                continue
             memory.append({
                 "entry_id": entry.entry_id,
                 "key": entry.key,
@@ -13964,6 +15295,9 @@ def create_app(runtime, orchestrator, registry):
                 "source": entry.source,
                 "created_at": entry.created_at.isoformat() if entry.created_at else None,
                 "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+                "use_count": int(getattr(entry, "use_count", 0) or 0),
+                "use_score": float(getattr(entry, "use_score", 0.0) or 0.0),
+                "last_used_at": entry.last_used_at.isoformat() if entry.last_used_at else None,
             })
 
         builder_proposals = []
@@ -13979,6 +15313,51 @@ def create_app(runtime, orchestrator, registry):
                 "resolved_at": record.resolved_at.isoformat() if record.resolved_at else None,
                 "accepted_skill_id": record.accepted_skill_id,
             })
+        memory_pressure = None
+        try:
+            from nullion.builder_memory import memory_policy_from_env, memory_pressure_for_owner
+
+            memory_pressure = memory_pressure_for_owner(
+                store,
+                dashboard_memory_owner,
+                policy=memory_policy_from_env(),
+            )
+            if memory_pressure.get("full") and not memory_pressure.get("smart_cleanup_enabled"):
+                full_buckets = [
+                    bucket for bucket in memory_pressure.get("full_buckets", [])
+                    if isinstance(bucket, dict)
+                ]
+                bucket_text = ", ".join(
+                    f"{bucket.get('label')} {bucket.get('count')}/{bucket.get('limit')}"
+                    for bucket in full_buckets
+                ) or "One memory bucket is full"
+                created_at_values = [
+                    entry.get("updated_at") or entry.get("created_at")
+                    for entry in memory
+                    if isinstance(entry, dict) and (entry.get("updated_at") or entry.get("created_at"))
+                ]
+                synthetic_created_at = max(created_at_values) if created_at_values else datetime.now(UTC).isoformat()
+                builder_proposals.insert(0, {
+                    "proposal_id": f"memory-full:{dashboard_memory_owner}",
+                    "title": "Agent memory is full",
+                    "summary": (
+                        f"{bucket_text}. Increase memory to keep more context, which can increase token usage, "
+                        "or run smart cleanup so Builder removes lower-strength memories first."
+                    ),
+                    "status": "warning",
+                    "decision_type": "memory_full",
+                    "confidence": 1.0,
+                    "created_at": synthetic_created_at,
+                    "resolved_at": None,
+                    "accepted_skill_id": None,
+                    "actions": {
+                        "can_increase": bool(memory_pressure.get("can_increase")),
+                        "smart_cleanup": True,
+                    },
+                    "memory_pressure": memory_pressure,
+                })
+        except Exception:
+            logger.debug("web status: failed to evaluate memory pressure", exc_info=True)
 
         doctor_actions = sorted(
             (
@@ -14017,6 +15396,8 @@ def create_app(runtime, orchestrator, registry):
             + counts.get("pending_doctor_actions", 0)
             + counts.get("open_sentinel_escalations", 0)
         )
+        if memory_pressure and memory_pressure.get("full") and not memory_pressure.get("smart_cleanup_enabled"):
+            attention += 1
         health = {"attention_needed": attention, "counts": counts}
         try:
             tool_count = len(registry.list_tool_definitions())
@@ -14101,6 +15482,43 @@ def create_app(runtime, orchestrator, registry):
             runtime.store.remove_user_memory_entry(entry.entry_id)
         runtime.checkpoint()
         return JSONResponse({"ok": True, "deleted": len(entries)})
+
+    @app.post("/api/memory/smart-cleanup")
+    async def smart_cleanup_memory():
+        from nullion.builder_memory import smart_cleanup_owner_memory
+
+        owner = memory_owner_for_web_admin()
+        result = smart_cleanup_owner_memory(runtime.store, owner)
+        runtime.checkpoint()
+        return JSONResponse({"ok": True, "removed": result.removed, "skipped": result.skipped})
+
+    @app.post("/api/memory/increase-limits")
+    async def increase_memory_limits():
+        from nullion.builder_memory import MAX_CONFIGURED_MEMORY_LIMIT, memory_policy_from_env, memory_pressure_for_owner
+
+        owner = memory_owner_for_web_admin()
+        policy = memory_policy_from_env()
+        pressure = memory_pressure_for_owner(runtime.store, owner, policy=policy)
+        kind_to_env = {
+            "preference": ("NULLION_MEMORY_LONG_TERM_LIMIT", policy.long_term_limit),
+            "environment_fact": ("NULLION_MEMORY_MID_TERM_LIMIT", policy.mid_term_limit),
+            "fact": ("NULLION_MEMORY_SHORT_TERM_LIMIT", policy.short_term_limit),
+        }
+        updates: dict[str, str] = {}
+        for bucket in pressure.get("full_buckets", []):
+            if not isinstance(bucket, dict):
+                continue
+            env_name, current_limit = kind_to_env.get(str(bucket.get("kind") or ""), ("", 0))
+            if not env_name or current_limit >= MAX_CONFIGURED_MEMORY_LIMIT:
+                continue
+            count = int(bucket.get("count") or 0)
+            next_limit = min(MAX_CONFIGURED_MEMORY_LIMIT, max(current_limit + 5, count + 5, 1))
+            if next_limit != current_limit:
+                updates[env_name] = str(next_limit)
+                os.environ[env_name] = str(next_limit)
+        if updates:
+            _write_env_updates(_find_env_path(), updates)
+        return JSONResponse({"ok": True, "changed": bool(updates), "updated": updates})
 
     @app.post("/api/permissions/{permission_kind}/{permission_id}/revoke")
     async def revoke_permission(permission_kind: str, permission_id: str):
@@ -14524,8 +15942,12 @@ def create_app(runtime, orchestrator, registry):
         ) or "medium"
         tg_streaming_enabled = os.environ.get("NULLION_TELEGRAM_CHAT_STREAMING_ENABLED", "true").lower() not in ("0", "false", "no", "off")
         doctor_enabled = os.environ.get("NULLION_DOCTOR_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+        smart_cleanup_enabled = _smart_cleanup_enabled()
         chat_enabled = os.environ.get("NULLION_TELEGRAM_CHAT_ENABLED", "true").lower() not in ("0", "false", "no", "off")
         memory_enabled = os.environ.get("NULLION_MEMORY_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+        memory_smart_cleanup = os.environ.get("NULLION_MEMORY_SMART_CLEANUP_ENABLED", "false").lower() not in ("0", "false", "no", "off")
+        from nullion.builder_memory import memory_policy_from_env
+        memory_policy = memory_policy_from_env()
         skill_learning = os.environ.get("NULLION_SKILL_LEARNING_ENABLED", "true").lower() not in ("0", "false", "no", "off")
         web_access = os.environ.get("NULLION_WEB_ACCESS_ENABLED", "true").lower() not in ("0", "false", "no", "off")
         browser_enabled = os.environ.get("NULLION_BROWSER_ENABLED", "true").lower() not in ("0", "false", "no", "off")
@@ -14754,8 +16176,13 @@ def create_app(runtime, orchestrator, registry):
             "admin_forced_model":     os.environ.get("NULLION_ADMIN_FORCED_MODEL") or creds.get("admin_forced_model") or None,
             "admin_forced_provider":  os.environ.get("NULLION_ADMIN_FORCED_PROVIDER") or creds.get("admin_forced_provider") or None,
             "doctor_enabled":  doctor_enabled,
+            "smart_cleanup_enabled": smart_cleanup_enabled,
             "chat_enabled":    chat_enabled,
             "memory_enabled":  memory_enabled,
+            "memory_smart_cleanup": memory_smart_cleanup,
+            "memory_long_term_limit": memory_policy.long_term_limit,
+            "memory_mid_term_limit": memory_policy.mid_term_limit,
+            "memory_short_term_limit": memory_policy.short_term_limit,
             "skill_learning":  skill_learning,
             "web_access":      web_access,
             "browser_enabled": browser_enabled,
@@ -14989,6 +16416,26 @@ def create_app(runtime, orchestrator, registry):
                 "result": result.output,
             }
         )
+
+    @app.post("/api/workspace/open")
+    async def open_workspace_folder():
+        """Open the main web/operator workspace folder in the host file manager."""
+        workspace_root = _web_operator_workspace_folder()
+        if not workspace_root.exists() or not workspace_root.is_dir():
+            return JSONResponse(
+                {"ok": False, "error": f"Workspace folder does not exist: {workspace_root}"},
+                status_code=404,
+            )
+        try:
+            _open_local_directory(workspace_root)
+        except FileNotFoundError:
+            return JSONResponse(
+                {"ok": False, "error": "No system folder opener is available on this machine."},
+                status_code=500,
+            )
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": f"Could not open workspace folder: {exc}"}, status_code=500)
+        return JSONResponse({"ok": True, "path": str(workspace_root)})
 
     @app.post("/api/config")
     async def post_config(request: Request):
@@ -15698,11 +17145,13 @@ def create_app(runtime, orchestrator, registry):
         # Handle feature toggles
         for toggle_key, env_name in [
             ("doctor_enabled", "NULLION_DOCTOR_ENABLED"),
+            ("smart_cleanup_enabled", "NULLION_SMART_CLEANUP_ENABLED"),
             ("chat_enabled", "NULLION_TELEGRAM_CHAT_ENABLED"),
             ("tg_streaming_enabled", "NULLION_TELEGRAM_CHAT_STREAMING_ENABLED"),
             ("slack_enabled", "NULLION_SLACK_ENABLED"),
             ("discord_enabled", "NULLION_DISCORD_ENABLED"),
             ("memory_enabled", "NULLION_MEMORY_ENABLED"),
+            ("memory_smart_cleanup", "NULLION_MEMORY_SMART_CLEANUP_ENABLED"),
             ("skill_learning", "NULLION_SKILL_LEARNING_ENABLED"),
             ("web_access", "NULLION_WEB_ACCESS_ENABLED"),
             ("browser_enabled", "NULLION_BROWSER_ENABLED"),
@@ -15737,6 +17186,9 @@ def create_app(runtime, orchestrator, registry):
             ("mini_agent_max_continuations", "NULLION_MINI_AGENT_MAX_CONTINUATIONS", 0),
             ("repeated_tool_failure_limit", "NULLION_REPEATED_TOOL_FAILURE_LIMIT", 1),
             ("mini_agent_stale_after_seconds", "NULLION_MINI_AGENT_STALE_AFTER_SECONDS", 1),
+            ("memory_long_term_limit", "NULLION_MEMORY_LONG_TERM_LIMIT", 0),
+            ("memory_mid_term_limit", "NULLION_MEMORY_MID_TERM_LIMIT", 0),
+            ("memory_short_term_limit", "NULLION_MEMORY_SHORT_TERM_LIMIT", 0),
         ]:
             if numeric_key not in body:
                 continue
@@ -17309,14 +18761,23 @@ def _recent_web_tool_context_prompt(runtime, conversation_id: str) -> str | None
     )
 
 
-def _web_memory_context(runtime) -> str | None:
+def _web_memory_context(runtime, *, owner: str | None = None, reinforce: bool = True) -> str | None:
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return None
     store = getattr(runtime, "store", None)
     if store is None:
         return None
-    owner = memory_owner_for_web_admin()
-    return format_memory_context(memory_entries_for_owner(store, owner))
+    memory_owner = owner or memory_owner_for_web_admin()
+    entries = memory_entries_for_owner(store, memory_owner)
+    try:
+        from nullion.builder_memory import reinforce_memory_entries, select_memory_entries_for_prompt
+
+        entries = select_memory_entries_for_prompt(entries)
+        if reinforce and reinforce_memory_entries(store, entries):
+            runtime.checkpoint()
+    except Exception:
+        logger.debug("Unable to reinforce web memory entries", exc_info=True)
+    return format_memory_context(entries)
 
 
 def _remember_web_chat_turn(
@@ -17352,7 +18813,7 @@ def _remember_web_chat_turn(
         logger.debug("Unable to checkpoint after web chat turn", exc_info=True)
 
 
-def _remember_web_explicit_memory(runtime, *, user_message: str) -> None:
+def _remember_web_explicit_memory(runtime, *, user_message: str, owner: str | None = None) -> None:
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return
     store = getattr(runtime, "store", None)
@@ -17360,7 +18821,7 @@ def _remember_web_explicit_memory(runtime, *, user_message: str) -> None:
         return
     written = capture_explicit_user_memory(
         store,
-        owner=memory_owner_for_web_admin(),
+        owner=owner or memory_owner_for_web_admin(),
         text=user_message,
         source="web_chat",
     )
@@ -17431,6 +18892,10 @@ def _feature_enabled(name: str, *, default: bool = True) -> bool:
     if raw is None or raw.strip() == "":
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _smart_cleanup_enabled() -> bool:
+    return _feature_enabled("NULLION_SMART_CLEANUP_ENABLED", default=True)
 
 
 ActivityCallback = Callable[[dict[str, str]], None]
@@ -17617,25 +19082,58 @@ def _try_web_builder_reflection(
     assistant_reply: str | None,
     tool_results: list[ToolResult],
     conversation_id: str,
+    memory_owner: str | None = None,
 ) -> WebBuilderActivityResult:
-    if not _feature_enabled("NULLION_SKILL_LEARNING_ENABLED"):
-        return WebBuilderActivityResult([], "Skill learning is off")
     model_client = getattr(orchestrator, "model_client", None)
     if model_client is None:
         return WebBuilderActivityResult([], "No model client for reflection")
+    memory_detail = "Memory skipped"
+    if memory_owner and _feature_enabled("NULLION_MEMORY_ENABLED"):
+        try:
+            from nullion.builder_memory import capture_turn_memory_claims, is_durable_memory_entry, manage_turn_memory
+
+            memory_result = manage_turn_memory(
+                runtime,
+                model_client,
+                owner=memory_owner,
+                user_message=user_message,
+                assistant_reply=assistant_reply,
+                tool_results=tool_results,
+            )
+            explicit_memory_result = capture_turn_memory_claims(
+                runtime,
+                model_client,
+                owner=memory_owner,
+                user_message=user_message,
+                assistant_reply=assistant_reply,
+            )
+            owner_memory_count = sum(
+                1 for entry in memory_entries_for_owner(runtime.store, memory_owner)
+                if is_durable_memory_entry(entry)
+            )
+            memory_detail = (
+                f"Memory: {owner_memory_count} kept"
+                if memory_result.skipped is None or explicit_memory_result.written
+                else f"Memory skipped: {memory_result.skipped}"
+            )
+        except Exception:
+            logger.debug("Web Builder memory failed (non-fatal)", exc_info=True)
+            memory_detail = "Memory check failed"
+    if not _feature_enabled("NULLION_SKILL_LEARNING_ENABLED"):
+        return WebBuilderActivityResult([], f"{memory_detail}; skill learning is off")
     try:
         from nullion.builder_observer import TurnOutcome, extract_turn_signal
         from nullion.builder_reflector import reflect_on_turn
 
         tool_names = [result.tool_name for result in tool_results]
         if not tool_names:
-            return WebBuilderActivityResult([], "Skipped: no tool activity")
+            return WebBuilderActivityResult([], f"{memory_detail}; skipped skill: no tool activity")
         if len(set(tool_names)) < 2:
-            return WebBuilderActivityResult([], "Skipped: needs 2+ distinct tools")
+            return WebBuilderActivityResult([], f"{memory_detail}; skipped skill: needs 2+ distinct tools")
         tool_error_count = sum(1 for result in tool_results if normalize_tool_status(result.status) != "completed")
         outcome = TurnOutcome.PARTIAL if tool_error_count else TurnOutcome.SUCCESS
         if outcome is not TurnOutcome.SUCCESS:
-            return WebBuilderActivityResult([], "Skipped: tool errors in turn")
+            return WebBuilderActivityResult([], f"{memory_detail}; skipped skill: tool errors in turn")
         signal = extract_turn_signal(
             signal_id=f"web-sig-{int(time.time() * 1000)}",
             user_message=user_message,
@@ -17652,12 +19150,12 @@ def _try_web_builder_reflection(
             turn_signal=signal,
         )
         if not reflection.should_propose or reflection.proposal is None:
-            return WebBuilderActivityResult([], "No reusable workflow detected")
+            return WebBuilderActivityResult([], f"{memory_detail}; no reusable workflow detected")
         record = runtime.store_builder_proposal(reflection.proposal, actor="builder_reflector")
         if record.status != "pending":
-            return WebBuilderActivityResult([], "Already learned or pending")
+            return WebBuilderActivityResult([], f"{memory_detail}; already learned or pending")
         skill = runtime.accept_stored_builder_skill_proposal(record.proposal_id, actor="builder_auto")
-        return WebBuilderActivityResult([skill.title], f"Learned skill: {skill.title}")
+        return WebBuilderActivityResult([skill.title], f"{memory_detail}; learned skill: {skill.title}")
     except Exception:
         logger.debug("Web Builder reflection failed (non-fatal)", exc_info=True)
         return WebBuilderActivityResult([], "Builder check failed")
@@ -17666,11 +19164,9 @@ def _try_web_builder_reflection(
 def _append_web_builder_notice(reply: str, learned_skill_titles: list[str]) -> str:
     if not learned_skill_titles:
         return reply
-    if len(learned_skill_titles) == 1:
-        notice = f"Builder learned a new skill: {learned_skill_titles[0]}"
-    else:
-        names = ", ".join(learned_skill_titles[:-1]) + f" and {learned_skill_titles[-1]}"
-        notice = f"Builder learned {len(learned_skill_titles)} new skills: {names}"
+    notice = "\n".join(f"::builder-skill::{title}" for title in learned_skill_titles if title)
+    if not notice:
+        return reply
     return f"{reply}\n\n{notice}" if reply else notice
 
 
@@ -18043,6 +19539,8 @@ def _run_turn_sync(
     activity_callback: ActivityCallback | None = None,
     attachments: list[dict[str, str]] | None = None,
     allow_mini_agents: bool = True,
+    memory_owner: str | None = None,
+    reinforce_memory_context: bool = True,
 ) -> dict:
     """Run one agent turn synchronously (called from thread executor)."""
     try:
@@ -18080,6 +19578,7 @@ def _run_turn_sync(
     }
     turn_orchestrator = _orchestrator_for_admin_forced_model(orchestrator, runtime)
     turn_orchestrator = _orchestrator_for_video_attachments(turn_orchestrator, normalized_attachments)
+    turn_memory_owner = memory_owner or memory_owner_for_web_admin()
     web_task_frame_id, web_conversation_turn_id = _start_web_task_frame(
         runtime,
         conversation_id=conv_id,
@@ -18200,7 +19699,11 @@ def _run_turn_sync(
         }],
     })
 
-    memory_context = _web_memory_context(runtime)
+    memory_context = _web_memory_context(
+        runtime,
+        owner=turn_memory_owner,
+        reinforce=reinforce_memory_context,
+    )
     if memory_context:
         history_prefix.append({
             "role": "system",
@@ -18279,7 +19782,7 @@ def _run_turn_sync(
             user_message=user_text,
             assistant_reply=reply,
         )
-        _remember_web_explicit_memory(runtime, user_message=user_text)
+        _remember_web_explicit_memory(runtime, user_message=user_text, owner=turn_memory_owner)
         _emit_activity(activity_callback, "memory", "Saving conversation", "done")
         _finish_web_task_frame(
             runtime,
@@ -18411,6 +19914,7 @@ def _run_turn_sync(
         assistant_reply=final_text,
         tool_results=tool_results,
         conversation_id=conv_id,
+        memory_owner=turn_memory_owner,
     )
     _emit_activity(
         activity_callback,
@@ -18429,7 +19933,7 @@ def _run_turn_sync(
         assistant_reply=final_text,
         tool_results=tool_results,
     )
-    _remember_web_explicit_memory(runtime, user_message=user_text)
+    _remember_web_explicit_memory(runtime, user_message=user_text, owner=turn_memory_owner)
     _emit_activity(activity_callback, "memory", "Saving conversation", "done")
     _emit_activity(activity_callback, "respond", "Writing response", "running")
     _finish_web_task_frame(
@@ -18489,7 +19993,7 @@ def _run_web_server(args) -> None:
         runtime, orchestrator, registry = _build_runtime()
     except Exception as exc:
         print(f"\n  ✗  Could not start Nullion: {exc}", file=sys.stderr)
-        print("  →  Check your .env file and API keys.", file=sys.stderr)
+        print("  →  Check the Nullion logs for startup details.", file=sys.stderr)
         sys.exit(1)
 
     app = create_app(runtime, orchestrator, registry)

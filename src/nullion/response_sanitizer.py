@@ -36,6 +36,14 @@ _SENSITIVE_STRUCTURED_KEYS = {
     "tool_results",
 }
 
+_LOCAL_POSIX_PATH_RE = re.compile(
+    r"(?P<path>/(?:Users|home)/[^/\s`\"'<>:)]+/[^\s`\"'<>)]*)"
+)
+_LOCAL_WINDOWS_PATH_RE = re.compile(
+    r"(?P<path>[A-Za-z]:\\Users\\[^\\\s`\"'<>:)]+\\[^\s`\"'<>)]*)"
+)
+_PRESERVE_DIRECTIVE_PREFIXES = ("MEDIA:", "ARTIFACT:")
+
 
 def user_requested_raw_output(user_message: str | None) -> bool:
     """Free-form user text does not bypass raw payload protection."""
@@ -57,11 +65,47 @@ def sanitize_user_visible_reply(
     raw = str(reply)
     parsed = _parse_bare_structured_payload(raw)
     if parsed is None:
-        return reply
+        return _sanitize_local_paths(raw)
     results = list(tool_results or ())
     if not _looks_like_raw_tool_payload(parsed, results):
-        return reply
+        return _sanitize_local_paths(raw)
     return safe_raw_tool_payload_replacement(tool_results=results, source=source)
+
+
+def _sanitize_local_paths(text: str) -> str:
+    """Hide machine-local absolute paths in text that will be shown to users."""
+
+    redacted_lines: list[str] = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith(_PRESERVE_DIRECTIVE_PREFIXES):
+            redacted_lines.append(line)
+            continue
+        redacted = _LOCAL_POSIX_PATH_RE.sub(_local_posix_path_display, line)
+        redacted = _LOCAL_WINDOWS_PATH_RE.sub(_local_windows_path_display, redacted)
+        changed = changed or redacted != line
+        redacted_lines.append(redacted)
+    return "".join(redacted_lines) if changed else text
+
+
+def _local_posix_path_display(match: re.Match[str]) -> str:
+    path = match.group("path").rstrip(".,;:")
+    suffix = match.group("path")[len(path) :]
+    workspace_match = re.search(
+        r"/\.nullion/workspaces/[^/]+/(?P<kind>artifacts|files|media)/(?P<name>[^/\s`\"'<>)]*)$",
+        path,
+    )
+    if workspace_match:
+        return f"{workspace_match.group('kind')}/{workspace_match.group('name')}{suffix}"
+    return f"{Path(path).name or '[local path]'}{suffix}"
+
+
+def _local_windows_path_display(match: re.Match[str]) -> str:
+    path = match.group("path").rstrip(".,;:")
+    suffix = match.group("path")[len(path) :]
+    name = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return f"{name or '[local path]'}{suffix}"
 
 
 def safe_raw_tool_payload_replacement(

@@ -37,8 +37,9 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Iterable, Iterator
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -57,6 +58,8 @@ log = logging.getLogger(__name__)
 _DB_PATH = Path.home() / ".nullion" / "chat_history.db"
 _KEY_PATH = Path.home() / ".nullion" / "chat_history.key"
 _ENCRYPTED_PREFIX = "enc:v1:"
+CHAT_SQLITE_MEASURE_ENABLED = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
+CHAT_SQLITE_SLOW_MS = float(os.environ.get("NULLION_SQLITE_SLOW_MS", "250"))
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -81,6 +84,10 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_conv
     ON messages (conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_conv_id
+    ON messages (conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_created_conv
+    ON messages (created_at, conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_status
     ON conversations (status, last_message_at);
 """
@@ -88,6 +95,8 @@ CREATE INDEX IF NOT EXISTS idx_conversations_status
 _POST_MIGRATION_DDL = """
 CREATE INDEX IF NOT EXISTS idx_conversations_channel
     ON conversations (channel, last_message_at);
+CREATE INDEX IF NOT EXISTS idx_conversations_status_channel_last
+    ON conversations (status, channel, last_message_at);
 """
 
 _MAX_TITLE_LEN = 60
@@ -104,6 +113,31 @@ _MESSAGE_MIGRATION_COLUMNS = [
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _log_chat_sqlite_timing(
+    operation: str,
+    started_at: float,
+    path: Path,
+    *,
+    rows: int | None = None,
+) -> None:
+    if not CHAT_SQLITE_MEASURE_ENABLED:
+        return
+    elapsed_ms = (perf_counter() - started_at) * 1000
+    row_suffix = "" if rows is None else f" rows={rows}"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    message = (
+        "chat SQLite %s took %.1fms path=%s size_bytes=%s%s"
+        % (operation, elapsed_ms, path.name, size, row_suffix)
+    )
+    if elapsed_ms >= CHAT_SQLITE_SLOW_MS:
+        log.warning(message)
+    else:
+        log.debug(message)
 
 
 def _make_title(text: str) -> str:
@@ -123,6 +157,15 @@ def _channel_label_for_conversation(conversation_id: str) -> str:
     if conversation_id.startswith("discord:"):
         return f"Discord · {conversation_id.removeprefix('discord:')}"
     return conversation_id
+
+
+def _month_bounds(year_month: str) -> tuple[str, str]:
+    year, month = (int(part) for part in year_month.split("-", 1))
+    if month == 12:
+        next_year, next_month = year + 1, 1
+    else:
+        next_year, next_month = year, month + 1
+    return f"{year:04d}-{month:02d}-01", f"{next_year:04d}-{next_month:02d}-01"
 
 
 class ChatStore:
@@ -342,6 +385,7 @@ class ChatStore:
 
         Optionally filter by ``channel`` (e.g. ``'web'`` or ``'telegram:123'``).
         """
+        started_at = perf_counter()
         with self._connect() as conn:
             if channel is None:
                 rows = conn.execute(
@@ -365,7 +409,9 @@ class ChatStore:
                        LIMIT ?""",
                     (status, channel, limit),
                 ).fetchall()
-            return [self._decrypt_row(r) for r in rows]
+            results = [self._decrypt_row(r) for r in rows]
+            _log_chat_sqlite_timing("list_conversations", started_at, self._path, rows=len(results))
+            return results
 
     def list_channels(self) -> list[dict]:
         """Return distinct channels with metadata, ordered by most-recently active.
@@ -376,6 +422,7 @@ class ChatStore:
             conversation_count -- number of non-cleared conversations on this channel
             last_message_at    -- ISO-8601 timestamp of the most recent message
         """
+        started_at = perf_counter()
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT channel, channel_label,
@@ -386,7 +433,9 @@ class ChatStore:
                    GROUP BY channel
                    ORDER BY last_message_at DESC"""
             ).fetchall()
-            return [self._decrypt_row(r) for r in rows]
+            results = [self._decrypt_row(r) for r in rows]
+            _log_chat_sqlite_timing("list_channels", started_at, self._path, rows=len(results))
+            return results
 
     def calendar_days(self, channel: str, year_month: str) -> dict[str, int]:
         """Return a map of ``'YYYY-MM-DD'`` → message count for the given channel/month.
@@ -397,17 +446,20 @@ class ChatStore:
         import re as _re
         if not _re.fullmatch(r"\d{4}-\d{2}", year_month):
             raise ValueError(f"year_month must be in YYYY-MM format, got {year_month!r}")
-        like_pattern = year_month + "-%"
+        started_at = perf_counter()
+        start_date, end_date = _month_bounds(year_month)
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT date(m.created_at) AS day, COUNT(m.id) AS msg_count
                    FROM messages m
                    JOIN conversations c ON c.id = m.conversation_id
-                   WHERE c.channel = ? AND date(m.created_at) LIKE ?
+                   WHERE c.channel = ? AND m.created_at >= ? AND m.created_at < ?
                    GROUP BY day""",
-                (channel, like_pattern),
+                (channel, start_date, end_date),
             ).fetchall()
-            return {row["day"]: row["msg_count"] for row in rows}
+            results = {row["day"]: row["msg_count"] for row in rows}
+            _log_chat_sqlite_timing("calendar_days", started_at, self._path, rows=len(results))
+            return results
 
     def list_conversations_for_channel_date(
         self, channel: str, date: str
@@ -417,6 +469,12 @@ class ChatStore:
         ``date`` must be in ``'YYYY-MM-DD'`` format.  Each entry includes a
         ``message_count`` field reflecting the number of messages on that day.
         """
+        started_at = perf_counter()
+        start_date = date
+        year, month, day = (int(part) for part in date.split("-", 2))
+        # Avoid date(m.created_at) in the WHERE clause so SQLite can use
+        # created_at indexes.
+        end_date_text = (datetime(year, month, day, tzinfo=timezone.utc) + timedelta(days=1)).date().isoformat()
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT c.id, c.title, c.channel, c.channel_label,
@@ -424,12 +482,19 @@ class ChatStore:
                           COUNT(m.id) AS message_count
                    FROM conversations c
                    JOIN messages m ON m.conversation_id = c.id
-                   WHERE c.channel = ? AND date(m.created_at) = ?
+                   WHERE c.channel = ? AND m.created_at >= ? AND m.created_at < ?
                    GROUP BY c.id
                    ORDER BY MIN(m.created_at) ASC""",
-                (channel, date),
+                (channel, start_date, end_date_text),
             ).fetchall()
-            return [self._decrypt_row(r) for r in rows]
+            results = [self._decrypt_row(r) for r in rows]
+            _log_chat_sqlite_timing(
+                "list_conversations_for_channel_date",
+                started_at,
+                self._path,
+                rows=len(results),
+            )
+            return results
 
     def archive_conversation(self, conv_id: str) -> bool:
         """Mark a conversation as archived. Returns True if it existed."""
@@ -502,6 +567,7 @@ class ChatStore:
         """
         if not text or not text.strip():
             return -1
+        started_at = perf_counter()
         safe_text = redact_text(text)
         metadata_text = None
         if metadata:
@@ -525,6 +591,23 @@ class ChatStore:
                         "UPDATE conversations SET title = ? WHERE id = ?",
                         (self._encrypt_text(_make_title(safe_text)), conv_id),
                     )
+            latest = conn.execute(
+                """SELECT id, role, text, metadata, is_error
+                   FROM messages
+                   WHERE conversation_id = ?
+                   ORDER BY id DESC
+                   LIMIT 1""",
+                (conv_id,),
+            ).fetchone()
+            if latest is not None:
+                latest_metadata = self._decrypt_text(latest["metadata"]) if latest["metadata"] else None
+                if (
+                    latest["role"] == role
+                    and (self._decrypt_text(latest["text"]) or "") == safe_text
+                    and bool(latest["is_error"]) == bool(is_error)
+                    and latest_metadata == metadata_text
+                ):
+                    return latest["id"]
             # Insert message
             cur = conn.execute(
                 "INSERT INTO messages (conversation_id, role, text, metadata, is_error, created_at) "
@@ -543,7 +626,9 @@ class ChatStore:
                 "UPDATE conversations SET last_message_at = ? WHERE id = ?",
                 (now, conv_id),
             )
-            return cur.lastrowid  # type: ignore[return-value]
+            message_id = cur.lastrowid  # type: ignore[assignment]
+            _log_chat_sqlite_timing("save_message", started_at, self._path, rows=1)
+            return message_id  # type: ignore[return-value]
 
     def import_runtime_chat_turns(self, turns: Iterable[dict]) -> int:
         """Import messaging chat turns from the runtime event log.
@@ -626,6 +711,7 @@ class ChatStore:
 
     def load_messages(self, conv_id: str, limit: int = 300) -> list[dict]:
         """Return the last ``limit`` messages in ascending chronological order."""
+        started_at = perf_counter()
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT id, role, text, metadata, is_error, created_at
@@ -638,7 +724,9 @@ class ChatStore:
                    ORDER BY id ASC""",
                 (conv_id, limit),
             ).fetchall()
-            return [self._decrypt_row(r) for r in rows]
+            results = [self._decrypt_row(r) for r in rows]
+            _log_chat_sqlite_timing("load_messages", started_at, self._path, rows=len(results))
+            return results
 
     def message_count(self, conv_id: str) -> int:
         with self._connect() as conn:

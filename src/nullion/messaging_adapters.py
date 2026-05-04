@@ -26,6 +26,7 @@ from nullion.chat_attachments import guess_media_type
 from nullion.chat_text import make_markdown_tables_chat_readable
 from nullion.config import NullionSettings
 from nullion.remediation import remediation_buttons_for_recommendation_code
+from nullion.response_sanitizer import sanitize_user_visible_reply
 from nullion.users import is_authorized_messaging_identity, resolve_messaging_user
 from nullion.workspace_storage import workspace_storage_roots_for_principal
 from nullion.task_frames import TaskFrameStatus
@@ -677,6 +678,27 @@ def _is_deliverable_messaging_attachment(path: Path, *, principal_id: str | None
     return is_safe_artifact_path(path)
 
 
+def _resolve_messaging_attachment_path(path: Path, *, principal_id: str | None) -> Path:
+    if path.is_absolute():
+        return path
+    parts = path.parts
+    if not parts or parts[0] not in {"artifacts", "files", "media"}:
+        return path
+    try:
+        workspace_roots = workspace_storage_roots_for_principal(principal_id)
+    except Exception:
+        return path
+    root_by_name = {
+        "artifacts": workspace_roots.artifacts,
+        "files": workspace_roots.files,
+        "media": workspace_roots.media,
+    }
+    root = root_by_name.get(parts[0])
+    if root is None:
+        return path
+    return root.joinpath(*parts[1:]) if len(parts) > 1 else root
+
+
 def sanitize_external_inline_markup(text: str) -> str:
     """Strip lightweight HTML emphasis tags commonly copied from RSS/search results."""
     unescaped = html.unescape(text)
@@ -695,10 +717,12 @@ def split_reply_for_platform_delivery(
     return split_media_reply_attachments(
         str(reply),
         is_safe_attachment_path=lambda path: _is_deliverable_messaging_attachment(path, principal_id=principal_id),
+        resolve_attachment_path=lambda path: _resolve_messaging_attachment_path(path, principal_id=principal_id),
     )
 
 
 _PLAIN_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[^\s`'\"<>|]+)")
+_BUILDER_SKILL_MARKER_PREFIX = "::builder-skill::"
 
 
 def text_or_attachments_expect_attachment_delivery(
@@ -756,12 +780,6 @@ def delivery_contract_for_turn(
             allow_plain_paths=False,
             required_attachment_extensions=required_extensions,
         )
-    if inbound_attachments and _plain_candidate_paths_from_text(str(reply or "")):
-        return DeliveryContract.attachment_required(
-            source="uploaded_file_output",
-            allow_plain_paths=True,
-            required_attachment_extensions=required_extensions,
-        )
     return DeliveryContract.message_only()
 
 
@@ -798,7 +816,7 @@ def _extension_for_artifact_kind(artifact_kind: object) -> str | None:
     if extension is not None:
         return extension
     direct_extension = f".{normalized}"
-    if direct_extension in set(ATTACHMENT_TOKEN_EXTENSIONS.values()):
+    if re.fullmatch(r"\.[a-z0-9]{1,16}", direct_extension):
         return direct_extension
     return None
 
@@ -890,10 +908,15 @@ def _caption_without_attached_paths(text: str, attachment_paths: tuple[Path, ...
     caption_lines: list[str] = []
     for raw_line in str(text or "").splitlines():
         line = raw_line
+        removed_path = False
         for path_text in path_texts:
+            if path_text in line:
+                removed_path = True
             line = line.replace(path_text, "")
         stripped = line.strip()
         if not stripped:
+            continue
+        if removed_path and not stripped.strip("`'\"<>[]() "):
             continue
         if stripped.rstrip(":").strip().lower() in {
             "attachment/artifact link",
@@ -909,6 +932,26 @@ def _caption_without_attached_paths(text: str, attachment_paths: tuple[Path, ...
     return caption or "Attached the requested file."
 
 
+def _strip_platform_internal_markers(text: str) -> str:
+    lines = [
+        line
+        for line in str(text or "").splitlines()
+        if not line.strip().startswith(_BUILDER_SKILL_MARKER_PREFIX)
+    ]
+    return "\n".join(lines).strip()
+
+
+def _sanitize_platform_visible_text(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return sanitize_user_visible_reply(
+        user_message=None,
+        reply=text,
+        tool_results=None,
+        source="platform_delivery",
+    ) or text
+
+
 def prepare_reply_for_platform_delivery(
     reply: str | None,
     *,
@@ -919,6 +962,7 @@ def prepare_reply_for_platform_delivery(
     if reply is None:
         return PlatformDelivery(text=None, attachments=())
     text = make_markdown_tables_chat_readable(sanitize_external_inline_markup(str(reply)))
+    text = _strip_platform_internal_markers(text)
     if delivery_contract is None:
         if allow_attachments is False:
             delivery_contract = DeliveryContract.message_only()
@@ -932,7 +976,11 @@ def prepare_reply_for_platform_delivery(
     media_candidates = media_candidate_paths_from_text(text)
     caption, attachments = split_reply_for_platform_delivery(text, principal_id=principal_id)
     if media_candidates and not delivery_contract.allow_attachment_delivery:
-        return PlatformDelivery(text=caption if caption else None, attachments=(), media_directive_count=0)
+        return PlatformDelivery(
+            text=_sanitize_platform_visible_text(caption if caption else None),
+            attachments=(),
+            media_directive_count=0,
+        )
     if (
         not media_candidates
         and delivery_contract.allow_attachment_delivery
@@ -946,8 +994,9 @@ def prepare_reply_for_platform_delivery(
         )
         plain_attachments = _attachments_matching_contract(plain_attachments, delivery_contract)
         if plain_attachments:
+            visible_text = _caption_without_attached_paths(text, plain_attachments)
             return PlatformDelivery(
-                text=_caption_without_attached_paths(text, plain_attachments),
+                text=_sanitize_platform_visible_text(visible_text),
                 attachments=plain_attachments,
                 media_directive_count=len(plain_attachments),
             )
@@ -959,7 +1008,7 @@ def prepare_reply_for_platform_delivery(
                 media_directive_count=1,
                 unavailable_attachment_count=1,
             )
-        return PlatformDelivery(text=text if text else None, attachments=())
+        return PlatformDelivery(text=_sanitize_platform_visible_text(text if text else None), attachments=())
     attachments = _attachments_matching_contract(attachments, delivery_contract)
     unavailable_count = max(0, len(media_candidates) - len(attachments))
     if not attachments:
@@ -969,13 +1018,14 @@ def prepare_reply_for_platform_delivery(
             media_directive_count=len(media_candidates),
             unavailable_attachment_count=unavailable_count or len(media_candidates),
         )
-    delivery_text = caption
+    delivery_text = _caption_without_attached_paths(caption, attachments) if caption else None
+    delivery_text = _sanitize_platform_visible_text(delivery_text)
     if unavailable_count:
         suffix = (
             f"I attached {len(attachments)} file{'s' if len(attachments) != 1 else ''}, "
             f"but {unavailable_count} attachment{'s were' if unavailable_count != 1 else ' was'} unavailable."
         )
-        delivery_text = f"{caption}\n\n{suffix}" if caption else suffix
+        delivery_text = f"{delivery_text}\n\n{suffix}" if delivery_text else suffix
     return PlatformDelivery(
         text=delivery_text,
         attachments=attachments,

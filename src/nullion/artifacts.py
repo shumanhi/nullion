@@ -30,6 +30,7 @@ _BLOCKED_DOWNLOAD_SUFFIXES = frozenset(
 _MEDIA_DIRECTIVE_PREFIX = "MEDIA:"
 _ARTIFACT_DIRECTIVE_PREFIX = "ARTIFACT:"
 _ATTACHMENT_DIRECTIVE_PREFIXES = (_MEDIA_DIRECTIVE_PREFIX, _ARTIFACT_DIRECTIVE_PREFIX)
+_ATTACHMENT_DIRECTIVE_WORDS = ("MEDIA", "ARTIFACT")
 _MEDIA_DIRECTIVE_STRIP_CHARS = "\ufeff\u200b\u200c\u200d"
 _ARTIFACT_MEDIA_TYPES_BY_SUFFIX = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -179,6 +180,23 @@ def parse_media_directive_line(raw_line: str) -> MediaDirective | None:
             directive_prefix = prefix
             media_index = candidate_index
     if media_index < 0 or not directive_prefix:
+        for word in _ATTACHMENT_DIRECTIVE_WORDS:
+            word_index = line.find(f"{word} ")
+            if word_index < 0:
+                continue
+            candidate_prefix = line[:word_index].strip()
+            if candidate_prefix and candidate_prefix.lstrip("-*•> ").strip():
+                continue
+            attachment_path = line[word_index + len(word) :].strip().split(maxsplit=1)[0].strip("`'\"<>")
+            if not _looks_like_attachment_path(attachment_path):
+                continue
+            raw_text = str(raw_line or "")
+            raw_media_index = raw_text.find(word)
+            prefix = raw_text[:raw_media_index].strip() if raw_media_index >= 0 else ""
+            prefix = prefix.lstrip(_MEDIA_DIRECTIVE_STRIP_CHARS).strip()
+            if prefix and not prefix.lstrip("-*•> ").strip():
+                prefix = ""
+            return MediaDirective(path=Path(attachment_path), prefix=prefix)
         return None
     raw_text = str(raw_line or "")
     raw_media_index = raw_text.find(directive_prefix)
@@ -193,33 +211,78 @@ def parse_media_directive_line(raw_line: str) -> MediaDirective | None:
     return MediaDirective(path=Path(attachment_path), prefix=prefix)
 
 
+def _looks_like_attachment_path(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    first_part = text.replace("\\", "/").split("/", 1)[0]
+    if first_part in {"artifacts", "files", "media"}:
+        return True
+    if text.startswith(("/", "~")):
+        return True
+    if text.startswith("file:"):
+        return True
+    return len(text) >= 3 and text[1:3] in {":\\", ":/"} and text[0].isalpha()
+
+
 def media_candidate_paths_from_text(text: str) -> list[Path]:
     paths: list[Path] = []
     for raw_line in str(text or "").splitlines():
         directive = parse_media_directive_line(raw_line)
         if directive is not None:
             paths.append(directive.path)
-    return paths
+    lines = str(text or "").splitlines()
+    index = 0
+    while index < len(lines):
+        current = lines[index].strip().lstrip(_MEDIA_DIRECTIVE_STRIP_CHARS).strip()
+        following = lines[index + 1].strip().strip("`'\"<>") if index + 1 < len(lines) else ""
+        if current in {"MEDIA", "ARTIFACT"} and following:
+            paths.append(Path(following))
+            index += 2
+            continue
+        index += 1
+    return list(dict.fromkeys(paths))
 
 
 def split_media_reply_attachments(
     reply: str,
     *,
     is_safe_attachment_path,
+    resolve_attachment_path=None,
 ) -> tuple[str | None, tuple[Path, ...]]:
+    def _resolve(path: Path) -> Path:
+        if resolve_attachment_path is None:
+            return path
+        resolved = resolve_attachment_path(path)
+        return resolved if isinstance(resolved, Path) else path
+
     caption_lines: list[str] = []
     attachment_paths: list[Path] = []
-    for raw_line in str(reply or "").splitlines():
+    lines = str(reply or "").splitlines()
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
         directive = parse_media_directive_line(raw_line)
         if directive is None:
+            current = raw_line.strip().lstrip(_MEDIA_DIRECTIVE_STRIP_CHARS).strip()
+            following = lines[index + 1].strip().strip("`'\"<>") if index + 1 < len(lines) else ""
+            if current in {"MEDIA", "ARTIFACT"} and following:
+                split_path = _resolve(Path(following))
+                if is_safe_attachment_path(split_path) and split_path.is_file():
+                    attachment_paths.append(split_path)
+                    index += 2
+                    continue
             caption_lines.append(raw_line)
+            index += 1
             continue
         if directive.prefix:
             caption_lines.append(directive.prefix)
-        if is_safe_attachment_path(directive.path):
-            if directive.path.is_file():
-                attachment_paths.append(directive.path)
+        attachment_path = _resolve(directive.path)
+        if is_safe_attachment_path(attachment_path):
+            if attachment_path.is_file():
+                attachment_paths.append(attachment_path)
             else:
-                caption_lines.append(f"Attachment unavailable: {directive.path.name or 'file'}")
+                caption_lines.append(f"Attachment unavailable: {attachment_path.name or directive.path.name or 'file'}")
+        index += 1
     caption = "\n".join(caption_lines).strip() or None
-    return caption, tuple(attachment_paths)
+    return caption, tuple(dict.fromkeys(attachment_paths))

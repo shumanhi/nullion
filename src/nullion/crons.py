@@ -1,6 +1,7 @@
 """Cron job management for Nullion.
 
-Jobs are persisted to ~/.nullion/crons.json.
+Jobs are persisted in runtime.db and mirrored to ~/.nullion/crons.json for
+older installs.
 A CronScheduler background thread ticks every 30 s, fires due jobs by
 calling the caller-supplied fire_fn(job), then updates last_run / next_run.
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -29,7 +31,10 @@ from typing import Callable
 log = logging.getLogger(__name__)
 
 _CRONS_PATH = Path.home() / ".nullion" / "crons.json"
+_RUNTIME_DB_PATH: Path | None = None
 _DEFAULT_WORKSPACE_ID = "workspace_admin"
+_CRON_COLLECTION = "cron_jobs"
+_CRON_TABLE = "reminders_crons"
 
 # ── Data model ─────────────────────────────────────────────────────────────────
 
@@ -150,7 +155,30 @@ def _fallback_next_run(schedule: str, after: datetime) -> str | None:
 
 # ── Storage ────────────────────────────────────────────────────────────────────
 
-def load_crons() -> list[CronJob]:
+def _runtime_db_path() -> Path:
+    if _RUNTIME_DB_PATH is not None:
+        return _RUNTIME_DB_PATH
+    return _CRONS_PATH.with_name("runtime.db")
+
+
+def _ensure_cron_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_CRON_TABLE} (
+            collection TEXT NOT NULL,
+            item_key   TEXT NOT NULL,
+            payload    TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (collection, item_key)
+        )
+        """
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{_CRON_TABLE}_collection ON {_CRON_TABLE} (collection)"
+    )
+
+
+def _load_crons_json() -> list[CronJob]:
     try:
         data = json.loads(_CRONS_PATH.read_text())
         return [CronJob.from_dict(d) for d in data]
@@ -161,6 +189,40 @@ def load_crons() -> list[CronJob]:
         return []
 
 
+def _load_crons_db() -> list[CronJob] | None:
+    db_path = _runtime_db_path()
+    if not db_path.exists():
+        return None
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            _ensure_cron_table(conn)
+            rows = conn.execute(
+                f"SELECT payload FROM {_CRON_TABLE} WHERE collection = ? ORDER BY rowid",
+                (_CRON_COLLECTION,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        log.warning("Failed to load crons from runtime DB %s: %s", db_path, exc)
+        return None
+    return [CronJob.from_dict(json.loads(str(row["payload"]))) for row in rows]
+
+
+def load_crons() -> list[CronJob]:
+    db_jobs = _load_crons_db()
+    if db_jobs is not None:
+        if db_jobs:
+            return db_jobs
+        legacy_jobs = _load_crons_json()
+        if legacy_jobs:
+            save_crons(legacy_jobs)
+            return legacy_jobs
+        return []
+    legacy_jobs = _load_crons_json()
+    if legacy_jobs:
+        save_crons(legacy_jobs)
+    return legacy_jobs
+
+
 def list_crons(*, workspace_id: str | None = None) -> list[CronJob]:
     jobs = load_crons()
     if workspace_id is None:
@@ -169,11 +231,39 @@ def list_crons(*, workspace_id: str | None = None) -> list[CronJob]:
     return [job for job in jobs if (job.workspace_id or _DEFAULT_WORKSPACE_ID) == requested_workspace]
 
 
-def save_crons(jobs: list[CronJob]) -> None:
+def _save_crons_json(jobs: list[CronJob]) -> None:
     _CRONS_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _CRONS_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps([j.to_dict() for j in jobs], indent=2))
     tmp.replace(_CRONS_PATH)
+
+
+def _save_crons_db(jobs: list[CronJob]) -> bool:
+    db_path = _runtime_db_path()
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(str(db_path), timeout=10) as conn:
+            _ensure_cron_table(conn)
+            conn.execute(f"DELETE FROM {_CRON_TABLE} WHERE collection = ?", (_CRON_COLLECTION,))
+            for job in jobs:
+                conn.execute(
+                    f"""INSERT OR REPLACE INTO {_CRON_TABLE}
+                        (collection, item_key, payload, updated_at)
+                        VALUES (?, ?, ?, ?)""",
+                    (_CRON_COLLECTION, job.id, json.dumps(job.to_dict(), sort_keys=True), now),
+                )
+        return True
+    except sqlite3.Error as exc:
+        log.warning("Failed to save crons to runtime DB %s: %s", db_path, exc)
+        return False
+
+
+def save_crons(jobs: list[CronJob]) -> None:
+    saved_to_db = _save_crons_db(jobs)
+    _save_crons_json(jobs)
+    if saved_to_db:
+        log.debug("Saved %d cron(s) to runtime DB and legacy JSON mirror.", len(jobs))
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────

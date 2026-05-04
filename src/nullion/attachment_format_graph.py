@@ -7,35 +7,54 @@ from functools import lru_cache
 import json
 import re
 from typing import TypedDict
+from urllib.parse import urlparse
 
 from langgraph.graph import END, START, StateGraph
 
 
 ATTACHMENT_TOKEN_EXTENSIONS: dict[str, str] = {
+    "aac": ".aac",
+    "avi": ".avi",
     "csv": ".csv",
     "doc": ".docx",
     "docx": ".docx",
+    "flac": ".flac",
     "gif": ".gif",
     "htm": ".html",
     "html": ".html",
     "jpeg": ".jpg",
     "jpg": ".jpg",
     "json": ".json",
+    "m4a": ".m4a",
+    "m4v": ".m4v",
     "markdown": ".md",
     "md": ".md",
+    "mkv": ".mkv",
+    "mov": ".mov",
+    "mp3": ".mp3",
+    "mp4": ".mp4",
+    "mpeg": ".mpeg",
+    "mpg": ".mpg",
+    "oga": ".oga",
+    "ogg": ".ogg",
+    "opus": ".opus",
     "pdf": ".pdf",
     "png": ".png",
     "ppt": ".pptx",
     "pptx": ".pptx",
     "svg": ".svg",
     "txt": ".txt",
+    "wav": ".wav",
+    "weba": ".weba",
     "webp": ".webp",
+    "webm": ".webm",
     "xls": ".xlsx",
     "xlsx": ".xlsx",
     "yaml": ".yaml",
     "yml": ".yaml",
 }
 VALID_ATTACHMENT_EXTENSIONS: tuple[str, ...] = tuple(sorted(set(ATTACHMENT_TOKEN_EXTENSIONS.values())))
+_GENERIC_EXTENSION_RE = re.compile(r"^\.[A-Za-z0-9]{1,16}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +139,7 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                         "properties": {
                             "extension": {
                                 "anyOf": [
-                                    {"type": "string", "enum": list(VALID_ATTACHMENT_EXTENSIONS)},
+                                    {"type": "string", "pattern": r"^\.[A-Za-z0-9]{1,16}$"},
                                     {"type": "null"},
                                 ]
                             },
@@ -135,7 +154,7 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
             system=(
                 "Identify whether this user request specifies a required attachment file format. "
                 "Call select_attachment_format with the result. "
-                f"extension must be one of {list(VALID_ATTACHMENT_EXTENSIONS)} or null. "
+                "extension must be a literal file extension such as .pdf, .html, or .blend, or null. "
                 "Use null when no attachment file format is specified."
             ),
         )
@@ -150,16 +169,77 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
     normalized = str(extension or "").strip().lower()
     if normalized and not normalized.startswith("."):
         normalized = f".{normalized}"
-    if normalized not in VALID_ATTACHMENT_EXTENSIONS:
+    if _GENERIC_EXTENSION_RE.fullmatch(normalized) is None:
         return None
     return AttachmentFormatPlan(extension=normalized, evidence="model_structured_output")
 
 
+def _token_around(text: str, start: int, end: int) -> str:
+    left = start
+    while left > 0 and not text[left - 1].isspace():
+        left -= 1
+    right = end
+    while right < len(text) and not text[right].isspace():
+        right += 1
+    return text[left:right].strip("`'\"<>(),;:")
+
+
+def _extension_candidate_priority(token: str) -> int:
+    parts = tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
+    if "artifacts" in parts:
+        return 0
+    if "files" in parts:
+        return 2
+    return 1
+
+
+def _extension_from_match(token: str, raw_extension: str) -> str | None:
+    normalized = raw_extension.lower()
+    mapped = ATTACHMENT_TOKEN_EXTENSIONS.get(normalized)
+    parsed = urlparse(token.split("=", 1)[-1] if "://" in token else token)
+    if parsed.scheme and parsed.netloc:
+        path_suffix = ""
+        path_match = re.search(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", parsed.path)
+        if path_match is not None:
+            path_suffix = f".{path_match.group(1).lower()}"
+        if not path_suffix:
+            return None
+        if mapped is not None:
+            return mapped if path_suffix == mapped else None
+        extension = f".{normalized}"
+        return extension if path_suffix == extension and _GENERIC_EXTENSION_RE.fullmatch(extension) else None
+    if "://" in token:
+        return None
+    if mapped is not None:
+        return mapped
+    extension = f".{normalized}"
+    if _GENERIC_EXTENSION_RE.fullmatch(extension) is None:
+        return None
+    parts = tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
+    has_path_evidence = (
+        token.startswith(".")
+        or "/" in token
+        or "\\" in token
+        or "artifacts" in parts
+        or "files" in parts
+    )
+    return extension if has_path_evidence else None
+
+
 def _explicit_extensions(text: str) -> list[str]:
+    candidates: list[tuple[int, int, str]] = []
+    value = str(text or "")
+    for index, match in enumerate(re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", value)):
+        if match.start() > 0 and value[match.start() - 1] == ".":
+            continue
+        token = _token_around(value, match.start(), match.end())
+        extension = _extension_from_match(token, match.group(1))
+        if extension is None:
+            continue
+        candidates.append((_extension_candidate_priority(token), index, extension))
     seen: list[str] = []
-    for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(text or "")):
-        extension = ATTACHMENT_TOKEN_EXTENSIONS.get(match.group(1).lower())
-        if extension is not None and extension not in seen:
+    for _priority, _index, extension in sorted(candidates):
+        if extension not in seen:
             seen.append(extension)
     return seen
 

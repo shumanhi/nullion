@@ -143,7 +143,7 @@ def _required_extension_for_artifact_kind(artifact_kind: str | None) -> str | No
     if extension is not None:
         return extension
     direct_extension = f".{normalized}"
-    if direct_extension in set(ATTACHMENT_TOKEN_EXTENSIONS.values()):
+    if re.fullmatch(r"\.[a-z0-9]{1,16}", direct_extension):
         return direct_extension
     return None
 
