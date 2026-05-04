@@ -745,6 +745,7 @@ def _nullion_ctl_impl() -> None:
               nullion --status        show service and tray status
               nullion tray install    install/start the tray icon
               nullion update          safe update with auto-rollback
+              nullion repair windows-install
               nullion uninstall       remove services, data, and installed package
         """),
     )
@@ -780,6 +781,13 @@ def _nullion_ctl_impl() -> None:
     uninstall.add_argument("--yes", "-y", action="store_true", help="Do not prompt for confirmation")
     uninstall.add_argument("--dry-run", action="store_true", help="Show what would be removed without deleting anything")
     uninstall.add_argument("--keep-data", action="store_true", help="Remove services/package but keep ~/.nullion data")
+    repair = sub.add_parser("repair", help="Repair a broken installed Nullion environment")
+    repair_sub = repair.add_subparsers(dest="repair_command")
+    windows_repair = repair_sub.add_parser("windows-install", help="Repair Windows update/launcher damage")
+    windows_repair.add_argument("--ref", default="origin/main", help="Git ref to reset the installed source to")
+    windows_repair.add_argument("--no-fetch", action="store_true", help="Skip git fetch before resetting")
+    windows_repair.add_argument("--no-start", action="store_true", help="Repair tasks without starting services")
+    windows_repair.add_argument("--dry-run", action="store_true", help="Show repair actions without changing files/tasks")
     tray = sub.add_parser("tray", help="Install, start, stop, or inspect the tray icon")
     tray_sub = tray.add_subparsers(dest="tray_command")
     tray_install = tray_sub.add_parser("install", help="Install and start the tray icon")
@@ -803,6 +811,17 @@ def _nullion_ctl_impl() -> None:
             dry_run=getattr(args, "dry_run", False),
             keep_data=getattr(args, "keep_data", False),
         )
+        return
+    if args.command == "repair":
+        if getattr(args, "repair_command", None) == "windows-install":
+            _run_windows_install_repair(
+                ref=getattr(args, "ref", "origin/main"),
+                fetch=not getattr(args, "no_fetch", False),
+                start=not getattr(args, "no_start", False),
+                dry_run=getattr(args, "dry_run", False),
+            )
+            return
+        repair.print_help()
         return
     if args.command == "tray":
         _run_tray_cli(getattr(args, "tray_command", None), port=getattr(args, "port", 8742))
@@ -915,6 +934,249 @@ def _run_uninstall_subprocess(command: list[str], *, dry_run: bool) -> None:
     if dry_run:
         return
     subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+_WINDOWS_REPAIR_TASKS: tuple[dict[str, object], ...] = (
+    {
+        "task": "Nullion Web Dashboard",
+        "bat": "start-nullion.bat",
+        "module": "nullion.web_app",
+        "args": ("--env-file", "{env}", "--checkpoint", "{checkpoint}"),
+        "stdout": "nullion.log",
+        "stderr": "nullion-error.log",
+    },
+    {
+        "task": "Nullion Tray",
+        "bat": "start-nullion-tray.bat",
+        "module": "nullion.tray_app",
+        "args": ("--env-file", "{env}"),
+        "stdout": "tray.log",
+        "stderr": "tray-error.log",
+    },
+    {
+        "task": "Nullion Telegram",
+        "bat": "start-nullion-telegram.bat",
+        "module": "nullion.telegram_entrypoint",
+        "args": ("--checkpoint", "{checkpoint}", "--env-file", "{env}"),
+        "stdout": "telegram.log",
+        "stderr": "telegram-error.log",
+    },
+)
+
+
+def _run_windows_install_repair(
+    *,
+    ref: str = "origin/main",
+    fetch: bool = True,
+    start: bool = True,
+    dry_run: bool = False,
+) -> None:
+    """Repair Windows installs damaged by interrupted pip/update entrypoint rewrites."""
+    if os.name != "nt":
+        raise SystemExit("windows-install repair is only supported on Windows.")
+    actions = _repair_windows_install(ref=ref, fetch=fetch, start=start, dry_run=dry_run)
+    print()
+    print("  Nullion Windows install repair")
+    print()
+    for action in actions:
+        print(f"  {action}")
+    print()
+    print("  Dry run complete." if dry_run else "  Repair complete.")
+
+
+def _repair_windows_install(
+    *,
+    ref: str = "origin/main",
+    fetch: bool = True,
+    start: bool = True,
+    dry_run: bool = False,
+) -> list[str]:
+    actions: list[str] = []
+    home = _NULLION_HOME
+    logs = _LOG_DIR
+    env_file = _ENV_FILE
+    checkpoint = home / "runtime.db"
+    source = _windows_repair_source_dir()
+    python = _windows_repair_python()
+    site_packages = _windows_repair_site_packages(python)
+
+    if not dry_run:
+        logs.mkdir(parents=True, exist_ok=True)
+    actions.extend(_stop_windows_repair_services(dry_run=dry_run))
+    actions.extend(_clean_windows_pip_leftovers(site_packages, dry_run=dry_run))
+    actions.extend(_reset_windows_repair_source(source, ref=ref, fetch=fetch, dry_run=dry_run))
+    actions.append(_write_windows_repair_pth(site_packages=site_packages, source=source, dry_run=dry_run))
+    actions.append(_install_windows_runtime_dependencies(python=python, source=source, dry_run=dry_run))
+    actions.extend(_write_windows_repair_wrappers(
+        python=python,
+        env_file=env_file,
+        checkpoint=checkpoint,
+        logs=logs,
+        dry_run=dry_run,
+    ))
+    actions.extend(_install_windows_repair_tasks(start=start, dry_run=dry_run))
+    return actions
+
+
+def _windows_repair_python() -> Path:
+    candidate = _NULLION_HOME / "venv" / "Scripts" / "python.exe"
+    return candidate if candidate.exists() else Path(sys.executable)
+
+
+def _windows_repair_source_dir() -> Path:
+    candidate = _NULLION_HOME / "venv" / "src" / "nullion"
+    if candidate.exists():
+        return candidate
+    try:
+        from nullion import updater
+
+        return updater._src_dir()
+    except Exception:
+        return candidate
+
+
+def _windows_repair_site_packages(python: Path) -> Path:
+    fallback = _NULLION_HOME / "venv" / "Lib" / "site-packages"
+    if not python.exists():
+        return fallback
+    result = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip())
+    return fallback
+
+
+def _stop_windows_repair_services(*, dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    for task in ("Nullion Web Dashboard", "Nullion Tray", "Nullion Telegram"):
+        subprocess.run(
+            ["schtasks", "/End", "/TN", task],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ) if not dry_run else None
+        actions.append(("Would stop" if dry_run else "Stopped") + f" Windows task {task}")
+    for image in ("nullion.exe", "nullion-cli.exe", "nullion-web.exe", "nullion-tray.exe", "nullion-telegram.exe", "nullion-webview.exe"):
+        subprocess.run(
+            ["taskkill", "/F", "/IM", image],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ) if not dry_run else None
+    actions.append(("Would stop" if dry_run else "Stopped") + " installed Nullion launcher processes")
+    return actions
+
+
+def _clean_windows_pip_leftovers(site_packages: Path, *, dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    if not site_packages.exists():
+        return [f"Skipped missing site-packages {site_packages}"]
+    for path in site_packages.iterdir():
+        if path.name.startswith("~"):
+            actions.append(_remove_path(path, dry_run=dry_run))
+    if not actions:
+        actions.append(f"No pip temporary leftovers found in {site_packages}")
+    return actions
+
+
+def _reset_windows_repair_source(source: Path, *, ref: str, fetch: bool, dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    if fetch:
+        if not dry_run:
+            subprocess.run(["git", "-C", str(source), "fetch", "origin", "main"], check=True)
+        actions.append(f"{'Would fetch' if dry_run else 'Fetched'} origin/main in {source}")
+    if not dry_run:
+        subprocess.run(["git", "-C", str(source), "reset", "--hard", ref], check=True)
+    actions.append(f"{'Would reset' if dry_run else 'Reset'} installed source to {ref}")
+    return actions
+
+
+def _write_windows_repair_pth(*, site_packages: Path, source: Path, dry_run: bool) -> str:
+    package_source = source / "src"
+    pth = site_packages / "nullion-editable-src.pth"
+    if not dry_run:
+        site_packages.mkdir(parents=True, exist_ok=True)
+        pth.write_text(str(package_source) + "\n", encoding="ascii")
+    return f"{'Would write' if dry_run else 'Wrote'} editable source path {pth}"
+
+
+def _install_windows_runtime_dependencies(*, python: Path, source: Path, dry_run: bool) -> str:
+    import tomllib
+
+    pyproject = source / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    project = data.get("project") if isinstance(data, dict) else {}
+    dependencies = project.get("dependencies") if isinstance(project, dict) else []
+    requirements = [str(item).strip() for item in dependencies if str(item).strip()]
+    if not requirements:
+        return "No runtime dependencies found to install"
+    if dry_run:
+        return f"Would install {len(requirements)} runtime dependencies without rewriting Nullion launchers"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".txt") as tmp:
+        tmp.write("\n".join(requirements) + "\n")
+        tmp_path = Path(tmp.name)
+    try:
+        subprocess.run([str(python), "-m", "pip", "install", "--quiet", "--no-cache-dir", "-r", str(tmp_path)], check=True)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return f"Installed {len(requirements)} runtime dependencies without rewriting Nullion launchers"
+
+
+def _quote_windows_batch_arg(value: str | Path) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _write_windows_repair_wrappers(
+    *,
+    python: Path,
+    env_file: Path,
+    checkpoint: Path,
+    logs: Path,
+    dry_run: bool,
+) -> list[str]:
+    actions: list[str] = []
+    replacements = {
+        "{env}": str(env_file),
+        "{checkpoint}": str(checkpoint),
+    }
+    for spec in _WINDOWS_REPAIR_TASKS:
+        bat = _NULLION_HOME / str(spec["bat"])
+        module = str(spec["module"])
+        module_args = [str(arg) for arg in spec["args"]]  # type: ignore[index]
+        expanded_args = [replacements.get(arg, arg) for arg in module_args]
+        stdout = logs / str(spec["stdout"])
+        stderr = logs / str(spec["stderr"])
+        command = " ".join([
+            _quote_windows_batch_arg(python),
+            "-m",
+            module,
+            *(_quote_windows_batch_arg(arg) for arg in expanded_args),
+        ])
+        content = f"@echo off\r\n{command} >> {_quote_windows_batch_arg(stdout)} 2>> {_quote_windows_batch_arg(stderr)}\r\n"
+        if not dry_run:
+            bat.write_text(content, encoding="ascii")
+        actions.append(f"{'Would write' if dry_run else 'Wrote'} wrapper {bat}")
+    return actions
+
+
+def _install_windows_repair_tasks(*, start: bool, dry_run: bool) -> list[str]:
+    actions: list[str] = []
+    for spec in _WINDOWS_REPAIR_TASKS:
+        task = str(spec["task"])
+        bat = _NULLION_HOME / str(spec["bat"])
+        if not dry_run:
+            subprocess.run(["schtasks", "/Delete", "/TN", task, "/F"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["schtasks", "/Create", "/TN", task, "/TR", f'"{bat}"', "/SC", "ONLOGON", "/RL", "LIMITED", "/F"], check=True)
+        actions.append(f"{'Would recreate' if dry_run else 'Recreated'} Windows task {task}")
+        if start:
+            if not dry_run:
+                subprocess.run(["schtasks", "/Run", "/TN", task], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            actions.append(f"{'Would start' if dry_run else 'Started'} Windows task {task}")
+    return actions
 
 
 def _tray_executable() -> Path | None:

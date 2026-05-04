@@ -39,6 +39,7 @@ Try:
 
 ```bash
 nullion-web
+nullion --dashboard
 open http://localhost:8742
 ```
 
@@ -173,6 +174,13 @@ Update safely:
 nullion update
 ```
 
+Use the repository-head channel when you need a commit that has not been
+released yet:
+
+```bash
+nullion update --hash
+```
+
 Or from chat:
 
 ```text
@@ -187,6 +195,16 @@ fail. Runtime state backups can be listed and restored with:
 /restore latest
 /restore <generation>
 ```
+
+On Windows, if an interrupted update leaves `~ullion` pip leftovers, missing
+launchers, broken scheduled tasks, or a locked `venv\Scripts\nullion.exe`, run:
+
+```powershell
+nullion repair windows-install
+```
+
+That command repairs the installed source pointer and recreates Web, Tray, and
+Telegram scheduled tasks without rewriting the locked console launcher.
 
 ## What to include in a bug report
 

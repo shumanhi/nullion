@@ -126,7 +126,33 @@ bash install.sh
 /skill-packs
 /backups
 /update
+nullion --dashboard
+nullion --web
+nullion --logs
+nullion --errors
+nullion --config
+nullion --status
+nullion --stop
+nullion --restart
+nullion --model gpt-5.5
+nullion --provider openai
+nullion update --hash
+nullion update --ignore-checks
+nullion repair windows-install
+nullion tray install
+nullion tray start
+nullion tray stop
+nullion tray status
+nullion-web
+nullion-webview
+nullion-cli --one-shot "Summarize my project"
+nullion-cli update --hash
+nullion-cli skill-pack enable openclaw/local-skills
+nullion-auth --reauth codex
 nullion-recovery status
+nullion-recovery backups
+nullion-recovery serve --port 8020
+nullion-recovery telegram
 ```
 
 The same operator command handler is used by Telegram and the web command path.

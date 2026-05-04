@@ -74,6 +74,7 @@ CLI:
 nullion-cli skill-pack install ~/.openclaw/workspace/skills --id openclaw/local-skills
 nullion-cli skill-pack install https://github.com/example/skills.git --id example/skills
 nullion-cli skill-pack list
+nullion-cli skill-pack enable openclaw/local-skills
 ```
 
 Web:
