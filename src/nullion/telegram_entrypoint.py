@@ -70,12 +70,6 @@ def _run_async_sync(factory) -> bool:
 def _resolve_browser_backend() -> str | None:
     if os.environ.get("NULLION_BROWSER_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
         return None
-    be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip()
-    if be:
-        return be
-    plugins_env = os.environ.get("NULLION_PLUGINS", "")
-    if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):
-        return "auto"
     try:
         from nullion.auth import load_stored_credentials
         creds = load_stored_credentials() or {}
@@ -84,6 +78,12 @@ def _resolve_browser_backend() -> str | None:
             return be
     except Exception:
         logger.debug("Unable to read stored browser backend credentials.", exc_info=True)
+    be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip().lower()
+    if be:
+        return be
+    plugins_env = os.environ.get("NULLION_PLUGINS", "")
+    if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):
+        return "auto"
     return None
 
 
@@ -463,7 +463,7 @@ def _build_runtime_service_from_settings(
     browser_backend = _resolve_browser_backend()
     if browser_backend:
         try:
-            os.environ.setdefault("NULLION_BROWSER_BACKEND", browser_backend)
+            os.environ["NULLION_BROWSER_BACKEND"] = browser_backend
             from nullion.plugins.browser_plugin import register_browser_tools
             register_browser_tools(active_tool_registry)
             logger.info("Browser plugin registered for Telegram (backend=%s)", browser_backend)

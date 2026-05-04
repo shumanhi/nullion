@@ -1244,9 +1244,28 @@ def _kill_existing_webview() -> None:
         return
     if existing_pid <= 0:
         return
-    # Try graceful TERM first, then a brief wait, then SIGKILL.
+    if os.name == "nt":
+        result = subprocess.run(
+            ["taskkill", "/PID", str(existing_pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode not in {0, 128}:
+            return
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        return
+
+    # Try graceful TERM first, then a brief wait, then SIGKILL when available.
     import signal
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    signals = [signal.SIGTERM]
+    sigkill = getattr(signal, "SIGKILL", None)
+    if sigkill is not None:
+        signals.append(sigkill)
+    for sig in signals:
         try:
             os.kill(existing_pid, sig)
         except ProcessLookupError:
