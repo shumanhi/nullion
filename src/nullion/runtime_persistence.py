@@ -258,6 +258,14 @@ _SQLITE_RUNTIME_TABLES: dict[str, str] = {
 }
 
 _SQLITE_TABLE_NAMES = tuple(dict.fromkeys(_SQLITE_RUNTIME_TABLES.values()))
+_SQLITE_RUNTIME_COLLECTIONS_BY_TABLE = {
+    table_name: tuple(
+        collection
+        for collection, collection_table_name in _SQLITE_RUNTIME_TABLES.items()
+        if collection_table_name == table_name
+    )
+    for table_name in _SQLITE_TABLE_NAMES
+}
 _ENCRYPTED_SQLITE_COLLECTIONS = frozenset({"user_facts", "preferences", "environment_facts"})
 
 
@@ -1643,8 +1651,9 @@ def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path) -> Path:
             "INSERT OR REPLACE INTO runtime_meta (key, value) VALUES (?, ?)",
             ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)),
         )
-        for table_name in _SQLITE_TABLE_NAMES:
-            conn.execute(f"DELETE FROM {table_name}")
+        for table_name, collections in _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE.items():
+            placeholders = ", ".join("?" for _ in collections)
+            conn.execute(f"DELETE FROM {table_name} WHERE collection IN ({placeholders})", collections)
         for collection in _RUNTIME_STORE_COLLECTION_KEYS:
             table_name = _SQLITE_RUNTIME_TABLES[collection]
             rows = payload.get(collection, [])

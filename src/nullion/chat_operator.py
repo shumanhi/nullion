@@ -1596,55 +1596,6 @@ def _artifact_paths_mentioned_in_reply(
     return list(dict.fromkeys(paths))
 
 
-def _artifact_paths_created_since(
-    runtime: PersistentRuntime,
-    *,
-    since: datetime,
-    principal_id: str | None = None,
-    required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
-) -> list[str]:
-    def _mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    required = tuple(
-        ext.lower() if str(ext).startswith(".") else f".{str(ext).lower()}"
-        for ext in (required_attachment_extensions or ())
-        if str(ext or "").strip()
-    )
-    threshold = since.timestamp() - 1.0
-    paths: list[str] = []
-    for artifact_root in (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)):
-        try:
-            candidates = [path for path in artifact_root.iterdir() if path.is_file()]
-        except OSError:
-            continue
-        candidates.sort(key=_mtime, reverse=True)
-        for path in candidates:
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            if stat.st_mtime < threshold:
-                break
-            if required and path.suffix.lower() not in required:
-                continue
-            descriptor = artifact_descriptor_for_path(path, artifact_root=artifact_root)
-            if descriptor is not None:
-                paths.append(descriptor.path)
-    return list(dict.fromkeys(paths))
-
-
-def _should_auto_attach_created_artifacts(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
-    for result in tool_results or ():
-        output = result.output if isinstance(result.output, dict) else {}
-        if output.get("foreground_auto_attach_created_artifacts") is False:
-            return False
-    return True
-
-
 def _should_suppress_foreground_reply(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
     for result in tool_results or ():
         output = result.output if isinstance(result.output, dict) else {}
@@ -2996,7 +2947,6 @@ def _render_chat_turn(
                 )
             elif not handled_by_mini_agents:
                 # Single-step: run directly as an orchestrator turn so the LLM decides
-                turn_started_at = datetime.now(UTC)
                 turn_result = agent_orchestrator.run_turn(
                     conversation_id=conversation_id,
                     principal_id=principal_id,
@@ -3015,17 +2965,6 @@ def _render_chat_turn(
                     reply = f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
                     turn_outcome = TurnOutcome.SUSPENDED
                 else:
-                    if _should_auto_attach_created_artifacts(turn_result.tool_results):
-                        turn_result.artifacts.extend(
-                            path
-                            for path in _artifact_paths_created_since(
-                                runtime,
-                                since=turn_started_at,
-                                principal_id=principal_id,
-                                required_attachment_extensions=requested_attachment_extensions,
-                            )
-                            if path not in turn_result.artifacts
-                        )
                     suppress_foreground_reply = _should_suppress_foreground_reply(turn_result.tool_results)
                     reply = "" if suppress_foreground_reply else turn_result.final_text or "Done."
                     if not suppress_foreground_reply:
@@ -3062,7 +3001,6 @@ def _render_chat_turn(
                             {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
                             {"role": "assistant", "content": [{"type": "text", "text": reply}]},
                         ]
-                        repair_started_at = datetime.now(UTC)
                         repair_result = agent_orchestrator.run_turn(
                             conversation_id=conversation_id,
                             principal_id=principal_id,
@@ -3081,17 +3019,6 @@ def _render_chat_turn(
                         else:
                             turn_result.tool_results.extend(list(repair_result.tool_results))
                             turn_result.artifacts.extend(list(repair_result.artifacts))
-                            if _should_auto_attach_created_artifacts(repair_result.tool_results):
-                                turn_result.artifacts.extend(
-                                    path
-                                    for path in _artifact_paths_created_since(
-                                        runtime,
-                                        since=repair_started_at,
-                                        principal_id=principal_id,
-                                        required_attachment_extensions=requested_attachment_extensions,
-                                    )
-                                    if path not in turn_result.artifacts
-                                )
                             reply = repair_result.final_text or reply
                             reply = _append_chat_artifacts_to_reply(
                                 runtime,
