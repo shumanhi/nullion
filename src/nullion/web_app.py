@@ -3601,12 +3601,6 @@ _HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Delivery receipts -->
-    <div class="dash-section">
-      <h3>Deliveries <span class="badge" id="delivery-count">0</span></h3>
-      <div id="deliveries-list"><div class="empty">No delivery failures</div></div>
-    </div>
-
     <!-- Pending approvals -->
     <div class="dash-section" id="approvals">
       <h3>Approvals <span class="badge" id="approval-count">0</span></h3>
@@ -7539,17 +7533,16 @@ function attentionPayload(data = {}) {
     ...(data.doctor_actions || []),
     ...(data.sentinel_escalations || []),
   ].filter(item => !doctorItemIsTerminal(item));
-  const deliveryIssues = (data.delivery_receipts || []).filter(item => ['failed', 'partial'].includes(String(item.status || '').toLowerCase()));
   const taskItems = [
     ...(data.task_frames || []).map(item => ({ ...item, attention_kind: 'frame' })),
     ...(data.mini_agent_tasks || []).map(item => ({ ...item, attention_kind: 'mini-agent' })),
   ].filter(item => ['waiting_approval', 'waiting_input', 'blocked', 'failed'].includes(String(item.status || '').toLowerCase()));
-  return { pendingApprovals, builderItems, doctorItems, deliveryIssues, taskItems };
+  return { pendingApprovals, builderItems, doctorItems, taskItems };
 }
 
 function attentionTotal(data = {}) {
   const payload = attentionPayload(data);
-  return payload.pendingApprovals.length + payload.builderItems.length + payload.doctorItems.length + payload.deliveryIssues.length + payload.taskItems.length;
+  return payload.pendingApprovals.length + payload.builderItems.length + payload.doctorItems.length + payload.taskItems.length;
 }
 
 function attentionSectionHtml(title, items, renderer) {
@@ -7573,18 +7566,6 @@ function builderItemCardHtml(p) {
     <div class="control-meta">${escHtml(p.summary || '')}</div>
     ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
     ${memoryActions}
-  </div>`;
-}
-
-function deliveryIssueCardHtml(item) {
-  const status = String(item.status || 'unknown').toLowerCase();
-  const timestamp = deliveryReceiptTimestamp(item);
-  return `<div class="control-card">
-    <div class="control-top"><span class="control-icon">📦</span><span class="control-title">${escHtml(deliveryReceiptTitle(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(status)}</span></div>
-    <div class="doctor-body">
-      <div class="doctor-note"><strong>Delivery boundary</strong>${escHtml(deliveryReceiptDetail(item))}</div>
-      ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
-    </div>
   </div>`;
 }
 
@@ -7615,7 +7596,6 @@ function renderAttentionModal(data = {}) {
       if (id) doctorItemCache.set(String(id), item);
       return doctorItemHtml(item);
     }),
-    attentionSectionHtml('Deliveries', payload.deliveryIssues, deliveryIssueCardHtml),
     attentionSectionHtml('Tasks', payload.taskItems, attentionTaskCardHtml),
   ].filter(Boolean).join('');
   body.innerHTML = total
@@ -8103,45 +8083,6 @@ function renderDoctor(data) {
   }
 }
 
-function deliveryReceiptTimestamp(item) {
-  const raw = item.created_at || item.updated_at || '';
-  if (!raw) return '';
-  const dt = new Date(raw);
-  if (!Number.isFinite(dt.getTime())) return String(raw);
-  return dt.toLocaleString();
-}
-
-function deliveryReceiptTitle(item) {
-  const channel = item.channel || 'unknown';
-  const target = item.target_id || 'unknown';
-  return `${channel}:${target}`;
-}
-
-function deliveryReceiptDetail(item) {
-  const parts = [];
-  const attachments = Number(item.attachment_count || 0);
-  parts.push(`${attachments} attachment${attachments === 1 ? '' : 's'}`);
-  parts.push(item.attachment_required ? 'required' : 'message');
-  const unavailable = Number(item.unavailable_attachment_count || 0);
-  if (unavailable) parts.push(`${unavailable} unavailable`);
-  if (item.error) parts.push(String(item.error));
-  return parts.join(' · ');
-}
-
-function renderDeliveryReceipts(items) {
-  const el = document.getElementById('deliveries-list');
-  const badge = document.getElementById('delivery-count');
-  if (!el || !badge) return;
-  const failures = (items || []).filter(item => ['failed', 'partial'].includes(String(item.status || '').toLowerCase()));
-  badge.textContent = failures.length;
-  badge.className = 'badge' + (failures.length ? ' yellow' : '');
-  if (!failures.length) {
-    el.innerHTML = '<div class="empty"><strong>Delivery clear</strong>No failed or partial platform deliveries in the latest receipts.</div>';
-    return;
-  }
-  renderDynamicList(el, failures, deliveryIssueCardHtml, { key: 'deliveries', title: `Delivery issues · ${failures.length}`, className: 'control-list' });
-}
-
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
 async function killTask(kind, id, title) {
@@ -8178,7 +8119,6 @@ async function refreshDashboard() {
     renderDecisionHistory(data.approvals || []);
     renderBuilder(data.builder_proposals || []);
     renderDoctor(data);
-    renderDeliveryReceipts(data.delivery_receipts || []);
     renderTasks(data.task_frames || [], data.mini_agent_tasks || []);
     renderSkills(data.skills || []);
     renderMemory(data.memory || []);
@@ -8245,8 +8185,6 @@ function renderCountChip(el, count, singular, tone) {
 function renderMission(data) {
   const approvals = (data.approvals || []).filter(a => approvalStatusValue(a.status) === 'pending');
   const health = data.health || {};
-  const deliveryHealth = data.delivery_health || {};
-  const deliveryIssues = Number(deliveryHealth.issue_count || 0);
   const attention = attentionTotal(data);
   const title = document.getElementById('mission-title');
   const subtitle = document.getElementById('mission-subtitle');
@@ -8262,10 +8200,6 @@ function renderMission(data) {
   if (title) title.textContent = 'Waiting for your next instruction';
   if (approvals.length) {
     if (subtitle) subtitle.textContent = `${approvals.length} request${approvals.length === 1 ? '' : 's'} need a decision before work can continue.`;
-  } else if (deliveryIssues) {
-    const issue = deliveryHealth.latest_issue || {};
-    const channel = issue.channel || 'a platform';
-    if (subtitle) subtitle.textContent = `${deliveryIssues} delivery issue${deliveryIssues === 1 ? '' : 's'} need review. Latest: ${channel}.`;
   } else {
     if (subtitle) subtitle.textContent = 'Nullion is idle, connected to its runtime store, and ready to plan, act, ask for approval, or remember context.';
   }
@@ -15411,17 +15345,6 @@ def create_app(runtime, orchestrator, registry):
             checkpoint_name = ""
         if checkpoint_name:
             health["checkpoint_name"] = checkpoint_name
-        delivery_receipts, _delivery_status_filter = _delivery_receipts_for_web(status="all", limit=10)
-        delivery_failures = [
-            receipt for receipt in delivery_receipts
-            if str(receipt.get("status") or "").lower() in {"failed", "partial"}
-        ]
-        delivery_health = {
-            "recent_count": len(delivery_receipts),
-            "issue_count": len(delivery_failures),
-            "latest_issue": delivery_failures[0] if delivery_failures else None,
-        }
-
         return JSONResponse({
             "approvals": approvals,
             "permission_grants": permission_grants,
@@ -15436,8 +15359,6 @@ def create_app(runtime, orchestrator, registry):
             "skills": skills,
             "memory": memory,
             "health": health,
-            "delivery_receipts": delivery_receipts,
-            "delivery_health": delivery_health,
             "tool_count": tool_count,
         })
 

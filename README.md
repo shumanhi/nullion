@@ -78,6 +78,35 @@ nullion uninstall
 
 Use `nullion uninstall --dry-run` to preview the cleanup, or `nullion uninstall --keep-data` to remove services while keeping `~/.nullion`.
 
+Useful local commands:
+
+```text
+nullion --dashboard          # open the dashboard; --web is also accepted
+nullion --logs               # tail live logs
+nullion --errors             # tail error logs
+nullion --config             # open ~/.nullion/.env in $EDITOR
+nullion --status             # show service and tray status
+nullion --stop               # stop background service and tray
+nullion --restart            # restart web, chat services, and tray
+nullion --model gpt-5.5      # switch model
+nullion --provider openai    # switch provider
+nullion tray install         # install/start tray companion
+nullion tray status          # inspect tray service
+nullion update               # update to the latest release
+nullion update --hash        # update to the latest repository commit
+nullion update --ignore-checks
+nullion repair windows-install
+nullion-cli --one-shot "Summarize my project"
+nullion-cli update --hash
+nullion-cli skill-pack enable openclaw/local-skills
+nullion-auth --reauth codex
+```
+
+On Windows, use `nullion repair windows-install` after a broken update leaves
+launcher scripts, scheduled tasks, or `~ullion` pip leftovers behind. It repairs
+the installed source pointer and recreates Web, Tray, and Telegram launch tasks
+without rewriting the locked `nullion.exe` launcher.
+
 ## License and security
 
 Nullion is released under the Apache License 2.0. See [LICENSE](LICENSE).
@@ -347,9 +376,12 @@ nullion-recovery status
 nullion-recovery services
 nullion-recovery restart telegram
 nullion-recovery restart all
+nullion-recovery backups
 nullion-recovery snapshot-config
 nullion-recovery restore runtime 0
 nullion-recovery restore config latest
+nullion-recovery serve --port 8020
+nullion-recovery telegram
 ```
 
 `nullion-recovery` is intentionally separate from the main web app and chat
@@ -387,6 +419,7 @@ Telegram mention form (`/help@<bot_username>`) is supported in group chats.
 
 ```bash
 nullion-web              # http://localhost:8742
+nullion-webview          # native window wrapper
 ```
 
 Provides a browser-based chat interface (left panel) and live dashboard (right panel) with approvals, tasks, skills, and health. No Telegram account required.
