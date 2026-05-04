@@ -15342,7 +15342,8 @@ def create_app(runtime, orchestrator, registry):
                     "title": "Agent memory is full",
                     "summary": (
                         f"{bucket_text}. Increase memory to keep more context, which can increase token usage, "
-                        "or run smart cleanup so Builder removes lower-strength memories first."
+                        "or run smart cleanup so Builder removes lower-strength memories first. "
+                        "Enable it so Builder can remove lower-strength memories automatically."
                     ),
                     "status": "warning",
                     "decision_type": "memory_full",
@@ -15353,6 +15354,7 @@ def create_app(runtime, orchestrator, registry):
                     "actions": {
                         "can_increase": bool(memory_pressure.get("can_increase")),
                         "smart_cleanup": True,
+                        "suggest_enable_smart_cleanup": True,
                     },
                     "memory_pressure": memory_pressure,
                 })
