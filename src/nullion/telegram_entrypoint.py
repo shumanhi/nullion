@@ -21,6 +21,7 @@ from nullion.artifacts import ensure_artifact_root
 from nullion.messaging_adapters import messaging_file_allowed_roots
 from nullion.providers import resolve_plugin_provider_kwargs
 from nullion.runtime import bootstrap_persistent_runtime
+from nullion.runtime_persistence import list_runtime_store_backups, restore_runtime_store_backup
 from nullion.telegram_app import build_messaging_operator_service, build_telegram_operator_service
 from nullion.tools import (
     SandboxLauncherTerminalExecutorBackend,
@@ -106,7 +107,7 @@ def _checkpoint_is_valid_sqlite(checkpoint: Path) -> bool:
     return bool(row and row[0] == "ok")
 
 
-def _recover_runtime_from_corrupt_checkpoint(checkpoint: Path, error: ValueError):
+def _recover_runtime_from_corrupt_checkpoint(checkpoint: Path, error: Exception):
     if not checkpoint.exists():
         raise error
 
@@ -127,12 +128,43 @@ def _recover_runtime_from_corrupt_checkpoint(checkpoint: Path, error: ValueError
         candidate = checkpoint.with_name(f"{checkpoint.name}.corrupt-{suffix}-{collision}")
     checkpoint.replace(candidate)
     logger.warning(
-        "Recovered from corrupt runtime checkpoint (checkpoint=%s, corrupt_backup=%s, error=%s)",
+        "Moved corrupt runtime checkpoint aside (checkpoint=%s, corrupt_backup=%s, error=%s)",
         checkpoint,
         candidate,
         error,
     )
-    return bootstrap_persistent_runtime(checkpoint)
+    for backup in list_runtime_store_backups(checkpoint):
+        if backup.get("kind") != "backup" or not backup.get("restorable"):
+            continue
+        restore_id = str(backup.get("restore_id", ""))
+        try:
+            restore_runtime_store_backup(checkpoint, generation=restore_id)
+        except Exception as restore_error:
+            logger.warning(
+                "Skipping runtime checkpoint backup during recovery "
+                "(checkpoint=%s, backup=%s, error=%s)",
+                checkpoint,
+                backup.get("name"),
+                restore_error,
+            )
+            continue
+        logger.warning(
+            "Recovered runtime checkpoint from backup "
+            "(checkpoint=%s, corrupt_backup=%s, restored_backup=%s)",
+            checkpoint,
+            candidate,
+            backup.get("name"),
+        )
+        return bootstrap_persistent_runtime(checkpoint)
+    logger.warning(
+        "No restorable runtime checkpoint backup found; starting with a new runtime "
+        "(checkpoint=%s, corrupt_backup=%s)",
+        checkpoint,
+        candidate,
+    )
+    runtime = bootstrap_persistent_runtime(checkpoint)
+    runtime.checkpoint()
+    return runtime
 
 
 
@@ -367,7 +399,7 @@ def _build_runtime_service_from_settings(
     settings = load_settings(env_path=env_path)
     try:
         runtime = bootstrap_persistent_runtime(checkpoint)
-    except ValueError as exc:
+    except (ValueError, sqlite3.Error) as exc:
         runtime = _recover_runtime_from_corrupt_checkpoint(checkpoint, exc)
     workspace_root = (
         Path(settings.workspace_root).expanduser()
