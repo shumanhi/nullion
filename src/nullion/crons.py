@@ -212,6 +212,17 @@ def _load_crons_json() -> list[CronJob]:
         return []
 
 
+def _has_crons_json_rows() -> bool:
+    try:
+        data = json.loads(_CRONS_PATH.read_text())
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        log.warning("Failed to inspect cron JSON mirror %s: %s", _CRONS_PATH, exc)
+        return False
+    return isinstance(data, list) and bool(data)
+
+
 def _load_crons_db_snapshot() -> tuple[list[CronJob], datetime | None] | None:
     db_path = _runtime_db_path()
     if not db_path.exists():
@@ -247,10 +258,24 @@ def load_crons() -> list[CronJob]:
     if db_snapshot is not None:
         db_jobs, db_updated_at = db_snapshot
         json_updated_at = _crons_json_mtime()
+        if not db_jobs and _has_crons_json_rows():
+            legacy_jobs = _load_crons_json()
+            save_crons(legacy_jobs)
+            log.warning(
+                "Runtime DB had no cron rows; restored %d cron(s) from legacy JSON mirror.",
+                len(legacy_jobs),
+            )
+            return legacy_jobs
         if json_updated_at is not None and (
             db_updated_at is None or json_updated_at > db_updated_at + _STORE_FRESHNESS_SKEW
         ):
             legacy_jobs = _load_crons_json()
+            if not legacy_jobs and db_jobs:
+                log.warning(
+                    "Ignoring newer empty cron JSON mirror because runtime DB still has %d cron(s).",
+                    len(db_jobs),
+                )
+                return db_jobs
             save_crons(legacy_jobs)
             log.info(
                 "Imported %d cron(s) from newer legacy JSON mirror into runtime DB.",
@@ -300,7 +325,17 @@ def _save_crons_db(jobs: list[CronJob]) -> bool:
         return False
 
 
-def save_crons(jobs: list[CronJob]) -> None:
+def _persisted_cron_count() -> int:
+    snapshot = _load_crons_db_snapshot()
+    db_count = 0 if snapshot is None else len(snapshot[0])
+    json_count = len(_load_crons_json())
+    return max(db_count, json_count)
+
+
+def save_crons(jobs: list[CronJob], *, allow_empty: bool = False) -> None:
+    if not jobs and not allow_empty and _persisted_cron_count() > 0:
+        log.error("Refusing to overwrite existing cron store with an implicit empty cron list.")
+        raise RuntimeError("Refusing to overwrite existing cron store with an implicit empty cron list.")
     saved_to_db = _save_crons_db(jobs)
     _save_crons_json(jobs)
     if saved_to_db:
@@ -368,7 +403,7 @@ def remove_cron(cron_id: str) -> bool:
     new_jobs = [j for j in jobs if j.id != cron_id]
     if len(new_jobs) == len(jobs):
         return False
-    save_crons(new_jobs)
+    save_crons(new_jobs, allow_empty=True)
     log.info("Cron deleted: %s", cron_id)
     return True
 

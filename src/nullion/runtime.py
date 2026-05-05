@@ -3114,6 +3114,10 @@ def _apply_task_frame_continuation_head(
 ) -> str | None:
     if active_frame is None or continuation is None:
         return active_frame.frame_id if active_frame is not None else None
+    if continuation.mode.value == "start_new":
+        if store.get_active_task_frame_id(conversation_id) == active_frame.frame_id:
+            store.set_active_task_frame_id(conversation_id, None)
+        return None
     if continuation.mode.value not in {"substitute_target", "revise"}:
         return active_frame.frame_id
 
@@ -3183,14 +3187,10 @@ def process_conversation_message(
         and active_task_frame is not None
         and active_branch.branch_id == active_task_frame.branch_id
     )
-    task_frame_continuation = (
-        resolve_task_frame_continuation(
-            text=user_message,
-            active_frame=active_task_frame,
-            branch_continuous=task_frame_branch_continuous,
-        )
-        if active_task_frame is not None
-        else None
+    task_frame_continuation = resolve_task_frame_continuation(
+        text=user_message,
+        active_frame=active_task_frame,
+        branch_continuous=task_frame_branch_continuous,
     )
     if (
         active_branch is not None

@@ -298,22 +298,13 @@ def evaluate_response_fulfillment(
         missing.append(f"{artifact_kind} attachment")
 
     if missing:
-        if attempted_tool_names:
-            missing_text = ", ".join(f"a {item}" for item in missing)
-            final_sentence = (
-                "I’ll keep it open instead of marking it done."
-                if frame is not None
-                else "I won’t mark it done."
-            )
-            response = (
-                f"I’m not done yet — this task still needs {missing_text}, "
-                "but I didn’t produce one in that run. "
-                f"{final_sentence}"
-            )
+        attachment_missing = any("attachment" in item for item in missing)
+        if attachment_missing:
+            response = "I couldn't attach the requested file. The task is still open."
+        elif attempted_tool_names:
+            response = "I couldn't complete the requested operation. The task is still open."
         else:
-            response = (
-                f"I can’t mark this complete yet — this task still needs {', '.join(missing)}."
-            )
+            response = "I need more output before this task can be completed."
         return ResponseFulfillmentDecision(False, response, tuple(missing))
 
     evidence_reply = (

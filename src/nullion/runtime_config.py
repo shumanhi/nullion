@@ -10,14 +10,21 @@ from nullion import __version__
 from nullion.settings import Settings
 
 
-_CREDENTIALS_PATH = Path.home() / ".nullion" / "credentials.json"
+def _default_credentials_path() -> Path:
+    configured_home = os.environ.get("NULLION_HOME")
+    if configured_home and configured_home.strip():
+        return Path(configured_home).expanduser() / "credentials.json"
+    return Path.home() / ".nullion" / "credentials.json"
+
+
+_CREDENTIALS_PATH = _default_credentials_path()
 _DEFAULT_CREDENTIALS_PATH = _CREDENTIALS_PATH
 
 
 def _credentials_path() -> Path:
     if _CREDENTIALS_PATH != _DEFAULT_CREDENTIALS_PATH:
         return _CREDENTIALS_PATH
-    return Path.home() / ".nullion" / "credentials.json"
+    return _default_credentials_path()
 
 
 @dataclass(frozen=True, slots=True)

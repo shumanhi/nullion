@@ -51,7 +51,6 @@ from nullion.chat_response_contract import (
     build_live_information_resolution_facts,
     build_pending_approval_facts_from_tool_results,
     build_tool_execution_facts_from_tool_results,
-    is_canonical_deferred_runtime_offer_reply,
     render_chat_response_for_telegram,
 )
 from nullion.chat_streaming import TELEGRAM_CHAT_CAPABILITIES, streaming_enabled_by_default
@@ -169,30 +168,6 @@ _SKILL_INJECT_MIN_SCORE = LEARNED_SKILL_INJECT_MIN_SCORE
 # Memory compaction: only run every N turns to avoid an LLM call each turn.
 _COMPACTION_CHECK_INTERVAL = 10
 _builder_turn_counter: int = 0
-_FILE_REFERENCE_EXTENSIONS = frozenset({
-    "csv",
-    "doc",
-    "docx",
-    "gif",
-    "htm",
-    "html",
-    "jpeg",
-    "jpg",
-    "json",
-    "md",
-    "pdf",
-    "png",
-    "ppt",
-    "pptx",
-    "py",
-    "svg",
-    "txt",
-    "webp",
-    "xls",
-    "xlsx",
-    "yaml",
-    "yml",
-})
 _ATTACHMENT_EXTENSION_LABELS: dict[str, str] = {
     ".csv": "CSV file",
     ".doc": "Word document",
@@ -244,34 +219,6 @@ def _word_tokens(text: str) -> tuple[str, ...]:
 
 def _is_explicit_approval_reply(message: str) -> bool:
     """Plain text is never treated as an approval decision."""
-    return False
-
-
-
-def _contains_file_reference(reply: str) -> bool:
-    for chunk in reply.split():
-        candidate = chunk.strip("()[]{}<>,;:!?'\"`")
-        if "." not in candidate:
-            continue
-        path_start = candidate.find("/")
-        if path_start >= 0:
-            path_candidate = candidate[path_start:]
-            path_parts = path_candidate.rsplit(".", maxsplit=1)
-            if len(path_parts) != 2:
-                continue
-            _, extension = path_parts
-            if extension.isalnum():
-                return True
-        filename = candidate.rsplit("/", maxsplit=1)[-1]
-        if "." not in filename:
-            continue
-        stem, extension = filename.rsplit(".", maxsplit=1)
-        if not stem or not extension:
-            continue
-        if not all(character.isalnum() or character == "_" for character in stem):
-            continue
-        if extension.lower() in _FILE_REFERENCE_EXTENSIONS:
-            return True
     return False
 
 
@@ -1143,6 +1090,18 @@ def _should_include_conversation_context(result, thread: list[dict[str, str]]) -
     return continuation.mode.value != "start_new"
 
 
+def _should_include_recent_tool_context(result) -> bool:
+    continuation = getattr(result, "task_frame_continuation", None)
+    if continuation is not None and continuation.mode.value != "start_new":
+        return True
+    disposition = getattr(getattr(result, "turn", None), "disposition", None)
+    return disposition in {
+        ConversationTurnDisposition.CONTINUE,
+        ConversationTurnDisposition.REVISE,
+        ConversationTurnDisposition.BACKGROUND_FOLLOW_UP,
+    }
+
+
 
 def _previous_user_message(thread: list[dict[str, str]]) -> str | None:
     if not thread:
@@ -1229,7 +1188,7 @@ def _is_low_information_acknowledgment_reply(reply: str | None) -> bool:
     normalized = _normalize_local_intent_text(reply)
     if not normalized:
         return False
-    if "?" in reply or _assistant_reply_exposes_referencable_artifact(reply):
+    if "?" in reply:
         return False
     return False
 
@@ -1252,43 +1211,43 @@ def _previous_assistant_message(thread: list[dict[str, str]]) -> str | None:
 
 
 
-def _looks_like_short_ambiguous_follow_up(prompt: str) -> bool:
-    normalized = _normalize_local_intent_text(prompt)
-    if not normalized:
-        return False
-    if len(normalized) > 80:
-        return False
-    return len(normalized.split()) <= 8
-
-
-
 def _assistant_reply_referencable_artifact_reason(reply: str | None) -> str | None:
-    if not isinstance(reply, str) or not reply.strip():
-        return None
-    if "```" in reply:
-        return "code_block"
-    if "`" in reply:
-        return "inline_code"
-    if "http://" in reply or "https://" in reply:
-        return "url"
-    if _contains_file_reference(reply):
-        return "file"
-    if is_canonical_deferred_runtime_offer_reply(reply):
-        return "deferred_offer"
-    if re.search(r"\bI attempted [a-z][a-z0-9_]* in this turn\b", reply):
-        return "runtime_tool_attempt"
+    """Assistant prose is not structured evidence for follow-up routing."""
+
+    _ = reply
     return None
 
 
+def _task_frame_referencable_artifact_reason(runtime: PersistentRuntime, *, conversation_id: str) -> str | None:
+    active_task_frame_id = runtime.store.get_active_task_frame_id(conversation_id)
+    if not isinstance(active_task_frame_id, str) or not active_task_frame_id:
+        return None
+    frame = runtime.store.get_task_frame(active_task_frame_id)
+    if frame is None:
+        return None
+    if frame.finish.requires_artifact_delivery or frame.output.artifact_kind:
+        return "task_frame_artifact_contract"
+    metadata = getattr(frame, "metadata", {}) or {}
+    last_outcome = metadata.get("last_outcome") if isinstance(metadata, dict) else None
+    if not isinstance(last_outcome, dict):
+        return None
+    tool_results = last_outcome.get("tool_results")
+    if not isinstance(tool_results, list):
+        return None
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        if str(result.get("status") or "").strip().lower() == "completed":
+            return "task_frame_completed_tool"
+        output = result.get("output")
+        if isinstance(output, dict) and any(output.get(key) for key in ("path", "artifact_path", "artifact_paths", "artifacts", "url")):
+            return "task_frame_tool_artifact"
+    return None
 
-def _assistant_reply_exposes_referencable_artifact(reply: str | None) -> bool:
-    return _assistant_reply_referencable_artifact_reason(reply) is not None
 
-
-
-def _chat_ambiguity_fallback(thread: list[dict[str, str]], prompt: str):
-    previous_assistant = _previous_assistant_message(thread)
-    ambiguity_reason = _assistant_reply_referencable_artifact_reason(previous_assistant)
+def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None, prompt: str):
+    conversation_id = _conversation_id_for_chat(chat_id)
+    ambiguity_reason = _task_frame_referencable_artifact_reason(runtime, conversation_id=conversation_id)
 
     def fallback(text: str, active_branch_exists: bool):
         _ = (text, active_branch_exists, prompt, ambiguity_reason)
@@ -1637,10 +1596,7 @@ def _append_chat_artifacts_to_reply(
     if not descriptors:
         return reply
     attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
-    if attachment_label == "screenshot" and "screenshot" in reply.lower():
-        visible_reply = reply
-    else:
-        visible_reply = f"Done — attached the requested {attachment_label}."
+    visible_reply = f"Done — attached the requested {attachment_label}."
     media_lines = [f"MEDIA:{descriptor.path}" for descriptor in descriptors]
     return "\n\n".join([visible_reply, "\n".join(media_lines)])
 
@@ -1679,10 +1635,8 @@ def _incomplete_artifact_delivery_reply(
     if frame is None or not frame.finish.requires_artifact_delivery:
         return None
     artifact_kind = frame.finish.required_artifact_kind or frame.output.artifact_kind or "file"
-    return (
-        f"I’m not done yet — this task still needs a {artifact_kind} attachment, "
-        "but I didn’t produce one in that run. I’ll keep it open instead of marking it done."
-    )
+    label = "screenshot" if artifact_kind in {"png", ".png"} else f"{artifact_kind} attachment"
+    return f"I couldn't attach the requested {label}. The task is still open."
 
 
 def _enforce_chat_response_fulfillment(
@@ -2487,7 +2441,7 @@ def _render_chat_turn(
 
     thread = _get_chat_thread(runtime, chat_id)
     previous_assistant_message = _previous_assistant_message(thread)
-    ambiguity_fallback, ambiguity_fallback_reason = _chat_ambiguity_fallback(thread, prompt)
+    ambiguity_fallback, ambiguity_fallback_reason = _chat_ambiguity_fallback(runtime, chat_id=chat_id, prompt=prompt)
     ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(thread, model_client=model_client)
     conversation_result = runtime.process_conversation_message(
         conversation_id=_conversation_id_for_chat(chat_id),
@@ -2751,7 +2705,11 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": f"Known user memory:\n{memory_context}"}],
                 })
-            recent_tool_context = _recent_tool_context_prompt(runtime, conversation_id)
+            recent_tool_context = (
+                _recent_tool_context_prompt(runtime, conversation_id)
+                if _should_include_recent_tool_context(conversation_result)
+                else None
+            )
             if recent_tool_context:
                 orchestrator_conversation_history.append({
                     "role": "system",

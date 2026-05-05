@@ -6,6 +6,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 import re
 from typing import Any, TypedDict
 from urllib.parse import urlparse
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
-from nullion.artifacts import artifact_path_for_generated_workspace_file
+from nullion.artifacts import artifact_descriptor_for_path, artifact_path_for_generated_workspace_file, artifact_root_for_principal
 from nullion.runtime import invoke_tool
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
 
@@ -85,6 +86,24 @@ def _session_id_from_result(result: ToolResult) -> str:
 
 
 def _materialize_png(runtime, output: dict[str, object], *, principal_id: str | None = None) -> str | None:
+    artifact_root = artifact_root_for_principal(principal_id)
+    for key in ("artifact_path", "path"):
+        value = output.get(key)
+        if isinstance(value, str) and artifact_descriptor_for_path(Path(value), artifact_root=artifact_root) is not None:
+            output["path"] = value
+            output["artifact_path"] = value
+            output["artifact_paths"] = [value]
+            output.pop("image_base64", None)
+            return value
+    paths = output.get("artifact_paths")
+    if isinstance(paths, list):
+        for value in paths:
+            if isinstance(value, str) and artifact_descriptor_for_path(Path(value), artifact_root=artifact_root) is not None:
+                output["path"] = value
+                output["artifact_path"] = value
+                output["artifact_paths"] = [value]
+                output.pop("image_base64", None)
+                return value
     image_base64 = output.get("image_base64")
     if not isinstance(image_base64, str) or not image_base64:
         return None

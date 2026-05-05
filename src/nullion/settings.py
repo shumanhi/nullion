@@ -10,8 +10,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-_CREDENTIALS_PATH = Path.home() / ".nullion" / "credentials.json"
-_DEFAULT_CHECKPOINT = Path.home() / ".nullion" / "runtime.db"
+def _nullion_home() -> Path:
+    configured_home = os.environ.get("NULLION_HOME")
+    if configured_home and configured_home.strip():
+        return Path(configured_home).expanduser()
+    return Path.home() / ".nullion"
+
+
+_CREDENTIALS_PATH = _nullion_home() / "credentials.json"
+_DEFAULT_CREDENTIALS_PATH = _CREDENTIALS_PATH
+
+
+def _credentials_path() -> Path:
+    if _CREDENTIALS_PATH != _DEFAULT_CREDENTIALS_PATH:
+        return _CREDENTIALS_PATH
+    return _nullion_home() / "credentials.json"
 
 
 def _first_model_entry(value: object) -> str:
@@ -38,7 +51,7 @@ class Settings:
     """All runtime settings, resolved from env vars + credentials file."""
 
     model: ModelSettings = field(default_factory=ModelSettings)
-    checkpoint_path: Path = field(default_factory=lambda: _DEFAULT_CHECKPOINT)
+    checkpoint_path: Path = field(default_factory=lambda: _nullion_home() / "runtime.db")
     operator_name: str = ""
     data_dir: str = ""
 
@@ -162,7 +175,8 @@ def _load_credentials() -> dict[str, Any]:
     try:
         from nullion.credential_store import migrate_credentials_json_to_db
 
-        return migrate_credentials_json_to_db(_CREDENTIALS_PATH, db_path=_CREDENTIALS_PATH.with_name("runtime.db")) or {}
+        credentials_path = _credentials_path()
+        return migrate_credentials_json_to_db(credentials_path, db_path=credentials_path.with_name("runtime.db")) or {}
     except Exception:
         return {}
 

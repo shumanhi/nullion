@@ -147,8 +147,7 @@ class DeliveryContract:
 
 
 _ATTACHMENT_UNAVAILABLE_REPLY = (
-    "I couldn't attach the requested file because the artifact is unavailable. "
-    "I won't mark it delivered."
+    "I couldn't attach the requested file. The task is still open."
 )
 _ATTACHMENT_UPLOAD_FAILED_REPLY = (
     "I couldn't upload the requested attachment to this platform. "

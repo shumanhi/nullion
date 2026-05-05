@@ -633,9 +633,11 @@ function Initialize-KeyStorage {
     $outputFile = [System.IO.Path]::GetTempFileName()
     $errorFile = [System.IO.Path]::GetTempFileName()
     $oldPythonWarnings = $env:PYTHONWARNINGS
+    $previousErrorActionPreference = $ErrorActionPreference
     try {
-        $env:PYTHONWARNINGS = "ignore::RuntimeWarning"
-        & $VENV_PYTHON -m nullion.secure_storage --init --storage $Storage 1> $outputFile 2> $errorFile
+        $env:PYTHONWARNINGS = "ignore"
+        $ErrorActionPreference = "Continue"
+        & $VENV_PYTHON -W ignore -m nullion.secure_storage --init --storage $Storage 1> $outputFile 2> $errorFile
         if ($LASTEXITCODE -eq 0) {
             if ($Storage -eq "system") {
                 Write-Ok "Local data key protected with Windows Credential Manager."
@@ -651,6 +653,7 @@ function Initialize-KeyStorage {
         }
         throw "Could not initialize local key storage: $detail"
     } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
         if ($null -eq $oldPythonWarnings) {
             Remove-Item Env:\PYTHONWARNINGS -ErrorAction SilentlyContinue
         } else {

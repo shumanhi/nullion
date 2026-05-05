@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from ipaddress import ip_address
 from pathlib import Path
+import re
+import shlex
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -12,7 +14,29 @@ from nullion.policy import BoundaryFact, BoundaryKind
 if TYPE_CHECKING:
     from nullion.tools import ToolInvocation
 
-_NETWORK_COMMAND_PREFIXES = ("curl", "wget")
+_NETWORK_COMMAND_FAMILIES = {
+    "curl",
+    "curl.exe",
+    "wget",
+    "wget.exe",
+    "invoke-webrequest",
+    "invoke-restmethod",
+    "iwr",
+    "irm",
+    "start-bitstransfer",
+}
+_SHELL_COMMAND_FAMILIES = {
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+    "cmd",
+    "cmd.exe",
+    "sh",
+    "bash",
+    "zsh",
+}
+_HTTP_URL_RE = re.compile(r"https?://[^\s'\"<>()\[\]{}]+", re.I)
 _WEB_SEARCH_TARGET = "https://www.bing.com/*"
 
 # Account-scoped tools: maps tool_name → (operation, account_type)
@@ -30,11 +54,29 @@ _PLUGIN_TOOL_PREFIX = "plugin:"
 
 
 def _extract_http_url(command: str) -> str | None:
-    for token in command.split():
-        candidate = token.strip().strip("'\"<>()[]{}")
+    for match in _HTTP_URL_RE.finditer(command):
+        candidate = match.group(0).rstrip(".,;")
         parsed = urlparse(candidate)
         if parsed.scheme in {"http", "https"} and parsed.netloc:
             return candidate
+    return None
+
+
+def _command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=False)
+    except ValueError:
+        return command.split()
+
+
+def _terminal_network_command_family(command: str) -> str | None:
+    # This inspects structured command syntax, not the user's free-form prompt.
+    for token in _command_tokens(command):
+        normalized = Path(token.strip("'\"")).name.lower()
+        if normalized in _NETWORK_COMMAND_FAMILIES:
+            return normalized
+        if normalized in _SHELL_COMMAND_FAMILIES:
+            continue
     return None
 
 
@@ -119,8 +161,8 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
         stripped = command.strip()
         if not stripped:
             return []
-        parts = stripped.split()
-        if not parts or parts[0] not in _NETWORK_COMMAND_PREFIXES:
+        command_family = _terminal_network_command_family(stripped)
+        if command_family is None:
             return []
         target = _extract_http_url(stripped)
         if target is None:
@@ -130,7 +172,7 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
                 tool_name=invocation.tool_name,
                 operation="http_get",
                 target=target,
-                command_family=parts[0],
+                command_family=command_family,
             )
         ]
 

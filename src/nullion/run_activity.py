@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
-from nullion.chat_response_contract import text_mentions_approval_claim
+from nullion.approval_markers import is_tool_approval_marker
 from nullion.prompt_injection import is_untrusted_tool_name, safe_untrusted_tool_metadata
 
 SKILL_USAGE_GLYPH = "⧁"
@@ -25,7 +25,9 @@ class RunActivityPhase(str, Enum):
 
 
 def classify_run_activity_phase(*, reply: str | None) -> RunActivityPhase:
-    if text_mentions_approval_claim(reply):
+    if is_tool_approval_marker(reply):
+        return RunActivityPhase.WAITING_APPROVAL
+    if isinstance(reply, str) and "approval required" in reply.casefold():
         return RunActivityPhase.WAITING_APPROVAL
     return RunActivityPhase.ACTIVE
 

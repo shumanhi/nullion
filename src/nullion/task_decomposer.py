@@ -1,9 +1,10 @@
-"""Task decomposer — breaks a user message into parallel TaskRecords via one LLM call.
+"""Task decomposer — plans optional TaskRecords via one structured LLM call.
 
-The decomposer sends a single structured prompt to the model and parses the
-JSON response into a list of TaskRecord objects with dependency edges set up
-as a DAG. A single-task response is the fast path — no async overhead is added
-for simple queries.
+The decomposer sends a single structured prompt to the model and parses the JSON
+response into a list of TaskRecord objects with dependency edges set up as a DAG.
+One user message remains one task unless a validated model-produced structured
+plan says otherwise. A single-task response is the fast path — no async overhead
+is added for simple queries.
 
 Usage::
 
@@ -41,14 +42,15 @@ from nullion.task_queue import (
 
 logger = logging.getLogger(__name__)
 
-_DECOMPOSE_SYSTEM_PROMPT = """You are a task decomposer for the Nullion agent system.
-Given a user request and a list of available tools, break the request into discrete, parallelizable tasks.
+_DECOMPOSE_SYSTEM_PROMPT = """You are a language-neutral structured planner for the Nullion agent system.
+Given a user request and a list of available tools, return one structured execution plan.
 
 Output ONLY one JSON object (no markdown fences, no commentary):
 {
   "disposition": "single_turn" | "clarification" | "sequential_mission" | "parallel_mission",
   "needs_clarification": boolean,
   "clarification_question": string or null,
+  "routing_evidence": array of strings,
   "tasks": [
     {
       "title": string, ≤ 50 chars, human-readable task name,
@@ -65,6 +67,11 @@ Output ONLY one JSON object (no markdown fences, no commentary):
 }
 
 Rules:
+- Treat one user message as one request unless this JSON plan gives a coherent typed DAG.
+- Do not split based on conjunctions, punctuation, sentence count, English words, phrases, regexes, or synonyms.
+- Use semantic understanding across languages, but put the routing decision only in this schema.
+- For multi-task plans, set routing_evidence=["model_structured_plan"].
+- Use available tool names, tool scopes, explicit URLs/domains, literal file extensions, attachment metadata, task/frame state, approval state, artifact descriptors, or tool-result schemas as evidence. Do not infer routing from prose triggers.
 - Tasks that can run in parallel must have no dependency between them.
 - If task B needs task A's output, set dependencies=[A_index] and matching context keys.
 - Discovery must precede interpretation: if one task finds/locates/lists config,
@@ -90,6 +97,7 @@ Example output for "fetch example.com, summarize it, email me":
   "disposition": "sequential_mission",
   "needs_clarification": false,
   "clarification_question": null,
+  "routing_evidence": ["model_structured_plan"],
   "tasks": [
     {"title": "Fetch example.com", "description": "Retrieve https://example.com/ HTML.", "tool_scope": ["web_fetch"], "priority": "normal", "dependencies": [], "context_key_in": null, "context_key_out": "page_html", "required_inputs": [], "can_start": true},
     {"title": "Summarize content", "description": "Read page_html from context. Extract 3-5 key points.", "tool_scope": [], "priority": "normal", "dependencies": [0], "context_key_in": "page_html", "context_key_out": "summary", "required_inputs": [], "can_start": true},
@@ -118,6 +126,7 @@ class DagPlan:
     tasks: list[DecomposedTask]
     needs_clarification: bool = False
     clarification_question: str | None = None
+    routing_evidence: list[str] | None = None
     validation_errors: list[str] | None = None
 
     @property
@@ -167,7 +176,11 @@ class TaskDecomposer:
         gid = group_id or make_group_id()
         normalized_message = strip_composer_mode_instruction(user_message)
         dag_plan = self.plan_dag(normalized_message, available_tools=available_tools)
-        raw_tasks = dag_plan.tasks if dag_plan.can_dispatch or (dag_plan.is_valid and len(dag_plan.tasks) == 1) else []
+        raw_tasks = (
+            dag_plan.tasks
+            if dag_plan.can_dispatch or (dag_plan.is_valid and len(dag_plan.tasks) == 1)
+            else []
+        )
 
         if not raw_tasks:
             # Fallback: treat the whole message as one task
@@ -251,6 +264,7 @@ class TaskDecomposer:
         return DagPlan(
             disposition="single_turn",
             tasks=[],
+            routing_evidence=[],
             validation_errors=["planner graph returned no plan"],
         )
 
@@ -259,13 +273,22 @@ class TaskDecomposer:
     def _call_model(
         self, user_message: str, *, available_tools: list[str]
     ) -> DagPlan | None:
-        raw_text = _call_decomposer_model_text(self._model_client, user_message, available_tools=available_tools)
+        raw_text = _call_decomposer_model_text(
+            self._model_client,
+            user_message,
+            available_tools=available_tools,
+        )
         if raw_text is None:
             return None
         return _parse_dag_plan(raw_text)
 
 
-def _call_decomposer_model_text(model_client: Any, user_message: str, *, available_tools: list[str]) -> str | None:
+def _call_decomposer_model_text(
+    model_client: Any,
+    user_message: str,
+    *,
+    available_tools: list[str],
+) -> str | None:
     tools_str = ", ".join(available_tools) if available_tools else "(none)"
     prompt = (
         f"Available tools: {tools_str}\n\n"
@@ -321,6 +344,7 @@ def _dag_validate_node(state: _DagPlanningState) -> dict[str, object]:
         return {"dag_plan": DagPlan(
             disposition="single_turn",
             tasks=[],
+            routing_evidence=[],
             validation_errors=["planner returned no parseable plan"],
         )}
     return {
@@ -383,18 +407,31 @@ def _parse_dag_plan(raw: str) -> DagPlan | None:
     if isinstance(parsed, list):
         tasks = _parse_decomposed_task_items(parsed)
         disposition = "single_turn" if len(tasks) <= 1 else _infer_legacy_disposition(tasks)
-        return DagPlan(disposition=disposition, tasks=tasks)
+        return DagPlan(
+            disposition=disposition,
+            tasks=tasks,
+            routing_evidence=["legacy_structured_json"],
+        )
     if not isinstance(parsed, dict):
         logger.debug("TaskDecomposer: no JSON object/array in response")
         return None
     tasks = _parse_decomposed_task_items(parsed.get("tasks") or [])
-    disposition = str(parsed.get("disposition") or ("single_turn" if len(tasks) <= 1 else _infer_legacy_disposition(tasks)))
+    disposition = str(
+        parsed.get("disposition")
+        or ("single_turn" if len(tasks) <= 1 else _infer_legacy_disposition(tasks))
+    )
     clarification_question = parsed.get("clarification_question")
+    routing_evidence = [
+        str(value).strip()
+        for value in (parsed.get("routing_evidence") or [])
+        if isinstance(value, str) and value.strip()
+    ]
     return DagPlan(
         disposition=disposition,
         tasks=tasks,
         needs_clarification=bool(parsed.get("needs_clarification")),
         clarification_question=str(clarification_question) if clarification_question else None,
+        routing_evidence=routing_evidence,
     )
 
 
@@ -446,7 +483,11 @@ def _parse_decomposed_task_items(items: object) -> list[DecomposedTask]:
             priority = TaskPriority(priority_raw)
         except ValueError:
             priority = TaskPriority.NORMAL
-        dep_indices = [int(d) for d in (item.get("dependencies") or []) if isinstance(d, (int, float))]
+        dep_indices = [
+            int(d)
+            for d in (item.get("dependencies") or [])
+            if isinstance(d, (int, float))
+        ]
         ctx_in = item.get("context_key_in")
         ctx_out = item.get("context_key_out")
         required_inputs = [
@@ -477,14 +518,27 @@ def _infer_legacy_disposition(tasks: list[DecomposedTask]) -> str:
     return "parallel_mission"
 
 
-def _validate_dag_plan(plan: DagPlan, *, available_tools: list[str], max_tasks: int = 20) -> DagPlan:
+def _validate_dag_plan(
+    plan: DagPlan,
+    *,
+    available_tools: list[str],
+    max_tasks: int = 20,
+) -> DagPlan:
     errors: list[str] = []
-    if plan.disposition not in {"single_turn", "clarification", "sequential_mission", "parallel_mission"}:
+    if plan.disposition not in {
+        "single_turn",
+        "clarification",
+        "sequential_mission",
+        "parallel_mission",
+    }:
         errors.append(f"invalid disposition: {plan.disposition}")
     if not plan.tasks:
         errors.append("plan has no tasks")
     if len(plan.tasks) > max_tasks:
         errors.append(f"plan has too many tasks: {len(plan.tasks)}")
+    routing_evidence = list(plan.routing_evidence or [])
+    if len(plan.tasks) > 1 and "model_structured_plan" not in routing_evidence:
+        errors.append("multi-task plan lacks model_structured_plan routing evidence")
     available = set(available_tools)
     context_outputs = {
         task.context_key_out
@@ -510,7 +564,11 @@ def _validate_dag_plan(plan: DagPlan, *, available_tools: list[str], max_tasks: 
     if _has_cycle([task.dep_indices for task in plan.tasks]):
         errors.append("plan has a dependency cycle")
     if plan.disposition == "parallel_mission":
-        independent = [task for task in plan.tasks if not task.dep_indices and task.can_start and not task.required_inputs]
+        independent = [
+            task
+            for task in plan.tasks
+            if not task.dep_indices and task.can_start and not task.required_inputs
+        ]
         if len(independent) < 2:
             errors.append("parallel_mission needs at least two independently runnable tasks")
     if plan.needs_clarification and not plan.clarification_question:
@@ -520,6 +578,7 @@ def _validate_dag_plan(plan: DagPlan, *, available_tools: list[str], max_tasks: 
         tasks=plan.tasks,
         needs_clarification=plan.needs_clarification or plan.disposition == "clarification",
         clarification_question=plan.clarification_question,
+        routing_evidence=routing_evidence,
         validation_errors=errors,
     )
 
@@ -532,6 +591,7 @@ def _planner_metadata(plan: DagPlan) -> dict[str, object]:
         "dispatchable": plan.can_dispatch,
         "needs_clarification": plan.needs_clarification,
         "clarification_question": plan.clarification_question,
+        "routing_evidence": list(plan.routing_evidence or []),
         "validation_errors": list(plan.validation_errors or []),
         "tasks": [
             {

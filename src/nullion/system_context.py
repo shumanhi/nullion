@@ -29,6 +29,7 @@ class SystemContextToolSummary:
     side_effect_class: str
     risk_level: str
     requires_approval: bool
+    capability_tags: tuple[str, ...] = ()
     source: str = "core fallback"
     availability: str = "available"
 
@@ -69,6 +70,11 @@ def _tool_summary_from_spec(spec: ToolSpec) -> SystemContextToolSummary:
         side_effect_class=spec.side_effect_class.value,
         risk_level=spec.risk_level.value,
         requires_approval=spec.requires_approval,
+        capability_tags=tuple(
+            str(tag).strip().lower()
+            for tag in (getattr(spec, "capability_tags", ()) or ())
+            if str(tag).strip()
+        ),
         source=source,
         availability=availability,
     )
@@ -203,6 +209,8 @@ def format_system_context_for_prompt(snapshot: SystemContextSnapshot) -> str:
             if tool.availability != "unavailable":
                 approval_text = "approval required" if tool.requires_approval else "direct"
                 line += f" ({tool.side_effect_class}, {tool.risk_level}, {approval_text})"
+            if tool.capability_tags:
+                line += f" tags={','.join(tool.capability_tags)}"
             if tool.description:
                 line += f" — {tool.description}"
             tool_lines.append(line)
