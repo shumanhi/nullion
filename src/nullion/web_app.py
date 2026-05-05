@@ -5014,7 +5014,7 @@ _HTML = r"""<!DOCTYPE html>
               <div class="setup-card-head">
                 <div>
                   <div class="setup-card-title">Web search</div>
-                  <div class="setup-card-copy">Most installs can use built-in search. Add provider credentials only when you want a specific search backend.</div>
+                  <div class="setup-card-copy">Brave Search API is recommended for a better live web-search experience. It has a free plan; built-in search remains available when you do not want an API key.</div>
                 </div>
                 <div class="setup-card-kicker">Optional</div>
               </div>
@@ -5031,15 +5031,15 @@ _HTML = r"""<!DOCTYPE html>
                   <div class="form-hint">Used when web search is enabled in General settings.</div>
                 </div>
                 <div class="setup-muted-panel">
-                  <strong>Suggested path</strong>
-                  Leave this on built-in search unless your workflow depends on Brave, Google Custom Search, or Perplexity.
+                  <strong>Recommended</strong>
+                  Choose Brave Search API and create a free key at api-dashboard.search.brave.com/app/keys. Use built-in search only as the no-key fallback.
                 </div>
               </div>
               <div id="search-provider-credentials" class="setup-conditional-panel" hidden>
                 <div class="setup-provider-field" data-search-provider="brave_search_provider" hidden>
                   <label>Brave Search API key</label>
                   <input type="password" id="cfg-brave-search-key" placeholder="BSA…" autocomplete="off">
-                  <div class="form-hint">Shown only when Brave Search API is selected.</div>
+                  <div class="form-hint">Create a free key at api-dashboard.search.brave.com/app/keys.</div>
                 </div>
                 <div class="setup-provider-field" data-search-provider="google_custom_search_provider" hidden>
                   <label>Google Search API key</label>
@@ -9516,7 +9516,7 @@ function settingsHaveUnsavedChanges() {
 
 async function refreshSettingsBaseline({force = false} = {}) {
   const loads = [
-    loadConfig(),
+    loadConfig({skipSettingsApplyIfDirty: !force}),
     loadBuilderDoctorSettingsSummary(),
     loadPreferences(),
     loadUsersTab(),
@@ -10328,10 +10328,13 @@ function mediaEnabledForProvider(selectId) {
   return Boolean(select && (select.value === 'local_auto' || select.value === 'model'));
 }
 
-async function loadConfig() {
+async function loadConfig(options = {}) {
   try {
     const cfg = await API('/api/config');
     renderHeaderConfig(cfg);
+    if (options.skipSettingsApplyIfDirty && settingsDirtyExplicit) {
+      return cfg;
+    }
     document.getElementById('cfg-data-dir').value = cfg.data_dir || '';
     // Messaging
     document.getElementById('cfg-tg-token').value = cfg.tg_token_set ? '••••••••' : '';

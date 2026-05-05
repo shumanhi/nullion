@@ -17,6 +17,7 @@ src/*.egg-info/
 .DS_Store
 **/.DS_Store
 # Internal mockups and working files — stay local only
+AGENTS.md
 mockups/
 push.sh
 reddit-post.html
