@@ -144,12 +144,13 @@ workspace-specific.
 Search provider options:
 
 ```bash
-# Default: no extra account or key.
-NULLION_PROVIDER_BINDINGS=search_plugin=builtin_search_provider
-
-# Brave Search API.
+# Recommended: Brave Search API. Create a free key at
+# https://api-dashboard.search.brave.com/app/keys for better live search.
 NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider
 NULLION_BRAVE_SEARCH_API_KEY=...
+
+# No-key fallback: built-in local adapter.
+NULLION_PROVIDER_BINDINGS=search_plugin=builtin_search_provider
 
 # Google Custom Search JSON API. Requires a Programmable Search Engine ID.
 NULLION_PROVIDER_BINDINGS=search_plugin=google_custom_search_provider

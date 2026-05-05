@@ -4417,19 +4417,73 @@ def _build_web_search_handler(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
-                output={},
+                output={"query": raw_query, "reason": "web_search_failed"},
                 error=str(exc),
+            )
+
+        usable_results = [
+            result
+            for result in results
+            if _web_search_result_has_usable_evidence(result)
+        ]
+        if not usable_results:
+            candidates = [
+                _web_search_candidate_for_fallback(result)
+                for result in results[:limit]
+            ]
+            candidates = [candidate for candidate in candidates if candidate is not None]
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "query": raw_query,
+                    "reason": "no_usable_search_results",
+                    "result_count": len(results),
+                    "candidates": candidates,
+                },
+                error="web_search returned result rows without usable source evidence",
             )
 
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"query": raw_query, "results": results},
+            output={"query": raw_query, "results": usable_results},
             error=None,
         )
 
     return handler
+
+
+def _web_search_result_has_usable_evidence(result: dict[str, object]) -> bool:
+    url = result.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    snippet = str(
+        result.get("snippet")
+        or result.get("summary")
+        or result.get("description")
+        or ""
+    ).strip()
+    return bool(snippet)
+
+
+def _web_search_candidate_for_fallback(result: dict[str, object]) -> dict[str, str] | None:
+    url = result.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    candidate: dict[str, str] = {"url": url}
+    title = result.get("title")
+    if isinstance(title, str) and title.strip():
+        candidate["title"] = title.strip()
+    return candidate
 
 
 
@@ -4551,13 +4605,10 @@ def register_search_plugin(
                 ToolSpec(
                     name="web_search",
                     description=(
-                        "Search the web and return a ranked list of result links + snippets. "
-                        "PREFER THIS for any 'find', 'look up', 'search for', 'what is', "
-                        "'who is', 'latest', 'news', 'today', or open-ended information request "
-                        "that doesn't already have a specific URL. This is fast, cheap, and "
-                        "returns multiple sources you can compare. Only fall back to "
-                        "browser_navigate or web_fetch when you already have a specific URL "
-                        "or when search snippets aren't enough detail."
+                        "Search the web and return ranked source links with evidence snippets. "
+                        "Use this when no specific URL is already available. If the result has "
+                        "no usable evidence snippets, treat it as insufficient for a final answer "
+                        "and continue from structured candidate URLs or another structured source."
                     ),
                     risk_level=ToolRiskLevel.LOW,
                     side_effect_class=ToolSideEffectClass.READ,
@@ -5075,12 +5126,9 @@ def register_browser_plugin(
                 name="browser_navigate",
                 description=(
                     "Drive a real Chromium browser to a SPECIFIC URL you already have, "
-                    "and return page metadata. Use this ONLY when (a) the user gave you "
-                    "a URL, (b) you've already called web_search and need to read one of "
-                    "its result pages in full, or (c) the page requires JavaScript to "
-                    "render. Do NOT use this as a substitute for web_search — for any "
-                    "open-ended 'find / look up / news / today / latest' question, call "
-                    "web_search first; it's faster and returns multiple comparable sources."
+                    "and return page metadata. Use this only with a URL from explicit "
+                    "runtime evidence, structured tool output, or a model-produced "
+                    "structured recovery plan."
                 ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,

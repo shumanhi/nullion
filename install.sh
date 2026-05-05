@@ -1829,21 +1829,28 @@ if [[ -n "${EXISTING_SEARCH_PROVIDER:-}" ]]; then
 fi
 
 if [[ "$SKIP_SEARCH_SETUP" == "false" ]]; then
-print_menu_item "1" "Built-in local adapter" "Default search/fetch behavior; no extra key" "[default]"
-print_menu_item "2" "Brave Search API" "Independent web index"
+print_info "For the best web-search experience, use Brave Search API. It has a free plan and works better than the built-in local adapter."
+print_info "Create a free key at https://api-dashboard.search.brave.com/app/keys"
+print_menu_item "1" "Brave Search API" "Free API key; better live search results" "[recommended]"
+print_menu_item "2" "Built-in local adapter" "No extra key; fallback search/fetch behavior"
 print_menu_item "3" "Google Custom Search API" "Requires API key plus search engine ID"
 print_menu_item "4" "Perplexity Search API" "Ranked AI-oriented web results"
 print_menu_item "5" "DuckDuckGo Instant Answers" "Keyless, but not full web search"
 echo
 prompt_read -rp "  Enter 1, 2, 3, 4, or 5: " SEARCH_CHOICE
 case "$SEARCH_CHOICE" in
-    2)
+    ""|1)
         SEARCH_PROVIDER="brave_search_provider"
-        echo -e "  Get a key at ${CYAN}https://api-dashboard.search.brave.com/${RESET}"
+        echo -e "  Open ${CYAN}https://api-dashboard.search.brave.com/app/keys${RESET}"
+        echo "  Sign in, create a free Search API key, then paste it here."
         echo -n "  Paste your Brave Search API key (hidden): "
         prompt_read -rs BRAVE_SEARCH_KEY
         echo
         print_ok "Brave Search selected."
+        ;;
+    2)
+        SEARCH_PROVIDER="builtin_search_provider"
+        print_info "Using built-in local search. You can switch to Brave Search API later from Settings for a better experience."
         ;;
     3)
         SEARCH_PROVIDER="google_custom_search_provider"
