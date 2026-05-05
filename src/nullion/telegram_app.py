@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
 import inspect
 import logging
@@ -41,7 +42,6 @@ from nullion.messaging_adapters import (
 from nullion.telegram_turn_graph import plan_telegram_post_run_delivery
 from nullion.turn_dispatch_graph import AsyncTurnDispatchTracker, TurnDispatchDecision
 from nullion.policy import permission_scope_principal
-from nullion.chat_response_contract import text_mentions_approval_claim
 from nullion.chat_streaming import (
     ChatStreamingMode,
     TELEGRAM_CHAT_CAPABILITIES,
@@ -1144,10 +1144,7 @@ def _existing_pending_approval_card(runtime: PersistentRuntime, reply: str | Non
                 text=_approval_card_text(approval),
                 reply_markup=_build_approval_markup(approval=approval),
             )
-    if marker is None and not (
-        reply.startswith("Approval required before Nullion can continue.")
-        or text_mentions_approval_claim(reply)
-    ):
+    if marker is None and "approval required" not in reply.casefold():
         return None
     pending_approvals = [
         approval
@@ -2349,6 +2346,137 @@ class ChatOperatorService:
     _turn_dispatch_tracker: AsyncTurnDispatchTracker = field(default_factory=AsyncTurnDispatchTracker)
     _seen_ingress_ids: set[str] = field(default_factory=set)
     _first_run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _live_config_signature_cache: tuple[object, ...] | None = None
+
+    def __post_init__(self) -> None:
+        self.settings = copy.deepcopy(self.settings)
+        self._live_config_signature_cache = self._live_config_signature()
+
+    def _live_config_signature(self) -> tuple[object, ...]:
+        paths: list[Path] = []
+        env_path = os.environ.get("NULLION_ENV_FILE")
+        if env_path:
+            paths.append(Path(env_path).expanduser())
+
+        signature: list[object] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                signature.append((str(path), None, None))
+                continue
+            signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+        runtime_checkpoint = getattr(self.runtime, "checkpoint_path", None)
+        settings_checkpoint = getattr(self.settings, "checkpoint_path", None)
+        checkpoint_path_raw = (
+            os.environ.get("NULLION_CREDENTIALS_DB_PATH")
+            or os.environ.get("NULLION_CHECKPOINT_PATH")
+            or runtime_checkpoint
+            or settings_checkpoint
+        )
+        if checkpoint_path_raw:
+            checkpoint_path = Path(checkpoint_path_raw).expanduser()
+        else:
+            checkpoint_path = None
+        if checkpoint_path is None:
+            signature.append(("credentials", None, None))
+        else:
+            try:
+                import hashlib
+                import json
+
+                from nullion.credential_store import load_encrypted_credentials
+
+                credential_payload = load_encrypted_credentials(db_path=checkpoint_path) or {}
+                credential_blob = json.dumps(credential_payload, sort_keys=True, default=str, separators=(",", ":"))
+                signature.append(
+                    (
+                        "credentials",
+                        str(checkpoint_path),
+                        hashlib.sha256(credential_blob.encode("utf-8")).hexdigest(),
+                    )
+                )
+            except Exception:
+                signature.append(("credentials", str(checkpoint_path), None))
+        env_snapshot = tuple(
+            sorted(
+                (key, value)
+                for key, value in os.environ.items()
+                if key.startswith("NULLION_")
+                or key
+                in {
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "OPENAI_MODEL",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_MODEL",
+                    "OPENROUTER_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                    "GROQ_API_KEY",
+                    "MISTRAL_API_KEY",
+                    "DEEPSEEK_API_KEY",
+                    "XAI_API_KEY",
+                    "TOGETHER_API_KEY",
+                    "OLLAMA_API_KEY",
+                }
+            )
+        )
+        signature.append(env_snapshot)
+        return tuple(signature)
+
+    def _apply_live_settings(self, next_settings: NullionSettings) -> None:
+        for settings_field in fields(NullionSettings):
+            setattr(self.settings, settings_field.name, getattr(next_settings, settings_field.name))
+        self.bot_token = next_settings.telegram.bot_token or ""
+        operator_chat_id = next_settings.telegram.operator_chat_id
+        self.operator_chat_id = operator_chat_id.strip() if isinstance(operator_chat_id, str) and operator_chat_id.strip() else None
+
+    def refresh_live_configuration(self, *, force: bool = False) -> bool:
+        signature = self._live_config_signature()
+        if not force and signature == self._live_config_signature_cache:
+            return False
+
+        from nullion.agent_orchestrator import AgentOrchestrator
+        from nullion.config import load_env_file_into_environ, load_settings
+
+        env_path_raw = os.environ.get("NULLION_ENV_FILE")
+        env_path = Path(env_path_raw).expanduser() if env_path_raw else None
+        os.environ.setdefault("NULLION_CHECKPOINT_PATH", str(self.runtime.checkpoint_path))
+        os.environ.setdefault("NULLION_HOME", str(self.runtime.checkpoint_path.parent))
+        if env_path is not None:
+            load_env_file_into_environ(env_path, override=True)
+
+        next_settings = load_settings(env_path=env_path)
+        self._apply_live_settings(next_settings)
+
+        if self.settings.telegram.chat_enabled:
+            next_client = _build_chat_model_client_with_fallback(self.settings, surface="Telegram")
+        else:
+            next_client = None
+
+        if next_client is None:
+            self.model_client = None
+            self.agent_orchestrator = None
+        else:
+            self.model_client = next_client
+            self.agent_orchestrator = AgentOrchestrator(model_client=next_client)
+        try:
+            self.runtime.model_client = self.model_client
+        except Exception:
+            pass
+        self._live_config_signature_cache = self._live_config_signature()
+        logger.info(
+            "Telegram live configuration refreshed (chat_enabled=%s provider=%s model=%s operator_chat_id=%s)",
+            self.settings.telegram.chat_enabled,
+            getattr(getattr(self.settings, "model", None), "provider", "?"),
+            getattr(getattr(self.settings, "model", None), "openai_model", "?"),
+            self.operator_chat_id or "",
+        )
+        return True
+
+    def refresh_model_client_if_configuration_changed(self, *, force: bool = False) -> bool:
+        return self.refresh_live_configuration(force=force)
 
     def swap_model_client(self, model_name: str) -> None:
         """Hot-swap the live model client to use *model_name* — no restart required.
@@ -2447,6 +2575,7 @@ class ChatOperatorService:
     ) -> str | None:
         from nullion.reminders import reminder_chat_context
 
+        self.refresh_live_configuration()
         model_client, agent_orchestrator = self._media_model_for_attachments(attachments)
         with reminder_chat_context(reminder_chat_id or chat_id):
             return handle_chat_operator_message(
@@ -2589,6 +2718,7 @@ class ChatOperatorService:
         # ── First-run: self-discover operator chat if not yet configured ────
         if await self._maybe_do_first_run_setup(message, chat_id_text):
             return
+        self.refresh_live_configuration()
 
         telegram_attachments = await _download_telegram_attachments(message, context, settings=self.settings)
         if text_for_ack is None and telegram_attachments:
@@ -2956,6 +3086,7 @@ class ChatOperatorService:
             await callback_query.answer("On it!")
             suggestion_text = record_id  # text stored directly in callback record_id
             if suggestion_text and message is not None:
+                self.refresh_live_configuration()
                 typing_keepalive_task = asyncio.create_task(
                     _run_typing_keepalive(message, runtime=self.runtime, text=suggestion_text)
                 )
@@ -3158,7 +3289,6 @@ class ChatOperatorService:
         # back through Telegram.  We capture bot/token here (before run_polling
         # starts the event loop) and build an async-safe deliver_fn closure.
         if self.agent_orchestrator is not None and hasattr(self.agent_orchestrator, "set_deliver_fn"):
-            _bot_token = self.bot_token
             _service_ref = self
             _status_messages: dict[tuple[str, str], int] = {}
             _status_texts: dict[tuple[str, str], str] = {}
@@ -3175,6 +3305,9 @@ class ChatOperatorService:
                     chat_id = _service_ref.operator_chat_id or ""
                 if not chat_id:
                     return False
+                bot_token = _service_ref.bot_token
+                if not bot_token:
+                    return False
                 if kwargs.get("is_status"):
                     group_id = str(kwargs.get("group_id") or "")
                     status_kind = str(kwargs.get("status_kind") or "task_summary")
@@ -3188,13 +3321,13 @@ class ChatOperatorService:
                         loop = _asyncio.get_running_loop()
                         loop.create_task(
                             _send_or_edit_telegram_task_status_message(
-                                _bot_token,
+                                bot_token,
                                 _status_messages,
                                 chat_id=chat_id,
                                 group_id=group_id,
                                 text=text,
                                 runtime=_service_ref.runtime,
-                                bot_token=_bot_token,
+                                bot_token=bot_token,
                                 status_texts=_status_texts,
                                 status_locks=_status_locks,
                                 typing_tasks=_status_typing_tasks,
@@ -3211,7 +3344,7 @@ class ChatOperatorService:
                     loop = _asyncio.get_running_loop()
                     loop.create_task(
                         _send_operator_telegram_message(
-                            _bot_token,
+                            bot_token,
                             chat_id,
                             outbound_text,
                             principal_id=principal_id,
@@ -3222,7 +3355,7 @@ class ChatOperatorService:
                     try:
                         _asyncio.run(
                             _send_operator_telegram_message(
-                                _bot_token,
+                                bot_token,
                                 chat_id,
                                 outbound_text,
                                 principal_id=principal_id,
@@ -3251,6 +3384,36 @@ class ChatOperatorService:
                 logger.warning("set_my_commands failed; Telegram slash menu may be stale", exc_info=True)
             if monitor is not None:
                 await monitor.start()
+
+            async def _watch_live_config() -> None:
+                try:
+                    poll_seconds = max(float(os.environ.get("NULLION_TELEGRAM_CONFIG_POLL_SECONDS", "2") or "2"), 0.25)
+                except ValueError:
+                    poll_seconds = 2.0
+                app_bot = getattr(app, "bot", None)
+                app_bot_token = str(getattr(app_bot, "token", "") or "").strip()
+                while True:
+                    await asyncio.sleep(poll_seconds)
+                    try:
+                        self.refresh_live_configuration()
+                    except Exception:
+                        logger.debug("Could not refresh Telegram live config from polling watcher", exc_info=True)
+                        continue
+                    service_bot_token = str(self.bot_token or "").strip()
+                    if app_bot_token and service_bot_token and service_bot_token != app_bot_token:
+                        logger.info("Telegram bot token changed; restarting polling application to bind the new token")
+                        stop_running = getattr(app, "stop_running", None)
+                        if callable(stop_running):
+                            stop_running()
+                        else:
+                            stop = getattr(app, "stop", None)
+                            if callable(stop):
+                                result = stop()
+                                if inspect.isawaitable(result):
+                                    await result
+                        return
+
+            app._nullion_live_config_task = asyncio.create_task(_watch_live_config())
             from nullion.reminder_delivery import run_reminder_delivery_loop
 
             async def _send(chat_id: str, text: str) -> bool:
@@ -3264,6 +3427,13 @@ class ChatOperatorService:
             )
 
         async def _post_shutdown(app) -> None:
+            config_task = getattr(app, "_nullion_live_config_task", None)
+            if config_task is not None:
+                config_task.cancel()
+                try:
+                    await config_task
+                except asyncio.CancelledError:
+                    pass
             reminder_task = getattr(app, "_nullion_reminder_task", None)
             if reminder_task is not None:
                 reminder_task.cancel()
@@ -3288,6 +3458,45 @@ class ChatOperatorService:
 
 
 
+def _openai_platform_fallback_settings(settings: NullionSettings) -> NullionSettings | None:
+    model_cfg = getattr(settings, "model", None)
+    provider = str(getattr(model_cfg, "provider", "") or "").strip().lower()
+    api_key = str(getattr(model_cfg, "openai_api_key", "") or "").strip()
+    if provider != "codex" or not api_key.startswith("sk-"):
+        return None
+    return replace(settings, model=replace(model_cfg, provider="openai"))
+
+
+def _build_chat_model_client_with_fallback(settings: NullionSettings, *, surface: str) -> object | None:
+    try:
+        return build_model_client_from_settings(settings)
+    except ModelClientConfigurationError as exc:
+        fallback_settings = _openai_platform_fallback_settings(settings)
+        if fallback_settings is not None:
+            try:
+                client = build_model_client_from_settings(fallback_settings)
+                logger.warning(
+                    "Provider warning: %s — falling back to platform OpenAI credentials for %s chat.",
+                    exc,
+                    surface,
+                )
+                return client
+            except ModelClientConfigurationError as fallback_exc:
+                logger.warning(
+                    "Provider warning: %s — %s chat fallback also failed: %s",
+                    exc,
+                    surface,
+                    fallback_exc,
+                )
+                return None
+        logger.warning(
+            "Provider warning: %s — %s chat will be unavailable until credentials are refreshed.",
+            exc,
+            surface,
+        )
+        return None
+
+
 def build_telegram_operator_service(
     runtime: PersistentRuntime,
     *,
@@ -3308,12 +3517,7 @@ def build_telegram_operator_service(
 
     model_client = None
     if settings.telegram.chat_enabled:
-        try:
-            model_client = build_model_client_from_settings(settings)
-        except ModelClientConfigurationError as exc:
-            logger.warning(
-                "Provider warning: %s — Telegram chat will be unavailable until credentials are refreshed.", exc
-            )
+        model_client = _build_chat_model_client_with_fallback(settings, surface="Telegram")
 
     agent_orchestrator = None
     if model_client is not None:
@@ -3337,12 +3541,7 @@ def build_messaging_operator_service(
     """Build the shared operator service for non-Telegram messaging adapters."""
     model_client = None
     if settings.telegram.chat_enabled:
-        try:
-            model_client = build_model_client_from_settings(settings)
-        except ModelClientConfigurationError as exc:
-            logger.warning(
-                "Provider warning: %s — Messaging chat will be unavailable until credentials are refreshed.", exc
-            )
+        model_client = _build_chat_model_client_with_fallback(settings, surface="messaging")
 
     agent_orchestrator = None
     if model_client is not None:

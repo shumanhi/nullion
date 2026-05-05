@@ -49,11 +49,16 @@ jobs:
         env:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
           if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
             test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" && "${HEAD_REF}" == nullion/* ]]; then
+            test_ref="nullion-test/${HEAD_REF#nullion/}"
           fi
 
           if [[ -z "${test_ref}" ]]; then
@@ -118,11 +123,16 @@ jobs:
         env:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
           if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
             test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" && "${HEAD_REF}" == nullion/* ]]; then
+            test_ref="nullion-test/${HEAD_REF#nullion/}"
           fi
 
           if [[ -z "${test_ref}" ]]; then
@@ -172,11 +182,16 @@ jobs:
         env:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
           if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
             test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" && "${HEAD_REF}" == nullion/* ]]; then
+            test_ref="nullion-test/${HEAD_REF#nullion/}"
           fi
 
           if [[ -z "${test_ref}" ]]; then
@@ -227,11 +242,16 @@ jobs:
         env:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
           if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
             test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" && "${HEAD_REF}" == nullion/* ]]; then
+            test_ref="nullion-test/${HEAD_REF#nullion/}"
           fi
 
           if [[ -z "${test_ref}" ]]; then
@@ -281,11 +301,16 @@ jobs:
         env:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
           if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" ]]; then
             test_ref="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^Nullion-Test-Ref:[[:space:]]*//p' | head -n 1)"
+          fi
+
+          if [[ -z "${test_ref}" && "${{ github.event_name }}" == "pull_request" && "${HEAD_REF}" == nullion/* ]]; then
+            test_ref="nullion-test/${HEAD_REF#nullion/}"
           fi
 
           if [[ -z "${test_ref}" ]]; then

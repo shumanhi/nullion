@@ -10,6 +10,7 @@ import http.server
 import argparse
 import contextlib
 import json
+import os
 import socket
 import sys
 import threading
@@ -31,7 +32,21 @@ from nullion.credential_store import (
     save_encrypted_credentials,
 )
 
-CREDENTIALS_PATH = Path.home() / ".nullion" / "credentials.json"
+def _default_credentials_path() -> Path:
+    configured_home = os.environ.get("NULLION_HOME")
+    if configured_home and configured_home.strip():
+        return Path(configured_home).expanduser() / "credentials.json"
+    return Path.home() / ".nullion" / "credentials.json"
+
+
+CREDENTIALS_PATH = _default_credentials_path()
+_DEFAULT_CREDENTIALS_PATH = CREDENTIALS_PATH
+
+
+def _credentials_path() -> Path:
+    if CREDENTIALS_PATH != _DEFAULT_CREDENTIALS_PATH:
+        return CREDENTIALS_PATH
+    return _default_credentials_path()
 
 # ── Provider menu ─────────────────────────────────────────────────────────────
 
@@ -396,7 +411,7 @@ def _collect_api_key(provider: dict[str, Any]) -> dict[str, Any]:
 # ── Persistence ────────────────────────────────────────────────────────────────
 
 def _save(creds: dict[str, Any]) -> None:
-    save_encrypted_credentials(creds, db_path=CREDENTIALS_PATH.with_name("runtime.db"))
+    save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
 
 
 def codex_oauth_credentials() -> dict[str, Any]:
@@ -460,7 +475,7 @@ def _auth_merge_credentials_node(state: _AuthCredentialWorkflowState) -> dict[st
 def _auth_save_credentials_node(state: _AuthCredentialWorkflowState) -> dict[str, object]:
     creds = dict(state.get("credentials") or {})
     _save(creds)
-    return {"saved_path": CREDENTIALS_PATH.with_name("runtime.db")}
+    return {"saved_path": _credentials_path().with_name("runtime.db")}
 
 
 @lru_cache(maxsize=1)
@@ -481,7 +496,7 @@ def save_credentials_for_provider(provider: dict[str, Any]) -> Path:
         {"mode": "setup", "provider": provider},
         config={"configurable": {"thread_id": f"auth-setup:{provider.get('id', 'unknown')}"}},
     )
-    return final_state.get("saved_path") or CREDENTIALS_PATH.with_name("runtime.db")
+    return final_state.get("saved_path") or _credentials_path().with_name("runtime.db")
 
 
 def reauthenticate_codex_oauth() -> Path:
@@ -489,7 +504,7 @@ def reauthenticate_codex_oauth() -> Path:
         {"mode": "reauth_codex", "provider": {"id": "codex", "kind": "oauth"}},
         config={"configurable": {"thread_id": "auth-reauth:codex"}},
     )
-    saved_path = final_state.get("saved_path") or CREDENTIALS_PATH.with_name("runtime.db")
+    saved_path = final_state.get("saved_path") or _credentials_path().with_name("runtime.db")
     print()
     print(f"  Saved Codex OAuth credentials to {saved_path}")
     print()
@@ -497,10 +512,11 @@ def reauthenticate_codex_oauth() -> Path:
 
 
 def load_stored_credentials() -> dict[str, Any] | None:
-    stored = load_encrypted_credentials(db_path=CREDENTIALS_PATH.with_name("runtime.db"))
+    credentials_path = _credentials_path()
+    stored = load_encrypted_credentials(db_path=credentials_path.with_name("runtime.db"))
     if stored:
         return stored
-    return migrate_credentials_json_to_db(CREDENTIALS_PATH, db_path=CREDENTIALS_PATH.with_name("runtime.db"))
+    return migrate_credentials_json_to_db(credentials_path, db_path=credentials_path.with_name("runtime.db"))
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────

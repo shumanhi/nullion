@@ -37,6 +37,7 @@ from typing import Any, AsyncIterator, Callable, Iterable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from nullion.conversation_runtime import ConversationTurnDisposition
 from nullion.version import version_tag
 from nullion.artifacts import (
     artifact_descriptor_for_path,
@@ -68,6 +69,7 @@ from nullion.cron_delivery import (
     cron_agent_prompt,
     cron_delivery_target,
     cron_delivery_text,
+    cron_structured_result_block_reason,
     effective_cron_delivery_channel,
     run_cron_delivery_workflow,
     scheduled_task_delivery_text,
@@ -129,7 +131,18 @@ from nullion.tools import ToolInvocation, ToolResult, normalize_tool_status
 
 logger = logging.getLogger(__name__)
 
-CRON_EXECUTION_BLOCKED_TOOLS = frozenset({"create_cron", "delete_cron", "toggle_cron", "run_cron"})
+CRON_EXECUTION_BLOCKED_CAPABILITY_TAGS = frozenset({"scheduler"})
+CRON_EXECUTION_BLOCKED_TOOLS = frozenset(
+    {
+        "create_cron",
+        "delete_cron",
+        "list_crons",
+        "list_reminders",
+        "run_cron",
+        "set_reminder",
+        "toggle_cron",
+    }
+)
 _WEB_ARTIFACTS: dict[str, Path] = {}
 _LOG_BUFFER: deque[dict[str, str]] = deque(maxlen=500)
 _SERVER_STARTED_AT = datetime.now(UTC).isoformat()
@@ -155,24 +168,42 @@ class CronExecutionToolRegistry:
     def __init__(self, delegate) -> None:
         self._delegate = delegate
 
+    @staticmethod
+    def _spec_tags(spec: object) -> frozenset[str]:
+        return frozenset(
+            str(tag).strip().lower()
+            for tag in (getattr(spec, "capability_tags", ()) or ())
+            if str(tag).strip()
+        )
+
+    def _is_blocked_spec(self, spec: object) -> bool:
+        spec_name = str(getattr(spec, "name", "") or "").strip()
+        if spec_name in CRON_EXECUTION_BLOCKED_TOOLS:
+            return True
+        return bool(
+            self._spec_tags(spec).intersection(CRON_EXECUTION_BLOCKED_CAPABILITY_TAGS)
+        )
+
     def get_spec(self, name: str):
-        if name in CRON_EXECUTION_BLOCKED_TOOLS:
+        spec = self._delegate.get_spec(name)
+        if self._is_blocked_spec(spec):
             raise KeyError(f"Unknown tool: {name}")
-        return self._delegate.get_spec(name)
+        return spec
 
     def list_specs(self) -> list[object]:
         return [
             spec
             for spec in self._delegate.list_specs()
-            if getattr(spec, "name", None) not in CRON_EXECUTION_BLOCKED_TOOLS
+            if not self._is_blocked_spec(spec)
         ]
 
     def list_tool_definitions(self, *args, **kwargs) -> list[dict[str, object]]:
         definitions = self._delegate.list_tool_definitions(*args, **kwargs)
+        allowed_names = {str(getattr(spec, "name", "") or "") for spec in self.list_specs()}
         return [
             definition
             for definition in definitions
-            if str(definition.get("name") or "") not in CRON_EXECUTION_BLOCKED_TOOLS
+            if str(definition.get("name") or "") in allowed_names
         ]
 
     def filesystem_allowed_roots(self):
@@ -185,7 +216,14 @@ class CronExecutionToolRegistry:
         return self._delegate.is_plugin_installed(plugin_name)
 
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
-        if invocation.tool_name in CRON_EXECUTION_BLOCKED_TOOLS:
+        try:
+            spec = self._delegate.get_spec(invocation.tool_name)
+        except KeyError:
+            spec = None
+        if spec is not None and self._is_blocked_spec(spec):
+            blocked_tags = sorted(
+                self._spec_tags(spec).intersection(CRON_EXECUTION_BLOCKED_CAPABILITY_TAGS)
+            )
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
@@ -193,6 +231,8 @@ class CronExecutionToolRegistry:
                 output={
                     "reason": "cron_execution_capability_denied",
                     "denied_tools": sorted(CRON_EXECUTION_BLOCKED_TOOLS),
+                    "denied_capability_tags": blocked_tags,
+                    "tool_capability_tags": sorted(self._spec_tags(spec)),
                 },
                 error=f"Capability denied during scheduled task execution: {invocation.tool_name}",
             )
@@ -294,13 +334,14 @@ def _model_provider_and_codex_token_for_config(
     oai_key_s = str(oai_key or "")
     legacy_openai_oauth = provider_name == "openai" and bool(oai_key_s) and not oai_key_s.startswith("sk-")
     provider = "codex" if legacy_openai_oauth else raw_provider
+    maybe_codex_oai_key = oai_key_s if (legacy_openai_oauth or provider_name == "codex") and not oai_key_s.startswith("sk-") else ""
     codex_token = (
         os.environ.get("NULLION_CODEX_REFRESH_TOKEN", "")
         or os.environ.get("CODEX_REFRESH_TOKEN", "")
         or str(creds.get("refresh_token") or "")
         or (str(creds.get("api_key") or "") if str(creds.get("provider") or "").strip().lower() == "codex" else "")
         or str(stored_keys.get("codex") or "")
-        or (oai_key_s if legacy_openai_oauth or provider_name == "codex" else "")
+        or maybe_codex_oai_key
     )
     return provider, codex_token
 
@@ -4760,19 +4801,19 @@ _HTML = r"""<!DOCTYPE html>
           <div class="form-hint" style="margin-bottom:12px">This information is stored locally and shared with the AI so it can personalise responses.</div>
           <div class="form-group">
             <label>Full name</label>
-            <input type="text" id="cfg-profile-name" placeholder="Jane Smith">
+            <input type="text" id="cfg-profile-name" placeholder="Your name">
           </div>
           <div class="form-group">
             <label>Email</label>
-            <input type="email" id="cfg-profile-email" placeholder="jane@example.com">
+            <input type="email" id="cfg-profile-email" placeholder="Optional">
           </div>
           <div class="form-group">
             <label>Phone</label>
-            <input type="tel" id="cfg-profile-phone" placeholder="+1 555 000 0000">
+            <input type="tel" id="cfg-profile-phone" placeholder="Optional">
           </div>
           <div class="form-group">
             <label>Address</label>
-            <textarea id="cfg-profile-address" rows="2" placeholder="123 Main St, City, Country"></textarea>
+            <textarea id="cfg-profile-address" rows="2" placeholder="Optional"></textarea>
           </div>
           <div class="form-group" style="margin-bottom:0">
             <label>Notes</label>
@@ -5376,6 +5417,7 @@ let currentActivityEl = null;
 let currentActivityItems = new Map();
 let _activityElByTurn = new Map();
 let _activityItemsByTurn = new Map();
+let _activityEventsByTurn = new Map();
 let _activityElByApproval = new Map();
 let _activityTurnByApproval = new Map();
 let _taskStatusBubbles = new Map();
@@ -5453,6 +5495,37 @@ function finishTurnUi(turnId = null) {
   setSendButtonDisabled(false);
 }
 
+function activeTurnIdForBackgroundReply(text) {
+  const backgroundText = String(text || '').trim();
+  if (!backgroundText || !_activeSendTurnIds.size) return null;
+  const activeIds = Array.from(_activeSendTurnIds).reverse();
+  for (const turnId of activeIds) {
+    const bubble = _botTurnBubbles.get(turnId);
+    if (!bubble) return turnId;
+    const rawText = String(bubble.dataset.rawText || '').trim();
+    if (
+      bubble.classList.contains('typing-bubble') ||
+      bubble.classList.contains('status-bubble') ||
+      !rawText ||
+      rawText === backgroundText
+    ) {
+      return turnId;
+    }
+  }
+  return null;
+}
+
+function renderServerDeliveredBackgroundReply(text, artifacts = []) {
+  const turnId = activeTurnIdForBackgroundReply(text);
+  if (!turnId) return null;
+  _messageMetadataByTurn.set(turnId, { artifacts: artifacts || [] });
+  _skipSaveByTurn.set(turnId, true);
+  const bubble = finalizeBotMsg(text, false, turnId);
+  addArtifactLinks(bubble, artifacts || []);
+  finishTurnUi(turnId);
+  return bubble;
+}
+
 function typingIndicatorHtml(label = 'Thinking') {
   return `<span class="typing-indicator" role="status" aria-live="polite" aria-label="${escHtml(label)}">
     <span class="typing-label">${escHtml(label)}</span>
@@ -5491,12 +5564,14 @@ function resetRunActivity(turnId = null) {
   if (turnId) {
     _activityElByTurn.delete(turnId);
     _activityItemsByTurn.delete(turnId);
+    _activityEventsByTurn.delete(turnId);
     return;
   }
   currentActivityEl = null;
   currentActivityItems = new Map();
   _activityElByTurn = new Map();
   _activityItemsByTurn = new Map();
+  _activityEventsByTurn = new Map();
   _activityElByApproval = new Map();
   _activityTurnByApproval = new Map();
 }
@@ -5699,6 +5774,19 @@ function isActivityGroup(label, detail) {
 function updateRunActivity(event) {
   if (!activityTraceEnabled || !event) return;
   const turnId = event.turn_id || null;
+  if (turnId) {
+    const recorded = _activityEventsByTurn.get(turnId) || [];
+    const compact = {
+      id: String(event.id || event.label || Date.now()),
+      label: String(event.label || 'Working'),
+      status: String(event.status || 'running'),
+      detail: String(event.detail || ''),
+    };
+    const existingIndex = recorded.findIndex(item => String(item.id || '') === compact.id);
+    if (existingIndex >= 0) recorded[existingIndex] = compact;
+    else recorded.push(compact);
+    _activityEventsByTurn.set(turnId, recorded);
+  }
   const id = String(event.id || event.label || Date.now());
   const label = String(event.label || 'Working');
   const status = String(event.status || 'running');
@@ -5763,6 +5851,17 @@ function restoreRunActivity(bubble, activity) {
     bubble.appendChild(activity);
     bubble.classList.add('has-run-activity');
   }
+}
+
+function restoreRunActivityEvents(bubble, events) {
+  if (!bubble || !Array.isArray(events) || !events.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'run-activity';
+  wrap.innerHTML = '<div class="run-activity-head"><span>Activity</span><span>Saved</span></div><div class="run-activity-body"></div>';
+  bubble.appendChild(wrap);
+  bubble.classList.add('has-run-activity');
+  const items = new Map();
+  events.forEach(event => updateRunActivityInWrap(wrap, event, items));
 }
 
 function addSystemNotice(text) {
@@ -5872,7 +5971,11 @@ async function connect() {
         updateTaskStatusCard(data);
         refreshDashboard();
       } else if (data.type === 'done') {
-        _messageMetadataByTurn.set(data.turn_id || '__current__', { artifacts: data.artifacts || [] });
+        const doneTurnId = data.turn_id || '__current__';
+        _messageMetadataByTurn.set(doneTurnId, {
+          artifacts: data.artifacts || [],
+          activity: _activityEventsByTurn.get(doneTurnId) || [],
+        });
         const bubble = finalizeBotMsg(null, false, data.turn_id || null);
         addArtifactLinks(bubble, data.artifacts || []);
         finishTurnUi(data.turn_id || null);
@@ -5898,7 +6001,9 @@ async function connect() {
         refreshDashboard();
       } else if (data.type === 'background_message') {
         if (!data.conversation_id || data.conversation_id === conversationId) {
-          addMessage('bot', data.text || '', false, { artifacts: data.artifacts || [] });
+          const artifacts = data.artifacts || [];
+          const bubble = renderServerDeliveredBackgroundReply(data.text || '', artifacts);
+          if (!bubble) addMessage('bot', data.text || '', false, { artifacts });
           refreshDashboard();
         }
       } else if (data.type === 'gateway_notice') {
@@ -7523,6 +7628,11 @@ function openAttentionItems() {
   document.getElementById('attention-overlay').style.display = 'flex';
 }
 
+function attentionModalIsOpen() {
+  const overlay = document.getElementById('attention-overlay');
+  return Boolean(overlay && overlay.style.display !== 'none');
+}
+
 function attentionPayload(data = {}) {
   const pendingApprovals = (data.approvals || []).filter(a => approvalStatusValue(a.status) === 'pending');
   const builderItems = (data.builder_proposals || []).filter(item => {
@@ -8119,6 +8229,7 @@ async function refreshDashboard() {
     renderDecisionHistory(data.approvals || []);
     renderBuilder(data.builder_proposals || []);
     renderDoctor(data);
+    if (attentionModalIsOpen()) renderAttentionModal(data);
     renderTasks(data.task_frames || [], data.mini_agent_tasks || []);
     renderSkills(data.skills || []);
     renderMemory(data.memory || []);
@@ -9505,7 +9616,7 @@ async function runDoctorDiagnose() {
   }
 }
 
-// Populated from loadConfig — tracks which providers have saved credentials
+// Populated from loadConfig — tracks provider credential state
 let _providerConfigured = {};
 // Per-provider saved model strings (e.g. {openai: "gpt-...", anthropic: "claude-...", openrouter: "tencent/...", codex: ""})
 let _providerModels = {};
@@ -9527,7 +9638,7 @@ let _providerChangeIsInitialLoad = false;
 let _headerConfig = null;
 let _headerSwitching = false;
 
-// Tracks which provider the model field currently belongs to so we can stash
+// Tracks the provider owning the model field so we can stash
 // edits to _providerModels before swapping.
 let _modelFieldProvider = null;
 
@@ -12564,6 +12675,7 @@ finalizeBotMsg = function(fallback = null, isError = false, turnId = null) {
     const metadata = _messageMetadataByTurn.get(metadataKey) || null;
     if (text.trim() && !skipSave) _chatSaveMsg('bot', text, isError, metadata);
     _messageMetadataByTurn.delete(metadataKey);
+    _activityEventsByTurn.delete(metadataKey);
   }
   if (turnId) {
     _skipSaveByTurn.delete(turnId);
@@ -12574,10 +12686,7 @@ finalizeBotMsg = function(fallback = null, isError = false, turnId = null) {
 };
 
 function cleanRestoredBotText(text) {
-  let cleaned = String(text || '');
-  const activityIndex = cleaned.search(/\n?\s*Activity\s+Live\s+/i);
-  if (activityIndex >= 0) cleaned = cleaned.slice(0, activityIndex);
-  return cleaned.trim();
+  return String(text || '').trim();
 }
 
 function renderRestoredMessages(messages) {
@@ -12589,8 +12698,11 @@ function renderRestoredMessages(messages) {
     const text = role === 'bot' ? cleanRestoredBotText(m.text) : String(m.text || '');
     const metadata = role === 'user'
       ? { attachments: m.attachments || [] }
-      : { artifacts: m.artifacts || [] };
-    if (text) _origAddMessage(role, text, !!m.is_error, metadata);
+      : { artifacts: m.artifacts || [], activity: (m.metadata && Array.isArray(m.metadata.activity)) ? m.metadata.activity : [] };
+    if (text) {
+      const bubble = _origAddMessage(role, text, !!m.is_error, metadata);
+      if (role === 'bot') restoreRunActivityEvents(bubble, metadata.activity);
+    }
   }
   container.scrollTop = container.scrollHeight;
 }
@@ -12753,8 +12865,11 @@ async function viewArchivedConv(convId, title) {
       const text = role === 'bot' ? cleanRestoredBotText(m.text) : String(m.text || '');
       const metadata = role === 'user'
         ? { attachments: m.attachments || [] }
-        : { artifacts: m.artifacts || [] };
-      if (text) _origAddMessage(role, text, !!m.is_error, metadata);
+        : { artifacts: m.artifacts || [], activity: (m.metadata && Array.isArray(m.metadata.activity)) ? m.metadata.activity : [] };
+      if (text) {
+        const bubble = _origAddMessage(role, text, !!m.is_error, metadata);
+        if (role === 'bot') restoreRunActivityEvents(bubble, metadata.activity);
+      }
     }
     container.scrollTop = container.scrollHeight;
     document.getElementById('send-btn').disabled = true;
@@ -13120,6 +13235,7 @@ async function _loadAhMessages(convId, rowEl) {
         '<div class="ahm-text">' + (role === 'bot' ? renderMessageText(text) : escHtml(text)) + '</div>';
       const textEl = bub.querySelector('.ahm-text');
       addArtifactLinks(textEl, role === 'user' ? (m.attachments || []) : (m.artifacts || []));
+      if (role === 'bot') restoreRunActivityEvents(textEl, (m.metadata && Array.isArray(m.metadata.activity)) ? m.metadata.activity : []);
       msgPane.appendChild(bub);
     });
     msgPane.scrollTop = msgPane.scrollHeight;
@@ -13341,15 +13457,15 @@ async function submitCronForm() {
   }
 }
 
-// Refresh crons dashboard every 60s
-setInterval(() => fetch('/api/crons').then(r => r.json()).then(renderCronsDash).catch(()=>{}), 60000);
+// Refresh crons dashboard occasionally; the full status dashboard has its own refresh.
+setInterval(() => fetch('/api/crons').then(r => r.json()).then(renderCronsDash).catch(()=>{}), 120000);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 connect();
 refreshDashboard();
 connectDashboardEvents();
 loadHeaderConfig();
-setInterval(refreshDashboard, 5000);
+setInterval(refreshDashboard, 30000);
 setInterval(updateElapsedCounters, 1000);
 checkForUpdates();
 loadCronsTab();
@@ -14410,6 +14526,9 @@ def create_app(runtime, orchestrator, registry):
     def _cron_result_block_reason(result: dict, text: str, artifacts: object) -> str | None:
         if result.get("reached_iteration_limit"):
             return "cron_run_reached_iteration_limit"
+        structured_reason = cron_structured_result_block_reason(result, artifacts)
+        if structured_reason is not None:
+            return structured_reason
         has_artifacts = bool(artifacts)
         if str(text or "").startswith("Fetched untrusted web content:") and not has_artifacts:
             return "cron_run_unfinished_untrusted_web_fetch"
@@ -14526,6 +14645,7 @@ def create_app(runtime, orchestrator, registry):
                     allow_mini_agents=allow_mini_agents,
                     memory_owner=memory_owner_for_workspace(getattr(cron_job, "workspace_id", "workspace_admin")),
                     reinforce_memory_context=False,
+                    include_structured_result=True,
                 ),
                 record_event=_record_cron_delivery_event,
                 block_reason=_cron_result_block_reason,
@@ -15364,23 +15484,21 @@ def create_app(runtime, orchestrator, registry):
 
     @app.get("/api/status/stream")
     async def status_stream(request: Request):
-        """Server-Sent Events stream for dashboard state changes."""
+        """Cheap heartbeat stream for dashboard connectivity.
+
+        The dashboard already polls /api/status. Re-rendering the whole runtime
+        store for every open SSE connection can starve normal API responses.
+        """
         from fastapi.responses import StreamingResponse
         import asyncio
 
         async def _sse():
-            last_signature = _dashboard_state_signature()
             yield f"data: {json.dumps({'type': 'connected'})}\n\n"
             while True:
                 if await request.is_disconnected():
                     break
-                await asyncio.sleep(1.0)
-                signature = _dashboard_state_signature()
-                if signature != last_signature:
-                    last_signature = signature
-                    yield f"data: {json.dumps({'type': 'status_changed'})}\n\n"
-                else:
-                    yield ": ping\n\n"
+                await asyncio.sleep(15.0)
+                yield ": ping\n\n"
 
         return StreamingResponse(
             _sse(),
@@ -16519,7 +16637,8 @@ def create_app(runtime, orchestrator, registry):
             _new_settings.model.openai_model = model_s
         _new_client = build_model_client_from_settings(_new_settings)
         _replacement = _AgentOrchestrator(model_client=_new_client)
-        orchestrator.__dict__.update(_replacement.__dict__)
+        if orchestrator is not None:
+            orchestrator.__dict__.update(_replacement.__dict__)
         try:
             runtime.model_client = _new_client
         except Exception:
@@ -16981,8 +17100,13 @@ def create_app(runtime, orchestrator, registry):
             ) else "false"
             updates["NULLION_SKILL_PACK_ACCESS_ENABLED"] = skill_pack_access
             updates["NULLION_CONNECTOR_ACCESS_ENABLED"] = connector_access
+            updates["NULLION_ENABLED_SKILL_PACKS"] = enabled_skill_packs
             os.environ["NULLION_SKILL_PACK_ACCESS_ENABLED"] = skill_pack_access
             os.environ["NULLION_CONNECTOR_ACCESS_ENABLED"] = connector_access
+            if enabled_skill_packs.strip():
+                os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_skill_packs
+            else:
+                os.environ.pop("NULLION_ENABLED_SKILL_PACKS", None)
 
         for key, env_name in [
             ("audio_transcribe_enabled", "NULLION_AUDIO_TRANSCRIBE_ENABLED"),
@@ -17845,7 +17969,15 @@ def create_app(runtime, orchestrator, registry):
 
             result = await loop.run_in_executor(
                 None,
-                lambda: _run_guarded_turn_sync(user_text, conv_id, orchestrator, registry, runtime, attachments=attachments),
+                lambda: _run_guarded_turn_sync(
+                    user_text,
+                    conv_id,
+                    orchestrator,
+                    registry,
+                    runtime,
+                    attachments=attachments,
+                    config_action=payload.get("config_action"),
+                ),
             )
             if result.get("suspended_for_approval"):
                 return JSONResponse({
@@ -18007,6 +18139,7 @@ def create_app(runtime, orchestrator, registry):
                         runtime,
                         activity_callback=emit_activity_event,
                         attachments=attachments,
+                        config_action=payload.get("config_action"),
                     ),
                 )
             except Exception as exc:
@@ -18306,11 +18439,12 @@ def _web_task_frame_summary(user_text: str, *, limit: int = 90) -> str:
     return compact[: limit - 3].rstrip() + "..."
 
 
-def _start_web_task_frame(runtime, *, conversation_id: str, user_text: str) -> tuple[str | None, str | None]:
+def _start_web_task_frame(runtime, *, conversation_id: str, user_text: str) -> tuple[str | None, str | None, object | None]:
     """Record a visible task-frame for a normal web chat turn."""
     store = getattr(runtime, "store", None)
     if store is None:
-        return None, None
+        return None, None, None
+    conversation_result = None
     try:
         from nullion.runtime import process_conversation_message
 
@@ -18345,7 +18479,7 @@ def _start_web_task_frame(runtime, *, conversation_id: str, user_text: str) -> t
         )
         store.add_task_frame(updated)
         store.set_active_task_frame_id(conversation_id, updated.frame_id)
-        return updated.frame_id, turn_id
+        return updated.frame_id, turn_id, conversation_result
 
     frame = TaskFrame(
         frame_id=f"frame-web-{uuid4().hex[:12]}",
@@ -18370,7 +18504,19 @@ def _start_web_task_frame(runtime, *, conversation_id: str, user_text: str) -> t
         runtime.checkpoint()
     except Exception:
         logger.debug("Unable to checkpoint after starting web task frame", exc_info=True)
-    return frame.frame_id, turn_id
+    return frame.frame_id, turn_id, conversation_result
+
+
+def _should_include_web_recent_tool_context(conversation_result: object | None) -> bool:
+    continuation = getattr(conversation_result, "task_frame_continuation", None)
+    if continuation is not None and continuation.mode.value != "start_new":
+        return True
+    disposition = getattr(getattr(conversation_result, "turn", None), "disposition", None)
+    return disposition in {
+        ConversationTurnDisposition.CONTINUE,
+        ConversationTurnDisposition.REVISE,
+        ConversationTurnDisposition.BACKGROUND_FOLLOW_UP,
+    }
 
 
 def _finish_web_task_frame(
@@ -18757,59 +18903,165 @@ def _remember_web_explicit_memory(runtime, *, user_message: str, owner: str | No
             logger.debug("Unable to checkpoint after web memory write", exc_info=True)
 
 
-def _handle_web_config_request(user_text: str, *, runtime, orchestrator) -> str | None:
-    text = str(user_text or "").strip()
-    lowered = text.lower()
-    model_question_markers = (
-        "what model",
-        "which model",
-        "model am i using",
-        "model are you using",
-        "what provider",
-        "which provider",
-    )
-    if any(marker in lowered for marker in model_question_markers):
-        from nullion.runtime_config import current_runtime_config
+class _WebConfigIntentState(TypedDict, total=False):
+    text: str
+    model_client: object | None
+    action: str | None
+    confidence: float
 
-        cfg = current_runtime_config(model_client=getattr(orchestrator, "model_client", None))
-        return (
-            "Current model config:\n"
-            f"- Provider: {cfg.provider}\n"
-            f"- Model: {cfg.model}\n"
-            f"- Web access: {'on' if cfg.web_access else 'off'}\n"
-            f"- Browser: {'on' if cfg.browser_enabled else 'off'}\n"
-            f"- Memory: {'on' if cfg.memory_enabled else 'off'}"
-        )
 
-    match = re.search(
-        r"\b(?:switch|change|set|use)\s+(?:the\s+)?model\s+(?:to\s+)?([A-Za-z0-9][A-Za-z0-9._:/+-]{1,80})\b",
-        text,
-        flags=re.IGNORECASE,
+def _web_config_summary(orchestrator) -> str:
+    from nullion.runtime_config import current_runtime_config
+
+    cfg = current_runtime_config(model_client=getattr(orchestrator, "model_client", None))
+    return (
+        "Current model config:\n"
+        f"- Provider: {cfg.provider}\n"
+        f"- Model: {cfg.model}\n"
+        f"- Web access: {'on' if cfg.web_access else 'off'}\n"
+        f"- Browser: {'on' if cfg.browser_enabled else 'off'}\n"
+        f"- Memory: {'on' if cfg.memory_enabled else 'off'}"
     )
-    if match is None:
+
+
+def _text_from_web_config_model_response(response: object) -> str:
+    if not isinstance(response, dict):
+        return ""
+    parts: list[str] = []
+    for block in response.get("content") or ():
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+    return "\n".join(parts).strip()
+
+
+def _web_config_payload_from_model_response(response: object) -> dict[str, object] | None:
+    if not isinstance(response, dict):
         return None
-
-    model_name = match.group(1).strip(".,;: ")
-    from nullion.runtime_config import persist_model_name
-
-    persist_model_name(model_name)
+    for block in response.get("content") or ():
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use" and block.get("name") == "select_web_config_action":
+            payload = block.get("input")
+            return payload if isinstance(payload, dict) else None
+    text = _text_from_web_config_model_response(response)
+    if not text:
+        return None
     try:
-        from nullion.agent_orchestrator import AgentOrchestrator
-        from nullion.model_clients import clone_model_client_with_model
-
-        current_client = getattr(orchestrator, "model_client", None)
-        if current_client is None:
-            return f"Model set to {model_name}. Restart Nulliøn to apply it live."
-        new_client = clone_model_client_with_model(current_client, model_name)
-        replacement = AgentOrchestrator(model_client=new_client)
-        orchestrator.__dict__.update(replacement.__dict__)
+        payload = json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
         try:
-            runtime.model_client = new_client
+            payload = json.loads(text[start : end + 1])
         except Exception:
-            pass
-        return f"Switched model to {model_name}. It is active for new turns."
-    except Exception as exc:
-        return f"Model set to {model_name}, but live switch failed: {_short_error_text(exc)}. Restart Nulliøn to apply it."
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _web_config_intent_model_node(state: _WebConfigIntentState) -> dict[str, object]:
+    model_client = state.get("model_client")
+    create = getattr(model_client, "create", None)
+    if not callable(create):
+        return {"action": None, "confidence": 0.0}
+    try:
+        response = create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": str(state.get("text") or "")}],
+                }
+            ],
+            tools=[
+                {
+                    "name": "select_web_config_action",
+                    "description": "Select a Nullion web configuration action requested by the user.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["show_runtime_config", "none"],
+                            },
+                            "confidence": {"type": "number"},
+                        },
+                        "required": ["action", "confidence"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+            max_tokens=80,
+            system=(
+                "Classify the message into a web configuration action. "
+                "Return show_runtime_config only when the user is asking to inspect the active Nullion model/provider/runtime configuration. "
+                "Return none for model switching, ordinary chat, or any request that should be handled by slash/operator commands or the main assistant. "
+                "Use semantic understanding across languages and do not split one message into multiple tasks."
+            ),
+        )
+    except Exception:
+        logger.debug("Web config structured intent classification failed", exc_info=True)
+        return {"action": None, "confidence": 0.0}
+    payload = _web_config_payload_from_model_response(response)
+    if payload is None:
+        return {"action": None, "confidence": 0.0}
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+    action = str(payload.get("action") or "").strip()
+    if action not in {"show_runtime_config", "none"}:
+        action = "none"
+    return {"action": action, "confidence": confidence}
+
+
+@lru_cache(maxsize=1)
+def _compiled_web_config_intent_graph():
+    graph = StateGraph(_WebConfigIntentState)
+    graph.add_node("classify", _web_config_intent_model_node)
+    graph.add_edge(START, "classify")
+    graph.add_edge("classify", END)
+    return graph.compile()
+
+
+def _structured_web_config_action(config_action: object) -> str | None:
+    if not isinstance(config_action, dict):
+        return None
+    action = str(config_action.get("action") or config_action.get("type") or "").strip()
+    if action in {"show_runtime_config", "runtime_config_summary"}:
+        return "show_runtime_config"
+    return None
+
+
+def _handle_web_config_request(
+    user_text: str,
+    *,
+    runtime,
+    orchestrator,
+    config_action: object = None,
+) -> str | None:
+    _ = runtime
+    explicit_action = _structured_web_config_action(config_action)
+    if explicit_action == "show_runtime_config":
+        return _web_config_summary(orchestrator)
+
+    final_state = _compiled_web_config_intent_graph().invoke(
+        {
+            "text": str(user_text or ""),
+            "model_client": getattr(orchestrator, "model_client", None),
+            "action": None,
+            "confidence": 0.0,
+        },
+        config={"configurable": {"thread_id": "web-config-intent"}},
+    )
+    action = str(final_state.get("action") or "")
+    try:
+        confidence = float(final_state.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+    if action == "show_runtime_config" and confidence >= 0.7:
+        return _web_config_summary(orchestrator)
+    return None
 
 
 def _feature_enabled(name: str, *, default: bool = True) -> bool:
@@ -19463,9 +19715,11 @@ def _run_turn_sync(
     runtime,
     activity_callback: ActivityCallback | None = None,
     attachments: list[dict[str, str]] | None = None,
+    config_action: object = None,
     allow_mini_agents: bool = True,
     memory_owner: str | None = None,
     reinforce_memory_context: bool = True,
+    include_structured_result: bool = False,
 ) -> dict:
     """Run one agent turn synchronously (called from thread executor)."""
     try:
@@ -19479,6 +19733,7 @@ def _run_turn_sync(
         user_text,
         runtime=runtime,
         orchestrator=orchestrator,
+        config_action=config_action,
     )
     if config_shortcut is not None:
         _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Handled by configuration shortcut")
@@ -19504,7 +19759,7 @@ def _run_turn_sync(
     turn_orchestrator = _orchestrator_for_admin_forced_model(orchestrator, runtime)
     turn_orchestrator = _orchestrator_for_video_attachments(turn_orchestrator, normalized_attachments)
     turn_memory_owner = memory_owner or memory_owner_for_web_admin()
-    web_task_frame_id, web_conversation_turn_id = _start_web_task_frame(
+    web_task_frame_id, web_conversation_turn_id, web_conversation_result = _start_web_task_frame(
         runtime,
         conversation_id=conv_id,
         user_text=user_text,
@@ -19634,7 +19889,11 @@ def _run_turn_sync(
             "role": "system",
             "content": [{"type": "text", "text": f"Known user memory:\n{memory_context}"}],
         })
-    recent_tool_context = _recent_web_tool_context_prompt(runtime, conv_id)
+    recent_tool_context = (
+        _recent_web_tool_context_prompt(runtime, conv_id)
+        if _should_include_web_recent_tool_context(web_conversation_result)
+        else None
+    )
     if recent_tool_context:
         history_prefix.append({
             "role": "system",
@@ -19880,6 +20139,8 @@ def _run_turn_sync(
         "artifacts": artifacts,
         "thinking": getattr(result, "thinking_text", None) or "",
     }
+    if include_structured_result:
+        payload["tool_results"] = _compact_web_tool_results_for_context(tool_results)
     if getattr(result, "reached_iteration_limit", False):
         payload["reached_iteration_limit"] = True
     return payload
@@ -19902,7 +20163,9 @@ def _cli_impl() -> None:
 
     _load_env(args.env_file)
     if args.checkpoint:
-        os.environ["NULLION_CHECKPOINT_PATH"] = str(Path(args.checkpoint).expanduser())
+        checkpoint_path = Path(args.checkpoint).expanduser()
+        os.environ["NULLION_CHECKPOINT_PATH"] = str(checkpoint_path)
+        os.environ.setdefault("NULLION_HOME", str(checkpoint_path.parent))
 
     return run_single_instance_entrypoint(
         "web",
@@ -20120,7 +20383,7 @@ def _build_runtime():
 
 def _build_model_client_from_env():
     provider = os.environ.get("NULLION_MODEL_PROVIDER", "").lower()
-    if provider == "openai" or os.environ.get("OPENAI_API_KEY"):
+    if provider == "openai" or os.environ.get("OPENAI_API_KEY") or os.environ.get("NULLION_OPENAI_API_KEY"):
         return _build_openai_client()
     if provider == "anthropic" or os.environ.get("ANTHROPIC_API_KEY"):
         return _build_anthropic_client()
@@ -20133,7 +20396,11 @@ def _env_model_provider_configured() -> bool:
     provider = os.environ.get("NULLION_MODEL_PROVIDER", "").strip().lower()
     if provider in {"openai", "anthropic"}:
         return True
-    return bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"))
+    return bool(
+        os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("NULLION_OPENAI_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+    )
 
 
 def _current_process_restart_command() -> list[str]:
@@ -20219,7 +20486,7 @@ def _build_openai_client():
         import openai
     except ImportError:
         raise RuntimeError("openai package not installed. Run: pip install openai")
-    api_key = os.environ["OPENAI_API_KEY"]
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ["NULLION_OPENAI_API_KEY"]
     client = openai.OpenAI(api_key=api_key)
     model = os.environ.get("NULLION_MODEL", "")
     if not model:
@@ -20326,6 +20593,9 @@ _DEFAULT_CREDENTIALS_PATH = _CREDENTIALS_PATH
 def _credentials_path() -> Path:
     if _CREDENTIALS_PATH != _DEFAULT_CREDENTIALS_PATH:
         return _CREDENTIALS_PATH
+    configured_home = os.environ.get("NULLION_HOME")
+    if configured_home and configured_home.strip():
+        return Path(configured_home).expanduser() / "credentials.json"
     return Path.home() / ".nullion" / "credentials.json"
 
 

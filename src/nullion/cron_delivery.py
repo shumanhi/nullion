@@ -18,6 +18,7 @@ MESSAGING_CRON_DELIVERY_CHANNELS = frozenset({"telegram", "slack", "discord"})
 MAX_CRON_TEXT_ARTIFACT_CHARS = 12000
 DEFAULT_CRON_NO_OUTPUT_MESSAGE = "Cron ran successfully; no output was produced."
 SCHEDULED_TASK_DELIVERY_PREFIX = "⏰ Scheduled task:"
+CRON_INTERNAL_CAPABILITY_TAGS = frozenset({"scheduler"})
 
 # Cron delivery contract for future agents:
 # - Cron can deliver text, file attachments, both, or no message.
@@ -123,6 +124,18 @@ def cron_delivery_target(
     explicit_target = str(getattr(job, "delivery_target", "") or "").strip()
     if explicit_target and not (channel in MESSAGING_CRON_DELIVERY_CHANNELS and explicit_target.startswith("web:")):
         return explicit_target
+    workspace_id = str(getattr(job, "workspace_id", "") or "").strip()
+    if channel in MESSAGING_CRON_DELIVERY_CHANNELS and workspace_id and workspace_id != "workspace_admin":
+        try:
+            from nullion.users import messaging_delivery_targets_for_workspace
+
+            for candidate in messaging_delivery_targets_for_workspace(workspace_id, settings=settings):
+                candidate_channel = str(getattr(candidate, "channel", "") or "").strip().lower()
+                candidate_target = str(getattr(candidate, "target_id", "") or "").strip()
+                if candidate_channel == channel and candidate_target:
+                    return candidate_target
+        except Exception:
+            pass
     return configured_delivery_target(channel, settings=settings, env=env)
 
 
@@ -211,6 +224,67 @@ def _tool_result_status(result: object) -> str:
     return str(getattr(result, "status", "") or "")
 
 
+def _normalized_tool_result_status(result: object) -> str:
+    try:
+        from nullion.tools import normalize_tool_status
+
+        return normalize_tool_status(_tool_result_status(result))
+    except Exception:
+        return _tool_result_status(result).strip().lower()
+
+
+def _tool_result_capability_tags(result: object) -> frozenset[str]:
+    output = _tool_result_output(result)
+    raw_tags = output.get("tool_capability_tags")
+    if raw_tags is None:
+        raw_tags = output.get("denied_capability_tags")
+    if not isinstance(raw_tags, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(
+        str(tag).strip().lower() for tag in raw_tags if str(tag).strip()
+    )
+
+
+def _cron_result_has_internal_capability_denial(result: dict[str, object]) -> bool:
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "denied":
+            continue
+        if (
+            _tool_result_output(tool_result).get("reason")
+            != "cron_execution_capability_denied"
+        ):
+            continue
+        if _tool_result_capability_tags(tool_result).intersection(CRON_INTERNAL_CAPABILITY_TAGS):
+            return True
+    return False
+
+
+def _cron_result_has_completed_tool_evidence(result: dict[str, object]) -> bool:
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "completed":
+            continue
+        if _tool_result_capability_tags(tool_result).intersection(CRON_INTERNAL_CAPABILITY_TAGS):
+            continue
+        return True
+    return False
+
+
+def cron_structured_result_block_reason(
+    result: dict[str, object],
+    artifacts: object,
+) -> str | None:
+    """Return a delivery block reason from typed cron execution facts."""
+    if _cron_result_has_internal_capability_denial(result):
+        return "cron_run_denied_internal_capability"
+    if (
+        result.get("tool_results")
+        and not artifacts
+        and not _cron_result_has_completed_tool_evidence(result)
+    ):
+        return "cron_run_without_completed_tool_evidence"
+    return None
+
+
 def _artifact_paths_from_value(value: object) -> tuple[str, ...]:
     paths: list[str] = []
     for item in _artifact_values(value):
@@ -241,10 +315,26 @@ def _is_state_artifact_media(path_text: str, state_filenames: set[str]) -> bool:
     return "artifacts" in parts and Path(path_text).name in state_filenames
 
 
+def _file_write_deliverable_artifact_path(path_text: object, state_filenames: set[str]) -> str:
+    path = _artifact_path_from_value(path_text)
+    if not path or _is_state_artifact_media(path, state_filenames):
+        return ""
+    parts = _path_parts(path)
+    if "artifacts" not in parts:
+        return ""
+    try:
+        candidate = Path(path).expanduser()
+        if not candidate.is_file() or candidate.stat().st_size <= 0:
+            return ""
+        return str(candidate)
+    except OSError:
+        return ""
+
+
 def _structured_tool_artifact_paths(result: dict[str, object], state_filenames: set[str]) -> tuple[str, ...]:
     paths: list[str] = []
     for tool_result in result.get("tool_results") or ():
-        if _tool_result_status(tool_result).strip().lower() != "completed":
+        if _normalized_tool_result_status(tool_result) != "completed":
             continue
         output = _tool_result_output(tool_result)
         # These fields are the typed artifact channel exposed by file-producing
@@ -254,6 +344,10 @@ def _structured_tool_artifact_paths(result: dict[str, object], state_filenames: 
             for path in _artifact_paths_from_value(output.get(key)):
                 if _is_state_artifact_media(path, state_filenames):
                     continue
+                paths.append(path)
+        if _tool_result_name(tool_result) == "file_write":
+            path = _file_write_deliverable_artifact_path(output.get("path"), state_filenames)
+            if path:
                 paths.append(path)
     return tuple(dict.fromkeys(paths))
 
@@ -649,6 +743,7 @@ __all__ = [
     "cron_delivery_target",
     "cron_delivery_text",
     "cron_delivery_text_from_result",
+    "cron_structured_result_block_reason",
     "effective_cron_delivery_channel",
     "normalize_cron_delivery_channel",
     "run_cron_delivery_workflow",

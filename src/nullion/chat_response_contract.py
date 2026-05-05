@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-import re
 from typing import Any, Callable, Mapping
 
 import nullion.system_context as system_context
+from nullion.approval_markers import TOOL_APPROVAL_REQUESTED_MARKER
 from nullion.config import load_settings, web_session_allow_duration_label
 from nullion.approval_display import approval_display_from_request
 from nullion.live_information import (
@@ -32,6 +32,13 @@ class ContextLinkMode(str, Enum):
     CONTINUE = "continue"
 
 
+class DraftOperationalClaim(str, Enum):
+    APPROVAL_REQUIRED = "approval_required"
+    TOOL_ATTEMPTED = "tool_attempted"
+    TOOL_COMPLETED = "tool_completed"
+    EXECUTION_STATE_REQUESTED = "execution_state_requested"
+
+
 @dataclass(frozen=True, slots=True)
 class OperationalFact:
     fact_id: str
@@ -52,134 +59,14 @@ class ChatTurnStateSnapshot:
 @dataclass(frozen=True, slots=True)
 class ModelDraftResponse:
     text: str
+    operational_claims: tuple[DraftOperationalClaim, ...] = ()
+    claimed_tool_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ChatResponseContract:
     state: ChatTurnStateSnapshot
     draft: ModelDraftResponse
-
-
-_UNGROUNDED_APPROVAL_CLAIM_PHRASES = (
-    "permission mode",
-    "needs your approval to run",
-    "got blocked by the permission mode",
-    "approval to run",
-    "allow it",
-    "requires approval",
-    "can't run",
-    "approval required before nullion can continue",
-    "please approve to proceed",
-)
-_UNGROUNDED_OPERATIONAL_NARRATION_PHRASES = (
-    "i need permission",
-    "resend the message",
-    "try again",
-    "fetch web content first",
-    "runtime state",
-    "permission to fetch",
-    "webfetch",
-)
-_EXECUTION_STATE_NARRATION_PHRASES = (
-    "runtime state",
-    "execution state",
-    "execution path",
-)
-_NEGATIVE_TOOL_STATUS_MARKERS = (
-    "denied",
-    "blocked",
-    "failed",
-    "approval required",
-    "requires approval",
-)
-
-
-def _tokenize_text(text: str) -> list[str]:
-    normalized_chars = [char if (char.isalnum() or char in {"_", "'"}) else " " for char in text.casefold().replace("’", "'")]
-    return "".join(normalized_chars).split()
-
-
-def _normalized_lower_text(text: str) -> str:
-    return " ".join(_tokenize_text(text))
-
-
-def _text_has_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
-    normalized = _normalized_lower_text(text)
-    padded = f" {normalized} "
-    return any(f" {phrase} " in padded for phrase in phrases)
-
-
-def _is_ungrounded_operational_narration(text: str) -> bool:
-    if _text_has_any_phrase(text, _UNGROUNDED_OPERATIONAL_NARRATION_PHRASES):
-        return True
-    tokens = _tokenize_text(text)
-    for index, token in enumerate(tokens):
-        if token != "approve":
-            continue
-        next_tokens = tokens[index + 1 : index + 5]
-        if "tool" in next_tokens:
-            return True
-    return False
-
-
-def _is_tool_success_claim(text: str) -> bool:
-    normalized = _normalized_lower_text(text)
-    if "completed successfully" in normalized:
-        return True
-    success_index = normalized.find("successfully")
-    if success_index < 0:
-        return False
-    for verb in ("executed", "executing", "ran"):
-        verb_index = normalized.find(verb)
-        if verb_index >= 0 and verb_index < success_index:
-            return True
-    return False
-
-
-def _is_execution_state_narration(text: str) -> bool:
-    return _text_has_any_phrase(text, _EXECUTION_STATE_NARRATION_PHRASES)
-
-
-def _extract_tool_name_from_segment(segment: str, known_tool_names: set[str]) -> str | None:
-    tokens = _tokenize_text(segment)
-    for token in tokens:
-        if token in known_tool_names:
-            return token
-    for token in tokens:
-        if "_" in token and token and token[0].isalpha():
-            return token
-    return None
-
-
-def _negative_tool_status_claims(text: str, known_tool_names: set[str]) -> list[str]:
-    claims: list[str] = []
-    tokens = _tokenize_text(text)
-    for index in range(len(tokens) - 7):
-        if tokens[index : index + 3] != ["i", "haven't", "attempted"]:
-            continue
-        tool_name = tokens[index + 3]
-        if tokens[index + 4 : index + 8] != ["in", "this", "turn", "yet"]:
-            continue
-        if tool_name and tool_name[0].isalpha():
-            claims.append(tool_name)
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip().lstrip("- ").strip()
-        if not line:
-            continue
-        if "—" in line:
-            left, right = line.split("—", 1)
-        elif " - " in line:
-            left, right = line.split(" - ", 1)
-        else:
-            continue
-        status_text = " ".join(_tokenize_text(right))
-        if not any(status_text.startswith(marker) for marker in _NEGATIVE_TOOL_STATUS_MARKERS):
-            continue
-        tool_name = _extract_tool_name_from_segment(left, known_tool_names)
-        if tool_name is not None:
-            claims.append(tool_name)
-    return claims
 
 
 _UNGROUNDED_APPROVAL_CLAIM_REPLY = (
@@ -189,7 +76,7 @@ _UNGROUNDED_APPROVAL_CLAIM_REPLY = (
 
 
 def text_mentions_approval_claim(text: str | None) -> bool:
-    return isinstance(text, str) and _text_has_any_phrase(text, _UNGROUNDED_APPROVAL_CLAIM_PHRASES)
+    return False
 _UNGROUNDED_OPERATIONAL_NARRATION_REPLY = (
     "I haven't actually run that tool path in this turn yet. "
     "If you want, I can try it now or draft the exact next step first."
@@ -231,7 +118,7 @@ def _pending_approval_reply(state: ChatTurnStateSnapshot) -> str | None:
         tool_name = fact.payload.get("tool_name") or fact.payload.get("resource")
         display_label = fact.payload.get("display_label")
         display_detail = fact.payload.get("display_detail")
-        lines = ["Approval required before Nullion can continue."]
+        lines = [f"{TOOL_APPROVAL_REQUESTED_MARKER}: {approval_id}", "Approval required before Nullion can continue."]
         if isinstance(display_label, str) and display_label:
             lines.append(f"Action: {display_label}")
         elif isinstance(tool_name, str) and tool_name:
@@ -347,13 +234,11 @@ def build_live_information_resolution_facts(
     return tuple(facts)
 
 
-def _tool_failure_reply(state: ChatTurnStateSnapshot, *, text: str | None = None) -> str | None:
+def _tool_failure_reply(state: ChatTurnStateSnapshot) -> str | None:
     for fact in state.facts:
         if fact.kind is not OperationalFactKind.TOOL_FAILED:
             continue
         tool_name = fact.payload.get("tool_name")
-        if isinstance(text, str) and isinstance(tool_name, str) and tool_name and tool_name.lower() not in text.lower():
-            continue
         if not isinstance(tool_name, str) or not tool_name:
             tool_name = "that tool"
         error = fact.payload.get("error")
@@ -468,23 +353,18 @@ def _latest_completed_tool_fact(state: ChatTurnStateSnapshot) -> Mapping[str, An
 
 
 
-def _claimed_tool_name_from_text(text: str) -> str | None:
-    normalized = text.replace("*", "")
-    match = re.search(r"tool:\s*`?([a-z][a-z0-9_]+)`?", normalized, re.IGNORECASE)
-    if match is None:
-        return None
-    return match.group(1).lower()
-
-
-
-def _completed_tool_reply(state: ChatTurnStateSnapshot, *, text: str) -> str | None:
+def _completed_tool_reply(
+    state: ChatTurnStateSnapshot,
+    *,
+    text: str,
+    claimed_tool_name: str | None = None,
+) -> str | None:
     completed_payload = _latest_completed_tool_fact(state)
     if completed_payload is None:
         return None
     tool_name = completed_payload.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name:
         tool_name = "that tool"
-    claimed_tool_name = _claimed_tool_name_from_text(text)
     if claimed_tool_name and tool_name.lower() != claimed_tool_name and not _draft_media_suffix(text):
         return _MISMATCHED_COMPLETED_TOOL_REPLY
     if _draft_media_suffix(text):
@@ -494,60 +374,11 @@ def _completed_tool_reply(state: ChatTurnStateSnapshot, *, text: str) -> str | N
 
 
 def _draft_conflicts_with_completed_tool(text: str) -> bool:
-    return text_mentions_approval_claim(text) or _is_ungrounded_operational_narration(text)
+    return False
 
 
-def _tool_names_for_fact_kind(state: ChatTurnStateSnapshot, kind: OperationalFactKind) -> set[str]:
-    names: set[str] = set()
-    for fact in state.facts:
-        if fact.kind is not kind:
-            continue
-        tool_name = fact.payload.get("tool_name")
-        if isinstance(tool_name, str) and tool_name:
-            names.add(tool_name.lower())
-    return names
-
-
-def _pending_approval_tool_names(state: ChatTurnStateSnapshot) -> set[str]:
-    names: set[str] = set()
-    for fact in state.facts:
-        if fact.kind is not OperationalFactKind.APPROVAL_REQUEST_PENDING:
-            continue
-        for key in ("tool_name", "resource"):
-            tool_name = fact.payload.get(key)
-            if isinstance(tool_name, str) and tool_name:
-                names.add(tool_name.lower())
-    return names
-
-
-def _unsupported_negative_tool_claim_reply(state: ChatTurnStateSnapshot, text: str) -> str | None:
-    completed_tools = _tool_names_for_fact_kind(state, OperationalFactKind.TOOL_COMPLETED)
-    failed_tools = _tool_names_for_fact_kind(state, OperationalFactKind.TOOL_FAILED)
-    attempted_tools = _tool_names_for_fact_kind(state, OperationalFactKind.TOOL_ATTEMPTED)
-    pending_tools = _pending_approval_tool_names(state)
-    known_tools = completed_tools | failed_tools | attempted_tools | pending_tools
-    completed_claims: list[str] = []
-    unattempted_claims: list[str] = []
-    seen: set[tuple[str, str]] = set()
-    for tool_name in _negative_tool_status_claims(text, known_tools):
-        if tool_name in failed_tools or tool_name in pending_tools:
-            continue
-        if (tool_name, "completed") in seen or (tool_name, "unattempted") in seen:
-            continue
-        if tool_name in completed_tools:
-            completed_claims.append(tool_name)
-            seen.add((tool_name, "completed"))
-            continue
-        if tool_name not in attempted_tools:
-            unattempted_claims.append(tool_name)
-            seen.add((tool_name, "unattempted"))
-    if not completed_claims and not unattempted_claims:
-        return None
-    if unattempted_claims and failed_tools and not completed_claims:
-        return _tool_failure_reply(state)
-    lines = [f"I completed {tool_name} in this turn." for tool_name in completed_claims]
-    lines.extend(f"I haven't attempted {tool_name} in this turn yet." for tool_name in unattempted_claims)
-    return "\n".join(lines) + _draft_media_suffix(text)
+def _draft_claims(claims: tuple[DraftOperationalClaim, ...], claim: DraftOperationalClaim) -> bool:
+    return claim in claims
 
 
 def _execution_state_reply(state: ChatTurnStateSnapshot) -> str | None:
@@ -623,37 +454,29 @@ def render_chat_response_for_telegram(contract: ChatResponseContract) -> str:
     if approval_reply is not None:
         return approval_reply
     text = contract.draft.text
-    if text_mentions_approval_claim(text) and not _has_pending_approval_fact(contract.state):
+    claims = contract.draft.operational_claims
+    if _draft_claims(claims, DraftOperationalClaim.APPROVAL_REQUIRED) and not _has_pending_approval_fact(contract.state):
         if _has_tool_completed_fact(contract.state):
-            completed_reply = _completed_tool_reply(contract.state, text=text)
+            completed_reply = _completed_tool_reply(
+                contract.state,
+                text=text,
+                claimed_tool_name=contract.draft.claimed_tool_name,
+            )
             if completed_reply is not None:
                 return completed_reply
         return _UNGROUNDED_APPROVAL_CLAIM_REPLY
     if (
-        not _has_pending_approval_fact(contract.state)
+        _draft_claims(claims, DraftOperationalClaim.TOOL_ATTEMPTED)
+        and not _has_pending_approval_fact(contract.state)
         and not _has_tool_attempt_fact(contract.state)
         and not _has_live_information_resolution_fact(contract.state)
     ):
-        if _is_ungrounded_operational_narration(text):
-            return _UNGROUNDED_OPERATIONAL_NARRATION_REPLY
-    if _is_execution_state_narration(text):
+        return _UNGROUNDED_OPERATIONAL_NARRATION_REPLY
+    if _draft_claims(claims, DraftOperationalClaim.EXECUTION_STATE_REQUESTED):
         execution_state_reply = _execution_state_reply(contract.state)
         if execution_state_reply is not None:
             return execution_state_reply
     if _has_tool_attempt_fact(contract.state):
-        unsupported_negative_tool_claim_reply = _unsupported_negative_tool_claim_reply(contract.state, text)
-        if unsupported_negative_tool_claim_reply is not None:
-            return unsupported_negative_tool_claim_reply
-        named_failure_reply = _tool_failure_reply(contract.state, text=text)
-        if named_failure_reply is not None:
-            for fact in contract.state.facts:
-                if fact.kind is not OperationalFactKind.TOOL_FAILED:
-                    continue
-                tool_name = fact.payload.get("tool_name")
-                if isinstance(tool_name, str) and tool_name and tool_name.lower() in text.lower():
-                    if not _has_tool_completed_fact_for_name(contract.state, tool_name):
-                        return named_failure_reply
-                    break
         primary_failure_reply = _primary_tool_outcome_failure_reply(contract.state)
         if primary_failure_reply is not None:
             return primary_failure_reply
@@ -664,7 +487,7 @@ def render_chat_response_for_telegram(contract: ChatResponseContract) -> str:
         failure_reply = _tool_failure_reply(contract.state)
         if failure_reply is not None and not _has_tool_completed_fact(contract.state):
             return failure_reply
-    if _is_tool_success_claim(text):
+    if _draft_claims(claims, DraftOperationalClaim.TOOL_COMPLETED) and not _has_tool_completed_fact(contract.state):
         return _UNGROUNDED_TOOL_SUCCESS_REPLY
     return text
 
@@ -673,6 +496,7 @@ __all__ = [
     "ChatResponseContract",
     "ChatTurnStateSnapshot",
     "ContextLinkMode",
+    "DraftOperationalClaim",
     "ModelDraftResponse",
     "OperationalFact",
     "OperationalFactKind",

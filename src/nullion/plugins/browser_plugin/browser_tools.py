@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import threading
 from typing import Any
 
+from nullion.artifacts import artifact_path_for_generated_workspace_file
 from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy, BrowserPolicyViolation
 from nullion.plugins.browser_plugin.browser_session import BrowserBackend, BrowserSessionPool
 from nullion.tools import ToolInvocation, ToolResult
@@ -195,8 +195,26 @@ class BrowserTools:
         self._remember_session(invocation, session_id)
         try:
             png_bytes = _run(self._backend.screenshot(session_id))
-            b64 = base64.b64encode(png_bytes).decode()
-            return _ok(invocation, {"image_base64": b64, "size_bytes": len(png_bytes), "session_id": session_id})
+            if not png_bytes:
+                return _fail(invocation, "Screenshot returned no image data.")
+            artifact_path = artifact_path_for_generated_workspace_file(
+                principal_id=invocation.principal_id,
+                suffix=".png",
+                stem="screenshot",
+            )
+            artifact_path.write_bytes(png_bytes)
+            path = str(artifact_path)
+            return _ok(
+                invocation,
+                {
+                    "path": path,
+                    "artifact_path": path,
+                    "artifact_paths": [path],
+                    "format": "png",
+                    "size_bytes": len(png_bytes),
+                    "session_id": session_id,
+                },
+            )
         except Exception as e:
             return _fail(invocation, f"Screenshot failed: {e}")
 

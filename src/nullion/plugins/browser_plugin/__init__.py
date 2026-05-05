@@ -113,7 +113,7 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_screenshot",
-            "Capture the current viewport as a PNG image (returns base64).",
+            "Capture the current viewport as a PNG artifact and return its path.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,

@@ -153,9 +153,11 @@ async def _deliver_reminder(
                 exc_info=True,
             )
 
+    if origin_key:
+        return origin_key in delivered_targets
     if target_keys:
         return target_keys.issubset(delivered_targets)
-    return origin_key in delivered_targets
+    return False
 
 
 async def deliver_due_reminders_once(

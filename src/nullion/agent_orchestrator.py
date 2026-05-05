@@ -88,9 +88,12 @@ def _artifact_paths_from_tool_result(result: ToolResult, *, runtime_store=None) 
             image_bytes = base64.b64decode(image_base64)
             artifact_path = artifact_path_for_generated_file(runtime_store, suffix=".png")
             artifact_path.write_bytes(image_bytes)
-            output["path"] = str(artifact_path)
+            path = str(artifact_path)
+            output["path"] = path
+            output["artifact_path"] = path
+            output["artifact_paths"] = [path]
             output.pop("image_base64", None)
-            return [str(artifact_path)]
+            return [path]
         except Exception:
             logger.warning("Failed to materialize browser screenshot artifact", exc_info=True)
     return []

@@ -29,6 +29,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlencode, urlparse
 
+from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
 from nullion.approval_context import FLOW_TRIGGER_CONTEXT_KEY, build_trigger_flow_context
 from nullion.approvals import (
     ApprovalRequest,
@@ -755,6 +756,7 @@ class ToolSpec:
     filesystem_boundary_policy: str = _FILESYSTEM_BOUNDARY_DEFAULT
     permission_scope: str = "global"
     input_schema: dict[str, object] | None = None
+    capability_tags: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -790,6 +792,9 @@ _TEXT_FILE_WRITE_BLOCKED_EXTENSIONS = frozenset({
     ".xls",
     ".xlsx",
 })
+_TERMINAL_DELIVERABLE_ARTIFACT_EXTENSIONS = frozenset(VALID_ATTACHMENT_EXTENSIONS) | _TEXT_FILE_WRITE_BLOCKED_EXTENSIONS
+_MAX_TERMINAL_DISCOVERED_ARTIFACTS = 25
+_MAX_TERMINAL_ARTIFACT_SCAN_ENTRIES = 10000
 
 
 def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
@@ -882,10 +887,21 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute."},
+                "shell": {
+                    "type": "string",
+                    "enum": ["auto", "sh", "bash", "zsh", "powershell", "pwsh", "cmd"],
+                    "description": "Optional shell family for this command. Defaults to the platform shell.",
+                },
                 "network_mode": {
                     "type": "string",
                     "enum": sorted(_VALID_NETWORK_MODES),
                     "description": "Optional network policy for the command.",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300,
+                    "description": "Optional execution timeout in seconds.",
                 },
             },
             "required": ["command"],
@@ -1053,6 +1069,14 @@ class TerminalExecutionResult:
     exit_code: int
     stdout: str
     stderr: str
+    shell: str = "unknown"
+    argv: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalShellInvocation:
+    shell: str
+    argv: tuple[str, ...]
 
 
 _FIND_PATH_OPTION_ARITY = {
@@ -1238,7 +1262,115 @@ class TerminalExecutorBackend(Protocol):
         cwd: str | None,
         timeout: int,
         policy: TerminalExecutionPolicy,
+        shell: str | None = None,
     ) -> TerminalExecutionResult: ...
+
+
+_POSIX_SHELL_CHOICES = {
+    "sh": ("sh", "-lc"),
+    "bash": ("bash", "-lc"),
+    "zsh": ("zsh", "-lc"),
+}
+_WINDOWS_SHELL_CHOICES = {
+    "pwsh": ("pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"),
+    "powershell": ("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"),
+    "cmd": ("cmd.exe", "/d", "/s", "/c"),
+}
+
+
+def _normalize_terminal_shell(raw_shell: object) -> str | None:
+    if not isinstance(raw_shell, str):
+        return None
+    shell = raw_shell.strip().lower()
+    return shell or None
+
+
+def _terminal_shell_from_env() -> str | None:
+    raw_shell = os.environ.get("NULLION_TERMINAL_SHELL")
+    if not raw_shell:
+        return None
+    shell = raw_shell.strip()
+    if not shell:
+        return None
+    shell_name = Path(shell).name.lower()
+    if shell_name in {"pwsh", "pwsh.exe"}:
+        return "pwsh"
+    if shell_name in {"powershell", "powershell.exe"}:
+        return "powershell"
+    if shell_name in {"cmd", "cmd.exe"}:
+        return "cmd"
+    if shell_name in _POSIX_SHELL_CHOICES:
+        return shell_name
+    return shell
+
+
+def _which_shell(executable: str) -> str | None:
+    if Path(executable).parent != Path():
+        return executable if Path(executable).exists() else None
+    return shutil.which(executable)
+
+
+def _resolve_posix_terminal_shell(command: str, requested_shell: str | None) -> TerminalShellInvocation:
+    shell = requested_shell if requested_shell in _POSIX_SHELL_CHOICES else None
+    if shell is None and requested_shell in _WINDOWS_SHELL_CHOICES:
+        shell = "sh"
+    if shell is None:
+        env_shell = _terminal_shell_from_env()
+        if env_shell and env_shell not in _POSIX_SHELL_CHOICES:
+            resolved_env_shell = _which_shell(env_shell)
+            if resolved_env_shell is not None:
+                return TerminalShellInvocation(
+                    shell=Path(resolved_env_shell).name.lower(),
+                    argv=(resolved_env_shell, "-lc", command),
+                )
+        shell = env_shell if env_shell in _POSIX_SHELL_CHOICES else "sh"
+    executable, flag = _POSIX_SHELL_CHOICES.get(shell, ("sh", "-lc"))
+    resolved = _which_shell(executable) or "/bin/sh"
+    return TerminalShellInvocation(shell=shell, argv=(resolved, flag, command))
+
+
+def _resolve_windows_terminal_shell(command: str, requested_shell: str | None) -> TerminalShellInvocation:
+    candidates: list[str] = []
+    if requested_shell and requested_shell != "auto":
+        candidates.append(requested_shell)
+    env_shell = _terminal_shell_from_env()
+    if env_shell:
+        candidates.append(env_shell)
+    candidates.extend(("pwsh", "powershell", "cmd"))
+
+    seen: set[str] = set()
+    for shell in candidates:
+        if shell in seen:
+            continue
+        seen.add(shell)
+        template = _WINDOWS_SHELL_CHOICES.get(shell)
+        if template is None:
+            continue
+        executable = _which_shell(template[0])
+        if executable is None:
+            continue
+        return TerminalShellInvocation(shell=shell, argv=(executable, *template[1:], command))
+
+    comspec = os.environ.get("COMSPEC")
+    cmd = comspec if comspec else "cmd.exe"
+    return TerminalShellInvocation(shell="cmd", argv=(cmd, "/d", "/s", "/c", command))
+
+
+def _resolve_terminal_shell_invocation(command: str, *, shell: str | None = None) -> TerminalShellInvocation:
+    requested_shell = _normalize_terminal_shell(shell) or "auto"
+    if os.name == "nt":
+        return _resolve_windows_terminal_shell(command, requested_shell)
+    return _resolve_posix_terminal_shell(command, requested_shell)
+
+
+def _terminal_timeout_seconds(raw_timeout: object, *, default: int = 20, maximum: int = 300) -> int:
+    if isinstance(raw_timeout, bool):
+        return default
+    try:
+        timeout = int(raw_timeout) if raw_timeout is not None else default
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(maximum, timeout))
 
 
 class SubprocessTerminalExecutorBackend:
@@ -1259,14 +1391,14 @@ class SubprocessTerminalExecutorBackend:
         cwd: str | None,
         timeout: int,
         policy: TerminalExecutionPolicy,
+        shell: str | None = None,
     ) -> TerminalExecutionResult:
         del policy
-        shell_executable = os.environ.get("NULLION_TERMINAL_SHELL") or "/bin/sh"
+        invocation = _resolve_terminal_shell_invocation(command, shell=shell)
         try:
             completed = subprocess.run(
-                command,
-                shell=True,
-                executable=shell_executable,
+                list(invocation.argv),
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -1278,11 +1410,23 @@ class SubprocessTerminalExecutorBackend:
                 exit_code=self._INTERRUPTED_EXIT_CODE,
                 stdout="",
                 stderr=self._INTERRUPTED_MESSAGE,
+                shell=invocation.shell,
+                argv=invocation.argv,
+            )
+        except OSError as exc:
+            return TerminalExecutionResult(
+                exit_code=127,
+                stdout="",
+                stderr=f"Shell startup failed: {exc}",
+                shell=invocation.shell,
+                argv=invocation.argv,
             )
         return TerminalExecutionResult(
             exit_code=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
+            shell=invocation.shell,
+            argv=invocation.argv,
         )
 
 
@@ -1444,7 +1588,9 @@ class SandboxLauncherTerminalExecutorBackend:
         cwd: str | None,
         timeout: int,
         policy: TerminalExecutionPolicy,
+        shell: str | None = None,
     ) -> TerminalExecutionResult:
+        del shell
         invocation = self._build_invocation(command, policy=policy)
         env = {**os.environ, **invocation.env}
         try:
@@ -1463,11 +1609,23 @@ class SandboxLauncherTerminalExecutorBackend:
                 exit_code=self._INTERRUPTED_EXIT_CODE,
                 stdout="",
                 stderr=self._INTERRUPTED_MESSAGE,
+                shell="launcher",
+                argv=invocation.argv,
+            )
+        except OSError as exc:
+            return TerminalExecutionResult(
+                exit_code=127,
+                stdout="",
+                stderr=f"Terminal launcher startup failed: {exc}",
+                shell="launcher",
+                argv=invocation.argv,
             )
         return TerminalExecutionResult(
             exit_code=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
+            shell="launcher",
+            argv=invocation.argv,
         )
 
 
@@ -1537,7 +1695,14 @@ class ToolRegistry:
             {
                 "name": spec.name,
                 "description": spec.description,
-                "input_schema": getattr(spec, "input_schema", None) or _default_input_schema_for_tool(spec.name),
+                "input_schema": getattr(spec, "input_schema", None)
+                or _default_input_schema_for_tool(spec.name),
+                "capability_tags": list(getattr(spec, "capability_tags", ()) or ()),
+                "side_effect_class": str(
+                    getattr(spec.side_effect_class, "value", spec.side_effect_class)
+                ),
+                "risk_level": str(getattr(spec.risk_level, "value", spec.risk_level)),
+                "requires_approval": bool(spec.requires_approval),
             }
             for spec in self.list_specs()
         ]
@@ -3236,6 +3401,55 @@ def _build_workspace_summary_handler(
 
 
 
+def _terminal_deliverable_artifact_paths_since(
+    roots: Iterable[Path],
+    *,
+    since_timestamp: float,
+) -> list[str]:
+    candidates: list[tuple[float, str]] = []
+    seen: set[str] = set()
+    scanned_entries = 0
+    for raw_root in roots:
+        try:
+            root = Path(raw_root).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not root.is_dir():
+            continue
+        stack = [root]
+        while stack and scanned_entries < _MAX_TERMINAL_ARTIFACT_SCAN_ENTRIES:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        scanned_entries += 1
+                        if scanned_entries > _MAX_TERMINAL_ARTIFACT_SCAN_ENTRIES:
+                            break
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            path = Path(entry.path).resolve()
+                            if path.suffix.lower() not in _TERMINAL_DELIVERABLE_ARTIFACT_EXTENSIONS:
+                                continue
+                            stat = path.stat()
+                        except (OSError, RuntimeError, ValueError):
+                            continue
+                        if stat.st_size <= 0 or stat.st_mtime < since_timestamp:
+                            continue
+                        resolved = str(path)
+                        if resolved in seen:
+                            continue
+                        seen.add(resolved)
+                        candidates.append((stat.st_mtime, resolved))
+            except OSError:
+                continue
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [path for _mtime, path in candidates[-_MAX_TERMINAL_DISCOVERED_ARTIFACTS:]]
+
+
 def _build_terminal_exec_handler(
     workspace_root: str | Path | None = None,
     allowed_roots: list[Path] | tuple[Path, ...] | None = None,
@@ -3297,6 +3511,8 @@ def _build_terminal_exec_handler(
             if isinstance(approved_targets, (list, tuple, set, frozenset))
             else (),
         )
+        shell = _normalize_terminal_shell(invocation.arguments.get("shell"))
+        timeout_seconds = _terminal_timeout_seconds(invocation.arguments.get("timeout_seconds"))
         has_network_egress = bool(egress_attempts)
 
         if _is_restrictive_network_mode(network_mode):
@@ -3377,35 +3593,69 @@ def _build_terminal_exec_handler(
             )
 
         try:
-            completed = backend.run(
-                raw_command,
-                cwd=str(execution_cwd) if execution_cwd is not None else None,
-                timeout=20,
-                policy=policy,
-            )
+            started_at = datetime.now(UTC).timestamp()
+            try:
+                completed = backend.run(
+                    raw_command,
+                    cwd=str(execution_cwd) if execution_cwd is not None else None,
+                    timeout=timeout_seconds,
+                    policy=policy,
+                    shell=shell,
+                )
+            except TypeError as exc:
+                if "shell" not in str(exc):
+                    raise
+                completed = backend.run(
+                    raw_command,
+                    cwd=str(execution_cwd) if execution_cwd is not None else None,
+                    timeout=timeout_seconds,
+                    policy=policy,
+                )
         except subprocess.TimeoutExpired:
             output = {"egress_attempts": egress_attempts} if has_network_egress else {}
             if network_mode is not None:
                 output["network_mode"] = network_mode
+            output["timeout_seconds"] = timeout_seconds
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
                 output=output,
-                error="Command timed out",
+                error=f"Command timed out after {timeout_seconds}s",
             )
 
-        output = {"stdout": completed.stdout, "stderr": completed.stderr, "exit_code": completed.exit_code}
+        output = {
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "exit_code": completed.exit_code,
+            "shell": completed.shell,
+            "timeout_seconds": timeout_seconds,
+        }
         if network_mode is not None:
             output["network_mode"] = network_mode
         if has_network_egress:
             output["egress_attempts"] = egress_attempts
+        if completed.exit_code == 0:
+            artifact_paths = _terminal_deliverable_artifact_paths_since(
+                resolved_allowed_roots,
+                since_timestamp=started_at,
+            )
+            if artifact_paths:
+                output["artifact_paths"] = artifact_paths
+        error = None
+        if completed.exit_code != 0:
+            if completed.exit_code == 127 and completed.stderr.startswith(
+                ("Shell startup failed:", "Terminal launcher startup failed:")
+            ):
+                error = completed.stderr
+            else:
+                error = f"Command failed with exit code {completed.exit_code}"
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed" if completed.exit_code == 0 else "failed",
             output=output,
-            error=None if completed.exit_code == 0 else f"Command failed with exit code {completed.exit_code}",
+            error=error,
         )
 
     return handler
@@ -5078,6 +5328,7 @@ def register_reminder_tools(
             side_effect_class=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout_seconds=10,
+            capability_tags=("scheduler", "reminder"),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -5109,6 +5360,7 @@ def register_reminder_tools(
             side_effect_class=ToolSideEffectClass.READ,
             requires_approval=False,
             timeout_seconds=10,
+            capability_tags=("scheduler", "reminder"),
         ),
         _build_list_reminders_handler(runtime),
     )
@@ -5429,6 +5681,7 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
                     "cron_run_failed",
                     "reached_iteration_limit",
                     "suspended_for_approval",
+                    "approval_id",
                     "reason",
                 }
             }
@@ -5546,6 +5799,7 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
             result_text, removed_media_count = _foreground_cron_result_view(raw_result_text)
             if not result_text:
                 result_text = _foreground_cron_no_output_text()
+        updated_stored_job = False
         for stored in jobs:
             if stored.id == job.id:
                 stored.last_run = now
@@ -5554,8 +5808,10 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
                     if runner_failed
                     else result_text
                 )
+                updated_stored_job = True
                 break
-        save_crons(jobs)
+        if updated_stored_job:
+            save_crons(jobs)
         output: dict[str, object] = {
             "id": job.id,
             "name": job.name,
@@ -5576,6 +5832,19 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
         if isinstance(runner_output, dict):
             output["result"] = _foreground_cron_runner_output(runner_output)
         if runner_failed:
+            approval_id = runner_output.get("approval_id") if isinstance(runner_output, dict) else None
+            if runner_failure_reason == "cron_run_waiting_for_approval":
+                output["reason"] = "approval_required"
+                output["requires_approval"] = True
+                if isinstance(approval_id, str) and approval_id:
+                    output["approval_id"] = approval_id
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="denied",
+                    output=output,
+                    error="Approval required before the cron can continue.",
+                )
             output["reason"] = runner_failure_reason
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -5627,6 +5896,7 @@ def register_cron_tools(
             side_effect_class=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout_seconds=10,
+            capability_tags=("scheduler", "cron"),
         ),
         _build_create_cron_handler(
             default_delivery_channel=default_delivery_channel,
@@ -5644,6 +5914,7 @@ def register_cron_tools(
             side_effect_class=ToolSideEffectClass.READ,
             requires_approval=False,
             timeout_seconds=10,
+            capability_tags=("scheduler", "cron"),
         ),
         _build_list_crons_handler(),
     )
@@ -5655,6 +5926,7 @@ def register_cron_tools(
             side_effect_class=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout_seconds=10,
+            capability_tags=("scheduler", "cron"),
         ),
         _build_delete_cron_handler(),
     )
@@ -5669,6 +5941,7 @@ def register_cron_tools(
             side_effect_class=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout_seconds=10,
+            capability_tags=("scheduler", "cron"),
         ),
         _build_toggle_cron_handler(),
     )
@@ -5684,6 +5957,7 @@ def register_cron_tools(
             side_effect_class=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout_seconds=120,
+            capability_tags=("scheduler", "cron"),
         ),
         _build_run_cron_handler(cron_runner),
     )

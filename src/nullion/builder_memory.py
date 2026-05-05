@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -58,6 +59,42 @@ MIN_MEMORY_CONFIDENCE = 0.62
 PROMOTE_TO_MID_TERM_SCORE = 3.0
 PROMOTE_TO_LONG_TERM_SCORE = 7.0
 MAX_VOLATILE_DIGIT_RUN = 9
+MIN_VOLATILE_HEX_TOKEN = 8
+
+_VOLATILE_MEMORY_KEY_PARTS = frozenset(
+    {
+        "approval",
+        "approvals",
+        "cron",
+        "crons",
+        "due",
+        "error",
+        "failed",
+        "failure",
+        "job",
+        "jobs",
+        "pending",
+        "reminder",
+        "reminders",
+        "run",
+        "runs",
+        "runtime",
+        "schedule",
+        "state",
+        "status",
+        "unavailable",
+    }
+)
+_CRON_EXPRESSION_RE = re.compile(
+    r"(?<!\S)(?:\*|\d{1,2}|\*/\d{1,2}|\d{1,2}-\d{1,2}|\d{1,2},\d{1,2})(?:\s+"
+    r"(?:\*|\d{1,2}|\*/\d{1,2}|\d{1,2}-\d{1,2}|\d{1,2},\d{1,2})){4}(?!\S)"
+)
+_ISO_DATETIME_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b")
+_VOLATILE_HEX_TOKEN_RE = re.compile(
+    rf"\b(?=[a-f0-9]*[a-f])[a-f0-9]{{{MIN_VOLATILE_HEX_TOKEN},}}\b"
+    rf"|\b[a-z]+-(?=[a-f0-9]*[a-f])[a-f0-9]{{6,}}\b",
+    re.I,
+)
 
 
 @dataclass(slots=True)
@@ -817,7 +854,15 @@ def _is_structurally_durable_memory(key: str, value: str) -> bool:
     key_parts = [part for part in _normalize_memory_key(key).split("_") if part]
     if key_parts and key_parts[-1] == "id":
         return False
+    if any(part in _VOLATILE_MEMORY_KEY_PARTS for part in key_parts):
+        return False
     if _has_long_digit_run(value):
+        return False
+    if _has_runtime_shaped_token(value):
+        return False
+    if _has_cron_expression(value):
+        return False
+    if _has_iso_datetime(value):
         return False
     return True
 
@@ -832,6 +877,18 @@ def _has_long_digit_run(value: str) -> bool:
         else:
             run = 0
     return False
+
+
+def _has_runtime_shaped_token(value: str) -> bool:
+    return bool(_VOLATILE_HEX_TOKEN_RE.search(value))
+
+
+def _has_cron_expression(value: str) -> bool:
+    return bool(_CRON_EXPRESSION_RE.search(value))
+
+
+def _has_iso_datetime(value: str) -> bool:
+    return bool(_ISO_DATETIME_RE.search(value))
 
 
 def _parse_json_object(raw: str) -> dict[str, object]:

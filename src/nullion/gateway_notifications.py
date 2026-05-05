@@ -23,8 +23,8 @@ from nullion.users import load_user_registry
 logger = logging.getLogger(__name__)
 
 _STATE_DIR = Path.home() / ".nullion"
-_EVENTS_PATH = _STATE_DIR / "gateway-events.json"
-_RESTART_MARKER_PATH = _STATE_DIR / "gateway-restart.json"
+_EVENTS_PATH: Path | None = None
+_RESTART_MARKER_PATH: Path | None = None
 _MAX_EVENTS = 50
 
 
@@ -53,17 +53,37 @@ def _read_json_list(path: Path) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+def _resolve_state_dir() -> Path:
+    nullion_home = os.environ.get("NULLION_HOME")
+    if nullion_home:
+        return Path(nullion_home).expanduser()
+    env_file = os.environ.get("NULLION_ENV_FILE")
+    if env_file:
+        return Path(env_file).expanduser().parent
+    return _STATE_DIR
+
+
+def _events_path() -> Path:
+    return _EVENTS_PATH or (_resolve_state_dir() / "gateway-events.json")
+
+
+def _restart_marker_path() -> Path:
+    return _RESTART_MARKER_PATH or (_resolve_state_dir() / "gateway-restart.json")
+
+
 def record_gateway_lifecycle_event(kind: str, text: str) -> GatewayLifecycleEvent:
-    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_dir = _resolve_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    events_path = _events_path()
     event = GatewayLifecycleEvent(
         event_id=uuid.uuid4().hex,
         kind=kind,
         text=text,
         created_at=_now(),
     )
-    events = _read_json_list(_EVENTS_PATH)
+    events = _read_json_list(events_path)
     events.append(event.to_dict())
-    _EVENTS_PATH.write_text(
+    events_path.write_text(
         json.dumps(events[-_MAX_EVENTS:], indent=2, sort_keys=True),
         encoding="utf-8",
     )
@@ -78,7 +98,7 @@ def list_gateway_lifecycle_events(*, since_id: str | None = None) -> list[Gatewa
             text=str(item.get("text") or ""),
             created_at=str(item.get("created_at") or ""),
         )
-        for item in _read_json_list(_EVENTS_PATH)
+        for item in _read_json_list(_events_path())
         if isinstance(item, dict)
     ]
     if not since_id:
@@ -115,7 +135,7 @@ def _send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
 
 
 def _load_notification_settings() -> NullionSettings:
-    env_path = Path(os.environ.get("NULLION_ENV_FILE") or (_STATE_DIR / ".env"))
+    env_path = Path(os.environ.get("NULLION_ENV_FILE") or (_resolve_state_dir() / ".env"))
     return load_settings(env=os.environ, env_path=env_path if env_path.exists() else None)
 
 
@@ -213,8 +233,9 @@ def begin_gateway_restart(
 ) -> GatewayLifecycleEvent:
     text = "🟡 Nulliøn gateway is restarting. Chat may pause for a moment."
     event = record_gateway_lifecycle_event("restarting", text)
-    _STATE_DIR.mkdir(parents=True, exist_ok=True)
-    _RESTART_MARKER_PATH.write_text(
+    state_dir = _resolve_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _restart_marker_path().write_text(
         json.dumps({"event_id": event.event_id, "created_at": event.created_at}, indent=2, sort_keys=True),
         encoding="utf-8",
     )
@@ -223,10 +244,11 @@ def begin_gateway_restart(
 
 
 def complete_gateway_restart_if_needed(*, settings: NullionSettings | None = None) -> GatewayLifecycleEvent | None:
-    if not _RESTART_MARKER_PATH.exists():
+    marker_path = _restart_marker_path()
+    if not marker_path.exists():
         return None
     try:
-        _RESTART_MARKER_PATH.unlink()
+        marker_path.unlink()
     except Exception:
         logger.debug("Could not clear gateway restart marker", exc_info=True)
     text = "🟢 Nulliøn gateway is back online."

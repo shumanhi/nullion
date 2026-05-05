@@ -394,7 +394,10 @@ def _build_runtime_service_from_settings(
     service_factory=build_telegram_operator_service,
 ):
     checkpoint = Path(checkpoint_path)
+    os.environ["NULLION_CHECKPOINT_PATH"] = str(checkpoint.expanduser())
+    os.environ.setdefault("NULLION_HOME", str(checkpoint.expanduser().parent))
     if env_path is not None:
+        os.environ["NULLION_ENV_FILE"] = str(Path(env_path).expanduser())
         load_env_file_into_environ(env_path, override=True)
     settings = load_settings(env_path=env_path)
     try:
@@ -505,25 +508,27 @@ def _build_runtime_service_from_settings(
         except Exception:
             logger.debug("Could not record Telegram cron delivery event", exc_info=True)
 
+    def _refresh_service_live_config() -> None:
+        refresh = getattr(service, "refresh_live_configuration", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                logger.debug("Could not refresh live Telegram service config", exc_info=True)
+
+    def _current_service_settings():
+        _refresh_service_live_config()
+        return getattr(service, "settings", settings)
+
     def _effective_cron_delivery_channel(job) -> str:
         from nullion.cron_delivery import effective_cron_delivery_channel
-        from nullion.config import load_settings as _load_settings
 
-        try:
-            current_settings = _load_settings()
-        except Exception:
-            current_settings = settings
-        return effective_cron_delivery_channel(job, settings=current_settings)
+        return effective_cron_delivery_channel(job, settings=_current_service_settings())
 
     def _cron_delivery_target(job, channel: str) -> str:
         from nullion.cron_delivery import cron_delivery_target
-        from nullion.config import load_settings as _load_settings
 
-        try:
-            current_settings = _load_settings()
-        except Exception:
-            current_settings = settings
-        return cron_delivery_target(job, channel, settings=current_settings)
+        return cron_delivery_target(job, channel, settings=_current_service_settings())
 
     def _cron_result_block_reason(result: dict, text: str, artifacts: object) -> str | None:
         if result.get("reached_iteration_limit"):
@@ -542,6 +547,7 @@ def _build_runtime_service_from_settings(
         from nullion.system_context import build_system_context_snapshot, format_system_context_for_prompt
         from nullion.workspace_storage import format_workspace_storage_for_prompt
 
+        current_settings = _current_service_settings()
         history: list[dict] = []
         caps_text = format_system_context_for_prompt(build_system_context_snapshot(tool_registry=active_tool_registry))
         if caps_text:
@@ -559,8 +565,8 @@ def _build_runtime_service_from_settings(
         connections_text = format_workspace_connections_for_prompt(principal_id=conv_id)
         if connections_text:
             history.append({"role": "system", "content": [{"type": "text", "text": connections_text}]})
-        skill_text = format_enabled_skill_packs_for_prompt(settings.enabled_skill_packs)
-        access_text = skill_pack_access_prompt(settings.enabled_skill_packs, principal_id=conv_id)
+        skill_text = format_enabled_skill_packs_for_prompt(current_settings.enabled_skill_packs)
+        access_text = skill_pack_access_prompt(current_settings.enabled_skill_packs, principal_id=conv_id)
         if access_text:
             skill_text = (skill_text + "\n\n" + access_text).strip()
         if skill_text:
@@ -609,11 +615,12 @@ def _build_runtime_service_from_settings(
         if channel != "telegram":
             return False
         target = _cron_delivery_target(job, channel)
-        if not target or not settings.telegram.bot_token:
+        current_settings = _current_service_settings()
+        if not target or not current_settings.telegram.bot_token:
             return False
         message = scheduled_task_delivery_text(job, text, run_label=run_label)
         return _run_async_sync(lambda: _send_operator_telegram_delivery(
-            settings.telegram.bot_token,
+            current_settings.telegram.bot_token,
             target,
             message,
             principal_id=f"telegram:{target}",
@@ -826,6 +833,15 @@ def main(
 ):
     checkpoint = Path(checkpoint_path)
     env_path_value = None if env_path is None else Path(env_path)
+    startup_settings = load_settings(env_path=env_path)
+    if not startup_settings.telegram.chat_enabled:
+        logger.info(
+            "Nullion Telegram operator disabled by NULLION_TELEGRAM_CHAT_ENABLED=false "
+            "(checkpoint=%s, env_path=%s)",
+            checkpoint,
+            env_path_value,
+        )
+        return
 
     # ── SIGHUP → graceful service rebuild on next loop iteration ─────────────
     _sighup_requested = False

@@ -945,7 +945,12 @@ def build_model_client_from_settings(
     provider = provider.strip().lower() if isinstance(provider, str) else None
 
     if provider == "codex":
-        codex_token = api_key.strip() if isinstance(api_key, str) and api_key.strip() else ""
+        raw_codex_token = api_key.strip() if isinstance(api_key, str) and api_key.strip() else ""
+        # OPENAI_API_KEY / NULLION_OPENAI_API_KEY may hold a platform API key
+        # even when the selected provider is Codex. A platform key is not a
+        # Codex OAuth token, so do not treat it as one and leave room for the
+        # caller to fall back to the platform OpenAI client.
+        codex_token = "" if raw_codex_token.startswith("sk-") else raw_codex_token
         refresh_token = getattr(model_cfg, "codex_refresh_token", None) if model_cfg is not None else None
         refresh_token = refresh_token.strip() if isinstance(refresh_token, str) else ""
 

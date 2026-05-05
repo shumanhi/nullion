@@ -66,7 +66,7 @@ def nullion_tools_as_langchain_tools(
             name=str(tool_def.get("name")),
             description=_enhanced_tool_description(tool_def),
             args_schema=_normalized_input_schema(tool_def),
-            metadata={"nullion_tool_group": _tool_group_for_name(str(tool_def.get("name") or ""))},
+            metadata=_tool_metadata(tool_def),
         )
         for tool_def in tool_definitions
         if isinstance(tool_def.get("name"), str)
@@ -430,8 +430,37 @@ def _enhanced_tool_description(tool_definition: dict[str, Any]) -> str:
     name = str(tool_definition.get("name") or "")
     base = str(tool_definition.get("description") or "").strip()
     group = _tool_group_for_name(name)
-    suffix = f"Nullion scoped tool. Group: {group}. Sentinel policy and approval checks still apply."
+    tags = _normalized_capability_tags(tool_definition)
+    capability_text = f" Capabilities: {', '.join(tags)}." if tags else ""
+    suffix = (
+        f"Nullion scoped tool. Group: {group}.{capability_text} "
+        "Sentinel policy and approval checks still apply."
+    )
     return f"{base}\n\n{suffix}" if base else suffix
+
+
+def _tool_metadata(tool_definition: dict[str, Any]) -> dict[str, Any]:
+    name = str(tool_definition.get("name") or "")
+    return {
+        "nullion_tool_group": _tool_group_for_name(name),
+        "capability_tags": _normalized_capability_tags(tool_definition),
+        "side_effect_class": str(tool_definition.get("side_effect_class") or ""),
+        "risk_level": str(tool_definition.get("risk_level") or ""),
+        "requires_approval": bool(tool_definition.get("requires_approval")),
+    }
+
+
+def _normalized_capability_tags(tool_definition: dict[str, Any]) -> list[str]:
+    tags = tool_definition.get("capability_tags")
+    if not isinstance(tags, (list, tuple, set, frozenset)):
+        return []
+    return list(
+        dict.fromkeys(
+            str(tag).strip().lower()
+            for tag in tags
+            if isinstance(tag, str) and tag.strip()
+        )
+    )
 
 
 def _tool_group_for_name(name: str) -> str:
