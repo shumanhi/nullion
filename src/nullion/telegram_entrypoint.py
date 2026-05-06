@@ -743,15 +743,14 @@ async def _send_operator_telegram_delivery(
                             caption=caption_text,
                             **caption_kwargs,
                         )
-                record_platform_delivery_receipt(
-                    build_platform_delivery_receipt(
-                        channel="telegram",
-                        target_id=str(chat_id),
-                        delivery=delivery,
-                        transport_ok=True,
-                    )
+                receipt = build_platform_delivery_receipt(
+                    channel="telegram",
+                    target_id=str(chat_id),
+                    delivery=delivery,
+                    transport_ok=True,
                 )
-                return True
+                record_platform_delivery_receipt(receipt)
+                return receipt.status == "succeeded"
             message_kwargs = {}
             if reply_markup is not None:
                 message_kwargs["reply_markup"] = reply_markup
@@ -764,15 +763,14 @@ async def _send_operator_telegram_delivery(
                 message_text, formatting_kwargs = format_telegram_text(delivery.text or "")
                 message_kwargs.update(formatting_kwargs)
             await bot.send_message(chat_id, message_text, **message_kwargs)
-            record_platform_delivery_receipt(
-                build_platform_delivery_receipt(
-                    channel="telegram",
-                    target_id=str(chat_id),
-                    delivery=delivery,
-                    transport_ok=True,
-                )
+            receipt = build_platform_delivery_receipt(
+                channel="telegram",
+                target_id=str(chat_id),
+                delivery=delivery,
+                transport_ok=True,
             )
-            return True
+            record_platform_delivery_receipt(receipt)
+            return receipt.status == "succeeded"
     except Exception:
         logger.warning("Failed to deliver operator notification message", exc_info=True)
         if delivery is not None:

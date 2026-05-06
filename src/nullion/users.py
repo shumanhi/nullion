@@ -16,7 +16,12 @@ from typing import Any
 
 from nullion.config import NullionSettings
 
-_USERS_PATH = Path.home() / ".nullion" / "users.json"
+def _nullion_home() -> Path:
+    configured = str(os.environ.get("NULLION_HOME") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".nullion"
+
+
+_USERS_PATH = _nullion_home() / "users.json"
 _ADMIN_ID = "admin"
 _ADMIN_WORKSPACE_ID = "workspace_admin"
 

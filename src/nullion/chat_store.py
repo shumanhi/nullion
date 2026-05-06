@@ -1,6 +1,6 @@
 """Persistent chat history for the Nullion web UI.
 
-SQLite database at ~/.nullion/chat_history.db.
+SQLite database at the active Nullion home, e.g. ~/.nullion/chat_history.db.
 
 Schema
 ------
@@ -55,8 +55,17 @@ from nullion.secure_storage import (
 
 log = logging.getLogger(__name__)
 
-_DB_PATH = Path.home() / ".nullion" / "chat_history.db"
-_KEY_PATH = Path.home() / ".nullion" / "chat_history.key"
+def _nullion_home() -> Path:
+    configured = str(os.environ.get("NULLION_HOME") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".nullion"
+
+
+def _default_db_path() -> Path:
+    return _nullion_home() / "chat_history.db"
+
+
+def _default_key_path() -> Path:
+    return _nullion_home() / "chat_history.key"
 _ENCRYPTED_PREFIX = "enc:v1:"
 CHAT_SQLITE_MEASURE_ENABLED = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
 CHAT_SQLITE_SLOW_MS = float(os.environ.get("NULLION_SQLITE_SLOW_MS", "250"))
@@ -181,8 +190,8 @@ class ChatStore:
         *,
         key_path: Path | str | None = None,
     ) -> None:
-        self._path = Path(db_path) if db_path else _DB_PATH
-        self._key_path = Path(key_path) if key_path else _KEY_PATH
+        self._path = Path(db_path) if db_path else _default_db_path()
+        self._key_path = Path(key_path) if key_path else _default_key_path()
         primary_key = self._load_or_create_key()
         self._cipher = Fernet(primary_key)
         self._decrypt_ciphers = [self._cipher]

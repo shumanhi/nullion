@@ -797,8 +797,66 @@ _MAX_TERMINAL_DISCOVERED_ARTIFACTS = 25
 _MAX_TERMINAL_ARTIFACT_SCAN_ENTRIES = 10000
 
 
+def _cron_tool_properties(*, include_workspace: bool = True) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "id": {"type": "string", "description": "Existing cron job id."},
+        "name": {"type": "string", "description": "Human-readable cron label."},
+        "schedule": {"type": "string", "description": "Five-field cron expression, for example '0 9 * * 1-5'."},
+        "task": {"type": "string", "description": "Instruction Nullion runs when the cron fires."},
+        "enabled": {"type": "boolean", "description": "Whether the cron should be enabled."},
+        "delivery_channel": {"type": "string", "description": "Delivery adapter such as web, telegram, slack, or discord."},
+        "delivery_target": {"type": "string", "description": "Channel-specific destination id."},
+    }
+    if include_workspace:
+        properties["workspace_id"] = {"type": "string", "description": "Workspace that owns the cron."}
+    return properties
+
+
 def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
     schemas: dict[str, dict[str, object]] = {
+        "create_cron": {
+            "type": "object",
+            "properties": _cron_tool_properties(),
+            "required": ["name", "schedule", "task"],
+            "additionalProperties": False,
+        },
+        "list_crons": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string", "description": "Workspace id to list. Defaults to the current workspace."},
+                "include_all_workspaces": {"type": "boolean", "description": "Whether to include crons from every workspace."},
+            },
+            "additionalProperties": False,
+        },
+        "update_cron": {
+            "type": "object",
+            "properties": _cron_tool_properties(),
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+        "delete_cron": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "Cron job id to delete."}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+        "toggle_cron": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Cron job id to enable or disable."},
+                "enabled": {"type": "boolean", "description": "True to enable the cron, false to disable it."},
+            },
+            "required": ["id", "enabled"],
+            "additionalProperties": False,
+        },
+        "run_cron": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Cron job id to run immediately."},
+                "name": {"type": "string", "description": "Cron job name to run immediately when id is unavailable."},
+            },
+            "additionalProperties": False,
+        },
         "file_read": {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Absolute or workspace-relative file path to read."}},
@@ -1721,10 +1779,43 @@ class ToolRegistry:
     def is_plugin_installed(self, plugin_name: str) -> bool:
         return plugin_name in self._installed_plugins
 
+    @staticmethod
+    def _missing_required_schema_arguments(schema: dict[str, object], arguments: dict[str, object]) -> list[str]:
+        missing: list[str] = []
+        for raw_name in schema.get("required", ()) or ():
+            name = str(raw_name)
+            value = arguments.get(name)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing.append(name)
+        return missing
+
+    def _preflight_schema_result(self, spec: ToolSpec, invocation: ToolInvocation) -> ToolResult | None:
+        schema = spec.input_schema or _default_input_schema_for_tool(spec.name)
+        if not isinstance(schema, dict):
+            return None
+        missing = self._missing_required_schema_arguments(schema, invocation.arguments or {})
+        if not missing:
+            return None
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="failed",
+            output={
+                "reason": "invalid_tool_arguments",
+                "missing_required": missing,
+                "suppress_activity": True,
+            },
+            error=f"Missing required arguments: {', '.join(missing)}",
+        )
+
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
         handler = self._handlers.get(invocation.tool_name)
         if handler is None:
             raise KeyError(f"Unknown tool: {invocation.tool_name}")
+        spec = self._specs[invocation.tool_name]
+        preflight = self._preflight_schema_result(spec, invocation)
+        if preflight is not None:
+            return preflight
         return handler(invocation)
 
     def register_cleanup_hook(self, hook: ToolCleanupHook) -> None:
@@ -5582,6 +5673,87 @@ def _build_delete_cron_handler():
     return handle
 
 
+def _build_update_cron_handler():
+    def handle(invocation: ToolInvocation) -> ToolResult:
+        from nullion.connections import workspace_id_for_principal
+        from nullion.crons import get_cron, update_cron
+
+        args = invocation.arguments or {}
+        cron_id = str(args.get("id", "")).strip()
+        if not cron_id:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="id is required",
+            )
+        existing = get_cron(cron_id)
+        workspace_id = workspace_id_for_principal(invocation.principal_id)
+        if existing is not None and existing.workspace_id != workspace_id:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"id": cron_id, "workspace_id": existing.workspace_id},
+                error=f"Cron {cron_id!r} belongs to workspace {existing.workspace_id}.",
+            )
+        mutable_fields = ("name", "schedule", "task", "enabled", "delivery_channel", "delivery_target", "workspace_id")
+        updates: dict[str, object] = {}
+        for field in mutable_fields:
+            if field not in args:
+                continue
+            value = args[field]
+            if field in {"name", "schedule", "task", "delivery_channel", "delivery_target", "workspace_id"}:
+                value = str(value or "").strip()
+            updates[field] = value
+        if not updates:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"id": cron_id},
+                error="at least one cron field is required",
+            )
+        try:
+            job = update_cron(cron_id, **updates)
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"id": cron_id},
+                error=f"Failed to update cron: {exc}",
+            )
+        if job is None:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"id": cron_id},
+                error=f"No cron found with id={cron_id!r}",
+            )
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "id": job.id,
+                "name": job.name,
+                "schedule": job.schedule,
+                "task": job.task,
+                "workspace_id": job.workspace_id,
+                "delivery_channel": job.delivery_channel,
+                "delivery_target": job.delivery_target,
+                "enabled": job.enabled,
+                "next_run": job.next_run,
+                "message": f"Cron updated: '{job.name}' (id={job.id}).",
+            },
+            error=None,
+        )
+    return handle
+
+
 def _build_toggle_cron_handler():
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.connections import workspace_id_for_principal
@@ -5927,7 +6099,7 @@ def register_cron_tools(
     """Register cron management tools into an existing ToolRegistry.
 
     Call this after building the registry so the agent can create, list,
-    toggle and delete scheduled cron jobs.
+    update, toggle, run, and delete scheduled cron jobs.
     """
     registry.register(
         ToolSpec(
@@ -5977,6 +6149,22 @@ def register_cron_tools(
             capability_tags=("scheduler", "cron"),
         ),
         _build_delete_cron_handler(),
+    )
+    registry.register(
+        ToolSpec(
+            name="update_cron",
+            description=(
+                "Update an existing scheduled cron job by id. Required args: id. "
+                "Optional fields: name, schedule, task, enabled, workspace_id, delivery_channel, delivery_target. "
+                "At least one optional field must be provided."
+            ),
+            risk_level=ToolRiskLevel.MEDIUM,
+            side_effect_class=ToolSideEffectClass.WRITE,
+            requires_approval=False,
+            timeout_seconds=10,
+            capability_tags=("scheduler", "cron"),
+        ),
+        _build_update_cron_handler(),
     )
     registry.register(
         ToolSpec(

@@ -141,6 +141,7 @@ CRON_EXECUTION_BLOCKED_TOOLS = frozenset(
         "run_cron",
         "set_reminder",
         "toggle_cron",
+        "update_cron",
     }
 )
 _WEB_ARTIFACTS: dict[str, Path] = {}
@@ -2652,6 +2653,10 @@ _HTML = r"""<!DOCTYPE html>
     font-size: 10.5px; font-weight: 720; line-height: 1.1; min-height: 26px;
   }
   .memory-chip.full { max-width: 100%; border-color: rgba(141,120,255,0.35); background: rgba(141,120,255,0.13); }
+  .memory-chip-kind {
+    flex-shrink: 0; color: var(--muted); font-size: 8.5px; font-weight: 850;
+    text-transform: uppercase; padding-right: 1px;
+  }
   .memory-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .memory-chip-value { color: var(--muted); font-weight: 650; }
   .memory-chip-x {
@@ -5421,6 +5426,42 @@ let _activityEventsByTurn = new Map();
 let _activityElByApproval = new Map();
 let _activityTurnByApproval = new Map();
 let _taskStatusBubbles = new Map();
+let _recentBotReplyFingerprints = new Map();
+
+function pruneRecentBotReplyFingerprints(now = Date.now()) {
+  for (const [key, seenAt] of _recentBotReplyFingerprints.entries()) {
+    if (now - seenAt > 120000) _recentBotReplyFingerprints.delete(key);
+  }
+}
+
+function botReplyFingerprint(text, artifacts = []) {
+  const body = String(text || '').trim();
+  const artifactKeys = Array.isArray(artifacts)
+    ? artifacts.map((artifact) => [
+        String((artifact && artifact.url) || ''),
+        String((artifact && artifact.name) || ''),
+        String((artifact && artifact.media_type) || ''),
+      ].join(':')).sort().join('|')
+    : '';
+  return `${body}\n--artifacts--\n${artifactKeys}`;
+}
+
+function rememberDisplayedBotReply(text, artifacts = []) {
+  const body = String(text || '').trim();
+  if (!body) return;
+  const now = Date.now();
+  pruneRecentBotReplyFingerprints(now);
+  _recentBotReplyFingerprints.set(botReplyFingerprint(body, artifacts), now);
+}
+
+function wasRecentlyDisplayedBotReply(text, artifacts = []) {
+  const body = String(text || '').trim();
+  if (!body) return false;
+  const now = Date.now();
+  pruneRecentBotReplyFingerprints(now);
+  const seenAt = _recentBotReplyFingerprints.get(botReplyFingerprint(body, artifacts));
+  return Boolean(seenAt && now - seenAt <= 120000);
+}
 
 function markTurnStarted(turnId, text) {
   const id = turnId || '__current__';
@@ -6001,9 +6042,17 @@ async function connect() {
         refreshDashboard();
       } else if (data.type === 'background_message') {
         if (!data.conversation_id || data.conversation_id === conversationId) {
+          const text = data.text || '';
           const artifacts = data.artifacts || [];
-          const bubble = renderServerDeliveredBackgroundReply(data.text || '', artifacts);
-          if (!bubble) addMessage('bot', data.text || '', false, { artifacts });
+          if (wasRecentlyDisplayedBotReply(text, artifacts)) {
+            refreshDashboard();
+            return;
+          }
+          const bubble = renderServerDeliveredBackgroundReply(text, artifacts);
+          if (!bubble) {
+            addMessage('bot', text, false, { artifacts });
+            rememberDisplayedBotReply(text, artifacts);
+          }
           refreshDashboard();
         }
       } else if (data.type === 'gateway_notice') {
@@ -8803,8 +8852,10 @@ function memoryChipHtml(m, full = false) {
     const encodedId = encodeURIComponent(id);
     const valueLimit = full ? 72 : 38;
     const displayText = value ? (value.length > valueLimit ? `${value.slice(0, valueLimit - 3)}...` : value) : key;
-    const title = displayText;
+    const label = memoryKindLabel(m.kind);
+    const title = `${label} memory: ${displayText}`;
     return `<span class="memory-chip${full ? ' full' : ''}" title="${escAttr(title)}">
+      <span class="memory-chip-kind">${escHtml(memoryKindShortLabel(m.kind))}</span>
       <span class="memory-chip-text">${escHtml(displayText)}</span>
       <button class="memory-chip-x" title="Delete memory" aria-label="Delete memory" onclick="event.stopPropagation();deleteMemoryItem(decodeURIComponent('${escAttr(encodedId)}'))">×</button>
     </span>`;
@@ -8815,6 +8866,13 @@ function memoryKindLabel(kind) {
   if (value === 'preference') return 'Long-term';
   if (value === 'environment_fact') return 'Mid-term';
   return 'Short-term';
+}
+
+function memoryKindShortLabel(kind) {
+  const value = String(kind || '');
+  if (value === 'preference') return 'Long';
+  if (value === 'environment_fact') return 'Mid';
+  return 'Short';
 }
 
 function memoryScore(m) {
@@ -9853,6 +9911,10 @@ function mediaProviderEnabled(provider) {
   return _mediaProvidersEnabled[provider] === true;
 }
 
+function chatProviderEnabled(provider) {
+  return _providersEnabled[provider] === true;
+}
+
 function selectedMediaCapabilities() {
   const cap = document.getElementById('cfg-media-model-type')?.value || '';
   return cap ? [cap] : [];
@@ -10008,7 +10070,7 @@ function updateProviderStatusHeader() {
   }
   if (!statusEl) return;
   const chatConfigured = !!_providerConfigured[prov];
-  const chatEnabled = _providersEnabled[prov] !== false;
+  const chatEnabled = chatProviderEnabled(prov);
   const hasMedia = providerHasMediaModels(prov);
   const mediaAccess = providerHasMediaAccess(prov);
   const mediaEnabled = hasMedia && mediaProviderEnabled(prov) && mediaAccess;
@@ -10049,8 +10111,6 @@ function onModelApiKeyInput() {
   const apiKey = document.getElementById('cfg-api-key')?.value || '';
   const toggle = document.getElementById('cfg-model-provider-enabled');
   if (!provider || !toggle || !apiKey || apiKey.startsWith('•')) return;
-  toggle.checked = true;
-  _providersEnabled[provider] = true;
   updateProviderStatusHeader();
   refreshMediaHelperOptionsFromInventory();
 }
@@ -10218,7 +10278,7 @@ function onProviderChange() {
     if (Object.prototype.hasOwnProperty.call(_providersEnabled, prov)) {
       toggleEl.checked = !!_providersEnabled[prov];
     } else {
-      toggleEl.checked = !!_providerConfigured[prov];
+      toggleEl.checked = false;
     }
   }
 
@@ -12676,6 +12736,8 @@ finalizeBotMsg = function(fallback = null, isError = false, turnId = null) {
     const skipSave = turnId ? Boolean(_skipSaveByTurn.get(turnId)) : _skipCurrentTurnSave;
     const metadataKey = turnId || '__current__';
     const metadata = _messageMetadataByTurn.get(metadataKey) || null;
+    const artifacts = metadata && Array.isArray(metadata.artifacts) ? metadata.artifacts : [];
+    if (text.trim()) rememberDisplayedBotReply(text, artifacts);
     if (text.trim() && !skipSave) _chatSaveMsg('bot', text, isError, metadata);
     _messageMetadataByTurn.delete(metadataKey);
     _activityEventsByTurn.delete(metadataKey);

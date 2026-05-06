@@ -217,6 +217,10 @@ def _selector_matches(rule: BoundaryPolicyRule, request: BoundaryPolicyRequest) 
     target = request.boundary.target
     if rule.selector == target:
         return True
+    if request.boundary.kind is BoundaryKind.ACCOUNT_ACCESS and rule.selector.endswith(":*"):
+        base_selector = rule.selector[:-2]
+        if target == base_selector or target.startswith(f"{base_selector}:"):
+            return True
     if fnmatch(target, rule.selector):
         return True
     if rule.selector.endswith("/*") and target == rule.selector[:-2]:
@@ -240,6 +244,10 @@ def _selector_specificity(rule: BoundaryPolicyRule, request: BoundaryPolicyReque
     target = request.boundary.target
     if rule.selector == target:
         return 2
+    if request.boundary.kind is BoundaryKind.ACCOUNT_ACCESS and rule.selector.endswith(":*"):
+        base_selector = rule.selector[:-2]
+        if target == base_selector or target.startswith(f"{base_selector}:"):
+            return 1
     if fnmatch(target, rule.selector):
         return 1
     if rule.selector.endswith("/*") and target == rule.selector[:-2]:

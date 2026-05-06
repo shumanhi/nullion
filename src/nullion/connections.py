@@ -12,7 +12,12 @@ from typing import Any
 
 from nullion.users import load_user_registry, resolve_messaging_user
 
-_CONNECTIONS_PATH = Path.home() / ".nullion" / "connections.json"
+def _nullion_home() -> Path:
+    configured = str(os.environ.get("NULLION_HOME") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".nullion"
+
+
+_CONNECTIONS_PATH = _nullion_home() / "connections.json"
 _ADMIN_WORKSPACE_ID = "workspace_admin"
 _NATIVE_EMAIL_PROVIDER_IDS = frozenset(
     {

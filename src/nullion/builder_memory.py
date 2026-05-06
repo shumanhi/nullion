@@ -95,6 +95,21 @@ _VOLATILE_HEX_TOKEN_RE = re.compile(
     rf"|\b[a-z]+-(?=[a-f0-9]*[a-f])[a-f0-9]{{6,}}\b",
     re.I,
 )
+_RUNTIME_PATH_TOKEN_RE = re.compile(
+    r"(?:^|[\s`\"'])"
+    r"(?:~/(?:\.nullion(?:-(?:test|stage))?)|(?:/[\w .-]+)+/\.nullion(?:-(?:test|stage))?)"
+    r"(?:\b|/)",
+    re.I,
+)
+_RUNTIME_STATE_TOKEN_RE = re.compile(
+    r"(?:\.git/HEAD|\bruntime\.db\b|\bconnections\.json\b|\bcrons\.json\b)",
+    re.I,
+)
+_GENERATED_FILE_TOKEN_RE = re.compile(
+    r"\b[\w.-]+\.(?:csv|docx?|gif|html?|jpe?g|json|md|mp3|mp4|pdf|png|pptx?|rtf|svg|txt|webp|xlsx?|xml|zip)\b",
+    re.I,
+)
+_GENERATED_FILE_KEY_PARTS = frozenset({"artifact", "artifacts", "file", "files", "report", "reports", "tracker"})
 
 
 @dataclass(slots=True)
@@ -172,6 +187,7 @@ Return ONLY valid JSON:
       "key": "stable_snake_case_key",
       "value": "concise fact, preference, or environment detail",
       "kind": "fact",
+      "content_type": "durable_memory",
       "confidence": 0.84
     }
   ]
@@ -185,7 +201,10 @@ Rules:
 - Existing memory includes use_count, use_score, and last_used_at; preserve repeatedly recalled memory unless it is superseded.
 - Each value must be 160 characters or less.
 - Use kind "preference", "fact", or "environment_fact".
-- Do not store transient task status, one-off command outputs, secrets, tokens, or raw conversation history.
+- Set content_type to "durable_memory" only for entries that belong in long-term, mid-term, or short-term memory.
+- Set content_type to "task_observation" for transient task status, one-off command outputs, generated artifact/report findings, delivery/output quality, raw logs, or conversation history.
+- Set content_type to "secret_or_token" for secrets or tokens.
+- Entries whose content_type is not "durable_memory" will be discarded.
 - Do not add facts not supported by the provided turn or existing memory.
 - Do not rely on English trigger words; judge memory only from the full turn evidence.
 - If nothing should be remembered, return {"entries": []}.
@@ -201,6 +220,7 @@ Return ONLY valid JSON:
       "key": "stable_snake_case_key",
       "value": "concise durable fact or preference",
       "kind": "preference",
+      "content_type": "durable_memory",
       "confidence": 0.91
     }
   ]
@@ -210,7 +230,10 @@ Rules:
 - Use only the current turn evidence. Do not preserve or rewrite old memory here.
 - Include durable user facts, preferences, and workspace context that should help later turns.
 - Use kind "preference" for long-term user preferences, "environment_fact" for mid-term workspace/environment context, and "fact" for short-term context.
-- Exclude transient task status, generated IDs, one-off command outputs, raw logs, secrets, tokens, and conversation history.
+- Set content_type to "durable_memory" only for entries that belong in long-term, mid-term, or short-term memory.
+- Set content_type to "task_observation" for transient task status, generated IDs, one-off command outputs, generated artifact/report findings, delivery/output quality, raw logs, or conversation history.
+- Set content_type to "secret_or_token" for secrets or tokens.
+- Entries whose content_type is not "durable_memory" will be discarded.
 - Do not rely on English trigger words. Judge the turn from its meaning and the assistant acknowledgment.
 - If no durable memory was explicitly stated or confirmed, return {"entries": []}.
 """
@@ -834,6 +857,9 @@ def _parse_turn_memory_entries(raw: str, *, policy: MemoryPolicy | None = None) 
             kind = UserMemoryKind(str(item.get("kind") or "fact"))
         except ValueError:
             kind = UserMemoryKind.FACT
+        content_type = str(item.get("content_type") or "").strip().lower()
+        if content_type != "durable_memory":
+            continue
         if per_kind_seen[kind] >= policy.limit_for_kind(kind):
             continue
         normalized.append({"key": key, "value": value, "kind": kind})
@@ -855,6 +881,10 @@ def _is_structurally_durable_memory(key: str, value: str) -> bool:
     if key_parts and key_parts[-1] == "id":
         return False
     if any(part in _VOLATILE_MEMORY_KEY_PARTS for part in key_parts):
+        return False
+    if _has_runtime_storage_value(value):
+        return False
+    if _has_generated_file_observation(key_parts, value):
         return False
     if _has_long_digit_run(value):
         return False
@@ -881,6 +911,16 @@ def _has_long_digit_run(value: str) -> bool:
 
 def _has_runtime_shaped_token(value: str) -> bool:
     return bool(_VOLATILE_HEX_TOKEN_RE.search(value))
+
+
+def _has_runtime_storage_value(value: str) -> bool:
+    return bool(_RUNTIME_PATH_TOKEN_RE.search(value) or _RUNTIME_STATE_TOKEN_RE.search(value))
+
+
+def _has_generated_file_observation(key_parts: list[str], value: str) -> bool:
+    if not any(part in _GENERATED_FILE_KEY_PARTS for part in key_parts):
+        return False
+    return bool(_GENERATED_FILE_TOKEN_RE.search(value))
 
 
 def _has_cron_expression(value: str) -> bool:
@@ -968,7 +1008,7 @@ def _replacement_memory_entry(
         kind=item["kind"],
         key=key,
         value=str(item["value"]),
-        source="builder_memory",
+        source="builder_memory:durable",
         created_at=previous.created_at if previous and previous.created_at is not None else now,
         updated_at=now,
         use_count=int(getattr(previous, "use_count", 0) or 0) if previous else 0,

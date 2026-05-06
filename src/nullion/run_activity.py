@@ -120,6 +120,11 @@ def _tool_field(tool_result: Any, name: str, default: Any = None) -> Any:
     return getattr(tool_result, name, default)
 
 
+def should_suppress_tool_activity(tool_result: Any) -> bool:
+    output = _tool_field(tool_result, "output")
+    return isinstance(output, dict) and bool(output.get("suppress_activity"))
+
+
 def _tool_status_icon(status: str) -> str:
     normalized = status.lower()
     if normalized in {"completed", "approved", "ok", "success"}:
@@ -300,7 +305,11 @@ def format_tool_activity_line(tool_result: Any) -> str:
 
 
 def format_tool_activity_detail(tool_results: Iterable[Any]) -> str:
-    return "\n".join(format_tool_activity_line(result) for result in (tool_results or ()))
+    return "\n".join(
+        format_tool_activity_line(result)
+        for result in (tool_results or ())
+        if not should_suppress_tool_activity(result)
+    )
 
 
 def format_tool_results_activity_detail(tool_results: Iterable[Any]) -> str:
@@ -442,6 +451,7 @@ __all__ = [
     "format_tool_inventory_activity_detail",
     "format_tool_results_activity_detail",
     "normalize_verbose_mode",
+    "should_suppress_tool_activity",
     "SKILL_USAGE_GLYPH",
     "set_activity_trace_enabled",
     "set_task_planner_feed_enabled",
