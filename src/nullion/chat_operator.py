@@ -88,6 +88,7 @@ from nullion.run_activity import (
     format_tool_results_activity_detail,
     set_activity_trace_enabled,
     set_task_planner_feed_mode,
+    should_suppress_tool_activity,
     task_planner_feed_mode,
     verbose_mode_status_text,
 )
@@ -1256,9 +1257,19 @@ def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None,
     return fallback, ambiguity_reason
 
 
-def _chat_ambiguity_classifier(thread: list[dict[str, str]], *, model_client: object | None):
+def _chat_ambiguity_classifier(
+    thread: list[dict[str, str]],
+    *,
+    model_client: object | None,
+    structured_followup_evidence: bool = False,
+):
     previous_user_message = _previous_user_message(thread)
-    if model_client is None or not isinstance(previous_user_message, str) or not previous_user_message.strip():
+    if (
+        not structured_followup_evidence
+        or model_client is None
+        or not isinstance(previous_user_message, str)
+        or not previous_user_message.strip()
+    ):
         return None, None
 
     def classifier(text: str, ctx):
@@ -2222,6 +2233,7 @@ def _try_builder_reflection(
     outcome: TurnOutcome,
     conversation_id: str,
     memory_owner: str | None = None,
+    turn_disposition: ConversationTurnDisposition | None = None,
 ) -> None:
     """Fire-and-forget Builder reflection after a completed turn.
 
@@ -2229,6 +2241,9 @@ def _try_builder_reflection(
     repeated patterns, and asks the LLM to propose a skill when warranted.
     Errors are caught and logged at DEBUG level — never blocks the main turn.
     """
+    if turn_disposition not in {None, ConversationTurnDisposition.INDEPENDENT}:
+        return
+
     try:
         from uuid import uuid4 as _uuid4
 
@@ -2442,7 +2457,11 @@ def _render_chat_turn(
     thread = _get_chat_thread(runtime, chat_id)
     previous_assistant_message = _previous_assistant_message(thread)
     ambiguity_fallback, ambiguity_fallback_reason = _chat_ambiguity_fallback(runtime, chat_id=chat_id, prompt=prompt)
-    ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(thread, model_client=model_client)
+    ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(
+        thread,
+        model_client=model_client,
+        structured_followup_evidence=ambiguity_fallback_reason is not None,
+    )
     conversation_result = runtime.process_conversation_message(
         conversation_id=_conversation_id_for_chat(chat_id),
         chat_id=chat_id,
@@ -2572,6 +2591,8 @@ def _render_chat_turn(
     def _record_tool_activity(result: ToolResult) -> None:
         nonlocal tool_activity_count
         if activity_callback is None:
+            return
+        if should_suppress_tool_activity(result):
             return
         tool_activity_count += 1
         normalized = normalize_tool_status(result.status)
@@ -2902,6 +2923,7 @@ def _render_chat_turn(
                     ),
                     outcome=mission_outcome,
                     conversation_id=conversation_id,
+                    turn_disposition=conversation_result.turn.disposition,
                 )
             elif not handled_by_mini_agents:
                 # Single-step: run directly as an orchestrator turn so the LLM decides
@@ -3028,6 +3050,7 @@ def _render_chat_turn(
                     outcome=turn_outcome,
                     conversation_id=conversation_id,
                     memory_owner=_memory_owner_for_chat(chat_id, settings),
+                    turn_disposition=conversation_result.turn.disposition,
                 )
             # Only persist the turn when it has a real result.  Storing
             # "Tool approval requested: …" as the assistant reply pollutes the

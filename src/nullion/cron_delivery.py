@@ -54,6 +54,11 @@ def cron_agent_prompt(job: object, *, label: str) -> str:
         "Scheduled task delivery contract:\n"
         "- Cron may deliver text, file attachments, both, or no message, depending on the task.\n"
         "- If a file/report/export is expected, create it and attach it with a MEDIA line.\n"
+        "- Generated artifacts must be internally consistent and valid for their file type before delivery: "
+        "JSON must parse, text must be non-empty, HTML reports must not duplicate or contradict their own "
+        "visible counts, and binary formats must be real files.\n"
+        "- For HTML dashboards/reports, derive visible metrics, charts, and tables from the same source rows "
+        "instead of manually repeating totals.\n"
         "- Keep scratch/checkpoint/state files in the workspace unless they are requested deliverables.\n"
         "- If the task says to alert only on new data or meaningful changes, return no output when nothing changed.\n"
         f"- If no output behavior is specified and there is nothing specific to report, send: {DEFAULT_CRON_NO_OUTPUT_MESSAGE}"
@@ -480,6 +485,35 @@ def cron_delivery_text_from_result(result: dict[str, object]) -> str:
     return _append_media_directives(text, deliverable_paths)
 
 
+def cron_delivery_artifact_paths_from_result(result: dict[str, object], text: str | None = None) -> tuple[str, ...]:
+    """Return concrete artifact paths that this cron delivery is about to expose."""
+    from nullion.artifacts import media_candidate_paths_from_text
+
+    state_filenames = _workspace_state_filenames(result)
+    paths = list(_structured_tool_artifact_paths(result, state_filenames))
+    paths.extend(str(path) for path in media_candidate_paths_from_text(str(text or "")))
+    return tuple(dict.fromkeys(path for path in paths if path))
+
+
+def cron_artifact_validation_block_reason(result: dict[str, object], text: str | None = None) -> str | None:
+    """Validate deliverable cron artifacts before marking a run delivered."""
+    from nullion.artifact_validation import validate_artifact_paths
+
+    paths = cron_delivery_artifact_paths_from_result(result, text)
+    if not paths:
+        result.pop("cron_artifact_validation_errors", None)
+        return None
+    validation = validate_artifact_paths(paths)
+    if validation.ok:
+        result.pop("cron_artifact_validation_errors", None)
+        return None
+    result["cron_artifact_validation_errors"] = [
+        {"path": issue.path, "code": issue.code, "message": issue.message}
+        for issue in validation.issues
+    ]
+    return "cron_artifact_validation_failed"
+
+
 def legacy_cron_delivery_text_with_media(text: str, artifacts: object) -> str:
     """Append MEDIA directives from path-like artifacts without assuming a type."""
     media_lines: list[str] = []
@@ -563,6 +597,8 @@ def _cron_run_prepare_delivery_node(state: _CronRunDeliveryState) -> dict[str, o
     artifacts = result.get("artifacts")
     text = cron_delivery_text_from_result(result)
     block_reason = state["callbacks"].block_reason(result, str(text), artifacts)
+    if block_reason is None:
+        block_reason = cron_artifact_validation_block_reason(result, str(text))
     return {"result": result, "text": str(text), "artifacts": artifacts, "block_reason": block_reason}
 
 
@@ -740,6 +776,8 @@ __all__ = [
     "configured_delivery_target",
     "cron_agent_prompt",
     "cron_conversation_id",
+    "cron_artifact_validation_block_reason",
+    "cron_delivery_artifact_paths_from_result",
     "cron_delivery_target",
     "cron_delivery_text",
     "cron_delivery_text_from_result",

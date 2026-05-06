@@ -230,21 +230,29 @@ async def send_slack_platform_delivery(
                 paths=delivery.attachments,
                 initial_comment=formatted_reply or None,
             )
-            _record_slack_delivery_receipt(
-                channel=channel,
+            receipt = build_platform_delivery_receipt(
+                channel="slack",
+                target_id=channel,
                 delivery=delivery,
                 transport_ok=uploaded,
                 error=None if uploaded else "attachment_upload_failed",
             )
-            return uploaded
+            record_platform_delivery_receipt(receipt)
+            return receipt.status == "succeeded"
         await _post_slack_message_with_plain_fallback(
             client,
             channel=channel,
             formatted_text=formatted_reply or "",
             plain_text=delivery.text or "",
         )
-        _record_slack_delivery_receipt(channel=channel, delivery=delivery, transport_ok=True)
-        return True
+        receipt = build_platform_delivery_receipt(
+            channel="slack",
+            target_id=channel,
+            delivery=delivery,
+            transport_ok=True,
+        )
+        record_platform_delivery_receipt(receipt)
+        return receipt.status == "succeeded"
     except Exception:
         logger.warning("Slack platform delivery failed", exc_info=True)
         if delivery is not None:

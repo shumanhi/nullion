@@ -1,7 +1,6 @@
 """Cron job management for Nullion.
 
-Jobs are persisted in runtime.db and mirrored to ~/.nullion/crons.json for
-older installs.
+Jobs are persisted in the active Nullion runtime DB.
 A CronScheduler background thread ticks every 30 s, fires due jobs by
 calling the caller-supplied fire_fn(job), then updates last_run / next_run.
 
@@ -19,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -30,12 +30,15 @@ from typing import Callable
 
 log = logging.getLogger(__name__)
 
-_CRONS_PATH = Path.home() / ".nullion" / "crons.json"
+def _nullion_home() -> Path:
+    configured = str(os.environ.get("NULLION_HOME") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".nullion"
+
+
 _RUNTIME_DB_PATH: Path | None = None
 _DEFAULT_WORKSPACE_ID = "workspace_admin"
 _CRON_COLLECTION = "cron_jobs"
 _CRON_TABLE = "reminders_crons"
-_STORE_FRESHNESS_SKEW = timedelta(seconds=1)
 
 # ── Data model ─────────────────────────────────────────────────────────────────
 
@@ -159,7 +162,7 @@ def _fallback_next_run(schedule: str, after: datetime) -> str | None:
 def _runtime_db_path() -> Path:
     if _RUNTIME_DB_PATH is not None:
         return _RUNTIME_DB_PATH
-    return _CRONS_PATH.with_name("runtime.db")
+    return _nullion_home() / "runtime.db"
 
 
 def _parse_store_timestamp(value: object) -> datetime | None:
@@ -171,16 +174,6 @@ def _parse_store_timestamp(value: object) -> datetime | None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
-        return None
-
-
-def _crons_json_mtime() -> datetime | None:
-    try:
-        return datetime.fromtimestamp(_CRONS_PATH.stat().st_mtime, tz=timezone.utc)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        log.warning("Failed to stat crons JSON mirror %s: %s", _CRONS_PATH, exc)
         return None
 
 
@@ -199,28 +192,6 @@ def _ensure_cron_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{_CRON_TABLE}_collection ON {_CRON_TABLE} (collection)"
     )
-
-
-def _load_crons_json() -> list[CronJob]:
-    try:
-        data = json.loads(_CRONS_PATH.read_text())
-        return [CronJob.from_dict(d) for d in data]
-    except FileNotFoundError:
-        return []
-    except Exception as exc:
-        log.warning("Failed to load crons from %s: %s", _CRONS_PATH, exc)
-        return []
-
-
-def _has_crons_json_rows() -> bool:
-    try:
-        data = json.loads(_CRONS_PATH.read_text())
-    except FileNotFoundError:
-        return False
-    except Exception as exc:
-        log.warning("Failed to inspect cron JSON mirror %s: %s", _CRONS_PATH, exc)
-        return False
-    return isinstance(data, list) and bool(data)
 
 
 def _load_crons_db_snapshot() -> tuple[list[CronJob], datetime | None] | None:
@@ -255,38 +226,9 @@ def _load_crons_db() -> list[CronJob] | None:
 
 def load_crons() -> list[CronJob]:
     db_snapshot = _load_crons_db_snapshot()
-    if db_snapshot is not None:
-        db_jobs, db_updated_at = db_snapshot
-        json_updated_at = _crons_json_mtime()
-        if not db_jobs and _has_crons_json_rows():
-            legacy_jobs = _load_crons_json()
-            save_crons(legacy_jobs)
-            log.warning(
-                "Runtime DB had no cron rows; restored %d cron(s) from legacy JSON mirror.",
-                len(legacy_jobs),
-            )
-            return legacy_jobs
-        if json_updated_at is not None and (
-            db_updated_at is None or json_updated_at > db_updated_at + _STORE_FRESHNESS_SKEW
-        ):
-            legacy_jobs = _load_crons_json()
-            if not legacy_jobs and db_jobs:
-                log.warning(
-                    "Ignoring newer empty cron JSON mirror because runtime DB still has %d cron(s).",
-                    len(db_jobs),
-                )
-                return db_jobs
-            save_crons(legacy_jobs)
-            log.info(
-                "Imported %d cron(s) from newer legacy JSON mirror into runtime DB.",
-                len(legacy_jobs),
-            )
-            return legacy_jobs
-        return db_jobs
-    legacy_jobs = _load_crons_json()
-    if legacy_jobs:
-        save_crons(legacy_jobs)
-    return legacy_jobs
+    if db_snapshot is None:
+        return []
+    return db_snapshot[0]
 
 
 def list_crons(*, workspace_id: str | None = None) -> list[CronJob]:
@@ -295,13 +237,6 @@ def list_crons(*, workspace_id: str | None = None) -> list[CronJob]:
         return jobs
     requested_workspace = str(workspace_id or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID
     return [job for job in jobs if (job.workspace_id or _DEFAULT_WORKSPACE_ID) == requested_workspace]
-
-
-def _save_crons_json(jobs: list[CronJob]) -> None:
-    _CRONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _CRONS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps([j.to_dict() for j in jobs], indent=2))
-    tmp.replace(_CRONS_PATH)
 
 
 def _save_crons_db(jobs: list[CronJob]) -> bool:
@@ -327,9 +262,7 @@ def _save_crons_db(jobs: list[CronJob]) -> bool:
 
 def _persisted_cron_count() -> int:
     snapshot = _load_crons_db_snapshot()
-    db_count = 0 if snapshot is None else len(snapshot[0])
-    json_count = len(_load_crons_json())
-    return max(db_count, json_count)
+    return 0 if snapshot is None else len(snapshot[0])
 
 
 def save_crons(jobs: list[CronJob], *, allow_empty: bool = False) -> None:
@@ -337,17 +270,18 @@ def save_crons(jobs: list[CronJob], *, allow_empty: bool = False) -> None:
         log.error("Refusing to overwrite existing cron store with an implicit empty cron list.")
         raise RuntimeError("Refusing to overwrite existing cron store with an implicit empty cron list.")
     saved_to_db = _save_crons_db(jobs)
-    _save_crons_json(jobs)
     if saved_to_db:
-        log.debug("Saved %d cron(s) to runtime DB and legacy JSON mirror.", len(jobs))
+        log.debug("Saved %d cron(s) to runtime DB.", len(jobs))
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Maximum length for a cron task string.  Longer strings are rejected to
-# prevent stored prompt-injection payloads from accumulating unbounded
-# context in the LLM turn triggered on each scheduled fire.
-_MAX_TASK_LEN = 2_000
+# Maximum length for a cron task string. Longer strings are rejected to prevent
+# stored prompt-injection payloads from accumulating unbounded context in the
+# LLM turn triggered on each scheduled fire. Keep this aligned with the cron
+# delivery artifact threshold so detailed report instructions can be stored
+# without forcing a fail-then-retry tool loop.
+_MAX_TASK_LEN = 12_000
 _MAX_NAME_LEN = 200
 _MAX_SCHEDULE_LEN = 64
 

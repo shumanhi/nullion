@@ -200,8 +200,14 @@ async def send_discord_platform_delivery(
                         response.raise_for_status()
 
                     await retry_messaging_delivery_operation(operation)
-                _record_discord_delivery_receipt(channel_id=channel_id, delivery=delivery, transport_ok=True)
-                return True
+                receipt = build_platform_delivery_receipt(
+                    channel="discord",
+                    target_id=channel_id,
+                    delivery=delivery,
+                    transport_ok=True,
+                )
+                record_platform_delivery_receipt(receipt)
+                return receipt.status == "succeeded"
             try:
                 response = await client.post(url, headers=headers, json={"content": delivery.text or ""})
                 response.raise_for_status()
@@ -213,8 +219,14 @@ async def send_discord_platform_delivery(
                     json={"content": _discord_plain_format_fallback_text(delivery.text or "")},
                 )
                 response.raise_for_status()
-            _record_discord_delivery_receipt(channel_id=channel_id, delivery=delivery, transport_ok=True)
-            return True
+            receipt = build_platform_delivery_receipt(
+                channel="discord",
+                target_id=channel_id,
+                delivery=delivery,
+                transport_ok=True,
+            )
+            record_platform_delivery_receipt(receipt)
+            return receipt.status == "succeeded"
     except Exception:
         logger.warning("Discord platform delivery failed", exc_info=True)
         if delivery is not None:
