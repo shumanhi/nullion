@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 PROBE_INTERVAL_SECONDS = 30
 _ESCALATION_THRESHOLD = 2   # consecutive failures before creating a doctor action
+_DEFAULT_TERMINAL_AUTH_BACKOFF_SECONDS = 15 * 60
 
 
 @dataclass(slots=True)
@@ -53,6 +56,7 @@ class HealthMonitor:
         self._task: asyncio.Task | None = None
         self._probes: list[ProbeFunc] = []
         self._failure_counts: dict[str, int] = {}
+        self._probe_paused_until: dict[str, float] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -93,6 +97,9 @@ class HealthMonitor:
     async def _run_all_probes(self) -> None:
         loop = asyncio.get_event_loop()
         for probe in self._probes:
+            service_id = getattr(probe, "service_id", None)
+            if isinstance(service_id, str) and self._probe_is_paused(service_id):
+                continue
             try:
                 if inspect.iscoroutinefunction(probe):
                     result = await probe()
@@ -104,6 +111,18 @@ class HealthMonitor:
 
     def _handle_result(self, result: ProbeResult) -> None:
         _compiled_health_result_graph().invoke({"monitor": self, "result": result})
+
+    def _probe_is_paused(self, service_id: str) -> bool:
+        paused_until = self._probe_paused_until.get(service_id)
+        if paused_until is None:
+            return False
+        if time.monotonic() < paused_until:
+            return True
+        self._probe_paused_until.pop(service_id, None)
+        return False
+
+    def _pause_probe(self, service_id: str, seconds: float) -> None:
+        self._probe_paused_until[service_id] = time.monotonic() + max(0.0, seconds)
 
     def _escalate(self, result: ProbeResult) -> None:
         """Attempt auto-heal; if that fails, create a doctor action card."""
@@ -168,6 +187,33 @@ class _HealthResultState(TypedDict, total=False):
     service_id: str
     previous_failures: int
     failure_count: int
+    terminal_failure: bool
+
+
+def _terminal_auth_backoff_seconds() -> float:
+    raw = os.environ.get("NULLION_HEALTH_MONITOR_AUTH_BACKOFF_SECONDS")
+    if raw is None:
+        return float(_DEFAULT_TERMINAL_AUTH_BACKOFF_SECONDS)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(_DEFAULT_TERMINAL_AUTH_BACKOFF_SECONDS)
+
+
+def _is_terminal_model_auth_failure(result: ProbeResult) -> bool:
+    if result.service_id != "model_api":
+        return False
+    details = result.details if isinstance(result.details, dict) else {}
+    if details.get("category") == "auth" and details.get("terminal") is True:
+        return True
+    if details.get("http_status") == 401 and str(details.get("provider_code") or "") in {
+        "token_invalidated",
+        "token_revoked",
+        "invalid_api_key",
+        "invalid_token",
+    }:
+        return True
+    return False
 
 
 def _health_result_start_node(state: _HealthResultState) -> dict[str, object]:
@@ -181,7 +227,9 @@ def _health_result_route_ok(state: _HealthResultState) -> str:
 
 def _health_result_success_node(state: _HealthResultState) -> dict[str, object]:
     service_id = state["service_id"]
-    previous_failures = state["monitor"]._failure_counts.pop(service_id, 0)
+    monitor = state["monitor"]
+    previous_failures = monitor._failure_counts.pop(service_id, 0)
+    monitor._probe_paused_until.pop(service_id, None)
     return {"previous_failures": previous_failures}
 
 
@@ -201,6 +249,9 @@ def _health_result_failure_node(state: _HealthResultState) -> dict[str, object]:
     service_id = state["service_id"]
     monitor = state["monitor"]
     count = monitor._failure_counts.get(service_id, 0) + 1
+    terminal_failure = _is_terminal_model_auth_failure(state["result"])
+    if terminal_failure:
+        count = max(count, _ESCALATION_THRESHOLD)
     monitor._failure_counts[service_id] = count
     logger.warning(
         "Health monitor: %s probe failed (consecutive=%d, error=%s)",
@@ -208,11 +259,20 @@ def _health_result_failure_node(state: _HealthResultState) -> dict[str, object]:
         count,
         state["result"].error,
     )
-    return {"failure_count": count}
+    if terminal_failure:
+        backoff_seconds = _terminal_auth_backoff_seconds()
+        monitor._pause_probe(service_id, backoff_seconds)
+        logger.warning(
+            "Health monitor: %s probe paused for %.0fs after terminal auth failure",
+            service_id,
+            backoff_seconds,
+        )
+    return {"failure_count": count, "terminal_failure": terminal_failure}
 
 
 def _health_result_route_failure(state: _HealthResultState) -> str:
-    return "escalate" if int(state.get("failure_count") or 0) >= _ESCALATION_THRESHOLD else END
+    count = int(state.get("failure_count") or 0)
+    return "escalate" if count == _ESCALATION_THRESHOLD else END
 
 
 def _health_result_escalate_node(state: _HealthResultState) -> dict[str, object]:

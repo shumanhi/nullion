@@ -49,15 +49,44 @@ def _read_credentials_json() -> dict[str, object]:
     return {}
 
 
-def _media_model_selection(provider_env: str, model_env: str, enabled_env: str) -> tuple[str, str] | None:
+def _media_capability_disabled(enabled_env: str) -> bool:
     enabled = os.environ.get(enabled_env)
-    if enabled is not None and enabled.strip().lower() in {"0", "false", "no", "off"}:
+    return enabled is not None and enabled.strip().lower() in {"0", "false", "no", "off"}
+
+
+def _media_model_selection(provider_env: str, model_env: str, enabled_env: str) -> tuple[str, str] | None:
+    if _media_capability_disabled(enabled_env):
         return None
     provider = os.environ.get(provider_env, "").strip()
     model = os.environ.get(model_env, "").strip()
     if provider and model:
         return provider, model
     return None
+
+
+def _media_model_provider_configured(provider: str) -> bool:
+    provider_l = provider.strip().lower()
+    if not _provider_key_for_media(provider_l):
+        return False
+    if provider_l == "custom":
+        return bool(os.environ.get("NULLION_MEDIA_CUSTOM_BASE_URL", "").strip())
+    return True
+
+
+def image_generation_configured() -> bool:
+    if _media_capability_disabled("NULLION_IMAGE_GENERATE_ENABLED"):
+        return False
+    if os.environ.get("NULLION_IMAGE_GENERATE_COMMAND", "").strip():
+        return True
+    model_selection = _media_model_selection(
+        "NULLION_IMAGE_GENERATE_PROVIDER",
+        "NULLION_IMAGE_GENERATE_MODEL",
+        "NULLION_IMAGE_GENERATE_ENABLED",
+    )
+    if model_selection is None:
+        return False
+    provider, _model = model_selection
+    return _media_model_provider_configured(provider)
 
 
 def _provider_key_for_media(provider: str) -> str:
@@ -615,6 +644,8 @@ def _model_image_extract_text(provider: str, model: str, path: str) -> dict[str,
 
 
 def _local_image_generate(prompt: str, output_path: str, size: str | None, source_path: str | None = None) -> dict[str, object]:
+    if _media_capability_disabled("NULLION_IMAGE_GENERATE_ENABLED"):
+        raise RuntimeError("image_generate provider is not configured")
     template = os.environ.get("NULLION_IMAGE_GENERATE_COMMAND", "").strip()
     if template:
         return _command_image_generate(template, prompt, output_path, size, source_path=source_path)
@@ -1470,7 +1501,7 @@ def resolve_plugin_provider_kwargs(*, plugin_name: str, provider_name: str) -> d
             return {
                 "audio_transcriber": _local_audio_transcribe,
                 "image_text_extractor": _local_image_extract_text,
-                "image_generator": _local_image_generate,
+                "image_generator": _local_image_generate if image_generation_configured() else None,
             }
         raise ValueError(f"unknown provider binding for media_plugin: {provider_name}")
     raise ValueError(f"unsupported plugin provider resolution: {plugin_name}")

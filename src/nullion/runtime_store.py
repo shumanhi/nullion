@@ -510,6 +510,13 @@ class RuntimeStore:
     def list_doctor_actions(self) -> list[dict[str, Any]]:
         return [dict(action) for action in self.doctor_actions]
 
+    def remove_doctor_action(self, action_id: str) -> bool:
+        for index, action in enumerate(self.doctor_actions):
+            if action["action_id"] == action_id:
+                del self.doctor_actions[index]
+                return True
+        return False
+
     def add_doctor_action_object(self, action: DoctorAction, *, action_type: str) -> None:
         self.add_doctor_action(_doctor_action_record_from_object(action, action_type=action_type))
 
@@ -534,6 +541,9 @@ class RuntimeStore:
 
     def list_mini_agent_runs(self) -> list[MiniAgentRun]:
         return list(self.mini_agent_runs.values())
+
+    def remove_mini_agent_run(self, run_id: str) -> bool:
+        return self.mini_agent_runs.pop(run_id, None) is not None
 
     def add_mission(self, mission: MissionRecord) -> None:
         self.missions[mission.mission_id] = mission
@@ -577,6 +587,19 @@ class RuntimeStore:
 
     def get_task_frame(self, frame_id: str) -> TaskFrame | None:
         return self.task_frames.get(frame_id)
+
+    def remove_task_frame(self, frame_id: str) -> bool:
+        frame = self.task_frames.pop(frame_id, None)
+        if frame is None:
+            return False
+        stale_conversations = [
+            conversation_id
+            for conversation_id, active_frame_id in self.active_task_frames.items()
+            if active_frame_id == frame_id
+        ]
+        for conversation_id in stale_conversations:
+            self.active_task_frames.pop(conversation_id, None)
+        return True
 
     def list_task_frames(self, conversation_id: str) -> list[TaskFrame]:
         return [

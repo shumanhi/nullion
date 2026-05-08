@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
-from nullion.artifacts import artifact_path_for_generated_workspace_file
+from nullion.artifacts import artifact_path_for_generated_workspace_file, path_is_within
 from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy, BrowserPolicyViolation
-from nullion.plugins.browser_plugin.browser_session import BrowserBackend, BrowserSessionPool
+from nullion.plugins.browser_plugin.browser_session import BrowserBackend, BrowserScreenshotResult, BrowserSessionPool
 from nullion.tools import ToolInvocation, ToolResult
+from nullion.workspace_storage import workspace_storage_roots_for_principal
 
 
 def _ok(invocation: ToolInvocation, output: dict[str, Any]) -> ToolResult:
@@ -38,6 +43,7 @@ _BROWSER_LOOP_LOCK = threading.Lock()
 # fails fast instead of starving the worker thread pool.
 _MAX_CONCURRENT_BROWSER_OPS = 8
 _BROWSER_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_BROWSER_OPS)
+_LOCAL_PREVIEW_SUFFIXES = frozenset({".html", ".htm"})
 
 
 def _ensure_browser_loop() -> asyncio.AbstractEventLoop:
@@ -88,6 +94,30 @@ def _run(coro) -> Any:
         _BROWSER_SEMAPHORE.release()
 
 
+def _workspace_html_preview_url(raw_url: str, *, principal_id: str | None) -> str | None:
+    parsed = urlparse(raw_url)
+    if parsed.scheme == "file":
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            return None
+        raw_path = url2pathname(parsed.path)
+    elif not parsed.scheme:
+        raw_path = raw_url
+    else:
+        return None
+
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute() or path.suffix.lower() not in _LOCAL_PREVIEW_SUFFIXES:
+        return None
+    resolved = path.resolve(strict=False)
+    if not resolved.is_file():
+        return None
+
+    roots = workspace_storage_roots_for_principal(principal_id, create=False)
+    if any(path_is_within(resolved, root) for root in roots.all_roots()):
+        return resolved.as_uri()
+    return None
+
+
 class BrowserTools:
     """Sync wrappers around the async backend, registered as kernel tools."""
 
@@ -99,7 +129,12 @@ class BrowserTools:
         self._sessions_by_scope: dict[str, set[str]] = {}
 
     def _session_id(self, invocation: ToolInvocation) -> str:
-        return str(invocation.arguments.get("session_id", "default"))
+        raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
+        if raw_session_id and raw_session_id != "default":
+            return raw_session_id
+        scope = self._cleanup_scope(invocation)
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+        return f"default-{digest}"
 
     def _cleanup_scope(self, invocation: ToolInvocation) -> str:
         return str(invocation.capsule_id or invocation.principal_id or "global")
@@ -142,15 +177,18 @@ class BrowserTools:
         url = invocation.arguments.get("url", "")
         if not url:
             return _fail(invocation, "Missing required argument: url")
+        navigate_url = _workspace_html_preview_url(str(url), principal_id=invocation.principal_id)
         try:
-            self._policy.check_url(str(url))
+            if navigate_url is None:
+                self._policy.check_url(str(url))
+                navigate_url = str(url)
         except BrowserPolicyViolation as e:
             return _fail(invocation, str(e))
 
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:
-            result = _run(self._backend.navigate(session_id, str(url)))
+            result = _run(self._backend.navigate(session_id, navigate_url))
             return _ok(invocation, {"result": result, "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"Navigation failed: {e}")
@@ -193,8 +231,29 @@ class BrowserTools:
     def browser_screenshot(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
+        mode = str(invocation.arguments.get("mode") or "auto").strip().lower()
+        if mode not in {"auto", "viewport", "full_page"}:
+            return _fail(invocation, "mode must be one of: auto, viewport, full_page")
         try:
-            png_bytes = _run(self._backend.screenshot(session_id))
+            screenshot = _run(self._backend.screenshot(session_id, mode=mode))
+            if isinstance(screenshot, BrowserScreenshotResult):
+                png_bytes = screenshot.data
+                screenshot_metadata = {
+                    "mode": screenshot.mode,
+                    "requested_mode": screenshot.requested_mode,
+                    "viewport_width": screenshot.viewport_width,
+                    "viewport_height": screenshot.viewport_height,
+                    "document_width": screenshot.document_width,
+                    "document_height": screenshot.document_height,
+                    "is_clipped": screenshot.is_clipped,
+                }
+            else:
+                png_bytes = screenshot
+                screenshot_metadata = {
+                    "mode": mode,
+                    "requested_mode": mode,
+                    "is_clipped": False,
+                }
             if not png_bytes:
                 return _fail(invocation, "Screenshot returned no image data.")
             artifact_path = artifact_path_for_generated_workspace_file(
@@ -213,6 +272,7 @@ class BrowserTools:
                     "format": "png",
                     "size_bytes": len(png_bytes),
                     "session_id": session_id,
+                    **screenshot_metadata,
                 },
             )
         except Exception as e:

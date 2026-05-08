@@ -48,7 +48,7 @@ class TaskPriority(str, Enum):
 @dataclass
 class TaskResult:
     task_id: str
-    status: Literal["success", "failure", "partial"]
+    status: Literal["success", "failure", "partial", "cancelled"]
     output: str | None = None
     artifacts: list[str] = field(default_factory=list)   # file paths produced
     error: str | None = None
@@ -205,6 +205,7 @@ class TaskRegistry:
                 return False
             task.status = TaskStatus.CANCELLED
             task.completed_at = datetime.now(timezone.utc)
+            task.result = TaskResult(task_id=task.task_id, status="cancelled", error="Cancelled by user.")
             logger.debug("TaskRegistry: cancelled task %s", task_id)
             return True
 

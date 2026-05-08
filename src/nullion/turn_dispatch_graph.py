@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 import json
+import threading
 from typing import TypedDict
 from uuid import uuid4
 
@@ -26,10 +27,18 @@ class TurnDispatchDecision:
     dependency_turn_ids: tuple[str, ...] = ()
     disposition: ConversationTurnDisposition = ConversationTurnDisposition.INDEPENDENT
     reason: str = "default_independent"
+    target_active_turn_index: int | None = None
 
     @property
     def should_wait(self) -> bool:
         return self.policy is TurnDispatchPolicy.WAIT_FOR_ACTIVE and bool(self.dependency_turn_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredTurnDisposition:
+    disposition: ConversationTurnDisposition
+    reason: str
+    target_active_turn_index: int | None = None
 
 
 class _TurnDispatchState(TypedDict, total=False):
@@ -39,12 +48,16 @@ class _TurnDispatchState(TypedDict, total=False):
     model_client: object | None
     disposition: ConversationTurnDisposition
     disposition_reason: str
+    target_active_turn_index: int | None
     decision: TurnDispatchDecision
 
 
 def _normalize_node(state: _TurnDispatchState) -> dict[str, object]:
     active_turn_ids = tuple(str(turn_id) for turn_id in state.get("active_turn_ids", ()) if str(turn_id).strip())
-    active_turn_texts = tuple(str(text) for text in state.get("active_turn_texts", ()) if str(text).strip())
+    raw_active_turn_texts = tuple(str(text) for text in state.get("active_turn_texts", ()))
+    if len(raw_active_turn_texts) < len(active_turn_ids):
+        raw_active_turn_texts = raw_active_turn_texts + ("",) * (len(active_turn_ids) - len(raw_active_turn_texts))
+    active_turn_texts = raw_active_turn_texts[: len(active_turn_ids)]
     return {
         "active_turn_ids": active_turn_ids,
         "active_turn_texts": active_turn_texts,
@@ -79,25 +92,35 @@ def _parse_json_object(text: str) -> dict[str, object] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _trim_active_request_text(text: str, *, limit: int = 700) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "..."
+
+
 def _model_turn_disposition(
     *,
     model_client: object | None,
     current_text: str,
     active_turn_texts: tuple[str, ...],
-) -> tuple[ConversationTurnDisposition, str] | None:
+) -> _StructuredTurnDisposition | None:
     if model_client is None or not active_turn_texts:
         return None
     create = getattr(model_client, "create", None)
     if not callable(create):
         return None
     active_payload = [
-        {"index": index, "user_request": text}
+        {"index": index, "user_request": _trim_active_request_text(text)}
         for index, text in enumerate(active_turn_texts[-3:], start=max(0, len(active_turn_texts) - 3))
     ]
     system = (
-        "Classify whether the current user message should wait for an active in-progress request "
-        "or run as a separate request. Return only JSON with keys relationship, effect, and confidence. "
+        "Classify whether the current user message should link to one active or recent request "
+        "or run as a separate request. Return only JSON with keys relationship, effect, confidence, "
+        "and target_index. "
         "relationship must be one of: follow_up, separate. effect must be one of: continue, revise, interrupt. "
+        "For follow_up, target_index must be the index of exactly one active_requests item. "
+        "For separate, target_index must be null. "
         "Use continue when the active request should still produce its own result, revise when the current "
         "message changes the active request's requested output or parameters, and interrupt when the active "
         "request should be replaced. "
@@ -109,6 +132,7 @@ def _model_turn_disposition(
             "current_message": current_text,
             "allowed_relationships": ["follow_up", "separate"],
             "allowed_effects": ["continue", "revise", "interrupt"],
+            "allowed_target_indexes": [item["index"] for item in active_payload],
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -130,14 +154,36 @@ def _model_turn_disposition(
     if confidence < 0.55:
         return None
     if relationship == "follow_up":
+        target_index = payload.get("target_index")
+        if target_index is None and len(active_turn_texts) == 1:
+            target_index = 0
+        try:
+            target_index = int(target_index)
+        except Exception:
+            return None
+        allowed_target_indexes = {int(item["index"]) for item in active_payload}
+        if target_index not in allowed_target_indexes:
+            return None
         effect = str(payload.get("effect") or "continue").strip().lower()
         if effect == "revise":
-            return ConversationTurnDisposition.REVISE, "model_structured_revision"
+            return _StructuredTurnDisposition(
+                ConversationTurnDisposition.REVISE,
+                "model_structured_revision",
+                target_index,
+            )
         if effect == "interrupt":
-            return ConversationTurnDisposition.INTERRUPT, "model_structured_interrupt"
-        return ConversationTurnDisposition.CONTINUE, "model_structured_follow_up"
+            return _StructuredTurnDisposition(
+                ConversationTurnDisposition.INTERRUPT,
+                "model_structured_interrupt",
+                target_index,
+            )
+        return _StructuredTurnDisposition(
+            ConversationTurnDisposition.CONTINUE,
+            "model_structured_follow_up",
+            target_index,
+        )
     if relationship == "separate":
-        return ConversationTurnDisposition.INDEPENDENT, "model_structured_separate"
+        return _StructuredTurnDisposition(ConversationTurnDisposition.INDEPENDENT, "model_structured_separate")
     return None
 
 
@@ -146,6 +192,7 @@ def _classify_node(state: _TurnDispatchState) -> dict[str, object]:
     if not active_turn_ids:
         disposition = ConversationTurnDisposition.INDEPENDENT
         reason = "no_active_turn"
+        target_active_turn_index = None
     else:
         model_decision = _model_turn_disposition(
             model_client=state.get("model_client"),
@@ -155,11 +202,15 @@ def _classify_node(state: _TurnDispatchState) -> dict[str, object]:
         if model_decision is None:
             disposition = ConversationTurnDisposition.INDEPENDENT
             reason = "no_structured_dispatch_decision"
+            target_active_turn_index = None
         else:
-            disposition, reason = model_decision
+            disposition = model_decision.disposition
+            reason = model_decision.reason
+            target_active_turn_index = model_decision.target_active_turn_index
     return {
         "disposition": disposition,
         "disposition_reason": reason,
+        "target_active_turn_index": target_active_turn_index,
     }
 
 
@@ -167,18 +218,31 @@ def _dispatch_node(state: _TurnDispatchState) -> dict[str, object]:
     active_turn_ids = tuple(state.get("active_turn_ids", ()))
     disposition = state.get("disposition") or ConversationTurnDisposition.INDEPENDENT
     reason = str(state.get("disposition_reason") or "default_independent")
+    target_active_turn_index = state.get("target_active_turn_index")
     if active_turn_ids and disposition in {
         ConversationTurnDisposition.CONTINUE,
         ConversationTurnDisposition.REVISE,
         ConversationTurnDisposition.INTERRUPT,
         ConversationTurnDisposition.BACKGROUND_FOLLOW_UP,
     }:
+        try:
+            dependency_turn_id = active_turn_ids[int(target_active_turn_index)]
+        except Exception:
+            return {
+                "decision": TurnDispatchDecision(
+                    policy=TurnDispatchPolicy.PARALLEL,
+                    dependency_turn_ids=(),
+                    disposition=ConversationTurnDisposition.INDEPENDENT,
+                    reason="invalid_structured_dispatch_target",
+                )
+            }
         return {
             "decision": TurnDispatchDecision(
                 policy=TurnDispatchPolicy.WAIT_FOR_ACTIVE,
-                dependency_turn_ids=(active_turn_ids[-1],),
+                dependency_turn_ids=(dependency_turn_id,),
                 disposition=disposition,
                 reason=reason,
+                target_active_turn_index=int(target_active_turn_index),
             )
         }
     return {
@@ -236,6 +300,7 @@ class ActiveTurnRegistration:
     turn_id: str
     decision: TurnDispatchDecision
     dependency_tasks: tuple[asyncio.Task, ...]
+    cancellation_event: threading.Event
     _tracker: "AsyncTurnDispatchTracker"
     _finished: bool = False
 
@@ -266,6 +331,9 @@ class ActiveTurnRegistration:
     async def is_superseded(self) -> bool:
         return await self._tracker.is_superseded(self.conversation_id, self.turn_id)
 
+    def is_cancelled(self) -> bool:
+        return self.cancellation_event.is_set()
+
 
 class AsyncTurnDispatchTracker:
     """Tracks active turns per conversation and applies dispatch dependencies."""
@@ -276,6 +344,7 @@ class AsyncTurnDispatchTracker:
         self._order_by_conversation: dict[str, list[str]] = {}
         self._text_by_conversation: dict[str, dict[str, str]] = {}
         self._superseded_by_conversation: dict[str, set[str]] = {}
+        self._cancel_events_by_conversation: dict[str, dict[str, threading.Event]] = {}
 
     async def register(
         self,
@@ -319,14 +388,17 @@ class AsyncTurnDispatchTracker:
                     for dependency_turn_id in decision.dependency_turn_ids
                     if dependency_turn_id in active_tasks and active_tasks[dependency_turn_id] is not current_task
                 )
+            cancellation_event = threading.Event()
             active_tasks[turn_key] = current_task
             self._order_by_conversation.setdefault(conversation_key, []).append(turn_key)
             self._text_by_conversation.setdefault(conversation_key, {})[turn_key] = str(text or "")
+            self._cancel_events_by_conversation.setdefault(conversation_key, {})[turn_key] = cancellation_event
         return ActiveTurnRegistration(
             conversation_id=conversation_key,
             turn_id=turn_key,
             decision=decision,
             dependency_tasks=dependency_tasks,
+            cancellation_event=cancellation_event,
             _tracker=self,
         )
 
@@ -353,6 +425,11 @@ class AsyncTurnDispatchTracker:
                     pass
                 if not active_order:
                     self._order_by_conversation.pop(conversation_key, None)
+            cancel_events = self._cancel_events_by_conversation.get(conversation_key)
+            if cancel_events is not None:
+                cancel_events.pop(turn_key, None)
+                if not cancel_events:
+                    self._cancel_events_by_conversation.pop(conversation_key, None)
             superseded_turns = self._superseded_by_conversation.get(conversation_key)
             if superseded_turns is not None:
                 superseded_turns.discard(turn_key)
@@ -364,6 +441,56 @@ class AsyncTurnDispatchTracker:
         turn_key = _normalize_key(turn_id, fallback="")
         async with self._lock:
             return turn_key in self._superseded_by_conversation.get(conversation_key, set())
+
+    async def active_turn_ids(self, conversation_id: object) -> tuple[str, ...]:
+        conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
+        async with self._lock:
+            return tuple(self._order_by_conversation.get(conversation_key, ()))
+
+    async def cancel_conversation(self, conversation_id: object) -> tuple[str, ...]:
+        conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
+        current_task = asyncio.current_task()
+        tasks_to_cancel: list[tuple[str, asyncio.Task]] = []
+        async with self._lock:
+            active_tasks = self._tasks_by_conversation.get(conversation_key)
+            if not active_tasks:
+                return ()
+            for turn_key, task in list(active_tasks.items()):
+                if task is current_task or task.done():
+                    continue
+                tasks_to_cancel.append((turn_key, task))
+            if not tasks_to_cancel:
+                return ()
+            cancelled_turn_ids = tuple(turn_key for turn_key, _task in tasks_to_cancel)
+            superseded_turns = self._superseded_by_conversation.setdefault(conversation_key, set())
+            superseded_turns.update(cancelled_turn_ids)
+            active_texts = self._text_by_conversation.get(conversation_key)
+            active_order = self._order_by_conversation.get(conversation_key)
+            cancel_events = self._cancel_events_by_conversation.get(conversation_key)
+            for turn_key, _task in tasks_to_cancel:
+                if cancel_events is not None:
+                    cancel_event = cancel_events.pop(turn_key, None)
+                    if cancel_event is not None:
+                        cancel_event.set()
+                active_tasks.pop(turn_key, None)
+                if active_texts is not None:
+                    active_texts.pop(turn_key, None)
+                if active_order is not None:
+                    try:
+                        active_order.remove(turn_key)
+                    except ValueError:
+                        pass
+            if not active_tasks:
+                self._tasks_by_conversation.pop(conversation_key, None)
+            if active_texts is not None and not active_texts:
+                self._text_by_conversation.pop(conversation_key, None)
+            if active_order is not None and not active_order:
+                self._order_by_conversation.pop(conversation_key, None)
+            if cancel_events is not None and not cancel_events:
+                self._cancel_events_by_conversation.pop(conversation_key, None)
+        for _turn_key, task in tasks_to_cancel:
+            task.cancel()
+        return tuple(turn_key for turn_key, _task in tasks_to_cancel)
 
 
 def _normalize_key(value: object, *, fallback: str) -> str:

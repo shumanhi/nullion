@@ -308,6 +308,45 @@ def workspace_id_for_user(user: NullionUser) -> str:
     return user.workspace_id or _workspace_id_for_name(user.display_name)
 
 
+def registered_workspace_ids(*, settings: NullionSettings | None = None) -> tuple[str, ...]:
+    registry = load_user_registry(settings=settings)
+    ids = [
+        workspace_id_for_user(user)
+        for user in registry.users
+        if user.active or user.role == "admin"
+    ]
+    return tuple(dict.fromkeys(workspace_id for workspace_id in ids if workspace_id))
+
+
+def format_workspace_registry_for_prompt(*, settings: NullionSettings | None = None) -> str | None:
+    """Return structured workspace records for chat/tool planning.
+
+    This is intentionally a registry dump, not prompt parsing. Agents may use
+    these concrete IDs and display names as runtime evidence, but should not
+    create new workspace identities from free-form user text.
+    """
+
+    registry = load_user_registry(settings=settings)
+    records: list[str] = []
+    for user in registry.users:
+        if not user.active and user.role != "admin":
+            continue
+        workspace_id = workspace_id_for_user(user)
+        records.append(
+            f"- workspace_id={workspace_id}; display_name={user.display_name}; "
+            f"user_id={user.user_id}; role={user.role}"
+        )
+    if not records:
+        return None
+    return (
+        "Known workspace registry:\n"
+        + "\n".join(records)
+        + "\nUse only these workspace_id values for cross-workspace actions. "
+        "If a requested person or workspace is not listed, ask for clarification "
+        "instead of creating a new workspace, user, folder, or workspace_id from chat text."
+    )
+
+
 def messaging_delivery_targets_for_workspace(
     workspace_id: str | None,
     *,
@@ -395,8 +434,37 @@ def build_messaging_user_context_prompt(
     return "Current messaging user:\n" + "\n".join(parts)
 
 
+def format_workspace_registry_for_prompt(
+    *,
+    settings: NullionSettings | None = None,
+) -> str | None:
+    """Return structured workspace IDs available to routing/tool prompts."""
+    registry = load_user_registry(settings=settings)
+    rows: list[str] = []
+    seen: set[str] = set()
+    for user in registry.users:
+        if not user.active:
+            continue
+        workspace_id = workspace_id_for_user(user)
+        if workspace_id in seen:
+            continue
+        seen.add(workspace_id)
+        rows.append(
+            "workspace_id="
+            f"{workspace_id}; display_name={user.display_name}; role={user.role}; user_id={user.user_id}"
+        )
+    if not rows:
+        return None
+    return (
+        "Known workspaces:\n"
+        + "\n".join(rows)
+        + "\nUse one of these workspace IDs for existing users before creating a new workspace."
+    )
+
+
 __all__ = [
     "build_messaging_user_context_prompt",
+    "format_workspace_registry_for_prompt",
     "MessagingDeliveryTarget",
     "NullionUser",
     "UserRegistry",
@@ -404,6 +472,8 @@ __all__ = [
     "is_authorized_telegram_chat",
     "load_user_registry",
     "messaging_delivery_targets_for_workspace",
+    "format_workspace_registry_for_prompt",
+    "registered_workspace_ids",
     "resolve_messaging_user",
     "resolve_telegram_user",
     "save_user_registry",

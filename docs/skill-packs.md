@@ -53,6 +53,19 @@ NULLION_ENABLED_SKILL_PACKS=nullion/web-research,nullion/browser-automation,null
 
 Then restart Nulliøn.
 
+## Capability dependencies
+
+Skill packs can describe workflows that benefit from optional local Python
+packages, but they do not install those packages by themselves. Nullion exposes
+a separate Capability dependencies panel under Settings -> Learning and
+planning. Cataloged packages such as pandas, openpyxl, Pillow, pypdf,
+python-docx, python-pptx, and soundfile show their install status there.
+
+Installing or requesting a dependency creates a Builder proposal first. The
+operator reviews the package, source, docs link, and usage note before Nullion
+installs anything into the local runtime. Custom PyPI and GitHub package
+requests follow the same proposal flow.
+
 Commands:
 
 ```text

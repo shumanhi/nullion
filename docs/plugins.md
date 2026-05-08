@@ -20,7 +20,7 @@ separately, `calendar_plugin`; both may bind to `google_workspace_provider`.
 
 | Plugin | Capability | Status | Provider options |
 | --- | --- | --- | --- |
-| `search_plugin` | Search and fetch public web pages | Available | `builtin_search_provider`; `brave_search_provider`; `google_custom_search_provider`; `perplexity_search_provider`; `duckduckgo_instant_answer_provider` |
+| `search_plugin` | Search public web pages when an API-backed provider has credentials | Available | `brave_search_provider`; `google_custom_search_provider`; `perplexity_search_provider`; browser fallback when no API-backed provider is configured |
 | `browser_plugin` | Agent browser sessions, screenshots, page inspection | Available | Playwright; Chrome/Brave CDP |
 | `workspace_plugin` | File/project workspace tools inside allowed roots | Available | Local filesystem |
 | `media_plugin` | Audio transcription, image OCR, optional image generation | Available | Local media tools |
@@ -38,7 +38,7 @@ commands can reason about one source of truth.
 
 ```bash
 NULLION_ENABLED_PLUGINS=search_plugin,browser_plugin,workspace_plugin,media_plugin
-NULLION_PROVIDER_BINDINGS=search_plugin=builtin_search_provider,media_plugin=local_media_provider
+NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider,media_plugin=local_media_provider
 NULLION_BROWSER_ENABLED=true
 NULLION_BROWSER_BACKEND=auto
 NULLION_WORKSPACE_ROOT=/Users/you/Projects
@@ -51,7 +51,7 @@ enable or disable the behavior without discovering a missing package later:
 
 ```bash
 NULLION_ENABLED_PLUGINS=search_plugin,browser_plugin,workspace_plugin,media_plugin
-NULLION_PROVIDER_BINDINGS=search_plugin=builtin_search_provider,media_plugin=local_media_provider
+NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider,media_plugin=local_media_provider
 
 # Audio → text. Recommended: installer-managed whisper.cpp + ffmpeg with the
 # base.en GGML model at ~/.nullion/models/ggml-base.en.bin. Leave this unset
@@ -93,7 +93,7 @@ Provider-backed plugins declare explicit bindings:
 
 ```bash
 NULLION_ENABLED_PLUGINS=search_plugin,email_plugin,calendar_plugin
-NULLION_PROVIDER_BINDINGS=search_plugin=builtin_search_provider,email_plugin=google_workspace_provider,calendar_plugin=google_workspace_provider
+NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider,email_plugin=google_workspace_provider,calendar_plugin=google_workspace_provider
 ```
 
 Custom HTTP email API option:
@@ -144,13 +144,15 @@ workspace-specific.
 Search provider options:
 
 ```bash
-# Recommended: Brave Search API. Create a free key at
-# https://api-dashboard.search.brave.com/app/keys for better live search.
+# Recommended: Brave Search API. Create a key at
+# https://api-dashboard.search.brave.com/app/keys for faster live search.
 NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider
 NULLION_BRAVE_SEARCH_API_KEY=...
 
-# No-key fallback: built-in local adapter.
-NULLION_PROVIDER_BINDINGS=search_plugin=builtin_search_provider
+# No-key fallback: leave direct search credentials unset. Nullion uses browser
+# navigation, page extraction, and screenshots for public web research.
+NULLION_BROWSER_ENABLED=true
+NULLION_BROWSER_BACKEND=auto
 
 # Google Custom Search JSON API. Requires a Programmable Search Engine ID.
 NULLION_PROVIDER_BINDINGS=search_plugin=google_custom_search_provider
@@ -161,9 +163,13 @@ NULLION_GOOGLE_SEARCH_CX=...
 NULLION_PROVIDER_BINDINGS=search_plugin=perplexity_search_provider
 NULLION_PERPLEXITY_API_KEY=...
 
-# DuckDuckGo Instant Answers. Keyless, but not a full organic-results API.
+# Legacy DuckDuckGo Instant Answers. Keyless, but not a full organic-results API.
 NULLION_PROVIDER_BINDINGS=search_plugin=duckduckgo_instant_answer_provider
 ```
+
+Direct `web_fetch` is intentionally opt-in. Set
+`NULLION_DIRECT_WEB_FETCH_ENABLED=true` only when you want the direct fetch path
+registered in addition to browser-backed research.
 
 Disabling a plugin means removing it from `NULLION_ENABLED_PLUGINS` and
 restarting Nulliøn. Provider bindings for disabled plugins should also be

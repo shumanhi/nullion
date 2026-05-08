@@ -635,9 +635,9 @@ function Initialize-KeyStorage {
     $oldPythonWarnings = $env:PYTHONWARNINGS
     $previousErrorActionPreference = $ErrorActionPreference
     try {
-        $env:PYTHONWARNINGS = "ignore::RuntimeWarning"
+        $env:PYTHONWARNINGS = "ignore"
         $ErrorActionPreference = "Continue"
-        & $VENV_PYTHON -m nullion.secure_storage --init --storage $Storage 1> $outputFile 2> $errorFile
+        & $VENV_PYTHON -W ignore -m nullion.secure_storage --init --storage $Storage 1> $outputFile 2> $errorFile
         if ($LASTEXITCODE -eq 0) {
             if ($Storage -eq "system") {
                 Write-Ok "Local data key protected with Windows Credential Manager."
@@ -1110,9 +1110,9 @@ function Install-PlaywrightRuntime {
     }
     try {
         Write-Info "Installing Playwright Chromium runtime so browser automation is ready when enabled..."
-        & $pwPython -m pip install --quiet --no-cache-dir playwright
+        & $pwPython -m pip install --quiet --no-cache-dir "playwright>=1.46" "playwright-stealth>=2.0.3"
         if ($LASTEXITCODE -ne 0) {
-            Write-Err "Could not install Playwright Python package."
+            Write-Err "Could not install Playwright Python packages."
             return $false
         }
         & $pwExe install chromium
@@ -2298,20 +2298,20 @@ if ($ExistingProviderBindings -match 'search_plugin=([^,]+)') {
 }
 
 if (-not $SKIP_SEARCH_SETUP) {
-Write-Info "For the best web-search experience, use Brave Search API. It has a free plan and works better than the built-in local adapter."
-Write-Info "Create a free key at https://api-dashboard.search.brave.com/app/keys"
-Write-MenuItem "1" "Brave Search API" "Free API key; better live search results" "[recommended]"
-Write-MenuItem "2" "Built-in local adapter" "No extra key; fallback search/fetch behavior"
+Write-Info "For the best web-search experience, use Brave Search API. It includes monthly free credits and is faster than browser-only research."
+Write-Info "Create a key at https://api-dashboard.search.brave.com/app/keys"
+Write-MenuItem "1" "Brave Search API" "Monthly free credits; better live search results" "[recommended]"
+Write-MenuItem "2" "Headless browser fallback" "No extra key; uses the browser instead of direct fetch"
 Write-MenuItem "3" "Google Custom Search API" "Requires API key plus search engine ID"
 Write-MenuItem "4" "Perplexity Search API" "Ranked AI-oriented web results"
-Write-MenuItem "5" "DuckDuckGo Instant Answers" "Keyless, but not full web search"
+Write-MenuItem "5" "DuckDuckGo Instant Answers" "Legacy keyless adapter; browser remains the default fallback"
 Write-Host ""
 $SearchChoice = Read-Host "  Enter 1, 2, 3, 4, or 5"
 switch ($SearchChoice) {
     { $_ -eq "" -or $_ -eq "1" } {
         $SEARCH_PROVIDER = "brave_search_provider"
         Write-Host "  Open https://api-dashboard.search.brave.com/app/keys" -ForegroundColor Cyan
-        Write-Host "  Sign in, create a free Search API key, then paste it here."
+        Write-Host "  Sign in, create a Search API key, then paste it here."
         $secure = Read-Host "  Paste your Brave Search API key (hidden)" -AsSecureString
         $BRAVE_SEARCH_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
@@ -2319,7 +2319,7 @@ switch ($SearchChoice) {
     }
     "2" {
         $SEARCH_PROVIDER = "builtin_search_provider"
-        Write-Info "Using built-in local search. You can switch to Brave Search API later from Settings for a better experience."
+        Write-Info "Using headless browser fallback. You can switch to Brave Search API later from Settings for faster web research."
     }
     "3" {
         $SEARCH_PROVIDER = "google_custom_search_provider"

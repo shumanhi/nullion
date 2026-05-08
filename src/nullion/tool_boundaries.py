@@ -193,6 +193,9 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
         method = str(invocation.arguments.get("method") or "GET").strip().upper() or "GET"
         account_operation = "read" if method in {"GET", "HEAD"} else "write"
         raw_url = invocation.arguments.get("url")
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        if not provider_id or not isinstance(raw_url, str) or not raw_url.strip():
+            return []
         if isinstance(raw_url, str) and raw_url:
             facts.append(
                 _network_boundary_fact(
@@ -201,7 +204,6 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
                     target=raw_url,
                 )
             )
-        provider_id = str(invocation.arguments.get("provider_id") or "connector").strip() or "connector"
         facts.append(
             _account_boundary_fact(
                 tool_name=invocation.tool_name,

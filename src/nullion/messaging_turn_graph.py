@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import inspect
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -21,6 +22,7 @@ class MessagingTurnState(TypedDict, total=False):
     reply: str | None
     delivery_contract: adapters.DeliveryContract
     status: Literal["running", "reply_ready", "no_reply"]
+    turn_dispatch_decision: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,16 +39,30 @@ def _capture_decision_snapshot_node(state: MessagingTurnState) -> dict[str, obje
     }
 
 
+def _handle_text_message_accepts_kw(handler: object, name: str) -> bool:
+    try:
+        parameters = inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in parameters:
+        return True
+    return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
 def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
     ingress = state["ingress"]
-    reply = state["service"].handle_text_message(
-        text=ingress.text,
-        chat_id=ingress.operator_chat_id,
-        reminder_chat_id=ingress.reminder_chat_id,
-        attachments=list(ingress.attachments),
-        request_id=ingress.request_id,
-        message_id=ingress.message_id,
-    )
+    handler = state["service"].handle_text_message
+    kwargs = {
+        "text": ingress.text,
+        "chat_id": ingress.operator_chat_id,
+        "reminder_chat_id": ingress.reminder_chat_id,
+        "attachments": list(ingress.attachments),
+        "request_id": ingress.request_id,
+        "message_id": ingress.message_id,
+    }
+    if _handle_text_message_accepts_kw(handler, "turn_dispatch_decision"):
+        kwargs["turn_dispatch_decision"] = state.get("turn_dispatch_decision")
+    reply = handler(**kwargs)
     return {"raw_reply": reply}
 
 
@@ -93,9 +109,18 @@ def _compiled_messaging_turn_graph():
     return graph.compile()
 
 
-def run_messaging_turn_graph(service: object, ingress: adapters.MessagingIngress) -> MessagingTurnResult:
+def run_messaging_turn_graph(
+    service: object,
+    ingress: adapters.MessagingIngress,
+    *,
+    turn_dispatch_decision=None,
+) -> MessagingTurnResult:
     final_state = _compiled_messaging_turn_graph().invoke(
-        {"service": service, "ingress": ingress},
+        {
+            "service": service,
+            "ingress": ingress,
+            "turn_dispatch_decision": turn_dispatch_decision,
+        },
         config={"configurable": {"thread_id": ingress.request_id or ingress.operator_chat_id}},
     )
     delivery_contract = final_state.get("delivery_contract")

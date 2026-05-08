@@ -27,9 +27,9 @@ What they tell you:
 - `/approvals` shows work paused for your decision.
 - `/tools` shows what is actually registered in this runtime.
 - `/plugins` shows enabled plugins and setup hints.
-- `/verbose` shows the current visibility mode: `off`, `planner`,
-  or `full`. `/thinking` shows whether provider reasoning summaries are shown
-  separately.
+- `/verbose` shows whether activity details are `on` or `off`. Planner cards
+  are controlled separately by the Planner card setting and are on by default.
+  `/thinking` shows whether provider reasoning summaries are shown separately.
 
 ## Common problems
 
@@ -105,8 +105,44 @@ Run:
 Most stuck work is waiting for one of three things: an approval decision, a new
 boundary grant, or a health action.
 
-If the delegated plan itself is unclear, set Verbose to Planner or Full in
-Settings, then repeat the request.
+If the delegated plan itself is unclear, turn on Verbose in Settings, then
+repeat the request. Verbose now means activity details on or off; planner-card
+visibility is controlled separately by the Planner card setting.
+
+If you want to force an explicit step-by-step plan for one request, use:
+
+```text
+/planner <message>
+```
+
+That starts a planned task for the message after the command. It does not turn
+planner cards on or off.
+
+If a run is still active and you want to stop it, send:
+
+```text
+/stop
+```
+
+This cancels active work in the current session and marks the current task
+frame cancelled when one exists.
+
+### Planner and activity display contract
+
+- The planner card is controlled by the Planner card setting and should be on
+  by default for new installs.
+- Verbose is only `on`, `off`, or `status`; it controls activity details, not
+  planner-card visibility.
+- When planner card is on and activity/feed is off, show only the planner
+  header, request summary, and task checklist. Do not show the Activity section.
+- When activity/feed is on, show the same planner card plus the Activity
+  section below it.
+- Tool activity should show one task tool header, such as `Research Boston day
+  trip tools`, followed by tool rows only. Do not repeat the child task title
+  below the header.
+- Pending, queued, or blocked planner tasks should use the empty checkbox
+  marker `☐`; active tasks use `◐`, completed tasks use `☑`, failed tasks use
+  `✕`, and cancelled tasks use `⊘`.
 
 ### A file or PDF was promised but not delivered
 
@@ -121,8 +157,8 @@ artifact is attached or exposed as a web download. Check:
   a local filesystem path.
 - In Telegram, Slack, or Discord, the platform sends a document/image
   attachment when one is expected.
-- Verbose Full shows `Preparing artifacts` and `Writing response` after the
-  file tool or artifact generation tool completes.
+- Verbose activity shows compact artifact-preparation and response-writing
+  activity after the file tool or artifact generation tool completes.
 
 If the file exists locally but no download button appears, restart the web app
 and retry once. If it still happens, include the requested format and the
@@ -152,6 +188,38 @@ NULLION_BROWSER_BACKEND=auto
 
 Use `auto` first. Switch to `playwright` for a clean headless browser, or `cdp`
 when you intentionally want to attach to an existing Chrome/Brave session.
+
+### Web research feels slower than search
+
+Nullion now prefers API-backed search only when the configured provider has
+usable credentials. Without a Brave, Google Custom Search, or Perplexity key,
+public web research falls back to browser navigation, page extraction, and
+screenshots instead of registering a direct fetch/search tool that may fail.
+
+Check:
+
+```text
+/plugins
+/tools
+```
+
+For faster source discovery, configure one of:
+
+```bash
+NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider
+NULLION_BRAVE_SEARCH_API_KEY=...
+```
+
+```bash
+NULLION_PROVIDER_BINDINGS=search_plugin=google_custom_search_provider
+NULLION_GOOGLE_SEARCH_API_KEY=...
+NULLION_GOOGLE_SEARCH_CX=...
+```
+
+```bash
+NULLION_PROVIDER_BINDINGS=search_plugin=perplexity_search_provider
+NULLION_PERPLEXITY_API_KEY=...
+```
 
 ### Email or calendar is unavailable
 

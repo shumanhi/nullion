@@ -143,6 +143,17 @@ class DagPlan:
             and all(task.can_start and not task.required_inputs for task in self.tasks)
         )
 
+    @property
+    def can_dispatch_when_requested(self) -> bool:
+        """True when an explicit planner surface may run this typed plan."""
+        return (
+            self.is_valid
+            and not self.needs_clarification
+            and self.disposition in {"single_turn", "sequential_mission", "parallel_mission"}
+            and len(self.tasks) >= 1
+            and all(task.can_start and not task.required_inputs for task in self.tasks)
+        )
+
 
 class _DagPlanningState(TypedDict, total=False):
     model_client: Any
@@ -167,6 +178,7 @@ class TaskDecomposer:
         conversation_id: str,
         principal_id: str,
         available_tools: list[str],
+        dag_plan: DagPlan | None = None,
     ) -> TaskGroup:
         """Decompose *user_message* into a TaskGroup.
 
@@ -175,7 +187,10 @@ class TaskDecomposer:
         """
         gid = group_id or make_group_id()
         normalized_message = strip_composer_mode_instruction(user_message)
-        dag_plan = self.plan_dag(normalized_message, available_tools=available_tools)
+        if dag_plan is None:
+            dag_plan = self.plan_dag(normalized_message, available_tools=available_tools)
+        else:
+            dag_plan = _validate_dag_plan(dag_plan, available_tools=available_tools)
         raw_tasks = (
             dag_plan.tasks
             if dag_plan.can_dispatch or (dag_plan.is_valid and len(dag_plan.tasks) == 1)
@@ -589,6 +604,7 @@ def _planner_metadata(plan: DagPlan) -> dict[str, object]:
         "disposition": plan.disposition,
         "valid": plan.is_valid,
         "dispatchable": plan.can_dispatch,
+        "dispatchable_when_requested": plan.can_dispatch_when_requested,
         "needs_clarification": plan.needs_clarification,
         "clarification_question": plan.clarification_question,
         "routing_evidence": list(plan.routing_evidence or []),

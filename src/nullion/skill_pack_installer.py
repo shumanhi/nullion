@@ -393,6 +393,25 @@ def install_skill_pack(
     )
 
 
+def uninstall_skill_pack(
+    pack_id: str,
+    *,
+    root: Path | None = None,
+) -> InstalledSkillPack | None:
+    normalized_id = normalize_pack_id(pack_id)
+    pack = get_installed_skill_pack(normalized_id, root=root)
+    if pack is None:
+        return None
+    base = (root or default_skill_pack_root()).resolve()
+    destination = Path(pack.path).resolve() if pack.path else skill_pack_path(normalized_id, root=root).resolve()
+    try:
+        destination.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("installed skill pack path is outside the configured skill pack root") from exc
+    shutil.rmtree(destination)
+    return pack
+
+
 def _looks_like_git_source(source: str) -> bool:
     parsed = urlparse(source)
     return parsed.scheme in {"http", "https", "ssh", "git"} or source.startswith("git@")
@@ -539,4 +558,5 @@ __all__ = [
     "normalize_pack_id",
     "read_skill_pack_reference",
     "skill_pack_path",
+    "uninstall_skill_pack",
 ]

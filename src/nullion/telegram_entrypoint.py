@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import logging
 import os
 from pathlib import Path
@@ -16,6 +17,14 @@ import inspect
 import threading
 
 from nullion.config import ProviderBinding, load_env_file_into_environ, load_settings
+from nullion.cron_planner_status import (
+    build_cron_planner_status_preview,
+    cron_planner_run_succeeded,
+)
+from nullion.cron_execution_tools import (
+    CronExecutionToolRegistry,
+    build_cron_connector_scope_decision,
+)
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.artifacts import ensure_artifact_root
 from nullion.messaging_adapters import messaging_file_allowed_roots
@@ -36,6 +45,11 @@ from nullion.tools import (
     register_search_plugin,
     register_workspace_plugin,
     verify_terminal_backend_attestation,
+)
+from nullion.web_research_policy import (
+    default_browser_backend_for_web_research,
+    direct_web_fetch_enabled,
+    should_register_search_plugin,
 )
 
 
@@ -358,6 +372,8 @@ def _register_enabled_plugins(
     for plugin_name in enabled_plugins:
         if plugin_name in {"browser", "browser_plugin"}:
             continue
+        if plugin_name == "search_plugin" and not should_register_search_plugin(settings):
+            continue
         if plugin_name in seen_plugins:
             continue
         seen_plugins.add(plugin_name)
@@ -413,6 +429,7 @@ def _build_runtime_service_from_settings(
     registry_factory_kwargs = {
         "terminal_executor_backend": _terminal_executor_backend_from_settings(settings),
         "workspace_root": workspace_root,
+        "direct_web_fetch_enabled": direct_web_fetch_enabled(settings),
     }
     allowed_roots = messaging_file_allowed_roots(
         workspace_root,
@@ -463,7 +480,7 @@ def _build_runtime_service_from_settings(
                 provider_name="local_media_provider",
             ),
         )
-    browser_backend = _resolve_browser_backend()
+    browser_backend = _resolve_browser_backend() or default_browser_backend_for_web_research(settings)
     if browser_backend:
         try:
             os.environ["NULLION_BROWSER_BACKEND"] = browser_backend
@@ -531,15 +548,23 @@ def _build_runtime_service_from_settings(
         return cron_delivery_target(job, channel, settings=_current_service_settings())
 
     def _cron_result_block_reason(result: dict, text: str, artifacts: object) -> str | None:
+        from nullion.cron_delivery import cron_structured_result_block_reason
+
         if result.get("reached_iteration_limit"):
             return "cron_run_reached_iteration_limit"
         if result.get("suspended_for_approval"):
             return "waiting_for_approval"
-        _ = (text, artifacts)
-        return None
+        _ = text
+        return cron_structured_result_block_reason(result, artifacts, text=text)
 
-    def _cron_agent_history(conv_id: str) -> list[dict]:
+    def _cron_agent_history(
+        conv_id: str,
+        *,
+        tool_registry,
+        include_connector_context: bool,
+    ) -> list[dict]:
         from nullion.artifacts import artifact_root_for_principal
+        from nullion.builder_capabilities import format_installed_dependency_context
         from nullion.connections import format_workspace_connections_for_prompt
         from nullion.runtime_config import format_runtime_config_for_prompt
         from nullion.skill_pack_catalog import skill_pack_access_prompt
@@ -549,7 +574,10 @@ def _build_runtime_service_from_settings(
 
         current_settings = _current_service_settings()
         history: list[dict] = []
-        caps_text = format_system_context_for_prompt(build_system_context_snapshot(tool_registry=active_tool_registry))
+        caps_text = format_system_context_for_prompt(build_system_context_snapshot(tool_registry=tool_registry))
+        dependency_text = format_installed_dependency_context(runtime)
+        if dependency_text:
+            caps_text = (caps_text + "\n\n" + dependency_text).strip()
         if caps_text:
             history.append({
                 "role": "system",
@@ -562,11 +590,18 @@ def _build_runtime_service_from_settings(
         config_text = format_runtime_config_for_prompt(model_client=getattr(service, "model_client", None))
         if config_text:
             history.append({"role": "system", "content": [{"type": "text", "text": config_text}]})
-        connections_text = format_workspace_connections_for_prompt(principal_id=conv_id)
+        connections_text = format_workspace_connections_for_prompt(
+            principal_id=conv_id,
+            include_external_connectors=include_connector_context,
+        )
         if connections_text:
             history.append({"role": "system", "content": [{"type": "text", "text": connections_text}]})
         skill_text = format_enabled_skill_packs_for_prompt(current_settings.enabled_skill_packs)
-        access_text = skill_pack_access_prompt(current_settings.enabled_skill_packs, principal_id=conv_id)
+        access_text = (
+            skill_pack_access_prompt(current_settings.enabled_skill_packs, principal_id=conv_id)
+            if include_connector_context
+            else ""
+        )
         if access_text:
             skill_text = (skill_text + "\n\n" + access_text).strip()
         if skill_text:
@@ -584,20 +619,103 @@ def _build_runtime_service_from_settings(
         })
         return history
 
-    def _run_cron_agent_turn(job, conv_id: str, *, label: str) -> dict:
+    def _run_cron_agent_turn(job, conv_id: str, *, label: str, planner_status_preview: bool = False) -> dict:
         from nullion.cron_delivery import cron_agent_prompt
+        from nullion.run_activity import format_tool_activity_detail, task_planner_feed_enabled
 
         orchestrator = getattr(service, "agent_orchestrator", None)
         if orchestrator is None:
             return {"cron_run_failed": True, "reason": "agent_orchestrator_unavailable", "text": ""}
+        prompt = cron_agent_prompt(job, label=label)
+        deliver_fn = getattr(orchestrator, "_deliver_fn", None)
+        connector_scope_prompt = json.dumps(
+            {
+                "name": str(getattr(job, "name", "") or ""),
+                "task": str(getattr(job, "task", "") or ""),
+            },
+            ensure_ascii=False,
+        )
+        connector_scope = build_cron_connector_scope_decision(
+            model_client=getattr(orchestrator, "model_client", None),
+            user_message=connector_scope_prompt,
+            principal_id=conv_id,
+            registry=active_tool_registry,
+        )
+        preview = None
+        if planner_status_preview and callable(deliver_fn) and task_planner_feed_enabled():
+            try:
+                preview_registry = CronExecutionToolRegistry(
+                    active_tool_registry,
+                    allow_connector_tools=connector_scope.allow_connector_tools,
+                    connector_provider_ids=connector_scope.provider_ids,
+                )
+                preview = build_cron_planner_status_preview(
+                    model_client=getattr(orchestrator, "model_client", None),
+                    user_message=prompt,
+                    conversation_id=conv_id,
+                    principal_id=conv_id,
+                    tool_registry=preview_registry,
+                    subject=str(getattr(job, "name", "") or ""),
+                )
+            except Exception:
+                logger.debug("Could not build Telegram cron planner status preview", exc_info=True)
+                preview = None
+            if preview is not None:
+                try:
+                    deliver_fn(
+                        conv_id,
+                        preview.initial_text(),
+                        is_status=True,
+                        group_id=preview.group_id,
+                        status_kind="task_summary",
+                    )
+                except Exception:
+                    logger.debug("Could not deliver Telegram cron planner status preview", exc_info=True)
+        cron_tool_results: list[object] = []
+
+        def _deliver_cron_planner_tool_activity(tool_result) -> None:  # noqa: ANN001
+            if preview is None or not callable(deliver_fn):
+                return
+            cron_tool_results.append(tool_result)
+            try:
+                detail = format_tool_activity_detail(cron_tool_results).strip()
+            except Exception:
+                logger.debug("Could not format Telegram cron planner tool activity", exc_info=True)
+                return
+            if not detail:
+                return
+            try:
+                deliver_fn(
+                    conv_id,
+                    detail,
+                    is_status=True,
+                    group_id=preview.group_id,
+                    status_kind="tool_activity",
+                    activity_id="cron-tools",
+                    activity_label="Tools",
+                )
+            except Exception:
+                logger.debug("Could not deliver Telegram cron planner tool activity", exc_info=True)
+
+        execution_registry = CronExecutionToolRegistry(
+            active_tool_registry,
+            allowed_tool_names=preview.allowed_tools if preview is not None else None,
+            allow_connector_tools=connector_scope.allow_connector_tools,
+            connector_provider_ids=connector_scope.provider_ids,
+        )
         result = orchestrator.run_turn(
             conversation_id=conv_id,
             principal_id=conv_id,
-            user_message=cron_agent_prompt(job, label=label),
-            conversation_history=_cron_agent_history(conv_id),
-            tool_registry=active_tool_registry,
+            user_message=prompt,
+            conversation_history=_cron_agent_history(
+                conv_id,
+                tool_registry=execution_registry,
+                include_connector_context=connector_scope.allow_connector_tools,
+            ),
+            tool_registry=execution_registry,
             policy_store=runtime.store,
             approval_store=runtime.store,
+            tool_result_callback=_deliver_cron_planner_tool_activity if preview is not None else None,
         )
         payload = {
             "text": result.final_text or "",
@@ -606,47 +724,129 @@ def _build_runtime_service_from_settings(
             "suspended_for_approval": result.suspended_for_approval,
             "approval_id": result.approval_id,
             "reached_iteration_limit": result.reached_iteration_limit,
+            "raw_tool_payload_blocked": getattr(result, "raw_tool_payload_blocked", False),
         }
+        if preview is not None and callable(deliver_fn):
+            try:
+                deliver_fn(
+                    conv_id,
+                    preview.terminal_text(success=cron_planner_run_succeeded(payload)),
+                    is_status=True,
+                    group_id=preview.group_id,
+                    status_kind="task_summary",
+                )
+            except Exception:
+                logger.debug("Could not deliver Telegram cron planner terminal status", exc_info=True)
         return payload
 
-    def _send_cron_platform_delivery(job, channel: str, text: str, *, run_label: str = "Scheduled task") -> bool:
+    def _send_cron_platform_delivery(
+        job,
+        channel: str,
+        target: str,
+        text: str,
+        *,
+        run_label: str = "Scheduled task",
+    ) -> bool:
         from nullion.cron_delivery import scheduled_task_delivery_text
 
-        if channel != "telegram":
-            return False
-        target = _cron_delivery_target(job, channel)
+        target = str(target or "").strip() or _cron_delivery_target(job, channel)
         current_settings = _current_service_settings()
-        if not target or not current_settings.telegram.bot_token:
+        if not target:
             return False
         message = scheduled_task_delivery_text(job, text, run_label=run_label)
-        return _run_async_sync(lambda: _send_operator_telegram_delivery(
-            current_settings.telegram.bot_token,
-            target,
-            message,
-            principal_id=f"telegram:{target}",
-            suppress_link_preview=True,
-        ))
+        if channel == "telegram":
+            if not current_settings.telegram.bot_token:
+                return False
+            return _run_async_sync(lambda: _send_operator_telegram_delivery(
+                current_settings.telegram.bot_token,
+                target,
+                message,
+                principal_id=f"telegram:{target}",
+                suppress_link_preview=True,
+            ))
+        if channel == "slack":
+            if not current_settings.slack.bot_token:
+                return False
+            from nullion.slack_app import send_slack_platform_delivery
+
+            return _run_async_sync(lambda: send_slack_platform_delivery(
+                bot_token=current_settings.slack.bot_token,
+                channel=target,
+                text=message,
+                principal_id=f"slack:{target}",
+            ))
+        if channel == "discord":
+            if not current_settings.discord.bot_token:
+                return False
+            from nullion.discord_app import send_discord_platform_delivery
+
+            return _run_async_sync(lambda: send_discord_platform_delivery(
+                bot_token=current_settings.discord.bot_token,
+                channel_id=target,
+                text=message,
+                principal_id=f"discord:{target}",
+            ))
+        return False
 
     def _save_cron_web_delivery(job, conv_id: str, text: str, artifacts: object, result: dict) -> bool:
         _ = (job, conv_id, text, artifacts, result)
         return False
 
-    def _cron_tool_runner(job):
+    def _manual_telegram_delivery_target(invocation) -> str:
+        principal_id = str(getattr(invocation, "principal_id", "") or "").strip()
+        if principal_id.startswith("telegram:"):
+            target = principal_id.removeprefix("telegram:").strip()
+            if target:
+                return target
+        if principal_id.startswith("user:"):
+            try:
+                from nullion.users import load_user_registry
+
+                user_id = principal_id.removeprefix("user:")
+                for user in load_user_registry(settings=_current_service_settings()).users:
+                    if user.user_id != user_id or not user.active:
+                        continue
+                    channel = str(user.messaging_channel or "telegram").strip().lower()
+                    target = str(user.telegram_chat_id or user.messaging_user_id or "").strip()
+                    if channel == "telegram" and target:
+                        return target
+            except Exception:
+                logger.debug("Could not resolve manual Telegram cron target from invocation", exc_info=True)
+        return _operator_chat_id or ""
+
+    def _cron_tool_runner(job, invocation=None):
         from nullion.cron_delivery import CronRunDeliveryCallbacks, run_cron_delivery_workflow
+
+        manual_target = _manual_telegram_delivery_target(invocation)
+
+        def _manual_effective_channel(cron_job) -> str:
+            principal_id = str(getattr(invocation, "principal_id", "") or "").strip()
+            return "telegram" if manual_target and principal_id.startswith(("telegram:", "user:")) else _effective_cron_delivery_channel(cron_job)
+
+        def _manual_delivery_target(cron_job, channel: str) -> str:
+            if channel == "telegram" and manual_target:
+                return manual_target
+            return _cron_delivery_target(cron_job, channel)
 
         return run_cron_delivery_workflow(
             job,
             label="Manual scheduled task run",
             callbacks=CronRunDeliveryCallbacks(
-                effective_channel=_effective_cron_delivery_channel,
-                delivery_target=_cron_delivery_target,
-                run_agent_turn=lambda cron_job, conv_id: _run_cron_agent_turn(cron_job, conv_id, label="Manual scheduled task run"),
+                effective_channel=_manual_effective_channel,
+                delivery_target=_manual_delivery_target,
+                run_agent_turn=lambda cron_job, conv_id: _run_cron_agent_turn(
+                    cron_job,
+                    conv_id,
+                    label="Manual scheduled task run",
+                    planner_status_preview=True,
+                ),
                 record_event=_record_cron_delivery_event,
                 block_reason=_cron_result_block_reason,
                 save_web_delivery=_save_cron_web_delivery,
-                send_platform_delivery=lambda cron_job, channel, text: _send_cron_platform_delivery(
+                send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
                     cron_job,
                     channel,
+                    target,
                     text,
                     run_label="Manual scheduled task run",
                 ),

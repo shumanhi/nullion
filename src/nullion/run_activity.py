@@ -15,7 +15,7 @@ SKILL_USAGE_GLYPH = "⧁"
 ACTIVITY_GROUP_ICON = "→"
 ACTIVITY_SUBLIST_PREFIX = ""
 DEFAULT_SKILL_USAGE_ACTIVITY_LIMIT = 3
-VERBOSE_MODE_VALUES = {"off", "planner", "full"}
+VERBOSE_MODE_VALUES = {"off", "on"}
 
 
 class RunActivityPhase(str, Enum):
@@ -90,24 +90,19 @@ def task_planner_feed_status_text() -> str:
 def normalize_verbose_mode(mode: str) -> str:
     normalized = str(mode or "").strip().lower().replace("_", "-")
     if normalized not in VERBOSE_MODE_VALUES:
-        raise ValueError("verbose mode must be off, planner, or full")
+        raise ValueError("verbose mode must be on or off")
     return normalized
 
 
 def verbose_mode(*, default_activity_trace: bool = True, default_planner_feed: str = "task") -> str:
+    _ = default_planner_feed
     activity_enabled = activity_trace_enabled(default=default_activity_trace)
-    planner_enabled = task_planner_feed_mode(default=default_planner_feed) != "off"
-    if activity_enabled:
-        return "full"
-    if planner_enabled:
-        return "planner"
-    return "off"
+    return "on" if activity_enabled else "off"
 
 
 def set_verbose_mode(mode: str) -> None:
     normalized = normalize_verbose_mode(mode)
-    set_activity_trace_enabled(normalized == "full")
-    set_task_planner_feed_mode("task" if normalized in {"planner", "full"} else "off")
+    set_activity_trace_enabled(normalized == "on")
 
 
 def verbose_mode_status_text() -> str:
@@ -211,10 +206,17 @@ def format_tool_results_activity_detail(tool_results: Iterable[Any]) -> str:
 
 def _short_tool_detail(tool_result: Any) -> str:
     error = _tool_field(tool_result, "error")
+    tool_name = str(_tool_field(tool_result, "tool_name", "") or "")
+    if _tool_activity_should_hide_detail(tool_name):
+        return ""
     if error:
+        if _is_image_generation_setup_error(tool_name, str(error)):
+            return "provider not configured"
         return str(error).strip()[:140]
     output = _tool_field(tool_result, "output")
-    tool_name = str(_tool_field(tool_result, "tool_name", "") or "")
+    structured_detail = _safe_structured_tool_detail(tool_name, output)
+    if structured_detail:
+        return structured_detail
     if is_untrusted_tool_name(tool_name):
         metadata = safe_untrusted_tool_metadata(tool_name, output)
         for key in ("url", "title", "path", "query", "status_code", "content_type"):
@@ -229,6 +231,36 @@ def _short_tool_detail(tool_result: Any) -> str:
                 return _compact_tool_detail_value(key, value)
     if isinstance(output, str) and output.strip():
         return _compact_tool_detail_value("", output)
+    return ""
+
+
+def _is_image_generation_setup_error(tool_name: str, error: str) -> bool:
+    return str(tool_name or "").strip().lower() == "image_generate" and (
+        "local_media_provider requires NULLION_IMAGE_GENERATE_COMMAND" in error
+        or error == "image_generate provider is not configured"
+        or "image generation requires an API key" in error
+    )
+
+
+def _tool_activity_should_hide_detail(tool_name: str) -> bool:
+    return str(tool_name or "").strip().lower() in {"connector_request"}
+
+
+def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
+    if not isinstance(output, dict):
+        return ""
+    crons = output.get("crons")
+    if isinstance(crons, list):
+        count = len(crons)
+        return f"{count} scheduled task{'s' if count != 1 else ''}"
+    normalized_tool = str(tool_name or "").strip().lower()
+    if normalized_tool == "run_cron":
+        delivery_status = output.get("delivery_status")
+        if isinstance(delivery_status, str) and delivery_status.strip():
+            return f"delivery {delivery_status.strip()[:80]}"
+        name = output.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()[:140]
     return ""
 
 

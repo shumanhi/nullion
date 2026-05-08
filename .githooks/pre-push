@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
+while IFS= read -r git_env_name; do
+  unset "$git_env_name"
+done < <(git rev-parse --local-env-vars)
 
 if [[ -x ".venv/bin/python" ]]; then
   PYTHON_CMD=".venv/bin/python"
@@ -33,6 +36,28 @@ else
 
   echo "pre-push: running private test suite with coverage; overall coverage must be at least 70%..."
   export NULLION_APP_REPO="$ROOT"
+  missing_test_deps="$("$PYTHON_CMD" - <<'PY'
+import importlib.util
+
+missing = [
+    package
+    for module, package in (
+        ("coverage", "coverage"),
+        ("pytest", "pytest"),
+        ("pytest_asyncio", "pytest-asyncio"),
+    )
+    if importlib.util.find_spec(module) is None
+]
+print(" ".join(missing))
+PY
+)"
+  if [[ -n "$missing_test_deps" ]]; then
+    echo "pre-push: installing missing private test runner dependencies: $missing_test_deps"
+    if ! "$PYTHON_CMD" -m pip --version >/dev/null 2>&1; then
+      "$PYTHON_CMD" -m ensurepip --upgrade
+    fi
+    "$PYTHON_CMD" -m pip install $missing_test_deps
+  fi
   "$PYTHON_CMD" -m coverage erase
   "$PYTHON_CMD" -m coverage run --source=src/nullion -m pytest -q "$TEST_PATH"
   "$PYTHON_CMD" -m coverage report --fail-under=70

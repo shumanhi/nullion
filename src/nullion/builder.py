@@ -16,6 +16,7 @@ class BuilderDecisionType(str, Enum):
     MEMORY_PROPOSAL = "memory_proposal"
     SKILL_PROPOSAL = "skill_proposal"
     TOOL_PROPOSAL = "tool_proposal"
+    DEPENDENCY_PROPOSAL = "dependency_proposal"
 
 
 @dataclass(slots=True)
@@ -51,6 +52,15 @@ class BuilderProposal:
     suggested_trigger: str | None = None
     suggested_steps: tuple[str, ...] = ()
     suggested_tags: tuple[str, ...] = ()
+    dependency_id: str | None = None
+    dependency_package: str | None = None
+    dependency_import_name: str | None = None
+    dependency_requirement: str | None = None
+    dependency_install_command: tuple[str, ...] = ()
+    dependency_docs_url: str | None = None
+    dependency_github_url: str | None = None
+    dependency_license: str | None = None
+    dependency_usage_note: str | None = None
 
 
 @dataclass(slots=True)
@@ -62,6 +72,7 @@ class BuilderProposalRecord:
     accepted_skill_id: str | None = None
     resolved_at: datetime | None = None
     context_key: str | None = None
+    result: dict[str, object] | None = None
 
 
 @dataclass(slots=True)

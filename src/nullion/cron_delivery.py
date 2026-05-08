@@ -6,10 +6,15 @@ Keep routing decisions here so adapters do not each infer delivery semantics.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from functools import lru_cache
+import mimetypes
+import inspect
 from pathlib import Path
+import re
 from typing import Any, Callable, TypedDict
+from urllib.parse import unquote, urlsplit
 
 from langgraph.graph import END, START, StateGraph
 
@@ -19,15 +24,30 @@ MAX_CRON_TEXT_ARTIFACT_CHARS = 12000
 DEFAULT_CRON_NO_OUTPUT_MESSAGE = "Cron ran successfully; no output was produced."
 SCHEDULED_TASK_DELIVERY_PREFIX = "⏰ Scheduled task:"
 CRON_INTERNAL_CAPABILITY_TAGS = frozenset({"scheduler"})
+CRON_INTERNAL_REFERENCE_TOOLS = frozenset({"skill_pack_read"})
+CRON_DELIVERABLE_ARTIFACT_TOOLS = frozenset(
+    {
+        "file_write",
+        "pdf_create",
+        "pdf_edit",
+        "image_generate",
+        "terminal_exec",
+    }
+)
+_HTML_LOCAL_IMAGE_SRC_RE = re.compile(
+    r"(?P<prefix><img\b[^>]*?\bsrc\s*=\s*)(?P<quote>[\"'])(?P<src>[^\"']+)(?P=quote)",
+    re.IGNORECASE,
+)
+_HTML_INLINE_IMAGE_EXTENSIONS = frozenset({".apng", ".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"})
 
 # Cron delivery contract for future agents:
 # - Cron can deliver text, file attachments, both, or no message.
 # - Explicit MEDIA lines are user-facing file delivery and must be preserved.
-# - Completed tool results with structured artifact fields are user-facing file
-#   delivery evidence and should be converted to MEDIA lines after state-file
-#   filtering.
+# - Completed tool results with structured artifact fields, or verified
+#   workspace-artifact file reads/writes, are user-facing file delivery evidence
+#   and should be converted to MEDIA lines after state-file filtering.
 # - Raw artifact paths/objects are internal evidence unless the agent makes them
-#   explicit with MEDIA or they came from a completed tool artifact field.
+#   explicit with MEDIA or they came from completed structured tool evidence.
 # - Activity/status summaries should show that tools ran, but tool outputs that
 #   contain internal task text, paths, state files, artifacts, or connector
 #   payloads are not deliverables.
@@ -270,15 +290,42 @@ def _cron_result_has_completed_tool_evidence(result: dict[str, object]) -> bool:
             continue
         if _tool_result_capability_tags(tool_result).intersection(CRON_INTERNAL_CAPABILITY_TAGS):
             continue
+        if _tool_result_name(tool_result) in CRON_INTERNAL_REFERENCE_TOOLS:
+            continue
         return True
+    return False
+
+
+def _cron_result_leaked_internal_tool_output(result: dict[str, object], text: str | None) -> bool:
+    visible_text = str(text or "").strip()
+    if not visible_text:
+        return False
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "completed":
+            continue
+        if _tool_result_name(tool_result) not in CRON_INTERNAL_REFERENCE_TOOLS:
+            continue
+        output_text = str(_tool_result_output(tool_result).get("text") or "").strip()
+        if output_text and (visible_text == output_text or output_text in visible_text):
+            return True
     return False
 
 
 def cron_structured_result_block_reason(
     result: dict[str, object],
     artifacts: object,
+    *,
+    text: str | None = None,
 ) -> str | None:
     """Return a delivery block reason from typed cron execution facts."""
+    from nullion.response_sanitizer import is_safe_raw_tool_payload_replacement_reply
+
+    if result.get("raw_tool_payload_blocked"):
+        return "cron_run_raw_tool_payload"
+    if is_safe_raw_tool_payload_replacement_reply(reply=text, tool_results=result.get("tool_results") or ()):
+        return "cron_run_raw_tool_payload"
+    if _cron_result_leaked_internal_tool_output(result, text):
+        return "cron_run_internal_tool_output_leaked"
     if _cron_result_has_internal_capability_denial(result):
         return "cron_run_denied_internal_capability"
     if (
@@ -297,6 +344,114 @@ def _artifact_paths_from_value(value: object) -> tuple[str, ...]:
         if path:
             paths.append(path)
     return tuple(dict.fromkeys(paths))
+
+
+def _is_inline_or_remote_asset_src(src: str) -> bool:
+    raw = str(src or "").strip()
+    if not raw or raw.startswith("#"):
+        return True
+    parsed = urlsplit(raw)
+    if parsed.scheme in {"http", "https", "data", "blob", "cid", "mailto", "tel"}:
+        return True
+    return bool(parsed.netloc)
+
+
+def _resolve_html_local_image_asset(html_path: Path, src: str) -> Path | None:
+    if _is_inline_or_remote_asset_src(src):
+        return None
+    parsed = urlsplit(str(src or "").strip())
+    raw_path = unquote(parsed.path).strip()
+    if not raw_path:
+        return None
+    asset_path = Path(raw_path).expanduser()
+    if asset_path.suffix.lower() not in _HTML_INLINE_IMAGE_EXTENSIONS:
+        return None
+    if not asset_path.is_absolute():
+        asset_path = html_path.parent / asset_path
+    try:
+        resolved = asset_path.resolve()
+        if not resolved.is_file() or resolved.stat().st_size <= 0:
+            return None
+        return resolved
+    except OSError:
+        return None
+
+
+def _inline_html_local_image_assets(html_path_text: str) -> set[str]:
+    html_path = Path(str(html_path_text or "")).expanduser()
+    if html_path.suffix.lower() not in {".html", ".htm"}:
+        return set()
+    try:
+        original = html_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    support_assets: set[str] = set()
+    changed = False
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        src = match.group("src")
+        asset = _resolve_html_local_image_asset(html_path, src)
+        if asset is None:
+            return match.group(0)
+        try:
+            raw = asset.read_bytes()
+        except OSError:
+            return match.group(0)
+        mime_type = mimetypes.guess_type(str(asset))[0] or "application/octet-stream"
+        encoded = base64.b64encode(raw).decode("ascii")
+        support_assets.add(str(asset))
+        changed = True
+        return f"{match.group('prefix')}{match.group('quote')}data:{mime_type};base64,{encoded}{match.group('quote')}"
+
+    updated = _HTML_LOCAL_IMAGE_SRC_RE.sub(replace, original)
+    if changed and updated != original:
+        try:
+            html_path.write_text(updated, encoding="utf-8")
+        except OSError:
+            return set()
+    return support_assets
+
+
+def _prepare_cron_deliverable_paths_for_delivery(paths: tuple[str, ...]) -> tuple[tuple[str, ...], set[str]]:
+    """Make HTML artifacts self-contained and suppress their local support files."""
+    unique_paths = tuple(dict.fromkeys(path for path in paths if str(path or "").strip()))
+    support_assets: set[str] = set()
+    for path in unique_paths:
+        support_assets.update(_inline_html_local_image_assets(path))
+    if not support_assets:
+        return unique_paths, support_assets
+    filtered: list[str] = []
+    for path in unique_paths:
+        try:
+            resolved = str(Path(path).expanduser().resolve())
+        except OSError:
+            resolved = str(Path(path).expanduser())
+        if resolved in support_assets:
+            continue
+        filtered.append(path)
+    return tuple(filtered), support_assets
+
+
+def _filter_html_support_media_from_text(text: str, support_assets: set[str]) -> str:
+    if not support_assets:
+        return text
+    from nullion.artifacts import parse_media_directive_line
+
+    kept: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        directive = parse_media_directive_line(raw_line)
+        if directive is None:
+            kept.append(raw_line)
+            continue
+        try:
+            resolved = str(Path(str(directive.path)).expanduser().resolve())
+        except OSError:
+            resolved = str(Path(str(directive.path)).expanduser())
+        if resolved in support_assets:
+            continue
+        kept.append(raw_line)
+    return "\n".join(kept).strip()
 
 
 def _workspace_state_filenames(result: dict[str, object]) -> set[str]:
@@ -341,16 +496,19 @@ def _structured_tool_artifact_paths(result: dict[str, object], state_filenames: 
     for tool_result in result.get("tool_results") or ():
         if _normalized_tool_result_status(tool_result) != "completed":
             continue
+        tool_name = _tool_result_name(tool_result)
         output = _tool_result_output(tool_result)
-        # These fields are the typed artifact channel exposed by file-producing
-        # tools. Plain `path` fields are intentionally ignored here because many
-        # state/checkpoint tools use them for internal workspace files.
-        for key in ("artifact_path", "artifact_paths", "artifacts"):
-            for path in _artifact_paths_from_value(output.get(key)):
-                if _is_state_artifact_media(path, state_filenames):
-                    continue
-                paths.append(path)
-        if _tool_result_name(tool_result) == "file_write":
+        tool_name = _tool_result_name(tool_result)
+        # Only structured outputs from producing tools become outbound cron
+        # attachments. Read/verification tools can point at existing files, but
+        # those paths are evidence, not a delivery decision.
+        if tool_name in CRON_DELIVERABLE_ARTIFACT_TOOLS:
+            for key in ("artifact_path", "artifact_paths", "artifacts"):
+                for path in _artifact_paths_from_value(output.get(key)):
+                    if _is_state_artifact_media(path, state_filenames):
+                        continue
+                    paths.append(path)
+        if tool_name == "file_write":
             path = _file_write_deliverable_artifact_path(output.get("path"), state_filenames)
             if path:
                 paths.append(path)
@@ -448,6 +606,74 @@ def _normalize_split_artifact_directives(text: str) -> str:
     return "\n".join(normalized).strip()
 
 
+def _resolve_cron_media_path(path: Path, *, principal_id: str | None) -> Path | None:
+    if path.is_absolute():
+        return path if path.is_file() else None
+    if not path.parts:
+        return None
+    try:
+        from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+        roots = workspace_storage_roots_for_principal(principal_id)
+    except Exception:
+        return None
+    root_by_name = {
+        "artifacts": roots.artifacts,
+        "files": roots.files,
+        "media": roots.media,
+    }
+    if path.parts[0] in root_by_name:
+        candidate = root_by_name[path.parts[0]].joinpath(*path.parts[1:]) if len(path.parts) > 1 else root_by_name[path.parts[0]]
+        return candidate if candidate.is_file() else None
+    if len(path.parts) == 1 and path.name and path.suffix:
+        all_roots = [roots.artifacts, roots.files, roots.media]
+        try:
+            from nullion.workspace_storage import workspace_storage_base
+
+            for workspace_root in workspace_storage_base().glob("*"):
+                if workspace_root.is_dir():
+                    all_roots.extend(
+                        [
+                            workspace_root / "artifacts",
+                            workspace_root / "files",
+                            workspace_root / "media",
+                        ]
+                    )
+        except Exception:
+            pass
+        candidates = [
+            root / path.name
+            for root in tuple(dict.fromkeys(candidate_root.resolve() for candidate_root in all_roots))
+            if (root / path.name).is_file()
+        ]
+        unique = tuple(dict.fromkeys(candidate.resolve() for candidate in candidates))
+        return unique[0] if len(unique) == 1 else None
+    return None
+
+
+def _resolve_relative_media_directives(text: str, *, principal_id: str | None) -> str:
+    if not principal_id:
+        return text
+    from nullion.artifacts import parse_media_directive_line
+
+    lines: list[str] = []
+    changed = False
+    for raw_line in str(text or "").splitlines():
+        directive = parse_media_directive_line(raw_line)
+        if directive is None or directive.path.is_absolute():
+            lines.append(raw_line)
+            continue
+        resolved = _resolve_cron_media_path(directive.path, principal_id=principal_id)
+        if resolved is None:
+            lines.append(raw_line)
+            continue
+        if directive.prefix:
+            lines.append(directive.prefix)
+        lines.append(f"MEDIA:{resolved}")
+        changed = True
+    return "\n".join(lines).strip() if changed else text
+
+
 def _append_media_directives(text: str, deliverable_paths: tuple[str, ...]) -> str:
     if not deliverable_paths:
         return text
@@ -465,7 +691,7 @@ def _append_media_directives(text: str, deliverable_paths: tuple[str, ...]) -> s
     return "\n\n".join(parts)
 
 
-def cron_delivery_text_from_result(result: dict[str, object]) -> str:
+def cron_delivery_text_from_result(result: dict[str, object], *, principal_id: str | None = None) -> str:
     """Return deliverable cron text after filtering state-file-only media.
 
     The filter uses runtime facts, not prompt wording: a MEDIA path in
@@ -478,28 +704,46 @@ def cron_delivery_text_from_result(result: dict[str, object]) -> str:
 
     text = cron_delivery_text(user_visible_text_from_output(result), result.get("artifacts"))
     text = _normalize_split_artifact_directives(text)
+    text = _resolve_relative_media_directives(text, principal_id=principal_id)
     state_filenames = _workspace_state_filenames(result)
     deliverable_paths = _structured_tool_artifact_paths(result, state_filenames)
+    deliverable_paths, support_assets = _prepare_cron_deliverable_paths_for_delivery(deliverable_paths)
     text = _filter_state_media_from_text(text, state_filenames)
+    text = _filter_html_support_media_from_text(text, support_assets)
     text = _strip_split_artifact_directives(text, deliverable_paths)
     return _append_media_directives(text, deliverable_paths)
 
 
-def cron_delivery_artifact_paths_from_result(result: dict[str, object], text: str | None = None) -> tuple[str, ...]:
+def cron_delivery_artifact_paths_from_result(
+    result: dict[str, object],
+    text: str | None = None,
+    *,
+    principal_id: str | None = None,
+) -> tuple[str, ...]:
     """Return concrete artifact paths that this cron delivery is about to expose."""
     from nullion.artifacts import media_candidate_paths_from_text
 
     state_filenames = _workspace_state_filenames(result)
     paths = list(_structured_tool_artifact_paths(result, state_filenames))
-    paths.extend(str(path) for path in media_candidate_paths_from_text(str(text or "")))
-    return tuple(dict.fromkeys(path for path in paths if path))
+    for path in media_candidate_paths_from_text(str(text or "")):
+        resolved = _resolve_cron_media_path(path, principal_id=principal_id) if principal_id else None
+        paths.append(str(resolved or path))
+    deliverable_paths, _support_assets = _prepare_cron_deliverable_paths_for_delivery(
+        tuple(dict.fromkeys(path for path in paths if path))
+    )
+    return deliverable_paths
 
 
-def cron_artifact_validation_block_reason(result: dict[str, object], text: str | None = None) -> str | None:
+def cron_artifact_validation_block_reason(
+    result: dict[str, object],
+    text: str | None = None,
+    *,
+    principal_id: str | None = None,
+) -> str | None:
     """Validate deliverable cron artifacts before marking a run delivered."""
     from nullion.artifact_validation import validate_artifact_paths
 
-    paths = cron_delivery_artifact_paths_from_result(result, text)
+    paths = cron_delivery_artifact_paths_from_result(result, text, principal_id=principal_id)
     if not paths:
         result.pop("cron_artifact_validation_errors", None)
         return None
@@ -534,7 +778,7 @@ class CronRunDeliveryCallbacks:
     record_event: Callable[..., None]
     block_reason: Callable[[dict[str, object], str, object], str | None]
     save_web_delivery: Callable[[object, str, str, object, dict[str, object]], bool]
-    send_platform_delivery: Callable[[object, str, str], bool]
+    send_platform_delivery: Callable[[object, str, str, str], bool]
     start_background_delivery: Callable[[str, object], None] | None = None
     clear_background_delivery: Callable[[str], None] | None = None
 
@@ -595,19 +839,56 @@ def _cron_run_paused_node(state: _CronRunDeliveryState) -> dict[str, object]:
 def _cron_run_prepare_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
     result = dict(state.get("result") or {})
     artifacts = result.get("artifacts")
-    text = cron_delivery_text_from_result(result)
+    text = cron_delivery_text_from_result(result, principal_id=state.get("conversation_id"))
     block_reason = state["callbacks"].block_reason(result, str(text), artifacts)
     if block_reason is None:
-        block_reason = cron_artifact_validation_block_reason(result, str(text))
+        block_reason = cron_artifact_validation_block_reason(
+            result,
+            str(text),
+            principal_id=state.get("conversation_id"),
+        )
     return {"result": result, "text": str(text), "artifacts": artifacts, "block_reason": block_reason}
 
 
 def _cron_run_route_prepared(state: _CronRunDeliveryState) -> str:
+    result = state.get("result") or {}
+    if result.get("mini_agent_dispatch"):
+        return "deferred"
     if state.get("block_reason"):
         return "blocked"
     if not str(state.get("text") or "").strip():
         return "silent"
     return "web" if state.get("delivery_channel") == "web" else "messaging"
+
+
+def _send_platform_delivery(
+    callback: Callable[..., bool],
+    job: object,
+    channel: str,
+    target: str,
+    text: str,
+) -> bool:
+    """Call platform delivery callbacks across the old and current contracts."""
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return bool(callback(job, channel, target, text))
+    positional_count = sum(
+        1
+        for parameter in signature.parameters.values()
+        if parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+    )
+    has_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        for parameter in signature.parameters.values()
+    )
+    if has_varargs or positional_count >= 4:
+        return bool(callback(job, channel, target, text))
+    return bool(callback(job, channel, text))
 
 
 def _cron_run_blocked_node(state: _CronRunDeliveryState) -> dict[str, object]:
@@ -647,6 +928,22 @@ def _cron_run_silent_node(state: _CronRunDeliveryState) -> dict[str, object]:
     return {"result": result}
 
 
+def _cron_run_deferred_node(state: _CronRunDeliveryState) -> dict[str, object]:
+    """Leave final delivery to the dispatched mini-agent result callback."""
+    callbacks = state["callbacks"]
+    result = dict(state.get("result") or {})
+    result["cron_delivery_status"] = "deferred"
+    callbacks.record_event(
+        "cron.delivery.deferred",
+        state["job"],
+        state["delivery_channel"],
+        state["delivery_target"],
+        state["conversation_id"],
+        reason="mini_agent_dispatch",
+    )
+    return {"result": result}
+
+
 def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
     callbacks = state["callbacks"]
     result = dict(state.get("result") or {})
@@ -675,7 +972,13 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
     result = dict(state.get("result") or {})
     attempts = int(state.get("send_attempts") or 0) + 1
     text = cron_delivery_text(str(state.get("text") or ""), state.get("artifacts"))
-    if callbacks.send_platform_delivery(state["job"], state["delivery_channel"], text):
+    if _send_platform_delivery(
+        callbacks.send_platform_delivery,
+        state["job"],
+        state["delivery_channel"],
+        state["delivery_target"],
+        text,
+    ):
         if callbacks.clear_background_delivery is not None:
             callbacks.clear_background_delivery(state["conversation_id"])
         callbacks.record_event(
@@ -740,6 +1043,7 @@ def _compiled_cron_run_delivery_graph():
     graph.add_node("prepare", _cron_run_prepare_delivery_node)
     graph.add_node("blocked", _cron_run_blocked_node)
     graph.add_node("silent", _cron_run_silent_node)
+    graph.add_node("deferred", _cron_run_deferred_node)
     graph.add_node("web", _cron_run_web_delivery_node)
     graph.add_node("messaging", _cron_run_messaging_delivery_node)
     graph.add_edge(START, "resolve_route")
@@ -748,10 +1052,10 @@ def _compiled_cron_run_delivery_graph():
     graph.add_conditional_edges(
         "prepare",
         _cron_run_route_prepared,
-        {"blocked": "blocked", "silent": "silent", "web": "web", "messaging": "messaging"},
+        {"blocked": "blocked", "silent": "silent", "deferred": "deferred", "web": "web", "messaging": "messaging"},
     )
     graph.add_conditional_edges("messaging", _cron_run_route_after_messaging, {"retry": "messaging", END: END})
-    for node in ("paused", "blocked", "silent", "web"):
+    for node in ("paused", "blocked", "silent", "deferred", "web"):
         graph.add_edge(node, END)
     return graph.compile()
 

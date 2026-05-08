@@ -29,6 +29,7 @@ from nullion.approvals import (
 )
 from nullion.codebase_summary import build_codebase_summary, format_codebase_summary
 from nullion.config import NullionSettings, load_settings, web_session_allow_duration_label, web_session_allow_expires_at
+from nullion.builder_capabilities import accept_dependency_builder_proposal
 from nullion.doctor_playbooks import execute_doctor_playbook_command
 from nullion.runtime import (
     PersistentRuntime,
@@ -52,8 +53,15 @@ from nullion.thinking_display import (
 from nullion.plugin_catalog import get_plugin_catalog_entry, list_plugin_catalog
 from nullion.skill_pack_catalog import get_skill_pack_catalog_entry, list_available_skill_packs
 from nullion.system_context import build_system_context_snapshot, format_system_context_for_prompt
+from nullion.tips import format_setup_tip
 from nullion.memory import UserMemoryEntry, memory_owner_for_web_admin
 from nullion.messaging_adapters import list_platform_delivery_receipts
+from nullion.session_stop import (
+    SessionStopResult,
+    cancel_active_task_frame,
+    cancel_orchestrator_conversation_sync,
+    stop_session_reply,
+)
 
 
 @dataclass(frozen=True)
@@ -68,12 +76,20 @@ class OperatorCommandSpec:
         return self.command.split()[0]
 
 
+@dataclass(frozen=True)
+class PlannerCommand:
+    requested: bool
+    prompt: str = ""
+
+
 _OPERATOR_COMMAND_SPECS: tuple[OperatorCommandSpec, ...] = (
     OperatorCommandSpec("/help", "Show the quick-reference command menu", "help"),
     OperatorCommandSpec("/help commands", "Show the full command list", None),
     OperatorCommandSpec("/chat <message>", "Talk to Nullion Assistant", "chat"),
+    OperatorCommandSpec("/planner <message>", "Run a step-by-step planned task", "planner"),
+    OperatorCommandSpec("/stop", "Stop active work in this session", "stop"),
     OperatorCommandSpec("/new", "Clear conversation history and start fresh", "new"),
-    OperatorCommandSpec("/verbose [off|planner|full|status]", "Choose activity and planner visibility", "verbose"),
+    OperatorCommandSpec("/verbose [on|off|status]", "Toggle activity details", "verbose"),
     OperatorCommandSpec("/thinking [on|off|status]", "Show or hide provider reasoning summaries separately", "thinking"),
     OperatorCommandSpec("/streaming [on|off|status]", "Toggle streamed chat replies where supported", "streaming"),
     OperatorCommandSpec("/update [--ignore-checks|--force]", "Update Nullion safely with automatic rollback", "update"),
@@ -167,6 +183,48 @@ def normalize_operator_command_head(head: str) -> str:
     return _TELEGRAM_COMMAND_ALIASES.get(normalized, normalized)
 
 
+def parse_planner_command(text: object) -> PlannerCommand:
+    command = str(text or "").strip()
+    if not command.startswith("/"):
+        return PlannerCommand(False)
+    head, _separator, tail = command.partition(" ")
+    if normalize_operator_command_head(head) != "/planner":
+        return PlannerCommand(False)
+    return PlannerCommand(True, tail.strip())
+
+
+def is_stop_command_text(text: object) -> bool:
+    command = str(text or "").strip()
+    if not command.startswith("/"):
+        return False
+    parts = command.split()
+    if len(parts) != 1:
+        return False
+    return normalize_operator_command_head(parts[0]) == "/stop"
+
+
+def _service_stop_result(service: object | None) -> SessionStopResult:
+    if service is None:
+        return SessionStopResult()
+    stop_session = getattr(service, "stop_active_session_sync", None)
+    if callable(stop_session):
+        try:
+            result = stop_session()
+            if isinstance(result, SessionStopResult):
+                return result
+            return SessionStopResult(cancelled_task_count=max(0, int(result or 0)))
+        except Exception:
+            return SessionStopResult()
+    conversation_id = getattr(service, "active_conversation_id", None)
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        return SessionStopResult()
+    runtime = getattr(service, "runtime", None)
+    orchestrator = getattr(service, "agent_orchestrator", None)
+    cancelled_tasks = cancel_orchestrator_conversation_sync(orchestrator, conversation_id)
+    cancelled_frame = cancel_active_task_frame(runtime, conversation_id)
+    return SessionStopResult(cancelled_task_count=cancelled_tasks, cancelled_task_frame=cancelled_frame)
+
+
 def _render_command_reference(title: str, specs: tuple[OperatorCommandSpec, ...]) -> str:
     commands = {spec.command for spec in specs}
     lines = [title]
@@ -183,7 +241,9 @@ _UNKNOWN_COMMAND = (
     "Try one of these:\n"
     "• /help — command menu\n"
     "• /chat <message> — talk to Nullion\n"
-    "• /verbose full — show activity traces and planner task cards\n"
+    "• /planner <message> — run a step-by-step planned task\n"
+    "• /stop — stop active work in this session\n"
+    "• /verbose on — show activity details during runs\n"
     "• /thinking on — show provider reasoning summaries separately\n"
     "• /streaming off — disable streamed replies\n"
     "• /status — current state\n"
@@ -225,12 +285,12 @@ def _handle_verbose_command(parts: list[str]) -> str:
     if len(parts) == 1 or parts[1].strip().lower() in {"status", "show"}:
         return f"Verbose mode is {verbose_mode_status_text()}."
     if len(parts) > 2:
-        return "Usage: /verbose [off|planner|full|status]"
+        return "Usage: /verbose [on|off|status]"
     value = parts[1].strip().lower()
     try:
         set_verbose_mode(value)
     except ValueError:
-        return "Usage: /verbose [off|planner|full|status]"
+        return "Usage: /verbose [on|off|status]"
     return f"Verbose mode is {verbose_mode_status_text()}."
 
 
@@ -846,7 +906,7 @@ def _render_plugin_detail(plugin_id: str | None) -> str:
             lines.append(f"  • {provider.name} (`{provider.provider_id}`) — {provider.status}")
             lines.append(f"    {provider.notes}")
     if entry.setup_hint:
-        lines.extend(["", f"Setup: {entry.setup_hint}"])
+        lines.extend(["", format_setup_tip(entry.setup_hint)])
     lines.extend(
         [
             "",
@@ -929,7 +989,7 @@ def _render_skill_pack_detail(pack_id: str | None) -> str:
         for item in entry.coverage:
             lines.append(f"  • {item}")
     if entry.setup_hint:
-        lines.extend(["", f"Setup: {entry.setup_hint}"])
+        lines.extend(["", format_setup_tip(entry.setup_hint)])
     lines.extend(
         [
             "",
@@ -1604,6 +1664,12 @@ def _render_builder_proposal(runtime: PersistentRuntime, token: str | None) -> s
     if record.status == "accepted" and record.accepted_skill_id:
         lines.append(f"Accepted skill: {record.accepted_skill_id} (/skill {record.accepted_skill_id})")
     lines.append(f"Confidence: {confidence_percent}% • Approval mode: {record.proposal.approval_mode}")
+    if record.proposal.approval_mode == "dependency":
+        for step in record.proposal.suggested_steps:
+            if step.startswith(("requirement:", "license:", "source:", "docs:")):
+                label, _, value = step.partition(":")
+                if value:
+                    lines.append(f"{label.title()}: {value}")
     return "\n".join(lines)
 
 
@@ -1615,6 +1681,15 @@ def _accept_builder_proposal(runtime: PersistentRuntime, token: str | None) -> s
     record = _resolve_builder_proposal_token(runtime, token)
     if record is None:
         return f"Builder proposal not found: {normalized_token}"
+    if record.proposal.approval_mode == "dependency":
+        try:
+            result = accept_dependency_builder_proposal(runtime, record.proposal_id, actor="operator")
+        except (KeyError, ValueError, RuntimeError) as exc:
+            return str(exc)
+        return (
+            f"Accepted Builder proposal {record.proposal_id}.\n"
+            f"Installed dependency: {result.get('package')} {result.get('installed_version') or ''}".rstrip()
+        )
     if record.proposal.approval_mode != "skill":
         return (
             f"Builder proposal {record.proposal_id} is a {record.proposal.approval_mode} proposal and cannot be accepted as a skill.\n"
@@ -2153,9 +2228,11 @@ def _cmd_auto_skill(runtime: PersistentRuntime, conv_id: str | None) -> str:
     cache_proposals(cache_key, proposals)
 
     if not proposals:
+        from nullion.tips import format_tip
+
         return (
             "No automatable patterns detected in recent conversations.\n"
-            "Tip: have a few multi-step exchanges with Nullion, then try again."
+            f"{format_tip('have a few multi-step exchanges with Nullion, then try again.')}"
         )
 
     lines = [f"🧠 Found {len(proposals)} skill proposal(s):\n"]
@@ -2227,6 +2304,14 @@ def _dispatch_operator_command(
         if len(parts) > 1 and parts[1].strip().lower() == "commands":
             return _HELP_COMMANDS_TEXT
         return _HELP_TEXT
+
+    if head == "/planner":
+        return "Usage: /planner <message>"
+
+    if head == "/stop":
+        if len(parts) > 1:
+            return "Usage: /stop"
+        return stop_session_reply(_service_stop_result(service))
 
     if head == "/verbose":
         return _handle_verbose_command(parts)
@@ -2522,8 +2607,10 @@ def handle_operator_command(
 
 __all__ = [
     "handle_operator_command",
+    "is_stop_command_text",
     "normalize_operator_command_head",
     "operator_command_catalog",
     "operator_command_suggestions",
+    "parse_planner_command",
     "telegram_bot_command_menu",
 ]

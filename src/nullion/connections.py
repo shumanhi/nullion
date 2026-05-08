@@ -28,6 +28,11 @@ _NATIVE_EMAIL_PROVIDER_IDS = frozenset(
 )
 
 
+def _provider_id_looks_external_connector(provider_id: object) -> bool:
+    normalized = str(provider_id or "").strip().lower()
+    return normalized.startswith("skill_pack_connector_") or normalized.endswith("_connector_provider")
+
+
 @dataclass(slots=True)
 class ProviderConnection:
     connection_id: str
@@ -281,7 +286,11 @@ def require_workspace_connection_for_principal(principal_id: str | None, provide
     raise RuntimeError(f"{provider_id} is not connected for workspace {workspace_id}.")
 
 
-def format_workspace_connections_for_prompt(*, principal_id: str | None = None) -> str:
+def format_workspace_connections_for_prompt(
+    *,
+    principal_id: str | None = None,
+    include_external_connectors: bool = True,
+) -> str:
     registry = load_connection_registry()
     active = [connection for connection in registry.connections if connection.active]
     if principal_id is not None:
@@ -290,6 +299,12 @@ def format_workspace_connections_for_prompt(*, principal_id: str | None = None) 
             connection
             for connection in active
             if connection.workspace_id in {workspace_id, _ADMIN_WORKSPACE_ID}
+        ]
+    if not include_external_connectors:
+        active = [
+            connection
+            for connection in active
+            if not _provider_id_looks_external_connector(connection.provider_id)
         ]
     if not active:
         if principal_id is not None and multi_user_connections_active():

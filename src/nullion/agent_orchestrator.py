@@ -7,9 +7,10 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, TypedDict
 from uuid import uuid4
 
@@ -24,7 +25,12 @@ from nullion.prompt_injection import (
     model_security_envelope,
     safe_untrusted_tool_metadata,
 )
-from nullion.response_sanitizer import sanitize_user_visible_reply, safe_raw_tool_payload_replacement
+from nullion.response_sanitizer import (
+    is_raw_tool_payload_reply,
+    is_safe_raw_tool_payload_replacement_reply,
+    safe_raw_tool_payload_replacement,
+    sanitize_user_visible_reply,
+)
 from nullion.response_fulfillment_contract import evaluate_response_fulfillment
 from nullion.runtime import (
     mark_mission_completed,
@@ -37,6 +43,85 @@ from nullion.thinking_display import extract_thinking_text
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MODEL_TOOL_RESULT_MAX_CHARS = 87_420
+
+
+_ARTIFACT_RECOVERY_TOOLS = frozenset(
+    {
+        "file_write",
+        "pdf_create",
+        "pdf_edit",
+        "render",
+        "image_generate",
+        "browser_screenshot",
+    }
+)
+
+
+def _planner_task_timeout_seconds() -> float:
+    from nullion.mini_agent_config import planner_mini_agent_timeout_seconds
+
+    return planner_mini_agent_timeout_seconds()
+
+
+def _planner_dependency_recovery_attempts() -> int:
+    from nullion.mini_agent_config import planner_dependency_recovery_attempts
+
+    return planner_dependency_recovery_attempts()
+
+
+def _group_uses_planner_timeout(group: Any, *, single_task_fast_path: bool) -> bool:
+    return len(getattr(group, "tasks", ()) or ()) > 1 or not single_task_fast_path
+
+
+def _apply_planner_timeout_policy(group: Any, *, single_task_fast_path: bool) -> Any:
+    if not _group_uses_planner_timeout(group, single_task_fast_path=single_task_fast_path):
+        return group
+    timeout_s = _planner_task_timeout_seconds()
+    try:
+        group.tasks = [
+            replace(task, timeout_s=max(float(getattr(task, "timeout_s", 0.0) or 0.0), timeout_s))
+            for task in group.tasks
+        ]
+    except Exception:
+        logger.debug("Could not apply planner mini-agent timeout policy", exc_info=True)
+    return group
+
+
+def _task_has_artifact_delivery_scope(task: Any) -> bool:
+    allowed_tools = {str(tool) for tool in (getattr(task, "allowed_tools", None) or [])}
+    return bool(allowed_tools.intersection(_ARTIFACT_RECOVERY_TOOLS))
+
+
+def _task_dependency_recovery_description(
+    group: Any,
+    task: Any,
+    *,
+    failed_dependency_ids: list[str],
+    tasks_by_id: dict[str, Any],
+) -> str:
+    lines = [
+        str(getattr(task, "description", "") or getattr(task, "title", "") or "").strip(),
+        "",
+        "Dependency recovery context:",
+        f"Original request: {getattr(group, 'original_message', '')}",
+        "One or more prerequisite tasks reached a terminal failure before producing usable context:",
+    ]
+    for dependency_id in failed_dependency_ids:
+        dependency = tasks_by_id.get(dependency_id)
+        title = str(getattr(dependency, "title", dependency_id) or dependency_id)
+        result = getattr(dependency, "result", None)
+        detail = str(getattr(result, "error", None) or getattr(result, "output", None) or "failed").strip()
+        lines.append(f"- {title}: {detail[:240]}")
+    lines.extend(
+        [
+            "",
+            "Recover the deliverable from the original request and verified runtime/tool evidence. "
+            "Use the minimum additional tool work needed, create the requested artifact, and verify it before finishing.",
+        ]
+    )
+    return "\n".join(line for line in lines if line is not None).strip()
 
 
 def _resolve_runtime_store(*, policy_store, approval_store):
@@ -99,24 +184,30 @@ def _artifact_paths_from_tool_result(result: ToolResult, *, runtime_store=None) 
     return []
 
 
-def _artifact_root_snapshot(runtime_store) -> dict[str, tuple[int, int]]:
-    if runtime_store is None:
+def _artifact_root_snapshot(runtime_store, *, principal_id: str | None = None) -> dict[str, tuple[int, int]]:
+    if runtime_store is None and not principal_id:
         return {}
     try:
-        from nullion.artifacts import artifact_descriptor_for_path, artifact_root_for_runtime
+        from nullion.artifacts import artifact_descriptor_for_path
 
-        root = artifact_root_for_runtime(runtime_store)
-        if not root.exists():
-            return {}
+        roots = _artifact_roots_for_agent_turn(runtime_store, principal_id or "") if principal_id else ()
+        if not roots:
+            from nullion.artifacts import artifact_root_for_runtime
+
+            roots = (artifact_root_for_runtime(runtime_store),)
         snapshot: dict[str, tuple[int, int]] = {}
-        for path in root.rglob("*"):
-            if not path.is_file():
+        for root in roots:
+            root = Path(root).expanduser().resolve()
+            if not root.exists():
                 continue
-            descriptor = artifact_descriptor_for_path(path, artifact_root=root)
-            if descriptor is None:
-                continue
-            stat = path.stat()
-            snapshot[str(path.resolve())] = (stat.st_mtime_ns, stat.st_size)
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                descriptor = artifact_descriptor_for_path(path, artifact_root=root)
+                if descriptor is None:
+                    continue
+                stat = path.stat()
+                snapshot[str(path.resolve())] = (stat.st_mtime_ns, stat.st_size)
         return snapshot
     except Exception:
         logger.debug("Failed to snapshot artifact root", exc_info=True)
@@ -127,8 +218,9 @@ def _new_artifact_paths_since(
     before: dict[str, tuple[int, int]],
     *,
     runtime_store,
+    principal_id: str | None = None,
 ) -> list[str]:
-    after = _artifact_root_snapshot(runtime_store)
+    after = _artifact_root_snapshot(runtime_store, principal_id=principal_id)
     if not after:
         return []
     changed = [
@@ -139,10 +231,75 @@ def _new_artifact_paths_since(
     return sorted(changed, key=lambda path: after[path][0])
 
 
+def _model_tool_result_max_chars() -> int:
+    raw = os.environ.get("NULLION_MODEL_TOOL_RESULT_MAX_CHARS", "")
+    if raw.strip():
+        try:
+            return max(int(raw), 10_000)
+        except ValueError:
+            pass
+    return _DEFAULT_MODEL_TOOL_RESULT_MAX_CHARS
+
+
+def _json_safe_tool_value(value: object) -> object:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        return {
+            "content_kind": "binary",
+            "byte_count": len(value),
+            "body_omitted": True,
+        }
+    if isinstance(value, tuple):
+        return [_json_safe_tool_value(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe_tool_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_tool_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _compact_tool_output_for_model_context(tool_name: str, output: object) -> object:
+    safe_output = _json_safe_tool_value(output)
+    if not isinstance(safe_output, dict):
+        return _truncate_text(str(safe_output or ""), 12_000)
+    if tool_name == "web_fetch":
+        compact = {
+            key: safe_output.get(key)
+            for key in (
+                "url",
+                "status_code",
+                "content_type",
+                "content_kind",
+                "title",
+                "body_size",
+                "body_truncated",
+                "suggested_extension",
+            )
+            if safe_output.get(key) is not None
+        }
+        text = safe_output.get("text")
+        if isinstance(text, str) and text.strip():
+            compact["text"] = _truncate_text(text, 24_000)
+        return compact
+    if tool_name == "terminal_exec":
+        compact = {
+            key: safe_output.get(key)
+            for key in ("exit_code", "shell", "timeout_seconds", "network_mode", "artifact_paths")
+            if safe_output.get(key) is not None
+        }
+        for key in ("stdout", "stderr"):
+            value = safe_output.get(key)
+            if isinstance(value, str) and value.strip():
+                compact[key] = _truncate_text(value, 24_000)
+        return compact
+    return _compact_tool_output_for_repair(tool_name, safe_output)
+
+
 def _tool_result_message_payload(result: ToolResult) -> str:
     payload: dict[str, Any] = {
         "status": result.status,
-        "output": result.output,
+        "output": _json_safe_tool_value(result.output),
     }
     security = model_security_envelope(result.tool_name, result.output)
     if security is not None:
@@ -153,6 +310,20 @@ def _tool_result_message_payload(result: ToolResult) -> str:
         }
     if result.error:
         payload["error"] = result.error
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    max_chars = _model_tool_result_max_chars()
+    if len(text) <= max_chars:
+        return text
+    original_chars = len(text)
+    payload["output"] = _compact_tool_output_for_model_context(result.tool_name, result.output)
+    payload["model_context_compaction"] = {
+        "original_json_chars": original_chars,
+        "max_json_chars": max_chars,
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if len(text) <= max_chars:
+        return text
+    payload["output"] = _truncate_text(json.dumps(payload["output"], ensure_ascii=False, sort_keys=True), max_chars // 2)
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -167,6 +338,42 @@ def _malformed_tool_call_result(*, principal_id: str, reason: str, block: object
         output={"reason": "malformed_tool_call", "principal_id": principal_id},
         error=reason,
     )
+
+
+def _terminal_tool_failure_text(result: ToolResult) -> str | None:
+    output = result.output if isinstance(result.output, dict) else {}
+    reason = output.get("reason")
+    if (
+        result.tool_name == "run_cron"
+        and result.status == "failed"
+        and reason == "cron_run_raw_tool_payload"
+    ):
+        cron_name = output.get("name")
+        label = str(cron_name).strip() if isinstance(cron_name, str) and cron_name.strip() else "the scheduled task"
+        return (
+            f"I triggered {label}, but delivery was blocked because the run produced raw structured tool "
+            "output instead of a readable report."
+        )
+    return None
+
+
+def _foreground_suppressed_tool_completion_text(result: ToolResult) -> str | None:
+    if result.status != "completed":
+        return None
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("foreground_reply_suppressed") is not True:
+        return None
+    message = str(output.get("message") or "").strip()
+    delivery_status = str(output.get("delivery_status") or "").strip()
+    if result.tool_name == "run_cron":
+        if delivery_status == "sent":
+            delivery_text = "Delivery was sent to the configured channel."
+        elif delivery_status == "saved":
+            delivery_text = "Delivery was saved to the configured destination."
+        else:
+            delivery_text = "The configured delivery completed."
+        return " ".join(part for part in (message, delivery_text) if part).strip()
+    return message or "Done."
 
 
 def _last_useful_tool_message(tool_results: list[ToolResult]) -> str:
@@ -292,6 +499,210 @@ def _post_tool_delivery_nudge() -> str:
         "Use the tool results above to provide the requested answer or delivery status. "
         "Do not answer only Done, OK, Complete, or Completed."
     )
+
+
+def _raw_tool_payload_delivery_nudge() -> str:
+    return (
+        "Your draft final response was a raw structured tool payload. Convert the completed tool results "
+        "into a concise human-readable answer for the user. Do not paste JSON, connector payloads, "
+        "internal paths, or full raw tool output."
+    )
+
+
+def _raw_tool_payload_repair_system_prompt() -> str:
+    return (
+        "You are the final response repair step for a tool-using agent. "
+        "Use only the verified tool evidence provided by the runtime and the original request. "
+        "Write the concise user-facing answer that should have been delivered. "
+        "Do not mention JSON, raw payloads, internal tool output, or repair. "
+        "If the evidence is insufficient, say what was found and what could not be verified."
+    )
+
+
+def _compact_tool_evidence_for_repair(tool_results: list[ToolResult], *, limit: int = 7000) -> str:
+    records: list[dict[str, object]] = []
+    remaining = limit
+    for result in tool_results[-8:]:
+        output = result.output if isinstance(result.output, dict) else result.output
+        record = {
+            "tool_name": result.tool_name,
+            "status": result.status,
+            "error": result.error,
+            "output": _compact_tool_output_for_repair(result.tool_name, output),
+        }
+        text = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        if len(text) > remaining:
+            record["output"] = _truncate_text(str(record["output"]), max(200, remaining))
+            text = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        if len(text) > remaining and records:
+            break
+        records.append(record)
+        remaining -= min(len(text), remaining)
+        if remaining <= 0:
+            break
+    return json.dumps(records, ensure_ascii=False, sort_keys=True)
+
+
+def _compact_tool_output_for_repair(tool_name: str, output: object) -> object:
+    if not isinstance(output, dict):
+        return _truncate_text(str(output or ""), 1200)
+    if tool_name == "connector_request":
+        compact: dict[str, object] = {
+            key: output.get(key)
+            for key in ("provider_id", "method", "url", "status_code", "content_type")
+            if output.get(key) is not None
+        }
+        data = output.get("json")
+        if data is not None:
+            compact["json"] = _compact_structured_value_for_repair(data)
+        text = output.get("text")
+        if isinstance(text, str) and text.strip():
+            compact["text"] = _truncate_text(text, 1200)
+        return compact
+    compact_output: dict[str, object] = {}
+    for key in ("result_text", "delivery_text", "final_text", "message", "summary", "content", "stdout", "result"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            compact_output[key] = _truncate_text(value, 1600)
+    text = output.get("text")
+    if isinstance(text, str) and text.strip():
+        compact_output["text"] = _truncate_text(text, 2200)
+    for key in ("path", "artifact_path", "artifact_paths", "artifacts", "url", "title", "length"):
+        value = output.get(key)
+        if value is not None:
+            compact_output[key] = _compact_structured_value_for_repair(value)
+    return compact_output or _compact_structured_value_for_repair(output)
+
+
+def _compact_structured_value_for_repair(value: object, *, depth: int = 0) -> object:
+    if depth >= 4:
+        return _truncate_text(str(value), 300)
+    if isinstance(value, str):
+        return _truncate_text(value, 1200 if depth == 0 else 500)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_compact_structured_value_for_repair(item, depth=depth + 1) for item in value[:8]]
+    if isinstance(value, dict):
+        email_summary = _compact_email_message_for_repair(value)
+        if email_summary is not None:
+            return email_summary
+        compact: dict[str, object] = {}
+        preferred_keys = (
+            "id",
+            "threadId",
+            "resultSizeEstimate",
+            "messages",
+            "items",
+            "snippet",
+            "subject",
+            "from",
+            "date",
+            "name",
+            "title",
+            "summary",
+            "text",
+        )
+        keys = [key for key in preferred_keys if key in value]
+        keys.extend(key for key in value.keys() if key not in keys)
+        for key in keys[:12]:
+            compact[str(key)] = _compact_structured_value_for_repair(value.get(key), depth=depth + 1)
+        return compact
+    return _truncate_text(str(value), 500)
+
+
+def _compact_email_message_for_repair(value: dict[str, object]) -> dict[str, object] | None:
+    payload = value.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    headers = payload.get("headers")
+    if not isinstance(headers, list):
+        return None
+    wanted = {"from", "to", "subject", "date"}
+    compact_headers: dict[str, str] = {}
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        name = str(header.get("name") or "").strip().lower()
+        if name not in wanted:
+            continue
+        header_value = str(header.get("value") or "").strip()
+        if header_value:
+            compact_headers[name] = _truncate_text(header_value, 300)
+    if not compact_headers:
+        return None
+    result: dict[str, object] = {
+        "id": value.get("id"),
+        "threadId": value.get("threadId"),
+        "headers": compact_headers,
+    }
+    snippet = value.get("snippet")
+    if isinstance(snippet, str) and snippet.strip():
+        result["snippet"] = _truncate_text(snippet, 700)
+    label_ids = value.get("labelIds")
+    if isinstance(label_ids, list):
+        result["labelIds"] = [str(item) for item in label_ids[:8]]
+    return result
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _model_response_text(response: object) -> str:
+    if not isinstance(response, dict):
+        return ""
+    content = response.get("content") or []
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+            parts.append(str(block.get("text") or ""))
+    return "".join(parts).strip()
+
+
+def _repair_raw_tool_payload_final_text(state: "_AgentTurnGraphState", final_text: str | None) -> str | None:
+    tool_results = list(state.get("tool_results") or [])
+    if not tool_results:
+        return None
+    orchestrator = state.get("orchestrator")
+    model_client = getattr(orchestrator, "model_client", None)
+    if model_client is None:
+        return None
+    evidence = _compact_tool_evidence_for_repair(tool_results)
+    if not evidence:
+        return None
+    prompt = (
+        f"Original request:\n{state.get('user_message') or ''}\n\n"
+        f"Rejected draft final response:\n{final_text or ''}\n\n"
+        f"Verified compact tool evidence:\n{evidence}"
+    )
+    try:
+        response = model_client.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            tools=[],
+            max_tokens=900,
+            system=_raw_tool_payload_repair_system_prompt(),
+        )
+    except Exception:
+        logger.debug("Raw tool payload final repair failed", exc_info=True)
+        return None
+    repaired = _model_response_text(response)
+    if not repaired:
+        return None
+    if is_raw_tool_payload_reply(reply=repaired, tool_results=tool_results):
+        return None
+    if is_safe_raw_tool_payload_replacement_reply(reply=repaired, tool_results=tool_results):
+        return None
+    return repaired
 
 
 def _missing_artifact_delivery_nudge(missing_requirements: tuple[str, ...]) -> str:
@@ -461,6 +872,7 @@ class TurnResult:
     artifacts: list[str] = field(default_factory=list)
     thinking_text: str | None = None
     reached_iteration_limit: bool = False
+    raw_tool_payload_blocked: bool = False
 
 
 @dataclass(slots=True)
@@ -486,6 +898,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     runtime_store: Any
     max_iterations: int | None
     tool_result_callback: Callable[[ToolResult], None] | None
+    cancellation_checker: Callable[[], bool] | None
     cleanup_scope: str
     cleanup_done: bool
     tool_results: list[ToolResult]
@@ -494,6 +907,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     doctor_threshold: int
     next_doctor_notice_at: int
     post_tool_delivery_nudged: bool
+    raw_tool_payload_nudge_count: int
     repeated_failure_limit: int
     failure_fingerprints: dict[str, int]
     thinking_parts: list[str]
@@ -511,6 +925,21 @@ def _agent_turn_thinking_text(state: _AgentTurnGraphState) -> str | None:
     return "\n\n".join(state.get("thinking_parts") or []) or None
 
 
+def _agent_turn_was_cancelled(state: _AgentTurnGraphState) -> bool:
+    checker = state.get("cancellation_checker")
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        logger.debug("Agent turn cancellation checker failed", exc_info=True)
+        return False
+
+
+def _cancelled_agent_turn_update(state: _AgentTurnGraphState) -> dict[str, object]:
+    return _complete_agent_turn(state, final_text="Stopped by /stop.")
+
+
 def _complete_agent_turn(
     state: _AgentTurnGraphState,
     *,
@@ -518,6 +947,7 @@ def _complete_agent_turn(
     suspended_for_approval: bool = False,
     approval_id: str | None = None,
     reached_iteration_limit: bool = False,
+    raw_tool_payload_blocked: bool = False,
 ) -> dict[str, object]:
     cleanup_done = bool(state.get("cleanup_done"))
     tool_registry = state.get("tool_registry")
@@ -536,6 +966,7 @@ def _complete_agent_turn(
             artifacts=list(dict.fromkeys(state.get("artifacts") or [])),
             thinking_text=_agent_turn_thinking_text(state),
             reached_iteration_limit=reached_iteration_limit,
+            raw_tool_payload_blocked=raw_tool_payload_blocked,
         ),
     }
 
@@ -558,6 +989,8 @@ def _execute_agent_turn_tool_uses(
     tool_result_blocks: list[dict[str, object]] = []
 
     for block in content:
+        if _agent_turn_was_cancelled(state):
+            return _cancelled_agent_turn_update(state)
         if not isinstance(block, dict) or block.get("type") != "tool_use":
             continue
         tool_name = block.get("name")
@@ -607,7 +1040,7 @@ def _execute_agent_turn_tool_uses(
             tool_input=dict(tool_input),
         )
         artifact_snapshot = (
-            _artifact_root_snapshot(runtime_store)
+            _artifact_root_snapshot(runtime_store, principal_id=principal_id)
             if tool_name == "terminal_exec" and runtime_store is not None
             else None
         )
@@ -624,8 +1057,18 @@ def _execute_agent_turn_tool_uses(
             except Exception:
                 logger.debug("Tool result callback failed", exc_info=True)
         artifacts.extend(_artifact_paths_from_tool_result(result, runtime_store=runtime_store))
+        if _agent_turn_was_cancelled(state):
+            updated_state = dict(state)
+            updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
+            return _cancelled_agent_turn_update(updated_state)
         if result.status == "completed" and artifact_snapshot is not None:
-            artifacts.extend(_new_artifact_paths_since(artifact_snapshot, runtime_store=runtime_store))
+            artifacts.extend(
+                _new_artifact_paths_since(
+                    artifact_snapshot,
+                    runtime_store=runtime_store,
+                    principal_id=principal_id,
+                )
+            )
             artifacts = list(dict.fromkeys(artifacts))
 
         output = result.output if isinstance(result.output, dict) else {}
@@ -661,6 +1104,26 @@ def _execute_agent_turn_tool_uses(
                     suspended_for_approval=True,
                     approval_id=approval_id,
                 ),
+            }
+
+        terminal_failure_text = _terminal_tool_failure_text(result)
+        if terminal_failure_text is not None:
+            updated_state = dict(state)
+            updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
+            return {
+                "tool_results": tool_results,
+                "artifacts": artifacts,
+                **_complete_agent_turn(updated_state, final_text=terminal_failure_text),
+            }
+
+        foreground_suppressed_text = _foreground_suppressed_tool_completion_text(result)
+        if foreground_suppressed_text is not None:
+            updated_state = dict(state)
+            updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
+            return {
+                "tool_results": tool_results,
+                "artifacts": artifacts,
+                **_complete_agent_turn(updated_state, final_text=foreground_suppressed_text),
             }
 
         if state.get("enable_repeated_failure_guard", False):
@@ -729,6 +1192,8 @@ def _agent_turn_initial_tools_node(state: _AgentTurnGraphState) -> dict[str, obj
 
 
 def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
+    if _agent_turn_was_cancelled(state):
+        return _cancelled_agent_turn_update(state)
     iterations = int(state.get("iterations") or 0)
     max_iterations = state.get("max_iterations")
     if max_iterations is not None and iterations >= max_iterations:
@@ -763,6 +1228,8 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
 
 
 def _agent_turn_tools_node(state: _AgentTurnGraphState) -> dict[str, object]:
+    if _agent_turn_was_cancelled(state):
+        return _cancelled_agent_turn_update(state)
     messages = list(state.get("messages") or [])
     content = list(state.get("content") or [])
     messages.append({"role": "assistant", "content": _conversation_visible_content(content)})
@@ -863,13 +1330,54 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                 }
             )
             return {"messages": messages, "post_tool_delivery_nudged": True}
+    if (
+        tool_results
+        and int(state.get("raw_tool_payload_nudge_count") or 0) < 1
+        and (
+            is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
+            or is_safe_raw_tool_payload_replacement_reply(reply=final_text, tool_results=tool_results)
+        )
+    ):
+        nudge_count = int(state.get("raw_tool_payload_nudge_count") or 0) + 1
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _raw_tool_payload_delivery_nudge()}],
+            }
+        )
+        return {"messages": messages, "raw_tool_payload_nudge_count": nudge_count}
+    raw_payload_like = bool(
+        tool_results
+        and (
+            is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
+            or is_safe_raw_tool_payload_replacement_reply(reply=final_text, tool_results=tool_results)
+        )
+    )
+    if raw_payload_like:
+        repaired_final_text = _repair_raw_tool_payload_final_text(state, final_text)
+        if repaired_final_text is not None:
+            final_text = repaired_final_text
+            raw_payload_like = bool(
+                is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
+                or is_safe_raw_tool_payload_replacement_reply(reply=final_text, tool_results=tool_results)
+            )
     final_text = sanitize_user_visible_reply(
         user_message=state["user_message"],
         reply=final_text,
         tool_results=tool_results,
         source="agent",
     )
-    return _complete_agent_turn(state, final_text=final_text)
+    return _complete_agent_turn(
+        state,
+        final_text=final_text,
+        raw_tool_payload_blocked=raw_payload_like,
+    )
 
 
 def _agent_turn_route_after_initial(state: _AgentTurnGraphState) -> str:
@@ -1110,6 +1618,7 @@ class AgentOrchestrator:
         approval_store,
         max_iterations: int | None = None,
         tool_result_callback: Callable[[ToolResult], None] | None = None,
+        cancellation_checker: Callable[[], bool] | None = None,
     ) -> TurnResult:
         runtime_store = _resolve_runtime_store(policy_store=policy_store, approval_store=approval_store)
         messages = list(conversation_history)
@@ -1126,6 +1635,7 @@ class AgentOrchestrator:
                 "runtime_store": runtime_store,
                 "max_iterations": max_iterations,
                 "tool_result_callback": tool_result_callback,
+                "cancellation_checker": cancellation_checker,
                 "cleanup_scope": f"turn-{uuid4().hex}",
                 "cleanup_done": False,
                 "tool_results": [],
@@ -1134,6 +1644,7 @@ class AgentOrchestrator:
                 "doctor_threshold": doctor_threshold,
                 "next_doctor_notice_at": doctor_threshold,
                 "post_tool_delivery_nudged": False,
+                "raw_tool_payload_nudge_count": 0,
                 "repeated_failure_limit": _repeated_tool_failure_limit(),
                 "failure_fingerprints": {},
                 "thinking_parts": [],
@@ -1206,6 +1717,7 @@ class AgentOrchestrator:
                 "doctor_threshold": _tool_loop_doctor_threshold(),
                 "next_doctor_notice_at": _tool_loop_doctor_threshold(),
                 "post_tool_delivery_nudged": False,
+                "raw_tool_payload_nudge_count": 0,
                 "repeated_failure_limit": _repeated_tool_failure_limit(),
                 "failure_fingerprints": {},
                 "thinking_parts": [],
@@ -1234,6 +1746,8 @@ class AgentOrchestrator:
     _deliver_fn: Any = None
     _checkpoint_fn: Any = None
     _supervisor_tasks: set[asyncio.Task] | None = None
+    _runner_tasks_by_group: dict[str, set[asyncio.Task]] | None = None
+    _dispatch_policy_store: Any = None
     _dispatcher_loop: Any = None
     _dispatcher_thread: threading.Thread | None = None
 
@@ -1244,6 +1758,49 @@ class AgentOrchestrator:
     def set_checkpoint_fn(self, fn: Any) -> None:
         """Set the callback used to persist delegated-task state transitions."""
         self._checkpoint_fn = fn
+
+    def _track_runner_task(self, group_id: str, task: asyncio.Task) -> None:
+        if self._runner_tasks_by_group is None:
+            self._runner_tasks_by_group = {}
+        group_tasks = self._runner_tasks_by_group.setdefault(group_id, set())
+        group_tasks.add(task)
+
+        def _forget_runner_task(done_task: asyncio.Task, *, task_group_id: str = group_id) -> None:
+            if self._runner_tasks_by_group is None:
+                return
+            tracked = self._runner_tasks_by_group.get(task_group_id)
+            if tracked is None:
+                return
+            tracked.discard(done_task)
+            if not tracked:
+                self._runner_tasks_by_group.pop(task_group_id, None)
+
+        task.add_done_callback(_forget_runner_task)
+
+    def _spawn_runner_task(
+        self,
+        task: Any,
+        *,
+        runner: Any,
+        group: Any,
+        tool_registry: ToolRegistry,
+        policy_store: Any,
+        approval_store: Any,
+        name: str,
+    ) -> asyncio.Task:
+        runner_task = asyncio.create_task(
+            self._run_task(
+                task,
+                runner=runner,
+                group=group,
+                tool_registry=tool_registry,
+                policy_store=policy_store,
+                approval_store=approval_store,
+            ),
+            name=name,
+        )
+        self._track_runner_task(str(group.group_id), runner_task)
+        return runner_task
 
     def _checkpoint_dispatch_state(self) -> None:
         fn = self._checkpoint_fn
@@ -1354,22 +1911,81 @@ class AgentOrchestrator:
         except ValueError:
             return 5.0
 
-    async def _emit_supervised_status(self, conversation_id: str, text: str, **kwargs: Any) -> None:
+    async def _emit_supervised_status(self, conversation_id: str, text: str, **kwargs: Any) -> bool:
         deliver_fn = self._deliver_fn
         if deliver_fn is None:
-            return
+            return False
         try:
             result = deliver_fn(conversation_id, text, **kwargs)
             if asyncio.iscoroutine(result):
-                await result
+                result = await result
+            return result is not False
         except Exception:
             logger.debug("Could not deliver Mini-Agent supervision status", exc_info=True)
+            return False
+
+    def _can_recover_blocked_artifact_task(self, task: Any, failed_dependency_ids: list[str]) -> bool:
+        if not failed_dependency_ids:
+            return False
+        if not _task_has_artifact_delivery_scope(task):
+            return False
+        retry_count = int(getattr(task, "retry_count", 0) or 0)
+        return retry_count < _planner_dependency_recovery_attempts()
+
+    async def _recover_blocked_artifact_task(
+        self,
+        task: Any,
+        *,
+        group: Any,
+        failed_dependency_ids: list[str],
+        tasks_by_id: dict[str, Any],
+    ) -> Any | None:
+        if self._task_registry is None:
+            return None
+        from nullion.task_queue import TaskStatus
+
+        dependency_tools: list[str] = []
+        for dependency_id in failed_dependency_ids:
+            dependency = tasks_by_id.get(dependency_id)
+            dependency_tools.extend(str(tool) for tool in (getattr(dependency, "allowed_tools", None) or []))
+        allowed_tools = list(dict.fromkeys([
+            *(str(tool) for tool in (getattr(task, "allowed_tools", None) or [])),
+            *dependency_tools,
+        ]))
+        description = _task_dependency_recovery_description(
+            group,
+            task,
+            failed_dependency_ids=failed_dependency_ids,
+            tasks_by_id=tasks_by_id,
+        )
+        timeout_s = max(
+            float(getattr(task, "timeout_s", 0.0) or 0.0),
+            _planner_task_timeout_seconds(),
+        )
+        recovered = await self._task_registry.update_task(
+            task.task_id,
+            status=TaskStatus.QUEUED,
+            dependencies=[],
+            retry_count=int(getattr(task, "retry_count", 0) or 0) + 1,
+            allowed_tools=allowed_tools,
+            description=description,
+            timeout_s=timeout_s,
+            started_at=None,
+            completed_at=None,
+            result=None,
+            agent_id=None,
+        )
+        self._checkpoint_dispatch_state()
+        return recovered
 
     async def _supervise_dispatch_group(
         self,
         group_id: str,
         *,
         policy_store: Any,
+        runner: Any | None = None,
+        tool_registry: ToolRegistry | None = None,
+        approval_store: Any | None = None,
     ) -> None:
         from nullion.mini_agent_runner import ProgressUpdate
         from nullion.task_queue import TaskResult, TaskStatus
@@ -1396,11 +2012,15 @@ class AgentOrchestrator:
                     if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}
                 }
                 failures: list[tuple[Any, str]] = []
+                recoveries: list[tuple[Any, list[str]]] = []
                 for task in group.tasks:
                     if task.is_terminal() or task.status == TaskStatus.WAITING_INPUT:
                         continue
                     failed_dependency_ids = [dep_id for dep_id in task.dependencies if dep_id in failed_deps]
                     if failed_dependency_ids:
+                        if self._can_recover_blocked_artifact_task(task, failed_dependency_ids):
+                            recoveries.append((task, failed_dependency_ids))
+                            continue
                         failures.append((task, f"Dependency failed: {', '.join(failed_dependency_ids)}"))
                         continue
                     started_at = task.started_at or task.created_at
@@ -1413,6 +2033,39 @@ class AgentOrchestrator:
                             task,
                             f"Timed out after {int(age_seconds)}s without reaching a terminal state.",
                         ))
+
+                for task, failed_dependency_ids in recoveries:
+                    if runner is None or tool_registry is None:
+                        failures.append((task, f"Dependency failed: {', '.join(failed_dependency_ids)}"))
+                        continue
+                    recovered_task = await self._recover_blocked_artifact_task(
+                        task,
+                        group=group,
+                        failed_dependency_ids=failed_dependency_ids,
+                        tasks_by_id=tasks_by_id,
+                    )
+                    if recovered_task is None:
+                        failures.append((task, f"Dependency failed: {', '.join(failed_dependency_ids)}"))
+                        continue
+                    if self._progress_queue is not None:
+                        await self._progress_queue.put(
+                            ProgressUpdate(
+                                agent_id=recovered_task.agent_id or "supervisor",
+                                task_id=recovered_task.task_id,
+                                group_id=recovered_task.group_id,
+                                kind="progress_note",
+                                message="Recovering deliverable after dependency failure.",
+                            )
+                        )
+                    self._spawn_runner_task(
+                        recovered_task,
+                        runner=runner,
+                        group=group,
+                        tool_registry=tool_registry,
+                        policy_store=policy_store,
+                        approval_store=approval_store,
+                        name=f"task-recovery-{recovered_task.task_id}",
+                    )
 
                 for task, reason in failures:
                     result = TaskResult(task_id=task.task_id, status="failure", error=reason)
@@ -1452,6 +2105,7 @@ class AgentOrchestrator:
                         format_task_status_summary(
                             group.tasks,
                             planner_summary=_planner_summary_from_group(group),
+                            subject=group.original_message,
                         ),
                         is_status=True,
                         group_id=group.group_id,
@@ -1491,6 +2145,7 @@ class AgentOrchestrator:
         approval_store: Any,
         available_tools: list[str] | None = None,
         single_task_fast_path: bool = True,
+        dag_plan: Any | None = None,
     ) -> "DispatchResult":
         """Decompose *user_message* and dispatch tasks to mini-agents.
 
@@ -1512,6 +2167,7 @@ class AgentOrchestrator:
         tools = available_tools or [
             t.get("name", "") for t in tool_registry.list_tool_definitions()
         ]
+        self._dispatch_policy_store = policy_store
 
         # Lazy init.
         if self._task_registry is None:
@@ -1535,6 +2191,8 @@ class AgentOrchestrator:
             )
         if self._supervisor_tasks is None:
             self._supervisor_tasks = set()
+        if self._runner_tasks_by_group is None:
+            self._runner_tasks_by_group = {}
         if self._pool is None:
             self._pool = WarmAgentPool(min_size=3, max_size=20, shared_client=self._model_client)
             await self._pool.start()
@@ -1546,42 +2204,39 @@ class AgentOrchestrator:
             conversation_id=conversation_id,
             principal_id=principal_id,
             available_tools=tools,
+            dag_plan=dag_plan,
         )
+        group = _apply_planner_timeout_policy(group, single_task_fast_path=single_task_fast_path)
         await self._task_registry.add_group(group)
         self._checkpoint_dispatch_state()
 
-        # Single-task fast path — no async overhead.
+        # Single-task fast path — no async overhead unless the caller explicitly
+        # requested planner/mini-agent status delivery.
         if len(group.tasks) == 1:
             task = group.tasks[0]
-            if not single_task_fast_path:
+            if single_task_fast_path:
+                turn_result = self.run_turn(
+                    conversation_id=conversation_id,
+                    principal_id=principal_id,
+                    user_message=task.description,
+                    conversation_history=[],
+                    tool_registry=tool_registry,
+                    policy_store=policy_store,
+                    approval_store=approval_store,
+                )
                 return DispatchResult(
                     group_id=group.group_id,
-                    acknowledgment="",
+                    acknowledgment=turn_result.final_text or "(no reply)",
                     task_count=1,
                     is_single_task=True,
-                    dispatched=False,
                 )
-            turn_result = self.run_turn(
-                conversation_id=conversation_id,
-                principal_id=principal_id,
-                user_message=task.description,
-                conversation_history=[],
-                tool_registry=tool_registry,
-                policy_store=policy_store,
-                approval_store=approval_store,
-            )
-            return DispatchResult(
-                group_id=group.group_id,
-                acknowledgment=turn_result.final_text or "(no reply)",
-                task_count=1,
-                is_single_task=True,
-            )
 
-        # Multi-task — build acknowledgment and spawn tasks.
+        # Planner dispatch path — build acknowledgment and spawn task runner(s).
         planner_summary = _planner_summary_from_group(group)
         acknowledgment = format_task_status_summary(
             group.tasks,
             planner_summary=planner_summary,
+            subject=user_message,
             default_status=TaskStatus.PENDING,
         )
         task_status_detail = format_task_status_activity_detail(
@@ -1599,27 +2254,44 @@ class AgentOrchestrator:
         runner = MiniAgentRunner()
         for task in group.tasks:
             if task.status == TaskStatus.QUEUED:
-                asyncio.create_task(
-                    self._run_task(task, runner=runner, group=group,
-                                   tool_registry=tool_registry,
-                                   policy_store=policy_store,
-                                   approval_store=approval_store),
+                self._spawn_runner_task(
+                    task,
+                    runner=runner,
+                    group=group,
+                    tool_registry=tool_registry,
+                    policy_store=policy_store,
+                    approval_store=approval_store,
                     name=f"task-{task.task_id}",
                 )
         supervisor_task = asyncio.create_task(
-            self._supervise_dispatch_group(group.group_id, policy_store=policy_store),
+            self._supervise_dispatch_group(
+                group.group_id,
+                policy_store=policy_store,
+                runner=runner,
+                tool_registry=tool_registry,
+                approval_store=approval_store,
+            ),
             name=f"supervise-{group.group_id}",
         )
         self._supervisor_tasks.add(supervisor_task)
+        status_delivered = await self._emit_supervised_status(
+            group.conversation_id,
+            acknowledgment,
+            is_status=True,
+            group_id=group.group_id,
+            status_kind="task_summary",
+        )
 
         return DispatchResult(
             group_id=group.group_id,
             acknowledgment=acknowledgment,
             task_count=len(group.tasks),
+            is_single_task=len(group.tasks) == 1,
             planner_summary=planner_summary,
             planner_metadata=dict(getattr(group, "planner_metadata", {}) or {}),
             task_titles=[task.title for task in group.tasks],
             task_status_detail=task_status_detail,
+            status_delivered=status_delivered,
         )
 
     async def _run_task(
@@ -1640,7 +2312,11 @@ class AgentOrchestrator:
         agent = None
         agent_id = task.agent_id or "mini-agent"
         result: TaskResult | None = None
+        cancelled = False
         try:
+            current_task_record = self._task_registry.get_task(task.task_id) if self._task_registry is not None else None
+            if current_task_record is not None and current_task_record.status == TaskStatus.CANCELLED:
+                return
             agent = await self._pool.acquire(preferred_tools=task.allowed_tools, task_id=task.task_id)
             agent_id = agent.agent_id
             config = MiniAgentConfig(
@@ -1665,15 +2341,29 @@ class AgentOrchestrator:
                         kind="task_started",
                     )
                 )
-            result = await runner.run(
-                config,
-                anthropic_client=get_agent_client(agent),
-                tool_registry=tool_registry,
-                policy_store=policy_store,
-                approval_store=approval_store,
-                context_bus=self._context_bus,
-                progress_queue=self._progress_queue,
-            )
+            timeout_seconds = max(0.1, float(config.timeout_s or 180.0))
+            try:
+                result = await asyncio.wait_for(
+                    runner.run(
+                        config,
+                        anthropic_client=get_agent_client(agent),
+                        tool_registry=tool_registry,
+                        policy_store=policy_store,
+                        approval_store=approval_store,
+                        context_bus=self._context_bus,
+                        progress_queue=self._progress_queue,
+                    ),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                result = TaskResult(
+                    task_id=task.task_id,
+                    status="failure",
+                    error=f"Timed out after {timeout_seconds:g}s without reaching a terminal state.",
+                )
+        except asyncio.CancelledError:
+            cancelled = True
+            result = TaskResult(task_id=task.task_id, status="cancelled", error="Cancelled by user.")
         except Exception as exc:
             logger.warning("Mini-agent task %s failed before completion: %s", task.task_id, exc, exc_info=True)
             result = TaskResult(task_id=task.task_id, status="failure", error=str(exc) or exc.__class__.__name__)
@@ -1681,7 +2371,7 @@ class AgentOrchestrator:
             if agent is not None:
                 self._pool.release(agent)
 
-        final_status = _task_status_for_task_result(result)
+        final_status = TaskStatus.CANCELLED if cancelled else _task_status_for_task_result(result)
         _store_delegated_pause_suspended_turn(policy_store, approval_store, task=task, result=result, agent_id=agent_id)
         self._transition_dispatch_task_run(
             policy_store,
@@ -1700,7 +2390,7 @@ class AgentOrchestrator:
                     agent_id=agent_id,
                     task_id=task.task_id,
                     group_id=task.group_id,
-                    kind=_progress_kind_for_task_result(result),
+                    kind="task_cancelled" if final_status == TaskStatus.CANCELLED else _progress_kind_for_task_result(result),
                     message=result.output or result.error,
                 )
             )
@@ -1709,10 +2399,13 @@ class AgentOrchestrator:
         for dep_task in self._task_registry.ready_tasks_for_group(task.group_id):
             await self._task_registry.update_task(dep_task.task_id, status=TaskStatus.QUEUED)
             self._checkpoint_dispatch_state()
-            asyncio.create_task(
-                self._run_task(dep_task, runner=runner, group=group,
-                               tool_registry=tool_registry, policy_store=policy_store,
-                               approval_store=approval_store),
+            self._spawn_runner_task(
+                dep_task,
+                runner=runner,
+                group=group,
+                tool_registry=tool_registry,
+                policy_store=policy_store,
+                approval_store=approval_store,
                 name=f"task-{dep_task.task_id}",
             )
 
@@ -1817,12 +2510,84 @@ class AgentOrchestrator:
     async def cancel_group(self, group_id: str) -> int:
         if self._task_registry is None:
             return 0
+        group = self._task_registry.get_group(group_id)
+        cancellable_tasks = [
+            task
+            for task in (group.tasks if group is not None else self._task_registry.list_by_group(group_id))
+            if not task.is_terminal()
+        ]
         count = await self._task_registry.cancel_group(group_id)
+        policy_store = self._dispatch_policy_store
+        for task in cancellable_tasks:
+            self._transition_dispatch_task_run(
+                policy_store,
+                task,
+                MiniAgentRunStatus.CANCELLED,
+                result_summary="Cancelled by user.",
+            )
+        if self._runner_tasks_by_group is not None:
+            for runner_task in list(self._runner_tasks_by_group.get(group_id, ())):
+                if not runner_task.done():
+                    runner_task.cancel()
+        if self._supervisor_tasks is not None:
+            for supervisor_task in list(self._supervisor_tasks):
+                if not supervisor_task.done() and supervisor_task.get_name() == f"supervise-{group_id}":
+                    supervisor_task.cancel()
         if self._context_bus is not None:
             self._context_bus.clear_group(group_id)
+        self._checkpoint_dispatch_state()
+        if self._progress_queue is not None:
+            from nullion.mini_agent_runner import ProgressUpdate
+
+            for task in cancellable_tasks[:1]:
+                await self._progress_queue.put(
+                    ProgressUpdate(
+                        agent_id=task.agent_id or "supervisor",
+                        task_id=task.task_id,
+                        group_id=task.group_id,
+                        kind="task_cancelled",
+                        message="Cancelled by user.",
+                    )
+                )
         return count
 
+    async def cancel_conversation(self, conversation_id: str) -> int:
+        if self._task_registry is None:
+            return 0
+        group_ids = {
+            task.group_id
+            for task in self._task_registry.list_by_conversation(conversation_id)
+            if not task.is_terminal()
+        }
+        cancelled = 0
+        for group_id in sorted(group_ids):
+            cancelled += await self.cancel_group(group_id)
+        return cancelled
+
+    def cancel_conversation_sync(self, conversation_id: str, *, timeout_s: float = 3.0) -> int:
+        loop = self._dispatcher_loop
+        if loop is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self.cancel_conversation(conversation_id), loop)
+            return int(future.result(timeout=timeout_s) or 0)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return int(asyncio.run(self.cancel_conversation(conversation_id)) or 0)
+        return 0
+
     async def shutdown_dispatcher(self) -> None:
+        if self._runner_tasks_by_group:
+            runner_tasks = [
+                task
+                for tasks in self._runner_tasks_by_group.values()
+                for task in tasks
+                if not task.done()
+            ]
+            for task in runner_tasks:
+                task.cancel()
+            if runner_tasks:
+                await asyncio.gather(*runner_tasks, return_exceptions=True)
+            self._runner_tasks_by_group.clear()
         if self._supervisor_tasks:
             for task in list(self._supervisor_tasks):
                 if not task.done():
@@ -1928,6 +2693,8 @@ def _planner_summary_from_group(group: Any) -> str:
 def _task_status_for_task_result(result: Any) -> TaskStatus:
     from nullion.task_queue import TaskStatus
 
+    if getattr(result, "status", None) == "cancelled":
+        return TaskStatus.CANCELLED
     if getattr(result, "status", None) == "success":
         return TaskStatus.COMPLETE
     if getattr(result, "status", None) == "partial":
@@ -1936,6 +2703,8 @@ def _task_status_for_task_result(result: Any) -> TaskStatus:
 
 
 def _mini_agent_run_status_for_task_result(result: Any) -> MiniAgentRunStatus:
+    if getattr(result, "status", None) == "cancelled":
+        return MiniAgentRunStatus.CANCELLED
     if getattr(result, "status", None) == "success":
         return MiniAgentRunStatus.COMPLETED
     if getattr(result, "status", None) == "partial":
@@ -1944,6 +2713,8 @@ def _mini_agent_run_status_for_task_result(result: Any) -> MiniAgentRunStatus:
 
 
 def _progress_kind_for_task_result(result: Any) -> str:
+    if getattr(result, "status", None) == "cancelled":
+        return "task_cancelled"
     if getattr(result, "status", None) == "success":
         return "task_complete"
     if getattr(result, "status", None) == "partial":
@@ -1977,6 +2748,7 @@ class DispatchResult:
     planner_metadata: dict[str, object] | None = None
     task_titles: list[str] | None = None
     task_status_detail: str = ""
+    status_delivered: bool = False
 
 
 __all__ = ["AgentOrchestrator", "DispatchResult", "MissionResult", "TurnResult"]

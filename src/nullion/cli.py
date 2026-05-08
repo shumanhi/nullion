@@ -398,13 +398,24 @@ def _send_message(
 ) -> str:
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.response_sanitizer import sanitize_user_visible_reply
+    from nullion.turn_context_policy import build_turn_tool_evidence, scoped_turn_tool_registry
+
+    turn_tool_registry = scoped_turn_tool_registry(
+        registry,
+        evidence=build_turn_tool_evidence(
+            user_message=message,
+            conversation_result=None,
+        ),
+        model_client=getattr(orchestrator, "model_client", None),
+        user_message=message,
+    )
 
     result = orchestrator.run_turn(
         conversation_id=conversation_id,
         principal_id=conversation_id,
         user_message=message,
         conversation_history=history or [],
-        tool_registry=registry,
+        tool_registry=turn_tool_registry,
         policy_store=runtime.store,
         approval_store=runtime.store,
     )

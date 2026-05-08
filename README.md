@@ -146,8 +146,9 @@ bash install.sh
 - Global Doctor for health checks and safe recovery
 - Global Sentinel for approval, boundary policy, and grant management
 - Workspace-scoped approvals, crons, grants, and member connections
-- Validated planner task cards, optional activity traces, and thinking summaries
-- Builder proposals for reusable skills and compacted memory
+- Validated planner task cards, separate verbose activity traces, and thinking summaries
+- Builder proposals for reusable skills, compacted memory, and optional
+  capability dependencies
 
 ## Launch feature summary
 
@@ -167,18 +168,25 @@ bash install.sh
 - **Workspace ownership** — approvals, scheduled jobs, provider connections,
   delivery targets, memory, and grants stay attached to the initiating
   workspace or operator instead of leaking across users.
-- **Visible planning and artifacts** — Verbose modes can show activity traces,
-  planner task cards, compact tool outcomes, Builder/Doctor checkpoints, and
-  generated image/file artifacts without
-  dumping raw tracebacks into user-facing channels.
+- **Visible planning and artifacts** — Planner cards show planned work by default
+  and stay separate from verbose mode. Verbose is only on/off for activity
+  details; when the planner feed is off, supported chat surfaces still show the
+  planner header/request/task rows without the activity section. Requested
+  artifacts are surfaced as the requested format, without dumping intermediate
+  files used to build them.
+- **Faster normal chat** — independent turns can continue in parallel while
+  linked follow-ups wait only when typed task state says they should. Tool
+  results are compacted before returning to the model so large payloads do not
+  swamp the next response.
 - **Delivery as a contract** — message-only tasks finish when the reply is
   delivered; attachment tasks finish only when the requested file exists and is
   surfaced as a web download or messaging attachment.
 - **Self-healing runtime** — Doctor probes adapters, plugins, scheduler,
   database, browser backend, model client, and warm-pool capacity, then retries
   safe recovery before escalating.
-- **Skills that improve with use** — Builder detects repeated workflows and
-  proposes versioned skills for review instead of silently mutating prompts.
+- **Skills and capabilities that improve with use** — Builder detects repeated
+  workflows and missing optional local packages, then proposes versioned skills
+  or dependency installs for review instead of silently mutating prompts.
 - **Local-first state** — runtime data, history, memory, skills, schedules,
   grants, and audit records stay under the local Nullion data directory.
 
@@ -221,13 +229,15 @@ Useful commands:
 /tools
 /verbose status
 /thinking status
+/planner <message>
+/stop
 ```
 
 Env-based setup:
 
 ```bash
 NULLION_ENABLED_PLUGINS=search_plugin,browser_plugin,workspace_plugin,media_plugin
-NULLION_PROVIDER_BINDINGS=search_plugin=builtin_search_provider,media_plugin=local_media_provider
+NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider,media_plugin=local_media_provider
 NULLION_BROWSER_ENABLED=true
 NULLION_BROWSER_BACKEND=auto
 NULLION_WORKSPACE_ROOT=/Users/you/Projects
@@ -240,6 +250,12 @@ NULLION_IMAGE_OCR_COMMAND='tesseract {input} stdout'
 
 See `docs/plugins.md` for the catalog, installer UX, disable/reconfigure
 guidance, and plugin-author documentation.
+
+Public web research uses API-backed search only when the configured provider
+has credentials. Without a Brave, Google Custom Search, or Perplexity key,
+Nullion falls back to browser navigation, page extraction, and screenshots.
+Set `NULLION_DIRECT_WEB_FETCH_ENABLED=true` only when you explicitly want the
+direct fetch path registered.
 
 ## Skill Packs
 
@@ -400,14 +416,16 @@ consume the same Telegram updates.
 - plain text — when `NULLION_TELEGRAM_CHAT_ENABLED=true`, routed to the Nullion Assistant
 - `/help` — list available commands
 - `/chat <message>` — send a message through the Nullion Assistant
-- `/verbose [off|planner|full|status]` — choose activity trace and planner task-card visibility
+- `/verbose [on|off|status]` — show or hide activity details during chat runs
 - `/thinking [on|off|status]` — show or hide provider reasoning summaries separately from final replies
+- `/planner <message>` — run a message through the explicit step-by-step planner path
 - `/approvals [status=pending|approved|denied|all]` — list approval requests
 - `/approve <id>` / `/deny <id>` — approve or deny a request
 - `/grants` — list permission grants
 - `/revoke-grant <id>` — revoke a grant
 - `/proposals` / `/accept-proposal <id>` / `/reject-proposal <id>` — manage Builder skill proposals
 - `/skills` / `/skill <id>` / `/skill-history <id>` — browse saved skills
+- `/stop` — stop active work in the current session
 - `/ping` / `/version` / `/health` / `/uptime` / `/status` — liveness and status
 - `/backups` / `/restore [latest|<generation>]` — checkpoint management
 - `/system-context` / `/codebase` / `/tools` — runtime introspection

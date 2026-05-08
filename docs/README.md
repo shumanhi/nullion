@@ -5,9 +5,10 @@ to the model provider you choose, and can use approved tools for web research,
 local files, browser automation, media processing, scheduled work, and preview
 account connectors. Current builds include workspace-scoped approvals and
 scheduled jobs, platform-aware delivery routing, validated planner task cards,
-thinking-summary controls, LangChain model/tool adapters, LangGraph turn routing
-and delivery workflows, Deep Agents mini-agent execution, model fallback
-settings, default PDF/document skill packs, and cleaner activity traces.
+separate verbose activity controls, LangChain model/tool adapters, LangGraph
+turn routing and delivery workflows, Deep Agents mini-agent execution, model
+fallback settings, default PDF/document skill packs, Builder-managed capability
+dependencies, browser-backed web research fallback, and cleaner activity traces.
 
 This docs folder is written for a mixed audience:
 
@@ -41,16 +42,22 @@ Core systems:
 - Recovery control plane for service restart, config snapshots, runtime restore,
   and Telegram takeover when the normal adapter is down
 - Builder skill proposals, learned skills, and memory compaction
+- Builder-reviewed capability dependency proposals for local document,
+  spreadsheet, PDF, image, presentation, and audio workflows
 - LangChain adapters that expose Nullion tools as structured tools and wrap
   configured model clients as chat models
 - Warm mini-agents and Deep Agents for bounded parallel work
 - LangGraph-backed turn routing for independent parallel work versus dependent follow-ups
+- Typed turn-scope policy that hides web, scheduler, connector, and artifact
+  tools unless URL, attachment, file-extension, task-frame, or structured-plan
+  evidence grants that scope
 - LangGraph workflows for approval decisions, artifact handling, attachment
   formatting, and platform delivery
 - File/PDF delivery contracts across web, Telegram, Slack, and Discord
-- Validated DAG planning with optional planner task cards in chat surfaces
-- User-facing observability controls for Verbose modes, compact tool outcomes,
-  planner task cards, generated artifacts, and reasoning summaries
+- Validated DAG planning with planner task cards in chat surfaces
+- User-facing observability controls for verbose activity details, compact tool
+  outcomes, planner task cards, generated artifacts, and reasoning summaries
+- Per-session stop/cancel handling through `/stop`
 - Local runtime state, history, schedules, grants, skills, and audit records
 
 Capability status:
@@ -122,6 +129,8 @@ bash install.sh
 /tools
 /verbose
 /thinking
+/planner <message>
+/stop
 /plugins
 /skill-packs
 /backups
@@ -167,8 +176,8 @@ runtime.
   grant real account access.
 - `support.md` gives first-response troubleshooting steps.
 - `runtime-persistence.md` covers local runtime checkpoint behavior.
-- The online docs at `website/docs/index.html` include the v0.2 delivery,
-  routing, and fresh-install notes shown on https://nullion.ai/docs/.
+- The online docs at `website/docs/index.html` mirror the current website copy
+  shown on https://nullion.ai/docs/.
 - `operations/recovery-control-plane.md` covers break-glass recovery,
   config snapshots, service restarts, and Telegram takeover mode.
 - `operations/telegram-operator-runbook.md` covers Telegram operations.
@@ -206,3 +215,33 @@ The same idea is used across web, Telegram, Slack, and Discord:
 - prefer requested formats such as `.pdf`, `.docx`, `.xlsx`, `.csv`, or images
 - strip raw local paths from messaging captions when the platform attaches the file
 - leave the task active or report failure when a required attachment is missing
+
+## Planner, activity, and background work
+
+Planner cards and verbose activity are separate controls. The Planner card
+setting controls whether supported chat surfaces show the request summary and
+task checklist. Verbose controls the extra activity feed below that card.
+
+Use `/planner <message>` when you want a request to run through the explicit
+step-by-step planner path. It is not a visibility toggle; it starts a planned
+task using the message that follows the command.
+
+![Nullion web console showing planner cards, activity, generated artifacts, approvals, schedules, and runtime controls](https://www.nullion.ai/assets/nullion-web-console-real.png)
+
+When background tasks are enabled, independent turns can run without blocking a
+new message. Follow-ups wait only when the typed turn dispatcher links them to
+an active task frame or prior turn. The dispatcher uses structured runtime
+evidence such as task state, attachments, URLs, file extensions, UI actions,
+tool schemas, and model-produced structured plans, not prompt-word matching.
+
+If a run should stop, `/stop` cancels active work in the current session and
+marks the active task frame cancelled when possible.
+
+## Capability dependencies
+
+Some local artifact workflows need optional Python packages. Settings ->
+Learning and planning -> Capability dependencies shows the supported catalog
+and creates Builder proposal cards before installing packages. Built-in
+catalog entries include pandas, openpyxl, Pillow, pypdf, python-docx,
+python-pptx, and soundfile. Custom PyPI or GitHub package requests also create
+a reviewable Builder proposal instead of installing silently.
