@@ -224,6 +224,31 @@ def _completed_tool_evidence_reply(tool_results: Iterable[ToolResult] | None) ->
     return None
 
 
+def _missing_dependency_reply(tool_results: Iterable[ToolResult] | None) -> str | None:
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) == "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("reason") != "missing_dependency":
+            continue
+        package = str(output.get("package") or output.get("dependency") or "").strip()
+        if not package:
+            continue
+        license_name = str(output.get("license") or "").strip()
+        install_command = str(output.get("install_command") or "").strip()
+        tool_name = str(getattr(result, "tool_name", "") or "tool").strip()
+        lines = [
+            f"I need the open-source `{package}` package before I can create this file with `{tool_name}`.",
+        ]
+        if license_name:
+            lines.append(f"License: {license_name}.")
+        if install_command:
+            lines.append(f"Install command: `{install_command}`.")
+        lines.append("Please approve installing it, then I can retry the file delivery.")
+        return "\n".join(lines)
+    return None
+
+
 def evaluate_response_fulfillment(
     *,
     store,

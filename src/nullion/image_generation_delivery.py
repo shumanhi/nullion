@@ -12,6 +12,7 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from nullion.artifacts import artifact_path_for_generated_workspace_file
+from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
 
 
@@ -65,7 +66,7 @@ def _friendly_image_generation_error(error: str | None) -> str:
         "local_media_provider requires NULLION_IMAGE_GENERATE_COMMAND" in detail
         or detail == "image_generate provider is not configured"
     ):
-        return "Image generation is not configured. Enable an image generation provider in Settings."
+        return f"Image generation is not configured.\n\n{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}"
     return detail or "Image generation provider failed."
 
 
@@ -120,7 +121,7 @@ def _image_artifact_prepare_node(state: _ImageArtifactWorkflowState) -> dict[str
         return {
             "result": ImageGenerationDeliveryResult(
                 matched=True,
-                error="Image generation is not configured. Enable the media plugin and image provider in Settings.",
+                error=f"Image generation is not configured.\n\n{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}",
             )
         }
     if registry is None:

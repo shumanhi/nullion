@@ -5,6 +5,28 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from urllib.parse import urlsplit
+
+
+@dataclass(frozen=True)
+class BrowserScreenshotResult:
+    data: bytes
+    mode: str
+    requested_mode: str
+    viewport_width: int | None = None
+    viewport_height: int | None = None
+    document_width: int | None = None
+    document_height: int | None = None
+    is_clipped: bool = False
+
+
+def auto_screenshot_uses_full_page(current_url: str | None, exceeds_viewport: bool) -> bool:
+    """Choose full-page capture for local/document artifacts, not normal websites."""
+
+    if not exceeds_viewport:
+        return False
+    scheme = urlsplit(str(current_url or "")).scheme.lower()
+    return scheme not in {"http", "https"}
 
 
 class BrowserBackend(Protocol):
@@ -14,7 +36,7 @@ class BrowserBackend(Protocol):
     async def click(self, session_id: str, selector: str) -> None: ...
     async def type_text(self, session_id: str, selector: str, text: str) -> None: ...
     async def extract_text(self, session_id: str, selector: str | None) -> str: ...
-    async def screenshot(self, session_id: str) -> bytes: ...
+    async def screenshot(self, session_id: str, mode: str = "auto") -> BrowserScreenshotResult: ...
     async def scroll(self, session_id: str, direction: str, amount: int) -> None: ...
     async def wait_for(
         self, session_id: str, selector: str | None, url_pattern: str | None, timeout: float

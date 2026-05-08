@@ -34,7 +34,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Any, Mapping, TypedDict
+from typing import Any, Iterable, Mapping, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
@@ -73,6 +73,10 @@ _VOLATILE_MEMORY_KEY_PARTS = frozenset(
         "failure",
         "job",
         "jobs",
+        "metric",
+        "metrics",
+        "monitor",
+        "monitors",
         "pending",
         "reminder",
         "reminders",
@@ -80,6 +84,8 @@ _VOLATILE_MEMORY_KEY_PARTS = frozenset(
         "runs",
         "runtime",
         "schedule",
+        "scheduled",
+        "scheduler",
         "state",
         "status",
         "unavailable",
@@ -90,26 +96,38 @@ _CRON_EXPRESSION_RE = re.compile(
     r"(?:\*|\d{1,2}|\*/\d{1,2}|\d{1,2}-\d{1,2}|\d{1,2},\d{1,2})){4}(?!\S)"
 )
 _ISO_DATETIME_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b")
+_EMAIL_ADDRESS_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_OPERATIONAL_MEMORY_VALUE_RE = re.compile(
+    r"\b(?:"
+    r"audience metrics|can be triggered on request|configured destination|delivery saves|failed metric sources|"
+    r"gh api|list_crons|public awareness|run_cron|scheduled cron|scheduled monitor|scheduled task|"
+    r"traffic metrics|web scraping"
+    r")\b",
+    re.I,
+)
+_OPERATIONAL_BUILDER_TOOL_NAMES = frozenset(
+    {
+        "create_cron",
+        "delete_cron",
+        "delete_reminder",
+        "disable_cron",
+        "enable_cron",
+        "list_crons",
+        "list_reminders",
+        "pause_cron",
+        "resume_cron",
+        "run_cron",
+        "set_reminder",
+        "toggle_cron",
+        "update_cron",
+        "update_reminder",
+    }
+)
 _VOLATILE_HEX_TOKEN_RE = re.compile(
     rf"\b(?=[a-f0-9]*[a-f])[a-f0-9]{{{MIN_VOLATILE_HEX_TOKEN},}}\b"
     rf"|\b[a-z]+-(?=[a-f0-9]*[a-f])[a-f0-9]{{6,}}\b",
     re.I,
 )
-_RUNTIME_PATH_TOKEN_RE = re.compile(
-    r"(?:^|[\s`\"'])"
-    r"(?:~/(?:\.nullion(?:-(?:test|stage))?)|(?:/[\w .-]+)+/\.nullion(?:-(?:test|stage))?)"
-    r"(?:\b|/)",
-    re.I,
-)
-_RUNTIME_STATE_TOKEN_RE = re.compile(
-    r"(?:\.git/HEAD|\bruntime\.db\b|\bconnections\.json\b|\bcrons\.json\b)",
-    re.I,
-)
-_GENERATED_FILE_TOKEN_RE = re.compile(
-    r"\b[\w.-]+\.(?:csv|docx?|gif|html?|jpe?g|json|md|mp3|mp4|pdf|png|pptx?|rtf|svg|txt|webp|xlsx?|xml|zip)\b",
-    re.I,
-)
-_GENERATED_FILE_KEY_PARTS = frozenset({"artifact", "artifacts", "file", "files", "report", "reports", "tracker"})
 
 
 @dataclass(slots=True)
@@ -760,6 +778,41 @@ def is_durable_memory_entry(entry: UserMemoryEntry) -> bool:
     )
 
 
+def _tool_result_name(tool_result: Any) -> str:
+    if isinstance(tool_result, str):
+        return tool_result.strip()
+    if isinstance(tool_result, Mapping):
+        return str(tool_result.get("tool_name") or tool_result.get("name") or "").strip()
+    return str(
+        getattr(tool_result, "tool_name", None)
+        or getattr(tool_result, "name", None)
+        or ""
+    ).strip()
+
+
+def should_skip_builder_reflection_for_tool_results(
+    *,
+    tool_names: Iterable[str] | None = None,
+    tool_results: Iterable[Any] | None = None,
+) -> bool:
+    """Return true for turns made only of scheduler control tools.
+
+    The Builder learns durable user/project memory and reusable workflows. Cron
+    and reminder controls are operational state, so tool-backed scheduler turns
+    should stay out of Builder reflection even when their final answer is useful.
+    """
+    names: set[str] = set()
+    for name in tool_names or ():
+        normalized = str(name or "").strip()
+        if normalized:
+            names.add(normalized)
+    for result in tool_results or ():
+        normalized = _tool_result_name(result)
+        if normalized:
+            names.add(normalized)
+    return bool(names) and names <= _OPERATIONAL_BUILDER_TOOL_NAMES
+
+
 def reinforce_memory_entries(store, entries: list[UserMemoryEntry]) -> int:
     if not entries:
         return 0
@@ -857,7 +910,7 @@ def _parse_turn_memory_entries(raw: str, *, policy: MemoryPolicy | None = None) 
             kind = UserMemoryKind(str(item.get("kind") or "fact"))
         except ValueError:
             kind = UserMemoryKind.FACT
-        content_type = str(item.get("content_type") or "").strip().lower()
+        content_type = str(item.get("content_type") or "durable_memory").strip().lower()
         if content_type != "durable_memory":
             continue
         if per_kind_seen[kind] >= policy.limit_for_kind(kind):
@@ -882,10 +935,6 @@ def _is_structurally_durable_memory(key: str, value: str) -> bool:
         return False
     if any(part in _VOLATILE_MEMORY_KEY_PARTS for part in key_parts):
         return False
-    if _has_runtime_storage_value(value):
-        return False
-    if _has_generated_file_observation(key_parts, value):
-        return False
     if _has_long_digit_run(value):
         return False
     if _has_runtime_shaped_token(value):
@@ -893,6 +942,10 @@ def _is_structurally_durable_memory(key: str, value: str) -> bool:
     if _has_cron_expression(value):
         return False
     if _has_iso_datetime(value):
+        return False
+    if _has_email_address(value):
+        return False
+    if _has_operational_memory_value(value):
         return False
     return True
 
@@ -913,22 +966,20 @@ def _has_runtime_shaped_token(value: str) -> bool:
     return bool(_VOLATILE_HEX_TOKEN_RE.search(value))
 
 
-def _has_runtime_storage_value(value: str) -> bool:
-    return bool(_RUNTIME_PATH_TOKEN_RE.search(value) or _RUNTIME_STATE_TOKEN_RE.search(value))
-
-
-def _has_generated_file_observation(key_parts: list[str], value: str) -> bool:
-    if not any(part in _GENERATED_FILE_KEY_PARTS for part in key_parts):
-        return False
-    return bool(_GENERATED_FILE_TOKEN_RE.search(value))
-
-
 def _has_cron_expression(value: str) -> bool:
     return bool(_CRON_EXPRESSION_RE.search(value))
 
 
 def _has_iso_datetime(value: str) -> bool:
     return bool(_ISO_DATETIME_RE.search(value))
+
+
+def _has_email_address(value: str) -> bool:
+    return bool(_EMAIL_ADDRESS_RE.search(value))
+
+
+def _has_operational_memory_value(value: str) -> bool:
+    return bool(_OPERATIONAL_MEMORY_VALUE_RE.search(value))
 
 
 def _parse_json_object(raw: str) -> dict[str, object]:
@@ -1065,6 +1116,7 @@ __all__ = [
     "memory_policy_from_env",
     "reinforce_memory_entries",
     "select_memory_entries_for_prompt",
+    "should_skip_builder_reflection_for_tool_results",
     "smart_cleanup_enabled",
     "smart_cleanup_owner_memory",
 ]

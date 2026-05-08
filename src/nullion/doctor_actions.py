@@ -105,6 +105,13 @@ def transition_action_status(
     reason: str | None = None,
     error: str | None = None,
 ) -> DoctorAction:
+    if new_status == action.status:
+        if new_status == CANCELLED and reason is not None and reason.strip():
+            return replace(action, reason=reason, error=None)
+        if new_status == FAILED and error is not None and error.strip():
+            return replace(action, error=error)
+        return action
+
     allowed_next = _ALLOWED_TRANSITIONS[action.status]
     if new_status not in allowed_next:
         raise ValueError(f"Invalid status transition: {action.status} -> {new_status}")

@@ -11,15 +11,23 @@ TASK_STATUS_RUNNING = "◐"
 TASK_STATUS_COMPLETE = "☑"
 TASK_STATUS_FAILED = "✕"
 TASK_STATUS_CANCELLED = "⊘"
-TASK_STATUS_BLOCKED = "▣"
+TASK_STATUS_BLOCKED = "☐"
 TASK_STATUS_WAITING_INPUT = "▤"
 TASK_STATUS_SUBLIST_PREFIX = ""
+DEFAULT_TASK_STATUS_SUBJECT_LIMIT = 120
+
+
+def compact_task_status_subject(subject: str, *, limit: int = DEFAULT_TASK_STATUS_SUBJECT_LIMIT) -> str:
+    text = " ".join(str(subject or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
 
 
 def task_status_glyph(status: TaskStatus | str | None) -> str:
     normalized = status.value if isinstance(status, TaskStatus) else str(status or "").strip().lower()
     if normalized == TaskStatus.QUEUED.value:
-        return TASK_STATUS_RUNNING
+        return TASK_STATUS_PENDING
     if normalized == TaskStatus.RUNNING.value:
         return TASK_STATUS_RUNNING
     if normalized == TaskStatus.COMPLETE.value:
@@ -51,6 +59,7 @@ def format_task_status_summary(
     tasks: Iterable[TaskRecord],
     *,
     planner_summary: str = "",
+    subject: str = "",
     status_lines: dict[str, str] | None = None,
     default_status: TaskStatus | str | None = None,
 ) -> str:
@@ -58,6 +67,9 @@ def format_task_status_summary(
     lines: list[str] = []
     if planner_summary:
         lines.append(f"Planner: {planner_summary}")
+    subject_text = compact_task_status_subject(subject)
+    if subject_text:
+        lines.append(f"For: {subject_text}")
     count_label = f"{len(task_list)} task{'s' if len(task_list) != 1 else ''}"
     if planner_summary.lower().startswith("parallel mission"):
         lines.append(f"→ Running {count_label} in parallel:")
@@ -99,6 +111,7 @@ __all__ = [
     "TASK_STATUS_RUNNING",
     "TASK_STATUS_SUBLIST_PREFIX",
     "TASK_STATUS_WAITING_INPUT",
+    "compact_task_status_subject",
     "format_task_status_activity_detail",
     "format_task_status_line",
     "format_task_status_summary",

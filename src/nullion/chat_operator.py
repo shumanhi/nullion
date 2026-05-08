@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import inspect
 import json
@@ -72,7 +72,12 @@ from nullion.memory import (
     memory_owner_for_messaging,
 )
 from nullion.mini_agent_routing import should_route_without_mini_agents
-from nullion.operator_commands import handle_operator_command, normalize_operator_command_head
+from nullion.operator_commands import (
+    handle_operator_command,
+    is_stop_command_text,
+    normalize_operator_command_head,
+    parse_planner_command,
+)
 from nullion.runtime import (
     PersistentRuntime,
     build_runtime_status_snapshot,
@@ -87,10 +92,14 @@ from nullion.run_activity import (
     format_skill_usage_activity_detail,
     format_tool_results_activity_detail,
     set_activity_trace_enabled,
-    set_task_planner_feed_mode,
     should_suppress_tool_activity,
-    task_planner_feed_mode,
     verbose_mode_status_text,
+)
+from nullion.session_stop import (
+    SessionStopResult,
+    cancel_active_task_frame,
+    cancel_orchestrator_conversation_sync,
+    stop_session_reply,
 )
 from nullion.thinking_display import (
     append_thinking_to_reply,
@@ -108,9 +117,19 @@ from nullion.skill_usage import (
     build_learned_skill_usage_hint,
 )
 from nullion.suspended_turns import SuspendedTurn
+from nullion.task_decomposer import TaskDecomposer
 from nullion.task_frames import TaskFrameStatus, TaskFrameOperation
 from nullion.task_planner import TaskPlanner
+from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
+from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
+from nullion.turn_context_policy import (
+    build_turn_tool_evidence,
+    scoped_turn_tool_registry,
+    should_include_prior_turn_messages,
+    tool_registry_allows_skill_pack_context,
+    turn_is_context_linked,
+)
 from nullion.users import (
     build_messaging_user_context_prompt,
     is_authorized_messaging_identity,
@@ -169,6 +188,13 @@ _SKILL_INJECT_MIN_SCORE = LEARNED_SKILL_INJECT_MIN_SCORE
 # Memory compaction: only run every N turns to avoid an LLM call each turn.
 _COMPACTION_CHECK_INTERVAL = 10
 _builder_turn_counter: int = 0
+
+
+def _is_internal_scheduled_task_context(text: object) -> bool:
+    stripped = str(text or "").lstrip()
+    return stripped.startswith("[Scheduled task: ") or stripped.startswith("[Manual scheduled task run: ")
+
+
 _ATTACHMENT_EXTENSION_LABELS: dict[str, str] = {
     ".csv": "CSV file",
     ".doc": "Word document",
@@ -225,7 +251,8 @@ def _is_explicit_approval_reply(message: str) -> bool:
 
 
 def _requested_attachment_extension(prompt: str, *, model_client: object | None = None) -> str | None:
-    return plan_attachment_format(prompt, model_client=model_client).extension
+    del model_client
+    return plan_attachment_format(prompt).extension
 
 
 
@@ -284,13 +311,7 @@ def activity_trace_status_text_for_chat(runtime: PersistentRuntime, *, chat_id: 
 
 
 def verbose_mode_status_text_for_chat(runtime: PersistentRuntime, *, chat_id: str | None) -> str:
-    activity_enabled = activity_trace_enabled_for_chat(runtime, chat_id=chat_id)
-    planner_enabled = task_planner_feed_mode() != "off"
-    if activity_enabled:
-        return "full"
-    if planner_enabled:
-        return "planner"
-    return "off"
+    return "on" if activity_trace_enabled_for_chat(runtime, chat_id=chat_id) else "off"
 
 
 def set_activity_trace_enabled_for_chat(runtime: PersistentRuntime, *, chat_id: str | None, enabled: bool) -> None:
@@ -308,15 +329,13 @@ def set_activity_trace_enabled_for_chat(runtime: PersistentRuntime, *, chat_id: 
 
 def set_verbose_mode_for_chat(runtime: PersistentRuntime | None, *, chat_id: str | None, mode: str) -> None:
     normalized = str(mode or "").strip().lower()
-    if normalized not in {"off", "planner", "full"}:
-        raise ValueError("verbose mode must be off, planner, or full")
-    activity_enabled = normalized == "full"
-    planner_mode = "task" if normalized in {"planner", "full"} else "off"
+    if normalized not in {"on", "off"}:
+        raise ValueError("verbose mode must be on or off")
+    activity_enabled = normalized == "on"
     if runtime is None:
         set_activity_trace_enabled(activity_enabled)
     else:
         set_activity_trace_enabled_for_chat(runtime, chat_id=chat_id, enabled=activity_enabled)
-    set_task_planner_feed_mode(planner_mode)
 
 
 def _session_chat_streaming_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
@@ -408,12 +427,12 @@ def _handle_verbose_command_for_chat(runtime: PersistentRuntime | None, message:
         status = verbose_mode_status_text_for_chat(runtime, chat_id=chat_id) if runtime is not None else verbose_mode_status_text()
         return f"Verbose mode is {status}."
     if len(parts) > 2:
-        return "Usage: /verbose [off|planner|full|status]"
+        return "Usage: /verbose [on|off|status]"
     value = parts[1].strip().lower()
     try:
         set_verbose_mode_for_chat(runtime, chat_id=chat_id, mode=value)
     except ValueError:
-        return "Usage: /verbose [off|planner|full|status]"
+        return "Usage: /verbose [on|off|status]"
     status = verbose_mode_status_text_for_chat(runtime, chat_id=chat_id) if runtime is not None else verbose_mode_status_text()
     return f"Verbose mode is {status}."
 
@@ -553,6 +572,9 @@ def _chat_prompt_for_message(message: str) -> str | None:
     stripped = message.strip()
     if not stripped:
         return None
+    planner_command = parse_planner_command(stripped)
+    if planner_command.requested:
+        return planner_command.prompt or None
     if stripped.startswith("/"):
         if _normalize_command_head(stripped) != "/chat":
             return None
@@ -1050,13 +1072,11 @@ def _memory_context_for_chat(
             if entry.key not in {existing.key for existing in entries}
         )
     try:
-        from nullion.builder_memory import reinforce_memory_entries, select_memory_entries_for_prompt
+        from nullion.builder_memory import select_memory_entries_for_prompt
 
         entries = select_memory_entries_for_prompt(entries)
-        if reinforce_memory_entries(runtime.store, entries):
-            runtime.checkpoint()
     except Exception:
-        logger.debug("Unable to reinforce chat memory entries", exc_info=True)
+        logger.debug("Unable to select chat memory entries", exc_info=True)
     return format_memory_context(entries)
 
 
@@ -1081,26 +1101,11 @@ def _remember_explicit_memory(
 
 
 def _should_include_conversation_context(result, thread: list[dict[str, str]]) -> bool:
-    if not thread:
-        return False
-    if result.turn.parent_turn_id is not None:
-        return True
-    continuation = getattr(result, "task_frame_continuation", None)
-    if continuation is None:
-        return False
-    return continuation.mode.value != "start_new"
+    return should_include_prior_turn_messages(result, has_prior_turns=bool(thread))
 
 
 def _should_include_recent_tool_context(result) -> bool:
-    continuation = getattr(result, "task_frame_continuation", None)
-    if continuation is not None and continuation.mode.value != "start_new":
-        return True
-    disposition = getattr(getattr(result, "turn", None), "disposition", None)
-    return disposition in {
-        ConversationTurnDisposition.CONTINUE,
-        ConversationTurnDisposition.REVISE,
-        ConversationTurnDisposition.BACKGROUND_FOLLOW_UP,
-    }
+    return should_include_prior_turn_messages(result, has_prior_turns=True)
 
 
 
@@ -1265,15 +1270,17 @@ def _chat_ambiguity_classifier(
 ):
     previous_user_message = _previous_user_message(thread)
     if (
-        not structured_followup_evidence
-        or model_client is None
+        model_client is None
         or not isinstance(previous_user_message, str)
         or not previous_user_message.strip()
     ):
         return None, None
+    _ = structured_followup_evidence
 
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
+            return None
+        if not structured_followup_evidence and not has_structured_turn_relationship_evidence(text):
             return None
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
@@ -1291,6 +1298,219 @@ def _chat_ambiguity_classifier(
         return None
 
     return classifier, "model_structured_turn_relationship"
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactFollowupContext:
+    artifact_paths: tuple[Path, ...]
+    source: str
+    source_turn_id: str | None = None
+    assistant_reply: str | None = None
+
+
+def _artifact_paths_from_reply_for_delivery(reply: object, *, principal_id: str | None) -> tuple[Path, ...]:
+    if not isinstance(reply, str) or not reply.strip():
+        return ()
+    try:
+        from nullion.messaging_adapters import prepare_reply_for_platform_delivery
+
+        delivery = prepare_reply_for_platform_delivery(reply, principal_id=principal_id)
+    except Exception:
+        return ()
+    return tuple(path for path in getattr(delivery, "attachments", ()) or () if isinstance(path, Path))
+
+
+def _artifact_paths_from_compact_tool_results(
+    tool_results: object,
+    *,
+    principal_id: str | None,
+    runtime: PersistentRuntime,
+) -> tuple[Path, ...]:
+    if not isinstance(tool_results, list):
+        return ()
+    raw_paths: list[str] = []
+    for result in tool_results:
+        if not isinstance(result, dict) or str(result.get("status") or "").strip().lower() != "completed":
+            continue
+        output = result.get("output")
+        if not isinstance(output, dict):
+            continue
+        for key in ("path", "artifact_path"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                raw_paths.append(value.strip())
+        for key in ("artifact_paths", "artifacts"):
+            value = output.get(key)
+            if isinstance(value, (list, tuple)):
+                raw_paths.extend(str(item).strip() for item in value if str(item).strip())
+    paths: list[Path] = []
+    for root in (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)):
+        for descriptor in artifact_descriptors_for_paths(tuple(raw_paths), artifact_root=root):
+            paths.append(Path(descriptor.path))
+    return tuple(dict.fromkeys(paths))
+
+
+def _latest_artifact_followup_context(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    principal_id: str | None,
+    branch_id: str | None = None,
+) -> _ArtifactFollowupContext | None:
+    try:
+        events = runtime.store.list_conversation_events(conversation_id)
+    except Exception:
+        events = []
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("event_type") != "conversation.chat_turn":
+            continue
+        event_branch_id = str(event.get("branch_id") or "").strip()
+        if branch_id and event_branch_id and event_branch_id != branch_id:
+            continue
+        reply = event.get("assistant_reply")
+        paths = [
+            *_artifact_paths_from_reply_for_delivery(reply, principal_id=principal_id),
+            *_artifact_paths_from_compact_tool_results(
+                event.get("tool_results"),
+                principal_id=principal_id,
+                runtime=runtime,
+            ),
+        ]
+        unique_paths = tuple(dict.fromkeys(path for path in paths if path.is_file()))
+        if unique_paths:
+            return _ArtifactFollowupContext(
+                artifact_paths=unique_paths,
+                source="conversation_artifact",
+                source_turn_id=str(event.get("turn_id") or "") or None,
+                assistant_reply=reply if isinstance(reply, str) else None,
+            )
+    return None
+
+
+def _extract_model_text(response: object) -> str:
+    if not isinstance(response, dict):
+        return ""
+    content = response.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+    return ""
+
+
+def _parse_json_object(text: object) -> dict[str, object] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            payload = json.loads(raw[start : end + 1])
+        except Exception:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _classify_artifact_followup_action(
+    *,
+    model_client: object | None,
+    current_message: str,
+    context: _ArtifactFollowupContext,
+) -> str:
+    create = getattr(model_client, "create", None)
+    if not callable(create):
+        return "continue_normally"
+    artifact_facts = [
+        {
+            "name": path.name,
+            "suffix": path.suffix.lower(),
+            "size_bytes": path.stat().st_size if path.is_file() else 0,
+        }
+        for path in context.artifact_paths[:5]
+    ]
+    system = (
+        "Classify a follow-up to a previous artifact delivery. Return only JSON with keys "
+        "action and confidence. action must be one of: resend_existing_artifact, continue_normally. "
+        "Use semantic understanding across languages. Choose resend_existing_artifact only when the "
+        "current message is asking to receive, retry, reattach, recover, or fix delivery of the same "
+        "existing artifact. Do not infer or create new artifacts. If the user asks a new question, asks "
+        "for a transformed file, or asks about artifact contents, choose continue_normally."
+    )
+    user = json.dumps(
+        {
+            "current_message": current_message,
+            "previous_artifacts": artifact_facts,
+            "previous_delivery_source": context.source,
+            "allowed_actions": ["resend_existing_artifact", "continue_normally"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    try:
+        response = create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": user}]}],
+            tools=[],
+            max_tokens=80,
+            system=system,
+        )
+    except Exception:
+        return "continue_normally"
+    payload = _parse_json_object(_extract_model_text(response))
+    if payload is None:
+        return "continue_normally"
+    action = str(payload.get("action") or "").strip().lower()
+    try:
+        confidence = float(payload.get("confidence", 0))
+    except Exception:
+        confidence = 0.0
+    if action == "resend_existing_artifact" and confidence >= 0.6:
+        return action
+    return "continue_normally"
+
+
+def _artifact_followup_resend_reply(context: _ArtifactFollowupContext) -> str:
+    media_lines = "\n".join(f"MEDIA:{path}" for path in context.artifact_paths)
+    if len(context.artifact_paths) == 1:
+        return f"Re-attaching the existing file.\n\n{media_lines}"
+    return f"Re-attaching the existing files.\n\n{media_lines}"
+
+
+def _maybe_handle_existing_artifact_followup(
+    runtime: PersistentRuntime,
+    *,
+    conversation_result,
+    conversation_id: str,
+    prompt: str,
+    principal_id: str | None,
+    model_client: object | None,
+) -> tuple[str, _ArtifactFollowupContext] | None:
+    if not turn_is_context_linked(conversation_result):
+        return None
+    context = _latest_artifact_followup_context(
+        runtime,
+        conversation_id=conversation_id,
+        principal_id=principal_id,
+        branch_id=str(getattr(getattr(conversation_result, "turn", None), "branch_id", "") or "") or None,
+    )
+    if context is None:
+        return None
+    action = _classify_artifact_followup_action(
+        model_client=model_client,
+        current_message=prompt,
+        context=context,
+    )
+    if action != "resend_existing_artifact":
+        return None
+    return _artifact_followup_resend_reply(context), context
 
 
 
@@ -1480,13 +1700,24 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
     artifact_root = artifact_root_for_principal(principal_id)
     legacy_artifact_root = artifact_root_for_runtime(runtime)
     workspace_storage_text = format_workspace_storage_for_prompt(principal_id=principal_id)
+    try:
+        from nullion.config import load_settings
+        from nullion.users import format_workspace_registry_for_prompt
+
+        workspace_registry_text = format_workspace_registry_for_prompt(settings=load_settings())
+    except Exception:
+        workspace_registry_text = None
     return (
         "Chat delivery contract:\n"
         f"- When the user asks you to send, attach, upload, or deliver a file, write it with file_write under this workspace artifact directory only: {artifact_root}\n"
         f"- Legacy artifact directory still supported for older turns: {legacy_artifact_root}\n"
         "- When the user asks for a PDF, use pdf_create for new PDFs or pdf_edit for PDF changes. Do not ask to install PDF tools or use terminal_exec for normal PDF creation/editing.\n"
+        "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, links, and existing image artifact paths. Do not use terminal_exec for normal spreadsheet creation.\n"
+        "- For typed .pptx or slide deck artifact requirements, use presentation_create with structured slides and existing image artifact paths. Do not use terminal_exec for normal presentation creation.\n"
         "- For ordinary saved files, use this user's workspace file folder.\n"
         f"{workspace_storage_text}\n"
+        + (f"{workspace_registry_text}\n" if workspace_registry_text else "")
+        + (
         "- Do not write deliverable files under arbitrary folders.\n"
         "- Do not create helper scripts, diagnostic scripts, or source-code files unless the user explicitly asks you to create code.\n"
         "- For read-only diagnostics, inspect with read-only commands and return the findings in chat instead of writing helper files.\n"
@@ -1494,17 +1725,31 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         "- Do not say the chat platform cannot attach files. Nullion will attach completed artifact files after your turn.\n"
         "- Never answer only 'Done', 'OK', or 'Completed'. Always include the requested answer, file status, or concrete result.\n"
         "- If a tool result has status denied or error, treat it as failed and ask for the needed approval or report the failure."
+        )
     )
 
 
-def _chat_capability_inventory_prompt(runtime: PersistentRuntime) -> str | None:
-    registry = getattr(runtime, "active_tool_registry", None)
+def _chat_capability_inventory_prompt(
+    runtime: PersistentRuntime,
+    *,
+    tool_registry: object | None = None,
+) -> str | None:
+    registry = tool_registry or getattr(runtime, "active_tool_registry", None)
     if registry is None:
         return None
     try:
+        from nullion.config import load_settings
+        from nullion.builder_capabilities import format_installed_dependency_context
         from nullion.system_context import build_system_context_snapshot, format_system_context_for_prompt
+        from nullion.web_research_policy import format_web_research_guidance
 
         caps_text = format_system_context_for_prompt(build_system_context_snapshot(tool_registry=registry))
+        web_research_text = format_web_research_guidance(tool_registry=registry, settings=load_settings())
+        if web_research_text:
+            caps_text = (caps_text + "\n\n" + web_research_text).strip()
+        dependency_text = format_installed_dependency_context(runtime)
+        if dependency_text:
+            caps_text = (caps_text + "\n\n" + dependency_text).strip()
     except Exception:
         logger.debug("Could not build chat capability inventory prompt", exc_info=True)
         return None
@@ -1513,9 +1758,9 @@ def _chat_capability_inventory_prompt(runtime: PersistentRuntime) -> str | None:
     return (
         "Live capability inventory:\n"
         "Use only the tools registered in this turn. If a capability-specific tool is unavailable, "
-        "say what is missing instead of trying to synthesize account access through terminal, file, "
-        "or web tools. External account data requires a matching provider-backed tool; connections "
-        "are references, not raw credentials.\n\n"
+        "fall back to the core local tools when the task can still be completed locally; only say what "
+        "is missing when no local path exists. External account data still requires a matching provider-"
+        "backed tool; connections are references, not raw credentials.\n\n"
         f"{caps_text}"
     )
 
@@ -1608,8 +1853,34 @@ def _append_chat_artifacts_to_reply(
         return reply
     attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
     visible_reply = f"Done — attached the requested {attachment_label}."
+    if _image_generation_setup_failed(tool_results):
+        visible_reply += (
+            "\n\nI created the images with a local fallback because API image generation is not configured.\n\n"
+            f"{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}"
+        )
     media_lines = [f"MEDIA:{descriptor.path}" for descriptor in descriptors]
     return "\n\n".join([visible_reply, "\n".join(media_lines)])
+
+
+def _image_generation_setup_failed(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    for result in tool_results or ():
+        if result.tool_name != "image_generate":
+            continue
+        if normalize_tool_status(result.status) not in {"failed", "denied"}:
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("reason") == "provider_not_configured":
+            return True
+        error = str(result.error or "")
+        if (
+            "local_media_provider requires NULLION_IMAGE_GENERATE_COMMAND" in error
+            or error == "image_generate provider is not configured"
+            or "image generation requires an API key" in error
+        ):
+            return True
+    return False
 
 
 def _reply_media_candidate_paths(reply: str) -> list[Path]:
@@ -1904,6 +2175,9 @@ def _remember_chat_turn(
             "event_type": "conversation.chat_turn",
             "created_at": now.isoformat(),
             "chat_id": chat_id,
+            "turn_id": turn_id,
+            "parent_turn_id": parent_turn_id,
+            "branch_id": branch_id,
             "user_message": user_message,
             "assistant_reply": assistant_reply,
             "tool_results": _compact_tool_results_for_context(tool_results),
@@ -1998,8 +2272,11 @@ def _generate_backend_reply(
     agent_orchestrator: object | None = None,
     chat_id: str | None = None,
     principal_id: str | None = None,
+    active_tool_registry: object | None = None,
+    allow_mini_agents: bool = False,
 ) -> str:
     reply_kwargs = {"message": prompt}
+    live_registry = active_tool_registry or runtime.active_tool_registry
     parameters = inspect.signature(generate_chat_reply).parameters
     if "attachments" in parameters and attachments:
         reply_kwargs["attachments"] = attachments
@@ -2008,9 +2285,9 @@ def _generate_backend_reply(
     if "memory_context" in parameters:
         reply_kwargs["memory_context"] = memory_context
     if "active_tool_registry" in parameters:
-        reply_kwargs["active_tool_registry"] = runtime.active_tool_registry
+        reply_kwargs["active_tool_registry"] = live_registry
     elif "live_tool_registry" in parameters:
-        reply_kwargs["live_tool_registry"] = runtime.active_tool_registry
+        reply_kwargs["live_tool_registry"] = live_registry
     if "policy_store" in parameters:
         reply_kwargs["policy_store"] = runtime.store
     if "approval_store" in parameters:
@@ -2024,7 +2301,9 @@ def _generate_backend_reply(
     effective_principal_id = principal_id or _principal_id_for_chat(chat_id, None)
     if "principal_id" in parameters:
         reply_kwargs["principal_id"] = effective_principal_id
-    if "live_tool_invoker" in parameters and runtime.active_tool_registry is not None:
+    if "allow_mini_agents" in parameters:
+        reply_kwargs["allow_mini_agents"] = allow_mini_agents
+    if "live_tool_invoker" in parameters and live_registry is not None:
         def live_tool_invoker(tool_name: str, arguments: dict[str, object]) -> ToolResult:
             return invoke_tool_with_boundary_policy(
                 runtime.store,
@@ -2035,7 +2314,7 @@ def _generate_backend_reply(
                     arguments=dict(arguments),
                     capsule_id=None,
                 ),
-                registry=runtime.active_tool_registry,
+                registry=live_registry,
             )
 
         reply_kwargs["live_tool_invoker"] = live_tool_invoker
@@ -2058,6 +2337,7 @@ def _execute_compound_chat_turn(
     model_client: object | None = None,
     agent_orchestrator: object | None = None,
     principal_id: str | None = None,
+    active_tool_registry: object | None = None,
     append_activity_trace: bool = True,
 ) -> str | None:
     parts = split_compound_intent(prompt)
@@ -2082,6 +2362,7 @@ def _execute_compound_chat_turn(
             agent_orchestrator=agent_orchestrator,
             chat_id=chat_id,
             principal_id=principal_id,
+            active_tool_registry=active_tool_registry,
         )
         replies.append(reply)
         tool_results.extend(part_tool_results)
@@ -2234,17 +2515,40 @@ def _try_builder_reflection(
     conversation_id: str,
     memory_owner: str | None = None,
     turn_disposition: ConversationTurnDisposition | None = None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    builder_learning_enabled: bool = True,
 ) -> None:
-    """Fire-and-forget Builder reflection after a completed turn.
+    """Run Builder reflection after a completed turn.
 
     Extracts a TurnSignal, appends it to the rolling window, checks for
     repeated patterns, and asks the LLM to propose a skill when warranted.
-    Errors are caught and logged at DEBUG level — never blocks the main turn.
+    Call through _schedule_builder_reflection so this never blocks delivery.
     """
+    if not builder_learning_enabled:
+        return
     if turn_disposition not in {None, ConversationTurnDisposition.INDEPENDENT}:
         return
+    if not tool_names and not (tool_results or ()):
+        return
+    try:
+        from nullion.builder_memory import should_skip_builder_reflection_for_tool_results
+
+        if should_skip_builder_reflection_for_tool_results(
+            tool_names=tool_names,
+            tool_results=tool_results,
+        ):
+            return
+    except Exception:
+        logger.debug("Builder scheduler-tool guard failed (non-fatal)", exc_info=True)
 
     try:
+        try:
+            from nullion.builder_capabilities import propose_missing_dependencies_from_tool_results
+
+            propose_missing_dependencies_from_tool_results(runtime, tool_results)
+        except Exception:
+            logger.debug("Builder dependency proposal failed (non-fatal)", exc_info=True)
+
         from uuid import uuid4 as _uuid4
 
         signal = extract_turn_signal(
@@ -2281,6 +2585,7 @@ def _try_builder_reflection(
                     owner=memory_owner,
                     user_message=user_message,
                     assistant_reply=assistant_reply,
+                    tool_results=list(tool_results or ()),
                 )
             except Exception:
                 logger.debug("Builder memory management failed (non-fatal)", exc_info=True)
@@ -2330,6 +2635,62 @@ def _try_builder_reflection(
         logger.debug("Builder reflection failed (non-fatal)", exc_info=True)
 
 
+def _schedule_builder_reflection(
+    runtime: PersistentRuntime,
+    agent_orchestrator: object,
+    *,
+    user_message: str,
+    assistant_reply: str | None,
+    tool_names: list[str],
+    tool_error_count: int,
+    outcome: TurnOutcome,
+    conversation_id: str,
+    memory_owner: str | None = None,
+    turn_disposition: ConversationTurnDisposition | None = None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    builder_learning_enabled: bool = True,
+) -> None:
+    if not builder_learning_enabled:
+        return
+    if turn_disposition not in {None, ConversationTurnDisposition.INDEPENDENT}:
+        return
+    if not tool_names and not (tool_results or ()):
+        return
+    try:
+        from nullion.builder_memory import should_skip_builder_reflection_for_tool_results
+
+        if should_skip_builder_reflection_for_tool_results(
+            tool_names=tool_names,
+            tool_results=tool_results,
+        ):
+            return
+    except Exception:
+        logger.debug("Builder scheduler-tool guard failed (non-fatal)", exc_info=True)
+
+    def _worker() -> None:
+        _try_builder_reflection(
+            runtime,
+            agent_orchestrator,
+            user_message=user_message,
+            assistant_reply=assistant_reply,
+            tool_names=tool_names,
+            tool_error_count=tool_error_count,
+            outcome=outcome,
+            conversation_id=conversation_id,
+            memory_owner=memory_owner,
+            turn_disposition=turn_disposition,
+            tool_results=tool_results,
+            builder_learning_enabled=builder_learning_enabled,
+        )
+
+    try:
+        from nullion.builder_background import schedule_builder_background_task
+
+        schedule_builder_background_task("chat-builder-reflection", _worker)
+    except Exception:
+        logger.debug("Unable to schedule chat Builder reflection", exc_info=True)
+
+
 def _build_skill_hint(runtime: PersistentRuntime, user_message: str) -> LearnedSkillUsageHint | None:
     """Return a learned-skill hint only for explicit structured skill selection."""
     try:
@@ -2371,6 +2732,21 @@ def _mini_agent_activity_detail(dispatch_result: object, task_count: int) -> str
         return task_detail
     task_titles = getattr(dispatch_result, "task_titles", ()) or ()
     return format_mini_agent_activity_detail(task_titles, task_count=task_count)
+
+
+def _conversation_dispatch_kwargs(turn_dispatch_decision: object | None) -> dict[str, object]:
+    if turn_dispatch_decision is None:
+        return {}
+    dependency_turn_ids = tuple(
+        str(dependency_id).strip()
+        for dependency_id in getattr(turn_dispatch_decision, "dependency_turn_ids", ()) or ()
+        if str(dependency_id).strip()
+    )
+    return {
+        "dispatch_disposition": getattr(turn_dispatch_decision, "disposition", None),
+        "dispatch_dependency_turn_ids": dependency_turn_ids,
+        "dispatch_reason": getattr(turn_dispatch_decision, "reason", None),
+    }
 
 
 def _task_titles_from_status_summary(summary: object) -> list[str]:
@@ -2418,8 +2794,12 @@ def _auto_accept_proposal(runtime: PersistentRuntime, proposal, *, source: str) 
         if record.status != "pending":
             # Duplicate or already resolved — skip
             return
-        skill = runtime.accept_stored_builder_skill_proposal(record.proposal_id, actor="builder_auto")
-        _NEWLY_LEARNED_SKILLS.setdefault(runtime, []).append(skill.title)
+        accept_result = runtime.accept_stored_builder_skill_proposal_result(record.proposal_id, actor="builder_auto")
+        skill = accept_result.skill
+        if accept_result.created:
+            titles = _NEWLY_LEARNED_SKILLS.setdefault(runtime, [])
+            if skill.title not in titles:
+                titles.append(skill.title)
         logger.info("Builder: auto-accepted skill %r (%s) from %s", skill.title, skill.skill_id, source)
     except Exception:
         logger.debug("Builder auto-accept failed (non-fatal)", exc_info=True)
@@ -2438,11 +2818,14 @@ def _render_chat_turn(
     agent_orchestrator: object | None = None,
     activity_callback: ActivityCallback | None = None,
     append_activity_trace: bool = True,
-    allow_mini_agents: bool = True,
+    allow_mini_agents: bool = False,
+    turn_dispatch_decision: object | None = None,
+    cancellation_checker: Callable[[], bool] | None = None,
 ) -> str:
     prompt = _chat_prompt_for_message(message)
     if prompt is None:
         return "Usage: /chat <message>"
+    planner_requested = parse_planner_command(message).requested
     principal_id = _principal_id_for_chat(chat_id, settings)
     approval_ids_before = _pending_approval_ids(runtime)
 
@@ -2460,7 +2843,7 @@ def _render_chat_turn(
     ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(
         thread,
         model_client=model_client,
-        structured_followup_evidence=ambiguity_fallback_reason is not None,
+        structured_followup_evidence=bool(attachments),
     )
     conversation_result = runtime.process_conversation_message(
         conversation_id=_conversation_id_for_chat(chat_id),
@@ -2473,7 +2856,49 @@ def _render_chat_turn(
         ambiguity_fallback_reason=ambiguity_fallback_reason,
         ambiguity_classifier=ambiguity_classifier,
         ambiguity_classifier_reason=ambiguity_classifier_reason,
+        **_conversation_dispatch_kwargs(turn_dispatch_decision),
     )
+
+    conversation_id = _conversation_id_for_chat(chat_id)
+    artifact_followup = _maybe_handle_existing_artifact_followup(
+        runtime,
+        conversation_result=conversation_result,
+        conversation_id=conversation_id,
+        prompt=prompt,
+        principal_id=principal_id,
+        model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+    )
+    if artifact_followup is not None:
+        reply, artifact_context = artifact_followup
+        if activity_callback is not None:
+            activity_callback({"id": "prepare", "label": "Preparing request", "status": "done"})
+            activity_callback({
+                "id": "artifact-delivery",
+                "label": "Reusing existing artifact",
+                "status": "done",
+                "detail": ", ".join(path.name for path in artifact_context.artifact_paths)[:140],
+            })
+        tool_result = ToolResult(
+            invocation_id=f"artifact-followup-{request_id or conversation_result.turn.turn_id}",
+            tool_name="artifact_delivery",
+            status="completed",
+            output={
+                "artifact_paths": [str(path) for path in artifact_context.artifact_paths],
+                "summary": "Re-attached existing artifact delivery.",
+            },
+        )
+        _remember_chat_turn(
+            runtime,
+            chat_id=chat_id,
+            user_message=prompt,
+            assistant_reply=reply,
+            conversation_turn_id=conversation_result.turn.turn_id,
+            tool_results=[tool_result],
+        )
+        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        runtime.checkpoint()
+        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply)
 
     conversation_context = _build_conversation_context(thread) if _should_include_conversation_context(conversation_result, thread) else None
     memory_context = _memory_context_for_chat(runtime, chat_id=chat_id, settings=settings)
@@ -2495,6 +2920,18 @@ def _render_chat_turn(
         chat_attachment_content_blocks(effective_prompt, normalized_attachments)
         if normalized_attachments
         else None
+    )
+    turn_tool_evidence = build_turn_tool_evidence(
+        user_message=effective_prompt,
+        conversation_result=conversation_result,
+        has_attachments=bool(normalized_attachments),
+        requested_extensions=requested_attachment_extensions,
+    )
+    active_turn_tool_registry = scoped_turn_tool_registry(
+        runtime.active_tool_registry or ToolRegistry(),
+        evidence=turn_tool_evidence,
+        model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+        user_message=effective_prompt,
     )
     screenshot_reply = _telegram_screenshot_reply_if_requested(
         runtime,
@@ -2523,7 +2960,7 @@ def _render_chat_turn(
     artifact_result = run_pre_chat_artifact_workflow(
         runtime,
         prompt=effective_prompt,
-        registry=runtime.active_tool_registry,
+        registry=active_turn_tool_registry,
         principal_id=principal_id,
         source_image_path=_first_source_image_path(normalized_attachments),
     )
@@ -2608,15 +3045,23 @@ def _render_chat_turn(
         if result.error:
             detail = str(result.error)
         elif isinstance(result.output, dict):
-            for key in ("reason", "summary", "message", "path", "url"):
-                value = result.output.get(key)
-                if value:
-                    detail = str(value)
-                    if key == "url":
-                        parsed = urlparse(detail)
-                        if parsed.netloc:
-                            detail = parsed.netloc
-                    break
+            if result.tool_name == "list_crons" and isinstance(result.output.get("crons"), list):
+                count = len(result.output.get("crons") or [])
+                detail = f"{count} scheduled task{'s' if count != 1 else ''}"
+            elif result.tool_name == "run_cron":
+                delivery_status = result.output.get("delivery_status")
+                if isinstance(delivery_status, str) and delivery_status.strip():
+                    detail = f"delivery {delivery_status.strip()[:80]}"
+            if detail is None:
+                for key in ("reason", "summary", "message", "path", "url"):
+                    value = result.output.get(key)
+                    if value:
+                        detail = str(value)
+                        if key == "url":
+                            parsed = urlparse(detail)
+                            if parsed.netloc:
+                                detail = parsed.netloc
+                        break
         elif isinstance(result.output, str) and result.output.strip():
             detail = result.output.strip()
         event = {
@@ -2630,7 +3075,6 @@ def _render_chat_turn(
     # Route all messages through the orchestrator when available (no heuristic pre-routing)
     if agent_orchestrator is not None:
         try:
-            planner = TaskPlanner()
             conversation_id = _conversation_id_for_chat(chat_id)
             active_task_frame_id = runtime.store.get_active_task_frame_id(conversation_id)
             active_task_frame = (
@@ -2638,26 +3082,30 @@ def _render_chat_turn(
                 if isinstance(active_task_frame_id, str) and active_task_frame_id
                 else None
             )
-            build_execution_plan = getattr(planner, "build_execution_plan", None)
-            if callable(build_execution_plan):
-                execution_plan = build_execution_plan(
-                    user_message=effective_prompt,
-                    principal_id=principal_id,
-                    active_task_frame=active_task_frame,
-                )
-            else:
-                mission = planner.plan(
-                    user_message=effective_prompt,
-                    principal_id=principal_id,
-                    active_task_frame=active_task_frame,
-                )
-                step_count = len(getattr(mission, "steps", ()) or ())
-                execution_plan = SimpleNamespace(
-                    mission=mission,
-                    can_dispatch_mini_agents=step_count > 1,
-                    can_run_mission=step_count > 1,
-                )
-            mission = execution_plan.mission
+            execution_plan = None
+            mission = None
+            if allow_mini_agents:
+                planner = TaskPlanner()
+                build_execution_plan = getattr(planner, "build_execution_plan", None)
+                if callable(build_execution_plan):
+                    execution_plan = build_execution_plan(
+                        user_message=effective_prompt,
+                        principal_id=principal_id,
+                        active_task_frame=active_task_frame,
+                    )
+                else:
+                    mission = planner.plan(
+                        user_message=effective_prompt,
+                        principal_id=principal_id,
+                        active_task_frame=active_task_frame,
+                    )
+                    step_count = len(getattr(mission, "steps", ()) or ())
+                    execution_plan = SimpleNamespace(
+                        mission=mission,
+                        can_dispatch_mini_agents=step_count > 1,
+                        can_run_mission=step_count > 1,
+                    )
+                mission = execution_plan.mission
             # Build proper message history: system (memory only) + actual turn pairs.
             # Conversation context must be structured as real user/assistant messages,
             # NOT as text in the system prompt — otherwise the model treats it as
@@ -2667,7 +3115,10 @@ def _render_chat_turn(
                 "role": "system",
                 "content": [{"type": "text", "text": _chat_delivery_contract_prompt(runtime, principal_id=principal_id)}],
             })
-            _capability_inventory = _chat_capability_inventory_prompt(runtime)
+            _capability_inventory = _chat_capability_inventory_prompt(
+                runtime,
+                tool_registry=active_turn_tool_registry,
+            )
             if _capability_inventory:
                 orchestrator_conversation_history.append({
                     "role": "system",
@@ -2702,7 +3153,11 @@ def _render_chat_turn(
                         "role": "system",
                         "content": [{"type": "text", "text": _user_context_text}],
                     })
-                _skill_pack_text = _enabled_skill_pack_prompt(settings)
+                _skill_pack_text = (
+                    _enabled_skill_pack_prompt(settings)
+                    if tool_registry_allows_skill_pack_context(active_turn_tool_registry)
+                    else None
+                )
                 if _skill_pack_text:
                     orchestrator_conversation_history.append({
                         "role": "system",
@@ -2736,15 +3191,16 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": recent_tool_context}],
                 })
-            for past_turn in thread:
-                orchestrator_conversation_history.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": past_turn["user"]}],
-                })
-                orchestrator_conversation_history.append({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": past_turn["assistant"]}],
-                })
+            if _should_include_conversation_context(conversation_result, thread):
+                for past_turn in thread:
+                    orchestrator_conversation_history.append({
+                        "role": "user",
+                        "content": [{"type": "text", "text": past_turn["user"]}],
+                    })
+                    orchestrator_conversation_history.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": past_turn["assistant"]}],
+                    })
             # Skill injection: if a stored skill matches the current message well,
             # prepend its steps as a system-level procedure hint so the LLM follows
             # the learned workflow instead of starting from scratch.
@@ -2766,16 +3222,43 @@ def _render_chat_turn(
             reply = "Done."
             turn_outcome = TurnOutcome.SUCCESS
             thinking_text: str | None = None
+            dispatch_dag_plan = None
+            dispatch_available_tools: list[str] | None = None
             if (
-                execution_plan.can_dispatch_mini_agents
-                and _feature_enabled("NULLION_TASK_DECOMPOSITION_ENABLED")
+                _feature_enabled("NULLION_TASK_DECOMPOSITION_ENABLED")
                 and _feature_enabled("NULLION_MULTI_AGENT_ENABLED")
                 and hasattr(agent_orchestrator, "dispatch_request_sync")
                 and not normalized_attachments
                 and allow_mini_agents
+                and (planner_requested or not requested_attachment_extensions)
                 and not should_route_without_mini_agents(effective_prompt, has_attachments=bool(normalized_attachments))
             ):
-                planned_task_titles = _mission_step_titles(mission)
+                model_for_dispatch = getattr(agent_orchestrator, "model_client", None)
+                if model_for_dispatch is not None:
+                    dispatch_available_tools = [
+                        str(tool.get("name", ""))
+                        for tool in active_turn_tool_registry.list_tool_definitions()
+                        if tool.get("name")
+                    ]
+                    dispatch_dag_plan = TaskDecomposer(model_client=model_for_dispatch).plan_dag(
+                        effective_prompt,
+                        available_tools=dispatch_available_tools,
+                    )
+            if (
+                dispatch_dag_plan is not None
+                and (
+                    getattr(dispatch_dag_plan, "can_dispatch", False)
+                    or (
+                        planner_requested
+                        and getattr(dispatch_dag_plan, "can_dispatch_when_requested", False)
+                    )
+                )
+            ):
+                planned_task_titles = [
+                    task.title.strip()
+                    for task in dispatch_dag_plan.tasks
+                    if isinstance(getattr(task, "title", None), str) and task.title.strip()
+                ] or _mission_step_titles(mission)
                 if activity_callback is not None:
                     activity_callback({
                         "id": "mini-agents",
@@ -2790,10 +3273,12 @@ def _render_chat_turn(
                     conversation_id=conversation_id,
                     principal_id=principal_id,
                     user_message=effective_prompt,
-                    tool_registry=runtime.active_tool_registry or ToolRegistry(),
+                    tool_registry=active_turn_tool_registry,
                     policy_store=runtime.store,
                     approval_store=runtime.store,
+                    available_tools=dispatch_available_tools,
                     single_task_fast_path=False,
+                    dag_plan=dispatch_dag_plan,
                 )
                 if getattr(dispatch_result, "dispatched", True):
                     task_count = int(getattr(dispatch_result, "task_count", 0) or len(mission.steps))
@@ -2837,6 +3322,7 @@ def _render_chat_turn(
                             output={
                                 "summary": f"Dispatched {task_count} helper task(s).",
                                 "tasks": dispatched_task_titles,
+                                "status_delivered": bool(getattr(dispatch_result, "status_delivered", False)),
                             },
                         )
                     ]
@@ -2852,9 +3338,18 @@ def _render_chat_turn(
                         })
                     handled_by_mini_agents = True
                     suppress_runtime_nudges = True
+            elif dispatch_dag_plan is not None:
+                logger.debug(
+                    "Chat mini-agent structured planner declined dispatch: disposition=%s valid=%s errors=%s",
+                    getattr(dispatch_dag_plan, "disposition", None),
+                    getattr(dispatch_dag_plan, "is_valid", None),
+                    getattr(dispatch_dag_plan, "validation_errors", None),
+                )
 
             if (
                 not handled_by_mini_agents
+                and allow_mini_agents
+                and execution_plan is not None
                 and execution_plan.can_run_mission
                 and _feature_enabled("NULLION_TASK_DECOMPOSITION_ENABLED")
             ):
@@ -2863,7 +3358,7 @@ def _render_chat_turn(
                     conversation_id=conversation_id,
                     principal_id=principal_id,
                     conversation_history=orchestrator_conversation_history,
-                    tool_registry=runtime.active_tool_registry or ToolRegistry(),
+                    tool_registry=active_turn_tool_registry,
                     policy_store=runtime.store,
                     approval_store=runtime.store,
                     runtime_store=runtime.store,
@@ -2911,8 +3406,8 @@ def _render_chat_turn(
                     )
                     if attachment_failure is not None:
                         reply = attachment_failure
-                # Builder: reflect on the whole mission as a single compound turn
-                _try_builder_reflection(
+                # Builder: observe the whole mission as a single compound turn without blocking delivery.
+                _schedule_builder_reflection(
                     runtime,
                     agent_orchestrator,
                     user_message=effective_prompt,
@@ -2924,6 +3419,7 @@ def _render_chat_turn(
                     outcome=mission_outcome,
                     conversation_id=conversation_id,
                     turn_disposition=conversation_result.turn.disposition,
+                    tool_results=mission_result.tool_results,
                 )
             elif not handled_by_mini_agents:
                 # Single-step: run directly as an orchestrator turn so the LLM decides
@@ -2933,10 +3429,11 @@ def _render_chat_turn(
                     user_message=effective_prompt,
                     user_content_blocks=user_content_blocks,
                     conversation_history=orchestrator_conversation_history,
-                    tool_registry=runtime.active_tool_registry or ToolRegistry(),
+                    tool_registry=active_turn_tool_registry,
                     policy_store=runtime.store,
                     approval_store=runtime.store,
                     tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                    cancellation_checker=cancellation_checker,
                 )
                 activity_tool_results = list(turn_result.tool_results)
                 thinking_text = getattr(turn_result, "thinking_text", None)
@@ -2986,10 +3483,11 @@ def _render_chat_turn(
                             principal_id=principal_id,
                             user_message=_required_attachment_repair_prompt(requested_attachment_extensions),
                             conversation_history=repair_history,
-                            tool_registry=runtime.active_tool_registry or ToolRegistry(),
+                            tool_registry=active_turn_tool_registry,
                             policy_store=runtime.store,
                             approval_store=runtime.store,
                             tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                            cancellation_checker=cancellation_checker,
                         )
                         activity_tool_results.extend(list(repair_result.tool_results))
                         if repair_result.suspended_for_approval:
@@ -3036,9 +3534,8 @@ def _render_chat_turn(
                     )
                     if attachment_failure is not None:
                         reply = attachment_failure
-                # Builder: reflect on this turn to detect reusable skills / patterns.
-                # Runs after the reply is formed; fails silently if anything goes wrong.
-                _try_builder_reflection(
+                # Builder: observe this turn to detect reusable skills / patterns after delivery.
+                _schedule_builder_reflection(
                     runtime,
                     agent_orchestrator,
                     user_message=effective_prompt,
@@ -3051,6 +3548,7 @@ def _render_chat_turn(
                     conversation_id=conversation_id,
                     memory_owner=_memory_owner_for_chat(chat_id, settings),
                     turn_disposition=conversation_result.turn.disposition,
+                    tool_results=turn_result.tool_results,
                 )
             # Only persist the turn when it has a real result.  Storing
             # "Tool approval requested: …" as the assistant reply pollutes the
@@ -3137,6 +3635,8 @@ def _render_chat_turn(
                     agent_orchestrator=agent_orchestrator,
                     chat_id=chat_id,
                     principal_id=principal_id,
+                    active_tool_registry=active_turn_tool_registry,
+                    allow_mini_agents=allow_mini_agents,
                 )
                 reply = _maybe_materialize_requested_fetch_attachment(
                     runtime,
@@ -3244,6 +3744,7 @@ def _render_chat_turn(
             model_client=model_client,
             agent_orchestrator=agent_orchestrator,
             principal_id=principal_id,
+            active_tool_registry=active_turn_tool_registry,
             append_activity_trace=append_activity_trace,
         )
         if compound_reply is not None:
@@ -3264,6 +3765,7 @@ def _render_chat_turn(
             agent_orchestrator=agent_orchestrator,
             chat_id=chat_id,
             principal_id=principal_id,
+            active_tool_registry=active_turn_tool_registry,
         )
         reply = _maybe_materialize_requested_fetch_attachment(
             runtime,
@@ -3381,12 +3883,15 @@ def handle_chat_operator_message(
     service: object | None = None,
     activity_callback: ActivityCallback | None = None,
     append_activity_trace: bool = True,
-    allow_mini_agents: bool = True,
+    allow_mini_agents: bool = False,
+    turn_dispatch_decision: object | None = None,
+    cancellation_checker: Callable[[], bool] | None = None,
 ) -> str | None:
     message = text.strip()
     if not message:
         logger.info("Ignored blank Telegram text (chat_id=%s)", chat_id)
         return None
+    planner_command = parse_planner_command(message)
 
     configured_chat_id = None
     chat_enabled = False
@@ -3453,7 +3958,9 @@ def handle_chat_operator_message(
             agent_orchestrator=agent_orchestrator,
             activity_callback=activity_callback,
             append_activity_trace=append_activity_trace,
-            allow_mini_agents=allow_mini_agents,
+            allow_mini_agents=False,
+            turn_dispatch_decision=turn_dispatch_decision,
+            cancellation_checker=cancellation_checker,
         )
         result = _classify_command_result("/chat", reply)
         logger.info(
@@ -3464,7 +3971,20 @@ def handle_chat_operator_message(
         )
         return reply
 
-    if _normalize_command_head(message) == "/new":
+    if _normalize_command_head(message) == "/stop":
+        if not is_stop_command_text(message):
+            reply = "Usage: /stop"
+        else:
+            conversation_id = _conversation_id_for_chat(chat_id)
+            cancelled_tasks = cancel_orchestrator_conversation_sync(agent_orchestrator, conversation_id)
+            cancelled_frame = cancel_active_task_frame(runtime, conversation_id)
+            reply = stop_session_reply(
+                SessionStopResult(
+                    cancelled_task_count=cancelled_tasks,
+                    cancelled_task_frame=cancelled_frame,
+                )
+            )
+    elif _normalize_command_head(message) == "/new":
         conversation_id = _conversation_id_for_chat(chat_id)
         runtime.store.add_conversation_event(
             {
@@ -3478,13 +3998,35 @@ def handle_chat_operator_message(
         runtime.checkpoint()
         reply = "Starting fresh."
     elif _normalize_command_head(message) == "/verbose":
-        reply = _handle_verbose_command_for_chat(runtime, message, chat_id=chat_id) or "Usage: /verbose [off|planner|full|status]"
+        reply = _handle_verbose_command_for_chat(runtime, message, chat_id=chat_id) or "Usage: /verbose [on|off|status]"
     elif _normalize_command_head(message) in {"/stream", "/streaming"}:
         reply = _handle_streaming_command_for_chat(runtime, message, chat_id=chat_id) or "Usage: /streaming [on|off|status]"
     elif _normalize_command_head(message) == "/thinking":
         reply = _handle_thinking_command_for_chat(runtime, message, chat_id=chat_id) or "Usage: /thinking [on|off|status]"
     elif _normalize_command_head(message) == "/health":
         reply = _render_telegram_health(runtime)
+    elif planner_command.requested:
+        if not chat_enabled:
+            reply = "Telegram chat is disabled."
+        elif not planner_command.prompt:
+            reply = "Usage: /planner <message>"
+        else:
+            reply = _render_chat_turn(
+                runtime,
+                message=message,
+                chat_id=chat_id,
+                attachments=attachments,
+                settings=settings,
+                request_id=request_id,
+                message_id=message_id,
+                model_client=model_client,
+                agent_orchestrator=agent_orchestrator,
+                activity_callback=activity_callback,
+                append_activity_trace=append_activity_trace,
+                allow_mini_agents=True,
+                turn_dispatch_decision=turn_dispatch_decision,
+                cancellation_checker=cancellation_checker,
+            )
     elif _normalize_command_head(message) == "/chat":
         if not chat_enabled:
             reply = "Telegram chat is disabled."
@@ -3501,6 +4043,9 @@ def handle_chat_operator_message(
                 agent_orchestrator=agent_orchestrator,
                 activity_callback=activity_callback,
                 append_activity_trace=append_activity_trace,
+                allow_mini_agents=False,
+                turn_dispatch_decision=turn_dispatch_decision,
+                cancellation_checker=cancellation_checker,
             )
     else:
         reply = handle_operator_command(

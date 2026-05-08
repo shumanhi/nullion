@@ -6,8 +6,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
+import platform
 from typing import Any
+
+from nullion.plugins.browser_plugin.browser_session import (
+    BrowserScreenshotResult,
+    auto_screenshot_uses_full_page,
+)
 
 try:
     from playwright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -15,12 +22,56 @@ try:
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
+try:
+    from playwright_stealth import Stealth
+    _STEALTH_AVAILABLE = True
+except ImportError:
+    Stealth = None  # type: ignore[assignment]
+    _STEALTH_AVAILABLE = False
+
+
+logger = logging.getLogger(__name__)
+
 
 def _require_playwright() -> None:
     if not _PLAYWRIGHT_AVAILABLE:
         raise RuntimeError(
             "Playwright is not installed. Run: pip install playwright && playwright install chromium"
         )
+
+
+def _context_user_agent(browser_version: str) -> str:
+    """Return a UA aligned with the actual bundled Chromium build."""
+
+    version = str(browser_version or "").strip() or "0.0.0.0"
+    system = platform.system()
+    if system == "Windows":
+        platform_token = "Windows NT 10.0; Win64; x64"
+    elif system == "Darwin":
+        platform_token = "Macintosh; Intel Mac OS X 10_15_7"
+    else:
+        platform_token = "X11; Linux x86_64"
+    return (
+        f"Mozilla/5.0 ({platform_token}) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{version} Safari/537.36"
+    )
+
+
+def _navigator_platform() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return "Win32"
+    if system == "Darwin":
+        return "MacIntel"
+    return "Linux x86_64"
+
+
+def _stealth_context_manager(playwright_context_manager: Any) -> Any:
+    if not _STEALTH_AVAILABLE or Stealth is None:
+        logger.warning("playwright-stealth is not installed; continuing without headless stealth patches.")
+        return playwright_context_manager
+    return Stealth(navigator_platform_override=_navigator_platform()).use_async(playwright_context_manager)
 
 
 class PlaywrightBackend:
@@ -41,8 +92,11 @@ class PlaywrightBackend:
 
     async def _ensure_browser(self) -> "Browser":
         if self._browser is None or not self._browser.is_connected():
-            pw = await async_playwright().__aenter__()
-            self._playwright = pw
+            playwright_context_manager: Any = async_playwright()
+            if self._headless:
+                playwright_context_manager = _stealth_context_manager(playwright_context_manager)
+            pw = await playwright_context_manager.__aenter__()
+            self._playwright = playwright_context_manager
             self._browser = await pw.chromium.launch(headless=self._headless)
         return self._browser
 
@@ -51,11 +105,7 @@ class PlaywrightBackend:
             if session_id not in self._pages:
                 browser = await self._ensure_browser()
                 ctx: "BrowserContext" = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    )
+                    user_agent=_context_user_agent(browser.version),
                 )
                 self._pages[session_id] = await ctx.new_page()
         return self._pages[session_id]
@@ -83,9 +133,63 @@ class PlaywrightBackend:
             return await el.inner_text(timeout=5_000)
         return await page.inner_text("body")
 
-    async def screenshot(self, session_id: str) -> bytes:
+    async def _page_layout(self, page: "Page") -> dict[str, int]:
+        layout = await page.evaluate(
+            """() => {
+                const doc = document.documentElement || {};
+                const body = document.body || {};
+                const viewportWidth = window.innerWidth || doc.clientWidth || 0;
+                const viewportHeight = window.innerHeight || doc.clientHeight || 0;
+                const documentWidth = Math.max(
+                    doc.scrollWidth || 0,
+                    body.scrollWidth || 0,
+                    viewportWidth
+                );
+                const documentHeight = Math.max(
+                    doc.scrollHeight || 0,
+                    body.scrollHeight || 0,
+                    viewportHeight
+                );
+                return { viewportWidth, viewportHeight, documentWidth, documentHeight };
+            }"""
+        )
+        if not isinstance(layout, dict):
+            return {}
+        return {
+            key: max(0, int(layout.get(key) or 0))
+            for key in ("viewportWidth", "viewportHeight", "documentWidth", "documentHeight")
+        }
+
+    async def screenshot(self, session_id: str, mode: str = "auto") -> BrowserScreenshotResult:
         page = await self._get_page(session_id)
-        return await page.screenshot(type="png", timeout=8_000)
+        requested_mode = mode if mode in {"auto", "viewport", "full_page"} else "auto"
+        layout = await self._page_layout(page)
+        viewport_width = layout.get("viewportWidth")
+        viewport_height = layout.get("viewportHeight")
+        document_width = layout.get("documentWidth")
+        document_height = layout.get("documentHeight")
+        exceeds_viewport = bool(
+            viewport_width
+            and viewport_height
+            and document_width
+            and document_height
+            and (document_width > viewport_width + 1 or document_height > viewport_height + 1)
+        )
+        full_page = requested_mode == "full_page" or (
+            requested_mode == "auto"
+            and auto_screenshot_uses_full_page(getattr(page, "url", None), exceeds_viewport)
+        )
+        data = await page.screenshot(type="png", full_page=full_page, timeout=8_000)
+        return BrowserScreenshotResult(
+            data=data,
+            mode="full_page" if full_page else "viewport",
+            requested_mode=requested_mode,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            document_width=document_width,
+            document_height=document_height,
+            is_clipped=not full_page and exceeds_viewport,
+        )
 
     async def scroll(self, session_id: str, direction: str, amount: int) -> None:
         page = await self._get_page(session_id)

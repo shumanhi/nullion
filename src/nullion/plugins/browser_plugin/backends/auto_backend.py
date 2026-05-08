@@ -203,9 +203,9 @@ class AutoBackend:
         b = await self._ensure_backend()
         return await b.extract_text(session_id, selector)
 
-    async def screenshot(self, session_id: str) -> bytes:
+    async def screenshot(self, session_id: str, mode: str = "auto"):
         b = await self._ensure_backend()
-        return await b.screenshot(session_id)
+        return await b.screenshot(session_id, mode=mode)
 
     async def scroll(self, session_id: str, direction: str, amount: int) -> None:
         b = await self._ensure_backend()

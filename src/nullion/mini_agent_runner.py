@@ -53,15 +53,25 @@ class MiniAgentRunner:
 
         from nullion.deep_agent_runner import DeepAgentMiniAgentRunner
 
-        return await DeepAgentMiniAgentRunner().run(
-            config,
-            anthropic_client=anthropic_client,
-            tool_registry=tool_registry,
-            policy_store=policy_store,
-            approval_store=approval_store,
-            context_bus=context_bus,
-            progress_queue=progress_queue,
-        )
+        try:
+            return await asyncio.wait_for(
+                DeepAgentMiniAgentRunner().run(
+                    config,
+                    anthropic_client=anthropic_client,
+                    tool_registry=tool_registry,
+                    policy_store=policy_store,
+                    approval_store=approval_store,
+                    context_bus=context_bus,
+                    progress_queue=progress_queue,
+                ),
+                timeout=float(config.timeout_s),
+            )
+        except TimeoutError:
+            return TaskResult(
+                task_id=config.task.task_id,
+                status="failure",
+                error=f"Mini-Agent timed out after {int(float(config.timeout_s))}s.",
+            )
 
 
 @dataclass

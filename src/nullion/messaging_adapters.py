@@ -10,6 +10,7 @@ import html
 import os
 from pathlib import Path
 import re
+from urllib.parse import unquote
 from uuid import uuid4
 
 from nullion.artifacts import (
@@ -645,14 +646,18 @@ def _append_decision_fallbacks(reply: str | None, fallbacks: tuple[str, ...]) ->
     return f"{text}\n\n{suffix}" if text else suffix
 
 
-def handle_messaging_ingress_result(service, ingress: MessagingIngress):
+def handle_messaging_ingress_result(service, ingress: MessagingIngress, *, turn_dispatch_decision=None):
     from nullion.messaging_turn_graph import run_messaging_turn_graph
 
-    return run_messaging_turn_graph(service, ingress)
+    return run_messaging_turn_graph(service, ingress, turn_dispatch_decision=turn_dispatch_decision)
 
 
-def handle_messaging_ingress(service, ingress: MessagingIngress) -> str | None:
-    return handle_messaging_ingress_result(service, ingress).reply
+def handle_messaging_ingress(service, ingress: MessagingIngress, *, turn_dispatch_decision=None) -> str | None:
+    return handle_messaging_ingress_result(
+        service,
+        ingress,
+        turn_dispatch_decision=turn_dispatch_decision,
+    ).reply
 
 
 def principal_id_for_messaging_identity(channel: str, user_id: object, settings: NullionSettings | None = None) -> str:
@@ -667,6 +672,10 @@ def _messaging_output_roots(*, principal_id: str | None) -> tuple[Path, ...]:
         roots.extend([workspace_roots.artifacts, workspace_roots.files, workspace_roots.media])
     except Exception:
         pass
+    data_dir = os.environ.get("NULLION_DATA_DIR")
+    if isinstance(data_dir, str) and data_dir.strip():
+        data_root = Path(data_dir).expanduser()
+        roots.extend([data_root / "outputs", data_root / ".nullion-artifacts"])
     return tuple(dict.fromkeys(root.resolve() for root in roots))
 
 
@@ -681,6 +690,10 @@ def _resolve_messaging_attachment_path(path: Path, *, principal_id: str | None) 
     if path.is_absolute():
         return path
     parts = path.parts
+    if len(parts) == 1 and path.name == str(path) and path.suffix:
+        candidate = _resolve_output_attachment_filename(path.name, principal_id=principal_id)
+        if candidate is not None:
+            return candidate
     if not parts or parts[0] not in {"artifacts", "files", "media"}:
         return path
     try:
@@ -696,6 +709,34 @@ def _resolve_messaging_attachment_path(path: Path, *, principal_id: str | None) 
     if root is None:
         return path
     return root.joinpath(*parts[1:]) if len(parts) > 1 else root
+
+
+def _resolve_output_attachment_filename(name: str, *, principal_id: str | None) -> Path | None:
+    filename = Path(str(name or "").strip()).name
+    if not filename or filename != str(name or "").strip() or not Path(filename).suffix:
+        return None
+    search_roots = list(_messaging_output_roots(principal_id=principal_id))
+    try:
+        from nullion.workspace_storage import workspace_storage_base
+
+        for workspace_root in workspace_storage_base().glob("*"):
+            if workspace_root.is_dir():
+                search_roots.extend(
+                    [
+                        workspace_root / "artifacts",
+                        workspace_root / "files",
+                        workspace_root / "media",
+                    ]
+                )
+    except Exception:
+        pass
+    candidates = []
+    for root in tuple(dict.fromkeys(path.resolve() for path in search_roots)):
+        candidate = root / filename
+        if artifact_descriptor_for_path(candidate, artifact_root=root) is not None:
+            candidates.append(candidate)
+    unique = tuple(dict.fromkeys(path.resolve() for path in candidates))
+    return unique[0] if len(unique) == 1 else None
 
 
 def sanitize_external_inline_markup(text: str) -> str:
@@ -721,7 +762,35 @@ def split_reply_for_platform_delivery(
 
 
 _PLAIN_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[^\s`'\"<>|]+)")
+_SANDBOX_ARTIFACT_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(sandbox:([^)]+)\)|sandbox:([^\s)\]]+)")
 _BUILDER_SKILL_MARKER_PREFIX = "::builder-skill::"
+
+
+def _resolve_sandbox_artifact_path(reference: str, *, principal_id: str | None) -> Path | None:
+    raw = unquote(str(reference or "").strip().strip("`'\"<>"))
+    if not raw:
+        return None
+    name = Path(raw.replace("\\", "/")).name
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        return None
+    for root in _messaging_output_roots(principal_id=principal_id):
+        path = root / name
+        if _is_deliverable_messaging_attachment(path, principal_id=principal_id):
+            return path
+    return None
+
+
+def _rewrite_sandbox_artifact_links_for_delivery(text: str, *, principal_id: str | None) -> str:
+    def replace(match: re.Match[str]) -> str:
+        label = str(match.group(1) or "").strip()
+        reference = str(match.group(2) or match.group(3) or "").strip()
+        path = _resolve_sandbox_artifact_path(reference, principal_id=principal_id)
+        if path is None:
+            return match.group(0)
+        prefix = label or path.name
+        return f"{prefix}\nMEDIA:{path}"
+
+    return _SANDBOX_ARTIFACT_LINK_RE.sub(replace, str(text or ""))
 
 
 def text_or_attachments_expect_attachment_delivery(
@@ -962,6 +1031,7 @@ def prepare_reply_for_platform_delivery(
         return PlatformDelivery(text=None, attachments=())
     text = make_markdown_tables_chat_readable(sanitize_external_inline_markup(str(reply)))
     text = _strip_platform_internal_markers(text)
+    text = _rewrite_sandbox_artifact_links_for_delivery(text, principal_id=principal_id)
     if delivery_contract is None:
         if allow_attachments is False:
             delivery_contract = DeliveryContract.message_only()

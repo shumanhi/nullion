@@ -13,6 +13,7 @@ from ipaddress import ip_address
 import inspect
 import json
 import logging
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -57,10 +58,12 @@ from nullion.policy import (
 from nullion.prompt_injection import scan_tool_output
 from nullion.redaction import redact_value
 from nullion.runtime_store import RuntimeStore
+from nullion.tips import MEDIA_PROVIDER_SETUP_TIP, format_setup_tip
 from nullion.tool_boundaries import extract_boundary_facts
 
 
 _WEB_FETCH_MAX_REDIRECTS = 5
+_WEB_FETCH_MAX_BODY_BYTES = 2_000_000
 _LEGACY_GLOBAL_PERMISSION_PRINCIPALS = ("operator", "workspace:workspace_admin")
 logger = logging.getLogger(__name__)
 
@@ -199,6 +202,8 @@ _FILESYSTEM_PATH_ARGUMENTS_BY_TOOL = {
     "file_patch": ("path",),
     "image_extract_text": ("path",),
     "image_generate": ("source_path", "output_path"),
+    "presentation_create": ("output_path",),
+    "spreadsheet_create": ("output_path",),
 }
 
 
@@ -796,27 +801,30 @@ _TERMINAL_DELIVERABLE_ARTIFACT_EXTENSIONS = frozenset(VALID_ATTACHMENT_EXTENSION
 _MAX_TERMINAL_DISCOVERED_ARTIFACTS = 25
 _MAX_TERMINAL_ARTIFACT_SCAN_ENTRIES = 10000
 
+_CRON_TOOL_PROPERTIES: dict[str, dict[str, str]] = {
+    "id": {"type": "string", "description": "Cron job id. Required for update operations."},
+    "name": {"type": "string", "description": "Human-readable cron name."},
+    "schedule": {"type": "string", "description": "Cron schedule expression."},
+    "task": {"type": "string", "description": "Task instructions to run when the cron fires."},
+    "enabled": {"type": "boolean", "description": "Whether the cron is active."},
+    "workspace_id": {"type": "string", "description": "Workspace id that owns the cron."},
+    "delivery_channel": {"type": "string", "description": "Delivery channel such as web, telegram, slack, or discord."},
+    "delivery_target": {"type": "string", "description": "Channel-specific delivery target."},
+}
 
-def _cron_tool_properties(*, include_workspace: bool = True) -> dict[str, object]:
-    properties: dict[str, object] = {
-        "id": {"type": "string", "description": "Existing cron job id."},
-        "name": {"type": "string", "description": "Human-readable cron label."},
-        "schedule": {"type": "string", "description": "Five-field cron expression, for example '0 9 * * 1-5'."},
-        "task": {"type": "string", "description": "Instruction Nullion runs when the cron fires."},
-        "enabled": {"type": "boolean", "description": "Whether the cron should be enabled."},
-        "delivery_channel": {"type": "string", "description": "Delivery adapter such as web, telegram, slack, or discord."},
-        "delivery_target": {"type": "string", "description": "Channel-specific destination id."},
-    }
-    if include_workspace:
-        properties["workspace_id"] = {"type": "string", "description": "Workspace that owns the cron."}
-    return properties
+
+def _cron_tool_properties() -> dict[str, object]:
+    return {name: dict(schema) for name, schema in _CRON_TOOL_PROPERTIES.items()}
 
 
 def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
+    def cron_tool_properties() -> dict[str, object]:
+        return {name: dict(schema) for name, schema in _CRON_TOOL_PROPERTIES.items()}
+
     schemas: dict[str, dict[str, object]] = {
         "create_cron": {
             "type": "object",
-            "properties": _cron_tool_properties(),
+            "properties": cron_tool_properties(),
             "required": ["name", "schedule", "task"],
             "additionalProperties": False,
         },
@@ -830,7 +838,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         },
         "update_cron": {
             "type": "object",
-            "properties": _cron_tool_properties(),
+            "properties": cron_tool_properties(),
             "required": ["id"],
             "additionalProperties": False,
         },
@@ -870,6 +878,89 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 "content": {"type": "string", "description": "Text content to write."},
             },
             "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+        "spreadsheet_create": {
+            "type": "object",
+            "properties": {
+                "output_path": {
+                    "type": "string",
+                    "description": "Optional destination .xlsx path. If omitted, Nullion creates one in the artifact directory.",
+                },
+                "title": {"type": "string", "description": "Optional workbook title used for the default filename."},
+                "sheet_name": {"type": "string", "description": "Optional worksheet name."},
+                "columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional ordered column names. If omitted, object row keys are used.",
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            {"type": "object"},
+                            {
+                                "type": "array",
+                                "items": {
+                                    "anyOf": [
+                                        {"type": "string"},
+                                        {"type": "number"},
+                                        {"type": "integer"},
+                                        {"type": "boolean"},
+                                        {"type": "null"},
+                                        {"type": "object"},
+                                        {"type": "array", "items": {}},
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                    "description": "Rows as objects keyed by column name, or arrays matching the columns.",
+                },
+                "image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional existing image artifact paths to embed, aligned to rows when possible.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "presentation_create": {
+            "type": "object",
+            "properties": {
+                "output_path": {
+                    "type": "string",
+                    "description": "Optional destination .pptx path. If omitted, Nullion creates one in the artifact directory.",
+                },
+                "title": {"type": "string", "description": "Optional deck title used for the default filename."},
+                "slides": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "Slide title."},
+                            "body": {"type": "string", "description": "Short body text for the slide."},
+                            "bullets": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional bullet text for the slide.",
+                            },
+                            "image_paths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional existing image artifact paths for this slide.",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                    "description": "Structured slide contents. If omitted, image_paths are placed one per slide.",
+                },
+                "image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional existing image artifact paths to place into slides.",
+                },
+            },
             "additionalProperties": False,
         },
         "pdf_create": {
@@ -980,7 +1071,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 },
                 "url": {
                     "type": "string",
-                    "description": "Full HTTP(S) gateway URL from the installed connector skill.",
+                    "description": (
+                        "Full HTTP(S) gateway URL from the installed connector skill, under that "
+                        "provider's configured base URL. Do not use generic public web URLs here."
+                    ),
                 },
                 "params": {
                     "type": "object",
@@ -1075,7 +1169,12 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         },
         "browser_navigate": {
             "type": "object",
-            "properties": {"url": {"type": "string", "description": "HTTP or HTTPS URL to open in the browser."}},
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "HTTP/HTTPS URL, or a local HTML file path/file URL inside this workspace, to open in the browser.",
+                }
+            },
             "required": ["url"],
             "additionalProperties": False,
         },
@@ -1158,6 +1257,7 @@ def _terminal_filesystem_safety_denial(
     command: str,
     *,
     allowed_roots: Iterable[Path] = (),
+    principal_id: str | None = None,
 ) -> dict[str, object] | None:
     """Reject shell commands likely to trigger broad local data traversal."""
     try:
@@ -1181,6 +1281,9 @@ def _terminal_filesystem_safety_denial(
         str(Path(home) / "Library" / "Containers"),
         str(Path(home) / "Library" / "Group Containers"),
     }
+    unknown_workspace_denial = _unknown_workspace_storage_denial(tokens, principal_id=principal_id)
+    if unknown_workspace_denial is not None:
+        return unknown_workspace_denial
 
     for index, token in enumerate(tokens):
         if token != "find":
@@ -1220,6 +1323,44 @@ def _terminal_filesystem_safety_denial(
                         "Use a specific file path or a narrow app folder with explicit approval."
                     ),
                 }
+    workspace_denial = _terminal_unknown_workspace_denial(tokens, resolved_allowed_roots, principal_id=principal_id)
+    if workspace_denial is not None:
+        return workspace_denial
+    return None
+
+
+def _unknown_workspace_storage_denial(tokens: list[str], *, principal_id: str | None = None) -> dict[str, object] | None:
+    try:
+        from nullion.workspace_storage import sanitize_workspace_id, workspace_storage_base
+
+        storage_base = workspace_storage_base()
+    except Exception:
+        return None
+    allowed_workspaces = {
+        sanitize_workspace_id(workspace_id)
+        for workspace_id in _registered_or_existing_workspace_ids(storage_base)
+    }
+    for token in tokens:
+        if not token or token.startswith("-") or token in {";", "&&", "||", "|"}:
+            continue
+        try:
+            candidate = Path(os.path.expandvars(token)).expanduser().resolve(strict=False)
+        except Exception:
+            continue
+        try:
+            relative = candidate.relative_to(storage_base)
+        except ValueError:
+            continue
+        if not relative.parts:
+            continue
+        workspace_id = sanitize_workspace_id(relative.parts[0])
+        if not _workspace_access_allowed(workspace_id, principal_id=principal_id, allowed_workspaces=allowed_workspaces):
+            return {
+                "reason": "unknown_workspace_denied",
+                "workspace_id": workspace_id,
+                "path": str(candidate),
+                "message": f"Refusing to create or modify unknown workspace storage: {workspace_id}.",
+            }
     return None
 
 
@@ -1258,6 +1399,105 @@ def _normalize_find_root(raw_path: str, *, home: str) -> str:
         return str(expanded.resolve(strict=False))
     except Exception:
         return raw_path
+
+
+def _terminal_path_candidates(token: str) -> tuple[Path, ...]:
+    stripped = str(token or "").strip().strip("'\"`")
+    if not stripped:
+        return ()
+    candidates: list[str] = [stripped]
+    for separator in ("=", ":"):
+        if separator in stripped:
+            tail = stripped.split(separator, 1)[1].strip()
+            if tail:
+                candidates.append(tail)
+    paths: list[Path] = []
+    for candidate in candidates:
+        cleaned = candidate.strip("'\"`")
+        if not cleaned:
+            continue
+        if cleaned.startswith(("~", "/", "$HOME", "${HOME}")) or "/.nullion/workspaces/" in cleaned:
+            try:
+                paths.append(Path(os.path.expandvars(cleaned)).expanduser().resolve(strict=False))
+            except Exception:
+                continue
+    return tuple(dict.fromkeys(paths))
+
+
+def _registered_or_existing_workspace_ids(base: Path) -> set[str]:
+    ids: set[str] = set()
+    try:
+        from nullion.users import registered_workspace_ids
+
+        ids.update(registered_workspace_ids())
+    except Exception:
+        ids.add("workspace_admin")
+    try:
+        if base.is_dir():
+            ids.update(path.name for path in base.iterdir() if path.is_dir())
+    except OSError:
+        pass
+    ids.add("workspace_admin")
+    return ids
+
+
+def _workspace_access_allowed(
+    workspace_id: str,
+    *,
+    principal_id: str | None,
+    allowed_workspaces: set[str],
+) -> bool:
+    try:
+        from nullion.connections import workspace_id_for_principal
+        from nullion.workspace_storage import sanitize_workspace_id
+
+        principal_workspace = sanitize_workspace_id(workspace_id_for_principal(principal_id))
+        target_workspace = sanitize_workspace_id(workspace_id)
+    except Exception:
+        principal_workspace = "workspace_admin"
+        target_workspace = str(workspace_id or "workspace_admin")
+    if principal_workspace == target_workspace:
+        return True
+    if principal_workspace == "workspace_admin" and target_workspace in allowed_workspaces:
+        return True
+    return False
+
+
+def _terminal_unknown_workspace_denial(
+    tokens: list[str],
+    allowed_roots: Iterable[Path],
+    *,
+    principal_id: str | None = None,
+) -> dict[str, object] | None:
+    _ = allowed_roots
+    try:
+        from nullion.workspace_storage import workspace_storage_base
+
+        base = workspace_storage_base()
+    except Exception:
+        return None
+    allowed = _registered_or_existing_workspace_ids(base)
+    for token in tokens:
+        for path in _terminal_path_candidates(token):
+            try:
+                relative = path.relative_to(base)
+            except ValueError:
+                continue
+            if not relative.parts:
+                continue
+            workspace_id = relative.parts[0]
+            if _workspace_access_allowed(workspace_id, principal_id=principal_id, allowed_workspaces=allowed):
+                continue
+            return {
+                "reason": "unknown_workspace_denied",
+                "workspace_id": workspace_id,
+                "path": str(path),
+                "message": (
+                    "Refusing to use or create an unregistered workspace directory. "
+                    "Verify the person/workspace exists in the Users settings first."
+                ),
+            }
+    return None
 
 
 def _path_is_at_or_under(path: str, root: str) -> bool:
@@ -1742,6 +1982,10 @@ class ToolRegistry:
         self._specs[spec.name] = spec
         self._handlers[spec.name] = handler
 
+    def unregister(self, name: str) -> None:
+        self._specs.pop(name, None)
+        self._handlers.pop(name, None)
+
     def get_spec(self, name: str) -> ToolSpec:
         return self._specs[name]
 
@@ -1768,10 +2012,18 @@ class ToolRegistry:
     def filesystem_allowed_roots(self) -> tuple[Path, ...]:
         return self._filesystem_allowed_roots
 
+    def set_filesystem_allowed_roots(self, roots: Iterable[Path]) -> None:
+        self._filesystem_allowed_roots = tuple(Path(root).resolve() for root in roots)
+
     def mark_plugin_installed(self, plugin_name: str) -> None:
         normalized = plugin_name.strip()
         if normalized:
             self._installed_plugins.add(normalized)
+
+    def unmark_plugin_installed(self, plugin_name: str) -> None:
+        normalized = plugin_name.strip()
+        if normalized:
+            self._installed_plugins.discard(normalized)
 
     def list_installed_plugins(self) -> list[str]:
         return sorted(self._installed_plugins)
@@ -2861,6 +3113,451 @@ def _build_file_write_handler(
     return handler
 
 
+_SPREADSHEET_IMAGE_KEYS = ("image_path", "image_paths", "image")
+
+
+def _json_scalar_for_spreadsheet(value: object) -> str | int | float | bool | None:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _spreadsheet_columns(raw_columns: object, rows: list[object]) -> list[str]:
+    columns = [str(column).strip() for column in raw_columns or () if str(column or "").strip()] if isinstance(raw_columns, (list, tuple)) else []
+    if columns:
+        return list(dict.fromkeys(columns))
+    discovered: list[str] = []
+    for row in rows:
+        if isinstance(row, dict):
+            for key in row:
+                if key in _SPREADSHEET_IMAGE_KEYS:
+                    continue
+                column = str(key).strip()
+                if column and column not in discovered:
+                    discovered.append(column)
+        elif isinstance(row, (list, tuple)):
+            for index in range(len(row)):
+                column = f"Column {index + 1}"
+                if column not in discovered:
+                    discovered.append(column)
+    return discovered or ["Value"]
+
+
+def _spreadsheet_row_values(row: object, columns: list[str]) -> list[object]:
+    if isinstance(row, dict):
+        return [_json_scalar_for_spreadsheet(row.get(column)) for column in columns]
+    if isinstance(row, (list, tuple)):
+        values = [_json_scalar_for_spreadsheet(value) for value in row]
+        if len(values) < len(columns):
+            values.extend([None] * (len(columns) - len(values)))
+        return values[: len(columns)]
+    return [_json_scalar_for_spreadsheet(row), *([None] * max(0, len(columns) - 1))]
+
+
+def _spreadsheet_row_image_path(row: object, fallback: object) -> str | None:
+    candidates: list[object] = []
+    if isinstance(row, dict):
+        for key in _SPREADSHEET_IMAGE_KEYS:
+            value = row.get(key)
+            if isinstance(value, (list, tuple)):
+                candidates.extend(value)
+            else:
+                candidates.append(value)
+    candidates.append(fallback)
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _spreadsheet_output_path(
+    invocation: ToolInvocation,
+    *,
+    raw_path: object,
+    title: object,
+) -> Path:
+    if isinstance(raw_path, str) and raw_path.strip():
+        return Path(raw_path).expanduser().resolve()
+    from nullion.artifacts import artifact_path_for_generated_workspace_file
+
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", str(title or "spreadsheet").strip()).strip("-._")
+    return artifact_path_for_generated_workspace_file(
+        principal_id=invocation.principal_id,
+        suffix=".xlsx",
+        stem=stem or "spreadsheet",
+    )
+
+
+def _build_spreadsheet_create_handler(
+    workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
+    *,
+    include_principal_workspace: bool = True,
+) -> ToolHandler:
+    resolved_root = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        effective_roots = _effective_filesystem_roots(
+            invocation=invocation,
+            resolved_root=resolved_root,
+            resolved_allowed_roots=resolved_allowed_roots,
+            include_principal_workspace=include_principal_workspace,
+        )
+        if not effective_roots:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "File access requires workspace_root or allowed_roots")
+
+        try:
+            from openpyxl import Workbook
+            from openpyxl.drawing.image import Image as WorksheetImage
+            from openpyxl.styles import Font
+        except ModuleNotFoundError as exc:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "reason": "missing_dependency",
+                    "dependency_id": "openpyxl",
+                    "dependency": "openpyxl",
+                    "package": "openpyxl",
+                    "requirement": "openpyxl>=3.1,<4",
+                    "license": "MIT",
+                    "install_command": "python -m pip install 'openpyxl>=3.1,<4'",
+                },
+                f"spreadsheet_create requires openpyxl: {exc}",
+            )
+
+        rows = list(invocation.arguments.get("rows") or [])
+        if not isinstance(rows, list):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "rows must be a list")
+        columns = _spreadsheet_columns(invocation.arguments.get("columns"), rows)
+        image_paths = list(invocation.arguments.get("image_paths") or [])
+        if not isinstance(image_paths, list):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "image_paths must be a list")
+        row_image_paths = [
+            _spreadsheet_row_image_path(row, image_paths[index] if index < len(image_paths) else None)
+            for index, row in enumerate(rows)
+        ]
+        include_image_column = any(row_image_paths)
+        workbook_columns = [*columns, *(["Image"] if include_image_column else [])]
+        output_path = _spreadsheet_output_path(
+            invocation,
+            raw_path=invocation.arguments.get("output_path"),
+            title=invocation.arguments.get("title"),
+        )
+        if output_path.suffix.lower() != ".xlsx":
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"path": str(output_path)}, "spreadsheet_create output_path must end in .xlsx")
+        if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
+            output_path,
+            invocation.trusted_filesystem_selectors,
+        ):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Path is outside workspace root: {output_path}")
+
+        wb = Workbook()
+        ws = wb.active
+        sheet_name = str(invocation.arguments.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+        ws.title = re.sub(r"[\[\]:*?/\\]", " ", sheet_name)[:31] or "Sheet1"
+        ws.append(workbook_columns)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+
+        embedded_images: list[str] = []
+        skipped_images: list[str] = []
+        image_column_index = len(workbook_columns) if include_image_column else None
+        for row_index, row in enumerate(rows, start=2):
+            values = _spreadsheet_row_values(row, columns)
+            ws.append([*values, *([""] if include_image_column else [])])
+            for col_index, value in enumerate(values, start=1):
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    cell = ws.cell(row=row_index, column=col_index)
+                    cell.hyperlink = value
+                    cell.font = Font(color="0563C1", underline="single")
+            image_path_text = row_image_paths[row_index - 2]
+            if image_column_index is None or not image_path_text:
+                continue
+            image_path = Path(_resolve_virtual_workspace_path(image_path_text, principal_id=invocation.principal_id)).expanduser().resolve()
+            if not image_path.is_file() or not _path_within_any_root(image_path, effective_roots):
+                skipped_images.append(image_path_text)
+                continue
+            try:
+                image = WorksheetImage(str(image_path))
+                if image.width > 140:
+                    scale = 140 / float(image.width)
+                    image.width = int(image.width * scale)
+                    image.height = int(image.height * scale)
+                if image.height > 120:
+                    scale = 120 / float(image.height)
+                    image.width = int(image.width * scale)
+                    image.height = int(image.height * scale)
+                ws.add_image(image, f"{ws.cell(row=row_index, column=image_column_index).coordinate}")
+                ws.row_dimensions[row_index].height = max(ws.row_dimensions[row_index].height or 15, 92)
+                embedded_images.append(str(image_path))
+            except Exception:
+                skipped_images.append(image_path_text)
+
+        for column_cells in ws.columns:
+            header = str(column_cells[0].value or "")
+            max_length = max(len(str(cell.value or "")) for cell in column_cells[:100])
+            ws.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, len(header) + 2, 12), 48)
+        if image_column_index is not None:
+            ws.column_dimensions[ws.cell(row=1, column=image_column_index).column_letter].width = 22
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(output_path)
+        return ToolResult(
+            invocation.invocation_id,
+            invocation.tool_name,
+            "completed",
+            {
+                "path": str(output_path),
+                "artifact_path": str(output_path),
+                "artifact_paths": [str(output_path)],
+                "rows": len(rows),
+                "columns": len(workbook_columns),
+                "embedded_images": embedded_images,
+                "skipped_images": skipped_images,
+            },
+            None,
+        )
+
+    return handler
+
+
+def _presentation_output_path(
+    invocation: ToolInvocation,
+    *,
+    raw_path: object,
+    title: object,
+    roots: tuple[Path, ...],
+) -> Path:
+    if isinstance(raw_path, str) and raw_path.strip():
+        return Path(raw_path).expanduser().resolve()
+    try:
+        from nullion.artifacts import artifact_path_for_generated_workspace_file
+
+        return artifact_path_for_generated_workspace_file(
+            principal_id=invocation.principal_id,
+            suffix=".pptx",
+            stem=_safe_pdf_stem(str(title or "presentation")),
+        ).resolve()
+    except Exception:
+        return (roots[0] / f"{_safe_pdf_stem(str(title or 'presentation'))}.pptx").resolve()
+
+
+def _presentation_slide_specs(raw_slides: object, image_paths: list[str], *, title: str) -> tuple[list[dict[str, object]], str | None]:
+    if raw_slides is not None and not isinstance(raw_slides, list):
+        return [], "slides must be a list"
+    slides: list[dict[str, object]] = []
+    for index, raw_slide in enumerate(raw_slides or [], start=1):
+        if not isinstance(raw_slide, dict):
+            return [], "slides entries must be objects"
+        bullets, bullet_error = _coerce_string_list(raw_slide.get("bullets"), field=f"slides[{index}].bullets")
+        if bullet_error is not None:
+            return [], bullet_error
+        slide_images, image_error = _coerce_string_list(raw_slide.get("image_paths"), field=f"slides[{index}].image_paths")
+        if image_error is not None:
+            return [], image_error
+        slides.append(
+            {
+                "title": str(raw_slide.get("title") or f"Slide {index}").strip() or f"Slide {index}",
+                "body": str(raw_slide.get("body") or "").strip(),
+                "bullets": bullets,
+                "image_paths": slide_images,
+            }
+        )
+    if not slides:
+        if image_paths:
+            slides = [
+                {"title": title or f"Image {index}", "body": "", "bullets": [], "image_paths": [image_path]}
+                for index, image_path in enumerate(image_paths, start=1)
+            ]
+        else:
+            slides = [{"title": title or "Presentation", "body": "", "bullets": [], "image_paths": []}]
+    elif image_paths:
+        for index, image_path in enumerate(image_paths):
+            target = slides[index] if index < len(slides) else slides[-1]
+            target.setdefault("image_paths", [])
+            cast_images = target["image_paths"]
+            if isinstance(cast_images, list):
+                cast_images.append(image_path)
+    return slides, None
+
+
+def _resolve_presentation_image_paths(
+    raw_paths: list[str],
+    *,
+    roots: tuple[Path, ...],
+    invocation: ToolInvocation,
+) -> tuple[list[Path], list[str], str | None]:
+    resolved: list[Path] = []
+    skipped: list[str] = []
+    for raw_path in raw_paths:
+        image_path = Path(_resolve_virtual_workspace_path(raw_path, principal_id=invocation.principal_id)).expanduser().resolve()
+        if not _path_within_any_root(image_path, roots) and not _is_approved_filesystem_path(
+            image_path,
+            invocation.trusted_filesystem_selectors,
+        ):
+            return resolved, skipped, f"Image path is outside workspace root: {image_path}"
+        if not image_path.is_file():
+            skipped.append(raw_path)
+            continue
+        resolved.append(image_path)
+    return resolved, skipped, None
+
+
+def _add_presentation_text(slide, *, title: str, body: str, bullets: list[str], has_images: bool) -> None:
+    from pptx.util import Inches, Pt
+
+    title_box = slide.shapes.add_textbox(Inches(0.45), Inches(0.25), Inches(9.1), Inches(0.55))
+    title_frame = title_box.text_frame
+    title_frame.clear()
+    paragraph = title_frame.paragraphs[0]
+    paragraph.text = title[:120]
+    paragraph.font.bold = True
+    paragraph.font.size = Pt(28)
+
+    text_width = Inches(4.25 if has_images else 9.1)
+    body_box = slide.shapes.add_textbox(Inches(0.55), Inches(1.05), text_width, Inches(5.6))
+    text_frame = body_box.text_frame
+    text_frame.word_wrap = True
+    text_frame.clear()
+    first = True
+    for line in [body, *bullets]:
+        text = str(line or "").strip()
+        if not text:
+            continue
+        paragraph = text_frame.paragraphs[0] if first else text_frame.add_paragraph()
+        paragraph.text = text[:700]
+        paragraph.font.size = Pt(17 if first and body else 15)
+        if not first or text in bullets:
+            paragraph.level = 0
+        first = False
+
+
+def _add_presentation_images(slide, image_paths: list[Path]) -> list[str]:
+    from pptx.util import Inches
+
+    embedded: list[str] = []
+    if not image_paths:
+        return embedded
+    max_width = Inches(4.25)
+    max_height = Inches(4.85 if len(image_paths) == 1 else 2.25)
+    left = Inches(5.25)
+    top = Inches(1.18)
+    for index, image_path in enumerate(image_paths[:2]):
+        image_top = top + Inches(2.45 * index)
+        try:
+            slide.shapes.add_picture(str(image_path), left, image_top, width=max_width, height=max_height)
+            embedded.append(str(image_path))
+        except Exception:
+            continue
+    return embedded
+
+
+def _build_presentation_create_handler(
+    workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
+    *,
+    include_principal_workspace: bool = True,
+) -> ToolHandler:
+    resolved_root = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        effective_roots = _effective_filesystem_roots(
+            invocation=invocation,
+            resolved_root=resolved_root,
+            resolved_allowed_roots=resolved_allowed_roots,
+            include_principal_workspace=include_principal_workspace,
+        )
+        if not effective_roots:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "presentation_create requires workspace_root or allowed_roots")
+        try:
+            from pptx import Presentation
+        except ModuleNotFoundError as exc:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "reason": "missing_dependency",
+                    "dependency_id": "python-pptx",
+                    "dependency": "python-pptx",
+                    "package": "python-pptx",
+                    "requirement": "python-pptx>=1.0,<2",
+                    "license": "MIT",
+                    "install_command": "python -m pip install 'python-pptx>=1.0,<2'",
+                },
+                f"presentation_create requires python-pptx: {exc}",
+            )
+
+        title = str(invocation.arguments.get("title") or "Nullion presentation").strip() or "Nullion presentation"
+        image_paths, image_error = _coerce_string_list(invocation.arguments.get("image_paths"), field="image_paths")
+        if image_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, image_error)
+        slides, slide_error = _presentation_slide_specs(invocation.arguments.get("slides"), image_paths, title=title)
+        if slide_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, slide_error)
+
+        output_path = _presentation_output_path(
+            invocation,
+            raw_path=invocation.arguments.get("output_path"),
+            title=title,
+            roots=effective_roots,
+        )
+        if output_path.suffix.lower() != ".pptx":
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"path": str(output_path)}, "presentation_create output_path must end in .pptx")
+        if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
+            output_path,
+            invocation.trusted_filesystem_selectors,
+        ):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Path is outside workspace root: {output_path}")
+
+        deck = Presentation()
+        blank_layout = deck.slide_layouts[6]
+        embedded_images: list[str] = []
+        skipped_images: list[str] = []
+        for slide_spec in slides:
+            slide = deck.slides.add_slide(blank_layout)
+            slide_images, slide_skipped, image_error = _resolve_presentation_image_paths(
+                list(slide_spec.get("image_paths") or []),
+                roots=effective_roots,
+                invocation=invocation,
+            )
+            if image_error is not None:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, image_error)
+            skipped_images.extend(slide_skipped)
+            _add_presentation_text(
+                slide,
+                title=str(slide_spec.get("title") or title),
+                body=str(slide_spec.get("body") or ""),
+                bullets=[str(item) for item in slide_spec.get("bullets") or []],
+                has_images=bool(slide_images),
+            )
+            embedded_images.extend(_add_presentation_images(slide, slide_images))
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        deck.save(output_path)
+        return ToolResult(
+            invocation.invocation_id,
+            invocation.tool_name,
+            "completed",
+            {
+                "path": str(output_path),
+                "artifact_path": str(output_path),
+                "artifact_paths": [str(output_path)],
+                "slide_count": len(slides),
+                "embedded_images": embedded_images,
+                "skipped_images": skipped_images,
+                "bytes_written": output_path.stat().st_size,
+            },
+            None,
+        )
+
+    return handler
+
+
 _PDF_PAGE_SIZES = {
     "letter": (1275, 1650),
     "a4": (1240, 1754),
@@ -3570,6 +4267,7 @@ def _build_terminal_exec_handler(
         filesystem_denial = _terminal_filesystem_safety_denial(
             raw_command,
             allowed_roots=resolved_allowed_roots,
+            principal_id=invocation.principal_id,
         )
         if filesystem_denial is not None:
             return ToolResult(
@@ -3770,6 +4468,38 @@ def _is_https_transport_eof(exc: Exception) -> bool:
     return False
 
 
+def _web_fetch_binary_suffix(url: str, content_type: str) -> str:
+    parsed_suffix = Path(urlparse(url).path).suffix.lower()
+    if parsed_suffix in VALID_ATTACHMENT_EXTENSIONS:
+        return parsed_suffix
+    guessed = mimetypes.guess_extension(content_type.split(";", 1)[0].strip())
+    if guessed:
+        return ".jpg" if guessed == ".jpe" else guessed
+    return ".bin"
+
+
+def _web_fetch_is_textual(content_type: str, data: bytes) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type.startswith("text/") or media_type in {
+        "application/json",
+        "application/javascript",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/rss+xml",
+        "application/atom+xml",
+        "image/svg+xml",
+    }:
+        return True
+    sample = data[:1024]
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+        return media_type in {"", "application/octet-stream"}
+    except UnicodeDecodeError:
+        return False
+
+
 def _fetch_web_url_once(url: str, timeout_seconds: int) -> dict[str, object]:
     resolution = _resolve_web_fetch_resolution(url)
     parsed = urlparse(url)
@@ -3798,7 +4528,22 @@ def _fetch_web_url_once(url: str, timeout_seconds: int) -> dict[str, object]:
         with opener.open(request, timeout=timeout_seconds) as response:
             status_code = getattr(response, "status", 200)
             content_type = response.headers.get_content_type()
-            body = response.read(65536).decode("utf-8", "ignore")  # 64 KB
+            data = response.read(_WEB_FETCH_MAX_BODY_BYTES + 1)
+    truncated = len(data) > _WEB_FETCH_MAX_BODY_BYTES
+    if truncated:
+        data = data[:_WEB_FETCH_MAX_BODY_BYTES]
+    if not _web_fetch_is_textual(content_type, data):
+        return {
+            "url": url,
+            "status_code": status_code,
+            "content_type": content_type,
+            "content_kind": "binary",
+            "body_size": len(data),
+            "body_truncated": truncated,
+            "suggested_extension": _web_fetch_binary_suffix(url, content_type),
+            "_body_bytes": data,
+        }
+    body = data[:65536].decode("utf-8", "ignore")  # 64 KB of text
     title_match = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
     title = None if title_match is None else re.sub(r"\s+", " ", unescape(title_match.group(1))).strip() or None
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body)).strip()
@@ -3829,6 +4574,32 @@ def _default_web_fetcher(url: str, timeout_seconds: int) -> dict[str, object]:
         return response
 
 
+def register_web_fetch_tool(
+    registry: ToolRegistry,
+    web_fetcher: Callable[[str, int], dict[str, object]] | None = None,
+) -> ToolRegistry:
+    try:
+        registry.get_spec("web_fetch")
+        return registry
+    except KeyError:
+        pass
+    registry.register(
+        ToolSpec(
+            name="web_fetch",
+            description=(
+                "Fetch a URL and return its content and response metadata. "
+                "Use only when direct HTTP fetching is enabled by the runtime policy; otherwise use browser tools."
+            ),
+            risk_level=ToolRiskLevel.LOW,
+            side_effect_class=ToolSideEffectClass.READ,
+            requires_approval=False,
+            timeout_seconds=20,
+        ),
+        _build_web_fetch_handler(web_fetcher or _default_web_fetcher),
+    )
+    return registry
+
+
 
 def _build_kernel_tool_registry(
     *,
@@ -3837,6 +4608,7 @@ def _build_kernel_tool_registry(
     allowed_roots: list[Path] | tuple[Path, ...] | None = None,
     terminal_executor_backend: TerminalExecutorBackend | None = None,
     terminal_attestation_verifier: TerminalAttestationVerifier | None = None,
+    direct_web_fetch_enabled: bool | None = None,
 ) -> ToolRegistry:
     filesystem_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else (() if workspace_root is None else (Path(workspace_root).resolve(),))
     registry = ToolRegistry(
@@ -3872,6 +4644,46 @@ def _build_kernel_tool_registry(
                 timeout_seconds=20,
             ),
             _build_file_write_handler(
+                None
+                if workspace_root is None
+                else Path(workspace_root),
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
+            ),
+        )
+        registry.register(
+            ToolSpec(
+                name="spreadsheet_create",
+                description=(
+                    "Create a real .xlsx spreadsheet artifact from structured rows, links, and existing image files. "
+                    "Use this for spreadsheet delivery instead of terminal_exec. "
+                    "If the tool reports missing_dependency, ask the user to approve installing the listed open-source package."
+                ),
+                risk_level=ToolRiskLevel.MEDIUM,
+                side_effect_class=ToolSideEffectClass.WRITE,
+                requires_approval=False,
+                timeout_seconds=30,
+            ),
+            _build_spreadsheet_create_handler(
+                None
+                if workspace_root is None
+                else Path(workspace_root),
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
+            ),
+        )
+        registry.register(
+            ToolSpec(
+                name="presentation_create",
+                description=(
+                    "Create a real .pptx slide deck artifact from structured slides and existing image files. "
+                    "Use this for PowerPoint or presentation delivery instead of terminal_exec. "
+                    "If the tool reports missing_dependency, ask the user to approve installing the listed open-source package."
+                ),
+                risk_level=ToolRiskLevel.MEDIUM,
+                side_effect_class=ToolSideEffectClass.WRITE,
+                requires_approval=False,
+                timeout_seconds=30,
+            ),
+            _build_presentation_create_handler(
                 None
                 if workspace_root is None
                 else Path(workspace_root),
@@ -3935,22 +4747,12 @@ def _build_kernel_tool_registry(
                 terminal_attestation_verifier=terminal_attestation_verifier,
             ),
         )
-    if _env_flag("NULLION_WEB_ACCESS_ENABLED"):
-        registry.register(
-            ToolSpec(
-                name="web_fetch",
-                description=(
-                    "Fetch a URL and return its content and response metadata. "
-                    "Follows HTTP redirects automatically (up to 5 hops). "
-                    "Always prefer this over terminal_exec curl for HTTP/HTTPS requests."
-                ),
-                risk_level=ToolRiskLevel.LOW,
-                side_effect_class=ToolSideEffectClass.READ,
-                requires_approval=False,
-                timeout_seconds=20,
-            ),
-            _build_web_fetch_handler(_default_web_fetcher),
-        )
+    if _env_flag("NULLION_WEB_ACCESS_ENABLED") and (
+        direct_web_fetch_enabled
+        if direct_web_fetch_enabled is not None
+        else _env_flag("NULLION_DIRECT_WEB_FETCH_ENABLED", default=False)
+    ):
+        register_web_fetch_tool(registry)
     if _connector_access_enabled():
         register_connector_plugin(registry)
     if _env_flag("NULLION_SKILL_PACK_ACCESS_ENABLED", default=False):
@@ -3965,6 +4767,7 @@ def _build_kernel_tool_registry(
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
                 timeout_seconds=20,
+                capability_tags=("skill_pack",),
             ),
             _build_skill_pack_read_handler(),
         )
@@ -3978,6 +4781,7 @@ def create_core_tool_registry(
     allowed_roots: list[Path] | tuple[Path, ...] | None = None,
     terminal_executor_backend: TerminalExecutorBackend | None = None,
     terminal_attestation_verifier: TerminalAttestationVerifier | None = None,
+    direct_web_fetch_enabled: bool | None = None,
 ) -> ToolRegistry:
     return _build_kernel_tool_registry(
         plugin_registration_allowed=False,
@@ -3985,6 +4789,7 @@ def create_core_tool_registry(
         allowed_roots=allowed_roots,
         terminal_executor_backend=terminal_executor_backend,
         terminal_attestation_verifier=terminal_attestation_verifier,
+        direct_web_fetch_enabled=direct_web_fetch_enabled,
     )
 
 
@@ -3995,6 +4800,7 @@ def create_plugin_tool_registry(
     allowed_roots: list[Path] | tuple[Path, ...] | None = None,
     terminal_executor_backend: TerminalExecutorBackend | None = None,
     terminal_attestation_verifier: TerminalAttestationVerifier | None = None,
+    direct_web_fetch_enabled: bool | None = None,
 ) -> ToolRegistry:
     return _build_kernel_tool_registry(
         plugin_registration_allowed=True,
@@ -4002,6 +4808,7 @@ def create_plugin_tool_registry(
         allowed_roots=allowed_roots,
         terminal_executor_backend=terminal_executor_backend,
         terminal_attestation_verifier=terminal_attestation_verifier,
+        direct_web_fetch_enabled=direct_web_fetch_enabled,
     )
 
 
@@ -4078,6 +4885,30 @@ def _build_web_fetch_handler(
                 error=str(exc),
             )
 
+        body_bytes = response.pop("_body_bytes", None)
+        if isinstance(body_bytes, bytes):
+            try:
+                from nullion.artifacts import artifact_path_for_generated_workspace_file
+
+                suffix = str(response.get("suggested_extension") or ".bin")
+                path = artifact_path_for_generated_workspace_file(
+                    principal_id=invocation.principal_id,
+                    suffix=suffix,
+                    stem="web-fetch",
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(body_bytes)
+                response["artifact_path"] = str(path)
+                response["artifact_paths"] = [str(path)]
+            except Exception as exc:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output=response,
+                    error=f"Could not materialize binary web_fetch response: {exc}",
+                )
+
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
@@ -4139,12 +4970,14 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
                 "Make an HTTP request to an installed connector/API gateway using the current workspace's "
                 "configured connection credential. GET/HEAD are always read-only; POST, PUT, PATCH, and "
                 "DELETE require that connection's permission mode to be read_write. Use enabled connector "
-                "skill instructions and never reveal the credential value."
+                "skill instructions, keep requests under that provider's configured base URL, and never "
+                "reveal the credential value. Use public web/browser tools for generic public URLs instead."
             ),
             risk_level=ToolRiskLevel.HIGH,
             side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
             requires_approval=False,
             timeout_seconds=20,
+            capability_tags=("connector",),
         ),
         _build_connector_request_handler(),
     )
@@ -4945,11 +5778,7 @@ def _missing_media_provider_result(invocation: ToolInvocation, capability: str) 
         output={
             "reason": "provider_not_configured",
             "capability": capability,
-            "setup": (
-                "Enable media_plugin with a local provider binding, then configure "
-                "NULLION_AUDIO_TRANSCRIBE_COMMAND, NULLION_IMAGE_OCR_COMMAND, or "
-                "NULLION_IMAGE_GENERATE_COMMAND as needed."
-            ),
+            "setup": format_setup_tip(MEDIA_PROVIDER_SETUP_TIP),
         },
         error=f"{capability} provider is not configured",
     )
@@ -5151,17 +5980,18 @@ def register_media_plugin(
     try:
         registry.get_spec("image_generate")
     except KeyError:
-        registry.register(
-            ToolSpec(
-                name="image_generate",
-                description="Generate an image file with the configured local image generation provider.",
-                risk_level=ToolRiskLevel.MEDIUM,
-                side_effect_class=ToolSideEffectClass.WRITE,
-                requires_approval=False,
-                timeout_seconds=120,
-            ),
-            _build_image_generate_handler(image_generator),
-        )
+        if image_generator is not None:
+            registry.register(
+                ToolSpec(
+                    name="image_generate",
+                    description="Generate an image file with the configured local image generation provider.",
+                    risk_level=ToolRiskLevel.MEDIUM,
+                    side_effect_class=ToolSideEffectClass.WRITE,
+                    requires_approval=False,
+                    timeout_seconds=120,
+                ),
+                _build_image_generate_handler(image_generator),
+            )
     return registry
 
 
@@ -5508,6 +6338,20 @@ def register_reminder_tools(
 # ── Cron tools ────────────────────────────────────────────────────────────────
 
 def _build_create_cron_handler(*, default_delivery_channel: str = "", default_delivery_target: str = ""):
+    def _current_delivery_context_defaults() -> tuple[str, str]:
+        try:
+            from nullion.cron_delivery import normalize_cron_delivery_channel
+            from nullion.reminders import current_reminder_chat_id
+
+            chat_id = str(current_reminder_chat_id() or "").strip()
+            channel, separator, target = chat_id.partition(":")
+            normalized_channel = normalize_cron_delivery_channel(channel)
+            if separator and normalized_channel and target.strip():
+                return normalized_channel, target.strip()
+        except Exception:
+            pass
+        return "", ""
+
     def _workspace_id_from_invocation(invocation: ToolInvocation, args: dict[str, object]) -> str:
         explicit = str(args.get("workspace_id") or "").strip()
         if explicit:
@@ -5528,12 +6372,15 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
         task     = str(args.get("task", "")).strip()
         enabled  = bool(args.get("enabled", True))
         workspace_id = _workspace_id_from_invocation(invocation, args)
-        default_channel = normalize_cron_delivery_channel(default_delivery_channel)
+        context_channel, context_target = _current_delivery_context_defaults()
+        configured_default_channel = normalize_cron_delivery_channel(default_delivery_channel)
+        default_channel = context_channel or configured_default_channel
+        default_target = context_target if context_channel else str(default_delivery_target or "").strip()
         delivery_channel = normalize_cron_delivery_channel(args.get("delivery_channel")) or default_channel
         explicit_target = str(args.get("delivery_target") or "").strip()
         delivery_target = explicit_target
         if not delivery_target and (not delivery_channel or delivery_channel == default_channel):
-            delivery_target = str(default_delivery_target or "").strip()
+            delivery_target = default_target
         if not name or not schedule or not task:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -5616,6 +6463,7 @@ def _build_list_crons_handler():
                     "enabled": j.enabled,
                     "next_run": j.next_run,
                     "last_run": j.last_run,
+                    "task": j.task,
                     "has_task": bool(str(j.task or "").strip()),
                     "has_last_result": bool(str(j.last_result or "").strip()),
                 }
@@ -5628,6 +6476,25 @@ def _build_list_crons_handler():
             error=None,
         )
     return handle
+
+
+def _cron_admin_workspace_allowed(workspace_id: str) -> bool:
+    return str(workspace_id or "").strip() == "workspace_admin"
+
+
+def _cron_workspace_denial(
+    *,
+    invocation: ToolInvocation,
+    cron_id: str,
+    owner_workspace_id: str,
+) -> ToolResult:
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output={"id": cron_id, "workspace_id": owner_workspace_id},
+        error=f"Cron {cron_id!r} belongs to workspace {owner_workspace_id}.",
+    )
 
 
 def _build_delete_cron_handler():
@@ -5646,14 +6513,9 @@ def _build_delete_cron_handler():
             )
         job = get_cron(cron_id)
         workspace_id = workspace_id_for_principal(invocation.principal_id)
-        if job is not None and job.workspace_id != workspace_id:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={"id": cron_id, "workspace_id": job.workspace_id},
-                error=f"Cron {cron_id!r} belongs to workspace {job.workspace_id}.",
-            )
+        admin_cross_workspace = job is not None and job.workspace_id != workspace_id and _cron_admin_workspace_allowed(workspace_id)
+        if job is not None and job.workspace_id != workspace_id and not admin_cross_workspace:
+            return _cron_workspace_denial(invocation=invocation, cron_id=cron_id, owner_workspace_id=job.workspace_id)
         removed = remove_cron(cron_id)
         if not removed:
             return ToolResult(
@@ -5667,7 +6529,11 @@ def _build_delete_cron_handler():
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"id": cron_id, "message": f"Cron {cron_id} deleted."},
+            output={
+                "id": cron_id,
+                "admin_cross_workspace": admin_cross_workspace,
+                "message": f"Cron {cron_id} deleted.",
+            },
             error=None,
         )
     return handle
@@ -5690,14 +6556,13 @@ def _build_update_cron_handler():
             )
         existing = get_cron(cron_id)
         workspace_id = workspace_id_for_principal(invocation.principal_id)
-        if existing is not None and existing.workspace_id != workspace_id:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={"id": cron_id, "workspace_id": existing.workspace_id},
-                error=f"Cron {cron_id!r} belongs to workspace {existing.workspace_id}.",
-            )
+        admin_cross_workspace = (
+            existing is not None
+            and existing.workspace_id != workspace_id
+            and _cron_admin_workspace_allowed(workspace_id)
+        )
+        if existing is not None and existing.workspace_id != workspace_id and not admin_cross_workspace:
+            return _cron_workspace_denial(invocation=invocation, cron_id=cron_id, owner_workspace_id=existing.workspace_id)
         mutable_fields = ("name", "schedule", "task", "enabled", "delivery_channel", "delivery_target", "workspace_id")
         updates: dict[str, object] = {}
         for field in mutable_fields:
@@ -5746,6 +6611,7 @@ def _build_update_cron_handler():
                 "delivery_channel": job.delivery_channel,
                 "delivery_target": job.delivery_target,
                 "enabled": job.enabled,
+                "admin_cross_workspace": admin_cross_workspace,
                 "next_run": job.next_run,
                 "message": f"Cron updated: '{job.name}' (id={job.id}).",
             },
@@ -5771,14 +6637,13 @@ def _build_toggle_cron_handler():
             )
         existing = get_cron(cron_id)
         workspace_id = workspace_id_for_principal(invocation.principal_id)
-        if existing is not None and existing.workspace_id != workspace_id:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={"id": cron_id, "workspace_id": existing.workspace_id},
-                error=f"Cron {cron_id!r} belongs to workspace {existing.workspace_id}.",
-            )
+        admin_cross_workspace = (
+            existing is not None
+            and existing.workspace_id != workspace_id
+            and _cron_admin_workspace_allowed(workspace_id)
+        )
+        if existing is not None and existing.workspace_id != workspace_id and not admin_cross_workspace:
+            return _cron_workspace_denial(invocation=invocation, cron_id=cron_id, owner_workspace_id=existing.workspace_id)
         job = toggle_cron(cron_id, enabled)
         if job is None:
             return ToolResult(
@@ -5798,6 +6663,7 @@ def _build_toggle_cron_handler():
                 "name": job.name,
                 "workspace_id": job.workspace_id,
                 "enabled": job.enabled,
+                "admin_cross_workspace": admin_cross_workspace,
                 "message": f"Cron '{job.name}' ({cron_id}) is now {state}.",
             },
             error=None,
@@ -5805,7 +6671,7 @@ def _build_toggle_cron_handler():
     return handle
 
 
-def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, object] | None] | None):
+def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] | None] | None):
     def _foreground_cron_no_output_text() -> str:
         from nullion.cron_delivery import DEFAULT_CRON_NO_OUTPUT_MESSAGE
 
@@ -5884,26 +6750,80 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
         name = str(getattr(job, "name", "") or "cron").strip()
         if normalized == "silent":
             return "Cron ran successfully; no output was produced."
+        if normalized == "deferred":
+            return "Cron started; the result will be delivered to this chat when ready."
+        return ""
+
+    def _call_cron_runner(runner: Callable[..., str | dict[str, object] | None], job: object, invocation: ToolInvocation):
+        try:
+            parameters = inspect.signature(runner).parameters
+            accepts_invocation = (
+                any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters.values())
+                or "invocation" in parameters
+                or len(
+                    [
+                        parameter
+                        for parameter in parameters.values()
+                        if parameter.kind
+                        in {
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        }
+                    ]
+                )
+                >= 2
+            )
+        except (TypeError, ValueError):
+            accepts_invocation = False
+        if accepts_invocation:
+            return runner(job, invocation)
+        return runner(job)
+
+    def _foreground_cron_failure_text(reason: str) -> str:
+        if reason == "cron_run_raw_tool_payload":
+            return (
+                "Cron run was blocked because it produced raw structured tool output "
+                "instead of a deliverable report."
+            )
+        if reason == "cron_run_internal_tool_output_leaked":
+            return "Cron run was blocked because it tried to deliver internal tool reference content."
+        if reason == "cron_run_reached_iteration_limit":
+            return "Cron run stopped before producing a deliverable result."
+        if reason == "cron_run_waiting_for_approval":
+            return "Cron run is waiting for approval."
+        if reason:
+            return "Cron run did not deliver its result to the configured platform."
         return ""
 
     def _foreground_cron_runner_output(runner_output: str | dict[str, object] | None) -> str | dict[str, object] | None:
         if not isinstance(runner_output, dict):
             return runner_output
         delivery_status = str(runner_output.get("cron_delivery_status") or "").strip()
-        if delivery_status:
+        if delivery_status or runner_output.get("cron_delivery_failed") or runner_output.get("cron_run_failed"):
+            allowed_keys = {
+                "cron_delivery_status",
+                "cron_delivery_failed",
+                "cron_run_failed",
+                "reached_iteration_limit",
+                "raw_tool_payload_blocked",
+                "suspended_for_approval",
+                "approval_id",
+                "reason",
+            }
+            if delivery_status == "deferred" and runner_output.get("mini_agent_dispatch"):
+                allowed_keys.update({
+                    "mini_agent_dispatch",
+                    "task_group_id",
+                    "planner_summary",
+                    "text",
+                    "final_text",
+                    "message",
+                    "result_text",
+                })
             return {
                 key: value
                 for key, value in runner_output.items()
-                if key
-                in {
-                    "cron_delivery_status",
-                    "cron_delivery_failed",
-                    "cron_run_failed",
-                    "reached_iteration_limit",
-                    "suspended_for_approval",
-                    "approval_id",
-                    "reason",
-                }
+                if key in allowed_keys
             }
         sanitized = dict(runner_output)
         sanitized.pop("artifact_paths", None)
@@ -5985,7 +6905,7 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
                 error="This runtime can list crons but cannot run them on demand.",
             )
         try:
-            runner_output = cron_runner(job)
+            runner_output = _call_cron_runner(cron_runner, job, invocation)
         except Exception as exc:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -6002,7 +6922,7 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
                 runner_failure_reason = "cron_run_reached_iteration_limit"
             elif runner_output.get("cron_delivery_failed"):
                 runner_failed = True
-                runner_failure_reason = "cron_delivery_failed"
+                runner_failure_reason = str(runner_output.get("reason") or "cron_delivery_failed")
             elif runner_output.get("suspended_for_approval"):
                 runner_failed = True
                 runner_failure_reason = "cron_run_waiting_for_approval"
@@ -6012,7 +6932,12 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
 
         delivery_status = runner_output.get("cron_delivery_status") if isinstance(runner_output, dict) else ""
         foreground_reply_suppressed = str(delivery_status or "").strip() in {"sent", "saved"}
-        result_text = "" if foreground_reply_suppressed else _foreground_cron_status_text(job, delivery_status)
+        result_text = (
+            ""
+            if foreground_reply_suppressed
+            else _foreground_cron_failure_text(runner_failure_reason)
+            or _foreground_cron_status_text(job, delivery_status)
+        )
         removed_media_count = 0
         if not result_text and not foreground_reply_suppressed:
             raw_result_text = guaranteed_user_visible_text(subject=job, output=runner_output, kind="cron")
@@ -6047,6 +6972,18 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
             output["foreground_reply_suppressed"] = True
         if delivery_status:
             output["delivery_status"] = str(delivery_status)
+        if (
+            isinstance(runner_output, dict)
+            and str(delivery_status or "").strip() == "deferred"
+            and runner_output.get("mini_agent_dispatch")
+        ):
+            output["mini_agent_dispatch"] = True
+            task_group_id = str(runner_output.get("task_group_id") or "").strip()
+            if task_group_id:
+                output["task_group_id"] = task_group_id
+            planner_summary = str(runner_output.get("planner_summary") or "").strip()
+            if planner_summary:
+                output["planner_summary"] = planner_summary
         if removed_media_count:
             output["foreground_media_directive_count"] = removed_media_count
         if isinstance(runner_output, dict):
@@ -6074,8 +7011,12 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
                 error=(
                     "Cron run did not finish cleanly; check the Doctor action or retry after cleanup."
                     if runner_failure_reason == "cron_run_reached_iteration_limit"
+                    else "Cron run produced raw structured tool output instead of a deliverable report."
+                    if runner_failure_reason == "cron_run_raw_tool_payload"
+                    else "Cron run tried to deliver internal tool reference content."
+                    if runner_failure_reason == "cron_run_internal_tool_output_leaked"
                     else "Cron run did not deliver its result to the configured platform."
-                    if runner_failure_reason == "cron_delivery_failed"
+                    if runner_failure_reason.startswith("cron_delivery") or runner_failure_reason.startswith("cron_run")
                     else "Cron run is waiting for approval."
                 ),
             )
@@ -6092,7 +7033,7 @@ def _build_run_cron_handler(cron_runner: Callable[[object], str | dict[str, obje
 def register_cron_tools(
     registry,
     *,
-    cron_runner: Callable[[object], str | dict[str, object] | None] | None = None,
+    cron_runner: Callable[..., str | dict[str, object] | None] | None = None,
     default_delivery_channel: str = "",
     default_delivery_target: str = "",
 ) -> None:
@@ -6128,7 +7069,8 @@ def register_cron_tools(
             name="list_crons",
             description=(
                 "List scheduled cron jobs for the current workspace with their id, workspace, schedule, "
-                "enabled state, and next run time. Optional args: workspace_id, include_all_workspaces."
+                "enabled state, next run time, and stored task instructions in structured output. "
+                "Optional args: workspace_id, include_all_workspaces."
             ),
             risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.READ,
@@ -6154,9 +7096,8 @@ def register_cron_tools(
         ToolSpec(
             name="update_cron",
             description=(
-                "Update an existing scheduled cron job by id. Required args: id. "
-                "Optional fields: name, schedule, task, enabled, workspace_id, delivery_channel, delivery_target. "
-                "At least one optional field must be provided."
+                "Update a scheduled cron job by id. Required args: id. "
+                "Optional mutable fields: name, schedule, task, enabled, workspace_id, delivery_channel, delivery_target."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
             side_effect_class=ToolSideEffectClass.WRITE,

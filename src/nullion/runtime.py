@@ -35,6 +35,9 @@ from nullion.approvals import (
 )
 from nullion.artifacts import media_candidate_paths_from_text
 from nullion.doctor_actions import (
+    CANCELLED,
+    COMPLETED,
+    FAILED,
     IN_PROGRESS,
     PENDING,
     DoctorAction,
@@ -551,6 +554,30 @@ class PersistentRuntime:
         self.checkpoint()
         return skill
 
+    def create_skill_result(
+        self,
+        *,
+        title: str,
+        summary: str,
+        trigger: str,
+        steps: list[str],
+        tags: list[str] | None = None,
+        skill_id: str | None = None,
+        actor: str = "runtime",
+    ) -> SkillMutationResult:
+        result = create_skill_result(
+            self.store,
+            title=title,
+            summary=summary,
+            trigger=trigger,
+            steps=steps,
+            tags=tags,
+            skill_id=skill_id,
+            actor=actor,
+        )
+        self.checkpoint()
+        return result
+
     def create_mission(
         self,
         *,
@@ -834,14 +861,45 @@ class PersistentRuntime:
         self.checkpoint()
         return skill
 
+    def accept_builder_skill_proposal_result(
+        self,
+        proposal: BuilderProposal,
+        *,
+        trigger: str | None = None,
+        steps: list[str] | None = None,
+        tags: list[str] | None = None,
+        title: str | None = None,
+        skill_id: str | None = None,
+        actor: str = "runtime",
+    ) -> SkillMutationResult:
+        result = accept_builder_skill_proposal_result(
+            self.store,
+            proposal,
+            trigger=trigger,
+            steps=steps,
+            tags=tags,
+            title=title,
+            skill_id=skill_id,
+            actor=actor,
+        )
+        self.checkpoint()
+        return result
+
     def store_builder_proposal(
         self,
         proposal: BuilderProposal,
         *,
         proposal_id: str | None = None,
+        context_key: str | None = None,
         actor: str = "runtime",
     ) -> BuilderProposalRecord:
-        record = store_builder_proposal(self.store, proposal, proposal_id=proposal_id, actor=actor)
+        record = store_builder_proposal(
+            self.store,
+            proposal,
+            proposal_id=proposal_id,
+            context_key=context_key,
+            actor=actor,
+        )
         self.checkpoint()
         return record
 
@@ -858,6 +916,21 @@ class PersistentRuntime:
         skill = accept_stored_builder_skill_proposal(self.store, proposal_id, actor=actor)
         self.checkpoint()
         return skill
+
+    def accept_stored_builder_skill_proposal_result(
+        self,
+        proposal_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> SkillMutationResult:
+        result = accept_stored_builder_skill_proposal_result(self.store, proposal_id, actor=actor)
+        self.checkpoint()
+        return result
+
+    def accept_stored_builder_dependency_proposal(self, proposal_id: str, *, actor: str = "runtime") -> dict[str, object]:
+        result = accept_stored_builder_dependency_proposal(self.store, proposal_id, actor=actor)
+        self.checkpoint()
+        return result
 
     def reject_stored_builder_proposal(self, proposal_id: str, *, actor: str = "runtime") -> BuilderProposalRecord:
         proposal = reject_stored_builder_proposal(self.store, proposal_id, actor=actor)
@@ -970,12 +1043,14 @@ class PersistentRuntime:
         now: datetime | None = None,
         stale_after: timedelta | None = None,
         live_run_ids: Iterable[str] | None = None,
+        live_group_ids: Iterable[str] | None = None,
     ) -> list[MiniAgentRun]:
         runs = reconcile_stale_mini_agent_runs(
             self.store,
             now=now,
             stale_after=stale_after,
             live_run_ids=live_run_ids,
+            live_group_ids=live_group_ids,
         )
         if runs:
             self.checkpoint()
@@ -1066,6 +1141,9 @@ def transition_mini_agent_run(
         new_status,
         result_summary=result_summary,
     )
+    if updated == existing:
+        return existing
+
     store.add_mini_agent_run(updated)
     if store.get_skill_execution_plan(updated.capsule_id) is not None:
         transition_skill_execution_plan_for_mini_agent_run(
@@ -1112,6 +1190,8 @@ def complete_mini_agent_run(
     result_summary: str | None = None,
 ) -> MiniAgentRun:
     existing = store.get_mini_agent_run(run_id)
+    if existing is not None and existing.status in {MiniAgentRunStatus.COMPLETED, MiniAgentRunStatus.FAILED}:
+        return existing
     if existing is not None and existing.status is MiniAgentRunStatus.PENDING:
         transition_mini_agent_run(
             store,
@@ -1134,6 +1214,8 @@ def fail_mini_agent_run(
     result_summary: str | None = None,
 ) -> MiniAgentRun:
     existing = store.get_mini_agent_run(run_id)
+    if existing is not None and existing.status in {MiniAgentRunStatus.COMPLETED, MiniAgentRunStatus.FAILED}:
+        return existing
     if existing is not None and existing.status is MiniAgentRunStatus.PENDING:
         transition_mini_agent_run(
             store,
@@ -1154,6 +1236,7 @@ def reconcile_stale_mini_agent_runs(
     now: datetime | None = None,
     stale_after: timedelta | None = None,
     live_run_ids: Iterable[str] | None = None,
+    live_group_ids: Iterable[str] | None = None,
 ) -> list[MiniAgentRun]:
     """Fail orphaned active Mini-Agent records that can no longer make progress.
 
@@ -1169,12 +1252,22 @@ def reconcile_stale_mini_agent_runs(
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=UTC)
     live_ids = {str(run_id) for run_id in (live_run_ids or []) if str(run_id)}
+    scoped_group_ids = None
+    if live_group_ids is not None:
+        live_group_id_set = {str(group_id) for group_id in live_group_ids if str(group_id)}
+        scoped_group_ids = live_group_id_set or None
     stale_after = stale_after or mini_agent_stale_after()
     repaired: list[MiniAgentRun] = []
-    active_statuses = {MiniAgentRunStatus.PENDING, MiniAgentRunStatus.RUNNING}
+    active_statuses = {
+        MiniAgentRunStatus.PENDING,
+        MiniAgentRunStatus.RUNNING,
+        MiniAgentRunStatus.WAITING_INPUT,
+    }
 
     for run in list(store.list_mini_agent_runs()):
         if run.status not in active_statuses or run.run_id in live_ids:
+            continue
+        if scoped_group_ids is not None and run.capsule_id not in scoped_group_ids:
             continue
         created_at = run.created_at
         if created_at.tzinfo is None:
@@ -1273,7 +1366,11 @@ def diagnose_runtime_health(
     stale_after = stale_after or mini_agent_stale_after()
     live_ids = tuple(sorted({str(run_id) for run_id in (live_mini_agent_run_ids or []) if str(run_id)}))
     live_id_set = set(live_ids)
-    active_statuses = {MiniAgentRunStatus.PENDING, MiniAgentRunStatus.RUNNING}
+    active_statuses = {
+        MiniAgentRunStatus.PENDING,
+        MiniAgentRunStatus.RUNNING,
+        MiniAgentRunStatus.WAITING_INPUT,
+    }
     stale_runs: list[MiniAgentRun] = []
 
     for run in store.list_mini_agent_runs():
@@ -1536,7 +1633,7 @@ def start_doctor_action(store: RuntimeStore, action_id: str) -> dict[str, str | 
         raise KeyError(action_id)
 
     action, action_type = stored
-    if action.status == IN_PROGRESS:
+    if action.status in {IN_PROGRESS, COMPLETED, CANCELLED, FAILED}:
         return _doctor_action_record(action, action_type=action_type)
 
     return _transition_doctor_action(store, action_id, start_action)
@@ -1548,7 +1645,9 @@ def complete_doctor_action(store: RuntimeStore, action_id: str) -> dict[str, str
     if stored is None:
         raise KeyError(action_id)
 
-    action, _action_type = stored
+    action, action_type = stored
+    if action.status in {COMPLETED, CANCELLED, FAILED}:
+        return _doctor_action_record(action, action_type=action_type)
     if action.status == PENDING:
         _transition_doctor_action(store, action_id, start_action)
     return _transition_doctor_action(store, action_id, complete_action)
@@ -1561,6 +1660,13 @@ def cancel_doctor_action(
     *,
     reason: str | None = None,
 ) -> dict[str, str | None]:
+    stored = store.get_doctor_action_object(action_id)
+    if stored is None:
+        raise KeyError(action_id)
+
+    action, action_type = stored
+    if action.status in {COMPLETED, CANCELLED, FAILED}:
+        return _doctor_action_record(action, action_type=action_type)
     return _transition_doctor_action(
         store,
         action_id,
@@ -1575,6 +1681,13 @@ def fail_doctor_action(
     *,
     error: str | None = None,
 ) -> dict[str, str | None]:
+    stored = store.get_doctor_action_object(action_id)
+    if stored is None:
+        raise KeyError(action_id)
+
+    action, action_type = stored
+    if action.status in {COMPLETED, CANCELLED, FAILED}:
+        return _doctor_action_record(action, action_type=action_type)
     return _transition_doctor_action(
         store,
         action_id,
@@ -2698,6 +2811,125 @@ def _resolve_active_conversation_branch(
 
 
 
+_DISPATCH_LINK_DISPOSITIONS = frozenset(
+    {
+        ConversationTurnDisposition.CONTINUE,
+        ConversationTurnDisposition.REVISE,
+        ConversationTurnDisposition.INTERRUPT,
+        ConversationTurnDisposition.BACKGROUND_FOLLOW_UP,
+    }
+)
+
+
+def _normalize_dispatch_disposition(value: object | None) -> ConversationTurnDisposition | None:
+    if value is None:
+        return None
+    if isinstance(value, ConversationTurnDisposition):
+        return value
+    try:
+        return ConversationTurnDisposition(str(value))
+    except ValueError:
+        return None
+
+
+def _resolve_conversation_turn_from_ingress_id(
+    store: RuntimeStore,
+    *,
+    conversation_id: str,
+    ingress_id: str,
+) -> ConversationTurn | None:
+    if not ingress_id:
+        return None
+    direct = store.get_conversation_turn(ingress_id)
+    if direct is not None and direct.conversation_id == conversation_id:
+        return direct
+    for event in reversed(store.list_conversation_events(conversation_id)):
+        if not isinstance(event, dict):
+            continue
+        if event.get("event_type") not in {"conversation.turn_recorded", "conversation.message_received"}:
+            continue
+        if ingress_id not in {event.get("request_id"), event.get("message_id"), event.get("turn_id")}:
+            continue
+        event_turn_id = event.get("turn_id")
+        if not isinstance(event_turn_id, str) or not event_turn_id:
+            continue
+        turn = store.get_conversation_turn(event_turn_id)
+        if turn is not None and turn.conversation_id == conversation_id:
+            return turn
+    return None
+
+
+def _resolve_dispatch_parent_turn(
+    store: RuntimeStore,
+    *,
+    conversation_id: str,
+    dependency_turn_ids: tuple[str, ...],
+) -> tuple[ConversationTurn | None, ConversationBranch | None]:
+    for dependency_id in dependency_turn_ids:
+        turn = _resolve_conversation_turn_from_ingress_id(
+            store,
+            conversation_id=conversation_id,
+            ingress_id=str(dependency_id or "").strip(),
+        )
+        if turn is None:
+            continue
+        branch = store.get_conversation_branch(turn.branch_id)
+        if branch is None:
+            continue
+        return turn, branch
+    return None, None
+
+
+def _dispatch_reason_text(reason: object | None, disposition: ConversationTurnDisposition) -> str:
+    text = str(reason or "").strip()
+    if text:
+        return f"dispatch:{text}"
+    return f"dispatch:{disposition.value}"
+
+
+def _active_frame_for_linked_branch(
+    store: RuntimeStore,
+    *,
+    conversation_id: str,
+    branch: ConversationBranch | None,
+):
+    active_task_frame_id = store.get_active_task_frame_id(conversation_id)
+    frame = store.get_task_frame(active_task_frame_id) if isinstance(active_task_frame_id, str) else None
+    if frame is None or branch is None:
+        return frame
+    return frame if frame.branch_id == branch.branch_id else None
+
+
+def _is_context_linked_dispatch(
+    *,
+    disposition: ConversationTurnDisposition | None,
+    parent_turn: ConversationTurn | None,
+    parent_branch: ConversationBranch | None,
+) -> bool:
+    return (
+        disposition in _DISPATCH_LINK_DISPOSITIONS
+        and parent_turn is not None
+        and parent_branch is not None
+    )
+
+
+def _context_branch_for_disposition(
+    *,
+    disposition: ConversationTurnDisposition,
+    active_branch: ConversationBranch | None,
+    active_turn_id: str | None,
+    dispatch_parent_turn: ConversationTurn | None,
+    dispatch_parent_branch: ConversationBranch | None,
+) -> tuple[ConversationBranch | None, str | None]:
+    if _is_context_linked_dispatch(
+        disposition=disposition,
+        parent_turn=dispatch_parent_turn,
+        parent_branch=dispatch_parent_branch,
+    ):
+        return dispatch_parent_branch, dispatch_parent_turn.turn_id
+    return active_branch, active_turn_id
+
+
 def _record_mini_agent_conversation_task_link(
     store: RuntimeStore,
     *,
@@ -3156,36 +3388,65 @@ def process_conversation_message(
     ambiguity_classifier: TurnDispositionAmbiguityClassifier | None = None,
     ambiguity_classifier_reason: str | None = None,
     previous_assistant_message: str | None = None,
+    dispatch_disposition: ConversationTurnDisposition | str | None = None,
+    dispatch_dependency_turn_ids: tuple[str, ...] = (),
+    dispatch_reason: str | None = None,
 ) -> ConversationMessageResult:
     conversation_id = conversation_id or _next_runtime_id("conv")
     received_at = received_at or datetime.now(UTC)
     turn_id = turn_id or _next_runtime_id("turn")
 
     active_branch, active_turn_id = _resolve_active_conversation_branch(store, conversation_id)
-    active_task_frame_id = store.get_active_task_frame_id(conversation_id)
-    active_task_frame = (
-        store.get_task_frame(active_task_frame_id)
-        if isinstance(active_task_frame_id, str)
-        else None
+    normalized_dispatch_disposition = _normalize_dispatch_disposition(dispatch_disposition)
+    normalized_dispatch_dependency_turn_ids = tuple(
+        str(dependency_id).strip()
+        for dependency_id in dispatch_dependency_turn_ids
+        if str(dependency_id).strip()
     )
-    disposition_decision = classify_turn_disposition_with_reason(
-        text=user_message,
-        active_branch_exists=active_branch is not None,
-        ambiguity_fallback=ambiguity_fallback,
-        previous_assistant_message=previous_assistant_message,
-        ambiguity_classifier=ambiguity_classifier,
+    dispatch_parent_turn, dispatch_parent_branch = _resolve_dispatch_parent_turn(
+        store,
+        conversation_id=conversation_id,
+        dependency_turn_ids=normalized_dispatch_dependency_turn_ids,
     )
-    disposition = disposition_decision.disposition
-    disposition_reason = disposition_decision.reason
-    if disposition_reason == "ambiguity_fallback" and ambiguity_fallback_reason:
-        disposition_reason = f"ambiguity_fallback:{ambiguity_fallback_reason}"
-    if disposition_reason == "ambiguity_classifier" and ambiguity_classifier_reason:
-        disposition_reason = f"ambiguity_classifier:{ambiguity_classifier_reason}"
-    should_continue = disposition is ConversationTurnDisposition.CONTINUE and active_branch is not None
+    dispatch_linked = _is_context_linked_dispatch(
+        disposition=normalized_dispatch_disposition,
+        parent_turn=dispatch_parent_turn,
+        parent_branch=dispatch_parent_branch,
+    )
+    if dispatch_linked:
+        disposition = normalized_dispatch_disposition or ConversationTurnDisposition.INDEPENDENT
+        disposition_reason = _dispatch_reason_text(dispatch_reason, disposition)
+    else:
+        disposition_decision = classify_turn_disposition_with_reason(
+            text=user_message,
+            active_branch_exists=active_branch is not None,
+            ambiguity_fallback=ambiguity_fallback,
+            previous_assistant_message=previous_assistant_message,
+            ambiguity_classifier=ambiguity_classifier,
+        )
+        disposition = disposition_decision.disposition
+        disposition_reason = disposition_decision.reason
+        if disposition_reason == "ambiguity_fallback" and ambiguity_fallback_reason:
+            disposition_reason = f"ambiguity_fallback:{ambiguity_fallback_reason}"
+        if disposition_reason == "ambiguity_classifier" and ambiguity_classifier_reason:
+            disposition_reason = f"ambiguity_classifier:{ambiguity_classifier_reason}"
+    context_branch, context_turn_id = _context_branch_for_disposition(
+        disposition=disposition,
+        active_branch=active_branch,
+        active_turn_id=active_turn_id,
+        dispatch_parent_turn=dispatch_parent_turn,
+        dispatch_parent_branch=dispatch_parent_branch,
+    )
+    active_task_frame = _active_frame_for_linked_branch(
+        store,
+        conversation_id=conversation_id,
+        branch=context_branch,
+    )
+    should_continue = disposition is ConversationTurnDisposition.CONTINUE and context_branch is not None
     task_frame_branch_continuous = (
-        active_branch is not None
+        context_branch is not None
         and active_task_frame is not None
-        and active_branch.branch_id == active_task_frame.branch_id
+        and context_branch.branch_id == active_task_frame.branch_id
     )
     task_frame_continuation = resolve_task_frame_continuation(
         text=user_message,
@@ -3193,7 +3454,7 @@ def process_conversation_message(
         branch_continuous=task_frame_branch_continuous,
     )
     if (
-        active_branch is not None
+        context_branch is not None
         and task_frame_continuation is not None
         and task_frame_continuation.mode.value != "start_new"
         and not should_continue
@@ -3205,9 +3466,9 @@ def process_conversation_message(
 
     superseded_branch_id: str | None = None
     if should_continue:
-        branch = active_branch
-        resolved_branch_id = active_branch.branch_id
-        parent_turn_id = active_turn_id
+        branch = context_branch
+        resolved_branch_id = context_branch.branch_id
+        parent_turn_id = context_turn_id
     else:
         resolved_branch_id = branch_id or _next_runtime_id("branch")
         branch = ConversationBranch(
@@ -3218,19 +3479,20 @@ def process_conversation_message(
         )
         parent_turn_id = None
 
-        if disposition in {ConversationTurnDisposition.INTERRUPT, ConversationTurnDisposition.REVISE} and active_branch is not None:
+        branch_to_supersede = context_branch
+        if disposition in {ConversationTurnDisposition.INTERRUPT, ConversationTurnDisposition.REVISE} and branch_to_supersede is not None:
             superseded = replace(
-                active_branch,
+                branch_to_supersede,
                 status=ConversationBranchStatus.SUPERSEDED,
                 superseded_by_branch_id=resolved_branch_id,
                 cancelled_at=received_at,
             )
             store.add_conversation_branch(superseded)
-            superseded_branch_id = active_branch.branch_id
+            superseded_branch_id = branch_to_supersede.branch_id
 
             superseded_payload = {
                 "conversation_id": conversation_id,
-                "superseded_branch_id": active_branch.branch_id,
+                "superseded_branch_id": branch_to_supersede.branch_id,
                 "replacement_branch_id": resolved_branch_id,
                 "disposition": disposition.value,
             }
@@ -3253,13 +3515,13 @@ def process_conversation_message(
                 conversation_id=conversation_id,
                 event_type="conversation.branch_superseded",
                 created_at=received_at,
-                superseded_branch_id=active_branch.branch_id,
+                superseded_branch_id=branch_to_supersede.branch_id,
                 replacement_branch_id=resolved_branch_id,
             )
             _cancel_conversation_branch_tasks(
                 store,
                 conversation_id=conversation_id,
-                branch_id=active_branch.branch_id,
+                branch_id=branch_to_supersede.branch_id,
                 replacement_branch_id=resolved_branch_id,
                 created_at=received_at,
             )
@@ -3278,6 +3540,26 @@ def process_conversation_message(
         chat_id=chat_id,
     )
 
+    dispatch_event_fields = {}
+    if normalized_dispatch_disposition is not None or normalized_dispatch_dependency_turn_ids or dispatch_reason:
+        dispatch_event_fields = {
+            "dispatch_disposition": (
+                normalized_dispatch_disposition.value
+                if normalized_dispatch_disposition is not None
+                else None
+            ),
+            "dispatch_dependency_turn_ids": list(normalized_dispatch_dependency_turn_ids),
+            "dispatch_reason": str(dispatch_reason).strip() if dispatch_reason else None,
+            "dispatch_parent_turn_id": dispatch_parent_turn.turn_id if dispatch_parent_turn is not None else None,
+            "dispatch_parent_branch_id": dispatch_parent_branch.branch_id if dispatch_parent_branch is not None else None,
+            "dispatch_linked": dispatch_linked,
+        }
+        dispatch_event_fields = {
+            key: value
+            for key, value in dispatch_event_fields.items()
+            if value is not None
+        }
+
     message_received_payload = {
         "conversation_id": conversation_id,
         "message_id": envelope.message_id,
@@ -3287,6 +3569,7 @@ def process_conversation_message(
         "chat_id": chat_id,
         "user_message": user_message,
         "disposition_reason": disposition_reason,
+        **dispatch_event_fields,
     }
     store.add_event(
         make_event(
@@ -3313,6 +3596,7 @@ def process_conversation_message(
         branch_id=resolved_branch_id,
         chat_id=chat_id,
         disposition_reason=disposition_reason,
+        **dispatch_event_fields,
     )
 
     if not should_continue:
@@ -3324,6 +3608,7 @@ def process_conversation_message(
             "parent_turn_id": parent_turn_id,
             "disposition": disposition.value,
             "disposition_reason": disposition_reason,
+            **dispatch_event_fields,
         }
         store.add_event(
             make_event(
@@ -3350,6 +3635,7 @@ def process_conversation_message(
             created_from_turn_id=turn_id,
             disposition=disposition.value,
             disposition_reason=disposition_reason,
+            **dispatch_event_fields,
         )
 
     turn = ConversationTurn(
@@ -3388,6 +3674,7 @@ def process_conversation_message(
         "disposition_reason": disposition_reason,
         "chat_id": chat_id,
         "superseded_branch_id": superseded_branch_id,
+        **dispatch_event_fields,
     }
     store.add_event(
         make_event(
@@ -3412,6 +3699,7 @@ def process_conversation_message(
         branch_id=resolved_branch_id,
         parent_turn_id=parent_turn_id,
         disposition_reason=disposition_reason,
+        **dispatch_event_fields,
     )
 
     return ConversationMessageResult(
@@ -5409,6 +5697,13 @@ def _append_skill_workflow_signal(
 AUTO_SKILL_ACTORS = frozenset({"auto-skill", "web-auto-skill", "builder_reflector", "builder_auto"})
 
 
+@dataclass(frozen=True, slots=True)
+class SkillMutationResult:
+    skill: SkillRecord
+    created: bool
+    merged_duplicate: bool = False
+
+
 def builder_auto_approve_skill_proposals_enabled() -> bool:
     raw = os.environ.get("NULLION_BUILDER_AUTO_APPROVE_SKILLS")
     if raw is None or raw.strip() == "":
@@ -5427,17 +5722,33 @@ def _builder_proposal_is_auto_acceptable_skill(proposal: BuilderProposal) -> boo
     )
 
 
+def _builder_proposal_skill_fields(proposal: BuilderProposal) -> tuple[str, str, str, list[str], list[str]]:
+    return (
+        (proposal.suggested_skill_title or proposal.title).strip(),
+        proposal.summary.strip(),
+        str(proposal.suggested_trigger or "").strip(),
+        [str(step).strip() for step in proposal.suggested_steps if str(step).strip()],
+        [str(tag).strip() for tag in proposal.suggested_tags if str(tag).strip()],
+    )
+
+
+def _find_duplicate_skill_for_proposal(store: RuntimeStore, proposal: BuilderProposal) -> SkillRecord | None:
+    title, summary, trigger, steps, _tags = _builder_proposal_skill_fields(proposal)
+    if not title or not summary or not trigger or not steps:
+        return None
+    return _find_duplicate_skill(store, title=title, summary=summary, trigger=trigger)
+
+
 def _normalized_skill_text(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
 
 
 def _skill_duplicate_key(*, title: str, summary: str, trigger: str) -> str:
+    normalized_title = _normalized_skill_text(title)
     normalized_summary = summary.strip().lower()
     if normalized_summary.startswith("captured from:"):
-        captured = _normalized_skill_text(normalized_summary.removeprefix("captured from:"))
-        if captured:
-            return f"captured:{captured}"
-    return f"title-trigger:{_normalized_skill_text(title)}::{_normalized_skill_text(trigger)}"
+        return f"auto-title:{normalized_title}"
+    return f"title-trigger:{normalized_title}::{_normalized_skill_text(trigger)}"
 
 
 def _skill_record_duplicate_key(skill: SkillRecord) -> str:
@@ -5515,7 +5826,7 @@ def deduplicate_skills(store: RuntimeStore, *, actor: str = "runtime") -> int:
     return removed
 
 
-def create_skill(
+def create_skill_result(
     store: RuntimeStore,
     *,
     title: str,
@@ -5525,7 +5836,7 @@ def create_skill(
     tags: list[str] | None = None,
     skill_id: str | None = None,
     actor: str = "runtime",
-) -> SkillRecord:
+) -> SkillMutationResult:
     normalized_actor = _require_trusted_mutation_actor(actor=actor, action="create_skill")
     normalized_title = title.strip()
     normalized_summary = summary.strip()
@@ -5565,7 +5876,7 @@ def create_skill(
             payload = {"skill_id": duplicate.skill_id, "title": duplicate.title}
             store.add_event(make_event(event_type="skill.duplicate_merged", actor=normalized_actor, payload=payload))
             store.add_audit_record(make_audit_record(action="skill.duplicate_merged", actor=normalized_actor, details=payload))
-            return duplicate
+            return SkillMutationResult(skill=duplicate, created=False, merged_duplicate=True)
     now = datetime.now(UTC)
     skill = SkillRecord(
         skill_id=skill_id or f"skill-{uuid4().hex[:12]}",
@@ -5584,7 +5895,69 @@ def create_skill(
     }
     store.add_event(make_event(event_type="skill.created", actor=normalized_actor, payload=payload))
     store.add_audit_record(make_audit_record(action="skill.created", actor=normalized_actor, details=payload))
-    return skill
+    return SkillMutationResult(skill=skill, created=True)
+
+
+def create_skill(
+    store: RuntimeStore,
+    *,
+    title: str,
+    summary: str,
+    trigger: str,
+    steps: list[str],
+    tags: list[str] | None = None,
+    skill_id: str | None = None,
+    actor: str = "runtime",
+) -> SkillRecord:
+    return create_skill_result(
+        store,
+        title=title,
+        summary=summary,
+        trigger=trigger,
+        steps=steps,
+        tags=tags,
+        skill_id=skill_id,
+        actor=actor,
+    ).skill
+
+
+def accept_builder_skill_proposal_result(
+    store: RuntimeStore,
+    proposal: BuilderProposal,
+    *,
+    trigger: str | None = None,
+    steps: list[str] | None = None,
+    tags: list[str] | None = None,
+    title: str | None = None,
+    skill_id: str | None = None,
+    actor: str = "runtime",
+) -> SkillMutationResult:
+    normalized_actor = _require_trusted_mutation_actor(actor=actor, action="accept_builder_skill_proposal")
+    if proposal.decision_type is not BuilderDecisionType.SKILL_PROPOSAL:
+        raise ValueError("proposal must be a skill proposal")
+    resolved_title = title or proposal.suggested_skill_title or proposal.title
+    resolved_trigger = trigger or proposal.suggested_trigger
+    resolved_steps = steps or list(proposal.suggested_steps)
+    resolved_tags = tags or list(proposal.suggested_tags)
+    if not resolved_trigger or not resolved_steps:
+        raise ValueError("proposal is missing draft skill details")
+    result = create_skill_result(
+        store,
+        title=resolved_title,
+        summary=proposal.summary,
+        trigger=resolved_trigger,
+        steps=resolved_steps,
+        tags=resolved_tags,
+        skill_id=skill_id,
+        actor=normalized_actor,
+    )
+    _append_skill_workflow_signal(
+        result.skill,
+        source="builder_accept",
+        summary=f"Converged workflow from accepted proposal: {proposal.title}",
+        recorded_at=result.skill.updated_at or datetime.now(UTC),
+    )
+    return result
 
 
 
@@ -5599,32 +5972,16 @@ def accept_builder_skill_proposal(
     skill_id: str | None = None,
     actor: str = "runtime",
 ) -> SkillRecord:
-    normalized_actor = _require_trusted_mutation_actor(actor=actor, action="accept_builder_skill_proposal")
-    if proposal.decision_type is not BuilderDecisionType.SKILL_PROPOSAL:
-        raise ValueError("proposal must be a skill proposal")
-    resolved_title = title or proposal.suggested_skill_title or proposal.title
-    resolved_trigger = trigger or proposal.suggested_trigger
-    resolved_steps = steps or list(proposal.suggested_steps)
-    resolved_tags = tags or list(proposal.suggested_tags)
-    if not resolved_trigger or not resolved_steps:
-        raise ValueError("proposal is missing draft skill details")
-    skill = create_skill(
+    return accept_builder_skill_proposal_result(
         store,
-        title=resolved_title,
-        summary=proposal.summary,
-        trigger=resolved_trigger,
-        steps=resolved_steps,
-        tags=resolved_tags,
+        proposal,
+        trigger=trigger,
+        steps=steps,
+        tags=tags,
+        title=title,
         skill_id=skill_id,
-        actor=normalized_actor,
-    )
-    _append_skill_workflow_signal(
-        skill,
-        source="builder_accept",
-        summary=f"Converged workflow from accepted proposal: {proposal.title}",
-        recorded_at=skill.updated_at or datetime.now(UTC),
-    )
-    return skill
+        actor=actor,
+    ).skill
 
 
 
@@ -5644,6 +6001,31 @@ def store_builder_proposal(
             if existing_by_id.proposal == proposal:
                 return existing_by_id
             raise ValueError(f"proposal_id already exists with different proposal: {proposal_id}")
+
+    if normalized_actor in AUTO_SKILL_ACTORS | {"runtime"} and _builder_proposal_is_auto_acceptable_skill(proposal):
+        duplicate = _find_duplicate_skill_for_proposal(store, proposal)
+        if duplicate is not None:
+            transient_id = proposal_id or f"duplicate-proposal-{duplicate.skill_id}"
+            payload = {
+                "proposal_id": transient_id,
+                "decision_type": proposal.decision_type.value,
+                "status": "accepted",
+                "skill_id": duplicate.skill_id,
+                "title": duplicate.title,
+            }
+            store.add_event(make_event(event_type="builder.proposal_duplicate_skipped", actor=normalized_actor, payload=payload))
+            store.add_audit_record(
+                make_audit_record(action="builder.proposal_duplicate_skipped", actor=normalized_actor, details=payload)
+            )
+            return BuilderProposalRecord(
+                proposal_id=transient_id,
+                proposal=proposal,
+                status="accepted",
+                created_at=now,
+                accepted_skill_id=duplicate.skill_id,
+                resolved_at=now,
+                context_key=context_key,
+            )
 
     for existing in store.builder_proposals.values():
         if existing.status != "pending":
@@ -5707,24 +6089,24 @@ def _require_pending_builder_proposal(record: BuilderProposalRecord, *, action: 
 
 
 
-def accept_stored_builder_skill_proposal(
+def accept_stored_builder_skill_proposal_result(
     store: RuntimeStore,
     proposal_id: str,
     *,
     actor: str = "runtime",
-) -> SkillRecord:
+) -> SkillMutationResult:
     normalized_actor = _require_trusted_mutation_actor(actor=actor, action="accept_stored_builder_skill_proposal")
     record = get_builder_proposal(store, proposal_id)
     if record is None:
         raise KeyError(proposal_id)
     _require_pending_builder_proposal(record, action="accepted")
-    skill = accept_builder_skill_proposal(store, record.proposal, actor=normalized_actor)
+    result = accept_builder_skill_proposal_result(store, record.proposal, actor=normalized_actor)
     store.builder_proposals[proposal_id] = BuilderProposalRecord(
         proposal_id=record.proposal_id,
         proposal=record.proposal,
         status="accepted",
         created_at=record.created_at,
-        accepted_skill_id=skill.skill_id,
+        accepted_skill_id=result.skill.skill_id,
         resolved_at=datetime.now(UTC),
         context_key=record.context_key,
     )
@@ -5732,11 +6114,74 @@ def accept_stored_builder_skill_proposal(
         "proposal_id": proposal_id,
         "decision_type": record.proposal.decision_type.value,
         "status": "accepted",
-        "skill_id": skill.skill_id,
+        "skill_id": result.skill.skill_id,
+        "created_skill": str(result.created).lower(),
+        "merged_duplicate": str(result.merged_duplicate).lower(),
     }
     store.add_event(make_event(event_type="builder.proposal_accepted", actor=normalized_actor, payload=payload))
     store.add_audit_record(make_audit_record(action="builder.proposal_accepted", actor=normalized_actor, details=payload))
-    return skill
+    return result
+
+
+def accept_stored_builder_skill_proposal(
+    store: RuntimeStore,
+    proposal_id: str,
+    *,
+    actor: str = "runtime",
+) -> SkillRecord:
+    return accept_stored_builder_skill_proposal_result(store, proposal_id, actor=actor).skill
+
+
+def accept_stored_builder_dependency_proposal(
+    store: RuntimeStore,
+    proposal_id: str,
+    *,
+    actor: str = "runtime",
+) -> dict[str, object]:
+    normalized_actor = _require_trusted_mutation_actor(actor=actor, action="accept_stored_builder_dependency_proposal")
+    record = get_builder_proposal(store, proposal_id)
+    if record is None:
+        raise KeyError(proposal_id)
+    _require_pending_builder_proposal(record, action="accepted")
+    proposal = record.proposal
+    if str(getattr(proposal, "approval_mode", "")) != "dependency":
+        raise ValueError(f"proposal {proposal_id} is not a dependency proposal")
+    from nullion.builder_capabilities import install_dependency
+
+    dependency_payload = {
+        "dependency_id": proposal.dependency_id or proposal.dependency_package or proposal.title,
+        "package": proposal.dependency_package or proposal.dependency_id or proposal.title,
+        "import_name": proposal.dependency_import_name or proposal.dependency_package or proposal.title,
+        "summary": proposal.summary,
+        "usage_note": proposal.dependency_usage_note or proposal.summary,
+        "docs_url": proposal.dependency_docs_url,
+        "github_url": proposal.dependency_github_url,
+        "license": proposal.dependency_license,
+        "requirement": proposal.dependency_requirement,
+    }
+    result = install_dependency(dependency_payload)
+    store.builder_proposals[proposal_id] = BuilderProposalRecord(
+        proposal_id=record.proposal_id,
+        proposal=record.proposal,
+        status="accepted",
+        created_at=record.created_at,
+        accepted_skill_id=None,
+        resolved_at=datetime.now(UTC),
+        context_key=record.context_key,
+        result=result,
+    )
+    payload = {
+        "proposal_id": proposal_id,
+        "decision_type": record.proposal.decision_type.value,
+        "status": "accepted",
+        "installed": bool(result.get("installed")),
+        "installed_version": result.get("installed_version"),
+        "dependency_id": proposal.dependency_id,
+        "package": proposal.dependency_package,
+    }
+    store.add_event(make_event(event_type="builder.dependency_proposal_accepted", actor=normalized_actor, payload=payload))
+    store.add_audit_record(make_audit_record(action="builder.dependency_proposal_accepted", actor=normalized_actor, details=payload))
+    return result
 
 
 def reject_stored_builder_proposal(
@@ -6625,6 +7070,7 @@ __all__ = [
     "approve_approval_request",
     "accept_builder_skill_proposal",
     "accept_stored_builder_skill_proposal",
+    "accept_stored_builder_dependency_proposal",
     "archive_stored_builder_proposal",
     "bootstrap_persistent_runtime",
     "bootstrap_runtime_store",
@@ -6652,6 +7098,7 @@ __all__ = [
     "create_extension_tool_registry",
     "create_mission",
     "create_skill",
+    "create_skill_result",
     "deduplicate_skills",
     "deny_approval_request",
     "diagnose_runtime_health",
@@ -6686,6 +7133,7 @@ __all__ = [
     "list_skill_refinement_proposals",
     "list_skills",
     "recommend_skills",
+    "SkillMutationResult",
     "mark_mission_blocked",
     "mark_mission_completed",
     "mark_mission_failed",
@@ -6704,6 +7152,8 @@ __all__ = [
     "set_mission_plan",
     "advance_mission",
     "advance_mission_step",
+    "accept_builder_skill_proposal_result",
+    "accept_stored_builder_skill_proposal_result",
     "mark_mini_agent_run_running",
     "record_policy_signal",
     "record_progress_update",

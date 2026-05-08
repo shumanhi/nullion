@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
 from nullion.tools import ToolRegistry, ToolSpec
 
 CORE_FALLBACK_TOOL_NAMES = ("file_read", "file_write", "terminal_exec", "web_fetch")
@@ -14,11 +15,19 @@ _PLUGIN_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "workspace_plugin": ("file_search", "file_patch", "workspace_summary"),
     "email_plugin": ("email_search", "email_read"),
     "calendar_plugin": ("calendar_list",),
+    "media_plugin": ("audio_transcribe", "image_extract_text", "image_generate"),
 }
 _PLUGIN_BY_CAPABILITY: dict[str, str] = {
     capability: plugin
     for plugin, capabilities in _PLUGIN_CAPABILITIES.items()
     for capability in capabilities
+}
+_UNAVAILABLE_TOOL_DESCRIPTIONS = {
+    "image_generate": (
+        "API image generation is not configured. If you create local fallback images with core tools, "
+        "say they are local fallback images and use this setup tip format: "
+        f"{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}"
+    ),
 }
 
 
@@ -83,7 +92,7 @@ def _tool_summary_from_spec(spec: ToolSpec) -> SystemContextToolSummary:
 def _unavailable_tool_summary(*, name: str, source: str) -> SystemContextToolSummary:
     return SystemContextToolSummary(
         name=name,
-        description="",
+        description=_UNAVAILABLE_TOOL_DESCRIPTIONS.get(name, ""),
         side_effect_class="",
         risk_level="",
         requires_approval=False,

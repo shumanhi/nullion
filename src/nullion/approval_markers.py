@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 
 TOOL_APPROVAL_REQUESTED_MARKER = "Tool approval requested"
+APPROVAL_REQUIRED_CONTINUE_MARKER = "Approval required before Nullion can continue."
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +23,9 @@ def split_tool_approval_marker(text: str | None) -> ToolApprovalMarker | None:
     if not isinstance(text, str):
         return None
     stripped = text.lstrip()
+    if stripped.startswith(APPROVAL_REQUIRED_CONTINUE_MARKER):
+        remainder = stripped.removeprefix(APPROVAL_REQUIRED_CONTINUE_MARKER).strip()
+        return ToolApprovalMarker(approval_id=None, remainder=remainder or None)
     if not stripped.startswith(TOOL_APPROVAL_REQUESTED_MARKER):
         return None
 
@@ -46,4 +50,3 @@ def strip_tool_approval_marker(text: str | None) -> str | None:
 
 def is_tool_approval_marker(text: str | None) -> bool:
     return split_tool_approval_marker(text) is not None
-

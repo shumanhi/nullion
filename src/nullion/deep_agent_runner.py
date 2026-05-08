@@ -7,9 +7,14 @@ import inspect
 import logging
 import os
 from pathlib import Path
+import shutil
 from typing import Any
 
-from nullion.artifacts import artifact_descriptor_for_path, artifact_root_for_principal
+from nullion.artifacts import (
+    artifact_descriptor_for_path,
+    artifact_path_for_generated_workspace_file,
+    artifact_root_for_principal,
+)
 from nullion.deep_agent_profiles import (
     deep_agent_skill_files_for_task,
     deep_agent_skills_for_task,
@@ -18,6 +23,7 @@ from nullion.deep_agent_profiles import (
 from nullion.langchain_adapters import nullion_client_as_langchain_chat_model, nullion_tools_as_langchain_tools
 from nullion.response_sanitizer import sanitize_user_visible_reply
 from nullion.response_fulfillment_contract import artifact_paths_from_tool_results
+from nullion.run_activity import format_tool_activity_line, should_suppress_tool_activity
 from nullion.task_queue import TaskResult
 
 logger = logging.getLogger(__name__)
@@ -138,6 +144,11 @@ class DeepAgentMiniAgentRunner:
 
         system_prompt = _system_prompt_for_task(config, context_in=context_in)
         tool_results: list[Any] = []
+
+        def record_tool_result(result: Any) -> None:
+            tool_results.append(result)
+            _emit_tool_progress(progress_queue, config=config, result=result)
+
         tools = [
             *nullion_tools_as_langchain_tools(
                 tool_registry,
@@ -145,7 +156,7 @@ class DeepAgentMiniAgentRunner:
                 principal_id=task.principal_id,
                 cleanup_scope=task.task_id,
                 policy_store=policy_store,
-                tool_result_callback=tool_results.append,
+                tool_result_callback=record_tool_result,
             ),
             *_deep_agent_meta_tools(config, progress_queue=progress_queue),
         ]
@@ -181,7 +192,10 @@ class DeepAgentMiniAgentRunner:
             source="deep-agent",
         ) or output_text
         artifacts = artifact_paths_from_tool_results(tool_results)
+        artifacts = _relocate_external_artifact_paths_for_task(config, artifacts)
         deliverable_artifacts = _deliverable_artifact_paths_for_task(config, artifacts)
+        if deliverable_artifacts and _task_requires_user_file_delivery(task):
+            output_text = _artifact_delivery_success_output_text(deliverable_artifacts)
         pending_approval = _pending_approval_from_tool_results(tool_results)
         if pending_approval is not None:
             await _emit_progress(
@@ -236,6 +250,8 @@ def _system_prompt_for_task(config, *, context_in: Any) -> str:
         "- Do not use /tmp, /var/tmp, or arbitrary absolute paths for final files the user asked to receive.\n"
         "- Temporary scratch files must also stay inside the workspace storage area unless a tool explicitly returns "
         "a workspace-safe generated path.\n"
+        "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, links, and existing "
+        "image artifact paths instead of terminal_exec.\n"
         "- Mention a saved or attached file only after file_write, pdf_create, or another file-producing tool "
         "returns a path in the workspace artifact directory.\n\n"
         f"Task: {task.description}"
@@ -273,6 +289,54 @@ def _deliverable_artifact_paths_for_task(config, artifact_paths: list[str]) -> l
     return list(dict.fromkeys(deliverable))
 
 
+def _relocate_external_artifact_paths_for_task(config, artifact_paths: list[str]) -> list[str]:
+    if not artifact_paths:
+        return []
+    task = config.task
+    try:
+        artifact_root = artifact_root_for_principal(task.principal_id)
+    except Exception:
+        logger.debug("Could not resolve artifact root for external artifact relocation", exc_info=True)
+        return list(dict.fromkeys(artifact_paths))
+
+    relocated: list[str] = []
+    for raw_path in artifact_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        source_path = Path(raw_path).expanduser()
+        try:
+            descriptor = artifact_descriptor_for_path(source_path, artifact_root=artifact_root)
+        except Exception:
+            descriptor = None
+        if descriptor is not None:
+            relocated.append(descriptor.path)
+            continue
+
+        try:
+            resolved_source = source_path.resolve()
+        except Exception:
+            continue
+        if not resolved_source.is_file():
+            continue
+        suffix = resolved_source.suffix or ".bin"
+        target_path = artifact_path_for_generated_workspace_file(
+            principal_id=task.principal_id,
+            suffix=suffix,
+            stem=resolved_source.stem or "artifact",
+        )
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(resolved_source, target_path)
+            target_descriptor = artifact_descriptor_for_path(target_path, artifact_root=artifact_root)
+        except Exception:
+            logger.debug("Could not relocate external artifact %s", resolved_source, exc_info=True)
+            continue
+        if target_descriptor is not None:
+            relocated.append(target_descriptor.path)
+
+    return list(dict.fromkeys(relocated or artifact_paths))
+
+
 def _artifact_delivery_failure_for_task(config, artifact_paths: list[str], deliverable_artifacts: list[str]) -> str | None:
     task = config.task
     if deliverable_artifacts:
@@ -293,6 +357,15 @@ def _artifact_delivery_failure_for_task(config, artifact_paths: list[str], deliv
         "The mini-agent did not create a downloadable file for this request. "
         f"Final user-facing files must be written under {root_text}."
     )
+
+
+def _artifact_delivery_success_output_text(deliverable_artifacts: list[str]) -> str:
+    names = [Path(path).name for path in deliverable_artifacts if isinstance(path, str) and path]
+    if len(names) == 1:
+        return f"Created and verified downloadable artifact: {names[0]}"
+    if names:
+        return "Created and verified downloadable artifacts: " + ", ".join(names)
+    return "Created and verified the requested downloadable artifact."
 
 
 def _task_requires_user_file_delivery(task) -> bool:
@@ -666,6 +739,36 @@ async def _emit_progress(
         )
     except asyncio.QueueFull:
         logger.debug("DeepAgent progress queue full, dropping update")
+
+
+def _emit_tool_progress(queue: asyncio.Queue, *, config, result: Any) -> None:
+    if queue is None or should_suppress_tool_activity(result):
+        return
+    from nullion.mini_agent_runner import ProgressUpdate
+
+    try:
+        output = getattr(result, "output", None)
+        data: dict[str, object] = {
+            "tool_name": str(getattr(result, "tool_name", "") or "tool"),
+            "tool_status": str(getattr(result, "status", "") or "unknown"),
+        }
+        if isinstance(output, dict):
+            for key in ("path", "url", "title", "status_code", "content_type"):
+                value = output.get(key)
+                if value is not None:
+                    data[key] = str(value)[:300]
+        queue.put_nowait(
+            ProgressUpdate(
+                agent_id=config.agent_id,
+                task_id=config.task.task_id,
+                group_id=config.task.group_id,
+                kind="tool_activity",
+                message=format_tool_activity_line(result),
+                data=data,
+            )
+        )
+    except asyncio.QueueFull:
+        logger.debug("DeepAgent tool progress queue full, dropping update")
 
 
 async def _run_tool_registry_cleanup(tool_registry: Any, *, scope_id: str) -> None:

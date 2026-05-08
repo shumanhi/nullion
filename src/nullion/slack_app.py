@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import logging
 from pathlib import Path
 import re
@@ -28,6 +29,14 @@ from nullion.messaging_adapters import (
     split_reply_for_platform,
 )
 from nullion.messaging_runtime import build_messaging_runtime_service_from_settings
+from nullion.operator_commands import is_stop_command_text
+from nullion.platform_activity import (
+    PlatformTaskCardStore,
+    platform_activity_capabilities,
+    should_deliver_task_status,
+)
+from nullion.run_activity import activity_trace_enabled, task_planner_feed_mode
+from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
 from nullion.users import resolve_messaging_user
 
@@ -62,6 +71,24 @@ def _record_slack_delivery_receipt(
 def _optional_event_text(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _handle_messaging_ingress_result_with_dispatch(service, ingress, *, turn_dispatch_decision=None):
+    try:
+        parameters = inspect.signature(handle_messaging_ingress_result).parameters
+    except (TypeError, ValueError):
+        return handle_messaging_ingress_result(service, ingress)
+    accepts_dispatch = (
+        "turn_dispatch_decision" in parameters
+        or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    )
+    if accepts_dispatch:
+        return handle_messaging_ingress_result(
+            service,
+            ingress,
+            turn_dispatch_decision=turn_dispatch_decision,
+        )
+    return handle_messaging_ingress_result(service, ingress)
 
 
 # Slack mrkdwn formatting tokens that should be stripped before LLM ingestion.
@@ -153,6 +180,27 @@ def _slack_response_field(response: object, name: str) -> str | None:
     return text or None
 
 
+def _slack_response_ok(response: object) -> bool:
+    if response is None:
+        return True
+    if isinstance(response, dict):
+        value = response.get("ok")
+    else:
+        getter = getattr(response, "get", None)
+        if getter is None:
+            value = getattr(response, "ok", None)
+        else:
+            try:
+                value = getter("ok")
+            except Exception:
+                value = getattr(response, "ok", None)
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no"}
+
+
 async def _update_slack_message(client, *, channel: str, ts: str, text: str) -> bool:
     if client is None:
         return False
@@ -162,11 +210,69 @@ async def _update_slack_message(client, *, channel: str, ts: str, text: str) -> 
     try:
         result = chat_update(channel=channel, ts=ts, text=text)
         if asyncio.iscoroutine(result):
-            await result
-        return True
+            result = await result
+        return _slack_response_ok(result)
     except Exception:
         logger.debug("Slack working message update failed", exc_info=True)
         return False
+
+
+async def _deliver_slack_task_status(
+    *,
+    client,
+    channel: str,
+    group_id: str,
+    text: str,
+    status_kind: str,
+    activity_id: str,
+    activity_label: str,
+    task_card_store: PlatformTaskCardStore,
+    status_messages: dict[tuple[str, str], str],
+    status_locks: dict[tuple[str, str], asyncio.Lock],
+    planner_feed_enabled: bool,
+    include_activity: bool,
+) -> bool:
+    target = str(channel or "").strip()
+    group = str(group_id or "").strip()
+    if (
+        not target
+        or not group
+        or not should_deliver_task_status(
+            status_kind=status_kind,
+            planner_feed_enabled=planner_feed_enabled,
+            include_activity=include_activity,
+        )
+    ):
+        return False
+    rendered_status = task_card_store.update(
+        target_id=target,
+        group_id=group,
+        status_kind=status_kind,
+        text=text,
+        activity_id=activity_id,
+        activity_label=activity_label,
+        include_activity=include_activity,
+    )
+    if not rendered_status:
+        return True
+    key = (target, group)
+    lock = status_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        ts = status_messages.get(key)
+        formatted = _format_slack_reply(rendered_status)
+        if ts and await _update_slack_message(client, channel=target, ts=ts, text=formatted):
+            return True
+        try:
+            response = await client.chat_postMessage(channel=target, text=formatted)
+            if not _slack_response_ok(response):
+                return False
+            sent_ts = _slack_response_field(response, "ts")
+            if sent_ts:
+                status_messages[key] = sent_ts
+            return True
+        except Exception:
+            logger.debug("Slack task card delivery failed", exc_info=True)
+            return False
 
 
 async def _upload_slack_reply_files(client, *, channel: str, paths: tuple[Path, ...], initial_comment: str | None) -> bool:
@@ -350,6 +456,16 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         await say("Unauthorized messaging identity.")
         return
 
+    if is_stop_command_text(ingress.text):
+        stop_result = await stop_session_async(
+            conversation_id=ingress.operator_chat_id,
+            runtime=getattr(service, "runtime", None),
+            agent_orchestrator=getattr(service, "agent_orchestrator", None),
+            turn_tracker=GLOBAL_TURN_DISPATCH_TRACKER,
+        )
+        await say(stop_session_reply(stop_result))
+        return
+
     working_channel = str(event.get("channel") or "").strip()
     working_ts = None
     if client is not None and working_channel:
@@ -368,7 +484,12 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
     )
     try:
         await turn_registration.wait_for_dependencies()
-        turn_result = await asyncio.to_thread(handle_messaging_ingress_result, service, ingress)
+        turn_result = await asyncio.to_thread(
+            _handle_messaging_ingress_result_with_dispatch,
+            service,
+            ingress,
+            turn_dispatch_decision=turn_registration.decision,
+        )
         if await turn_registration.is_superseded():
             if working_ts:
                 await _update_slack_message(client, channel=working_channel, ts=working_ts, text="Updated by your follow-up.")
@@ -441,7 +562,11 @@ async def handle_slack_command(service, settings: NullionSettings, *, command: d
         await respond("Unauthorized messaging identity.")
         return
 
-    turn_result = await asyncio.to_thread(handle_messaging_ingress_result, service, ingress)
+    turn_result = await asyncio.to_thread(
+        _handle_messaging_ingress_result_with_dispatch,
+        service,
+        ingress,
+    )
     reply = turn_result.reply
     chunks = _slack_reply_chunks(reply or "", limit=39000)
     if not chunks:
@@ -468,6 +593,34 @@ async def run_slack_app(
     service = service_builder(checkpoint_path=checkpoint_path, env_path=env_path)
 
     app = AsyncApp(token=bot_token, signing_secret=settings.slack.signing_secret)
+    _task_card_store = PlatformTaskCardStore(platform_activity_capabilities("slack"))
+    _status_messages: dict[tuple[str, str], str] = {}
+    _status_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    async def _slack_deliver_fn(conversation_id: str, text: str, **kwargs) -> bool:
+        prefix, _, channel = str(conversation_id or "").partition(":")
+        if prefix != "slack" or not channel:
+            return False
+        if kwargs.get("is_status"):
+            return await _deliver_slack_task_status(
+                client=app.client,
+                channel=channel,
+                group_id=str(kwargs.get("group_id") or ""),
+                text=text,
+                status_kind=str(kwargs.get("status_kind") or "task_summary"),
+                activity_id=str(kwargs.get("activity_id") or ""),
+                activity_label=str(kwargs.get("activity_label") or ""),
+                task_card_store=_task_card_store,
+                status_messages=_status_messages,
+                status_locks=_status_locks,
+                planner_feed_enabled=task_planner_feed_mode() != "off",
+                include_activity=activity_trace_enabled(),
+            )
+        outbound_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text
+        return await send_slack_platform_delivery(bot_token=bot_token, channel=channel, text=outbound_text)
+
+    if getattr(service, "agent_orchestrator", None) is not None and hasattr(service.agent_orchestrator, "set_deliver_fn"):
+        service.agent_orchestrator.set_deliver_fn(_slack_deliver_fn)
 
     @app.event("message")
     async def _on_message(event, say, client):  # type: ignore[no-untyped-def]

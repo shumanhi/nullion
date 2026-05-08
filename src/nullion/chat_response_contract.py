@@ -16,6 +16,7 @@ from nullion.live_information import (
     format_live_information_resolution_label,
     format_live_information_states_for_prompt,
 )
+from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
 from nullion.tools import ToolResult, normalize_tool_status
 
 
@@ -238,6 +239,8 @@ def _tool_failure_reply(state: ChatTurnStateSnapshot) -> str | None:
     for fact in state.facts:
         if fact.kind is not OperationalFactKind.TOOL_FAILED:
             continue
+        if _is_image_generation_setup_failure(fact.payload):
+            return _IMAGE_GENERATION_NOT_CONFIGURED_REPLY
         tool_name = fact.payload.get("tool_name")
         if not isinstance(tool_name, str) or not tool_name:
             tool_name = "that tool"
@@ -313,6 +316,8 @@ def _primary_tool_outcome_failure_reply(state: ChatTurnStateSnapshot) -> str | N
     failed_payload = _tool_failed_fact_for_invocation(state, invocation_id)
     if failed_payload is None:
         return None
+    if _is_image_generation_setup_failure(failed_payload):
+        return _IMAGE_GENERATION_NOT_CONFIGURED_REPLY
     tool_name = failed_payload.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name:
         tool_name = "that tool"
@@ -321,6 +326,29 @@ def _primary_tool_outcome_failure_reply(state: ChatTurnStateSnapshot) -> str | N
     if isinstance(error, str) and error:
         lines.append(f"Error: {error}")
     return "\n".join(lines)
+
+
+_IMAGE_GENERATION_NOT_CONFIGURED_REPLY = (
+    "I couldn't use API image generation because it is not configured. "
+    "I can still create local fallback images when that fits the task.\n\n"
+    f"{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}"
+)
+
+
+def _is_image_generation_setup_failure(payload: Mapping[str, Any]) -> bool:
+    if payload.get("tool_name") != "image_generate":
+        return False
+    output = payload.get("output")
+    if isinstance(output, Mapping) and output.get("reason") == "provider_not_configured":
+        return True
+    error = payload.get("error")
+    if not isinstance(error, str):
+        return False
+    return (
+        "local_media_provider requires NULLION_IMAGE_GENERATE_COMMAND" in error
+        or error == "image_generate provider is not configured"
+        or "image generation requires an API key" in error
+    )
 
 
 def _primary_tool_completed(state: ChatTurnStateSnapshot) -> bool:

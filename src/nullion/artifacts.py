@@ -222,6 +222,9 @@ def _looks_like_attachment_path(value: str) -> bool:
         return True
     if text.startswith("file:"):
         return True
+    if "/" not in text and "\\" not in text and not text.startswith("."):
+        suffix = Path(text).suffix
+        return 1 < len(suffix) <= 16
     return len(text) >= 3 and text[1:3] in {":\\", ":/"} and text[0].isalpha()
 
 

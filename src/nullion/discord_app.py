@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
+import inspect
 import logging
 from pathlib import Path
 
@@ -28,6 +29,14 @@ from nullion.messaging_adapters import (
     split_reply_for_platform,
 )
 from nullion.messaging_runtime import build_messaging_runtime_service_from_settings
+from nullion.operator_commands import is_stop_command_text
+from nullion.platform_activity import (
+    PlatformTaskCardStore,
+    platform_activity_capabilities,
+    should_deliver_task_status,
+)
+from nullion.run_activity import activity_trace_enabled, task_planner_feed_mode
+from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
 from nullion.users import resolve_messaging_user
 
@@ -62,6 +71,24 @@ def _record_discord_delivery_receipt(
 def _optional_message_text(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _handle_messaging_ingress_result_with_dispatch(service, ingress, *, turn_dispatch_decision=None):
+    try:
+        parameters = inspect.signature(handle_messaging_ingress_result).parameters
+    except (TypeError, ValueError):
+        return handle_messaging_ingress_result(service, ingress)
+    accepts_dispatch = (
+        "turn_dispatch_decision" in parameters
+        or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    )
+    if accepts_dispatch:
+        return handle_messaging_ingress_result(
+            service,
+            ingress,
+            turn_dispatch_decision=turn_dispatch_decision,
+        )
+    return handle_messaging_ingress_result(service, ingress)
 
 
 def _require_discord_settings(settings: NullionSettings) -> str:
@@ -129,6 +156,71 @@ async def _send_discord_text_with_plain_fallback(channel, text: str) -> None:
     except Exception:
         logger.warning("Discord message delivery failed; retrying as plain text.", exc_info=True)
         await channel.send(_discord_plain_format_fallback_text(text))
+
+
+async def _edit_discord_message(message, text: str) -> bool:
+    edit = getattr(message, "edit", None)
+    if edit is None:
+        return False
+    try:
+        await edit(content=sanitize_external_inline_markup(text or ""))
+        return True
+    except Exception:
+        logger.debug("Discord task card edit failed", exc_info=True)
+        return False
+
+
+async def _deliver_discord_task_status(
+    *,
+    channel_id: str,
+    channel,
+    group_id: str,
+    text: str,
+    status_kind: str,
+    activity_id: str,
+    activity_label: str,
+    task_card_store: PlatformTaskCardStore,
+    status_messages: dict[tuple[str, str], object],
+    status_locks: dict[tuple[str, str], asyncio.Lock],
+    planner_feed_enabled: bool,
+    include_activity: bool,
+) -> bool:
+    target = str(channel_id or "").strip()
+    group = str(group_id or "").strip()
+    if (
+        channel is None
+        or not target
+        or not group
+        or not should_deliver_task_status(
+            status_kind=status_kind,
+            planner_feed_enabled=planner_feed_enabled,
+            include_activity=include_activity,
+        )
+    ):
+        return False
+    rendered_status = task_card_store.update(
+        target_id=target,
+        group_id=group,
+        status_kind=status_kind,
+        text=text,
+        activity_id=activity_id,
+        activity_label=activity_label,
+        include_activity=include_activity,
+    )
+    if not rendered_status:
+        return True
+    key = (target, group)
+    lock = status_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        existing = status_messages.get(key)
+        if existing is not None and await _edit_discord_message(existing, rendered_status):
+            return True
+        try:
+            status_messages[key] = await channel.send(sanitize_external_inline_markup(rendered_status))
+            return True
+        except Exception:
+            logger.debug("Discord task card delivery failed", exc_info=True)
+            return False
 
 
 async def _send_discord_chunks_with_plain_fallback(channel, text: str | None, *, limit: int = 1900) -> None:
@@ -308,6 +400,16 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         await message.channel.send("Unauthorized messaging identity.")
         return
 
+    if is_stop_command_text(ingress.text):
+        stop_result = await stop_session_async(
+            conversation_id=ingress.operator_chat_id,
+            runtime=getattr(service, "runtime", None),
+            agent_orchestrator=getattr(service, "agent_orchestrator", None),
+            turn_tracker=GLOBAL_TURN_DISPATCH_TRACKER,
+        )
+        await message.channel.send(stop_session_reply(stop_result))
+        return
+
     turn_registration = await GLOBAL_TURN_DISPATCH_TRACKER.register(
         ingress.operator_chat_id,
         ingress.text,
@@ -317,7 +419,12 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
     try:
         await turn_registration.wait_for_dependencies()
         async with _discord_typing(message.channel):
-            turn_result = await asyncio.to_thread(handle_messaging_ingress_result, service, ingress)
+            turn_result = await asyncio.to_thread(
+                _handle_messaging_ingress_result_with_dispatch,
+                service,
+                ingress,
+                turn_dispatch_decision=turn_registration.decision,
+            )
             reply = turn_result.reply
         if await turn_registration.is_superseded():
             return
@@ -415,6 +522,57 @@ async def run_discord_app(
                 )
 
     client = NullionDiscordClient(intents=intents)
+    _task_card_store = PlatformTaskCardStore(platform_activity_capabilities("discord"))
+    _status_messages: dict[tuple[str, str], object] = {}
+    _status_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    async def _resolve_discord_channel(channel_id: str):
+        if not channel_id:
+            return None
+        channel = client.get_channel(int(channel_id)) if str(channel_id).isdigit() else None
+        if channel is not None:
+            return channel
+        try:
+            return await client.fetch_channel(int(channel_id))
+        except Exception:
+            logger.debug("Discord task card channel fetch failed", exc_info=True)
+            return None
+
+    async def _discord_deliver_fn(conversation_id: str, text: str, **kwargs) -> bool:
+        prefix, _, channel_id = str(conversation_id or "").partition(":")
+        if prefix != "discord" or not channel_id:
+            return False
+        channel = await _resolve_discord_channel(channel_id)
+        if channel is None:
+            return False
+        if kwargs.get("is_status"):
+            return await _deliver_discord_task_status(
+                channel_id=channel_id,
+                channel=channel,
+                group_id=str(kwargs.get("group_id") or ""),
+                text=text,
+                status_kind=str(kwargs.get("status_kind") or "task_summary"),
+                activity_id=str(kwargs.get("activity_id") or ""),
+                activity_label=str(kwargs.get("activity_label") or ""),
+                task_card_store=_task_card_store,
+                status_messages=_status_messages,
+                status_locks=_status_locks,
+                planner_feed_enabled=task_planner_feed_mode() != "off",
+                include_activity=activity_trace_enabled(),
+            )
+        if kwargs.get("is_artifact"):
+            path = Path(str(text or "")).expanduser()
+            if path.exists() and path.is_file():
+                await _send_discord_reply_file(channel, path=path, content="Attached the requested file.")
+            else:
+                await _send_discord_chunks_with_plain_fallback(channel, text, limit=1900)
+        else:
+            await _send_discord_chunks_with_plain_fallback(channel, text, limit=1900)
+        return True
+
+    if getattr(service, "agent_orchestrator", None) is not None and hasattr(service.agent_orchestrator, "set_deliver_fn"):
+        service.agent_orchestrator.set_deliver_fn(_discord_deliver_fn)
+
     logger.info("Starting Nullion Discord adapter")
     await client.start(bot_token)
 

@@ -68,6 +68,15 @@ def _default_key_path() -> Path:
     return _nullion_home() / "chat_history.key"
 _ENCRYPTED_PREFIX = "enc:v1:"
 CHAT_SQLITE_MEASURE_ENABLED = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
+_INTERNAL_SCHEDULED_TASK_PREFIXES = (
+    "[Scheduled task: ",
+    "[Manual scheduled task run: ",
+)
+
+
+def _is_internal_scheduled_task_context(text: str) -> bool:
+    stripped = str(text or "").lstrip()
+    return any(stripped.startswith(prefix) for prefix in _INTERNAL_SCHEDULED_TASK_PREFIXES)
 CHAT_SQLITE_SLOW_MS = float(os.environ.get("NULLION_SQLITE_SLOW_MS", "250"))
 
 _DDL = """
@@ -154,6 +163,32 @@ def _make_title(text: str) -> str:
     if len(text) <= _MAX_TITLE_LEN:
         return text
     return text[:_MAX_TITLE_LEN].rsplit(" ", 1)[0] + "…"
+
+
+def _metadata_weight(metadata: Any) -> int:
+    if not metadata:
+        return 0
+    try:
+        return len(json.dumps(metadata, separators=(",", ":"), sort_keys=True))
+    except Exception:
+        return 1
+
+
+def _collapse_adjacent_duplicate_bot_messages(messages: list[dict]) -> list[dict]:
+    collapsed: list[dict] = []
+    for message in messages:
+        if (
+            collapsed
+            and message.get("role") == "bot"
+            and collapsed[-1].get("role") == "bot"
+            and message.get("text") == collapsed[-1].get("text")
+            and bool(message.get("is_error")) == bool(collapsed[-1].get("is_error"))
+        ):
+            if _metadata_weight(message.get("metadata")) > _metadata_weight(collapsed[-1].get("metadata")):
+                collapsed[-1] = {**collapsed[-1], "metadata": message.get("metadata")}
+            continue
+        collapsed.append(message)
+    return collapsed
 
 
 def _channel_label_for_conversation(conversation_id: str) -> str:
@@ -614,8 +649,28 @@ class ChatStore:
                     latest["role"] == role
                     and (self._decrypt_text(latest["text"]) or "") == safe_text
                     and bool(latest["is_error"]) == bool(is_error)
-                    and latest_metadata == metadata_text
                 ):
+                    if latest_metadata == metadata_text:
+                        return latest["id"]
+                    if role == "bot":
+                        # Web turns can first arrive from the runtime event log
+                        # without artifacts/activity metadata, then from the
+                        # browser with the same final text plus rich metadata.
+                        # Treat that as one delivered reply and keep the richer
+                        # row data instead of rendering two identical bubbles.
+                        preferred_metadata = metadata_text or latest_metadata
+                        conn.execute(
+                            "UPDATE messages SET metadata = ? WHERE id = ?",
+                            (
+                                self._encrypt_text(preferred_metadata) if preferred_metadata else None,
+                                latest["id"],
+                            ),
+                        )
+                        conn.execute(
+                            "UPDATE conversations SET last_message_at = ? WHERE id = ?",
+                            (now, conv_id),
+                        )
+                        return latest["id"]
                     return latest["id"]
             # Insert message
             cur = conn.execute(
@@ -660,6 +715,8 @@ class ChatStore:
                     continue
                 created_at = str(turn.get("created_at") or "").strip() or _now()
                 user_message = str(turn.get("user_message") or "").strip()
+                if _is_internal_scheduled_task_context(user_message):
+                    user_message = ""
                 assistant_reply = str(turn.get("assistant_reply") or "").strip()
                 if not user_message and not assistant_reply:
                     continue
@@ -733,7 +790,12 @@ class ChatStore:
                    ORDER BY id ASC""",
                 (conv_id, limit),
             ).fetchall()
-            results = [self._decrypt_row(r) for r in rows]
+            results = [
+                row
+                for row in (self._decrypt_row(r) for r in rows)
+                if not (row.get("role") == "user" and _is_internal_scheduled_task_context(str(row.get("text") or "")))
+            ]
+            results = _collapse_adjacent_duplicate_bot_messages(results)
             _log_chat_sqlite_timing("load_messages", started_at, self._path, rows=len(results))
             return results
 

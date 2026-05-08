@@ -193,11 +193,25 @@ def _extension_candidate_priority(token: str) -> int:
     return 1
 
 
+def _is_hidden_path_component_extension(token: str, raw_extension: str) -> bool:
+    if "/" not in token and "\\" not in token:
+        return False
+    parts = tuple(part for part in re.split(r"[\\/]+", token) if part)
+    if not parts:
+        return False
+    basename = parts[-1].split("=", 1)[-1]
+    return basename.lower() == f".{raw_extension.lower()}"
+
+
 def _extension_from_match(token: str, raw_extension: str) -> str | None:
+    if _is_hidden_path_component_extension(token, raw_extension):
+        return None
     normalized = raw_extension.lower()
     mapped = ATTACHMENT_TOKEN_EXTENSIONS.get(normalized)
     parsed = urlparse(token.split("=", 1)[-1] if "://" in token else token)
     if parsed.scheme and parsed.netloc:
+        if _is_hidden_path_component_extension(parsed.path, raw_extension):
+            return None
         path_suffix = ""
         path_match = re.search(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", parsed.path)
         if path_match is not None:
@@ -209,6 +223,9 @@ def _extension_from_match(token: str, raw_extension: str) -> str | None:
         extension = f".{normalized}"
         return extension if path_suffix == extension and _GENERIC_EXTENSION_RE.fullmatch(extension) else None
     if "://" in token:
+        return None
+    basename = re.split(r"[\\/]+", token)[-1].lower()
+    if basename == f".{normalized}" and ("/" in token or "\\" in token or token.startswith("~")):
         return None
     if mapped is not None:
         return mapped

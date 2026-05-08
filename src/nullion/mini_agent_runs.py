@@ -13,6 +13,7 @@ class MiniAgentRunStatus(str, Enum):
     WAITING_INPUT = "waiting_input"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(slots=True)
@@ -28,19 +29,22 @@ class MiniAgentRun:
 
 
 _ALLOWED_TRANSITIONS: dict[MiniAgentRunStatus, set[MiniAgentRunStatus]] = {
-    MiniAgentRunStatus.PENDING: {MiniAgentRunStatus.RUNNING},
+    MiniAgentRunStatus.PENDING: {MiniAgentRunStatus.RUNNING, MiniAgentRunStatus.CANCELLED},
     MiniAgentRunStatus.RUNNING: {
         MiniAgentRunStatus.WAITING_INPUT,
         MiniAgentRunStatus.COMPLETED,
         MiniAgentRunStatus.FAILED,
+        MiniAgentRunStatus.CANCELLED,
     },
     MiniAgentRunStatus.WAITING_INPUT: {
         MiniAgentRunStatus.RUNNING,
         MiniAgentRunStatus.COMPLETED,
         MiniAgentRunStatus.FAILED,
+        MiniAgentRunStatus.CANCELLED,
     },
     MiniAgentRunStatus.COMPLETED: set(),
     MiniAgentRunStatus.FAILED: set(),
+    MiniAgentRunStatus.CANCELLED: set(),
 }
 
 
@@ -70,6 +74,11 @@ def transition_mini_agent_run_status(
     result_summary: str | None = None,
 ) -> MiniAgentRun:
     """Return a new run record with a validated status transition."""
+
+    if new_status is run.status:
+        if result_summary is None or result_summary == run.result_summary:
+            return run
+        return replace(run, result_summary=result_summary)
 
     allowed_next = _ALLOWED_TRANSITIONS[run.status]
     if new_status not in allowed_next:

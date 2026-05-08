@@ -14,6 +14,7 @@ from ipaddress import ip_address
 from urllib.parse import quote_plus, urlparse
 
 from nullion.mini_agent_routing import should_route_without_mini_agents
+from nullion.task_decomposer import TaskDecomposer
 
 # Try to import optional decompressors; advertise their encodings only when
 # we can actually decode the response. This lets us look like a real browser
@@ -203,8 +204,8 @@ def _read_response(response, max_bytes: int = 65536) -> bytes:
 
     return response.read(max_bytes)
 
-from nullion.task_planner import TaskPlanner
 from nullion.tools import ToolRegistry
+from nullion.turn_context_policy import build_turn_tool_evidence, scoped_turn_tool_registry
 
 
 class ChatBackendUnavailableError(RuntimeError):
@@ -562,12 +563,21 @@ def _try_dispatch_mini_agents(
         or should_route_without_mini_agents(message, has_attachments=has_attachments)
     ):
         return None
-    plan = TaskPlanner().build_execution_plan(
-        user_message=message,
-        principal_id=principal_id,
-        active_task_frame=None,
+    model_client = getattr(agent_orchestrator, "model_client", None)
+    if model_client is None:
+        return None
+    available_tools = [str(tool.get("name", "")) for tool in tool_registry.list_tool_definitions() if tool.get("name")]
+    dag_plan = TaskDecomposer(model_client=model_client).plan_dag(
+        message,
+        available_tools=available_tools,
     )
-    if not plan.can_dispatch_mini_agents:
+    if not dag_plan.can_dispatch:
+        _logger.debug(
+            "Mini-agent structured planner declined dispatch: disposition=%s valid=%s errors=%s",
+            getattr(dag_plan, "disposition", None),
+            getattr(dag_plan, "is_valid", None),
+            getattr(dag_plan, "validation_errors", None),
+        )
         return None
     try:
         dispatch_result = agent_orchestrator.dispatch_request_sync(
@@ -577,7 +587,9 @@ def _try_dispatch_mini_agents(
             tool_registry=tool_registry,
             policy_store=policy_store,
             approval_store=approval_store,
+            available_tools=available_tools,
             single_task_fast_path=False,
+            dag_plan=dag_plan,
         )
     except Exception:
         _logger.debug("Mini-agent dispatch failed; falling back to normal chat turn", exc_info=True)
@@ -610,6 +622,7 @@ def generate_chat_reply(
     approval_store=None,
     conversation_id: str = "chat-backend",
     principal_id: str = "telegram_chat",
+    allow_mini_agents: bool = False,
 ) -> str:
     del external_context_fetcher, live_tool_invoker, live_tool_result_recorder, live_information_resolution_recorder
     del internal_context_fetcher
@@ -640,6 +653,17 @@ def generate_chat_reply(
         normalized_attachments = normalize_chat_attachments(attachments)
         if normalized_attachments:
             user_content_blocks = chat_attachment_content_blocks(message, normalized_attachments)
+    turn_tool_evidence = build_turn_tool_evidence(
+        user_message=message,
+        conversation_result=None,
+        has_attachments=bool(user_content_blocks),
+    )
+    turn_tool_registry = scoped_turn_tool_registry(
+        tool_registry or ToolRegistry(),
+        evidence=turn_tool_evidence,
+        model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+        user_message=message,
+    )
 
     run_turn = agent_orchestrator.run_turn
     turn_kwargs = {
@@ -647,7 +671,7 @@ def generate_chat_reply(
         "principal_id": principal_id,
         "user_message": message,
         "conversation_history": conversation_history,
-        "tool_registry": tool_registry or ToolRegistry(),
+        "tool_registry": turn_tool_registry,
         "policy_store": policy_store,
         "approval_store": approval_store,
     }
@@ -655,13 +679,13 @@ def generate_chat_reply(
         turn_kwargs["user_content_blocks"] = user_content_blocks
 
     dispatched_reply = None
-    if not created_orchestrator_from_model_client:
+    if allow_mini_agents and not created_orchestrator_from_model_client:
         dispatched_reply = _try_dispatch_mini_agents(
             agent_orchestrator=agent_orchestrator,
             conversation_id=conversation_id,
             principal_id=principal_id,
             message=message,
-            tool_registry=tool_registry or ToolRegistry(),
+            tool_registry=turn_tool_registry,
             policy_store=policy_store,
             approval_store=approval_store,
             has_attachments=bool(user_content_blocks),

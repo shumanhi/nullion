@@ -877,8 +877,8 @@ install_playwright_runtime() {
         return 1
     fi
     print_info "Installing Playwright Chromium runtime so browser automation is ready when enabled..."
-    "$VENV_DIR/bin/pip" install --quiet playwright || {
-        print_err "Could not install the Playwright Python package."
+    "$VENV_DIR/bin/pip" install --quiet "playwright>=1.46" "playwright-stealth>=2.0.3" || {
+        print_err "Could not install Playwright Python packages."
         return 1
     }
     if "$VENV_DIR/bin/playwright" install chromium --with-deps 2>/dev/null || "$VENV_DIR/bin/playwright" install chromium; then
@@ -1829,20 +1829,20 @@ if [[ -n "${EXISTING_SEARCH_PROVIDER:-}" ]]; then
 fi
 
 if [[ "$SKIP_SEARCH_SETUP" == "false" ]]; then
-print_info "For the best web-search experience, use Brave Search API. It has a free plan and works better than the built-in local adapter."
-print_info "Create a free key at https://api-dashboard.search.brave.com/app/keys"
-print_menu_item "1" "Brave Search API" "Free API key; better live search results" "[recommended]"
-print_menu_item "2" "Built-in local adapter" "No extra key; fallback search/fetch behavior"
+print_info "For the best web-search experience, use Brave Search API. It includes monthly free credits and is faster than browser-only research."
+print_info "Create a key at https://api-dashboard.search.brave.com/app/keys"
+print_menu_item "1" "Brave Search API" "Monthly free credits; better live search results" "[recommended]"
+print_menu_item "2" "Headless browser fallback" "No extra key; uses the browser instead of direct fetch"
 print_menu_item "3" "Google Custom Search API" "Requires API key plus search engine ID"
 print_menu_item "4" "Perplexity Search API" "Ranked AI-oriented web results"
-print_menu_item "5" "DuckDuckGo Instant Answers" "Keyless, but not full web search"
+print_menu_item "5" "DuckDuckGo Instant Answers" "Legacy keyless adapter; browser remains the default fallback"
 echo
 prompt_read -rp "  Enter 1, 2, 3, 4, or 5: " SEARCH_CHOICE
 case "$SEARCH_CHOICE" in
     ""|1)
         SEARCH_PROVIDER="brave_search_provider"
         echo -e "  Open ${CYAN}https://api-dashboard.search.brave.com/app/keys${RESET}"
-        echo "  Sign in, create a free Search API key, then paste it here."
+        echo "  Sign in, create a Search API key, then paste it here."
         echo -n "  Paste your Brave Search API key (hidden): "
         prompt_read -rs BRAVE_SEARCH_KEY
         echo
@@ -1850,7 +1850,7 @@ case "$SEARCH_CHOICE" in
         ;;
     2)
         SEARCH_PROVIDER="builtin_search_provider"
-        print_info "Using built-in local search. You can switch to Brave Search API later from Settings for a better experience."
+        print_info "Using headless browser fallback. You can switch to Brave Search API later from Settings for faster web research."
         ;;
     3)
         SEARCH_PROVIDER="google_custom_search_provider"

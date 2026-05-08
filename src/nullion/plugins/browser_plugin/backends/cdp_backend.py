@@ -17,6 +17,11 @@ import base64
 import os
 from typing import Any
 
+from nullion.plugins.browser_plugin.browser_session import (
+    BrowserScreenshotResult,
+    auto_screenshot_uses_full_page,
+)
+
 try:
     from playwright.async_api import async_playwright, CDPSession, Browser, Page
     _PLAYWRIGHT_AVAILABLE = True
@@ -93,28 +98,82 @@ class CDPBackend:
             return await el.inner_text(timeout=5_000)
         return await page.inner_text("body")
 
-    async def screenshot(self, session_id: str) -> bytes:
+    async def _layout_metrics(self, client: "CDPSession") -> dict[str, int]:
+        metrics = await asyncio.wait_for(client.send("Page.getLayoutMetrics"), timeout=2)
+        if not isinstance(metrics, dict):
+            return {}
+        layout_viewport = metrics.get("layoutViewport") if isinstance(metrics.get("layoutViewport"), dict) else {}
+        visual_viewport = metrics.get("visualViewport") if isinstance(metrics.get("visualViewport"), dict) else {}
+        content_size = metrics.get("contentSize") if isinstance(metrics.get("contentSize"), dict) else {}
+        viewport_width = int(layout_viewport.get("clientWidth") or visual_viewport.get("clientWidth") or 0)
+        viewport_height = int(layout_viewport.get("clientHeight") or visual_viewport.get("clientHeight") or 0)
+        document_width = int(content_size.get("width") or viewport_width or 0)
+        document_height = int(content_size.get("height") or viewport_height or 0)
+        return {
+            "viewportWidth": max(0, viewport_width),
+            "viewportHeight": max(0, viewport_height),
+            "documentWidth": max(0, document_width),
+            "documentHeight": max(0, document_height),
+        }
+
+    async def screenshot(self, session_id: str, mode: str = "auto") -> BrowserScreenshotResult:
         page = await self._get_page(session_id)
         client = await page.context.new_cdp_session(page)
         try:
             await asyncio.wait_for(client.send("Page.bringToFront"), timeout=2)
         except Exception:
             pass
+        layout: dict[str, int] = {}
+        try:
+            layout = await self._layout_metrics(client)
+        except Exception:
+            layout = {}
+        viewport_width = layout.get("viewportWidth")
+        viewport_height = layout.get("viewportHeight")
+        document_width = layout.get("documentWidth")
+        document_height = layout.get("documentHeight")
+        requested_mode = mode if mode in {"auto", "viewport", "full_page"} else "auto"
+        exceeds_viewport = bool(
+            viewport_width
+            and viewport_height
+            and document_width
+            and document_height
+            and (document_width > viewport_width + 1 or document_height > viewport_height + 1)
+        )
+        full_page = requested_mode == "full_page" or (
+            requested_mode == "auto"
+            and auto_screenshot_uses_full_page(getattr(page, "url", None), exceeds_viewport)
+        )
+        params: dict[str, object] = {
+            "format": "png",
+            "captureBeyondViewport": full_page,
+            "fromSurface": True,
+        }
+        if full_page and document_width and document_height:
+            params["clip"] = {
+                "x": 0,
+                "y": 0,
+                "width": document_width,
+                "height": document_height,
+                "scale": 1,
+            }
         payload = await asyncio.wait_for(
-            client.send(
-                "Page.captureScreenshot",
-                {
-                    "format": "png",
-                    "captureBeyondViewport": False,
-                    "fromSurface": True,
-                },
-            ),
+            client.send("Page.captureScreenshot", params),
             timeout=8,
         )
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, str) or not data:
             raise RuntimeError("CDP did not return screenshot data.")
-        return base64.b64decode(data)
+        return BrowserScreenshotResult(
+            data=base64.b64decode(data),
+            mode="full_page" if full_page else "viewport",
+            requested_mode=requested_mode,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            document_width=document_width,
+            document_height=document_height,
+            is_clipped=not full_page and exceeds_viewport,
+        )
 
     async def scroll(self, session_id: str, direction: str, amount: int) -> None:
         page = await self._get_page(session_id)

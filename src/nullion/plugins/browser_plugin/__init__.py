@@ -72,7 +72,7 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_navigate",
-            "Navigate to a URL in the browser. Returns when the page has loaded.",
+            "Navigate to an HTTP/HTTPS URL, or to a local HTML file generated inside this workspace, in the browser. Returns when the page has loaded.",
             risk=ToolRiskLevel.MEDIUM,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
@@ -113,7 +113,8 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_screenshot",
-            "Capture the current viewport as a PNG artifact and return its path.",
+            "Capture the browser page as a PNG artifact and return its path. "
+            "Defaults to auto mode, which captures the full page when the document is larger than the viewport.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,

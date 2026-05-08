@@ -1034,6 +1034,15 @@ def _serialize_builder_proposal(proposal: BuilderProposal) -> dict[str, object]:
         "suggested_trigger": proposal.suggested_trigger,
         "suggested_steps": list(proposal.suggested_steps),
         "suggested_tags": list(proposal.suggested_tags),
+        "dependency_id": proposal.dependency_id,
+        "dependency_package": proposal.dependency_package,
+        "dependency_import_name": proposal.dependency_import_name,
+        "dependency_requirement": proposal.dependency_requirement,
+        "dependency_install_command": list(proposal.dependency_install_command),
+        "dependency_docs_url": proposal.dependency_docs_url,
+        "dependency_github_url": proposal.dependency_github_url,
+        "dependency_license": proposal.dependency_license,
+        "dependency_usage_note": proposal.dependency_usage_note,
     }
 
 
@@ -1049,6 +1058,15 @@ def _deserialize_builder_proposal(payload: dict[str, object]) -> BuilderProposal
         suggested_trigger=payload.get("suggested_trigger"),
         suggested_steps=tuple(payload.get("suggested_steps", [])),
         suggested_tags=tuple(payload.get("suggested_tags", [])),
+        dependency_id=payload.get("dependency_id"),
+        dependency_package=payload.get("dependency_package"),
+        dependency_import_name=payload.get("dependency_import_name"),
+        dependency_requirement=payload.get("dependency_requirement"),
+        dependency_install_command=tuple(payload.get("dependency_install_command", [])),
+        dependency_docs_url=payload.get("dependency_docs_url"),
+        dependency_github_url=payload.get("dependency_github_url"),
+        dependency_license=payload.get("dependency_license"),
+        dependency_usage_note=payload.get("dependency_usage_note"),
     )
 
 
@@ -1062,6 +1080,7 @@ def _serialize_builder_proposal_record(record: BuilderProposalRecord) -> dict[st
         "accepted_skill_id": record.accepted_skill_id,
         "resolved_at": _dt(record.resolved_at),
         "context_key": record.context_key,
+        "result": record.result,
     }
 
 
@@ -1081,6 +1100,7 @@ def _deserialize_builder_proposal_record(payload: dict[str, object]) -> BuilderP
         accepted_skill_id=payload.get("accepted_skill_id"),
         resolved_at=_parse_dt(payload.get("resolved_at")),
         context_key=payload.get("context_key"),
+        result=payload.get("result"),
     )
 
 
