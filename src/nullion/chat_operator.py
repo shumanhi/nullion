@@ -1280,7 +1280,17 @@ def _chat_ambiguity_classifier(
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
             return None
-        if not structured_followup_evidence and not has_structured_turn_relationship_evidence(text):
+        has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
+        active_turn_text = previous_user_message
+        if not has_structured_evidence:
+            previous_assistant_message = getattr(ctx, "previous_assistant_message", None)
+            if not isinstance(previous_assistant_message, str) or not previous_assistant_message.strip():
+                return None
+            active_turn_text = (
+                f"User request: {previous_user_message}\n"
+                f"Assistant response: {previous_assistant_message}"
+            )
+        if not has_structured_evidence and not active_turn_text.strip():
             return None
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
@@ -1288,7 +1298,7 @@ def _chat_ambiguity_classifier(
             decision = route_turn_dispatch_with_context(
                 text,
                 active_turn_ids=("active-branch",),
-                active_turn_texts=(previous_user_message,),
+                active_turn_texts=(active_turn_text,),
                 model_client=model_client,
             )
         except Exception:
