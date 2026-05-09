@@ -41,6 +41,7 @@ from langgraph.graph import END, START, StateGraph
 
 from nullion.conversation_runtime import ConversationTurnDisposition
 from nullion.version import version_tag
+from nullion.builder import builder_proposal_acceptance_benefit
 from nullion.artifacts import (
     artifact_descriptor_for_path,
     artifact_descriptors_for_paths,
@@ -94,7 +95,12 @@ from nullion.messaging_adapters import (
     messaging_upload_root,
     prepare_reply_for_platform_delivery,
 )
-from nullion.operator_commands import is_stop_command_text, operator_command_suggestions, parse_planner_command
+from nullion.operator_commands import (
+    is_operator_command_text,
+    is_stop_command_text,
+    operator_command_suggestions,
+    parse_planner_command,
+)
 from nullion.prompt_injection import is_untrusted_tool_name, safe_untrusted_tool_metadata
 from nullion.workspace_storage import (
     format_workspace_storage_for_prompt,
@@ -161,6 +167,7 @@ from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_to
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.turn_context_policy import (
     build_turn_tool_evidence,
+    is_slash_prefixed_literal_message,
     scoped_turn_tool_registry,
     should_include_prior_turn_messages,
     tool_registry_allows_connector_context,
@@ -172,6 +179,387 @@ logger = logging.getLogger(__name__)
 _WEB_ARTIFACTS: dict[str, Path] = {}
 _LOG_BUFFER: deque[dict[str, str]] = deque(maxlen=500)
 _SERVER_STARTED_AT = datetime.now(UTC).isoformat()
+
+# Cache only the stable Web prompt prefix that is expensive to render on every
+# turn. Do not put current user text, chat history, memory, task frames,
+# attachments, recent tool context, or artifact state behind this cache; those
+# are per-turn/per-conversation inputs and were the source of prior chat
+# continuity regressions.
+_WEB_STABLE_CONTEXT_CACHE_MAX_ENTRIES = 32
+_WEB_STABLE_CONTEXT_CACHE: dict[tuple[object, ...], tuple[dict[str, object], ...]] = {}
+_WEB_STABLE_CONTEXT_CACHE_LOCK = threading.RLock()
+
+_WEB_STABLE_CONTEXT_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "BRAVE_SEARCH_API_KEY",
+    "CODEX_REFRESH_TOKEN",
+    "GOOGLE_SEARCH_API_KEY",
+    "GOOGLE_SEARCH_CX",
+    "NULLION_ADMIN_FORCED_MODEL",
+    "NULLION_ADMIN_FORCED_PROVIDER",
+    "NULLION_ALLOWED_ROOTS",
+    "NULLION_ANTHROPIC_API_KEY",
+    "NULLION_ANTHROPIC_MODEL",
+    "NULLION_BROWSER_BACKEND",
+    "NULLION_BROWSER_ENABLED",
+    "NULLION_BRAVE_SEARCH_API_KEY",
+    "NULLION_CHECKPOINT_PATH",
+    "NULLION_CODEX_REFRESH_TOKEN",
+    "NULLION_CONNECTOR_ACCESS_ENABLED",
+    "NULLION_CONNECTOR_GATEWAY",
+    "NULLION_CONNECTOR_PERMISSION_MODE",
+    "NULLION_DATA_DIR",
+    "NULLION_DIRECT_WEB_FETCH_ENABLED",
+    "NULLION_ENABLED_PLUGINS",
+    "NULLION_ENABLED_SKILL_PACKS",
+    "NULLION_FILE_ACCESS_ENABLED",
+    "NULLION_GOOGLE_SEARCH_API_KEY",
+    "NULLION_GOOGLE_SEARCH_CX",
+    "NULLION_MEMORY_ENABLED",
+    "NULLION_MODEL",
+    "NULLION_MODEL_PROVIDER",
+    "NULLION_OPENAI_API_KEY",
+    "NULLION_OPENAI_BASE_URL",
+    "NULLION_OPERATOR_NAME",
+    "NULLION_PERPLEXITY_API_KEY",
+    "NULLION_PROVIDER_BINDINGS",
+    "NULLION_REASONING_EFFORT",
+    "NULLION_SKILL_LEARNING_ENABLED",
+    "NULLION_SKILL_PACK_ACCESS_ENABLED",
+    "NULLION_TASK_DECOMPOSITION_ENABLED",
+    "NULLION_TELEGRAM_BOT_TOKEN",
+    "NULLION_TELEGRAM_OPERATOR_CHAT_ID",
+    "NULLION_TERMINAL_ENABLED",
+    "NULLION_WEB_ACCESS_ENABLED",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "PERPLEXITY_API_KEY",
+)
+
+
+def _clear_web_stable_context_cache(*, reason: str | None = None) -> None:
+    with _WEB_STABLE_CONTEXT_CACHE_LOCK:
+        if not _WEB_STABLE_CONTEXT_CACHE:
+            return
+        _WEB_STABLE_CONTEXT_CACHE.clear()
+    if reason:
+        logger.debug("Cleared Web stable context cache after %s", reason)
+
+
+def _web_freeze_for_cache(value: object) -> object:
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (str(key), _web_freeze_for_cache(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_web_freeze_for_cache(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_web_freeze_for_cache(item) for item in value), key=repr))
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "value"):
+        return str(getattr(value, "value"))
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _web_file_signature(path: Path | str | None) -> tuple[str, int | None, int | None]:
+    if path is None:
+        return ("", None, None)
+    try:
+        candidate = Path(path).expanduser()
+        stat_result = candidate.stat()
+        return (str(candidate), stat_result.st_mtime_ns, stat_result.st_size)
+    except Exception:
+        return (str(path), None, None)
+
+
+def _web_nullion_home_path() -> Path:
+    configured = str(os.environ.get("NULLION_HOME") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".nullion"
+
+
+def _web_context_file_signatures() -> tuple[tuple[str, int | None, int | None], ...]:
+    home = _web_nullion_home_path()
+    env_paths: list[Path] = []
+    explicit_env = str(os.environ.get("NULLION_ENV_FILE") or "").strip()
+    if explicit_env:
+        env_paths.append(Path(explicit_env).expanduser())
+    else:
+        env_paths.extend([home / ".env", Path(".env")])
+    try:
+        credentials_path = _credentials_path()
+    except Exception:
+        credentials_path = home / "credentials.json"
+    # Do not include runtime.db here. It also stores chat/runtime events and
+    # changes after ordinary turns, which would make this stable-prefix cache
+    # miss constantly. Web config saves clear the cache explicitly when
+    # encrypted credentials/model settings change.
+    paths = [
+        *env_paths,
+        credentials_path,
+        home / "connections.json",
+        home / "users.json",
+    ]
+    return tuple(_web_file_signature(path) for path in paths)
+
+
+def _web_prompt_env_signature() -> tuple[tuple[str, object], ...]:
+    sensitive_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+    pairs: list[tuple[str, object]] = []
+    for name in _WEB_STABLE_CONTEXT_ENV_KEYS:
+        value = os.environ.get(name)
+        if value is None:
+            pairs.append((name, None))
+        elif any(marker in name for marker in sensitive_markers):
+            pairs.append((name, bool(str(value).strip())))
+        else:
+            pairs.append((name, value))
+    return tuple(pairs)
+
+
+def _web_settings_signature(settings: object) -> tuple[object, ...]:
+    model = getattr(settings, "model", None)
+    provider_bindings = tuple(
+        sorted(
+            (
+                str(getattr(binding, "capability", "") or ""),
+                str(getattr(binding, "provider", "") or ""),
+            )
+            for binding in (getattr(settings, "provider_bindings", ()) or ())
+        )
+    )
+    return (
+        tuple(getattr(settings, "enabled_plugins", ()) or ()),
+        provider_bindings,
+        tuple(getattr(settings, "enabled_skill_packs", ()) or ()),
+        str(getattr(settings, "workspace_root", "") or ""),
+        tuple(getattr(settings, "allowed_roots", ()) or ()),
+        str(getattr(settings, "web_session_allow_duration", "") or ""),
+        str(getattr(model, "provider", "") or ""),
+        str(getattr(model, "openai_base_url", "") or ""),
+        str(getattr(model, "openai_model", "") or ""),
+        str(getattr(model, "reasoning_effort", "") or ""),
+        bool(str(getattr(model, "openai_api_key", "") or "").strip()),
+        bool(str(getattr(model, "codex_refresh_token", "") or "").strip()),
+        bool(str(getattr(model, "anthropic_api_key", "") or "").strip()),
+        str(getattr(model, "anthropic_model", "") or ""),
+    )
+
+
+def _web_model_client_signature(model_client: object | None) -> tuple[object, ...]:
+    if model_client is None:
+        return ("none",)
+    return (
+        type(model_client).__name__,
+        str(getattr(model_client, "provider", "") or ""),
+        str(getattr(model_client, "model", "") or ""),
+        str(getattr(model_client, "base_url", "") or ""),
+        str(getattr(model_client, "reasoning_effort", "") or ""),
+    )
+
+
+def _web_tool_registry_signature(tool_registry: object) -> object:
+    try:
+        definitions = getattr(tool_registry, "list_tool_definitions")()
+    except Exception:
+        try:
+            specs = getattr(tool_registry, "list_specs")()
+            definitions = [
+                {
+                    "name": getattr(spec, "name", ""),
+                    "description": getattr(spec, "description", ""),
+                    "capability_tags": tuple(getattr(spec, "capability_tags", ()) or ()),
+                    "side_effect_class": getattr(getattr(spec, "side_effect_class", None), "value", ""),
+                    "risk_level": getattr(getattr(spec, "risk_level", None), "value", ""),
+                    "requires_approval": bool(getattr(spec, "requires_approval", False)),
+                }
+                for spec in specs
+            ]
+        except Exception:
+            return (type(tool_registry).__name__, "unavailable")
+    return _web_freeze_for_cache(definitions)
+
+
+def _web_enabled_skill_pack_signature(enabled_pack_ids: Iterable[str]) -> object:
+    normalized_enabled = tuple(
+        str(pack_id or "").strip().lower()
+        for pack_id in enabled_pack_ids
+        if str(pack_id or "").strip()
+    )
+    if not normalized_enabled:
+        return ()
+    try:
+        from nullion.skill_pack_installer import BUILTIN_SKILL_PACK_PROMPTS, list_installed_skill_packs
+
+        installed = {pack.pack_id: pack for pack in list_installed_skill_packs()}
+    except Exception:
+        return normalized_enabled
+    signatures: list[object] = []
+    for pack_id in normalized_enabled:
+        if pack_id in BUILTIN_SKILL_PACK_PROMPTS:
+            signatures.append((pack_id, "builtin"))
+            continue
+        pack = installed.get(pack_id)
+        pack_path_text = str(getattr(pack, "path", "") or "") if pack is not None else ""
+        if not pack_path_text:
+            signatures.append((pack_id, "missing"))
+            continue
+        pack_path = Path(pack_path_text)
+        signatures.append(
+            (
+                pack_id,
+                str(pack_path),
+                _web_file_signature(pack_path),
+                _web_file_signature(pack_path / "nullion-skill-pack.json"),
+            )
+        )
+    return tuple(signatures)
+
+
+def _web_system_text_message(text: str) -> dict[str, object]:
+    return {"role": "system", "content": [{"type": "text", "text": text}]}
+
+
+def _web_clone_prompt_messages(messages: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+    clones: list[dict[str, object]] = []
+    for message in messages:
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        if isinstance(content, list):
+            cloned_content = [
+                dict(block)
+                for block in content
+                if isinstance(block, dict)
+            ]
+        else:
+            cloned_content = content
+        clones.append({"role": role, "content": cloned_content})
+    return clones
+
+
+def _web_stable_context_history_prefix(
+    *,
+    runtime: object,
+    principal_id: str,
+    turn_orchestrator: object,
+    turn_tool_registry: object,
+) -> list[dict[str, object]]:
+    # This renders stable context sections once per conservative signature:
+    # tool inventory, runtime config, connection references, skill-pack prompts,
+    # installed dependency cards, and web research guidance. The signature
+    # includes settings/env/file/tool/model/principal/runtime facts so config
+    # changes rebuild naturally, while `_hot_reload_live_config` clears eagerly.
+    try:
+        from nullion.system_context import (
+            build_system_context_snapshot,
+            format_system_context_for_prompt,
+        )
+        from nullion.runtime_config import format_runtime_config_for_prompt
+        from nullion.config import load_settings as load_app_settings
+        from nullion.builder_capabilities import format_installed_dependency_context
+        from nullion.connections import format_workspace_connections_for_prompt
+        from nullion.skill_pack_installer import format_enabled_skill_packs_for_prompt
+        from nullion.web_research_policy import format_web_research_guidance
+    except Exception:
+        return []
+
+    try:
+        app_settings = load_app_settings()
+    except Exception:
+        return []
+    model_client = getattr(turn_orchestrator, "model_client", None)
+    try:
+        include_connections = tool_registry_allows_connector_context(turn_tool_registry)
+    except Exception:
+        include_connections = False
+    try:
+        include_skill_packs = tool_registry_allows_skill_pack_context(turn_tool_registry)
+    except Exception:
+        include_skill_packs = False
+
+    enabled_skill_packs = tuple(getattr(app_settings, "enabled_skill_packs", ()) or ())
+    cache_key = (
+        principal_id,
+        id(runtime),
+        include_connections,
+        include_skill_packs,
+        _web_model_client_signature(model_client),
+        _web_tool_registry_signature(turn_tool_registry),
+        _web_settings_signature(app_settings),
+        _web_prompt_env_signature(),
+        _web_context_file_signatures(),
+        _web_enabled_skill_pack_signature(enabled_skill_packs),
+    )
+    with _WEB_STABLE_CONTEXT_CACHE_LOCK:
+        cached = _WEB_STABLE_CONTEXT_CACHE.get(cache_key)
+        if cached is not None:
+            return _web_clone_prompt_messages(cached)
+
+    try:
+        snapshot = build_system_context_snapshot(tool_registry=turn_tool_registry)
+        caps_text = format_system_context_for_prompt(snapshot)
+        config_text = format_runtime_config_for_prompt(model_client=model_client)
+        connections_text = format_workspace_connections_for_prompt(
+            principal_id=principal_id,
+            include_external_connectors=include_connections,
+        )
+        skill_pack_text = ""
+        if include_skill_packs:
+            skill_pack_text = format_enabled_skill_packs_for_prompt(enabled_skill_packs)
+            access_text = (
+                skill_pack_access_prompt(enabled_skill_packs, principal_id=principal_id)
+                if include_connections
+                else ""
+            )
+            if access_text:
+                skill_pack_text = (skill_pack_text + "\n\n" + access_text).strip()
+        entries: list[dict[str, object]] = []
+        if caps_text:
+            web_research_text = format_web_research_guidance(
+                tool_registry=turn_tool_registry,
+                settings=app_settings,
+            )
+            if web_research_text:
+                caps_text = (caps_text + "\n\n" + web_research_text).strip()
+            dependency_text = format_installed_dependency_context(runtime)
+            if dependency_text:
+                caps_text = (caps_text + "\n\n" + dependency_text).strip()
+            entries.append(
+                _web_system_text_message(
+                    "You are Nullion, a security-first AI agent. "
+                    "Below is the live inventory of tools registered in this session. "
+                    "Only claim a tool is unavailable if it does NOT appear in this list. "
+                    "Never say you cannot do something that an available tool directly supports. "
+                    "If a capability-specific tool is unavailable, say what is missing instead of "
+                    "trying to synthesize account access through terminal, file, or web tools. "
+                    "External account data requires a matching provider-backed tool; connections "
+                    "are references, not raw credentials.\n\n"
+                    + caps_text
+                )
+            )
+        if config_text:
+            entries.append(_web_system_text_message(config_text))
+        if connections_text:
+            entries.append(_web_system_text_message(connections_text))
+        if skill_pack_text:
+            entries.append(_web_system_text_message(skill_pack_text))
+    except Exception:
+        return []
+
+    with _WEB_STABLE_CONTEXT_CACHE_LOCK:
+        if len(_WEB_STABLE_CONTEXT_CACHE) >= _WEB_STABLE_CONTEXT_CACHE_MAX_ENTRIES:
+            _WEB_STABLE_CONTEXT_CACHE.clear()
+        _WEB_STABLE_CONTEXT_CACHE[cache_key] = tuple(_web_clone_prompt_messages(entries))
+    return entries
+
+
 _WEB_GATEWAY_CLIENTS: set[WebSocket] = set()
 _WEB_DELIVERY_LOOP: asyncio.AbstractEventLoop | None = None
 _STARTUP_WARNINGS: list[str] = []
@@ -237,6 +625,7 @@ def _open_local_directory(path: Path) -> None:
 
 _RUNTIME_HISTORY_SYNC_MTIMES: dict[str, float] = {}
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 4
+_MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
 
 
 def _truthy_env(value: str | None) -> bool:
@@ -1285,6 +1674,10 @@ _HTML = r"""<!DOCTYPE html>
     background: rgba(255,255,255,0.025);
     padding: 12px;
   }
+  .settings-stat.good { border-color: rgba(52,211,153,0.35); background: rgba(52,211,153,0.07); }
+  .settings-stat.warn { border-color: rgba(250,204,21,0.38); background: rgba(250,204,21,0.08); }
+  .settings-stat.caution { border-color: rgba(251,146,60,0.42); background: rgba(251,146,60,0.08); }
+  .settings-stat.danger { border-color: rgba(248,113,113,0.46); background: rgba(248,113,113,0.08); }
   .settings-stat-value {
     color: var(--text);
     font-size: 24px;
@@ -1330,6 +1723,77 @@ _HTML = r"""<!DOCTYPE html>
     font-size: 11px;
     white-space: nowrap;
   }
+  .doctor-storage-alert {
+    display: none;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+    margin: 12px 0;
+    padding: 10px 12px;
+    border: 1px solid rgba(250,204,21,0.28);
+    border-radius: 9px;
+    background: rgba(250,204,21,0.07);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .doctor-storage-alert.active { display: flex; }
+  .doctor-storage-alert-actions { display: inline-flex; gap: 8px; flex: 0 0 auto; }
+  .data-retention-card {
+    margin-top: 12px;
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid rgba(255,255,255,0.055);
+    border-radius: 10px;
+    background: rgba(255,255,255,0.022);
+  }
+  .data-type-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .data-type-pill {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.025);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.25;
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
+  }
+  .data-type-pill.selected {
+    border-color: rgba(167,139,250,0.36);
+    background: rgba(124,106,255,0.12);
+    color: var(--text);
+  }
+  .data-type-pill input { flex: 0 0 auto; accent-color: var(--accent2); }
+  .retention-controls { display: grid; grid-template-columns: minmax(140px, 180px) minmax(120px, 1fr); gap: 8px; }
+  .retention-controls input {
+    min-width: 0;
+    height: 40px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface2);
+    color: var(--text);
+    padding: 0 12px;
+    font: inherit;
+    font-size: 12px;
+    outline: none;
+  }
+  .retention-controls input:focus {
+    border-color: rgba(167,139,250,0.5);
+    box-shadow: 0 0 0 3px rgba(124,106,255,0.14);
+  }
+  .retention-controls input[hidden] { display: none; }
+  .doctor-action-row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom: 16px; }
   #tab-security .security-autonomy-card .pref-card-head {
     margin-bottom: 10px;
   }
@@ -4035,18 +4499,6 @@ _HTML = r"""<!DOCTYPE html>
           <div class="form-hint">Maximum saved memories per workspace. Recalled memories are kept longer.</div>
         </div>
 
-        <!-- ── Runtime presentation ── -->
-        <div class="settings-panel">
-          <div class="settings-panel-title">Runtime presentation</div>
-          <div class="feat-row">
-            <div class="feat-info">
-              <div class="feat-name">Thinking display</div>
-              <div class="feat-desc">Show provider reasoning summaries separately from final replies when the provider returns them.</div>
-            </div>
-            <label class="toggle-switch"><input type="checkbox" id="cfg-show-thinking"><span class="toggle-slider"></span></label>
-          </div>
-        </div>
-
         <!-- ── Integrations ── -->
         <div class="settings-panel">
           <div class="settings-panel-title">Integrations</div>
@@ -4530,6 +4982,34 @@ _HTML = r"""<!DOCTYPE html>
               </div>
             </div>
 
+            <div class="pref-card">
+              <div class="pref-card-head">
+                <div class="pref-card-title">Run presentation</div>
+                <div class="pref-card-note">Execution display</div>
+              </div>
+              <div class="pref-row">
+                <div>
+                  <div class="pref-row-title">Verbose</div>
+                  <div class="pref-row-desc">Show activity details during chat runs.</div>
+                </div>
+                <label class="toggle-switch"><input type="checkbox" id="cfg-verbose-enabled" checked onchange="setVerboseMode(this.checked ? 'on' : 'off')"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="pref-row">
+                <div>
+                  <div class="pref-row-title">Planner card</div>
+                  <div class="pref-row-desc">Show live task cards for planned work.</div>
+                </div>
+                <label class="toggle-switch"><input type="checkbox" id="cfg-task-planner-feed-enabled" checked onchange="toggleTaskPlannerFeed(this.checked)"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="pref-row">
+                <div>
+                  <div class="pref-row-title">Thinking display</div>
+                  <div class="pref-row-desc">Show provider reasoning summaries and structured thinking separately from final replies.</div>
+                </div>
+                <label class="toggle-switch"><input type="checkbox" id="cfg-show-thinking"><span class="toggle-slider"></span></label>
+              </div>
+            </div>
+
             <aside class="pref-card execution-scope-card">
               <div class="pref-card-head">
                 <div class="pref-card-title">Scope</div>
@@ -4578,30 +5058,35 @@ _HTML = r"""<!DOCTYPE html>
                 <div class="pref-row">
                   <div>
                     <div class="pref-row-title">Smart cleanup</div>
-                    <div class="pref-row-desc">Automatically clear stale waits and prune old resolved Doctor/task records during the throttled status refresh.</div>
+                    <div class="pref-row-desc">Automatically remove invalid Doctor records, merge duplicate Builder learnings, and prune stale recovery/task noise.</div>
                   </div>
                   <label class="toggle-switch"><input type="checkbox" id="cfg-smart-cleanup-enabled" checked><span class="toggle-slider"></span></label>
                 </div>
-                <div class="pref-row">
+                <div class="data-retention-card">
                   <div>
-                    <div class="pref-row-title">Verbose</div>
-                    <div class="pref-row-desc">Show activity details during chat runs.</div>
+                    <div class="pref-row-title">Stored data retention</div>
+                    <div class="pref-row-desc">Select the stored data families Doctor may clean by age. Invalid Doctor rows and duplicate Builder learnings are always safe cleanup candidates.</div>
                   </div>
-                  <label class="toggle-switch"><input type="checkbox" id="cfg-verbose-enabled" checked onchange="setVerboseMode(this.checked ? 'on' : 'off')"><span class="toggle-slider"></span></label>
-                </div>
-                <div class="pref-row">
-                  <div>
-                    <div class="pref-row-title">Planner card</div>
-                    <div class="pref-row-desc">Show live task cards for planned work.</div>
+                  <div class="data-type-grid" id="doctor-data-types">
+                    <label class="data-type-pill selected"><input type="checkbox" value="chat" checked onchange="updateDataRetentionTypeCards()">Chat history</label>
+                    <label class="data-type-pill selected"><input type="checkbox" value="builder" checked onchange="updateDataRetentionTypeCards()">Builder learnings</label>
+                    <label class="data-type-pill selected"><input type="checkbox" value="doctor" checked onchange="updateDataRetentionTypeCards()">Doctor logs</label>
+                    <label class="data-type-pill selected"><input type="checkbox" value="tasks" checked onchange="updateDataRetentionTypeCards()">Task runs</label>
+                    <label class="data-type-pill selected"><input type="checkbox" value="approvals" checked onchange="updateDataRetentionTypeCards()">Approvals</label>
+                    <label class="data-type-pill selected"><input type="checkbox" value="logs" checked onchange="updateDataRetentionTypeCards()">Runtime logs</label>
                   </div>
-                  <label class="toggle-switch"><input type="checkbox" id="cfg-task-planner-feed-enabled" checked onchange="toggleTaskPlannerFeed(this.checked)"><span class="toggle-slider"></span></label>
-                </div>
-                <div class="pref-row">
-                  <div>
-                    <div class="pref-row-title">Thinking display</div>
-                    <div class="pref-row-desc">Show provider reasoning summaries and structured thinking separately from final replies.</div>
+                  <div class="retention-controls">
+                    <select id="cfg-data-retention-days" onchange="updateDataRetentionControls()">
+                      <option value="">Never</option>
+                      <option value="7">7 days</option>
+                      <option value="15">15 days</option>
+                      <option value="30">30 days</option>
+                      <option value="60">60 days</option>
+                      <option value="90">90 days</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                    <input type="number" id="cfg-data-retention-custom-days" min="1" step="1" placeholder="Days" hidden>
                   </div>
-                  <label class="toggle-switch"><input type="checkbox" id="cfg-show-thinking"><span class="toggle-slider"></span></label>
                 </div>
                 <div class="pref-row">
                   <div>
@@ -4627,9 +5112,23 @@ _HTML = r"""<!DOCTYPE html>
                   <div class="settings-stat-value" id="doctor-settings-attention">0</div>
                   <div class="settings-stat-label">total attention items across Doctor, approvals, and Sentinel</div>
                 </div>
+                <div class="settings-stat good" id="doctor-settings-storage-card">
+                  <div class="settings-stat-value" id="doctor-settings-storage">0 MB</div>
+                  <div class="settings-stat-label" id="doctor-settings-storage-label">stored runtime data</div>
+                </div>
+              </div>
+              <div class="doctor-storage-alert" id="doctor-cleanup-alert">
+                <span>Auto cleanup is off. Enable auto clean or clean data now for better performance.</span>
+                <span class="doctor-storage-alert-actions">
+                  <button class="mini-btn good" type="button" onclick="enableDoctorAutoClean()">Enable auto clean</button>
+                  <button class="mini-btn" type="button" onclick="runDoctorCleanupNow()">Clean data now</button>
+                </span>
               </div>
               <div class="form-hint" style="margin:12px 0 16px">Safe fixes should report what changed in chat after they run. Pending Doctor items also appear under Attention items.</div>
-              <button class="image-artifact-btn" type="button" onclick="runDoctorDiagnose()">Run diagnose</button>
+              <div class="doctor-action-row">
+                <button class="image-artifact-btn" type="button" onclick="runDoctorDiagnose()">Run diagnose</button>
+                <button class="image-artifact-btn" type="button" onclick="runDoctorCleanupNow()">Clean up now</button>
+              </div>
               <div class="settings-command-list">
                 <div class="settings-command"><span>Ask Doctor to inspect the system</span><code>/doctor diagnose</code></div>
                 <div class="settings-command"><span>List Doctor actions</span><code>/doctor</code></div>
@@ -5486,7 +5985,12 @@ function confirmAction({
   titleEl.textContent = title;
   messageEl.textContent = message;
   okBtn.textContent = confirmText;
-  cancelBtn.textContent = cancelText;
+  if (cancelText === null || cancelText === false || cancelText === '') {
+    cancelBtn.style.display = 'none';
+  } else {
+    cancelBtn.style.display = '';
+    cancelBtn.textContent = cancelText;
+  }
   iconEl.innerHTML = icon === 'trash' ? NI.trash() : icon === 'shield' ? NI.shield() : NI.warn();
   overlay.style.display = 'flex';
   okBtn.focus();
@@ -8688,6 +9192,7 @@ function builderItemCardHtml(p) {
   const isDependency = String(p.approval_mode || '') === 'dependency';
   const isPending = String(p.status || '').toLowerCase() === 'pending';
   const status = isMemoryFull ? 'needs action' : (p.status || 'pending');
+  const acceptanceBenefit = p.acceptance_benefit || '';
   const metaBits = [];
   if (isDependency) {
     metaBits.push('library install card');
@@ -8706,6 +9211,7 @@ function builderItemCardHtml(p) {
   return `<div class="control-card">
     <div class="control-top"><span class="control-icon">${NI.wrench()}</span><span class="control-title">${escHtml(p.title || p.proposal_id)}</span><span class="decision-status ${escHtml(p.status || '')}">${escHtml(status)}</span></div>
     <div class="control-meta">${escHtml(p.summary || '')}</div>
+    ${acceptanceBenefit ? `<div class="control-meta builder-benefit">${escHtml(acceptanceBenefit)}</div>` : ''}
     ${metaBits.length ? `<div class="control-meta">${escHtml(metaBits.join(' · '))}</div>` : ''}
     ${timestamp ? `<div class="control-time">${escHtml(timestamp)}</div>` : ''}
     ${memoryActions}
@@ -9293,8 +9799,11 @@ async function killTask(kind, id, title) {
   }
 }
 
+let dashboardRefreshPromise = null;
 async function refreshDashboard() {
-  try {
+  if (dashboardRefreshPromise) return dashboardRefreshPromise;
+  dashboardRefreshPromise = (async () => {
+    try {
     const data = await API('/api/status');
     _lastDashboardData = data;
     renderMission(data);
@@ -9310,7 +9819,13 @@ async function refreshDashboard() {
     renderMemory(data.memory || []);
     renderHealth(data.health);
     renderActivity(data);
-  } catch (e) { /* silent */ }
+    } catch (e) { /* silent */ }
+  })();
+  try {
+    return await dashboardRefreshPromise;
+  } finally {
+    dashboardRefreshPromise = null;
+  }
 }
 
 let dashboardEvents = null;
@@ -10670,6 +11185,92 @@ function setTextIfPresent(id, value) {
   if (el) el.textContent = value;
 }
 
+function formatStoredBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return '0 MB';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  const digits = unit <= 1 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(digits)} ${units[unit]}`;
+}
+
+function updateDataRetentionControls() {
+  const select = document.getElementById('cfg-data-retention-days');
+  const custom = document.getElementById('cfg-data-retention-custom-days');
+  if (!select || !custom) return;
+  const isCustom = select.value === 'custom';
+  custom.hidden = !isCustom;
+  if (isCustom && !custom.value) custom.value = '30';
+}
+
+function updateDataRetentionTypeCards() {
+  document.querySelectorAll('#doctor-data-types .data-type-pill').forEach(card => {
+    const checkbox = card.querySelector('input[type="checkbox"]');
+    card.classList.toggle('selected', checkbox?.checked === true);
+  });
+}
+
+function dataRetentionTypesPayloadValue() {
+  return Array.from(document.querySelectorAll('#doctor-data-types input[type="checkbox"]:checked'))
+    .map(input => input.value)
+    .filter(Boolean);
+}
+
+function applyDataRetentionTypesConfig(value) {
+  const selected = Array.isArray(value) && value.length
+    ? new Set(value.map(item => String(item).trim()).filter(Boolean))
+    : null;
+  document.querySelectorAll('#doctor-data-types input[type="checkbox"]').forEach(input => {
+    input.checked = selected ? selected.has(input.value) : true;
+  });
+  updateDataRetentionTypeCards();
+}
+
+function dataRetentionDaysPayloadValue() {
+  const select = document.getElementById('cfg-data-retention-days');
+  const custom = document.getElementById('cfg-data-retention-custom-days');
+  if (!select) return '';
+  if (select.value === 'custom') return Number(custom && custom.value ? custom.value : 0);
+  return select.value === '' ? '' : Number(select.value);
+}
+
+function cleanupCountLabel(key, value) {
+  const labels = {
+    doctor_actions: 'Doctor records',
+    task_frames: 'task runs',
+    mini_agent_runs: 'mini-agent runs',
+    builder_proposals: 'Builder proposals',
+    skills: 'Builder skills merged',
+    chat_events: 'chat records',
+    log_files: 'log files',
+  };
+  const count = Number(value || 0);
+  return `${count} ${labels[key] || key.replaceAll('_', ' ')}`;
+}
+
+function applyDataRetentionConfig(value) {
+  const select = document.getElementById('cfg-data-retention-days');
+  const custom = document.getElementById('cfg-data-retention-custom-days');
+  if (!select || !custom) return;
+  const text = value === null || value === undefined ? '' : String(value).trim().toLowerCase();
+  if (!text || text === 'never' || text === 'none') {
+    select.value = '';
+    custom.value = '';
+  } else if (['7', '15', '30', '60', '90'].includes(text)) {
+    select.value = text;
+    custom.value = '';
+  } else {
+    select.value = 'custom';
+    custom.value = String(Math.max(1, Number(text) || 30));
+  }
+  updateDataRetentionControls();
+}
+
 async function loadBuilderDoctorSettingsSummary() {
   try {
     const data = await API('/api/status');
@@ -10688,6 +11289,16 @@ async function loadBuilderDoctorSettingsSummary() {
     setTextIfPresent('doctor-settings-recommendations', recommendations.length);
     setTextIfPresent('doctor-settings-open', openDoctorActions.length);
     setTextIfPresent('doctor-settings-attention', attention);
+    const storage = data.storage || {};
+    const status = String(storage.status || 'good').toLowerCase();
+    const storageCard = document.getElementById('doctor-settings-storage-card');
+    if (storageCard) storageCard.className = `settings-stat ${['good', 'warn', 'caution', 'danger'].includes(status) ? status : 'good'}`;
+    setTextIfPresent('doctor-settings-storage', formatStoredBytes(storage.total_bytes || storage.runtime_db_bytes || 0));
+    setTextIfPresent('doctor-settings-storage-label', storage.label || 'stored runtime data');
+    const cleanupAlert = document.getElementById('doctor-cleanup-alert');
+    const autoCleanup = document.getElementById('cfg-smart-cleanup-enabled')?.checked !== false;
+    const needsCleanup = storage.needs_cleanup === true || ['caution', 'danger'].includes(status);
+    if (cleanupAlert) cleanupAlert.classList.toggle('active', !autoCleanup && needsCleanup);
   } catch (e) { /* status panel is best-effort */ }
 }
 
@@ -10711,6 +11322,58 @@ async function runDoctorDiagnose() {
     const fb = document.getElementById('save-feedback');
     if (fb) { fb.textContent = message; fb.className = 'err'; }
   }
+}
+
+async function runDoctorCleanupNow() {
+  try {
+    const payload = {
+      data_retention_days: dataRetentionDaysPayloadValue(),
+      data_retention_types: dataRetentionTypesPayloadValue(),
+    };
+    const res = await fetch('/api/doctor/cleanup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) throw new Error(data.error || 'Doctor cleanup failed');
+    const removed = data.removed || {};
+    const total = Object.values(removed).reduce((sum, value) => sum + Number(value || 0), 0);
+    const detail = total ? `Cleaned ${total} stale or duplicate item${total === 1 ? '' : 's'}.` : 'Cleanup completed; nothing stale needed removal.';
+    const beforeBytes = Number(data.before_storage && data.before_storage.total_bytes || 0);
+    const afterBytes = Number(data.storage && data.storage.total_bytes || 0);
+    const bytesFreed = Number(data.bytes_freed || Math.max(0, beforeBytes - afterBytes));
+    const recordLines = Object.entries(removed)
+      .filter(([, value]) => Number(value || 0) > 0)
+      .map(([key, value]) => cleanupCountLabel(key, value));
+    const receipt = recordLines.length
+      ? `${recordLines.join(', ')}. Stored data: ${formatStoredBytes(beforeBytes)} to ${formatStoredBytes(afterBytes)} (${formatStoredBytes(bytesFreed)} reclaimed).`
+      : `No stale records matched the current cleanup settings. Stored data remains ${formatStoredBytes(afterBytes || beforeBytes)}.`;
+    recordActivity('Doctor cleanup', detail);
+    const fb = document.getElementById('save-feedback');
+    if (fb) { fb.textContent = detail; fb.className = 'ok'; }
+    await confirmAction({
+      title: total ? 'Cleanup complete' : 'Nothing to clean',
+      message: receipt,
+      confirmText: 'Done',
+      cancelText: '',
+      icon: total ? 'trash' : 'shield',
+    });
+    await loadBuilderDoctorSettingsSummary();
+    await refreshDashboard();
+  } catch (e) {
+    const message = e && e.message ? e.message : 'Doctor cleanup failed';
+    recordActivity('Doctor cleanup failed', message);
+    const fb = document.getElementById('save-feedback');
+    if (fb) { fb.textContent = message; fb.className = 'err'; }
+  }
+}
+
+async function enableDoctorAutoClean() {
+  const toggle = document.getElementById('cfg-smart-cleanup-enabled');
+  if (toggle) toggle.checked = true;
+  await saveConfig();
+  await runDoctorCleanupNow();
 }
 
 // Populated from loadConfig — tracks provider credential state
@@ -11506,6 +12169,8 @@ async function loadConfig(options = {}) {
     _updateAdminForcedStrip(cfg.admin_forced_model || null, cfg.admin_forced_provider || null);
     document.getElementById('cfg-doctor-enabled').checked = cfg.doctor_enabled !== false;
     document.getElementById('cfg-smart-cleanup-enabled').checked = cfg.smart_cleanup_enabled !== false;
+    applyDataRetentionConfig(cfg.data_retention_days ?? '');
+    applyDataRetentionTypesConfig(cfg.data_retention_types || []);
     document.getElementById('cfg-chat-enabled').checked = cfg.chat_enabled !== false;
     document.getElementById('cfg-memory-enabled').checked = cfg.memory_enabled !== false;
     document.getElementById('cfg-memory-smart-cleanup').checked = cfg.memory_smart_cleanup === true;
@@ -13173,6 +13838,8 @@ async function saveConfig() {
     media_providers_enabled: _mediaProvidersEnabled,
     doctor_enabled:  document.getElementById('cfg-doctor-enabled').checked,
     smart_cleanup_enabled: document.getElementById('cfg-smart-cleanup-enabled').checked,
+    data_retention_days: dataRetentionDaysPayloadValue(),
+    data_retention_types: dataRetentionTypesPayloadValue(),
     chat_enabled:    document.getElementById('cfg-chat-enabled').checked,
     memory_enabled:  document.getElementById('cfg-memory-enabled').checked,
     memory_smart_cleanup: document.getElementById('cfg-memory-smart-cleanup').checked,
@@ -15428,6 +16095,10 @@ def create_app(runtime, orchestrator, registry):
     runtime_store_sync_lock = threading.RLock()
     active_runtime_turns = 0
     status_maintenance_last_at = 0.0
+    status_cache_payload: dict[str, object] | None = None
+    status_cache_created_at = 0.0
+    status_cache_fingerprint: str | None = None
+    status_cache_lock = asyncio.Lock()
     try:
         from nullion.config import load_settings as _load_app_settings
         app_settings = _load_app_settings()
@@ -15553,6 +16224,7 @@ def create_app(runtime, orchestrator, registry):
         reload_browser: bool = False,
     ) -> dict[str, str]:
         errors: dict[str, str] = {}
+        _clear_web_stable_context_cache(reason=reason)
         _refresh_live_app_settings()
         if reload_browser:
             try:
@@ -16448,6 +17120,8 @@ def create_app(runtime, orchestrator, registry):
             store = _get_chat_store()
             convs = store.list_conversations(status="active", limit=25, channel=channel)
             latest = next((conv for conv in convs if int(conv.get("message_count") or 0) > 0), None)
+            if _latest_chat_restore_is_suppressed_after_reset(runtime, latest, channel=channel):
+                latest = None
             return JSONResponse({"ok": True, "conversation": latest})
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -16659,10 +17333,70 @@ def create_app(runtime, orchestrator, registry):
             "deliveries": receipts,
         })
 
+    def _status_cache_ttl_s() -> float:
+        try:
+            cache_ttl_s = float(os.environ.get("NULLION_WEB_STATUS_CACHE_TTL_S", "2.0"))
+        except ValueError:
+            cache_ttl_s = 2.0
+        return max(0.0, cache_ttl_s)
+
+    def _status_limit(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(f"NULLION_WEB_STATUS_{name.upper()}_LIMIT", str(default)))
+        except ValueError:
+            value = default
+        return max(0, value)
+
+    def _status_text_limit(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(f"NULLION_WEB_STATUS_{name.upper()}_TEXT_LIMIT", str(default)))
+        except ValueError:
+            value = default
+        return max(0, value)
+
+    def _invalidate_status_cache() -> None:
+        nonlocal status_cache_payload, status_cache_created_at, status_cache_fingerprint
+        status_cache_payload = None
+        status_cache_created_at = 0.0
+        status_cache_fingerprint = None
+
+    def _status_cache_response(cache_now: float, cache_ttl_s: float, *, fingerprint: str | None) -> JSONResponse | None:
+        if (
+            status_cache_payload is not None
+            and cache_ttl_s > 0
+            and cache_now - status_cache_created_at <= cache_ttl_s
+            and status_cache_fingerprint == fingerprint
+        ):
+            return JSONResponse(status_cache_payload, headers={"X-Nullion-Status-Cache": "hit"})
+        return None
+
+    @app.middleware("http")
+    async def _invalidate_status_cache_after_api_mutation(request: Request, call_next):
+        response = await call_next(request)
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path.startswith("/api/")
+            and response.status_code < 500
+        ):
+            _invalidate_status_cache()
+        return response
+
     @app.get("/api/status")
     async def status():
+        nonlocal status_cache_payload, status_cache_created_at
+        cache_ttl_s = _status_cache_ttl_s()
+        async with status_cache_lock:
+            _sync_runtime_store_from_checkpoint()
+            current_fingerprint = getattr(runtime, "last_checkpoint_fingerprint", None)
+            cache_now = time.monotonic()
+            cached = _status_cache_response(cache_now, cache_ttl_s, fingerprint=current_fingerprint)
+            if cached is not None:
+                return cached
+            return await _status_uncached(cache_ttl_s=cache_ttl_s, fingerprint=current_fingerprint)
+
+    async def _status_uncached(*, cache_ttl_s: float, fingerprint: str | None):
+        nonlocal status_cache_payload, status_cache_created_at, status_cache_fingerprint
         status_started_at = time.perf_counter()
-        _sync_runtime_store_from_checkpoint()
         run_maintenance = _status_maintenance_due()
         reconcile = getattr(runtime, "reconcile_effectively_approved_pending_approvals", None)
         if run_maintenance and callable(reconcile):
@@ -16837,7 +17571,7 @@ def create_app(runtime, orchestrator, registry):
         # Task frames
         if run_maintenance and _smart_cleanup_enabled():
             _cleanup_dead_task_frames(runtime)
-            _cleanup_old_dashboard_records(runtime)
+            _run_doctor_data_cleanup(runtime)
         task_frames = []
         for frame in store.task_frames.values():
             task_frames.append({
@@ -16929,6 +17663,8 @@ def create_app(runtime, orchestrator, registry):
         # Memory
         memory = []
         dashboard_memory_owner = memory_owner_for_web_admin()
+        memory_limit = _status_limit("memory", 250)
+        memory_value_limit = _status_text_limit("memory_value", 4000)
         try:
             from nullion.builder_memory import is_durable_memory_entry
         except Exception:
@@ -16938,12 +17674,19 @@ def create_app(runtime, orchestrator, registry):
             key=lambda item: (item.updated_at or item.created_at or datetime.min.replace(tzinfo=UTC), item.entry_id),
             reverse=True,
         ):
+            if len(memory) >= memory_limit:
+                break
             if not is_durable_memory_entry(entry):
                 continue
+            value = str(entry.value)
+            value_truncated = memory_value_limit > 0 and len(value) > memory_value_limit
+            if value_truncated:
+                value = value[:memory_value_limit] + "\n[truncated for dashboard status payload]"
             memory.append({
                 "entry_id": entry.entry_id,
                 "key": entry.key,
-                "value": str(entry.value),
+                "value": value,
+                "value_truncated": value_truncated,
                 "kind": entry.kind.value,
                 "source": entry.source,
                 "created_at": entry.created_at.isoformat() if entry.created_at else None,
@@ -16959,6 +17702,7 @@ def create_app(runtime, orchestrator, registry):
                 "proposal_id": record.proposal_id,
                 "title": record.proposal.title,
                 "summary": record.proposal.summary,
+                "acceptance_benefit": builder_proposal_acceptance_benefit(record.proposal),
                 "status": record.status,
                 "decision_type": str(getattr(record.proposal.decision_type, "value", record.proposal.decision_type)),
                 "approval_mode": record.proposal.approval_mode,
@@ -17071,6 +17815,9 @@ def create_app(runtime, orchestrator, registry):
         )
         if memory_pressure and memory_pressure.get("full") and not memory_pressure.get("smart_cleanup_enabled"):
             attention += 1
+        storage = _storage_status_payload(runtime)
+        if storage.get("needs_cleanup") and not storage.get("auto_cleanup_enabled"):
+            attention += 1
         health = {"attention_needed": attention, "counts": counts}
         try:
             tool_count = len(registry.list_tool_definitions())
@@ -17096,8 +17843,30 @@ def create_app(runtime, orchestrator, registry):
             "skills": skills,
             "memory": memory,
             "health": health,
+            "storage": storage,
             "tool_count": tool_count,
         }
+        status_limits = {
+            "approvals": _status_limit("approvals", 500),
+            "permission_grants": _status_limit("permission_grants", 500),
+            "boundary_rules": _status_limit("boundary_rules", 500),
+            "boundary_permits": _status_limit("boundary_permits", 500),
+            "builder_proposals": _status_limit("builder_proposals", 250),
+            "doctor_actions": _status_limit("doctor_actions", 250),
+            "doctor_recommendations": _status_limit("doctor_recommendations", 250),
+            "sentinel_escalations": _status_limit("sentinel_escalations", 250),
+            "task_frames": _status_limit("task_frames", 500),
+            "mini_agent_tasks": _status_limit("mini_agent_tasks", 500),
+            "skills": _status_limit("skills", 500),
+            "memory": memory_limit,
+        }
+        status_meta = {"cache_ttl_s": cache_ttl_s, "limits": status_limits, "truncated": {}}
+        for key, limit in status_limits.items():
+            items = payload.get(key)
+            if isinstance(items, list) and limit > 0 and len(items) > limit:
+                status_meta["truncated"][key] = {"shown": limit, "total": len(items)}
+                payload[key] = items[:limit]
+        payload["status_meta"] = status_meta
         try:
             elapsed_ms = (time.perf_counter() - status_started_at) * 1000
             threshold_ms = float(os.environ.get("NULLION_WEB_STATUS_SLOW_LOG_MS", "750"))
@@ -17121,7 +17890,10 @@ def create_app(runtime, orchestrator, registry):
                 len(doctor_actions),
                 len(sentinel_escalations),
             )
-        return JSONResponse(payload)
+        status_cache_payload = payload
+        status_cache_created_at = time.monotonic()
+        status_cache_fingerprint = fingerprint
+        return JSONResponse(payload, headers={"X-Nullion-Status-Cache": "miss"})
 
     @app.get("/api/status/stream")
     async def status_stream(request: Request):
@@ -17146,14 +17918,15 @@ def create_app(runtime, orchestrator, registry):
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
     @app.delete("/api/memory/{entry_id}")
-    async def delete_memory_entry(entry_id: str):
+    async def delete_user_memory_entry(entry_id: str):
+        owner = memory_owner_for_web_admin()
         entry = runtime.store.get_user_memory_entry(entry_id)
-        if entry is None or entry.owner != memory_owner_for_web_admin():
+        if entry is None or entry.owner != owner:
             return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
         runtime.store.remove_user_memory_entry(entry_id)
         runtime.checkpoint()
+        _invalidate_status_cache()
         return JSONResponse({"ok": True, "deleted": 1})
 
     @app.delete("/api/memory")
@@ -17163,6 +17936,7 @@ def create_app(runtime, orchestrator, registry):
         for entry in entries:
             runtime.store.remove_user_memory_entry(entry.entry_id)
         runtime.checkpoint()
+        _invalidate_status_cache()
         return JSONResponse({"ok": True, "deleted": len(entries)})
 
     @app.post("/api/memory/smart-cleanup")
@@ -17172,6 +17946,7 @@ def create_app(runtime, orchestrator, registry):
         owner = memory_owner_for_web_admin()
         result = smart_cleanup_owner_memory(runtime.store, owner)
         runtime.checkpoint()
+        _invalidate_status_cache()
         return JSONResponse({"ok": True, "removed": result.removed, "skipped": result.skipped})
 
     @app.post("/api/memory/increase-limits")
@@ -17201,6 +17976,7 @@ def create_app(runtime, orchestrator, registry):
         if updates:
             _write_env_updates(_find_env_path(), updates)
             _hot_reload_live_config(reason="memory limit update")
+            _invalidate_status_cache()
         return JSONResponse({"ok": True, "changed": bool(updates), "updated": updates})
 
     @app.post("/api/permissions/{permission_kind}/{permission_id}/revoke")
@@ -17208,6 +17984,7 @@ def create_app(runtime, orchestrator, registry):
         try:
             if permission_kind == "grant":
                 runtime.revoke_permission_grant(permission_id, actor="operator", reason="Revoked from web UI")
+                _invalidate_status_cache()
                 return JSONResponse({"ok": True})
             elif permission_kind in {"boundary-rule", "boundary-permit"}:
                 from nullion.runtime import revoke_related_boundary_permission
@@ -17220,6 +17997,7 @@ def create_app(runtime, orchestrator, registry):
                     reason="Revoked from web UI",
                 )
                 runtime.checkpoint()
+                _invalidate_status_cache()
                 return JSONResponse({"ok": True, "revoked": revoked})
             else:
                 return JSONResponse({"ok": False, "error": "unknown permission kind"}, status_code=400)
@@ -17283,6 +18061,7 @@ def create_app(runtime, orchestrator, registry):
         )
         runtime.store.add_boundary_policy_rule(rule)
         runtime.checkpoint()
+        _invalidate_status_cache()
         return JSONResponse({"ok": True, "rule_id": rule.rule_id, "selector": selector})
 
     @app.post("/api/decisions/{approval_id}/revoke")
@@ -17316,6 +18095,7 @@ def create_app(runtime, orchestrator, registry):
                     runtime.store.add_boundary_permit(replace(permit, revoked_at=datetime.now(UTC)))
                     revoked += 1
             runtime.checkpoint()
+            _invalidate_status_cache()
             return JSONResponse({"ok": True, "revoked": revoked})
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
@@ -17344,6 +18124,7 @@ def create_app(runtime, orchestrator, registry):
                 allow_redecide_denied=True,
             )
             runtime.checkpoint()
+            _invalidate_status_cache()
             return JSONResponse({"ok": True, "mode": mode})
         except KeyError:
             return JSONResponse(
@@ -17371,6 +18152,38 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": True, "report": report.as_dict()})
         except Exception as exc:
             logger.exception("Doctor diagnose failed")
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+    @app.post("/api/doctor/cleanup")
+    async def run_doctor_cleanup(request: Request):
+        try:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            body = body if isinstance(body, dict) else {}
+            retention_env, retention_error = _cleanup_retention_env_from_payload(body)
+            if retention_error:
+                return JSONResponse({"ok": False, "error": retention_error}, status_code=400)
+            before_storage = _storage_status_payload(runtime)
+            with _temporary_cleanup_retention_env(retention_env):
+                removed = _run_doctor_data_cleanup(runtime)
+                after_storage = _storage_status_payload(runtime)
+                applied_retention_days = _data_retention_days_config_value()
+                applied_retention_types = _data_retention_types_config_value()
+            before_total = int(before_storage.get("total_bytes") or 0)
+            after_total = int(after_storage.get("total_bytes") or 0)
+            return JSONResponse({
+                "ok": True,
+                "removed": removed,
+                "before_storage": before_storage,
+                "storage": after_storage,
+                "bytes_freed": max(0, before_total - after_total),
+                "applied_retention_days": applied_retention_days,
+                "applied_retention_types": applied_retention_types,
+            })
+        except Exception as exc:
+            logger.exception("Doctor cleanup failed")
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
     @app.post("/api/tasks/frame/{frame_id}/kill")
@@ -17791,6 +18604,8 @@ def create_app(runtime, orchestrator, registry):
         activity_trace = os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED", "true").lower() not in ("0", "false", "no", "off")
         planner_feed_mode = task_planner_feed_mode()
         show_thinking = os.environ.get("NULLION_SHOW_THINKING_ENABLED", "false").lower() not in ("0", "false", "no", "off")
+        data_retention_days = _data_retention_days_config_value()
+        data_retention_types = _data_retention_types_config_value()
         browser_backend = (creds.get("browser_backend", "") if creds else "") or os.environ.get("NULLION_BROWSER_BACKEND", "")
         provider_bindings = os.environ.get("NULLION_PROVIDER_BINDINGS", "")
         search_provider = "builtin_search_provider"
@@ -18019,6 +18834,8 @@ def create_app(runtime, orchestrator, registry):
             "activity_trace":   activity_trace,
             "task_planner_feed_mode": planner_feed_mode,
             "show_thinking":    show_thinking,
+            "data_retention_days": data_retention_days,
+            "data_retention_types": data_retention_types,
             "web_session_allow_duration": _web_session_allow_duration_value(),
             "web_session_allow_label": _web_session_allow_duration_label(),
             "browser_backend": browser_backend,
@@ -18133,6 +18950,7 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": False, "error": "source is required"}, status_code=400)
         try:
             pack = install_skill_pack(source, pack_id=pack_id, force=force)
+            _clear_web_stable_context_cache(reason="skill pack install")
             updates: dict[str, str] = {}
             if enable:
                 current = [
@@ -18309,6 +19127,7 @@ def create_app(runtime, orchestrator, registry):
                         "proposal_id": record.proposal_id,
                         "title": record.proposal.title,
                         "summary": record.proposal.summary,
+                        "acceptance_benefit": builder_proposal_acceptance_benefit(record.proposal),
                         "status": record.status,
                         "approval_mode": record.proposal.approval_mode,
                     },
@@ -18351,6 +19170,7 @@ def create_app(runtime, orchestrator, registry):
                         "proposal_id": record.proposal_id,
                         "title": record.proposal.title,
                         "summary": record.proposal.summary,
+                        "acceptance_benefit": builder_proposal_acceptance_benefit(record.proposal),
                         "status": record.status,
                         "approval_mode": record.proposal.approval_mode,
                     },
@@ -19241,6 +20061,40 @@ def create_app(runtime, orchestrator, registry):
             os.environ["NULLION_TASK_PLANNER_FEED_MODE"] = planner_feed_mode
             os.environ["NULLION_TASK_PLANNER_FEED_ENABLED"] = updates["NULLION_TASK_PLANNER_FEED_ENABLED"]
 
+        if "data_retention_days" in body:
+            raw_retention = body.get("data_retention_days")
+            if raw_retention is None or str(raw_retention).strip().lower() in {"", "never", "none"}:
+                updates["NULLION_DATA_RETENTION_DAYS"] = ""
+                os.environ.pop("NULLION_DATA_RETENTION_DAYS", None)
+            else:
+                try:
+                    retention_days = int(float(raw_retention))
+                except (TypeError, ValueError):
+                    return JSONResponse({"ok": False, "error": "data_retention_days must be never or a positive number."}, status_code=400)
+                if retention_days < 1:
+                    return JSONResponse({"ok": False, "error": "data_retention_days must be at least 1 day."}, status_code=400)
+                updates["NULLION_DATA_RETENTION_DAYS"] = str(retention_days)
+                os.environ["NULLION_DATA_RETENTION_DAYS"] = str(retention_days)
+
+        if "data_retention_types" in body:
+            raw_types = body.get("data_retention_types")
+            if raw_types is None:
+                selected_types = sorted(_data_retention_type_ids())
+            elif isinstance(raw_types, list):
+                selected_types = [str(item).strip().lower() for item in raw_types if str(item).strip()]
+            else:
+                selected_types = [part.strip().lower() for part in str(raw_types).split(",") if part.strip()]
+            allowed_types = _data_retention_type_ids()
+            invalid_types = sorted(set(selected_types) - allowed_types)
+            if invalid_types:
+                return JSONResponse({"ok": False, "error": f"Unknown data_retention_types: {', '.join(invalid_types)}"}, status_code=400)
+            ordered_types = [str(item["id"]) for item in _RETENTION_DATA_TYPES if str(item["id"]) in set(selected_types)]
+            updates["NULLION_DATA_RETENTION_TYPES"] = ",".join(ordered_types) if ordered_types else "none"
+            if ordered_types:
+                os.environ["NULLION_DATA_RETENTION_TYPES"] = ",".join(ordered_types)
+            else:
+                os.environ["NULLION_DATA_RETENTION_TYPES"] = "none"
+
         for numeric_key, env_name, minimum in [
             ("mini_agent_timeout_seconds", "NULLION_MINI_AGENT_TIMEOUT_SECONDS", 1),
             ("mini_agent_max_iterations", "NULLION_MINI_AGENT_MAX_ITERATIONS", 1),
@@ -19383,6 +20237,7 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": False, "error": "invalid users payload"}, status_code=400)
         try:
             save_user_registry(body, settings=app_settings)
+            _clear_web_stable_context_cache(reason="user registry save")
             registry = load_user_registry(settings=app_settings)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
@@ -19510,6 +20365,7 @@ def create_app(runtime, orchestrator, registry):
                 os.environ.update(env_updates)
                 _hot_reload_live_config(reason="connection settings save")
             save_connection_registry(body)
+            _clear_web_stable_context_cache(reason="connection settings save")
             connection_registry = load_connection_registry()
             if has_connector_connection:
                 try:
@@ -20036,7 +20892,7 @@ def create_app(runtime, orchestrator, registry):
                 })
 
             # Slash command in HTTP fallback path
-            if user_text.startswith("/"):
+            if is_operator_command_text(user_text):
                 if is_stop_command_text(user_text):
                     stop_result = await stop_session_async(
                         conversation_id=conv_id,
@@ -20329,7 +21185,7 @@ def create_app(runtime, orchestrator, registry):
                 }))
                 return
 
-            if user_text.startswith("/"):
+            if is_operator_command_text(user_text):
                 await send_activity_event({"id": "command", "label": "Running command", "status": "running"})
                 try:
                     from nullion.operator_commands import handle_operator_command
@@ -20465,6 +21321,7 @@ def create_app(runtime, orchestrator, registry):
                 from nullion.conversation_runtime import ConversationTurnDisposition
                 from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 
+                dispatch_started_at = time.perf_counter()
                 dispatch_decision = await asyncio.to_thread(
                     route_turn_dispatch_with_context,
                     user_text,
@@ -20472,6 +21329,26 @@ def create_app(runtime, orchestrator, registry):
                     active_turn_texts=tuple(active_turn_text_by_id.get(active_turn_id, "") for active_turn_id in active_turn_order),
                     model_client=getattr(orchestrator, "model_client", None),
                 )
+                dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000
+                try:
+                    dispatch_slow_ms = float(os.environ.get("NULLION_WEB_DISPATCH_SLOW_LOG_MS", "500"))
+                except ValueError:
+                    dispatch_slow_ms = 500.0
+                # Keep dispatch timing distinct from the main model/tool turn:
+                # this catches wasted "follow-up or separate?" preflights while
+                # the UI still says "Preparing request."
+                if active_turn_order or dispatch_ms >= dispatch_slow_ms:
+                    logger.info(
+                        "web dispatch timing conversation_id=%s turn_id=%s active_turns=%s dependencies=%s policy=%s disposition=%s reason=%s total_ms=%.1f",
+                        payload.get("conversation_id", "web:0"),
+                        turn_id,
+                        len(active_turn_order),
+                        len(getattr(dispatch_decision, "dependency_turn_ids", ()) or ()),
+                        getattr(getattr(dispatch_decision, "policy", None), "value", getattr(dispatch_decision, "policy", None)),
+                        getattr(getattr(dispatch_decision, "disposition", None), "value", getattr(dispatch_decision, "disposition", None)),
+                        getattr(dispatch_decision, "reason", None),
+                        dispatch_ms,
+                    )
                 dependency_tasks = tuple(
                     active_turn_tasks_by_id[dependency_turn_id]
                     for dependency_turn_id in dispatch_decision.dependency_turn_ids
@@ -20677,6 +21554,82 @@ def _record_web_conversation_reset(runtime, conversation_id: str) -> None:
         runtime.checkpoint()
     except Exception:
         logger.debug("Unable to checkpoint after web conversation reset", exc_info=True)
+
+
+def _parse_history_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _conversation_id_matches_history_channel(conversation_id: object, channel: str) -> bool:
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return False
+    if channel == "web":
+        return conversation_id == "web" or conversation_id.startswith("web:")
+    return conversation_id == channel
+
+
+def _latest_conversation_reset_at(runtime, *, channel: str) -> datetime | None:
+    store = getattr(runtime, "store", None)
+    if store is None or not hasattr(store, "list_conversation_events"):
+        return None
+    try:
+        events = store.list_conversation_events()
+    except TypeError:
+        return None
+    latest_reset: datetime | None = None
+    for event in events:
+        if event.get("event_type") != "conversation.session_reset":
+            continue
+        if not _conversation_id_matches_history_channel(event.get("conversation_id"), channel):
+            continue
+        created_at = _parse_history_timestamp(event.get("created_at"))
+        if created_at is not None and (latest_reset is None or created_at > latest_reset):
+            latest_reset = created_at
+    return latest_reset
+
+
+def _conversation_has_chat_turn_after(runtime, conversation_id: object, after: datetime) -> bool:
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return False
+    store = getattr(runtime, "store", None)
+    if store is None or not hasattr(store, "list_conversation_events"):
+        return False
+    try:
+        events = store.list_conversation_events(conversation_id)
+    except TypeError:
+        return False
+    for event in events:
+        if event.get("event_type") != "conversation.chat_turn":
+            continue
+        created_at = _parse_history_timestamp(event.get("created_at"))
+        if created_at is not None and created_at > after:
+            return True
+    return False
+
+
+def _latest_chat_restore_is_suppressed_after_reset(runtime, conversation: dict | None, *, channel: str) -> bool:
+    if not conversation:
+        return False
+    reset_at = _latest_conversation_reset_at(runtime, channel=channel)
+    if reset_at is None:
+        return False
+    if _conversation_has_chat_turn_after(runtime, conversation.get("id"), reset_at):
+        return False
+    last_message_at = _parse_history_timestamp(conversation.get("last_message_at")) or _parse_history_timestamp(
+        conversation.get("created_at")
+    )
+    return last_message_at is not None and reset_at > last_message_at
 
 
 def _web_task_frame_summary(user_text: str, *, limit: int = 90) -> str:
@@ -21032,6 +21985,105 @@ _DOCTOR_TERMINAL_RETENTION_SECONDS_DEFAULT = 24 * 60 * 60
 _DOCTOR_OPEN_RETENTION_SECONDS_DEFAULT = 72 * 60 * 60
 _TASK_HISTORY_RETENTION_SECONDS_DEFAULT = 24 * 60 * 60
 _MINI_AGENT_HISTORY_RETENTION_SECONDS_DEFAULT = 24 * 60 * 60
+_RETENTION_DATA_TYPES = (
+    {"id": "chat", "label": "Chat history"},
+    {"id": "builder", "label": "Builder learnings"},
+    {"id": "doctor", "label": "Doctor logs"},
+    {"id": "tasks", "label": "Task runs"},
+    {"id": "approvals", "label": "Approvals"},
+    {"id": "logs", "label": "Runtime logs"},
+)
+
+
+def _data_retention_days() -> int | None:
+    raw = os.environ.get("NULLION_DATA_RETENTION_DAYS", "").strip()
+    if not raw or raw.lower() in {"never", "none", "off"}:
+        return None
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return None
+    return value if value >= 1 else None
+
+
+def _data_retention_days_config_value() -> int | str:
+    days = _data_retention_days()
+    return "" if days is None else days
+
+
+def _data_retention_type_ids() -> set[str]:
+    return {str(item["id"]) for item in _RETENTION_DATA_TYPES}
+
+
+def _data_retention_types() -> set[str]:
+    allowed = _data_retention_type_ids()
+    raw = os.environ.get("NULLION_DATA_RETENTION_TYPES", "").strip()
+    if not raw:
+        return set(allowed)
+    if raw.lower() in {"none", "off"}:
+        return set()
+    selected = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    return selected & allowed
+
+
+def _data_retention_types_config_value() -> list[str]:
+    selected = _data_retention_types()
+    return [str(item["id"]) for item in _RETENTION_DATA_TYPES if str(item["id"]) in selected]
+
+
+def _cleanup_retention_env_from_payload(body: dict[str, object]) -> tuple[dict[str, str | None], str | None]:
+    updates: dict[str, str | None] = {}
+    if "data_retention_days" in body:
+        raw_retention = body.get("data_retention_days")
+        if raw_retention is None or str(raw_retention).strip().lower() in {"", "never", "none"}:
+            updates["NULLION_DATA_RETENTION_DAYS"] = None
+        else:
+            try:
+                retention_days = int(float(raw_retention))
+            except (TypeError, ValueError):
+                return {}, "data_retention_days must be never or a positive number."
+            if retention_days < 1:
+                return {}, "data_retention_days must be at least 1 day."
+            updates["NULLION_DATA_RETENTION_DAYS"] = str(retention_days)
+
+    if "data_retention_types" in body:
+        raw_types = body.get("data_retention_types")
+        if raw_types is None:
+            selected_types = sorted(_data_retention_type_ids())
+        elif isinstance(raw_types, list):
+            selected_types = [str(item).strip().lower() for item in raw_types if str(item).strip()]
+        else:
+            selected_types = [part.strip().lower() for part in str(raw_types).split(",") if part.strip()]
+        allowed_types = _data_retention_type_ids()
+        invalid_types = sorted(set(selected_types) - allowed_types)
+        if invalid_types:
+            return {}, f"Unknown data_retention_types: {', '.join(invalid_types)}"
+        ordered_types = [str(item["id"]) for item in _RETENTION_DATA_TYPES if str(item["id"]) in set(selected_types)]
+        updates["NULLION_DATA_RETENTION_TYPES"] = ",".join(ordered_types) if ordered_types else "none"
+    return updates, None
+
+
+@contextmanager
+def _temporary_cleanup_retention_env(updates: dict[str, str | None]):
+    previous = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _record_is_older_than(record: object, observed_at: datetime, age: timedelta) -> bool:
+    last_seen = _record_datetime(record, "updated_at", "created_at", "resolved_at", "decided_at")
+    return bool(last_seen and observed_at - last_seen >= age)
 
 
 def _cleanup_retention_seconds(env_name: str, default: int) -> int:
@@ -21073,18 +22125,23 @@ def _record_status_value(record: object) -> str:
     return str(getattr(status, "value", status) or "").lower()
 
 
-def _remove_doctor_action_record(store, action_id: str) -> bool:
+def _remove_doctor_action_record(store, action_id: str, action: dict[str, object] | None = None) -> bool:
     remover = getattr(store, "remove_doctor_action", None)
-    if callable(remover):
+    if action_id and callable(remover):
         return bool(remover(action_id))
     actions = getattr(store, "doctor_actions", None)
-    if isinstance(actions, dict):
+    if action_id and isinstance(actions, dict):
         return actions.pop(action_id, None) is not None
     if isinstance(actions, list):
-        for index, action in enumerate(actions):
-            if isinstance(action, dict) and action.get("action_id") == action_id:
+        for index, existing in enumerate(actions):
+            if isinstance(existing, dict) and action_id and existing.get("action_id") == action_id:
                 del actions[index]
                 return True
+        if action is not None:
+            for index, existing in enumerate(actions):
+                if isinstance(existing, dict) and all(existing.get(key) == action.get(key) for key in action.keys()):
+                    del actions[index]
+                    return True
     return False
 
 
@@ -21117,6 +22174,11 @@ def _doctor_cleanup_fingerprint(action: dict[str, object]) -> tuple[str, ...]:
     )
 
 
+def _is_malformed_doctor_action(action: dict[str, object]) -> bool:
+    required_fields = ("action_id", "owner", "status", "action_type", "recommendation_code", "summary", "severity")
+    return any(not str(action.get(field) or "").strip() for field in required_fields)
+
+
 def _cleanup_old_dashboard_records(runtime, *, now: datetime | None = None) -> dict[str, int]:
     store = getattr(runtime, "store", None)
     if store is None:
@@ -21126,6 +22188,7 @@ def _cleanup_old_dashboard_records(runtime, *, now: datetime | None = None) -> d
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=UTC)
     counts = {"doctor_actions": 0, "task_frames": 0, "mini_agent_runs": 0}
+    retention_types = _data_retention_types()
     doctor_terminal_after = _cleanup_retention_seconds(
         "NULLION_DOCTOR_ACTION_HISTORY_RETENTION_SECONDS",
         _DOCTOR_TERMINAL_RETENTION_SECONDS_DEFAULT,
@@ -21144,33 +22207,50 @@ def _cleanup_old_dashboard_records(runtime, *, now: datetime | None = None) -> d
     )
 
     actions = list(getattr(store, "list_doctor_actions", lambda: [])())
-    seen_open: set[tuple[str, ...]] = set()
-    open_actions = sorted(
-        [action for action in actions if _record_status_value(action) not in _TERMINAL_DOCTOR_ACTION_STATUSES],
-        key=lambda action: _record_datetime(action, "updated_at", "created_at") or datetime.min.replace(tzinfo=UTC),
-        reverse=True,
-    )
-    for action in open_actions:
-        action_id = str(action.get("action_id") or "")
-        if not action_id:
-            continue
-        fingerprint = _doctor_cleanup_fingerprint(action)
-        last_seen = _record_datetime(action, "updated_at", "created_at")
-        is_too_old = bool(last_seen and (observed_at - last_seen).total_seconds() >= doctor_open_after)
-        if fingerprint in seen_open or is_too_old:
-            if _remove_doctor_action_record(store, action_id):
-                counts["doctor_actions"] += 1
-            continue
-        seen_open.add(fingerprint)
-
     for action in actions:
-        action_id = str(action.get("action_id") or "")
-        if not action_id or _record_status_value(action) not in _TERMINAL_DOCTOR_ACTION_STATUSES:
-            continue
-        last_seen = _record_datetime(action, "updated_at", "created_at")
-        if last_seen and (observed_at - last_seen).total_seconds() >= doctor_terminal_after:
-            if _remove_doctor_action_record(store, action_id):
-                counts["doctor_actions"] += 1
+        if _is_malformed_doctor_action(action) and _remove_doctor_action_record(
+            store,
+            str(action.get("action_id") or ""),
+            action,
+        ):
+            counts["doctor_actions"] += 1
+    actions = [action for action in actions if not _is_malformed_doctor_action(action)]
+    if "doctor" in retention_types:
+        seen_open: set[tuple[str, ...]] = set()
+        open_actions = sorted(
+            [action for action in actions if _record_status_value(action) not in _TERMINAL_DOCTOR_ACTION_STATUSES],
+            key=lambda action: _record_datetime(action, "updated_at", "created_at") or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        for action in open_actions:
+            action_id = str(action.get("action_id") or "")
+            if not action_id:
+                continue
+            fingerprint = _doctor_cleanup_fingerprint(action)
+            last_seen = _record_datetime(action, "updated_at", "created_at")
+            is_too_old = bool(last_seen and (observed_at - last_seen).total_seconds() >= doctor_open_after)
+            if fingerprint in seen_open or is_too_old:
+                if _remove_doctor_action_record(store, action_id):
+                    counts["doctor_actions"] += 1
+                continue
+            seen_open.add(fingerprint)
+
+        for action in actions:
+            action_id = str(action.get("action_id") or "")
+            if not action_id or _record_status_value(action) not in _TERMINAL_DOCTOR_ACTION_STATUSES:
+                continue
+            last_seen = _record_datetime(action, "updated_at", "created_at")
+            if last_seen and (observed_at - last_seen).total_seconds() >= doctor_terminal_after:
+                if _remove_doctor_action_record(store, action_id):
+                    counts["doctor_actions"] += 1
+
+    if "tasks" not in retention_types:
+        if any(counts.values()):
+            try:
+                runtime.checkpoint()
+            except Exception:
+                logger.debug("Unable to checkpoint after dashboard cleanup", exc_info=True)
+        return counts
 
     frames = list(getattr(getattr(store, "task_frames", None), "values", lambda: [])())
     for frame in frames:
@@ -21209,6 +22289,175 @@ def _cleanup_old_dashboard_records(runtime, *, now: datetime | None = None) -> d
         except Exception:
             logger.debug("Unable to checkpoint after dashboard cleanup", exc_info=True)
     return counts
+
+
+def _cleanup_builder_learning_records(runtime, *, now: datetime | None = None) -> dict[str, int]:
+    store = getattr(runtime, "store", None)
+    counts = {"builder_proposals": 0, "skills": 0}
+    if store is None:
+        return counts
+    try:
+        from nullion.runtime import deduplicate_skills
+
+        counts["skills"] += int(deduplicate_skills(store, actor="doctor_cleanup") or 0)
+    except Exception:
+        logger.debug("Unable to deduplicate Builder skills during cleanup", exc_info=True)
+
+    retention_days = _data_retention_days()
+    if retention_days is None or "builder" not in _data_retention_types():
+        return counts
+    observed_at = now or datetime.now(UTC)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    age = timedelta(days=retention_days)
+    proposals = getattr(store, "builder_proposals", None)
+    if isinstance(proposals, dict):
+        for proposal_id, record in list(proposals.items()):
+            status = str(getattr(record, "status", "") or "").lower()
+            if status == "pending":
+                continue
+            if _record_is_older_than(record, observed_at, age):
+                proposals.pop(proposal_id, None)
+                counts["builder_proposals"] += 1
+    return counts
+
+
+def _cleanup_conversation_event_records(runtime, *, now: datetime | None = None) -> dict[str, int]:
+    store = getattr(runtime, "store", None)
+    counts = {"chat_events": 0}
+    retention_days = _data_retention_days()
+    if "chat" not in _data_retention_types():
+        return counts
+    events = getattr(store, "conversation_events", None) if store is not None else None
+    if retention_days is None or not isinstance(events, list):
+        return counts
+    observed_at = now or datetime.now(UTC)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    age = timedelta(days=retention_days)
+    kept: list[dict[str, Any]] = []
+    for event in events:
+        if isinstance(event, dict) and event.get("event_type") == "conversation.chat_turn" and _record_is_older_than(event, observed_at, age):
+            counts["chat_events"] += 1
+            continue
+        kept.append(event)
+    if counts["chat_events"]:
+        events[:] = kept
+    return counts
+
+
+def _runtime_log_dir() -> Path | None:
+    home = os.environ.get("NULLION_HOME") or os.environ.get("NULLION_DATA_DIR")
+    if home and home.strip():
+        return Path(home).expanduser() / "logs"
+    try:
+        raw_checkpoint = os.environ.get("NULLION_CHECKPOINT", "").strip()
+        if raw_checkpoint:
+            checkpoint = Path(raw_checkpoint).expanduser()
+            return checkpoint.parent / "logs"
+    except Exception:
+        pass
+    return None
+
+
+def _cleanup_runtime_log_files(*, now: datetime | None = None) -> dict[str, int]:
+    counts = {"log_files": 0}
+    retention_days = _data_retention_days()
+    if "logs" not in _data_retention_types():
+        return counts
+    log_dir = _runtime_log_dir()
+    if retention_days is None or log_dir is None or not log_dir.exists():
+        return counts
+    observed_at = now or datetime.now(UTC)
+    cutoff = observed_at.timestamp() - (retention_days * 24 * 60 * 60)
+    for path in log_dir.glob("*.log*"):
+        try:
+            if not path.is_file() or path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink()
+            counts["log_files"] += 1
+        except OSError:
+            logger.debug("Unable to remove old log file %s", path, exc_info=True)
+    return counts
+
+
+def _run_doctor_data_cleanup(runtime, *, now: datetime | None = None) -> dict[str, int]:
+    observed_at = now or datetime.now(UTC)
+    counts: dict[str, int] = {}
+    for bucket in (
+        _cleanup_old_dashboard_records(runtime, now=observed_at),
+        _cleanup_builder_learning_records(runtime, now=observed_at),
+        _cleanup_conversation_event_records(runtime, now=observed_at),
+        _cleanup_runtime_log_files(now=observed_at),
+    ):
+        for key, value in bucket.items():
+            counts[key] = counts.get(key, 0) + int(value or 0)
+    if any(counts.values()):
+        try:
+            runtime.checkpoint()
+        except Exception:
+            logger.debug("Unable to checkpoint after Doctor data cleanup", exc_info=True)
+    return counts
+
+
+def _directory_size_bytes(path: Path | None) -> int:
+    if path is None or not path.exists():
+        return 0
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _storage_status_payload(runtime) -> dict[str, object]:
+    checkpoint_raw = getattr(runtime, "checkpoint_path", None)
+    checkpoint = Path(checkpoint_raw) if checkpoint_raw else None
+    runtime_bytes = 0
+    if checkpoint:
+        try:
+            runtime_bytes = checkpoint.stat().st_size if checkpoint.exists() else 0
+        except OSError:
+            runtime_bytes = 0
+    log_bytes = _directory_size_bytes(_runtime_log_dir())
+    total_bytes = runtime_bytes + log_bytes
+    free_bytes = 0
+    capacity_ratio = 0.0
+    try:
+        usage_root = checkpoint.parent if checkpoint else Path.home()
+        usage = shutil.disk_usage(usage_root)
+        free_bytes = usage.free
+        capacity_ratio = total_bytes / max(1, usage.total)
+    except OSError:
+        pass
+    if total_bytes >= 1_000_000_000 or capacity_ratio >= 0.02:
+        status = "danger"
+        label = "high storage usage"
+    elif total_bytes >= 500_000_000 or capacity_ratio >= 0.01:
+        status = "caution"
+        label = "elevated storage usage"
+    elif total_bytes >= 128_000_000 or capacity_ratio >= 0.0025:
+        status = "warn"
+        label = "moderate stored runtime data"
+    else:
+        status = "good"
+        label = "stored runtime data"
+    return {
+        "runtime_db_bytes": runtime_bytes,
+        "log_bytes": log_bytes,
+        "total_bytes": total_bytes,
+        "free_bytes": free_bytes,
+        "capacity_ratio": capacity_ratio,
+        "status": status,
+        "label": label,
+        "needs_cleanup": status in {"caution", "danger"},
+        "auto_cleanup_enabled": _smart_cleanup_enabled(),
+        "retention_days": _data_retention_days_config_value(),
+        "data_types": list(_RETENTION_DATA_TYPES),
+    }
 
 
 def _web_chat_events_after_latest_reset(runtime, conversation_id: str) -> list[dict[str, Any]]:
@@ -21301,15 +22550,17 @@ def _web_ambiguity_classifier(
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
             return None
-        if not structured_followup_evidence and not has_structured_turn_relationship_evidence(text):
+        has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
+        if not has_structured_evidence:
             return None
+        active_turn_text = previous_user_message
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 
             decision = route_turn_dispatch_with_context(
                 text,
                 active_turn_ids=("recent-branch",),
-                active_turn_texts=(previous_user_message,),
+                active_turn_texts=(active_turn_text,),
                 model_client=model_client,
             )
         except Exception:
@@ -21319,6 +22570,18 @@ def _web_ambiguity_classifier(
         return None
 
     return classifier, "model_structured_turn_relationship"
+
+
+def _web_has_open_task_frame(runtime, conversation_id: str) -> bool:
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return False
+    try:
+        active_frame_id = store.get_active_task_frame_id(conversation_id)
+        active_frame = store.get_task_frame(active_frame_id) if isinstance(active_frame_id, str) else None
+    except Exception:
+        return False
+    return active_frame is not None and getattr(active_frame, "status", None) in _OPEN_WEB_TASK_FRAME_STATUSES
 
 
 def _compact_web_tool_results_for_context(
@@ -21331,11 +22594,34 @@ def _compact_web_tool_results_for_context(
             {
                 "tool_name": result.tool_name,
                 "status": result.status,
-                "output": redact_value(output),
+                "output": _compact_web_tool_output_for_context(result.tool_name, output),
                 **({"error": result.error} if result.error else {}),
             }
         )
     return compact
+
+
+def _compact_web_tool_output_for_context(tool_name: str, output: object) -> object:
+    redacted = redact_value(output)
+    if tool_name == "workspace_summary" and isinstance(redacted, dict):
+        sample_files = redacted.get("sample_files")
+        if isinstance(sample_files, list) and len(sample_files) > 50:
+            redacted = {
+                **redacted,
+                "sample_files": sample_files[:50],
+                "sample_files_truncated": {"shown": 50, "total": len(sample_files)},
+            }
+    try:
+        encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        encoded = str(redacted)
+    if len(encoded) <= _MAX_STORED_TOOL_OUTPUT_CHARS:
+        return redacted
+    return {
+        "truncated": True,
+        "original_chars": len(encoded),
+        "preview": encoded[:_MAX_STORED_TOOL_OUTPUT_CHARS],
+    }
 
 
 def _recent_web_tool_context_prompt(runtime, conversation_id: str) -> str | None:
@@ -21611,6 +22897,9 @@ def _handle_web_config_request(
     explicit_action = _structured_web_config_action(config_action)
     if explicit_action == "show_runtime_config":
         return _web_config_summary(orchestrator)
+
+    if not _feature_enabled("NULLION_WEB_CONFIG_TEXT_CLASSIFIER_ENABLED", default=False):
+        return None
 
     final_state = _compiled_web_config_intent_graph().invoke(
         {
@@ -22603,6 +23892,8 @@ def _requested_web_turn_attachment_extension(
     model_client: object | None = None,
     allow_model_planning: bool = False,
 ) -> str | None:
+    if is_slash_prefixed_literal_message(user_text):
+        return None
     literal_extension = plan_attachment_format(user_text, model_client=None).extension
     if literal_extension:
         return literal_extension
@@ -22663,8 +23954,11 @@ def _run_turn_sync(
         if total_ms < slow_threshold_ms:
             return
         logger.info(
-            "web turn slow timing conversation_id=%s outcome=%s allow_mini_agents=%s tools=%s artifacts=%s builder_checked=%s total_ms=%.1f phases=%s",
+            "web turn slow timing conversation_id=%s turn_id=%s dispatch_reason=%s dispatch_linked=%s outcome=%s allow_mini_agents=%s tools=%s artifacts=%s builder_checked=%s total_ms=%.1f phases=%s",
             conv_id,
+            turn_id,
+            getattr(turn_dispatch_decision, "reason", None),
+            bool(getattr(turn_dispatch_decision, "dependency_turn_ids", ()) or ()),
             outcome,
             allow_mini_agents,
             tool_count,
@@ -22720,10 +24014,15 @@ def _run_turn_sync(
     turn_orchestrator = _orchestrator_for_video_attachments(turn_orchestrator, normalized_attachments)
     turn_memory_owner = memory_owner or memory_owner_for_web_admin()
     web_chat_thread = _web_chat_thread_from_store(runtime, conv_id)
+    structured_followup_evidence = (
+        bool(normalized_attachments)
+        or _web_has_open_task_frame(runtime, conv_id)
+        or _web_dispatch_requires_existing_turn_context(turn_dispatch_decision)
+    )
     web_ambiguity_classifier, web_ambiguity_classifier_reason = _web_ambiguity_classifier(
         web_chat_thread,
         model_client=getattr(turn_orchestrator, "model_client", None),
-        structured_followup_evidence=bool(normalized_attachments),
+        structured_followup_evidence=structured_followup_evidence,
     )
     if persist_user_turn:
         web_task_frame_id, web_conversation_turn_id, web_conversation_result = _start_web_task_frame(
@@ -22783,73 +24082,17 @@ def _run_turn_sync(
     # ── Capabilities system message — always first ────────────────────────────
     # This tells the agent exactly what tools it has so it never falsely claims
     # it can't do something that is registered (e.g. browser tools).
-    try:
-        from nullion.system_context import (
-            build_system_context_snapshot,
-            format_system_context_for_prompt,
-        )
-        from nullion.runtime_config import format_runtime_config_for_prompt
-        from nullion.config import load_settings as load_app_settings
-        from nullion.builder_capabilities import format_installed_dependency_context
-        from nullion.connections import format_workspace_connections_for_prompt
-        from nullion.skill_pack_installer import format_enabled_skill_packs_for_prompt
-        from nullion.web_research_policy import format_web_research_guidance
-        app_settings = load_app_settings()
-        snapshot = build_system_context_snapshot(tool_registry=turn_tool_registry)
-        caps_text = format_system_context_for_prompt(snapshot)
-        config_text = format_runtime_config_for_prompt(model_client=getattr(turn_orchestrator, "model_client", None))
-        connections_text = format_workspace_connections_for_prompt(
+    # Keep this as a stable-prefix cache only. Dynamic conversation context is
+    # appended below, outside the cache, so independent task routing does not
+    # strip normal chat memory.
+    history_prefix.extend(
+        _web_stable_context_history_prefix(
+            runtime=runtime,
             principal_id=conv_id,
-            include_external_connectors=tool_registry_allows_connector_context(turn_tool_registry),
+            turn_orchestrator=turn_orchestrator,
+            turn_tool_registry=turn_tool_registry,
         )
-        skill_pack_text = ""
-        if tool_registry_allows_skill_pack_context(turn_tool_registry):
-            skill_pack_text = format_enabled_skill_packs_for_prompt(app_settings.enabled_skill_packs)
-            access_text = (
-                skill_pack_access_prompt(app_settings.enabled_skill_packs, principal_id=conv_id)
-                if tool_registry_allows_connector_context(turn_tool_registry)
-                else ""
-            )
-            if access_text:
-                skill_pack_text = (skill_pack_text + "\n\n" + access_text).strip()
-        if caps_text:
-            web_research_text = format_web_research_guidance(tool_registry=turn_tool_registry, settings=app_settings)
-            if web_research_text:
-                caps_text = (caps_text + "\n\n" + web_research_text).strip()
-            dependency_text = format_installed_dependency_context(runtime)
-            if dependency_text:
-                caps_text = (caps_text + "\n\n" + dependency_text).strip()
-            history_prefix.append({
-                "role": "system",
-                "content": [{"type": "text", "text": (
-                    "You are Nullion, a security-first AI agent. "
-                    "Below is the live inventory of tools registered in this session. "
-                    "Only claim a tool is unavailable if it does NOT appear in this list. "
-                    "Never say you cannot do something that an available tool directly supports. "
-                    "If a capability-specific tool is unavailable, say what is missing instead of "
-                    "trying to synthesize account access through terminal, file, or web tools. "
-                    "External account data requires a matching provider-backed tool; connections "
-                    "are references, not raw credentials.\n\n"
-                    + caps_text
-                )}],
-            })
-        if config_text:
-            history_prefix.append({
-                "role": "system",
-                "content": [{"type": "text", "text": config_text}],
-            })
-        if connections_text:
-            history_prefix.append({
-                "role": "system",
-                "content": [{"type": "text", "text": connections_text}],
-            })
-        if skill_pack_text:
-            history_prefix.append({
-                "role": "system",
-                "content": [{"type": "text", "text": skill_pack_text}],
-            })
-    except Exception:
-        pass
+    )
     _mark_timing("system_context")
 
     try:
@@ -22937,11 +24180,10 @@ def _run_turn_sync(
         })
         _emit_skill_usage_activity(activity_callback, getattr(skill_hint, "titles", (skill_hint.title,)))
     _mark_timing("skill_context")
-    if should_include_prior_turn_messages(
-        web_conversation_result,
-        has_prior_turns=True,
-    ):
-        history_prefix.extend(_web_chat_history_from_store(runtime, conv_id))
+    # Task routing and conversational memory are deliberately separate. A turn can
+    # start a new task branch while still needing the ordinary chat transcript
+    # (for example, answering a question the assistant just asked).
+    history_prefix.extend(_web_chat_history_from_store(runtime, conv_id))
     _mark_timing("history")
     _emit_activity(activity_callback, "prepare", "Preparing request", "done")
     _mark_timing("prepare_emit")

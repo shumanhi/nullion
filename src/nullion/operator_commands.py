@@ -175,12 +175,29 @@ def telegram_bot_command_menu(*, include_private_aliases: bool = True) -> tuple[
     return tuple(commands)
 
 
+@lru_cache(maxsize=1)
+def _operator_command_heads() -> frozenset[str]:
+    heads = {spec.head for spec in _OPERATOR_COMMAND_SPECS}
+    heads.update(_TELEGRAM_COMMAND_ALIASES)
+    heads.update(_TELEGRAM_COMMAND_ALIASES.values())
+    heads.add("/stream")
+    return frozenset(heads)
+
+
 def normalize_operator_command_head(head: str) -> str:
     if not head.startswith("/"):
         return head
     command_name, separator, mention = head.partition("@")
     normalized = command_name if separator and command_name and mention else head
     return _TELEGRAM_COMMAND_ALIASES.get(normalized, normalized)
+
+
+def is_operator_command_text(text: object) -> bool:
+    command = str(text or "").strip()
+    if not command.startswith("/"):
+        return False
+    head = command.split(maxsplit=1)[0]
+    return normalize_operator_command_head(head) in _operator_command_heads()
 
 
 def parse_planner_command(text: object) -> PlannerCommand:
@@ -2607,6 +2624,7 @@ def handle_operator_command(
 
 __all__ = [
     "handle_operator_command",
+    "is_operator_command_text",
     "is_stop_command_text",
     "normalize_operator_command_head",
     "operator_command_catalog",

@@ -603,6 +603,7 @@ def run_post_update_migrations(
         "memory_migrated": False,
         "memory_rows_encrypted": 0,
         "memory_rows_quarantined": 0,
+        "startup_maintenance": {},
         "warnings": [],
     }
 
@@ -649,6 +650,15 @@ def run_post_update_migrations(
         )
         log.warning("Memory encryption migration skipped; existing memories were left unchanged.")
         log.debug("Memory encryption migration skipped: %s", exc, exc_info=True)
+
+    try:
+        from nullion.startup_maintenance import run_startup_maintenance
+
+        details["startup_maintenance"] = run_startup_maintenance(checkpoint)
+    except Exception as exc:
+        details["warnings"].append("startup maintenance skipped; existing runtime data was left unchanged")
+        log.warning("Startup maintenance skipped; existing runtime data was left unchanged.")
+        log.debug("Startup maintenance skipped: %s", exc, exc_info=True)
 
     try:
         from nullion.runtime import bootstrap_persistent_runtime

@@ -7,13 +7,26 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 import json
+import logging
+import os
 import threading
+import time
 from typing import TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
 from .conversation_runtime import ConversationTurnDisposition
+
+
+logger = logging.getLogger(__name__)
+
+
+def _dispatch_slow_log_threshold_ms() -> float:
+    try:
+        return float(os.environ.get("NULLION_TURN_DISPATCH_SLOW_LOG_MS", "500"))
+    except ValueError:
+        return 500.0
 
 
 class TurnDispatchPolicy(str, Enum):
@@ -363,13 +376,43 @@ class AsyncTurnDispatchTracker:
         async with self._lock:
             active_order = list(self._order_by_conversation.get(conversation_key, []))
             active_texts_by_id = dict(self._text_by_conversation.get(conversation_key, {}))
-        decision = await asyncio.to_thread(
-            route_turn_dispatch_with_context,
-            str(text or ""),
-            active_turn_ids=tuple(active_order),
-            active_turn_texts=tuple(active_texts_by_id.get(active_turn_id, "") for active_turn_id in active_order),
-            model_client=model_client,
-        )
+        active_turn_ids = tuple(active_order)
+        active_turn_texts = tuple(active_texts_by_id.get(active_turn_id, "") for active_turn_id in active_order)
+        dispatch_started_at = time.perf_counter()
+        if active_turn_ids:
+            decision = await asyncio.to_thread(
+                route_turn_dispatch_with_context,
+                str(text or ""),
+                active_turn_ids=active_turn_ids,
+                active_turn_texts=active_turn_texts,
+                model_client=model_client,
+            )
+        else:
+            # Keep the no-active-turn path synchronous. It is cheap and avoids
+            # yielding before the first turn is registered, which would make a
+            # concurrent follow-up miss the active turn it should observe.
+            decision = route_turn_dispatch_with_context(
+                str(text or ""),
+                active_turn_ids=active_turn_ids,
+                active_turn_texts=active_turn_texts,
+                model_client=model_client,
+            )
+        dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000
+        # This is intentionally keyed by ids/counts rather than message text so
+        # production latency triage can find wasted relationship preflights
+        # without leaking prompts into infrastructure logs.
+        if active_order or dispatch_ms >= _dispatch_slow_log_threshold_ms():
+            logger.info(
+                "turn dispatch timing conversation_id=%s turn_id=%s active_turns=%s dependencies=%s policy=%s disposition=%s reason=%s total_ms=%.1f",
+                conversation_key,
+                turn_key,
+                len(active_order),
+                len(decision.dependency_turn_ids),
+                decision.policy.value,
+                decision.disposition.value,
+                decision.reason,
+                dispatch_ms,
+            )
         async with self._lock:
             active_order = list(self._order_by_conversation.get(conversation_key, []))
             active_tasks = self._tasks_by_conversation.setdefault(conversation_key, {})

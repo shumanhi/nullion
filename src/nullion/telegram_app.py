@@ -67,6 +67,7 @@ from nullion.operator_commands import (
     chat_model_option_for_token,
     chat_model_options,
     handle_operator_command,
+    is_operator_command_text,
     is_stop_command_text,
     parse_planner_command,
     telegram_bot_command_menu,
@@ -79,6 +80,7 @@ from nullion.model_clients import (
     build_model_client_from_settings,
 )
 from nullion.agent_orchestrator import AgentOrchestrator
+from nullion.builder import builder_proposal_acceptance_benefit
 from nullion.runtime import PersistentRuntime, format_doctor_diagnosis_for_operator
 from nullion.runtime_persistence import load_runtime_store, render_runtime_store_payload_json
 from nullion.telegram_formatting import format_telegram_text
@@ -1101,7 +1103,8 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
         card_text = (
             f"Builder proposal pending: {proposal_id}\n"
             f"Title: {proposal_obj.title}\n"
-            f"Summary: {proposal_obj.summary}"
+            f"Summary: {proposal_obj.summary}\n"
+            f"{builder_proposal_acceptance_benefit(proposal_obj)}"
         )
         return DecisionCard(
             text=card_text,
@@ -3079,7 +3082,7 @@ class ChatOperatorService:
             and isinstance(text_for_ack, str)
             and not planner_status_requested
             and (
-                not text_for_ack.strip().startswith("/")
+                not is_operator_command_text(text_for_ack)
                 or text_for_ack.strip().lower().startswith("/chat ")
             )
         )

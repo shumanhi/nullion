@@ -1396,7 +1396,9 @@ def _start_tray_service() -> bool:
             ["launchctl", "bootout", f"gui/{uid}/{label}"],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        time.sleep(0.4)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and _tray_service_running():
+            time.sleep(0.2)
         # Capture stderr so we can show the user *why* bootstrap failed
         # instead of only "Bootstrap failed: 5: Input/output error".
         bootstrap = subprocess.run(
@@ -1436,6 +1438,7 @@ def _start_tray_service() -> bool:
         print("  Tray icon did not start.")
         return False
     elif os.name == "nt":
+        subprocess.run(["schtasks", "/End", "/TN", "Nullion Tray"], check=False, capture_output=True, text=True)
         result = subprocess.run(
             ["schtasks", "/Run", "/TN", "Nullion Tray"],
             check=False,
@@ -1967,6 +1970,8 @@ def _restart_managed_services_legacy(*, manager: str, names: tuple[str, ...] | N
                 if not plist.exists():
                     continue
                 target = f"gui/{uid}/{label}"
+                subprocess.run(["launchctl", "bootout", target], check=False)
+                time.sleep(0.4)
                 result = subprocess.run(["launchctl", "kickstart", "-k", target], check=False)
                 if result.returncode != 0:
                     subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], check=False)
@@ -2008,6 +2013,7 @@ def _service_cmd(sm: str, action: str) -> None:
         elif action == "restart":
             _begin_gateway_restart_notice()
             _restart_all_managed_services(manager="launchd")
+            _open_desktop_entrypoint(port=_default_web_port(), force_reload=True)
             print("  Restarted.")
         elif action == "status":
             subprocess.run(["launchctl", "list", "com.nullion.web"], check=False)
@@ -2024,6 +2030,7 @@ def _service_cmd(sm: str, action: str) -> None:
             _stop_tray_service()
         if action == "restart":
             _restart_all_managed_services(manager="systemd")
+            _open_desktop_entrypoint(port=_default_web_port(), force_reload=True)
         else:
             subprocess.run(cmds[action], check=False)
     else:
@@ -2032,6 +2039,7 @@ def _service_cmd(sm: str, action: str) -> None:
         if action == "restart" and os.name == "nt":
             _begin_gateway_restart_notice()
             _restart_all_managed_services(manager="windows")
+            _open_desktop_entrypoint(port=_default_web_port(), force_reload=True)
             print("  Restarted.")
             return
         print("  Could not detect service manager. Try:")

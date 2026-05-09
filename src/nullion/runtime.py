@@ -208,6 +208,7 @@ from nullion.tool_boundaries import extract_boundary_facts
 logger = logging.getLogger(__name__)
 
 BUILDER_PROPOSAL_COOLDOWN = timedelta(hours=1)
+MAX_SKILL_REVISION_HISTORY = 20
 TRUSTED_MUTATION_ACTORS = frozenset(
     {"runtime", "operator", "builder_reflector", "builder_auto", "auto-skill", "web-auto-skill"}
 )
@@ -4326,6 +4327,12 @@ def bootstrap_runtime_store(path: str | Path) -> RuntimeStore:
 
 def bootstrap_persistent_runtime(path: str | Path) -> PersistentRuntime:
     checkpoint_path = Path(path)
+    try:
+        from nullion.startup_maintenance import run_startup_maintenance
+
+        run_startup_maintenance(checkpoint_path)
+    except Exception:
+        logger.debug("Startup maintenance skipped for runtime checkpoint %s", checkpoint_path, exc_info=True)
     store = bootstrap_runtime_store(checkpoint_path)
     fingerprint = render_runtime_store_payload_json(store) if checkpoint_path.exists() else None
     return PersistentRuntime(
@@ -5714,7 +5721,13 @@ def builder_auto_approve_skill_proposals_enabled() -> bool:
 def _builder_proposal_is_auto_acceptable_skill(proposal: BuilderProposal) -> bool:
     return (
         builder_auto_approve_skill_proposals_enabled()
-        and proposal.decision_type is BuilderDecisionType.SKILL_PROPOSAL
+        and _builder_proposal_has_skill_fields(proposal)
+    )
+
+
+def _builder_proposal_has_skill_fields(proposal: BuilderProposal) -> bool:
+    return (
+        proposal.decision_type is BuilderDecisionType.SKILL_PROPOSAL
         and str(proposal.approval_mode or "").strip().lower() == "skill"
         and bool(str(proposal.suggested_skill_title or "").strip())
         and bool(str(proposal.suggested_trigger or "").strip())
@@ -5786,8 +5799,9 @@ def _merge_skill_contents(primary: SkillRecord, duplicate: SkillRecord) -> bool:
         if signal not in primary.workflow_signals:
             primary.workflow_signals.append(signal)
             changed = True
-    if duplicate.summary and duplicate.summary not in primary.summary:
-        primary.summary = primary.summary or duplicate.summary
+    if duplicate.summary and not primary.summary:
+        primary.summary = duplicate.summary
+        changed = True
     latest = max(
         [dt for dt in (primary.updated_at, duplicate.updated_at, duplicate.created_at) if dt is not None],
         default=datetime.now(UTC),
@@ -5803,6 +5817,28 @@ def _merge_skill_contents(primary: SkillRecord, duplicate: SkillRecord) -> bool:
             recorded_at=datetime.now(UTC),
         )
     return changed
+
+
+def _skill_candidate_from_fields(
+    *,
+    title: str,
+    summary: str,
+    trigger: str,
+    steps: list[str],
+    tags: list[str],
+    skill_id: str | None = None,
+) -> SkillRecord:
+    now = datetime.now(UTC)
+    return SkillRecord(
+        skill_id=skill_id or f"candidate-{uuid4().hex[:12]}",
+        title=title,
+        summary=summary,
+        trigger=trigger,
+        steps=steps,
+        tags=tags,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def deduplicate_skills(store: RuntimeStore, *, actor: str = "runtime") -> int:
@@ -5851,32 +5887,29 @@ def create_skill_result(
     if not normalized_steps:
         raise ValueError("at least one step is required")
     normalized_tags = _normalize_skill_tags(tags)
-    if normalized_actor in AUTO_SKILL_ACTORS:
-        duplicate = _find_duplicate_skill(
-            store,
-            title=normalized_title,
-            summary=normalized_summary,
-            trigger=normalized_trigger,
-            exclude_skill_id=skill_id,
+    duplicate = _find_duplicate_skill(
+        store,
+        title=normalized_title,
+        summary=normalized_summary,
+        trigger=normalized_trigger,
+        exclude_skill_id=skill_id,
+    )
+    if duplicate is not None:
+        _merge_skill_contents(
+            duplicate,
+            _skill_candidate_from_fields(
+                skill_id=skill_id,
+                title=normalized_title,
+                summary=normalized_summary,
+                trigger=normalized_trigger,
+                steps=normalized_steps,
+                tags=normalized_tags,
+            ),
         )
-        if duplicate is not None:
-            _merge_skill_contents(
-                duplicate,
-                SkillRecord(
-                    skill_id=skill_id or f"candidate-{uuid4().hex[:12]}",
-                    title=normalized_title,
-                    summary=normalized_summary,
-                    trigger=normalized_trigger,
-                    steps=normalized_steps,
-                    tags=normalized_tags,
-                    created_at=datetime.now(UTC),
-                    updated_at=datetime.now(UTC),
-                ),
-            )
-            payload = {"skill_id": duplicate.skill_id, "title": duplicate.title}
-            store.add_event(make_event(event_type="skill.duplicate_merged", actor=normalized_actor, payload=payload))
-            store.add_audit_record(make_audit_record(action="skill.duplicate_merged", actor=normalized_actor, details=payload))
-            return SkillMutationResult(skill=duplicate, created=False, merged_duplicate=True)
+        payload = {"skill_id": duplicate.skill_id, "title": duplicate.title}
+        store.add_event(make_event(event_type="skill.duplicate_merged", actor=normalized_actor, payload=payload))
+        store.add_audit_record(make_audit_record(action="skill.duplicate_merged", actor=normalized_actor, details=payload))
+        return SkillMutationResult(skill=duplicate, created=False, merged_duplicate=True)
     now = datetime.now(UTC)
     skill = SkillRecord(
         skill_id=skill_id or f"skill-{uuid4().hex[:12]}",
@@ -6002,9 +6035,20 @@ def store_builder_proposal(
                 return existing_by_id
             raise ValueError(f"proposal_id already exists with different proposal: {proposal_id}")
 
-    if normalized_actor in AUTO_SKILL_ACTORS | {"runtime"} and _builder_proposal_is_auto_acceptable_skill(proposal):
+    if _builder_proposal_has_skill_fields(proposal):
         duplicate = _find_duplicate_skill_for_proposal(store, proposal)
         if duplicate is not None:
+            title, summary, trigger, steps, tags = _builder_proposal_skill_fields(proposal)
+            _merge_skill_contents(
+                duplicate,
+                _skill_candidate_from_fields(
+                    title=title,
+                    summary=summary,
+                    trigger=trigger,
+                    steps=steps,
+                    tags=tags,
+                ),
+            )
             transient_id = proposal_id or f"duplicate-proposal-{duplicate.skill_id}"
             payload = {
                 "proposal_id": transient_id,
@@ -6292,6 +6336,8 @@ def update_skill(
     skill.tags = list(next_tags)
     skill.revision += 1
     skill.revision_history.append(previous_revision)
+    if len(skill.revision_history) > MAX_SKILL_REVISION_HISTORY:
+        skill.revision_history[:] = skill.revision_history[-MAX_SKILL_REVISION_HISTORY:]
     skill.updated_at = now
     _append_skill_workflow_signal(
         skill,

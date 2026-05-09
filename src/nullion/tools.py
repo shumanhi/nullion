@@ -2109,6 +2109,17 @@ def _env_flag(name: str, *, default: bool = True) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
 def _connector_access_enabled() -> bool:
     raw = os.environ.get("NULLION_CONNECTOR_ACCESS_ENABLED")
     if raw is not None and raw.strip():
@@ -4134,16 +4145,31 @@ def _build_workspace_summary_handler(
             resolved_allowed_roots=resolved_allowed_roots,
             include_principal_workspace=include_principal_workspace,
         )
+        max_entries = _env_int("NULLION_WORKSPACE_SUMMARY_MAX_ENTRIES", 20_000, minimum=1)
+        max_sample_files = _env_int("NULLION_WORKSPACE_SUMMARY_SAMPLE_FILES", 200, minimum=0)
         seen_directories: set[Path] = set()
         seen_files: set[Path] = set()
         extensions: Counter[str] = Counter()
         sample_files: list[str] = []
+        scanned_entries = 0
+        truncated = False
 
         for root in roots:
+            if scanned_entries >= max_entries:
+                truncated = True
+                break
             for current_dir, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+                if scanned_entries >= max_entries:
+                    truncated = True
+                    dirnames[:] = []
+                    break
                 current_path = Path(current_dir)
                 scoped_dirnames: list[str] = []
                 for dirname in sorted(dirnames):
+                    scanned_entries += 1
+                    if scanned_entries > max_entries:
+                        truncated = True
+                        break
                     candidate_dir = current_path / dirname
                     if candidate_dir.is_symlink() or _should_prune_filesystem_walk_dir(candidate_dir):
                         continue
@@ -4155,6 +4181,10 @@ def _build_workspace_summary_handler(
                         seen_directories.add(resolved_dir)
                 dirnames[:] = scoped_dirnames
                 for filename in sorted(filenames):
+                    scanned_entries += 1
+                    if scanned_entries > max_entries:
+                        truncated = True
+                        break
                     candidate_file = current_path / filename
                     if candidate_file.is_symlink():
                         continue
@@ -4166,7 +4196,8 @@ def _build_workspace_summary_handler(
                     display_path = _display_path(root=root, path=candidate_file)
                     if len(roots) > 1:
                         display_path = f"{root}::{display_path}"
-                    sample_files.append(display_path)
+                    if len(sample_files) < max_sample_files:
+                        sample_files.append(display_path)
 
         return ToolResult(
             invocation_id=invocation.invocation_id,
@@ -4176,6 +4207,8 @@ def _build_workspace_summary_handler(
                 "roots": [str(root) for root in roots],
                 "file_count": len(seen_files),
                 "directory_count": len(seen_directories),
+                "scanned_entries": scanned_entries,
+                "truncated": truncated,
                 "extensions": [
                     {"extension": extension, "count": count}
                     for extension, count in sorted(extensions.items())
