@@ -1312,6 +1312,21 @@ def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None,
     return fallback, ambiguity_reason
 
 
+def _is_bare_confirmation_reply(text: str) -> bool:
+    normalized = _normalize_local_intent_text(text)
+    if normalized in {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "confirm", "confirmed", "approve", "approved", "go", "proceed"}:
+        return True
+    stripped = text.strip()
+    return bool(stripped) and all(character in {"✓", "✔", "✅", "+"} for character in stripped)
+
+
+def _assistant_requests_confirmation(text: str | None) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    normalized = _normalize_local_intent_text(text)
+    return any(marker in normalized for marker in ("please confirm", "confirm before", "confirm that", "confirm you want", "please approve"))
+
+
 def _chat_ambiguity_classifier(
     thread: list[dict[str, str]],
     *,
@@ -1325,15 +1340,27 @@ def _chat_ambiguity_classifier(
         or not previous_user_message.strip()
     ):
         return None, None
-    _ = structured_followup_evidence
+    previous_assistant_message = None
+    if thread:
+        candidate = thread[-1].get("assistant")
+        if isinstance(candidate, str) and candidate.strip():
+            previous_assistant_message = candidate.strip()
 
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
             return None
+        active_turn_text = previous_user_message
+        ctx_previous_assistant = getattr(ctx, "previous_assistant_message", None)
+        assistant_context = (
+            ctx_previous_assistant.strip()
+            if isinstance(ctx_previous_assistant, str) and ctx_previous_assistant.strip()
+            else previous_assistant_message
+        )
         has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
         if not has_structured_evidence:
-            return None
-        active_turn_text = previous_user_message
+            if not (assistant_context and _is_bare_confirmation_reply(text) and _assistant_requests_confirmation(assistant_context)):
+                return None
+            active_turn_text = f"{previous_user_message}\nAssistant: {assistant_context}"
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 

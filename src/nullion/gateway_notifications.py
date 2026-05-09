@@ -17,7 +17,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from nullion.config import NullionSettings, load_settings
+from nullion.config import NullionSettings, _read_env_file, load_settings
 from nullion.users import load_user_registry
 
 logger = logging.getLogger(__name__)
@@ -135,8 +135,11 @@ def _send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
 
 
 def _load_notification_settings() -> NullionSettings:
-    env_path = Path(os.environ.get("NULLION_ENV_FILE") or (_resolve_state_dir() / ".env"))
-    return load_settings(env=os.environ, env_path=env_path if env_path.exists() else None)
+    env_file = os.environ.get("NULLION_ENV_FILE")
+    env_path = Path(env_file).expanduser() if env_file else (_STATE_DIR / ".env")
+    if env_path.exists():
+        return load_settings(env=_read_env_file(env_path))
+    return load_settings(env=os.environ)
 
 
 def _send_gateway_telegram_messages(bot_token: str, chat_ids: tuple[str, ...], text: str) -> None:
