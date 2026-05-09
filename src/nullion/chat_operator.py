@@ -7,9 +7,11 @@ from datetime import UTC, datetime
 import inspect
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import threading
+import time
 from types import SimpleNamespace
 from typing import Callable, Iterable
 from urllib.parse import urlparse
@@ -74,6 +76,7 @@ from nullion.memory import (
 from nullion.mini_agent_routing import should_route_without_mini_agents
 from nullion.operator_commands import (
     handle_operator_command,
+    is_operator_command_text,
     is_stop_command_text,
     normalize_operator_command_head,
     parse_planner_command,
@@ -125,6 +128,7 @@ from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_to
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.turn_context_policy import (
     build_turn_tool_evidence,
+    is_slash_prefixed_literal_message,
     scoped_turn_tool_registry,
     should_include_prior_turn_messages,
     tool_registry_allows_skill_pack_context,
@@ -143,6 +147,22 @@ logger = logging.getLogger(__name__)
 ActivityCallback = Callable[[dict[str, str]], None]
 _MAX_CHAT_TURNS = 6
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 4
+_MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
+_MAX_ARTIFACT_FOLLOWUP_CANDIDATES = 12
+_DIAGNOSTIC_ATTACHMENT_SUFFIXES = frozenset({".log"})
+_PRIMARY_RENDERED_ARTIFACT_SUFFIXES = frozenset(
+    {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm"}
+)
+_TEXT_SIDECAR_ARTIFACT_SUFFIXES = frozenset({".txt", ".md"})
+_OPEN_TASK_FRAME_STATUSES = frozenset(
+    {
+        TaskFrameStatus.ACTIVE,
+        TaskFrameStatus.RUNNING,
+        TaskFrameStatus.WAITING_APPROVAL,
+        TaskFrameStatus.WAITING_INPUT,
+        TaskFrameStatus.VERIFYING,
+    }
+)
 
 
 def _trim_context_text(text: str, max_chars: int) -> str:
@@ -252,6 +272,8 @@ def _is_explicit_approval_reply(message: str) -> bool:
 
 def _requested_attachment_extension(prompt: str, *, model_client: object | None = None) -> str | None:
     del model_client
+    if is_slash_prefixed_literal_message(prompt):
+        return None
     return plan_attachment_format(prompt).extension
 
 
@@ -575,11 +597,11 @@ def _chat_prompt_for_message(message: str) -> str | None:
     planner_command = parse_planner_command(stripped)
     if planner_command.requested:
         return planner_command.prompt or None
-    if stripped.startswith("/"):
-        if _normalize_command_head(stripped) != "/chat":
-            return None
+    if stripped.startswith("/") and is_operator_command_text(stripped):
         parts = stripped.split()
         head = _normalize_command_head(parts[0])
+        if head != "/chat":
+            return None
         prompt = " ".join(parts[1:]) if head == "/chat" else stripped.removeprefix("/chat").strip()
         return prompt or None
     return stripped
@@ -1101,7 +1123,11 @@ def _remember_explicit_memory(
 
 
 def _should_include_conversation_context(result, thread: list[dict[str, str]]) -> bool:
-    return should_include_prior_turn_messages(result, has_prior_turns=bool(thread))
+    _ = result
+    # Task continuation controls branch/tool state, not ordinary dialogue memory.
+    # Keep recent chat available so terse replies can answer the assistant's
+    # previous question without forcing the turn to continue a task branch.
+    return bool(thread)
 
 
 def _should_include_recent_tool_context(result) -> bool:
@@ -1251,6 +1277,30 @@ def _task_frame_referencable_artifact_reason(runtime: PersistentRuntime, *, conv
     return None
 
 
+def _chat_has_open_task_frame(runtime: PersistentRuntime, *, conversation_id: str) -> bool:
+    active_task_frame_id = runtime.store.get_active_task_frame_id(conversation_id)
+    if not isinstance(active_task_frame_id, str) or not active_task_frame_id:
+        return False
+    frame = runtime.store.get_task_frame(active_task_frame_id)
+    return frame is not None and getattr(frame, "status", None) in _OPEN_TASK_FRAME_STATUSES
+
+
+def _chat_thread_has_structured_relationship_evidence(thread: list[dict[str, str]]) -> bool:
+    """Gate completed-turn relationship classification on typed prior-turn facts.
+
+    This deliberately looks for structured product signals such as URLs and
+    requested file extensions in stored turns. It must not become a synonym or
+    phrase list, because ordinary replies like "not much" still need to remain
+    normal chat unless runtime evidence says a turn relationship is plausible.
+    """
+
+    for turn in reversed(thread):
+        user_message = turn.get("user")
+        if isinstance(user_message, str) and has_structured_turn_relationship_evidence(user_message):
+            return True
+    return False
+
+
 def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None, prompt: str):
     conversation_id = _conversation_id_for_chat(chat_id)
     ambiguity_reason = _task_frame_referencable_artifact_reason(runtime, conversation_id=conversation_id)
@@ -1260,6 +1310,21 @@ def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None,
         return None
 
     return fallback, ambiguity_reason
+
+
+def _is_bare_confirmation_reply(text: str) -> bool:
+    normalized = _normalize_local_intent_text(text)
+    if normalized in {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "confirm", "confirmed", "approve", "approved", "go", "proceed"}:
+        return True
+    stripped = text.strip()
+    return bool(stripped) and all(character in {"✓", "✔", "✅", "+"} for character in stripped)
+
+
+def _assistant_requests_confirmation(text: str | None) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    normalized = _normalize_local_intent_text(text)
+    return any(marker in normalized for marker in ("please confirm", "confirm before", "confirm that", "confirm you want", "please approve"))
 
 
 def _chat_ambiguity_classifier(
@@ -1275,23 +1340,27 @@ def _chat_ambiguity_classifier(
         or not previous_user_message.strip()
     ):
         return None, None
-    _ = structured_followup_evidence
+    previous_assistant_message = None
+    if thread:
+        candidate = thread[-1].get("assistant")
+        if isinstance(candidate, str) and candidate.strip():
+            previous_assistant_message = candidate.strip()
 
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
             return None
-        has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
         active_turn_text = previous_user_message
+        ctx_previous_assistant = getattr(ctx, "previous_assistant_message", None)
+        assistant_context = (
+            ctx_previous_assistant.strip()
+            if isinstance(ctx_previous_assistant, str) and ctx_previous_assistant.strip()
+            else previous_assistant_message
+        )
+        has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
         if not has_structured_evidence:
-            previous_assistant_message = getattr(ctx, "previous_assistant_message", None)
-            if not isinstance(previous_assistant_message, str) or not previous_assistant_message.strip():
+            if not (assistant_context and _is_bare_confirmation_reply(text) and _assistant_requests_confirmation(assistant_context)):
                 return None
-            active_turn_text = (
-                f"User request: {previous_user_message}\n"
-                f"Assistant response: {previous_assistant_message}"
-            )
-        if not has_structured_evidence and not active_turn_text.strip():
-            return None
+            active_turn_text = f"{previous_user_message}\nAssistant: {assistant_context}"
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 
@@ -1397,6 +1466,65 @@ def _latest_artifact_followup_context(
     return None
 
 
+def _recent_artifact_followup_contexts(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    principal_id: str | None,
+    branch_id: str | None = None,
+    limit: int = _MAX_ARTIFACT_FOLLOWUP_CANDIDATES,
+) -> tuple[_ArtifactFollowupContext, ...]:
+    try:
+        events = runtime.store.list_conversation_events(conversation_id)
+    except Exception:
+        events = []
+    contexts: list[_ArtifactFollowupContext] = []
+    seen_paths: set[str] = set()
+    for event in reversed(events):
+        if len(contexts) >= limit:
+            break
+        if not isinstance(event, dict) or event.get("event_type") != "conversation.chat_turn":
+            continue
+        event_branch_id = str(event.get("branch_id") or "").strip()
+        if branch_id and event_branch_id and event_branch_id != branch_id:
+            continue
+        reply = event.get("assistant_reply")
+        paths = [
+            *_artifact_paths_from_reply_for_delivery(reply, principal_id=principal_id),
+            *_artifact_paths_from_compact_tool_results(
+                event.get("tool_results"),
+                principal_id=principal_id,
+                runtime=runtime,
+            ),
+        ]
+        unique_paths: list[Path] = []
+        for path in paths:
+            if not path.is_file():
+                continue
+            resolved = str(path.expanduser().resolve())
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            unique_paths.append(Path(resolved))
+        if unique_paths:
+            contexts.append(
+                _ArtifactFollowupContext(
+                    artifact_paths=tuple(unique_paths),
+                    source="conversation_artifact",
+                    source_turn_id=str(event.get("turn_id") or "") or None,
+                    assistant_reply=reply if isinstance(reply, str) else None,
+                )
+            )
+    return tuple(contexts)
+
+
+def _artifact_followup_candidates(contexts: tuple[_ArtifactFollowupContext, ...]) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for context in contexts:
+        paths.extend(context.artifact_paths)
+    return tuple(dict.fromkeys(paths))[:_MAX_ARTIFACT_FOLLOWUP_CANDIDATES]
+
+
 def _extract_model_text(response: object) -> str:
     if not isinstance(response, dict):
         return ""
@@ -1436,30 +1564,60 @@ def _classify_artifact_followup_action(
     current_message: str,
     context: _ArtifactFollowupContext,
 ) -> str:
+    selected = _classify_artifact_followup_selection(
+        model_client=model_client,
+        current_message=current_message,
+        contexts=(context,),
+    )
+    return "resend_existing_artifact" if selected else "continue_normally"
+
+
+def _classify_artifact_followup_selection(
+    *,
+    model_client: object | None,
+    current_message: str,
+    contexts: tuple[_ArtifactFollowupContext, ...],
+) -> tuple[Path, ...]:
+    candidates = _artifact_followup_candidates(contexts)
+    if not candidates:
+        return ()
     create = getattr(model_client, "create", None)
     if not callable(create):
-        return "continue_normally"
+        return ()
     artifact_facts = [
         {
+            "index": index,
             "name": path.name,
             "suffix": path.suffix.lower(),
             "size_bytes": path.stat().st_size if path.is_file() else 0,
         }
-        for path in context.artifact_paths[:5]
+        for index, path in enumerate(candidates)
     ]
     system = (
         "Classify a follow-up to a previous artifact delivery. Return only JSON with keys "
-        "action and confidence. action must be one of: resend_existing_artifact, continue_normally. "
+        "action, confidence, and selected_artifact_indices. action must be one of: "
+        "resend_existing_artifact, continue_normally. selected_artifact_indices must be an array of "
+        "integer indexes from previous_artifacts. "
         "Use semantic understanding across languages. Choose resend_existing_artifact only when the "
-        "current message is asking to receive, retry, reattach, recover, or fix delivery of the same "
-        "existing artifact. Do not infer or create new artifacts. If the user asks a new question, asks "
-        "for a transformed file, or asks about artifact contents, choose continue_normally."
+        "current message is asking to receive, retry, reattach, recover, or fix delivery of existing "
+        "artifact files. Select only artifacts that match the current request using their names, suffixes, "
+        "sizes, turn ids, and assistant reply context. Do not infer or create new artifacts. If the user "
+        "asks a new question, asks for a transformed file, asks about artifact contents, or the matching "
+        "artifact is ambiguous, choose continue_normally."
     )
     user = json.dumps(
         {
             "current_message": current_message,
             "previous_artifacts": artifact_facts,
-            "previous_delivery_source": context.source,
+            "previous_delivery_contexts": [
+                {
+                    "source": context.source,
+                    "source_turn_id": context.source_turn_id,
+                    "artifact_names": [path.name for path in context.artifact_paths],
+                    "assistant_reply_excerpt": str(context.assistant_reply or "")[:700],
+                }
+                for context in contexts
+            ],
             "allowed_actions": ["resend_existing_artifact", "continue_normally"],
         },
         ensure_ascii=False,
@@ -1473,23 +1631,33 @@ def _classify_artifact_followup_action(
             system=system,
         )
     except Exception:
-        return "continue_normally"
+        return ()
     payload = _parse_json_object(_extract_model_text(response))
     if payload is None:
-        return "continue_normally"
+        return ()
     action = str(payload.get("action") or "").strip().lower()
     try:
         confidence = float(payload.get("confidence", 0))
     except Exception:
         confidence = 0.0
-    if action == "resend_existing_artifact" and confidence >= 0.6:
-        return action
-    return "continue_normally"
+    if action != "resend_existing_artifact" or confidence < 0.6:
+        return ()
+    raw_indices = payload.get("selected_artifact_indices")
+    if not isinstance(raw_indices, list):
+        return candidates if len(candidates) == 1 else ()
+    selected: list[Path] = []
+    for raw_index in raw_indices:
+        if not isinstance(raw_index, int) or raw_index < 0 or raw_index >= len(candidates):
+            continue
+        path = candidates[raw_index]
+        if path.is_file():
+            selected.append(path)
+    return tuple(dict.fromkeys(selected))
 
 
-def _artifact_followup_resend_reply(context: _ArtifactFollowupContext) -> str:
-    media_lines = "\n".join(f"MEDIA:{path}" for path in context.artifact_paths)
-    if len(context.artifact_paths) == 1:
+def _artifact_followup_resend_reply(paths: tuple[Path, ...]) -> str:
+    media_lines = "\n".join(f"MEDIA:{path}" for path in paths)
+    if len(paths) == 1:
         return f"Re-attaching the existing file.\n\n{media_lines}"
     return f"Re-attaching the existing files.\n\n{media_lines}"
 
@@ -1505,22 +1673,22 @@ def _maybe_handle_existing_artifact_followup(
 ) -> tuple[str, _ArtifactFollowupContext] | None:
     if not turn_is_context_linked(conversation_result):
         return None
-    context = _latest_artifact_followup_context(
+    contexts = _recent_artifact_followup_contexts(
         runtime,
         conversation_id=conversation_id,
         principal_id=principal_id,
         branch_id=str(getattr(getattr(conversation_result, "turn", None), "branch_id", "") or "") or None,
     )
-    if context is None:
+    if not contexts:
         return None
-    action = _classify_artifact_followup_action(
+    selected_paths = _classify_artifact_followup_selection(
         model_client=model_client,
         current_message=prompt,
-        context=context,
+        contexts=contexts,
     )
-    if action != "resend_existing_artifact":
+    if not selected_paths:
         return None
-    return _artifact_followup_resend_reply(context), context
+    return _artifact_followup_resend_reply(selected_paths), replace(contexts[0], artifact_paths=selected_paths)
 
 
 
@@ -1706,6 +1874,93 @@ def _filter_artifact_descriptors_for_requested_format(
     return matching_descriptors
 
 
+def _filter_text_sidecar_artifact_descriptors(
+    descriptors,
+    *,
+    requested_extension: str | None,
+):
+    if requested_extension:
+        return descriptors
+    by_stem: dict[str, set[str]] = {}
+    for descriptor in descriptors:
+        path = Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", "")))
+        if not path.suffix:
+            continue
+        by_stem.setdefault(path.stem, set()).add(path.suffix.lower())
+    stems_with_primary = {
+        stem
+        for stem, suffixes in by_stem.items()
+        if suffixes & _PRIMARY_RENDERED_ARTIFACT_SUFFIXES and suffixes & _TEXT_SIDECAR_ARTIFACT_SUFFIXES
+    }
+    if not stems_with_primary:
+        return descriptors
+    filtered = []
+    for descriptor in descriptors:
+        path = Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", "")))
+        if path.stem in stems_with_primary and path.suffix.lower() in _TEXT_SIDECAR_ARTIFACT_SUFFIXES:
+            continue
+        filtered.append(descriptor)
+    return filtered
+
+
+def _is_unrequested_diagnostic_attachment(path: Path, *, requested_extension: str | None) -> bool:
+    suffix = path.suffix.lower()
+    if not suffix or suffix not in _DIAGNOSTIC_ATTACHMENT_SUFFIXES:
+        return False
+    return suffix != str(requested_extension or "").lower()
+
+
+def _suppress_unrequested_diagnostic_media_reply(
+    runtime: PersistentRuntime,
+    *,
+    reply: str,
+    requested_extension: str | None,
+    principal_id: str | None = None,
+) -> str:
+    if not isinstance(reply, str) or not reply.strip():
+        return reply
+    artifact_roots = (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))
+
+    def resolve(path: Path) -> Path:
+        if path.is_absolute():
+            return path
+        for root in artifact_roots:
+            candidate = root / path
+            if candidate.is_file():
+                return candidate
+        return path
+
+    def should_drop(path: Path) -> bool:
+        resolved = resolve(path)
+        if not _is_unrequested_diagnostic_attachment(resolved, requested_extension=requested_extension):
+            return False
+        return any(artifact_descriptor_for_path(resolved, artifact_root=root) is not None for root in artifact_roots)
+
+    lines = str(reply).splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
+        directive = parse_media_directive_line(raw_line)
+        if directive is not None:
+            if should_drop(directive.path):
+                if directive.prefix:
+                    kept.append(directive.prefix)
+                index += 1
+                continue
+            kept.append(raw_line)
+            index += 1
+            continue
+        current = raw_line.strip()
+        following = lines[index + 1].strip().strip("`'\"<>") if index + 1 < len(lines) else ""
+        if current in {"MEDIA", "ARTIFACT"} and following and should_drop(Path(following)):
+            index += 2
+            continue
+        kept.append(raw_line)
+        index += 1
+    return "\n".join(kept).strip()
+
+
 def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: str | None = None) -> str:
     artifact_root = artifact_root_for_principal(principal_id)
     legacy_artifact_root = artifact_root_for_runtime(runtime)
@@ -1839,11 +2094,19 @@ def _append_chat_artifacts_to_reply(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
 ) -> str:
-    if _reply_has_deliverable_media(runtime, reply, principal_id=principal_id):
-        return reply
+    requested_extension = (tuple(required_attachment_extensions or ()) or (None,))[0]
+    reply = _suppress_unrequested_diagnostic_media_reply(
+        runtime,
+        reply=reply,
+        requested_extension=requested_extension,
+        principal_id=principal_id,
+    )
+    reply_media_paths = tuple(str(path) for path in _artifact_paths_from_reply_for_delivery(reply, principal_id=principal_id))
     candidate_paths = [
+        *reply_media_paths,
         *(artifact_paths or ()),
         *_artifact_paths_from_tool_results(tool_results),
+        *_artifact_paths_mentioned_in_reply(runtime, reply=reply, principal_id=principal_id),
     ]
     descriptors = []
     seen_ids: set[str] = set()
@@ -1853,14 +2116,29 @@ def _append_chat_artifacts_to_reply(
                 continue
             seen_ids.add(descriptor.artifact_id)
             descriptors.append(descriptor)
-    requested_extension = (tuple(required_attachment_extensions or ()) or (None,))[0]
     descriptors = _filter_artifact_descriptors_for_requested_format(
         prompt,
         descriptors,
         requested_extension=requested_extension,
     )
+    descriptors = _filter_text_sidecar_artifact_descriptors(
+        descriptors,
+        requested_extension=requested_extension,
+    )
+    descriptors = [
+        descriptor
+        for descriptor in descriptors
+        if not _is_unrequested_diagnostic_attachment(
+            Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))),
+            requested_extension=requested_extension,
+        )
+    ]
     if not descriptors:
         return reply
+    if reply_media_paths:
+        selected_paths = tuple(str(getattr(descriptor, "path", "") or "") for descriptor in descriptors)
+        if selected_paths == reply_media_paths:
+            return reply
     attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
     visible_reply = f"Done — attached the requested {attachment_label}."
     if _image_generation_setup_failed(tool_results):
@@ -2205,11 +2483,34 @@ def _compact_tool_results_for_context(
             {
                 "tool_name": result.tool_name,
                 "status": result.status,
-                "output": redact_value(output),
+                "output": _compact_tool_output_for_context(result.tool_name, output),
                 **({"error": result.error} if result.error else {}),
             }
         )
     return compact
+
+
+def _compact_tool_output_for_context(tool_name: str, output: object) -> object:
+    redacted = redact_value(output)
+    if tool_name == "workspace_summary" and isinstance(redacted, dict):
+        sample_files = redacted.get("sample_files")
+        if isinstance(sample_files, list) and len(sample_files) > 50:
+            redacted = {
+                **redacted,
+                "sample_files": sample_files[:50],
+                "sample_files_truncated": {"shown": 50, "total": len(sample_files)},
+            }
+    try:
+        encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        encoded = str(redacted)
+    if len(encoded) <= _MAX_STORED_TOOL_OUTPUT_CHARS:
+        return redacted
+    return {
+        "truncated": True,
+        "original_chars": len(encoded),
+        "preview": encoded[:_MAX_STORED_TOOL_OUTPUT_CHARS],
+    }
 
 
 def _recent_tool_context_prompt(runtime: PersistentRuntime, conversation_id: str) -> str | None:
@@ -2835,6 +3136,51 @@ def _render_chat_turn(
     prompt = _chat_prompt_for_message(message)
     if prompt is None:
         return "Usage: /chat <message>"
+    timing_started_at = time.perf_counter()
+    timing_last_at = timing_started_at
+    timing_marks: list[dict[str, object]] = []
+
+    def _mark_timing(label: str) -> None:
+        nonlocal timing_last_at
+        now = time.perf_counter()
+        timing_marks.append({"phase": label, "ms": round((now - timing_last_at) * 1000, 1)})
+        timing_last_at = now
+
+    def _log_timing_if_slow(
+        outcome: str,
+        *,
+        conversation_id_value: str | None = None,
+        conversation_result_value: object | None = None,
+        tool_count: int = 0,
+        artifact_count: int = 0,
+    ) -> None:
+        total_ms = (time.perf_counter() - timing_started_at) * 1000
+        try:
+            slow_threshold_ms = float(os.environ.get("NULLION_CHAT_TURN_SLOW_LOG_MS", "1200"))
+        except ValueError:
+            slow_threshold_ms = 1200.0
+        if total_ms < slow_threshold_ms:
+            return
+        turn = getattr(conversation_result_value, "turn", None)
+        # These logs intentionally include ids, routing facts, and phase timings
+        # but not the raw user prompt. They are for production latency triage.
+        logger.info(
+            "messaging turn slow timing chat_id=%s conversation_id=%s request_id=%s message_id=%s turn_id=%s dispatch_reason=%s dispatch_linked=%s disposition=%s disposition_reason=%s outcome=%s tools=%s artifacts=%s total_ms=%.1f phases=%s",
+            chat_id,
+            conversation_id_value,
+            request_id,
+            message_id,
+            getattr(turn, "turn_id", None),
+            getattr(turn_dispatch_decision, "reason", None),
+            bool(getattr(turn_dispatch_decision, "dependency_turn_ids", ()) or ()),
+            getattr(getattr(turn, "disposition", None), "value", getattr(turn, "disposition", None)),
+            getattr(turn, "disposition_reason", None),
+            outcome,
+            tool_count,
+            artifact_count,
+            total_ms,
+            json.dumps(timing_marks, separators=(",", ":")),
+        )
     planner_requested = parse_planner_command(message).requested
     principal_id = _principal_id_for_chat(chat_id, settings)
     approval_ids_before = _pending_approval_ids(runtime)
@@ -2845,18 +3191,27 @@ def _render_chat_turn(
         _remember_chat_turn(runtime, chat_id=chat_id, user_message=prompt, assistant_reply=reply)
         _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
         runtime.checkpoint()
+        _mark_timing("local_reply")
+        _log_timing_if_slow("local_reply", conversation_id_value=_conversation_id_for_chat(chat_id))
         return reply
 
     thread = _get_chat_thread(runtime, chat_id)
     previous_assistant_message = _previous_assistant_message(thread)
     ambiguity_fallback, ambiguity_fallback_reason = _chat_ambiguity_fallback(runtime, chat_id=chat_id, prompt=prompt)
+    conversation_id = _conversation_id_for_chat(chat_id)
+    structured_followup_evidence = (
+        bool(attachments)
+        or bool(ambiguity_fallback_reason)
+        or _chat_has_open_task_frame(runtime, conversation_id=conversation_id)
+        or _chat_thread_has_structured_relationship_evidence(thread)
+    )
     ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(
         thread,
         model_client=model_client,
-        structured_followup_evidence=bool(attachments),
+        structured_followup_evidence=structured_followup_evidence,
     )
     conversation_result = runtime.process_conversation_message(
-        conversation_id=_conversation_id_for_chat(chat_id),
+        conversation_id=conversation_id,
         chat_id=chat_id,
         user_message=prompt,
         request_id=request_id,
@@ -2868,6 +3223,7 @@ def _render_chat_turn(
         ambiguity_classifier_reason=ambiguity_classifier_reason,
         **_conversation_dispatch_kwargs(turn_dispatch_decision),
     )
+    _mark_timing("turn_record")
 
     conversation_id = _conversation_id_for_chat(chat_id)
     artifact_followup = _maybe_handle_existing_artifact_followup(
@@ -2908,6 +3264,14 @@ def _render_chat_turn(
         _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
         runtime.checkpoint()
         _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("artifact_followup")
+        _log_timing_if_slow(
+            "artifact_followup",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+            tool_count=1,
+            artifact_count=len(artifact_context.artifact_paths),
+        )
         return _append_runtime_nudges(runtime, prompt=prompt, reply=reply)
 
     conversation_context = _build_conversation_context(thread) if _should_include_conversation_context(conversation_result, thread) else None
@@ -2965,6 +3329,12 @@ def _render_chat_turn(
         _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
         runtime.checkpoint()
         _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("screenshot")
+        _log_timing_if_slow(
+            "screenshot",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+        )
         return _append_runtime_nudges(runtime, prompt=prompt, reply=screenshot_reply)
 
     artifact_result = run_pre_chat_artifact_workflow(
@@ -3024,6 +3394,14 @@ def _render_chat_turn(
         _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
         runtime.checkpoint()
         _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("pre_chat_artifact")
+        _log_timing_if_slow(
+            "pre_chat_artifact",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+            tool_count=len(artifact_result.tool_results or []),
+            artifact_count=len(artifact_result.artifact_paths or []),
+        )
         return _append_runtime_nudges(runtime, prompt=prompt, reply=reply)
     if activity_callback is not None:
         activity_callback({"id": "prepare", "label": "Preparing request", "status": "done"})
@@ -3225,6 +3603,7 @@ def _render_chat_turn(
                     *orchestrator_conversation_history,
                 ]
                 _emit_skill_usage_activity(activity_callback, skill_uses)
+            _mark_timing("context")
 
             handled_by_mini_agents = False
             suppress_runtime_nudges = False
@@ -3290,6 +3669,7 @@ def _render_chat_turn(
                     single_task_fast_path=False,
                     dag_plan=dispatch_dag_plan,
                 )
+                _mark_timing("mini_agent_dispatch")
                 if getattr(dispatch_result, "dispatched", True):
                     task_count = int(getattr(dispatch_result, "task_count", 0) or len(mission.steps))
                     planner_summary = str(getattr(dispatch_result, "planner_summary", "") or "").strip()
@@ -3373,6 +3753,7 @@ def _render_chat_turn(
                     approval_store=runtime.store,
                     runtime_store=runtime.store,
                 )
+                _mark_timing("mission")
                 activity_tool_results = list(mission_result.tool_results)
                 if mission_result.status == "suspended":
                     approval_id = mission_result.suspended_approval_id
@@ -3445,6 +3826,7 @@ def _render_chat_turn(
                     tool_result_callback=_record_tool_activity if activity_callback is not None else None,
                     cancellation_checker=cancellation_checker,
                 )
+                _mark_timing("model_tools")
                 activity_tool_results = list(turn_result.tool_results)
                 thinking_text = getattr(turn_result, "thinking_text", None)
                 if turn_result.suspended_for_approval:
@@ -3499,6 +3881,7 @@ def _render_chat_turn(
                             tool_result_callback=_record_tool_activity if activity_callback is not None else None,
                             cancellation_checker=cancellation_checker,
                         )
+                        _mark_timing("repair_model_tools")
                         activity_tool_results.extend(list(repair_result.tool_results))
                         if repair_result.suspended_for_approval:
                             approval_id = repair_result.approval_id
@@ -3583,6 +3966,13 @@ def _render_chat_turn(
             if turn_outcome is TurnOutcome.SUCCESS and _should_suppress_foreground_reply(activity_tool_results):
                 runtime.checkpoint()
                 _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+                _mark_timing("save")
+                _log_timing_if_slow(
+                    "suppressed",
+                    conversation_id_value=conversation_id,
+                    conversation_result_value=conversation_result,
+                    tool_count=len(activity_tool_results),
+                )
                 return None
             visible_reply = append_activity_trace_to_reply(
                 reply,
@@ -3613,6 +4003,14 @@ def _render_chat_turn(
             _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
             runtime.checkpoint()
             _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+            _mark_timing("save")
+            _log_timing_if_slow(
+                "completed",
+                conversation_id_value=conversation_id,
+                conversation_result_value=conversation_result,
+                tool_count=len(activity_tool_results),
+                artifact_count=len(getattr(locals().get("turn_result", None), "artifacts", []) or []),
+            )
             if suppress_runtime_nudges:
                 return visible_reply
             return _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply)
@@ -3926,33 +4324,35 @@ def handle_chat_operator_message(
         )
         return "Unauthorized messaging identity."
 
-    if not message.startswith("/"):
-        auto_approval_command = _auto_approval_command_for_message(runtime, message, chat_id=chat_id)
-        if auto_approval_command is not None:
-            reply = handle_operator_command(runtime, auto_approval_command, service=service)
-            result = _classify_command_result(auto_approval_command, reply)
-            resumed_reply = None
-            approval_id = _approval_id_from_command(auto_approval_command)
-            if result == "ok" and approval_id is not None:
-                resumed_reply = resume_approved_telegram_request(
-                    runtime,
-                    approval_id=approval_id,
-                    chat_id=chat_id,
-                    request_id=request_id,
-                    message_id=message_id,
-                    model_client=model_client,
-                    agent_orchestrator=agent_orchestrator,
+    command_text = is_operator_command_text(message)
+    if not message.startswith("/") or not command_text:
+        if not message.startswith("/"):
+            auto_approval_command = _auto_approval_command_for_message(runtime, message, chat_id=chat_id)
+            if auto_approval_command is not None:
+                reply = handle_operator_command(runtime, auto_approval_command, service=service)
+                result = _classify_command_result(auto_approval_command, reply)
+                resumed_reply = None
+                approval_id = _approval_id_from_command(auto_approval_command)
+                if result == "ok" and approval_id is not None:
+                    resumed_reply = resume_approved_telegram_request(
+                        runtime,
+                        approval_id=approval_id,
+                        chat_id=chat_id,
+                        request_id=request_id,
+                        message_id=message_id,
+                        model_client=model_client,
+                        agent_orchestrator=agent_orchestrator,
+                    )
+                    if resumed_reply is not None:
+                        reply = f"{reply}\n\nContinuing the approved request...\n\n{resumed_reply}"
+                logger.info(
+                    "Handled Telegram approval shorthand (chat_id=%s, text=%s, command=%s, result=%s)",
+                    chat_id,
+                    message,
+                    auto_approval_command,
+                    result,
                 )
-                if resumed_reply is not None:
-                    reply = f"{reply}\n\nContinuing the approved request...\n\n{resumed_reply}"
-            logger.info(
-                "Handled Telegram approval shorthand (chat_id=%s, text=%s, command=%s, result=%s)",
-                chat_id,
-                message,
-                auto_approval_command,
-                result,
-            )
-            return reply
+                return reply
         if not chat_enabled:
             logger.info("Ignored non-command Telegram text (chat_id=%s, text=%s)", chat_id, message)
             return None

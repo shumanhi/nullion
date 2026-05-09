@@ -734,6 +734,29 @@ def cron_delivery_artifact_paths_from_result(
     return deliverable_paths
 
 
+def _cron_delivery_text_without_media_directives(text: str) -> str:
+    from nullion.artifacts import parse_media_directive_line
+
+    lines = str(text or "").splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        current = lines[index].strip().lstrip("-*•> ").strip()
+        following = lines[index + 1].strip().strip("`'\"<>") if index + 1 < len(lines) else ""
+        if current in {"MEDIA", "ARTIFACT"}:
+            index += 2 if following else 1
+            continue
+        directive = parse_media_directive_line(lines[index])
+        if directive is not None:
+            if directive.prefix:
+                kept.append(directive.prefix)
+            index += 1
+            continue
+        kept.append(lines[index])
+        index += 1
+    return "\n".join(kept).strip()
+
+
 def cron_artifact_validation_block_reason(
     result: dict[str, object],
     text: str | None = None,
@@ -991,6 +1014,29 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
         result["cron_delivery_status"] = "sent"
         return {"result": result, "send_attempts": attempts}
     if media_candidate_paths_from_text(text):
+        fallback_text = _cron_delivery_text_without_media_directives(text)
+        if fallback_text and _send_platform_delivery(
+            callbacks.send_platform_delivery,
+            state["job"],
+            state["delivery_channel"],
+            state["delivery_target"],
+            fallback_text,
+        ):
+            if callbacks.clear_background_delivery is not None:
+                callbacks.clear_background_delivery(state["conversation_id"])
+            callbacks.record_event(
+                "cron.delivery.partial_success",
+                state["job"],
+                state["delivery_channel"],
+                state["delivery_target"],
+                state["conversation_id"],
+                reason="attachment delivery failed after text fallback",
+            )
+            result["cron_delivery_status"] = "partial_success"
+            result["cron_delivery_partial_success"] = True
+            result["cron_delivery_attachment_failed"] = True
+            result["reason"] = "attachment delivery failed"
+            return {"result": result, "send_attempts": attempts}
         callbacks.record_event(
             "cron.delivery.failed",
             state["job"],
@@ -1027,7 +1073,7 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
 
 def _cron_run_route_after_messaging(state: _CronRunDeliveryState) -> str:
     result = state.get("result") or {}
-    if result.get("cron_delivery_status") in {"sent", "failed"}:
+    if result.get("cron_delivery_status") in {"sent", "failed", "partial_success"}:
         return END
     if int(state.get("send_attempts") or 0) < 2:
         return "retry"

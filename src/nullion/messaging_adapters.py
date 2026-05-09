@@ -23,6 +23,7 @@ from nullion.artifacts import (
 from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
 from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, plan_attachment_format
+from nullion.builder import builder_proposal_acceptance_benefit
 from nullion.chat_attachments import guess_media_type
 from nullion.chat_text import make_markdown_tables_chat_readable
 from nullion.config import NullionSettings
@@ -538,6 +539,8 @@ def _new_builder_proposal_text_fallbacks(runtime, before_ids: frozenset[str]) ->
         ]
         if summary:
             lines.append(f"Summary: {summary}")
+        if proposal is not None:
+            lines.append(builder_proposal_acceptance_benefit(proposal))
         lines.extend([
             "",
             f"Inspect: /proposal {proposal_id}",

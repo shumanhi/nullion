@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -134,11 +135,36 @@ def _run(args: list[str], *, timeout: float = 15.0) -> subprocess.CompletedProce
     return subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout)
 
 
-def _launchd_service_running(label: str) -> bool:
+def _launchd_print(label: str) -> subprocess.CompletedProcess[str]:
     uid = os.getuid()
-    target = f"gui/{uid}/{label}"
-    printed = _run(["launchctl", "print", target], timeout=10)
+    return _run(["launchctl", "print", f"gui/{uid}/{label}"], timeout=10)
+
+
+def _launchd_service_running(label: str) -> bool:
+    printed = _launchd_print(label)
     return printed.returncode == 0 and "state = running" in (printed.stdout or "")
+
+
+def _wait_for_launchd_stopped(label: str, *, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        printed = _launchd_print(label)
+        if printed.returncode != 0:
+            return True
+        output = printed.stdout or ""
+        if "state = running" not in output and "pid =" not in output:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _wait_for_launchd_running(label: str, *, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _launchd_service_running(label):
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def _restart_launchd_service(service: ManagedService) -> str | None:
@@ -148,23 +174,70 @@ def _restart_launchd_service(service: ManagedService) -> str | None:
         if not plist.exists():
             continue
         target = f"gui/{uid}/{label}"
-        listed = _run(["launchctl", "list", label], timeout=10)
-        if listed.returncode != 0:
-            _run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], timeout=15)
+        _run(["launchctl", "bootout", target], timeout=15)
+        if not _wait_for_launchd_stopped(label, timeout=10):
+            raise RuntimeError(f"{service.display_name} launchd service did not stop before restart ({label}).")
+        bootstrapped = _run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], timeout=15)
         restarted = _run(["launchctl", "kickstart", "-k", target], timeout=15)
-        if restarted.returncode == 0:
+        if restarted.returncode == 0 and _wait_for_launchd_running(label, timeout=10):
             return f"Restarted the {service.display_name} service ({label})."
         if _launchd_service_running(label):
             return f"Restarted the {service.display_name} service ({label})."
-        error = (restarted.stderr or restarted.stdout or "launchctl kickstart failed").strip()
+        error = (
+            restarted.stderr
+            or restarted.stdout
+            or bootstrapped.stderr
+            or bootstrapped.stdout
+            or "launchctl restart failed"
+        ).strip()
         raise RuntimeError(f"{service.display_name} launchd restart failed for {label}: {error}")
     return None
 
 
+def _systemd_unit_active(unit: str) -> bool:
+    active = _run(["systemctl", "--user", "is-active", "--quiet", unit], timeout=10)
+    return active.returncode == 0
+
+
+def _wait_for_systemd_inactive(unit: str, *, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _systemd_unit_active(unit):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _wait_for_systemd_active(unit: str, *, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _systemd_unit_active(unit):
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def _restart_systemd_service(service: ManagedService) -> str | None:
     for unit in service.systemd_units:
-        result = _run(["systemctl", "--user", "restart", unit], timeout=20)
-        if result.returncode == 0:
+        stopped = _run(["systemctl", "--user", "stop", unit], timeout=20)
+        if stopped.returncode != 0:
+            error = (stopped.stderr or stopped.stdout or "systemctl stop failed").strip()
+            lowered = error.lower()
+            if (
+                not systemd_unit_path(unit).exists()
+                and (
+                    "not found" in lowered
+                    or "could not be found" in lowered
+                    or "does not exist" in lowered
+                    or "not loaded" in lowered
+                )
+            ):
+                continue
+            raise RuntimeError(f"{service.display_name} systemd stop failed for {unit}: {error}")
+        if not _wait_for_systemd_inactive(unit, timeout=10):
+            raise RuntimeError(f"{service.display_name} systemd service did not stop before restart ({unit}).")
+        result = _run(["systemctl", "--user", "start", unit], timeout=20)
+        if result.returncode == 0 and _wait_for_systemd_active(unit, timeout=10):
             return f"Restarted the {service.display_name} service ({unit})."
         error = (result.stderr or result.stdout or "systemctl restart failed").strip()
         lowered = error.lower()

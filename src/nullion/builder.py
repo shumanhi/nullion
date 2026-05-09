@@ -86,6 +86,27 @@ class SkillRefinementProposal:
     confidence: float
 
 
+def builder_proposal_acceptance_benefit(proposal: BuilderProposal) -> str:
+    """Shared, platform-neutral copy explaining why accepting a proposal helps."""
+    approval_mode = str(getattr(proposal, "approval_mode", "") or "").strip().lower()
+    if approval_mode == "dependency":
+        return (
+            "Why accept: Builder installs the approved package so Nullion can use that capability "
+            "locally, create or update files/artifacts that need it, and finish similar requests "
+            "with less setup."
+        )
+    if approval_mode == "memory":
+        return (
+            "Why accept: Builder saves the lesson as durable memory so future work can reuse the "
+            "right context instead of asking you to repeat it."
+        )
+    return (
+        "Why accept: Builder saves this as a reusable skill so future similar work can start with "
+        "the right steps, create or update files/artifacts when needed, and finish requested work "
+        "with less setup."
+    )
+
+
 def _primary_trigger_for_packet(packet: BuilderInputPacket) -> str:
     if packet.successful_task:
         return "successful_task"
@@ -348,6 +369,7 @@ def build_builder_proposal_snapshot(proposal: BuilderProposal) -> dict[str, obje
         "decision_type": proposal.decision_type.value,
         "title": proposal.title,
         "summary": proposal.summary,
+        "acceptance_benefit": builder_proposal_acceptance_benefit(proposal),
         "confidence": proposal.confidence,
         "approval_mode": proposal.approval_mode,
         "confidence_percent": int(round(proposal.confidence * 100)),
@@ -355,11 +377,14 @@ def build_builder_proposal_snapshot(proposal: BuilderProposal) -> dict[str, obje
 
 
 def format_builder_proposal_for_telegram(snapshot: dict[str, object]) -> str:
+    benefit = str(snapshot.get("acceptance_benefit") or "")
+    benefit_line = f"{benefit}\n" if benefit else ""
     return (
         "🧱 Nullion Builder\n"
         f"{snapshot['title']}\n"
         "\n"
         f"{snapshot['summary']}\n"
+        f"{benefit_line}"
         f"Confidence: {snapshot['confidence_percent']}% • Approval mode: {snapshot['approval_mode']}"
     )
 
@@ -408,6 +433,7 @@ __all__ = [
     "build_builder_input_snapshot",
     "build_builder_proposal",
     "build_builder_proposal_snapshot",
+    "builder_proposal_acceptance_benefit",
     "build_skill_refinement_proposal_snapshot",
     "evaluate_builder_decision",
     "format_builder_proposal_for_telegram",

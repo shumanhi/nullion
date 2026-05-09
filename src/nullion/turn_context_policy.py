@@ -61,6 +61,7 @@ class TurnToolEvidence:
     has_attachments: bool = False
     requested_extensions: tuple[str, ...] = ()
     context_linked: bool = False
+    slash_prefixed_literal: bool = False
 
     @property
     def artifact_requested(self) -> bool:
@@ -158,6 +159,8 @@ class ScopedTurnToolRegistry:
             return self.turn_tool_scope_decision.allow_skill_pack_tools
         if self._evidence.context_linked:
             return True
+        if tool_name == "file_read" and self._evidence.slash_prefixed_literal and not self._evidence.has_attachments:
+            return False
         if tool_name in _URL_BOUNDARY_TOOLS:
             return self._evidence.has_url_target or self.turn_tool_scope_decision.allow_web_tools
         if tool_name in {"pdf_create", "pdf_edit"}:
@@ -200,6 +203,7 @@ class ScopedTurnToolRegistry:
                 "has_attachments": self._evidence.has_attachments,
                 "requested_extensions": list(self._evidence.requested_extensions),
                 "context_linked": self._evidence.context_linked,
+                "slash_prefixed_literal": self._evidence.slash_prefixed_literal,
                 "web_action": self.turn_tool_scope_decision.web_action,
                 "scheduler_action": self.turn_tool_scope_decision.scheduler_action,
                 "skill_pack_action": self.turn_tool_scope_decision.skill_pack_action,
@@ -262,7 +266,12 @@ def build_turn_tool_evidence(
         has_attachments=bool(has_attachments),
         requested_extensions=normalized_extensions,
         context_linked=turn_is_context_linked(conversation_result),
+        slash_prefixed_literal=is_slash_prefixed_literal_message(user_message),
     )
+
+
+def is_slash_prefixed_literal_message(user_message: object) -> bool:
+    return str(user_message or "").strip().startswith("/")
 
 
 def _registry_has_scoped_special_tools(registry) -> bool:
@@ -424,6 +433,7 @@ __all__ = [
     "TurnToolEvidence",
     "build_turn_tool_scope_decision",
     "build_turn_tool_evidence",
+    "is_slash_prefixed_literal_message",
     "scoped_turn_tool_registry",
     "should_include_prior_turn_messages",
     "tool_registry_allows_connector_context",

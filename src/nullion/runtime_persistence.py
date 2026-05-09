@@ -1554,12 +1554,14 @@ CREATE TABLE IF NOT EXISTS {table_name} (
 );
 CREATE INDEX IF NOT EXISTS idx_{table_name}_collection
     ON {table_name} (collection);
+CREATE INDEX IF NOT EXISTS idx_{table_name}_item_key
+    ON {table_name} (item_key);
+CREATE INDEX IF NOT EXISTS idx_{table_name}_collection_updated
+    ON {table_name} (collection, updated_at);
 """
         for table_name in _SQLITE_TABLE_NAMES
     ]
     runtime_event_indexes = """
-CREATE INDEX IF NOT EXISTS idx_runtime_events_collection_updated
-    ON runtime_events (collection, updated_at);
 CREATE INDEX IF NOT EXISTS idx_runtime_events_type_created
     ON runtime_events (
         json_extract(payload, '$.event_type'),
