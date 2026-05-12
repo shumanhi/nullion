@@ -3569,10 +3569,28 @@ def _build_presentation_create_handler(
     return handler
 
 
+_PDF_RENDER_DPI = 300.0
+_PDF_JPEG_QUALITY = 95
 _PDF_PAGE_SIZES = {
-    "letter": (1275, 1650),
-    "a4": (1240, 1754),
+    "letter": (2550, 3300),
+    "a4": (2480, 3508),
 }
+
+
+def _pdf_points_to_px(points: float) -> int:
+    return max(1, int(round((float(points) * _PDF_RENDER_DPI) / 72.0)))
+
+
+def _load_pdf_font(*, size_px: int, bold: bool = False):
+    from PIL import ImageFont
+
+    candidates = ("DejaVuSans-Bold.ttf", "Arial Bold.ttf", "Arial.ttf") if bold else ("DejaVuSans.ttf", "Arial.ttf")
+    for name in candidates:
+        try:
+            return ImageFont.truetype(name, size=size_px)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 def _pdf_default_output_path(invocation: ToolInvocation, *, title: str, roots: tuple[Path, ...]) -> Path:
@@ -3629,25 +3647,51 @@ def _image_to_pdf_page(path: Path, *, page_size: tuple[int, int]):
 
 
 def _text_to_pdf_page(text: str, *, title: str, page_size: tuple[int, int]):
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     page = Image.new("RGB", page_size, "white")
     draw = ImageDraw.Draw(page)
-    font = ImageFont.load_default()
-    margin = 84
+    body_font = _load_pdf_font(size_px=_pdf_points_to_px(12))
+    title_font = _load_pdf_font(size_px=_pdf_points_to_px(18), bold=True)
+    margin = _pdf_points_to_px(36)
+    max_width = max(120, page_size[0] - margin * 2)
+    body_line_height = max(22, int((draw.textbbox((0, 0), "Ag", font=body_font)[3]) * 1.35))
+    title_line_height = max(30, int((draw.textbbox((0, 0), "Ag", font=title_font)[3]) * 1.25))
+
+    def wrap_for_width(paragraph: str) -> list[str]:
+        words = [word for word in paragraph.split() if word]
+        if not words:
+            return [""]
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if draw.textlength(candidate, font=body_font) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                if draw.textlength(word, font=body_font) <= max_width:
+                    current = word
+                else:
+                    # Emergency fallback for oversized unbroken tokens.
+                    hard_lines = textwrap.wrap(word, width=40) or [word]
+                    lines.extend(hard_lines[:-1])
+                    current = hard_lines[-1]
+        lines.append(current)
+        return lines
+
     y = margin
     if title.strip():
-        draw.text((margin, y), title.strip()[:120], fill="black", font=font)
-        y += 34
-    max_chars = max(40, (page_size[0] - margin * 2) // 8)
+        draw.text((margin, y), title.strip()[:140], fill="black", font=title_font)
+        y += title_line_height + _pdf_points_to_px(6)
     for paragraph in str(text or "").splitlines() or [""]:
-        lines = textwrap.wrap(paragraph, width=max_chars) or [""]
+        lines = wrap_for_width(paragraph)
         for line in lines:
             if y > page_size[1] - margin:
                 return page
-            draw.text((margin, y), line, fill="black", font=font)
-            y += 20
-        y += 10
+            draw.text((margin, y), line, fill="black", font=body_font)
+            y += body_line_height
+        y += _pdf_points_to_px(6)
     return page
 
 
@@ -3687,7 +3731,10 @@ def _save_pdf_pages(path: Path, pages: list[object], *, title: str) -> None:
         "PDF",
         save_all=True,
         append_images=pages[1:],
-        resolution=150.0,
+        resolution=_PDF_RENDER_DPI,
+        quality=_PDF_JPEG_QUALITY,
+        subsampling=0,
+        optimize=True,
         title=title or None,
     )
 

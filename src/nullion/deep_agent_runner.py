@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import inspect
+import json
 import logging
 import os
 from pathlib import Path
@@ -34,6 +36,18 @@ class DeepAgentUserInputRequested(RuntimeError):
         super().__init__(question)
         self.question = question
         self.options = options
+
+
+class DeepAgentStalledLoopError(RuntimeError):
+    """Raised when Deep Agent tool execution loops without progress."""
+
+
+class DeepAgentEvidenceFallbackUnavailable(RuntimeError):
+    """Raised when tool evidence is insufficient to recover a final answer."""
+
+
+_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS_ENV = "NULLION_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS"
+_DEFAULT_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS = 5.0
 
 
 class DeepAgentMiniAgentRunner:
@@ -171,13 +185,30 @@ class DeepAgentMiniAgentRunner:
         skill_files = _deep_agent_skill_files_for_task(config)
         if skill_files:
             payload["files"] = skill_files
-        response = await _invoke_agent(
-            agent,
-            payload,
-            config=_deep_agent_graph_config(config),
-            progress_queue=progress_queue,
-            mini_agent_config=config,
-        )
+        try:
+            response = await _invoke_agent(
+                agent,
+                payload,
+                config=_deep_agent_graph_config(config),
+                progress_queue=progress_queue,
+                mini_agent_config=config,
+            )
+        except Exception as exc:
+            if not _is_graph_recursion_limit(exc):
+                raise
+            await _emit_progress(
+                progress_queue,
+                config=config,
+                kind="progress_note",
+                message="Recovering final answer from verified tool evidence.",
+                data={"phase": "graph_limit_recovery"},
+            )
+            fallback_text = await _fallback_answer_from_tool_evidence(
+                config,
+                tool_results=tool_results,
+                model_client=anthropic_client,
+            )
+            response = {"content": [{"type": "text", "text": fallback_text}]}
         output_text = _extract_response_text(response)
         if not output_text:
             return TaskResult(
@@ -492,6 +523,147 @@ def _deep_agent_thread_id(config) -> str:
     return f"nullion:{config.task.group_id}:{config.task.task_id}:{config.agent_id}"
 
 
+def _is_graph_recursion_limit(exc: BaseException) -> bool:
+    try:
+        from langgraph.errors import GraphRecursionError
+    except Exception:  # pragma: no cover - optional dependency shape
+        GraphRecursionError = None  # type: ignore[assignment]
+    if GraphRecursionError is not None and isinstance(exc, GraphRecursionError):
+        return True
+    return type(exc).__name__ == "GraphRecursionError"
+
+
+def _float_env(name: str, default: float, *, minimum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _evidence_fallback_timeout_seconds() -> float:
+    return _float_env(
+        _DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS_ENV,
+        _DEFAULT_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS,
+        minimum=0.1,
+    )
+
+
+async def _fallback_answer_from_tool_evidence(
+    config,
+    *,
+    tool_results: list[Any],
+    model_client: Any,
+) -> str:
+    completed_results = [
+        result
+        for result in tool_results
+        if str(getattr(result, "status", "") or "").lower() in {"completed", "success", "succeeded"}
+    ]
+    if not completed_results:
+        raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence was unavailable for recovery.")
+    create = getattr(model_client, "create", None)
+    if create is None:
+        raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence could not be summarized.")
+    evidence = _tool_evidence_payload(completed_results)
+    system_prompt = (
+        "You are completing a delegated Nullion task after the stateful agent graph hit a runtime step limit. "
+        "Use only the verified tool-result evidence provided by the runtime. "
+        "Output only JSON with this schema: "
+        '{"status":"success"|"failure","answer":"string"}. '
+        "Set status=failure when the evidence is insufficient. "
+        "Do not mention internal graph limits, retries, tools, or recovery mechanics to the user."
+    )
+    user_payload = {
+        "task": str(getattr(config.task, "description", "") or getattr(config.task, "title", "") or ""),
+        "tool_evidence": evidence,
+    }
+    create_kwargs = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": json.dumps(user_payload, ensure_ascii=False, default=str)}],
+            }
+        ],
+        "tools": [],
+        "max_tokens": 900,
+        "system": system_prompt,
+    }
+    try:
+        response = await asyncio.wait_for(
+            _call_model_create(create, create_kwargs),
+            timeout=_evidence_fallback_timeout_seconds(),
+        )
+    except TimeoutError as exc:
+        raise DeepAgentEvidenceFallbackUnavailable(
+            "Verified tool evidence recovery timed out."
+        ) from exc
+    decision = _parse_evidence_fallback_decision(_extract_response_text(response))
+    if decision is None:
+        raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence recovery returned no valid structured decision.")
+    if decision.get("status") != "success":
+        reason = str(decision.get("answer") or "Verified tool evidence was insufficient to finish the task.").strip()
+        raise DeepAgentEvidenceFallbackUnavailable(reason)
+    answer = str(decision.get("answer") or "").strip()
+    if not answer:
+        raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence recovery returned an empty answer.")
+    return answer
+
+
+def _tool_evidence_payload(tool_results: list[Any], *, max_results: int = 12, max_chars: int = 1200) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for result in tool_results[-max_results:]:
+        output = getattr(result, "output", None)
+        try:
+            output_text = json.dumps(output, ensure_ascii=False, default=str)
+        except TypeError:
+            output_text = str(output)
+        if len(output_text) > max_chars:
+            output_text = output_text[:max_chars] + "...[truncated]"
+        evidence.append(
+            {
+                "tool_name": str(getattr(result, "tool_name", "") or ""),
+                "status": str(getattr(result, "status", "") or ""),
+                "output": output_text,
+                "error": str(getattr(result, "error", "") or ""),
+            }
+        )
+    return evidence
+
+
+async def _call_model_create(create: Any, create_kwargs: dict[str, Any]) -> Any:
+    if inspect.iscoroutinefunction(create):
+        return await create(**create_kwargs)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: create(**create_kwargs))
+
+
+def _parse_evidence_fallback_decision(raw_text: str) -> dict[str, str] | None:
+    raw_text = str(raw_text or "").strip()
+    if not raw_text:
+        return None
+    candidates = [raw_text]
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(raw_text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        status = str(parsed.get("status") or "").strip().lower()
+        answer = str(parsed.get("answer") or "").strip()
+        if status in {"success", "failure"}:
+            return {"status": status, "answer": answer}
+    return None
+
+
 def _resume_token_for_pause(config, *, reason: str, payload: dict[str, object]) -> dict[str, object]:
     return {
         "backend": "deepagents",
@@ -539,7 +711,11 @@ async def _invoke_agent_with_events(
 ) -> Any:
     final_output: Any = None
     emitted: set[tuple[str, str]] = set()
+    loop_guard = _DeepAgentToolLoopGuard()
     async for event in agent.astream_events(payload, config=config, version="v2"):
+        stall_reason = loop_guard.observe(event)
+        if stall_reason is not None:
+            raise DeepAgentStalledLoopError(stall_reason)
         if event.get("event") == "on_chain_end" and event.get("name") == "LangGraph":
             final_output = (event.get("data") or {}).get("output")
         progress_update = _progress_update_from_deep_agent_event(event)
@@ -567,6 +743,88 @@ def _progress_message_from_deep_agent_event(event: dict[str, Any]) -> str | None
     if progress_update is None:
         return None
     return progress_update[1]
+
+
+def _int_env(name: str, default: int, *, minimum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _stable_event_signature(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, (str, int, float, bool)):
+        return json.dumps(value, ensure_ascii=True, sort_keys=True)
+    if isinstance(value, dict):
+        normalized = {str(key): _stable_event_signature(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+        return json.dumps(normalized, ensure_ascii=True, sort_keys=True)
+    if isinstance(value, (list, tuple)):
+        normalized_list = [_stable_event_signature(item) for item in value]
+        return json.dumps(normalized_list, ensure_ascii=True, sort_keys=True)
+    return f"<{type(value).__name__}>"
+
+
+def _tool_call_signature(event: dict[str, Any]) -> str | None:
+    if str(event.get("event") or "") != "on_tool_start":
+        return None
+    tool_name = str(event.get("name") or "").strip()
+    if not tool_name:
+        return None
+    data = event.get("data")
+    tool_input = data.get("input") if isinstance(data, dict) else None
+    return f"{tool_name}:{_stable_event_signature(tool_input)}"
+
+
+def _repeated_cycle_length(signatures: list[str], *, min_repeats: int, max_cycle_len: int) -> int | None:
+    if len(signatures) < min_repeats:
+        return None
+    max_len = min(max_cycle_len, len(signatures) // min_repeats)
+    for cycle_len in range(1, max_len + 1):
+        window_len = cycle_len * min_repeats
+        window = signatures[-window_len:]
+        cycle = window[:cycle_len]
+        if cycle * min_repeats == window:
+            return cycle_len
+    return None
+
+
+class _DeepAgentToolLoopGuard:
+    def __init__(self) -> None:
+        self._min_repeats = _int_env("NULLION_DEEP_AGENT_STALL_MIN_REPEATS", 3, minimum=2)
+        self._max_cycle_len = _int_env("NULLION_DEEP_AGENT_STALL_MAX_CYCLE_LEN", 6, minimum=1)
+        min_events_default = self._min_repeats * 2
+        self._min_events = _int_env("NULLION_DEEP_AGENT_STALL_MIN_TOOL_EVENTS", min_events_default, minimum=self._min_repeats)
+        history_cap_default = max(32, self._max_cycle_len * self._min_repeats * 2)
+        self._history: deque[str] = deque(maxlen=_int_env("NULLION_DEEP_AGENT_STALL_HISTORY_CAP", history_cap_default, minimum=8))
+
+    def observe(self, event: dict[str, Any]) -> str | None:
+        signature = _tool_call_signature(event)
+        if signature is None:
+            return None
+        self._history.append(signature)
+        if len(self._history) < self._min_events:
+            return None
+        signatures = list(self._history)
+        cycle_len = _repeated_cycle_length(
+            signatures,
+            min_repeats=self._min_repeats,
+            max_cycle_len=self._max_cycle_len,
+        )
+        if cycle_len is None:
+            return None
+        repeated_cycle = signatures[-cycle_len:]
+        cycle_preview = ", ".join(signature.split(":", 1)[0] for signature in repeated_cycle[:3])
+        return (
+            "stalled_tool_loop_no_progress: repeated tool cycle detected "
+            f"({self._min_repeats} repeats, cycle_len={cycle_len}). "
+            f"Recent tools: {cycle_preview}"
+        )
 
 
 def _progress_update_from_deep_agent_event(event: dict[str, Any]) -> tuple[str, str, dict[str, Any] | None] | None:
@@ -658,7 +916,13 @@ def _tool_names_from_chat_model_output(output: Any) -> list[str]:
 def _extract_response_text(response: Any) -> str:
     if isinstance(response, str):
         return response.strip()
+    if isinstance(response, list):
+        parts = [_extract_response_text(item) for item in response]
+        return "".join(part for part in parts if part).strip()
     if isinstance(response, dict):
+        text_value = response.get("text")
+        if isinstance(text_value, str) and text_value.strip():
+            return text_value.strip()
         for key in ("final", "final_text", "output", "content"):
             value = response.get(key)
             text = _extract_response_text(value)

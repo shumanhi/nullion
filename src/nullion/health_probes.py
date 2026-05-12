@@ -16,8 +16,11 @@ from nullion.health_monitor import ProbeResult
 logger = logging.getLogger(__name__)
 
 _AUTH_ERROR_CODE_RE = re.compile(r'"code"\s*:\s*"([^"]+)"')
+_ERROR_TYPE_RE = re.compile(r'"type"\s*:\s*"([^"]+)"')
 _HTTP_STATUS_RE = re.compile(r"\bHTTP\s+(\d{3})\b|\"status\"\s*:\s*(\d{3})")
+_RESETS_IN_SECONDS_RE = re.compile(r'"resets_in_seconds"\s*:\s*(\d+)')
 _TERMINAL_AUTH_CODES = {"token_invalidated", "token_revoked", "invalid_api_key", "invalid_token"}
+_TERMINAL_QUOTA_TYPES = {"usage_limit_reached", "insufficient_quota"}
 
 
 def _model_probe_error_details(exc: Exception) -> dict[str, object]:
@@ -25,10 +28,14 @@ def _model_probe_error_details(exc: Exception) -> dict[str, object]:
     text = str(exc)
     status_code = getattr(exc, "status_code", None)
     provider_code = getattr(exc, "code", None)
+    error_type = None
     if provider_code is None:
         match = _AUTH_ERROR_CODE_RE.search(text)
         if match:
             provider_code = match.group(1)
+    match = _ERROR_TYPE_RE.search(text)
+    if match:
+        error_type = match.group(1)
     if status_code is None:
         match = _HTTP_STATUS_RE.search(text)
         if match:
@@ -49,9 +56,26 @@ def _model_probe_error_details(exc: Exception) -> dict[str, object]:
         details["http_status"] = status_code
     if provider_code:
         details["provider_code"] = str(provider_code)
+    if error_type:
+        details["error_type"] = str(error_type)
     if terminal_auth:
         details["category"] = "auth"
         details["terminal"] = True
+    quota_exhausted = (
+        status_code == 429
+        and (
+            str(error_type or "") in _TERMINAL_QUOTA_TYPES
+            or "usage_limit_reached" in lowered
+            or "insufficient_quota" in lowered
+            or "exceeded your current quota" in lowered
+        )
+    )
+    if quota_exhausted:
+        details["category"] = "quota"
+        details["terminal"] = True
+        match = _RESETS_IN_SECONDS_RE.search(text)
+        if match:
+            details["retry_after_seconds"] = int(match.group(1))
     return details
 
 
@@ -101,8 +125,11 @@ def make_telegram_probe(bot_application) -> "ProbeFunc":
             token = getattr(getattr(bot_application, "bot", None), "token", None)
             if not isinstance(token, str) or not token:
                 raise RuntimeError("Telegram bot token unavailable for probe")
-            async with Bot(token) as bot:
-                await bot.get_me()
+            from nullion.messaging_adapters import retry_messaging_delivery_operation
+            from nullion.telegram_transport import build_telegram_bot
+
+            async with build_telegram_bot(Bot, token) as bot:
+                await retry_messaging_delivery_operation(lambda: bot.get_me())
             return ProbeResult(
                 service_id="telegram_bot",
                 ok=True,

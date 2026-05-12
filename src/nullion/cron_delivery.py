@@ -322,6 +322,8 @@ def cron_structured_result_block_reason(
 
     if result.get("raw_tool_payload_blocked"):
         return "cron_run_raw_tool_payload"
+    if result.get("response_fulfilled") is False:
+        return "cron_run_unfulfilled_delivery_contract"
     if is_safe_raw_tool_payload_replacement_reply(reply=text, tool_results=result.get("tool_results") or ()):
         return "cron_run_raw_tool_payload"
     if _cron_result_leaked_internal_tool_output(result, text):

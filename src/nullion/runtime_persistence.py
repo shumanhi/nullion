@@ -58,6 +58,7 @@ SUPPORTED_RUNTIME_STORE_FORMAT_VERSIONS = frozenset({RUNTIME_STORE_FORMAT_VERSIO
 RUNTIME_STORE_BACKUP_DEPTH = 3
 RUNTIME_SQLITE_MEASURE_ENABLED = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
 RUNTIME_SQLITE_SLOW_MS = float(os.environ.get("NULLION_SQLITE_SLOW_MS", "250"))
+RUNTIME_CHECKPOINT_SLOW_MS = float(os.environ.get("NULLION_RUNTIME_CHECKPOINT_SLOW_MS", "1500"))
 DEFAULT_NULLION_HOME = Path.home() / ".nullion"
 DEFAULT_MEMORY_KEY_PATH = DEFAULT_NULLION_HOME / "memory.key"
 MEMORY_KEYCHAIN_SERVICE = "Nullion Runtime Memory Key"
@@ -1662,22 +1663,42 @@ def _validate_sqlite_runtime_row(collection: str, decoded: dict[str, object]) ->
     _runtime_store_from_payload(payload)
 
 
-def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path) -> Path:
+def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path, *, merge_existing: bool = True) -> Path:
     target = Path(path)
     started_at = perf_counter()
-    if target.exists():
+    merge_ms = 0.0
+    if merge_existing and target.exists():
+        merge_started_at = perf_counter()
         try:
-            previous_store = _load_runtime_store_sqlite(target)
+            previous_store = _load_runtime_store_sqlite_collections(
+                target,
+                (
+                    "suspended_turns",
+                    "approval_requests",
+                    "permission_grants",
+                    "boundary_permits",
+                    "boundary_policy_rules",
+                    "events",
+                    "audit_records",
+                ),
+            )
             _merge_previous_checkpoint_records(store, previous_store)
         except Exception:
             pass
+        merge_ms = (perf_counter() - merge_started_at) * 1000
+    payload_started_at = perf_counter()
     payload = build_runtime_store_payload(store)
+    payload_ms = (perf_counter() - payload_started_at) * 1000
     target.parent.mkdir(parents=True, exist_ok=True)
+    backup_ms = 0.0
     if target.exists():
+        backup_started_at = perf_counter()
         _rotate_runtime_store_backups(target)
         shutil.copy2(target, _backup_path_for(target, 0))
+        backup_ms = (perf_counter() - backup_started_at) * 1000
 
     now = datetime.now(UTC).isoformat()
+    sqlite_write_started_at = perf_counter()
     with sqlite3.connect(str(target), timeout=10) as conn:
         # Keep runtime checkpoints self-contained so backup/restore can copy one file.
         conn.execute("PRAGMA journal_mode=DELETE")
@@ -1688,34 +1709,70 @@ def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path) -> Path:
             ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)),
         )
         for table_name, collections in _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE.items():
-            placeholders = ", ".join("?" for _ in collections)
-            conn.execute(f"DELETE FROM {table_name} WHERE collection IN ({placeholders})", collections)
-        for collection in _RUNTIME_STORE_COLLECTION_KEYS:
-            table_name = _SQLITE_RUNTIME_TABLES[collection]
-            rows = payload.get(collection, [])
-            if not isinstance(rows, list):
-                rows = []
-            for index, row in enumerate(rows):
-                conn.execute(
-                    f"""INSERT OR REPLACE INTO {table_name}
-                        (collection, item_key, payload, updated_at)
-                        VALUES (?, ?, ?, ?)""",
-                    (
+            for collection in collections:
+                rows = payload.get(collection, [])
+                if not isinstance(rows, list):
+                    rows = []
+                encoded_rows: dict[str, str] = {}
+                for index, row in enumerate(rows):
+                    encoded_rows[_sqlite_collection_item_key(collection, index, row)] = _encode_sqlite_runtime_payload(
                         collection,
-                        _sqlite_collection_item_key(collection, index, row),
-                        _encode_sqlite_runtime_payload(collection, target, row),
-                        now,
-                    ),
-                )
+                        target,
+                        row,
+                    )
+                existing_rows = {
+                    str(item_key): str(row_payload)
+                    for item_key, row_payload in conn.execute(
+                        f"SELECT item_key, payload FROM {table_name} WHERE collection = ?",
+                        (collection,),
+                    )
+                }
+                stale_keys = set(existing_rows) - set(encoded_rows)
+                if stale_keys:
+                    conn.executemany(
+                        f"DELETE FROM {table_name} WHERE collection = ? AND item_key = ?",
+                        [(collection, item_key) for item_key in stale_keys],
+                    )
+                changed_rows = [
+                    (collection, item_key, row_payload, now)
+                    for item_key, row_payload in encoded_rows.items()
+                    if existing_rows.get(item_key) != row_payload
+                ]
+                if changed_rows:
+                    conn.executemany(
+                        f"""INSERT OR REPLACE INTO {table_name}
+                            (collection, item_key, payload, updated_at)
+                            VALUES (?, ?, ?, ?)""",
+                        changed_rows,
+                    )
+    sqlite_write_ms = (perf_counter() - sqlite_write_started_at) * 1000
     record_count = sum(
         len(rows) if isinstance(rows, list) else 0
         for rows in payload.values()
     )
     _log_runtime_sqlite_timing("save", started_at, target, records=record_count)
+    total_ms = (perf_counter() - started_at) * 1000
+    if total_ms >= RUNTIME_CHECKPOINT_SLOW_MS:
+        logger.warning(
+            "runtime checkpoint phase timing path=%s total_ms=%.1f merge_ms=%.1f payload_ms=%.1f backup_ms=%.1f sqlite_write_ms=%.1f records=%s merge_existing=%s",
+            target.name,
+            total_ms,
+            merge_ms,
+            payload_ms,
+            backup_ms,
+            sqlite_write_ms,
+            record_count,
+            merge_existing,
+        )
     return target
 
 
-def _load_runtime_store_sqlite(path: str | Path) -> RuntimeStore:
+def _load_runtime_store_sqlite_payload(
+    path: str | Path,
+    collections: tuple[str, ...],
+    *,
+    timing_operation: str,
+) -> dict[str, object]:
     source = Path(path)
     started_at = perf_counter()
     payload: dict[str, object] = {
@@ -1732,7 +1789,7 @@ def _load_runtime_store_sqlite(path: str | Path) -> RuntimeStore:
         ).fetchone()
         if version_row is not None:
             payload["format_version"] = int(version_row["value"])
-        for collection in _RUNTIME_STORE_COLLECTION_KEYS:
+        for collection in collections:
             table_name = _SQLITE_RUNTIME_TABLES[collection]
             rows = conn.execute(
                 f"SELECT rowid, item_key, payload FROM {table_name} WHERE collection = ? ORDER BY rowid",
@@ -1756,13 +1813,31 @@ def _load_runtime_store_sqlite(path: str | Path) -> RuntimeStore:
                         reason=str(exc) or exc.__class__.__name__,
                     )
             payload[collection] = decoded_rows
-    store = _runtime_store_from_payload(payload)
     record_count = sum(
         len(rows) if isinstance(rows, list) else 0
         for rows in payload.values()
     )
-    _log_runtime_sqlite_timing("load", started_at, source, records=record_count)
+    _log_runtime_sqlite_timing(timing_operation, started_at, source, records=record_count)
+    return payload
+
+
+def _load_runtime_store_sqlite(path: str | Path) -> RuntimeStore:
+    payload = _load_runtime_store_sqlite_payload(
+        path,
+        _RUNTIME_STORE_COLLECTION_KEYS,
+        timing_operation="load",
+    )
+    store = _runtime_store_from_payload(payload)
     return store
+
+
+def _load_runtime_store_sqlite_collections(path: str | Path, collections: tuple[str, ...]) -> RuntimeStore:
+    payload = _load_runtime_store_sqlite_payload(
+        path,
+        collections,
+        timing_operation="load-merge",
+    )
+    return _runtime_store_from_payload(payload)
 
 
 
@@ -1834,14 +1909,14 @@ def render_runtime_store_payload_json(store: RuntimeStore) -> str:
 
 
 
-def save_runtime_store(store: RuntimeStore, path: str | Path) -> Path:
+def save_runtime_store(store: RuntimeStore, path: str | Path, *, merge_existing: bool = True) -> Path:
     target = Path(path)
     if _is_sqlite_runtime_path(target):
         with _runtime_store_file_lock(target):
-            return _save_runtime_store_sqlite(store, target)
+            return _save_runtime_store_sqlite(store, target, merge_existing=merge_existing)
     with _runtime_store_file_lock(target):
         previous_payload = target.read_text(encoding="utf-8") if target.exists() else None
-        if previous_payload is not None:
+        if merge_existing and previous_payload is not None:
             try:
                 previous_store = _runtime_store_from_payload(json.loads(previous_payload))
                 _merge_previous_checkpoint_records(store, previous_store)

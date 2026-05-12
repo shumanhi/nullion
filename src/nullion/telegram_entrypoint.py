@@ -18,6 +18,7 @@ import threading
 
 from nullion.config import ProviderBinding, load_env_file_into_environ, load_settings
 from nullion.cron_planner_status import (
+    build_cron_planner_status_fallback,
     build_cron_planner_status_preview,
     cron_planner_run_succeeded,
 )
@@ -27,11 +28,12 @@ from nullion.cron_execution_tools import (
 )
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.artifacts import ensure_artifact_root
-from nullion.messaging_adapters import messaging_file_allowed_roots
+from nullion.messaging_adapters import messaging_file_allowed_roots, retry_messaging_delivery_operation
 from nullion.providers import resolve_plugin_provider_kwargs
 from nullion.runtime import bootstrap_persistent_runtime
 from nullion.runtime_persistence import list_runtime_store_backups, restore_runtime_store_backup
 from nullion.telegram_app import build_messaging_operator_service, build_telegram_operator_service
+from nullion.telegram_transport import build_telegram_bot
 from nullion.tools import (
     SandboxLauncherTerminalExecutorBackend,
     SubprocessTerminalExecutorBackend,
@@ -57,6 +59,63 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
 _DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
+_MANUAL_CRON_DOCTOR_MONITOR_SECONDS_ENV = "NULLION_MANUAL_CRON_DOCTOR_MONITOR_SECONDS"
+_DEFAULT_MANUAL_CRON_DOCTOR_MONITOR_SECONDS = 900.0
+
+
+def _manual_cron_doctor_monitor_seconds() -> float:
+    raw_value = os.environ.get(_MANUAL_CRON_DOCTOR_MONITOR_SECONDS_ENV, "").strip()
+    if not raw_value:
+        return _DEFAULT_MANUAL_CRON_DOCTOR_MONITOR_SECONDS
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r",
+            _MANUAL_CRON_DOCTOR_MONITOR_SECONDS_ENV,
+            raw_value,
+        )
+        return _DEFAULT_MANUAL_CRON_DOCTOR_MONITOR_SECONDS
+    return max(0.0, parsed)
+
+
+def _manual_cron_monitoring_text(job, *, elapsed_seconds: float) -> str:
+    name = str(getattr(job, "name", "") or "scheduled task").strip()
+    elapsed = int(max(0, elapsed_seconds))
+    return (
+        "Doctor is monitoring this manual scheduled task because it is still running "
+        f"after {elapsed} seconds. It has not been stopped; Nullion will keep working "
+        "and will deliver the result when the run finishes."
+        f"\n\nTask: {name}"
+    )
+
+
+def _report_manual_cron_monitoring(
+    runtime,
+    *,
+    job,
+    invocation,
+    channel: str,
+    target: str,
+    elapsed_seconds: float,
+) -> None:
+    from nullion.health import HealthIssueType
+
+    runtime.report_health_issue(
+        issue_type=HealthIssueType.STALLED,
+        source="manual_cron",
+        message="A manual scheduled task is still running",
+        details={
+            "recommendation_code": "monitor_manual_cron",
+            "cron_id": str(getattr(job, "id", "") or ""),
+            "cron_name": str(getattr(job, "name", "") or ""),
+            "invocation_id": str(getattr(invocation, "invocation_id", "") or ""),
+            "principal_id": str(getattr(invocation, "principal_id", "") or ""),
+            "delivery_channel": str(channel or ""),
+            "delivery_target": str(target or ""),
+            "elapsed_seconds": int(max(0, elapsed_seconds)),
+        },
+    )
 
 
 def _run_async_sync(factory) -> bool:
@@ -614,6 +673,8 @@ def _build_runtime_service_from_settings(
                 "Cron delivery contract: create requested deliverable files under this artifact directory "
                 f"and attach them with explicit MEDIA lines: {artifact_root}. "
                 "Keep scratch, checkpoint, and state files in the workspace unless they are requested deliverables.\n\n"
+                "If a tool requires approval, pause and wait for the approval decision card. "
+                "After approval, resume from the suspended step; if denied, stop the run.\n\n"
                 f"{storage_text}"
             )}],
         })
@@ -623,10 +684,38 @@ def _build_runtime_service_from_settings(
         from nullion.cron_delivery import cron_agent_prompt
         from nullion.run_activity import format_tool_activity_detail, task_planner_feed_enabled
 
+        preflight_started_at = time.perf_counter()
+
+        def _record_agent_preflight(stage: str, **extra: object) -> None:
+            elapsed_ms = round((time.perf_counter() - preflight_started_at) * 1000, 1)
+            logger.info(
+                "cron delivery agent preflight conversation_id=%s stage=%s elapsed_ms=%.1f extra=%s",
+                conv_id,
+                stage,
+                elapsed_ms,
+                extra,
+            )
+            if os.environ.get("NULLION_CRON_PREFLIGHT_TIMING_EVENTS", "").strip() != "1":
+                return
+            _record_cron_delivery_event(
+                "cron.delivery.agent_preflight",
+                job,
+                "",
+                "",
+                conv_id,
+                stage=stage,
+                elapsed_ms=elapsed_ms,
+                **extra,
+            )
+
         orchestrator = getattr(service, "agent_orchestrator", None)
         if orchestrator is None:
             return {"cron_run_failed": True, "reason": "agent_orchestrator_unavailable", "text": ""}
         prompt = cron_agent_prompt(job, label=label)
+        planner_preview_prompt = (
+            f"{str(getattr(job, 'name', '') or '').strip()}\n"
+            f"{str(getattr(job, 'task', '') or '').strip()}"
+        ).strip() or prompt
         deliver_fn = getattr(orchestrator, "_deliver_fn", None)
         connector_scope_prompt = json.dumps(
             {
@@ -635,48 +724,15 @@ def _build_runtime_service_from_settings(
             },
             ensure_ascii=False,
         )
-        connector_scope = build_cron_connector_scope_decision(
-            model_client=getattr(orchestrator, "model_client", None),
-            user_message=connector_scope_prompt,
-            principal_id=conv_id,
-            registry=active_tool_registry,
-        )
         preview = None
-        if planner_status_preview and callable(deliver_fn) and task_planner_feed_enabled():
-            try:
-                preview_registry = CronExecutionToolRegistry(
-                    active_tool_registry,
-                    allow_connector_tools=connector_scope.allow_connector_tools,
-                    connector_provider_ids=connector_scope.provider_ids,
-                )
-                preview = build_cron_planner_status_preview(
-                    model_client=getattr(orchestrator, "model_client", None),
-                    user_message=prompt,
-                    conversation_id=conv_id,
-                    principal_id=conv_id,
-                    tool_registry=preview_registry,
-                    subject=str(getattr(job, "name", "") or ""),
-                )
-            except Exception:
-                logger.debug("Could not build Telegram cron planner status preview", exc_info=True)
-                preview = None
-            if preview is not None:
-                try:
-                    deliver_fn(
-                        conv_id,
-                        preview.initial_text(),
-                        is_status=True,
-                        group_id=preview.group_id,
-                        status_kind="task_summary",
-                    )
-                except Exception:
-                    logger.debug("Could not deliver Telegram cron planner status preview", exc_info=True)
+        display_preview = None
+        planner_group_id = ""
+        planner_terminal_sent = False
         cron_tool_results: list[object] = []
 
-        def _deliver_cron_planner_tool_activity(tool_result) -> None:  # noqa: ANN001
-            if preview is None or not callable(deliver_fn):
+        def _deliver_buffered_tool_activity() -> None:
+            if not planner_group_id or not callable(deliver_fn) or not cron_tool_results:
                 return
-            cron_tool_results.append(tool_result)
             try:
                 detail = format_tool_activity_detail(cron_tool_results).strip()
             except Exception:
@@ -689,7 +745,7 @@ def _build_runtime_service_from_settings(
                     conv_id,
                     detail,
                     is_status=True,
-                    group_id=preview.group_id,
+                    group_id=planner_group_id,
                     status_kind="tool_activity",
                     activity_id="cron-tools",
                     activity_label="Tools",
@@ -697,12 +753,116 @@ def _build_runtime_service_from_settings(
             except Exception:
                 logger.debug("Could not deliver Telegram cron planner tool activity", exc_info=True)
 
+        def _install_planner_preview(candidate, *, preserve_group_id: bool = False) -> None:  # noqa: ANN001
+            nonlocal preview, display_preview, planner_group_id
+            if candidate is None:
+                return
+            if preserve_group_id and planner_group_id:
+                candidate = candidate.with_group_id(planner_group_id)
+            preview = candidate
+            display_preview = candidate
+            planner_group_id = candidate.group_id
+            try:
+                deliver_fn(
+                    conv_id,
+                    candidate.initial_text(),
+                    is_status=True,
+                    group_id=planner_group_id,
+                    status_kind="task_summary",
+                )
+                _deliver_buffered_tool_activity()
+            except Exception:
+                logger.debug("Could not deliver Telegram cron planner status preview", exc_info=True)
+
+        _record_agent_preflight("started", planner_status_preview=bool(planner_status_preview))
+        if planner_status_preview and callable(deliver_fn) and task_planner_feed_enabled():
+            try:
+                preview_registry = CronExecutionToolRegistry(
+                    active_tool_registry,
+                )
+                preview = build_cron_planner_status_preview(
+                    model_client=getattr(orchestrator, "model_client", None),
+                    user_message=planner_preview_prompt,
+                    conversation_id=conv_id,
+                    principal_id=conv_id,
+                    tool_registry=preview_registry,
+                    subject=str(getattr(job, "name", "") or ""),
+                    cache_only=True,
+                )
+            except Exception:
+                logger.debug("Could not build Telegram cron planner status preview", exc_info=True)
+                preview = None
+            _install_planner_preview(preview)
+            _record_agent_preflight(
+                "planner_preview",
+                preview_available=preview is not None,
+                allowed_tools=len(preview.allowed_tools) if preview is not None else 0,
+                cache_only=True,
+            )
+            if preview is None:
+                fallback_preview = build_cron_planner_status_fallback(
+                    user_message=planner_preview_prompt,
+                    conversation_id=conv_id,
+                    principal_id=conv_id,
+                    subject=str(getattr(job, "name", "") or ""),
+                )
+                _install_planner_preview(fallback_preview)
+                _record_agent_preflight(
+                    "planner_preview_metadata_fallback_installed",
+                    fallback_group_id=fallback_preview.group_id,
+                )
+
+                def _build_planner_preview_background() -> None:
+                    try:
+                        candidate = build_cron_planner_status_preview(
+                            model_client=getattr(orchestrator, "model_client", None),
+                            user_message=planner_preview_prompt,
+                            conversation_id=conv_id,
+                            principal_id=conv_id,
+                            tool_registry=preview_registry,
+                            subject=str(getattr(job, "name", "") or ""),
+                        )
+                        _record_agent_preflight(
+                            "planner_preview_async",
+                            preview_available=candidate is not None,
+                            allowed_tools=len(candidate.allowed_tools) if candidate is not None else 0,
+                        )
+                        if candidate is not None and not planner_terminal_sent:
+                            _install_planner_preview(candidate, preserve_group_id=True)
+                    except Exception:
+                        logger.debug("Could not build async Telegram cron planner status preview", exc_info=True)
+
+                threading.Thread(
+                    target=_build_planner_preview_background,
+                    name="nullion-telegram-cron-planner-preview",
+                    daemon=True,
+                ).start()
+        connector_scope = build_cron_connector_scope_decision(
+            model_client=getattr(orchestrator, "model_client", None),
+            user_message=connector_scope_prompt,
+            principal_id=conv_id,
+            registry=active_tool_registry,
+            planned_tool_names=preview.allowed_tools if preview is not None and preview.allowed_tools else None,
+        )
+        _record_agent_preflight(
+            "connector_scope",
+            connector_allowed=bool(connector_scope.allow_connector_tools),
+            connector_providers=len(connector_scope.provider_ids),
+        )
+        def _deliver_cron_planner_tool_activity(tool_result) -> None:  # noqa: ANN001
+            cron_tool_results.append(tool_result)
+            _deliver_buffered_tool_activity()
+
         execution_registry = CronExecutionToolRegistry(
             active_tool_registry,
-            allowed_tool_names=preview.allowed_tools if preview is not None else None,
+            # Planner preview tool lists are display hints and can be partial
+            # (cache hits, timeouts, decomposer drift). Do not hard-gate cron
+            # execution on them; rely on runtime capability policy instead.
+            allowed_tool_names=None,
             allow_connector_tools=connector_scope.allow_connector_tools,
             connector_provider_ids=connector_scope.provider_ids,
         )
+        _record_agent_preflight("guarded_turn_start")
         result = orchestrator.run_turn(
             conversation_id=conv_id,
             principal_id=conv_id,
@@ -715,7 +875,11 @@ def _build_runtime_service_from_settings(
             tool_registry=execution_registry,
             policy_store=runtime.store,
             approval_store=runtime.store,
-            tool_result_callback=_deliver_cron_planner_tool_activity if preview is not None else None,
+            tool_result_callback=_deliver_cron_planner_tool_activity if planner_status_preview else None,
+        )
+        _record_agent_preflight(
+            "guarded_turn_done",
+            tool_results=len(result.tool_results),
         )
         payload = {
             "text": result.final_text or "",
@@ -726,13 +890,31 @@ def _build_runtime_service_from_settings(
             "reached_iteration_limit": result.reached_iteration_limit,
             "raw_tool_payload_blocked": getattr(result, "raw_tool_payload_blocked", False),
         }
-        if preview is not None and callable(deliver_fn):
+        if (
+            display_preview is None
+            and planner_status_preview
+            and callable(deliver_fn)
+            and task_planner_feed_enabled()
+        ):
+            fallback_preview = build_cron_planner_status_fallback(
+                user_message=planner_preview_prompt,
+                conversation_id=conv_id,
+                principal_id=conv_id,
+                subject=str(getattr(job, "name", "") or ""),
+            )
+            _install_planner_preview(fallback_preview)
+            _record_agent_preflight(
+                "planner_preview_terminal_fallback_installed",
+                fallback_group_id=fallback_preview.group_id,
+            )
+        if display_preview is not None and planner_group_id and callable(deliver_fn):
             try:
+                planner_terminal_sent = True
                 deliver_fn(
                     conv_id,
-                    preview.terminal_text(success=cron_planner_run_succeeded(payload)),
+                    display_preview.terminal_text(success=cron_planner_run_succeeded(payload)),
                     is_status=True,
-                    group_id=preview.group_id,
+                    group_id=planner_group_id,
                     status_kind="task_summary",
                 )
             except Exception:
@@ -818,6 +1000,10 @@ def _build_runtime_service_from_settings(
         from nullion.cron_delivery import CronRunDeliveryCallbacks, run_cron_delivery_workflow
 
         manual_target = _manual_telegram_delivery_target(invocation)
+        monitor_seconds = _manual_cron_doctor_monitor_seconds()
+        monitor_fired = threading.Event()
+        monitor_finished = threading.Event()
+        monitor_timer: threading.Timer | None = None
 
         def _manual_effective_channel(cron_job) -> str:
             principal_id = str(getattr(invocation, "principal_id", "") or "").strip()
@@ -828,32 +1014,71 @@ def _build_runtime_service_from_settings(
                 return manual_target
             return _cron_delivery_target(cron_job, channel)
 
-        return run_cron_delivery_workflow(
-            job,
-            label="Manual scheduled task run",
-            callbacks=CronRunDeliveryCallbacks(
-                effective_channel=_manual_effective_channel,
-                delivery_target=_manual_delivery_target,
-                run_agent_turn=lambda cron_job, conv_id: _run_cron_agent_turn(
-                    cron_job,
-                    conv_id,
-                    label="Manual scheduled task run",
-                    planner_status_preview=True,
-                ),
-                record_event=_record_cron_delivery_event,
-                block_reason=_cron_result_block_reason,
-                save_web_delivery=_save_cron_web_delivery,
-                send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
-                    cron_job,
+        def _notify_manual_cron_monitoring() -> None:
+            if monitor_finished.is_set() or monitor_fired.is_set():
+                return
+            monitor_fired.set()
+            channel = _manual_effective_channel(job)
+            target = _manual_delivery_target(job, channel)
+            try:
+                _report_manual_cron_monitoring(
+                    runtime,
+                    job=job,
+                    invocation=invocation,
+                    channel=channel,
+                    target=target,
+                    elapsed_seconds=monitor_seconds,
+                )
+            except Exception:
+                logger.debug("Could not report manual cron monitoring signal", exc_info=True)
+            try:
+                _send_cron_platform_delivery(
+                    job,
                     channel,
                     target,
-                    text,
-                    run_label="Manual scheduled task run",
+                    _manual_cron_monitoring_text(job, elapsed_seconds=monitor_seconds),
+                    run_label="Doctor monitoring",
+                )
+            except Exception:
+                logger.debug("Could not deliver manual cron monitoring notice", exc_info=True)
+
+        if monitor_seconds > 0:
+            monitor_timer = threading.Timer(monitor_seconds, _notify_manual_cron_monitoring)
+            monitor_timer.name = "nullion-manual-cron-doctor-monitor"
+            monitor_timer.daemon = True
+            monitor_timer.start()
+
+        try:
+            return run_cron_delivery_workflow(
+                job,
+                label="Manual scheduled task run",
+                callbacks=CronRunDeliveryCallbacks(
+                    effective_channel=_manual_effective_channel,
+                    delivery_target=_manual_delivery_target,
+                    run_agent_turn=lambda cron_job, conv_id: _run_cron_agent_turn(
+                        cron_job,
+                        conv_id,
+                        label="Manual scheduled task run",
+                        planner_status_preview=True,
+                    ),
+                    record_event=_record_cron_delivery_event,
+                    block_reason=_cron_result_block_reason,
+                    save_web_delivery=_save_cron_web_delivery,
+                    send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
+                        cron_job,
+                        channel,
+                        target,
+                        text,
+                        run_label="Manual scheduled task run",
+                    ),
+                    start_background_delivery=None,
+                    clear_background_delivery=None,
                 ),
-                start_background_delivery=None,
-                clear_background_delivery=None,
-            ),
-        )
+            )
+        finally:
+            monitor_finished.set()
+            if monitor_timer is not None:
+                monitor_timer.cancel()
 
     register_cron_tools(
         active_tool_registry,
@@ -899,8 +1124,10 @@ async def _send_operator_telegram_message(bot_token: str, chat_id: str, text: st
         from nullion.telegram_formatting import format_telegram_text
 
         formatted_text, message_kwargs = format_telegram_text(text)
-        async with Bot(bot_token) as bot:
-            await bot.send_message(chat_id, formatted_text, **message_kwargs)
+        async with build_telegram_bot(Bot, bot_token) as bot:
+            await retry_messaging_delivery_operation(
+                lambda: bot.send_message(chat_id, formatted_text, **message_kwargs)
+            )
     except Exception:
         logger.warning("Failed to deliver operator notification message", exc_info=True)
 
@@ -928,7 +1155,7 @@ async def _send_operator_telegram_delivery(
         from nullion.telegram_formatting import format_telegram_text
 
         delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
-        async with Bot(bot_token) as bot:
+        async with build_telegram_bot(Bot, bot_token) as bot:
             if delivery.attachments:
                 caption = delivery.text
                 for index, attachment_path in enumerate(delivery.attachments):
@@ -936,13 +1163,20 @@ async def _send_operator_telegram_delivery(
                     caption_kwargs = {}
                     if caption_text:
                         caption_text, caption_kwargs = format_telegram_text(caption_text)
-                    with attachment_path.open("rb") as document:
-                        await bot.send_document(
-                            chat_id,
-                            document,
-                            caption=caption_text,
-                            **caption_kwargs,
-                        )
+                    async def send_document(
+                        attachment_path=attachment_path,
+                        caption_text=caption_text,
+                        caption_kwargs=caption_kwargs,
+                    ):
+                        with attachment_path.open("rb") as document:
+                            return await bot.send_document(
+                                chat_id,
+                                document,
+                                caption=caption_text,
+                                **caption_kwargs,
+                            )
+
+                    await retry_messaging_delivery_operation(send_document)
                 receipt = build_platform_delivery_receipt(
                     channel="telegram",
                     target_id=str(chat_id),
@@ -962,7 +1196,9 @@ async def _send_operator_telegram_delivery(
             else:
                 message_text, formatting_kwargs = format_telegram_text(delivery.text or "")
                 message_kwargs.update(formatting_kwargs)
-            await bot.send_message(chat_id, message_text, **message_kwargs)
+            await retry_messaging_delivery_operation(
+                lambda: bot.send_message(chat_id, message_text, **message_kwargs)
+            )
             receipt = build_platform_delivery_receipt(
                 channel="telegram",
                 target_id=str(chat_id),

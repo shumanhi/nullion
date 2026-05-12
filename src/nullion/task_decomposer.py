@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -41,6 +42,9 @@ from nullion.task_queue import (
 )
 
 logger = logging.getLogger(__name__)
+_DEFAULT_DECOMPOSER_MAX_TOKENS = 512
+_DECOMPOSER_MAX_TOOLS_ENV = "NULLION_TASK_DECOMPOSER_MAX_TOOLS"
+_DEFAULT_DECOMPOSER_MAX_TOOLS = 48
 
 _DECOMPOSE_SYSTEM_PROMPT = """You are a language-neutral structured planner for the Nullion agent system.
 Given a user request and a list of available tools, return one structured execution plan.
@@ -105,6 +109,16 @@ Example output for "fetch example.com, summarize it, email me":
   ]
 }"""
 
+_DECOMPOSE_SYSTEM_PROMPT_SCHEDULED_PREVIEW_APPEND = """
+
+Scheduled-task preview override:
+- If the request includes structured frame metadata with `scheduled_task_preview=true`, treat it as an explicit product signal.
+- In that mode, treat required inputs as already resolved and do not return `disposition="clarification"`.
+- Build an actionable mission plan from the provided scheduled task request metadata.
+- Prefer `parallel_mission` when at least two independent tasks can start now; otherwise use `sequential_mission` or `single_turn`.
+- For monitoring/research/report-style scheduled requests, prefer a compact multi-task mission over collapsing into one generic task when independent workstreams exist.
+"""
+
 
 @dataclass
 class DecomposedTask:
@@ -157,6 +171,8 @@ class DagPlan:
 
 class _DagPlanningState(TypedDict, total=False):
     model_client: Any
+    model_timeout_seconds: float | None
+    scheduled_preview_mode: bool
     user_message: str
     available_tools: list[str]
     raw_text: str | None
@@ -167,8 +183,16 @@ class _DagPlanningState(TypedDict, total=False):
 class TaskDecomposer:
     """Decomposes a user message into a list of TaskRecords via one LLM call."""
 
-    def __init__(self, model_client: Any) -> None:
+    def __init__(
+        self,
+        model_client: Any,
+        *,
+        model_timeout_seconds: float | None = None,
+        scheduled_preview_mode: bool = False,
+    ) -> None:
         self._model_client = model_client
+        self._model_timeout_seconds = model_timeout_seconds
+        self._scheduled_preview_mode = scheduled_preview_mode
 
     def decompose(
         self,
@@ -268,6 +292,8 @@ class TaskDecomposer:
         final_state = _compiled_dag_planning_graph().invoke(
             {
                 "model_client": self._model_client,
+                "model_timeout_seconds": self._model_timeout_seconds,
+                "scheduled_preview_mode": self._scheduled_preview_mode,
                 "user_message": user_message,
                 "available_tools": list(available_tools),
             },
@@ -292,6 +318,8 @@ class TaskDecomposer:
             self._model_client,
             user_message,
             available_tools=available_tools,
+            timeout_seconds=self._model_timeout_seconds,
+            scheduled_preview_mode=self._scheduled_preview_mode,
         )
         if raw_text is None:
             return None
@@ -303,10 +331,14 @@ def _call_decomposer_model_text(
     user_message: str,
     *,
     available_tools: list[str],
+    timeout_seconds: float | None = None,
+    scheduled_preview_mode: bool = False,
 ) -> str | None:
-    tools_str = ", ".join(available_tools) if available_tools else "(none)"
+    tools_for_prompt = _tools_for_decomposer_prompt(available_tools)
+    tools_str = ", ".join(tools_for_prompt) if tools_for_prompt else "(none)"
     prompt = (
-        f"Available tools: {tools_str}\n\n"
+        f"Available tools ({len(tools_for_prompt)} shown"
+        f"{' of ' + str(len(available_tools)) if len(tools_for_prompt) != len(available_tools) else ''}): {tools_str}\n\n"
         f"User request: {user_message}"
     )
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
@@ -314,18 +346,17 @@ def _call_decomposer_model_text(
         "messages": messages,
         "tools": [],
     }
-    try:
-        params = inspect.signature(model_client.create).parameters
-    except (TypeError, ValueError):
-        params = {}
-    accepts_extra = any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
-    if accepts_extra or "max_tokens" in params:
-        create_kwargs["max_tokens"] = 1024
-    if accepts_extra or "system" in params:
-        create_kwargs["system"] = _DECOMPOSE_SYSTEM_PROMPT
+    system_prompt = _decomposer_system_prompt(scheduled_preview_mode=scheduled_preview_mode)
+    caps = _model_create_capabilities(model_client)
+    if caps.accepts_max_tokens:
+        create_kwargs["max_tokens"] = _DEFAULT_DECOMPOSER_MAX_TOKENS
+    if timeout_seconds is not None and timeout_seconds > 0 and caps.accepts_timeout:
+        create_kwargs["timeout"] = float(timeout_seconds)
+    if caps.accepts_system:
+        create_kwargs["system"] = system_prompt
     else:
         create_kwargs["messages"] = [
-            {"role": "system", "content": _DECOMPOSE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             *messages,
         ]
     try:
@@ -336,12 +367,75 @@ def _call_decomposer_model_text(
     return _response_text(response)
 
 
+def _decomposer_system_prompt(*, scheduled_preview_mode: bool = False) -> str:
+    base = _DECOMPOSE_SYSTEM_PROMPT
+    if scheduled_preview_mode:
+        return base + _DECOMPOSE_SYSTEM_PROMPT_SCHEDULED_PREVIEW_APPEND
+    return base
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelCreateCapabilities:
+    accepts_max_tokens: bool
+    accepts_timeout: bool
+    accepts_system: bool
+
+
+def _model_create_capabilities(model_client: Any) -> _ModelCreateCapabilities:
+    cached = getattr(model_client, "_nullion_decomposer_create_caps", None)
+    if isinstance(cached, _ModelCreateCapabilities):
+        return cached
+    try:
+        params = inspect.signature(model_client.create).parameters
+    except (TypeError, ValueError, AttributeError):
+        params = {}
+    accepts_extra = any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    caps = _ModelCreateCapabilities(
+        accepts_max_tokens=accepts_extra or "max_tokens" in params,
+        accepts_timeout=accepts_extra or "timeout" in params,
+        accepts_system=accepts_extra or "system" in params,
+    )
+    try:
+        setattr(model_client, "_nullion_decomposer_create_caps", caps)
+    except Exception:
+        # Some adapters may be frozen or proxy objects; uncached fallback is safe.
+        pass
+    return caps
+
+
+def _tools_for_decomposer_prompt(available_tools: list[str]) -> list[str]:
+    unique_tools = sorted(
+        {
+            str(tool_name).strip()
+            for tool_name in (available_tools or [])
+            if str(tool_name).strip()
+        }
+    )
+    max_tools = _decomposer_prompt_max_tools()
+    if max_tools <= 0 or len(unique_tools) <= max_tools:
+        return unique_tools
+    return unique_tools[:max_tools]
+
+
+def _decomposer_prompt_max_tools() -> int:
+    raw = os.getenv(_DECOMPOSER_MAX_TOOLS_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_DECOMPOSER_MAX_TOOLS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_DECOMPOSER_MAX_TOOLS
+    return max(0, value)
+
+
 def _dag_model_call_node(state: _DagPlanningState) -> dict[str, object]:
     return {
         "raw_text": _call_decomposer_model_text(
             state["model_client"],
             state["user_message"],
             available_tools=state.get("available_tools") or [],
+            timeout_seconds=state.get("model_timeout_seconds"),
+            scheduled_preview_mode=bool(state.get("scheduled_preview_mode")),
         )
     }
 

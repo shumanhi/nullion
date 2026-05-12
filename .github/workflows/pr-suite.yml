@@ -55,6 +55,7 @@ jobs:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
@@ -68,6 +69,22 @@ jobs:
 
           if [[ -z "${test_ref}" ]]; then
             test_ref="main"
+          fi
+
+          if [[ "${test_ref}" != "main" ]]; then
+            key_file="$(mktemp)"
+            chmod 600 "${key_file}"
+            printf '%s\n' "${NULLION_TEST_REPO_SSH_KEY}" > "${key_file}"
+            repo_ssh="git@github.com:${NULLION_TEST_REPOSITORY}.git"
+            ssh_cmd="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+            if ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/heads/${test_ref}" >/dev/null 2>&1 \
+              && ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/tags/${test_ref}" >/dev/null 2>&1; then
+              echo "Requested nullion-test ref '${test_ref}' not found; falling back to main."
+              test_ref="main"
+            fi
+
+            rm -f "${key_file}"
           fi
 
           echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
@@ -210,6 +227,7 @@ jobs:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
@@ -223,6 +241,22 @@ jobs:
 
           if [[ -z "${test_ref}" ]]; then
             test_ref="main"
+          fi
+
+          if [[ "${test_ref}" != "main" ]]; then
+            key_file="$(mktemp)"
+            chmod 600 "${key_file}"
+            printf '%s\n' "${NULLION_TEST_REPO_SSH_KEY}" > "${key_file}"
+            repo_ssh="git@github.com:${NULLION_TEST_REPOSITORY}.git"
+            ssh_cmd="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+            if ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/heads/${test_ref}" >/dev/null 2>&1 \
+              && ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/tags/${test_ref}" >/dev/null 2>&1; then
+              echo "Requested nullion-test ref '${test_ref}' not found; falling back to main."
+              test_ref="main"
+            fi
+
+            rm -f "${key_file}"
           fi
 
           echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
@@ -269,6 +303,7 @@ jobs:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
@@ -282,6 +317,22 @@ jobs:
 
           if [[ -z "${test_ref}" ]]; then
             test_ref="main"
+          fi
+
+          if [[ "${test_ref}" != "main" ]]; then
+            key_file="$(mktemp)"
+            chmod 600 "${key_file}"
+            printf '%s\n' "${NULLION_TEST_REPO_SSH_KEY}" > "${key_file}"
+            repo_ssh="git@github.com:${NULLION_TEST_REPOSITORY}.git"
+            ssh_cmd="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+            if ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/heads/${test_ref}" >/dev/null 2>&1 \
+              && ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/tags/${test_ref}" >/dev/null 2>&1; then
+              echo "Requested nullion-test ref '${test_ref}' not found; falling back to main."
+              test_ref="main"
+            fi
+
+            rm -f "${key_file}"
           fi
 
           echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
@@ -329,6 +380,7 @@ jobs:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
@@ -342,6 +394,22 @@ jobs:
 
           if [[ -z "${test_ref}" ]]; then
             test_ref="main"
+          fi
+
+          if [[ "${test_ref}" != "main" ]]; then
+            key_file="$(mktemp)"
+            chmod 600 "${key_file}"
+            printf '%s\n' "${NULLION_TEST_REPO_SSH_KEY}" > "${key_file}"
+            repo_ssh="git@github.com:${NULLION_TEST_REPOSITORY}.git"
+            ssh_cmd="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+            if ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/heads/${test_ref}" >/dev/null 2>&1 \
+              && ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/tags/${test_ref}" >/dev/null 2>&1; then
+              echo "Requested nullion-test ref '${test_ref}' not found; falling back to main."
+              test_ref="main"
+            fi
+
+            rm -f "${key_file}"
           fi
 
           echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"
@@ -388,6 +456,7 @@ jobs:
           INPUT_TEST_REF: ${{ github.event.inputs.test_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          NULLION_TEST_REPO_SSH_KEY: ${{ secrets.NULLION_TEST_REPO_SSH_KEY }}
         run: |
           test_ref="${INPUT_TEST_REF}"
 
@@ -401,6 +470,22 @@ jobs:
 
           if [[ -z "${test_ref}" ]]; then
             test_ref="main"
+          fi
+
+          if [[ "${test_ref}" != "main" ]]; then
+            key_file="$(mktemp)"
+            chmod 600 "${key_file}"
+            printf '%s\n' "${NULLION_TEST_REPO_SSH_KEY}" > "${key_file}"
+            repo_ssh="git@github.com:${NULLION_TEST_REPOSITORY}.git"
+            ssh_cmd="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+            if ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/heads/${test_ref}" >/dev/null 2>&1 \
+              && ! GIT_SSH_COMMAND="${ssh_cmd}" git ls-remote --exit-code "${repo_ssh}" "refs/tags/${test_ref}" >/dev/null 2>&1; then
+              echo "Requested nullion-test ref '${test_ref}' not found; falling back to main."
+              test_ref="main"
+            fi
+
+            rm -f "${key_file}"
           fi
 
           echo "ref=${test_ref}" >> "${GITHUB_OUTPUT}"

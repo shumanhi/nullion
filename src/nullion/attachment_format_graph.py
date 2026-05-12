@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import inspect
 import json
+import logging
+import os
 import re
+import time
 from typing import TypedDict
 from urllib.parse import urlparse
 
@@ -55,6 +59,9 @@ ATTACHMENT_TOKEN_EXTENSIONS: dict[str, str] = {
 }
 VALID_ATTACHMENT_EXTENSIONS: tuple[str, ...] = tuple(sorted(set(ATTACHMENT_TOKEN_EXTENSIONS.values())))
 _GENERIC_EXTENSION_RE = re.compile(r"^\.[A-Za-z0-9]{1,16}$")
+_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS_ENV = "NULLION_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS"
+_DEFAULT_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS = 3.0
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,9 +124,11 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
     create = getattr(model_client, "create", None)
     if create is None:
         return None
+    timeout_seconds = _attachment_format_model_timeout_seconds()
     try:
-        response = create(
-            messages=[
+        started_at = time.perf_counter()
+        create_kwargs = {
+            "messages": [
                 {
                     "role": "user",
                     "content": [
@@ -130,7 +139,7 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                     ],
                 }
             ],
-            tools=[
+            "tools": [
                 {
                     "name": "select_attachment_format",
                     "description": "Return the required attachment file format for this user request.",
@@ -150,15 +159,29 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                     },
                 }
             ],
-            max_tokens=120,
-            system=(
+            "max_tokens": 120,
+            "system": (
                 "Identify whether this user request specifies a required attachment file format. "
                 "Call select_attachment_format with the result. "
                 "extension must be a literal file extension such as .pdf, .html, or .blend, or null. "
                 "Use null when no attachment file format is specified."
             ),
-        )
-    except Exception:
+        }
+        try:
+            parameters = inspect.signature(create).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if timeout_seconds is not None and ("timeout" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )):
+            create_kwargs["timeout"] = timeout_seconds
+        response = create(**create_kwargs)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        if elapsed_ms >= 1000:
+            logger.info("attachment format model planner elapsed_ms=%.1f timeout_s=%s", elapsed_ms, timeout_seconds)
+    except Exception as exc:
+        logger.debug("Attachment format model planner failed: %s", exc)
         return None
     payload = _structured_payload_from_model_response(response) or _parse_json_object(_text_from_model_response(response))
     if payload is None:
@@ -172,6 +195,17 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
     if _GENERIC_EXTENSION_RE.fullmatch(normalized) is None:
         return None
     return AttachmentFormatPlan(extension=normalized, evidence="model_structured_output")
+
+
+def _attachment_format_model_timeout_seconds() -> float | None:
+    raw = os.environ.get(_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS_ENV)
+    if raw is None:
+        return _DEFAULT_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS
+    return value if value > 0 else None
 
 
 def _token_around(text: str, start: int, end: int) -> str:

@@ -17,12 +17,97 @@ from urllib.request import urlopen
 import webbrowser
 
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
-from nullion.tray_app import _DEFAULT_HOST, _DEFAULT_PORT, _load_env, _web_base_url, _build_icon_image
+from nullion.tray_app import _DEFAULT_HOST, _DEFAULT_PORT, _load_env as _load_tray_env, _web_base_url, _build_icon_image
 from nullion.version import version_tag
 
 
-_NULLION_HOME = Path.home() / ".nullion"
-_WEBVIEW_PID_FILE = _NULLION_HOME / "webview.pid"
+_DEFAULT_NULLION_HOME = Path.home() / ".nullion"
+
+
+def _configured_nullion_home() -> Path:
+    configured = os.environ.get("NULLION_HOME")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return _DEFAULT_NULLION_HOME.expanduser()
+
+
+class _DynamicNullionHome(os.PathLike[str]):
+    def __fspath__(self) -> str:
+        return str(_configured_nullion_home())
+
+    def __str__(self) -> str:
+        return str(Path(self))
+
+    def __getattr__(self, name: str):
+        return getattr(Path(self), name)
+
+    def __truediv__(self, key: str) -> Path:
+        return Path(self) / key
+
+    def __eq__(self, other: object) -> bool:
+        try:
+            return Path(self) == Path(other)  # type: ignore[arg-type]
+        except TypeError:
+            return False
+
+    def __repr__(self) -> str:
+        return repr(Path(self))
+
+
+class _DynamicWebviewPidFile(os.PathLike[str]):
+    def __fspath__(self) -> str:
+        return str(_configured_nullion_home() / "webview.pid")
+
+    def __str__(self) -> str:
+        return str(Path(self))
+
+    def __getattr__(self, name: str):
+        return getattr(Path(self), name)
+
+    def __eq__(self, other: object) -> bool:
+        try:
+            return Path(self) == Path(other)  # type: ignore[arg-type]
+        except TypeError:
+            return False
+
+    def __repr__(self) -> str:
+        return repr(Path(self))
+
+
+_NULLION_HOME = _DynamicNullionHome()
+_WEBVIEW_PID_FILE: os.PathLike[str] | Path | None = _DynamicWebviewPidFile()
+
+
+def _env_web_host() -> str:
+    return os.environ.get("NULLION_WEB_HOST", _DEFAULT_HOST)
+
+
+def _env_web_port() -> int:
+    try:
+        return int(os.environ.get("NULLION_WEB_PORT", _DEFAULT_PORT))
+    except (TypeError, ValueError):
+        return _DEFAULT_PORT
+
+
+def _resolve_target_args(args) -> None:
+    if args.host is None:
+        args.host = _env_web_host()
+    if args.port is None:
+        args.port = _env_web_port()
+
+
+def _nullion_home() -> Path:
+    return _configured_nullion_home()
+
+
+def _webview_pid_file() -> Path:
+    if _WEBVIEW_PID_FILE is not None:
+        return Path(_WEBVIEW_PID_FILE).expanduser()
+    return _nullion_home() / "webview.pid"
+
+
+def _load_env(env_file: str | None) -> None:
+    _load_tray_env(env_file, override=bool(env_file) or bool(os.environ.get("NULLION_HOME")))
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -45,20 +130,21 @@ def _focus_process(pid: int) -> bool:
 
 
 def _claim_single_instance() -> bool:
-    if _WEBVIEW_PID_FILE.exists():
+    pid_file = _webview_pid_file()
+    if pid_file.exists():
         try:
-            existing_pid = int(_WEBVIEW_PID_FILE.read_text().strip())
+            existing_pid = int(pid_file.read_text().strip())
         except ValueError:
             existing_pid = 0
         if existing_pid and _focus_process(existing_pid):
             return False
-    _WEBVIEW_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _WEBVIEW_PID_FILE.write_text(f"{os.getpid()}\n")
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(f"{os.getpid()}\n")
 
     def cleanup() -> None:
         try:
-            if _WEBVIEW_PID_FILE.read_text().strip() == str(os.getpid()):
-                _WEBVIEW_PID_FILE.unlink()
+            if pid_file.read_text().strip() == str(os.getpid()):
+                pid_file.unlink()
         except Exception:
             pass
 
@@ -67,7 +153,7 @@ def _claim_single_instance() -> bool:
 
 
 def _webview_icon_path() -> str:
-    icon_dir = _NULLION_HOME / "icons"
+    icon_dir = _nullion_home() / "icons"
     icon_dir.mkdir(parents=True, exist_ok=True)
     image = _build_icon_image(True, size=512)
     if os.name == "nt":
@@ -434,8 +520,8 @@ def cli() -> None:
 
 def _cli_impl() -> None:
     parser = argparse.ArgumentParser(prog="nullion-webview", description="Open Nullion in a native webview window")
-    parser.add_argument("--host", default=os.environ.get("NULLION_WEB_HOST", _DEFAULT_HOST))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("NULLION_WEB_PORT", _DEFAULT_PORT)))
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--env-file", default=os.environ.get("NULLION_ENV_FILE"))
     parser.add_argument("--path", default="", help="Path or hash to append to the Web UI URL, e.g. #approvals")
     parser.add_argument("--debug", action="store_true", help="Enable webview debug mode")
@@ -445,6 +531,7 @@ def _cli_impl() -> None:
     args = parser.parse_args()
 
     _load_env(args.env_file)
+    _resolve_target_args(args)
     url = _web_base_url(args.host, args.port)
     if args.path:
         suffix = args.path if args.path.startswith(("/", "#", "?")) else f"/{args.path}"

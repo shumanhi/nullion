@@ -46,6 +46,7 @@ _URL_BOUNDARY_TOOLS = frozenset(
 _PDF_EXTENSIONS = frozenset({".pdf"})
 _PRESENTATION_EXTENSIONS = frozenset({".ppt", ".pptx"})
 _SPREADSHEET_EXTENSIONS = frozenset({".csv", ".tsv", ".xls", ".xlsx"})
+_TEXT_WRITE_EXTENSIONS = frozenset({"", ".csv", ".htm", ".html", ".json", ".md", ".svg", ".tsv", ".txt", ".yaml", ".yml"})
 _CONNECTOR_TOOLS = frozenset({"connector_request"})
 _CONNECTOR_CAPABILITY_TAGS = frozenset({"connector"})
 _SKILL_PACK_TOOLS = frozenset({"skill_pack_read"})
@@ -160,6 +161,11 @@ class ScopedTurnToolRegistry:
         if self._evidence.context_linked:
             return True
         if tool_name == "file_read" and self._evidence.slash_prefixed_literal and not self._evidence.has_attachments:
+            return False
+        if tool_name == "file_write" and any(
+            extension not in _TEXT_WRITE_EXTENSIONS
+            for extension in self._evidence.requested_extensions
+        ):
             return False
         if tool_name in _URL_BOUNDARY_TOOLS:
             return self._evidence.has_url_target or self.turn_tool_scope_decision.allow_web_tools

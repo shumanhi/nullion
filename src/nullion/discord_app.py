@@ -7,11 +7,14 @@ import asyncio
 from contextlib import asynccontextmanager
 import inspect
 import logging
+import os
 from pathlib import Path
+import time
 
 from nullion.chat_attachments import is_supported_chat_file
 from nullion.config import NullionSettings, load_settings
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
+from nullion.events import make_event
 from nullion.messaging_adapters import (
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
@@ -44,6 +47,17 @@ from nullion.users import resolve_messaging_user
 logger = logging.getLogger(__name__)
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
 _DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
+_NULLION_DISCORD_TURN_SLOW_LOG_MS = "NULLION_DISCORD_TURN_SLOW_LOG_MS"
+
+
+def _float_env_ms(name: str, *, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
 
 
 def _record_discord_delivery_receipt(
@@ -374,17 +388,73 @@ async def _download_discord_attachments(
 
 
 async def handle_discord_message(service, settings: NullionSettings, message) -> None:
+    started_at = time.perf_counter()
+    timing_marks: list[str] = []
+    timing_last_at = started_at
+
+    def _mark_timing(label: str) -> None:
+        nonlocal timing_last_at
+        now = time.perf_counter()
+        timing_marks.append(f"{label}:{round((now - timing_last_at) * 1000, 1)}ms")
+        timing_last_at = now
+
+    def _log_turn_timing(outcome: str) -> None:
+        total_ms = (time.perf_counter() - started_at) * 1000
+        if total_ms < _float_env_ms(_NULLION_DISCORD_TURN_SLOW_LOG_MS, default=1000.0):
+            return
+        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        request_id = str(getattr(message, "id", "") or "")
+        message_id = request_id
+        logger.warning(
+            "discord turn slow timing channel=%s request_id=%s message_id=%s outcome=%s total_ms=%.1f phases=%s",
+            channel_id,
+            request_id,
+            message_id,
+            outcome,
+            total_ms,
+            ", ".join(timing_marks),
+        )
+        try:
+            runtime = getattr(service, "runtime", None)
+            if runtime is not None:
+                runtime.store.add_event(
+                    make_event(
+                        event_type="discord.turn_timing",
+                        actor="discord",
+                        payload={
+                            "request_id": request_id,
+                            "message_id": message_id,
+                            "channel_id": channel_id,
+                            "outcome": outcome,
+                            "total_ms": round(total_ms, 1),
+                            "phases": timing_marks,
+                            "platform": "discord",
+                        },
+                    )
+                )
+        except Exception:
+            logger.debug("Could not record Discord turn timing event", exc_info=True)
+
+    turn_outcome = "completed"
+    _mark_timing("received")
     if getattr(getattr(message, "author", None), "bot", False):
+        turn_outcome = "ignored"
+        _log_turn_timing(turn_outcome)
         return
     text = str(getattr(message, "content", "") or "").strip()
     user_id = str(getattr(getattr(message, "author", None), "id", "") or "").strip()
     if not user_id:
+        turn_outcome = "ignored"
+        _log_turn_timing(turn_outcome)
         return
     try:
         attachments = await _download_discord_attachments(message, settings=settings)
     except TypeError:
         attachments = await _download_discord_attachments(message)
+    _mark_timing("attachments_downloaded")
     if not text and not attachments:
+        turn_outcome = "empty"
+        _log_turn_timing(turn_outcome)
         return
 
     ingress = MessagingIngress(
@@ -398,6 +468,8 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
     )
     if not require_authorized_ingress(ingress, settings):
         await message.channel.send("Unauthorized messaging identity.")
+        turn_outcome = "unauthorized"
+        _log_turn_timing(turn_outcome)
         return
 
     if is_stop_command_text(ingress.text):
@@ -408,6 +480,8 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
             turn_tracker=GLOBAL_TURN_DISPATCH_TRACKER,
         )
         await message.channel.send(stop_session_reply(stop_result))
+        turn_outcome = "stop_command"
+        _log_turn_timing(turn_outcome)
         return
 
     turn_registration = await GLOBAL_TURN_DISPATCH_TRACKER.register(
@@ -416,8 +490,10 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         turn_id=ingress.message_id or ingress.request_id,
         model_client=getattr(service, "model_client", None),
     )
+    _mark_timing("turn_registered")
     try:
         await turn_registration.wait_for_dependencies()
+        _mark_timing("wait_dependencies")
         async with _discord_typing(message.channel):
             turn_result = await asyncio.to_thread(
                 _handle_messaging_ingress_result_with_dispatch,
@@ -426,7 +502,10 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
                 turn_dispatch_decision=turn_registration.decision,
             )
             reply = turn_result.reply
+        _mark_timing("handler_completed")
         if await turn_registration.is_superseded():
+            turn_outcome = "superseded"
+            _log_turn_timing(turn_outcome)
             return
         principal_id = principal_id_for_messaging_identity("discord", user_id, settings)
         delivery = prepare_reply_for_platform_delivery(
@@ -445,6 +524,8 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
                     request_id=ingress.request_id,
                     message_id=ingress.message_id,
                 )
+                _mark_timing("delivery_complete")
+                _log_turn_timing(turn_outcome)
                 return
             _record_discord_delivery_receipt(
                 channel_id=_optional_message_text(getattr(message.channel, "id", None)),
@@ -465,6 +546,8 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
                 request_id=ingress.request_id,
                 message_id=ingress.message_id,
             )
+        _mark_timing("delivery_complete")
+        _log_turn_timing(turn_outcome)
     finally:
         await turn_registration.finish()
 

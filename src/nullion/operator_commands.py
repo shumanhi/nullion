@@ -1873,6 +1873,27 @@ def _delete_memory(runtime: PersistentRuntime, args: list[str], *, owner: str | 
 
 
 _MODEL_PREFERENCE_KEY = "operator.model_preference"
+_CREDENTIALS_CACHE_KEY: tuple[str, tuple[int, int] | None, str, tuple[int, int] | None] | None = None
+_CREDENTIALS_CACHE_VALUE: dict[str, object] | None = None
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _credential_cache_key() -> tuple[str, tuple[int, int] | None, str, tuple[int, int] | None]:
+    path = _credentials_path()
+    db_path = path.with_name("runtime.db")
+    return (
+        str(path),
+        _file_signature(path),
+        str(db_path),
+        _file_signature(db_path),
+    )
 
 
 def _do_restart() -> None:
@@ -2052,23 +2073,40 @@ def _render_models(runtime: PersistentRuntime) -> str:
 
 
 def _credentials_path() -> Path:
+    configured_home = os.environ.get("NULLION_HOME")
+    if configured_home and configured_home.strip():
+        return Path(configured_home).expanduser() / "credentials.json"
     return Path.home() / ".nullion" / "credentials.json"
 
 
 def _read_credentials() -> dict[str, object]:
+    global _CREDENTIALS_CACHE_KEY
+    global _CREDENTIALS_CACHE_VALUE
+    cache_key = _credential_cache_key()
+    if cache_key == _CREDENTIALS_CACHE_KEY and _CREDENTIALS_CACHE_VALUE is not None:
+        return _CREDENTIALS_CACHE_VALUE
     try:
         from nullion.credential_store import migrate_credentials_json_to_db
 
         payload = migrate_credentials_json_to_db(_credentials_path(), db_path=_credentials_path().with_name("runtime.db"))
     except Exception:
         return {}
-    return payload if isinstance(payload, dict) else {}
+    credentials = payload if isinstance(payload, dict) else {}
+    _CREDENTIALS_CACHE_KEY = cache_key
+    _CREDENTIALS_CACHE_VALUE = credentials
+    return credentials
 
 
 def _write_credentials(creds: dict[str, object]) -> None:
+    global _CREDENTIALS_CACHE_KEY
+    global _CREDENTIALS_CACHE_VALUE
     from nullion.credential_store import save_encrypted_credentials
 
-    save_encrypted_credentials(dict(creds), db_path=_credentials_path().with_name("runtime.db"))
+    path = _credentials_path()
+    db_path = path.with_name("runtime.db")
+    save_encrypted_credentials(dict(creds), db_path=db_path)
+    _CREDENTIALS_CACHE_KEY = _credential_cache_key()
+    _CREDENTIALS_CACHE_VALUE = dict(creds)
 
 
 def _split_model_entries(value: object) -> list[str]:

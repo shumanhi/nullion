@@ -10,6 +10,8 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
+from nullion.chat_operator import _chat_model_issue_reply
+from nullion.operator_commands import is_operator_command_text
 from nullion import messaging_adapters as adapters
 
 
@@ -51,7 +53,22 @@ def _handle_text_message_accepts_kw(handler: object, name: str) -> bool:
 
 def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
     ingress = state["ingress"]
-    handler = state["service"].handle_text_message
+    service = state["service"]
+    handler = service.handle_text_message
+    runtime = getattr(service, "runtime", None)
+    settings = getattr(service, "settings", None)
+    chat_enabled = bool(getattr(getattr(settings, "telegram", None), "chat_enabled", False))
+    message = ingress.text
+    if (
+        runtime is not None
+        and isinstance(message, str)
+        and (not message.startswith("/") or not is_operator_command_text(message))
+        and chat_enabled
+    ):
+        health_reply = _chat_model_issue_reply(runtime, message=message)
+        if health_reply is not None:
+            return {"raw_reply": health_reply}
+
     kwargs = {
         "text": ingress.text,
         "chat_id": ingress.operator_chat_id,
@@ -62,6 +79,8 @@ def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
     }
     if _handle_text_message_accepts_kw(handler, "turn_dispatch_decision"):
         kwargs["turn_dispatch_decision"] = state.get("turn_dispatch_decision")
+    if _handle_text_message_accepts_kw(handler, "conversation_ingress_id"):
+        kwargs["conversation_ingress_id"] = ingress.request_id or ingress.message_id
     reply = handler(**kwargs)
     return {"raw_reply": reply}
 

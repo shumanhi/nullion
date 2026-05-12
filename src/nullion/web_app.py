@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 import html as html_lib
+import inspect
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from nullion.artifacts import (
     artifact_root_for_principal,
     artifact_root_for_runtime,
     ensure_artifact_root,
+    media_candidate_paths_from_text,
 )
 from nullion.chat_attachments import (
     attachment_processing_failure_reply,
@@ -57,7 +59,7 @@ from nullion.chat_attachments import (
     is_supported_video_attachment,
     normalize_chat_attachments,
 )
-from nullion.attachment_format_graph import plan_attachment_format
+from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, plan_attachment_format
 from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_display import approval_display_from_request, approval_display_from_tool_result
 from nullion.config import (
@@ -88,7 +90,7 @@ from nullion.memory import (
     memory_owner_for_web_admin,
     memory_owner_for_workspace,
 )
-from nullion.mini_agent_routing import should_route_without_mini_agents
+from nullion.mini_agent_routing import should_keep_dag_plan_in_direct_turn, should_route_without_mini_agents
 from nullion.messaging_adapters import (
     list_platform_delivery_receipts,
     messaging_file_allowed_roots,
@@ -122,6 +124,7 @@ from nullion.session_stop import (
 from nullion.response_sanitizer import sanitize_user_visible_reply
 from nullion.remediation import remediation_buttons_for_recommendation_code
 from nullion.cron_planner_status import (
+    build_cron_planner_status_fallback,
     build_cron_planner_status_preview,
     cron_planner_run_succeeded,
 )
@@ -188,6 +191,10 @@ _SERVER_STARTED_AT = datetime.now(UTC).isoformat()
 _WEB_STABLE_CONTEXT_CACHE_MAX_ENTRIES = 32
 _WEB_STABLE_CONTEXT_CACHE: dict[tuple[object, ...], tuple[dict[str, object], ...]] = {}
 _WEB_STABLE_CONTEXT_CACHE_LOCK = threading.RLock()
+_WEB_CHECKPOINT_LOCK = threading.RLock()
+_WEB_CHECKPOINT_INFLIGHT: set[int] = set()
+_WEB_CHECKPOINT_DIRTY: set[int] = set()
+_WEB_TURN_SLOW_LOG_MS = 1200.0
 
 _WEB_STABLE_CONTEXT_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
@@ -6058,6 +6065,9 @@ const FULL_LIST_PAGE_SIZE = 25;
 let _fullListViews = {};
 let _lastDashboardData = {};
 let _wsReconnectTimer = null;
+let _wsReconnectAttempt = 0;
+let _wsConnectInFlight = false;
+let _lastWsErrorReportAt = 0;
 let _activeTurnTimers = new Map();
 let _activeTurnStartedAt = new Map();
 let _activeSendTurnIds = new Set();
@@ -7037,23 +7047,52 @@ function setBotStatus(text, turnId = null) {
 
 // ── WebSocket chat ────────────────────────────────────────────────────────────
 
+function _websocketReconnectDelayMs() {
+  const cappedAttempt = Math.min(_wsReconnectAttempt, 5);
+  const baseDelay = 1500 * Math.pow(2, cappedAttempt);
+  const jitter = Math.floor(Math.random() * 500);
+  return Math.min(baseDelay + jitter, 30000);
+}
+
+function scheduleWebsocketReconnect(label = 'Reconnecting…') {
+  setStatus(false, label);
+  if (_wsReconnectTimer) return;
+  const delayMs = _websocketReconnectDelayMs();
+  _wsReconnectAttempt += 1;
+  _wsReconnectTimer = setTimeout(() => {
+    _wsReconnectTimer = null;
+    connect();
+  }, delayMs);
+}
+
+function clearWebsocketReconnect() {
+  if (_wsReconnectTimer) {
+    clearTimeout(_wsReconnectTimer);
+    _wsReconnectTimer = null;
+  }
+  _wsReconnectAttempt = 0;
+}
+
 async function connect() {
+  if (_wsConnectInFlight) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
+  _wsConnectInFlight = true;
   try {
     await API('/api/health');
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${window.location.host}/ws/chat`);
-    ws.onopen = () => {
+    const socket = new WebSocket(`${proto}://${window.location.host}/ws/chat`);
+    ws = socket;
+    socket.onopen = () => {
+      if (ws !== socket) return;
+      _wsConnectInFlight = false;
       setStatus(true, 'Connected');
-      if (_wsReconnectTimer) {
-        clearTimeout(_wsReconnectTimer);
-        _wsReconnectTimer = null;
-      }
+      clearWebsocketReconnect();
       loadGatewayLifecycleEvents();
     };
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (ws !== socket) return;
       let data = {};
       try { data = JSON.parse(event.data || '{}'); } catch (_) { return; }
       if (data.type === 'chunk') {
@@ -7136,7 +7175,9 @@ async function connect() {
         showGatewayNotice(data);
       }
     };
-    ws.onclose = () => {
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      _wsConnectInFlight = false;
       ws = null;
       if (_activeTurnTimers.size) {
         const activeTurnIds = Array.from(_activeSendTurnIds);
@@ -7151,22 +7192,23 @@ async function connect() {
         if (!activeTurnIds.length) finishTurnUi();
         refreshDashboard();
       }
-      setStatus(false, 'Reconnecting…');
-      if (!_wsReconnectTimer) {
-        _wsReconnectTimer = setTimeout(() => {
-          _wsReconnectTimer = null;
-          connect();
-        }, 1500);
-      }
+      scheduleWebsocketReconnect();
     };
-    ws.onerror = () => {
-      setStatus(false, 'Reconnecting…');
-      reportClientIssue('error', 'WebSocket error during web chat.', { conversation_id: conversationId });
-      try { ws.close(); } catch (_) {}
+    socket.onerror = () => {
+      if (ws !== socket) return;
+      _wsConnectInFlight = false;
+      const now = Date.now();
+      if (now - _lastWsErrorReportAt > 30000) {
+        _lastWsErrorReportAt = now;
+        reportClientIssue('error', 'WebSocket error during web chat.', { conversation_id: conversationId });
+      }
+      scheduleWebsocketReconnect();
+      try { socket.close(); } catch (_) {}
     };
   } catch (e) {
-    setStatus(false, 'Reconnecting…');
-    setTimeout(connect, 5000);
+    _wsConnectInFlight = false;
+    ws = null;
+    scheduleWebsocketReconnect();
   }
 }
 
@@ -7408,7 +7450,7 @@ async function sendHttpMessage(text, turnId = null, attachments = []) {
     });
     finishTurnUi();
     setStatus(false, 'Offline');
-    setTimeout(connect, 5000);
+    scheduleWebsocketReconnect('Offline');
   }
 }
 
@@ -9607,7 +9649,7 @@ function doctorActionButtonHtml(kind, id, action, label, title, className = 'min
 
 function taskActionButtonHtml(kind, id, title) {
   const disabled = pendingCardActions.has(pendingActionKey(`task:${kind}`, id, 'kill')) ? ' disabled aria-busy="true"' : '';
-  return `<button class="mini-btn danger" title="Stop this task and clear it from active work."${disabled} onclick="killTask('${escAttr(kind)}','${escAttr(id)}','${escAttr(title)}')">Kill</button>`;
+  return `<button class="mini-btn danger" title="Stop this task and clear it from active work."${disabled} data-task-kind="${escAttr(kind)}" data-task-id="${escAttr(id)}" data-task-title="${escAttr(title)}" onclick="killTaskFromButton(this)">Kill</button>`;
 }
 
 function askDoctorAboutItem(id) {
@@ -9797,6 +9839,14 @@ async function killTask(kind, id, title) {
     renderTasks((_lastDashboardData || {}).task_frames || [], (_lastDashboardData || {}).mini_agent_tasks || []);
     if (attentionModalIsOpen()) renderAttentionModal(_lastDashboardData || {});
   }
+}
+
+function killTaskFromButton(button) {
+  if (!button) return;
+  const kind = String(button.getAttribute('data-task-kind') || '');
+  const id = String(button.getAttribute('data-task-id') || '');
+  const title = String(button.getAttribute('data-task-title') || '');
+  killTask(kind, id, title);
 }
 
 let dashboardRefreshPromise = null;
@@ -15358,7 +15408,8 @@ def _web_delivery_artifact_paths(
     principal_id: str | None = None,
     requested_extension: str | None = None,
 ) -> list[str]:
-    candidates = [
+    explicit_media_paths = [str(path) for path in media_candidate_paths_from_text(str(reply or ""))]
+    candidates = explicit_media_paths or [
         *(artifact_paths or ()),
         *artifact_paths_from_tool_results(tool_results),
         *_web_plain_artifact_paths_from_reply(reply),
@@ -16098,6 +16149,7 @@ def create_app(runtime, orchestrator, registry):
     status_cache_payload: dict[str, object] | None = None
     status_cache_created_at = 0.0
     status_cache_fingerprint: str | None = None
+    status_checkpoint_file_signature: tuple[int, int] | None = None
     status_cache_lock = asyncio.Lock()
     try:
         from nullion.config import load_settings as _load_app_settings
@@ -16307,29 +16359,47 @@ def create_app(runtime, orchestrator, registry):
         with _runtime_turn_guard():
             return _run_turn_sync(*args, **kwargs)
 
+    def _checkpoint_file_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            logger.debug("Could not stat runtime checkpoint before status sync", exc_info=True)
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
     def _sync_runtime_store_from_checkpoint() -> bool:
+        nonlocal status_checkpoint_file_signature
         checkpoint_path = getattr(runtime, "checkpoint_path", None)
         if checkpoint_path is None:
             return False
         path = Path(checkpoint_path)
-        if not path.exists():
+        checkpoint_signature = _checkpoint_file_signature(path)
+        if checkpoint_signature is None:
             return False
         with runtime_store_sync_lock:
             if active_runtime_turns > 0:
                 return False
+            if checkpoint_signature == status_checkpoint_file_signature:
+                return False
         try:
-            from nullion.runtime_persistence import load_runtime_store, render_runtime_store_payload_json
+            from nullion.runtime_persistence import load_runtime_store
 
             loaded_store = load_runtime_store(path)
-            checkpoint_fingerprint = render_runtime_store_payload_json(loaded_store)
-            current_fingerprint = getattr(runtime, "last_checkpoint_fingerprint", None)
-            if checkpoint_fingerprint == current_fingerprint:
-                return False
             with runtime_store_sync_lock:
                 if active_runtime_turns > 0:
                     return False
                 runtime.store = loaded_store
-                runtime.last_checkpoint_fingerprint = checkpoint_fingerprint
+                # Skip expensive full-store fingerprint serialization here.
+                # A changed checkpoint file signature is sufficient to trigger
+                # an in-memory refresh for status/dashboard consumers.
+                runtime.last_checkpoint_fingerprint = None
+                try:
+                    runtime.last_checkpoint_file_signature = checkpoint_signature
+                except Exception:
+                    pass
+                status_checkpoint_file_signature = checkpoint_signature
             return True
         except Exception:
             logger.debug("Could not sync runtime store from checkpoint", exc_info=True)
@@ -16587,7 +16657,7 @@ def create_app(runtime, orchestrator, registry):
     def _cron_result_block_reason(result: dict, text: str, artifacts: object) -> str | None:
         if result.get("reached_iteration_limit"):
             return "cron_run_reached_iteration_limit"
-        structured_reason = cron_structured_result_block_reason(result, artifacts)
+        structured_reason = cron_structured_result_block_reason(result, artifacts, text=text)
         if structured_reason is not None:
             return structured_reason
         has_artifacts = bool(artifacts)
@@ -16788,7 +16858,35 @@ def create_app(runtime, orchestrator, registry):
                 logger.debug("Could not broadcast web cron planner status", exc_info=True)
 
         def _run_agent_turn_with_optional_planner_status(cron_job, conv_id: str) -> dict[str, object]:
+            preflight_started_at = time.perf_counter()
+
+            def _record_agent_preflight(stage: str, **extra: object) -> None:
+                elapsed_ms = round((time.perf_counter() - preflight_started_at) * 1000, 1)
+                logger.info(
+                    "cron delivery agent preflight conversation_id=%s stage=%s elapsed_ms=%.1f extra=%s",
+                    conv_id,
+                    stage,
+                    elapsed_ms,
+                    extra,
+                )
+                if os.environ.get("NULLION_CRON_PREFLIGHT_TIMING_EVENTS", "").strip() != "1":
+                    return
+                _record_cron_delivery_event(
+                    "cron.delivery.agent_preflight",
+                    cron_job,
+                    "",
+                    "",
+                    conv_id,
+                    stage=stage,
+                    elapsed_ms=elapsed_ms,
+                    **extra,
+                )
+
             prompt = cron_agent_prompt(cron_job, label=label)
+            planner_preview_prompt = (
+                f"{str(getattr(cron_job, 'name', '') or '').strip()}\n"
+                f"{str(getattr(cron_job, 'task', '') or '').strip()}"
+            ).strip() or prompt
             connector_scope_prompt = json.dumps(
                 {
                     "name": str(getattr(cron_job, "name", "") or ""),
@@ -16796,36 +16894,117 @@ def create_app(runtime, orchestrator, registry):
                 },
                 ensure_ascii=False,
             )
+            preview = None
+            display_preview = None
+            planner_group_id = ""
+            planner_terminal_sent = False
+            pending_activity_detail = ""
+
+            def _flush_pending_activity() -> None:
+                nonlocal pending_activity_detail
+                if display_preview is None or not planner_group_id or not pending_activity_detail:
+                    return
+                _broadcast_cron_planner_status(
+                    conv_id,
+                    planner_group_id,
+                    pending_activity_detail,
+                    status_kind="tool_activity",
+                    activity_id="cron-tools",
+                    activity_label="Tools",
+                )
+                pending_activity_detail = ""
+
+            def _install_planner_preview(candidate, *, preserve_group_id: bool = False) -> None:  # noqa: ANN001
+                nonlocal preview, display_preview, planner_group_id
+                if candidate is None:
+                    return
+                if preserve_group_id and planner_group_id:
+                    candidate = candidate.with_group_id(planner_group_id)
+                preview = candidate
+                display_preview = candidate
+                planner_group_id = candidate.group_id
+                _broadcast_cron_planner_status(conv_id, planner_group_id, candidate.initial_text())
+                _flush_pending_activity()
+
+            _record_agent_preflight("started", planner_status_preview=bool(planner_status_preview))
+            if planner_status_preview and task_planner_feed_enabled():
+                try:
+                    preview_registry = CronExecutionToolRegistry(
+                        registry,
+                    )
+                    preview = build_cron_planner_status_preview(
+                        model_client=getattr(orchestrator, "model_client", None),
+                        user_message=planner_preview_prompt,
+                        conversation_id=conv_id,
+                        principal_id=conv_id,
+                        tool_registry=preview_registry,
+                        subject=str(getattr(cron_job, "name", "") or ""),
+                        cache_only=True,
+                    )
+                except Exception:
+                    logger.debug("Could not build web cron planner status preview", exc_info=True)
+                    preview = None
+                _install_planner_preview(preview)
+                _record_agent_preflight(
+                    "planner_preview",
+                    preview_available=preview is not None,
+                    allowed_tools=len(preview.allowed_tools) if preview is not None else 0,
+                    cache_only=True,
+                )
+                if preview is None:
+                    fallback_preview = build_cron_planner_status_fallback(
+                        user_message=planner_preview_prompt,
+                        conversation_id=conv_id,
+                        principal_id=conv_id,
+                        subject=str(getattr(cron_job, "name", "") or ""),
+                    )
+                    _install_planner_preview(fallback_preview)
+                    _record_agent_preflight(
+                        "planner_preview_metadata_fallback_installed",
+                        fallback_group_id=fallback_preview.group_id,
+                    )
+
+                    def _build_planner_preview_background() -> None:
+                        try:
+                            candidate = build_cron_planner_status_preview(
+                                model_client=getattr(orchestrator, "model_client", None),
+                                user_message=planner_preview_prompt,
+                                conversation_id=conv_id,
+                                principal_id=conv_id,
+                                tool_registry=preview_registry,
+                                subject=str(getattr(cron_job, "name", "") or ""),
+                            )
+                            _record_agent_preflight(
+                                "planner_preview_async",
+                                preview_available=candidate is not None,
+                                allowed_tools=len(candidate.allowed_tools) if candidate is not None else 0,
+                            )
+                            if candidate is not None and not planner_terminal_sent:
+                                _install_planner_preview(candidate, preserve_group_id=True)
+                        except Exception:
+                            logger.debug("Could not build async web cron planner status preview", exc_info=True)
+
+                    threading.Thread(
+                        target=_build_planner_preview_background,
+                        name="nullion-web-cron-planner-preview",
+                        daemon=True,
+                    ).start()
             connector_scope = build_cron_connector_scope_decision(
                 model_client=getattr(orchestrator, "model_client", None),
                 user_message=connector_scope_prompt,
                 principal_id=conv_id,
                 registry=registry,
+                planned_tool_names=preview.allowed_tools if preview is not None and preview.allowed_tools else None,
             )
-            preview = None
-            if planner_status_preview and task_planner_feed_enabled():
-                try:
-                    preview_registry = CronExecutionToolRegistry(
-                        registry,
-                        allow_connector_tools=connector_scope.allow_connector_tools,
-                        connector_provider_ids=connector_scope.provider_ids,
-                    )
-                    preview = build_cron_planner_status_preview(
-                        model_client=getattr(orchestrator, "model_client", None),
-                        user_message=prompt,
-                        conversation_id=conv_id,
-                        principal_id=conv_id,
-                        tool_registry=preview_registry,
-                        subject=str(getattr(cron_job, "name", "") or ""),
-                    )
-                except Exception:
-                    logger.debug("Could not build web cron planner status preview", exc_info=True)
-                    preview = None
-                if preview is not None:
-                    _broadcast_cron_planner_status(conv_id, preview.group_id, preview.initial_text())
+            _record_agent_preflight(
+                "connector_scope",
+                connector_allowed=bool(connector_scope.allow_connector_tools),
+                connector_providers=len(connector_scope.provider_ids),
+            )
 
             def _planner_activity_callback(event: dict[str, str]) -> None:
-                if preview is None or not activity_trace_enabled():
+                nonlocal pending_activity_detail
+                if not activity_trace_enabled():
                     return
                 event_id = str(event.get("id") or "")
                 if event_id != "orchestrate":
@@ -16833,9 +17012,12 @@ def create_app(runtime, orchestrator, registry):
                 detail = str(event.get("detail") or "").strip()
                 if not detail:
                     return
+                if display_preview is None or not planner_group_id:
+                    pending_activity_detail = detail
+                    return
                 _broadcast_cron_planner_status(
                     conv_id,
-                    preview.group_id,
+                    planner_group_id,
                     detail,
                     status_kind="tool_activity",
                     activity_id="cron-tools",
@@ -16844,10 +17026,14 @@ def create_app(runtime, orchestrator, registry):
 
             execution_registry = CronExecutionToolRegistry(
                 registry,
-                allowed_tool_names=preview.allowed_tools if preview is not None else None,
+                # Planner preview tool lists are display hints and can be partial
+                # (cache hits, timeouts, decomposer drift). Do not hard-gate cron
+                # execution on them; rely on runtime capability policy instead.
+                allowed_tool_names=None,
                 allow_connector_tools=connector_scope.allow_connector_tools,
                 connector_provider_ids=connector_scope.provider_ids,
             )
+            _record_agent_preflight("guarded_turn_start")
             result = _run_guarded_turn_sync(
                 prompt,
                 conv_id,
@@ -16858,15 +17044,37 @@ def create_app(runtime, orchestrator, registry):
                 memory_owner=memory_owner_for_workspace(getattr(cron_job, "workspace_id", "workspace_admin")),
                 reinforce_memory_context=False,
                 include_structured_result=True,
+                force_model_attachment_planning=True,
                 persist_user_turn=False,
                 builder_learning_enabled=False,
-                activity_callback=_planner_activity_callback if preview is not None else None,
+                activity_callback=_planner_activity_callback if planner_status_preview else None,
             )
-            if preview is not None:
+            _record_agent_preflight(
+                "guarded_turn_done",
+                tool_results=len(result.get("tool_results") or ()) if isinstance(result, dict) else 0,
+            )
+            if (
+                display_preview is None
+                and planner_status_preview
+                and task_planner_feed_enabled()
+            ):
+                fallback_preview = build_cron_planner_status_fallback(
+                    user_message=planner_preview_prompt,
+                    conversation_id=conv_id,
+                    principal_id=conv_id,
+                    subject=str(getattr(cron_job, "name", "") or ""),
+                )
+                _install_planner_preview(fallback_preview)
+                _record_agent_preflight(
+                    "planner_preview_terminal_fallback_installed",
+                    fallback_group_id=fallback_preview.group_id,
+                )
+            if display_preview is not None and planner_group_id:
+                planner_terminal_sent = True
                 _broadcast_cron_planner_status(
                     conv_id,
-                    preview.group_id,
-                    preview.terminal_text(success=cron_planner_run_succeeded(result)),
+                    planner_group_id,
+                    display_preview.terminal_text(success=cron_planner_run_succeeded(result)),
                 )
             return result
 
@@ -17370,6 +17578,34 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse(status_cache_payload, headers={"X-Nullion-Status-Cache": "hit"})
         return None
 
+    def _status_cache_fingerprint() -> str | None:
+        checkpoint_fingerprint = getattr(runtime, "last_checkpoint_fingerprint", None)
+        try:
+            owner = memory_owner_for_web_admin()
+            memory_signature = [
+                (
+                    entry.entry_id,
+                    str(getattr(entry, "kind", "")),
+                    entry.updated_at.isoformat() if getattr(entry, "updated_at", None) else "",
+                    int(getattr(entry, "use_count", 0) or 0),
+                    float(getattr(entry, "use_score", 0.0) or 0.0),
+                )
+                for entry in memory_entries_for_owner(runtime.store, owner)
+            ]
+        except Exception:
+            memory_signature = []
+        try:
+            return json.dumps(
+                {
+                    "checkpoint": checkpoint_fingerprint,
+                    "dashboard_memory": sorted(memory_signature),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception:
+            return checkpoint_fingerprint
+
     @app.middleware("http")
     async def _invalidate_status_cache_after_api_mutation(request: Request, call_next):
         response = await call_next(request)
@@ -17387,7 +17623,7 @@ def create_app(runtime, orchestrator, registry):
         cache_ttl_s = _status_cache_ttl_s()
         async with status_cache_lock:
             _sync_runtime_store_from_checkpoint()
-            current_fingerprint = getattr(runtime, "last_checkpoint_fingerprint", None)
+            current_fingerprint = _status_cache_fingerprint()
             cache_now = time.monotonic()
             cached = _status_cache_response(cache_now, cache_ttl_s, fingerprint=current_fingerprint)
             if cached is not None:
@@ -19442,6 +19678,17 @@ def create_app(runtime, orchestrator, registry):
             )
             if not isinstance(result, dict):
                 raise RuntimeError("Model returned an unexpected response shape.")
+            if provider == "codex":
+                try:
+                    from nullion.health_monitor import clear_recovered_service_doctor_actions
+
+                    clear_recovered_service_doctor_actions(
+                        runtime,
+                        "model_api",
+                        reason="Codex model test succeeded",
+                    )
+                except Exception:
+                    logger.debug("Unable to clear recovered model Doctor actions after model test", exc_info=True)
             return JSONResponse(
                 {
                     "ok": True,
@@ -19601,7 +19848,17 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": False, "error": f"OAuth re-auth not supported for provider: {provider}"}, status_code=400)
 
         async def _sse():
-            async for event in _stream_codex_reauth_events(request=request):
+            stream_kwargs: dict[str, object] = {"request": request}
+            try:
+                stream_signature = inspect.signature(_stream_codex_reauth_events)
+                if "runtime" in stream_signature.parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in stream_signature.parameters.values()
+                ):
+                    stream_kwargs["runtime"] = runtime
+            except (TypeError, ValueError):
+                stream_kwargs["runtime"] = runtime
+            async for event in _stream_codex_reauth_events(**stream_kwargs):
                 yield f"data: {json.dumps(event)}\n\n"
 
         return StreamingResponse(
@@ -21583,33 +21840,53 @@ def _latest_conversation_reset_at(runtime, *, channel: str) -> datetime | None:
     store = getattr(runtime, "store", None)
     if store is None or not hasattr(store, "list_conversation_events"):
         return None
+    if hasattr(store, "list_recent_conversation_events"):
+        try:
+            events = list(store.list_recent_conversation_events(None, event_type="conversation.session_reset", limit=128))
+        except TypeError:
+            events = []
+        for event in reversed(events):
+            if not _conversation_id_matches_history_channel(event.get("conversation_id"), channel):
+                continue
+            created_at = _parse_history_timestamp(event.get("created_at"))
+            if created_at is not None:
+                return created_at
+
     try:
         events = store.list_conversation_events()
     except TypeError:
         return None
-    latest_reset: datetime | None = None
-    for event in events:
+    for event in reversed(events):
         if event.get("event_type") != "conversation.session_reset":
             continue
         if not _conversation_id_matches_history_channel(event.get("conversation_id"), channel):
             continue
-        created_at = _parse_history_timestamp(event.get("created_at"))
-        if created_at is not None and (latest_reset is None or created_at > latest_reset):
-            latest_reset = created_at
-    return latest_reset
+        return _parse_history_timestamp(event.get("created_at"))
+    return None
 
 
 def _conversation_has_chat_turn_after(runtime, conversation_id: object, after: datetime) -> bool:
     if not isinstance(conversation_id, str) or not conversation_id:
         return False
     store = getattr(runtime, "store", None)
-    if store is None or not hasattr(store, "list_conversation_events"):
+    if store is None:
         return False
+    if hasattr(store, "list_recent_conversation_events"):
+        try:
+            events = store.list_recent_conversation_events(conversation_id, event_type="conversation.chat_turn", limit=1)
+        except TypeError:
+            events = []
+        for event in events[::-1]:
+            created_at = _parse_history_timestamp(event.get("created_at"))
+            if created_at is not None and created_at > after:
+                return True
+        return False
+
     try:
         events = store.list_conversation_events(conversation_id)
     except TypeError:
         return False
-    for event in events:
+    for event in reversed(events):
         if event.get("event_type") != "conversation.chat_turn":
             continue
         created_at = _parse_history_timestamp(event.get("created_at"))
@@ -21734,10 +22011,8 @@ def _start_web_task_frame(
     )
     store.add_task_frame(frame)
     store.set_active_task_frame_id(conversation_id, frame.frame_id)
-    try:
-        runtime.checkpoint()
-    except Exception:
-        logger.debug("Unable to checkpoint after starting web task frame", exc_info=True)
+    if _feature_enabled("NULLION_WEB_TASK_FRAME_START_CHECKPOINT_ENABLED"):
+        _schedule_web_checkpoint(runtime, force=True)
     return frame.frame_id, turn_id, conversation_result
 
 
@@ -21772,10 +22047,8 @@ def _finish_web_task_frame(
             store.set_active_task_frame_id(conversation_id, None)
     else:
         store.set_active_task_frame_id(conversation_id, frame_id)
-    try:
-        runtime.checkpoint()
-    except Exception:
-        logger.debug("Unable to checkpoint after finishing web task frame", exc_info=True)
+    if _feature_enabled("NULLION_WEB_TASK_FRAME_FINISH_CHECKPOINT_ENABLED"):
+        _schedule_web_checkpoint(runtime, force=True)
 
 
 _OPEN_WEB_TASK_FRAME_STATUSES = {
@@ -21861,7 +22134,7 @@ def _stale_web_task_frame_is_dead(frame: TaskFrame, *, now: datetime | None = No
     if status_value not in {"active", "running", "waiting_input", "verifying"}:
         return False
     conversation_id = str(getattr(frame, "conversation_id", "") or "")
-    if not conversation_id.startswith("web:"):
+    if not _is_web_task_frame_conversation(conversation_id):
         return False
     updated_at = getattr(frame, "updated_at", None)
     if not isinstance(updated_at, datetime):
@@ -21869,6 +22142,16 @@ def _stale_web_task_frame_is_dead(frame: TaskFrame, *, now: datetime | None = No
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=UTC)
     return ((now or datetime.now(UTC)) - updated_at).total_seconds() >= _stale_web_task_frame_seconds()
+
+
+def _is_web_task_frame_conversation(conversation_id: str) -> bool:
+    normalized = conversation_id.strip().lower()
+    if not normalized:
+        return False
+    if normalized == "web" or normalized.startswith("web:"):
+        return True
+    # Legacy web conversation IDs used by older runtime surfaces.
+    return normalized.startswith("live-") and normalized.endswith("-web")
 
 
 def _dead_task_doctor_action_id(frame_id: str) -> str:
@@ -22342,7 +22625,11 @@ def _cleanup_conversation_event_records(runtime, *, now: datetime | None = None)
             continue
         kept.append(event)
     if counts["chat_events"]:
-        events[:] = kept
+        set_events = getattr(store, "set_conversation_events", None)
+        if callable(set_events):
+            set_events(kept)
+        else:
+            events[:] = kept
     return counts
 
 
@@ -22460,10 +22747,23 @@ def _storage_status_payload(runtime) -> dict[str, object]:
     }
 
 
-def _web_chat_events_after_latest_reset(runtime, conversation_id: str) -> list[dict[str, Any]]:
+def _web_chat_events_after_latest_reset(
+    runtime,
+    conversation_id: str,
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
     store = getattr(runtime, "store", None)
     if store is None:
         return []
+    if hasattr(store, "list_recent_conversation_events_after_reset"):
+        return list(
+            getattr(store, "list_recent_conversation_events_after_reset")(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=limit,
+            )
+        )
     events = list(store.list_conversation_events(conversation_id))
     latest_reset_index = -1
     for index, event in enumerate(events):
@@ -22473,7 +22773,29 @@ def _web_chat_events_after_latest_reset(runtime, conversation_id: str) -> list[d
         event
         for event in events[latest_reset_index + 1 :]
         if event.get("event_type") == "conversation.chat_turn"
-    ]
+    ][-limit:]
+
+
+def _last_web_conversation_turn_id(runtime, *, conversation_id: str) -> str | None:
+    store = getattr(runtime, "store", None)
+    if store is None or not conversation_id:
+        return None
+    events = (
+        list(store.list_recent_conversation_events(conversation_id, event_type="conversation.chat_turn", limit=50))
+        if hasattr(store, "list_recent_conversation_events")
+        else list(store.list_conversation_events(conversation_id))
+    )
+    if not events:
+        return None
+    for event in reversed(events):
+        if event.get("event_type") != "conversation.chat_turn":
+            continue
+        turn_id = event.get("turn_id")
+        if isinstance(turn_id, str):
+            turn_id = turn_id.strip()
+            if turn_id:
+                return turn_id
+    return None
 
 
 def _is_internal_scheduled_task_context(text: object) -> bool:
@@ -22483,7 +22805,7 @@ def _is_internal_scheduled_task_context(text: object) -> bool:
 
 def _web_chat_history_from_store(runtime, conversation_id: str, *, limit: int = 8) -> list[dict[str, object]]:
     history: list[dict[str, object]] = []
-    chat_events = _web_chat_events_after_latest_reset(runtime, conversation_id)[-limit:]
+    chat_events = _web_chat_events_after_latest_reset(runtime, conversation_id, limit=limit)
     for event in chat_events:
         user_message = event.get("user_message")
         assistant_reply = event.get("assistant_reply")
@@ -22506,10 +22828,14 @@ def _web_chat_history_from_store(runtime, conversation_id: str, *, limit: int = 
 
 def _web_chat_thread_from_store(runtime, conversation_id: str, *, limit: int = 8) -> list[dict[str, str]]:
     try:
-        restored = runtime.list_conversation_chat_turns(conversation_id)
+        restored = runtime.list_conversation_chat_turns(conversation_id, limit=limit)
     except Exception:
         store = getattr(runtime, "store", None)
-        restored = store.list_conversation_chat_turns(conversation_id) if store is not None else []
+        restored = (
+            store.list_conversation_chat_turns(conversation_id, limit=limit)
+            if store is not None
+            else []
+        )
     if not isinstance(restored, list):
         return []
     thread: list[dict[str, str]] = []
@@ -22629,12 +22955,43 @@ def _recent_web_tool_context_prompt(runtime, conversation_id: str) -> str | None
     if store is None:
         return None
     try:
-        events = store.list_conversation_events(conversation_id)
+        events = []
+        if hasattr(store, "list_recent_conversation_events"):
+            events = list(
+                store.list_recent_conversation_events(
+                    conversation_id,
+                    event_type="conversation.chat_turn",
+                    limit=_MAX_RECENT_TOOL_CONTEXT_TURNS,
+                )
+            )
+        elif hasattr(store, "list_recent_conversation_events_after_reset"):
+            events = list(
+                store.list_recent_conversation_events_after_reset(
+                    conversation_id,
+                    event_type="conversation.chat_turn",
+                    limit=_MAX_RECENT_TOOL_CONTEXT_TURNS,
+                )
+            )
+        else:
+            raw_events = list(store.list_conversation_events(conversation_id))
+            latest_reset_index = -1
+            for index, event in enumerate(raw_events):
+                if event.get("event_type") == "conversation.session_reset":
+                    latest_reset_index = index
+            relevant_events = raw_events[latest_reset_index + 1 :]
+            filtered = [
+                event
+                for event in relevant_events
+                if event.get("event_type") == "conversation.chat_turn"
+            ]
+            events = filtered
+            if _MAX_RECENT_TOOL_CONTEXT_TURNS:
+                events = events[-_MAX_RECENT_TOOL_CONTEXT_TURNS:]
     except Exception:
         events = []
     records: list[dict[str, object]] = []
     for event in events:
-        if not isinstance(event, dict) or event.get("event_type") != "conversation.chat_turn":
+        if not isinstance(event, dict):
             continue
         tool_results = event.get("tool_results")
         if not isinstance(tool_results, list) or not tool_results:
@@ -22696,7 +23053,7 @@ def _web_memory_context(runtime, *, owner: str | None = None, reinforce: bool = 
 
         entries = select_memory_entries_for_prompt(entries)
         if reinforce and reinforce_memory_entries(store, entries):
-            runtime.checkpoint()
+            _schedule_web_checkpoint(runtime, force=True)
     except Exception:
         logger.debug("Unable to reinforce web memory entries", exc_info=True)
     return format_memory_context(entries)
@@ -22706,6 +23063,7 @@ def _remember_web_chat_turn(
     runtime,
     *,
     conversation_id: str,
+    conversation_turn_id: str | None = None,
     user_message: str,
     assistant_reply: str,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
@@ -22713,9 +23071,17 @@ def _remember_web_chat_turn(
     store = getattr(runtime, "store", None)
     if store is None:
         return
+    conversation_turn_id = (
+        str(conversation_turn_id).strip()
+        if isinstance(conversation_turn_id, str)
+        else f"turn-web-{uuid4().hex[:12]}"
+    )
+    if not conversation_turn_id:
+        conversation_turn_id = f"turn-web-{uuid4().hex[:12]}"
     event = {
         "conversation_id": conversation_id,
         "event_type": "conversation.chat_turn",
+        "turn_id": conversation_turn_id,
         "created_at": datetime.now(UTC).isoformat(),
         "chat_id": None,
         "user_message": user_message,
@@ -22729,10 +23095,8 @@ def _remember_web_chat_turn(
         get_chat_store().import_runtime_chat_turns([event])
     except Exception:
         logger.debug("Unable to persist web chat turn to chat history", exc_info=True)
-    try:
-        runtime.checkpoint()
-    except Exception:
-        logger.debug("Unable to checkpoint after web chat turn", exc_info=True)
+    if _feature_enabled("NULLION_WEB_CHAT_TURN_CHECKPOINT_ENABLED"):
+        _schedule_web_checkpoint(runtime, force=True)
 
 
 def _remember_web_explicit_memory(runtime, *, user_message: str, owner: str | None = None) -> None:
@@ -22750,10 +23114,7 @@ def _remember_web_explicit_memory(runtime, *, user_message: str, owner: str | No
         source="web_chat",
     )
     if written:
-        try:
-            runtime.checkpoint()
-        except Exception:
-            logger.debug("Unable to checkpoint after web memory write", exc_info=True)
+        _schedule_web_checkpoint(runtime, force=True)
 
 
 class _WebConfigIntentState(TypedDict, total=False):
@@ -22927,6 +23288,49 @@ def _feature_enabled(name: str, *, default: bool = True) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _schedule_web_checkpoint(runtime, *, force: bool = False) -> None:
+    if runtime is None:
+        return
+    runtime_id = id(runtime)
+
+    with _WEB_CHECKPOINT_LOCK:
+        if runtime_id in _WEB_CHECKPOINT_INFLIGHT:
+            _WEB_CHECKPOINT_DIRTY.add(runtime_id)
+            return
+        _WEB_CHECKPOINT_INFLIGHT.add(runtime_id)
+
+    def _run() -> None:
+        try:
+            while True:
+                try:
+                    checkpoint_kwargs: dict[str, object] = {}
+                    if force:
+                        try:
+                            checkpoint_signature = inspect.signature(runtime.checkpoint)
+                            if "force" in checkpoint_signature.parameters or any(
+                                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                                for parameter in checkpoint_signature.parameters.values()
+                            ):
+                                checkpoint_kwargs["force"] = True
+                        except (TypeError, ValueError):
+                            checkpoint_kwargs["force"] = True
+                    runtime.checkpoint(**checkpoint_kwargs)
+                except Exception:
+                    logger.debug("Unable to run web checkpoint", exc_info=True)
+                with _WEB_CHECKPOINT_LOCK:
+                    if runtime_id in _WEB_CHECKPOINT_DIRTY:
+                        _WEB_CHECKPOINT_DIRTY.remove(runtime_id)
+                        continue
+                    _WEB_CHECKPOINT_INFLIGHT.discard(runtime_id)
+                    return
+        finally:
+            with _WEB_CHECKPOINT_LOCK:
+                _WEB_CHECKPOINT_INFLIGHT.discard(runtime_id)
+                _WEB_CHECKPOINT_DIRTY.discard(runtime_id)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _smart_cleanup_enabled() -> bool:
     return _feature_enabled("NULLION_SMART_CLEANUP_ENABLED", default=True)
 
@@ -22944,6 +23348,7 @@ def _try_dispatch_web_mini_agents(
     tool_registry,
     runtime,
     has_attachments: bool,
+    requested_extensions: tuple[str, ...] | list[str] | None = None,
     force_dispatch: bool = False,
 ) -> Any | None:
     if (
@@ -22967,6 +23372,16 @@ def _try_dispatch_web_mini_agents(
         user_message,
         available_tools=available_tools,
     )
+    if not force_dispatch and should_keep_dag_plan_in_direct_turn(
+        dag_plan,
+        available_tools=available_tools,
+        requested_extensions=requested_extensions,
+    ):
+        logger.info(
+            "Web mini-agent dispatch skipped for small structured artifact workflow conversation_id=%s",
+            conversation_id,
+        )
+        return None
     dispatchable = bool(
         getattr(dag_plan, "can_dispatch", False)
         or (force_dispatch and getattr(dag_plan, "can_dispatch_when_requested", False))
@@ -23077,13 +23492,21 @@ def _schedule_web_no_tool_memory_capture(
         try:
             from nullion.builder_memory import capture_turn_memory_claims
 
-            capture_turn_memory_claims(
+            result = capture_turn_memory_claims(
                 runtime,
                 model_client,
                 owner=str(owner),
                 user_message=user_message,
                 assistant_reply=assistant_reply,
             )
+            if getattr(result, "skipped", None) == "empty":
+                capture_turn_memory_claims(
+                    runtime,
+                    model_client,
+                    owner=str(owner),
+                    user_message=user_message,
+                    assistant_reply=assistant_reply,
+                )
         except Exception:
             logger.debug("Web background memory capture failed (non-fatal)", exc_info=True)
 
@@ -23667,9 +24090,13 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         tool_results=tool_results,
         source="agent",
     ) or final_text
+    conversation_turn_id = getattr(result, "turn_id", None)
+    if not isinstance(conversation_turn_id, str) or not conversation_turn_id.strip():
+        conversation_turn_id = _last_web_conversation_turn_id(runtime, conversation_id=conversation_id)
     _remember_web_chat_turn(
         runtime,
         conversation_id=conversation_id,
+        conversation_turn_id=conversation_turn_id,
         user_message=user_text,
         assistant_reply=final_text,
         tool_results=tool_results,
@@ -23779,18 +24206,39 @@ def _web_interactive_fast_reasoning_effort() -> str | None:
     return normalize_reasoning_effort(os.environ.get("NULLION_WEB_INTERACTIVE_FAST_REASONING_EFFORT") or "low")
 
 
-def _model_client_with_reasoning_effort(model_client: object | None, reasoning_effort: str | None):
+def _web_interactive_fast_max_tokens() -> int | None:
+    raw_value = os.environ.get("NULLION_WEB_INTERACTIVE_FAST_MAX_TOKENS", "").strip()
+    if not raw_value:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return max(64, value)
+
+
+def _model_client_with_reasoning_effort(
+    model_client: object | None,
+    reasoning_effort: str | None,
+    *,
+    max_tokens: int | None = None,
+):
     effort = normalize_reasoning_effort(reasoning_effort)
-    if model_client is None or not effort:
+    if model_client is None:
         return model_client
-    if getattr(model_client, "reasoning_effort", None) == effort:
-        return model_client
-    if not hasattr(model_client, "reasoning_effort"):
+    updates: dict[str, object] = {}
+    if effort and hasattr(model_client, "reasoning_effort") and getattr(model_client, "reasoning_effort", None) != effort:
+        updates["reasoning_effort"] = effort
+    if max_tokens is not None and hasattr(model_client, "max_tokens") and getattr(model_client, "max_tokens", None) != max_tokens:
+        updates["max_tokens"] = max_tokens
+    if not updates:
         return model_client
     try:
-        return replace(model_client, reasoning_effort=effort)
+        return replace(model_client, **updates)
     except Exception:
-        logger.debug("Could not clone model client with interactive reasoning effort", exc_info=True)
+        logger.debug("Could not clone model client with interactive reasoning profile", exc_info=True)
         return model_client
 
 
@@ -23807,7 +24255,11 @@ def _model_client_with_interactive_fast_profile(model_client: object | None):
         except Exception:
             logger.debug("Could not clone model client with interactive fast model", exc_info=True)
             profiled_client = model_client
-    return _model_client_with_reasoning_effort(profiled_client, _web_interactive_fast_reasoning_effort())
+    return _model_client_with_reasoning_effort(
+        profiled_client,
+        _web_interactive_fast_reasoning_effort(),
+        max_tokens=_web_interactive_fast_max_tokens(),
+    )
 
 
 def _web_dispatch_requires_existing_turn_context(turn_dispatch_decision: object | None) -> bool:
@@ -23845,6 +24297,30 @@ def _web_turn_fast_profile_candidate(
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
     )
+
+
+def _web_turn_skip_tool_scope_decision(
+    *,
+    evidence,
+    config_action: object,
+    allow_mini_agents: bool,
+    force_mini_agent_dispatch: bool,
+    turn_dispatch_decision: object | None,
+) -> bool:
+    if not _feature_enabled("NULLION_WEB_TOOL_SCOPE_DECISION_ENABLED", default=True):
+        return False
+    if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
+        return False
+    if _web_dispatch_requires_existing_turn_context(turn_dispatch_decision):
+        return False
+    if (
+        getattr(evidence, "has_url_target", False)
+        or getattr(evidence, "has_attachments", False)
+        or getattr(evidence, "artifact_requested", False)
+        or getattr(evidence, "context_linked", False)
+    ):
+        return False
+    return True
 
 
 def _turn_tool_scope_requires_special_tools(tool_registry: object) -> bool:
@@ -23891,16 +24367,17 @@ def _requested_web_turn_attachment_extension(
     *,
     model_client: object | None = None,
     allow_model_planning: bool = False,
+    require_attachment_token_for_model_planning: bool = True,
 ) -> str | None:
     if is_slash_prefixed_literal_message(user_text):
         return None
     literal_extension = plan_attachment_format(user_text, model_client=None).extension
     if literal_extension:
         return literal_extension
-    if not (
-        allow_model_planning
-        or _feature_enabled("NULLION_WEB_ATTACHMENT_FORMAT_MODEL_PLANNING_ENABLED", default=False)
-    ):
+    if not allow_model_planning:
+        return None
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_.+-]+", str(user_text or ""))}
+    if require_attachment_token_for_model_planning and not tokens.intersection(ATTACHMENT_TOKEN_EXTENSIONS):
         return None
     return plan_attachment_format(user_text, model_client=model_client).extension
 
@@ -23919,6 +24396,7 @@ def _run_turn_sync(
     memory_owner: str | None = None,
     reinforce_memory_context: bool = False,
     include_structured_result: bool = False,
+    force_model_attachment_planning: bool = False,
     early_reply_callback: EarlyReplyCallback | None = None,
     persist_user_turn: bool = True,
     builder_learning_enabled: bool = True,
@@ -23947,10 +24425,7 @@ def _run_turn_sync(
         builder_checked: bool = False,
     ) -> None:
         total_ms = (time.perf_counter() - timing_started_at) * 1000
-        try:
-            slow_threshold_ms = float(os.environ.get("NULLION_WEB_TURN_SLOW_LOG_MS", "1200"))
-        except ValueError:
-            slow_threshold_ms = 1200.0
+        slow_threshold_ms = _WEB_TURN_SLOW_LOG_MS
         if total_ms < slow_threshold_ms:
             return
         logger.info(
@@ -23971,7 +24446,7 @@ def _run_turn_sync(
     try:
         from nullion.config import load_default_env_file_into_environ
 
-        load_default_env_file_into_environ()
+        load_default_env_file_into_environ(override=True)
     except Exception:
         logger.debug("Could not refresh env file before web turn", exc_info=True)
     _emit_activity(activity_callback, "prepare", "Preparing request", "running")
@@ -23987,6 +24462,18 @@ def _run_turn_sync(
         _mark_timing("prepare")
         _log_timing_if_slow("config_shortcut")
         return {"text": config_shortcut, "artifacts": []}
+    try:
+        from nullion.chat_operator import _chat_model_issue_reply
+
+        health_reply = _chat_model_issue_reply(runtime, message=user_text)
+    except Exception:
+        health_reply = None
+    if health_reply is not None:
+        _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Known model health issue")
+        _emit_activity(activity_callback, "respond", "Writing response", "done")
+        _mark_timing("model_health_gate")
+        _log_timing_if_slow("model_health_gate")
+        return {"text": health_reply, "artifacts": []}
     screenshot_payload = _web_screenshot_payload_if_requested(
         runtime,
         user_text=user_text,
@@ -24014,17 +24501,21 @@ def _run_turn_sync(
     turn_orchestrator = _orchestrator_for_video_attachments(turn_orchestrator, normalized_attachments)
     turn_memory_owner = memory_owner or memory_owner_for_web_admin()
     web_chat_thread = _web_chat_thread_from_store(runtime, conv_id)
+    _mark_timing("history_thread")
     structured_followup_evidence = (
         bool(normalized_attachments)
         or _web_has_open_task_frame(runtime, conv_id)
         or _web_dispatch_requires_existing_turn_context(turn_dispatch_decision)
     )
+    _mark_timing("history_evidence")
     web_ambiguity_classifier, web_ambiguity_classifier_reason = _web_ambiguity_classifier(
         web_chat_thread,
         model_client=getattr(turn_orchestrator, "model_client", None),
         structured_followup_evidence=structured_followup_evidence,
     )
+    _mark_timing("ambiguity_classifier")
     if persist_user_turn:
+        _mark_timing("task_frame_record_start")
         web_task_frame_id, web_conversation_turn_id, web_conversation_result = _start_web_task_frame(
             runtime,
             conversation_id=conv_id,
@@ -24035,14 +24526,24 @@ def _run_turn_sync(
             ambiguity_classifier=web_ambiguity_classifier,
             ambiguity_classifier_reason=web_ambiguity_classifier_reason,
         )
+        _mark_timing("task_frame_recorded")
     else:
         web_task_frame_id = None
         web_conversation_turn_id = None
         web_conversation_result = None
+        _mark_timing("task_frame_not_recorded")
+    workspace_has_artifact_evidence = _web_workspace_has_artifact_evidence(conv_id)
     requested_attachment_extension = _requested_web_turn_attachment_extension(
         user_text,
         model_client=getattr(turn_orchestrator, "model_client", None),
-        allow_model_planning=_web_workspace_has_artifact_evidence(conv_id),
+        allow_model_planning=(
+            force_model_attachment_planning
+            or workspace_has_artifact_evidence
+        ),
+        require_attachment_token_for_model_planning=not (
+            force_model_attachment_planning
+            or workspace_has_artifact_evidence
+        ),
     )
     required_attachment_extensions = (
         (requested_attachment_extension,) if requested_attachment_extension else ()
@@ -24053,6 +24554,7 @@ def _run_turn_sync(
         has_attachments=bool(normalized_attachments),
         requested_extensions=required_attachment_extensions,
     )
+    _mark_timing("tool_evidence")
     fast_profile_candidate = _web_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
         config_action=config_action,
@@ -24060,21 +24562,38 @@ def _run_turn_sync(
         force_mini_agent_dispatch=force_mini_agent_dispatch,
         turn_dispatch_decision=turn_dispatch_decision,
     )
-    tool_scope_model_client = getattr(turn_orchestrator, "model_client", None)
-    if fast_profile_candidate:
-        tool_scope_model_client = _model_client_with_interactive_fast_profile(tool_scope_model_client)
-    turn_tool_registry = scoped_turn_tool_registry(
-        registry,
+    _mark_timing("fast_profile_candidate")
+    _mark_timing("tool_scope_decision_check_start")
+    skip_tool_scope_decision = _web_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
-        model_client=tool_scope_model_client,
-        user_message=user_text,
+        config_action=config_action,
+        allow_mini_agents=allow_mini_agents,
+        force_mini_agent_dispatch=force_mini_agent_dispatch,
+        turn_dispatch_decision=turn_dispatch_decision,
     )
+    if skip_tool_scope_decision:
+        turn_tool_registry = registry
+        _mark_timing("tool_scope_decision_skipped")
+    else:
+        _mark_timing("tool_scope_decision_allowed")
+        tool_scope_model_client = getattr(turn_orchestrator, "model_client", None)
+        if fast_profile_candidate:
+            tool_scope_model_client = _model_client_with_interactive_fast_profile(tool_scope_model_client)
+        _mark_timing("tool_scope_registry_start")
+        turn_tool_registry = scoped_turn_tool_registry(
+            registry,
+            evidence=turn_tool_evidence,
+            model_client=tool_scope_model_client,
+            user_message=user_text,
+        )
+        _mark_timing("tool_scope_registry_done")
     turn_orchestrator = _orchestrator_with_interactive_fast_profile(
         turn_orchestrator,
         enabled=fast_profile_candidate,
         tool_registry=turn_tool_registry,
     )
     _mark_timing("preflight")
+    _mark_timing("post_preflight")
 
     # Build system context: preferences + profile
     history_prefix: list[dict] = []
@@ -24221,6 +24740,7 @@ def _run_turn_sync(
             tool_registry=turn_tool_registry,
             runtime=runtime,
             has_attachments=bool(user_content_blocks),
+            requested_extensions=required_attachment_extensions,
             force_dispatch=force_mini_agent_dispatch,
         ) if allow_mini_agents else None
 
@@ -24243,6 +24763,7 @@ def _run_turn_sync(
             _remember_web_chat_turn(
                 runtime,
                 conversation_id=conv_id,
+                conversation_turn_id=web_conversation_turn_id,
                 user_message=user_text,
                 assistant_reply=reply,
             )
@@ -24447,6 +24968,7 @@ def _run_turn_sync(
         _remember_web_chat_turn(
             runtime,
             conversation_id=conv_id,
+            conversation_turn_id=getattr(result, "turn_id", None) or web_conversation_turn_id,
             user_message=user_text,
             assistant_reply=final_text,
             tool_results=tool_results,
@@ -24495,6 +25017,7 @@ def _run_turn_sync(
             payload["text"] = deferred_cron_dispatch["text"]
     if include_structured_result:
         payload["tool_results"] = _compact_web_tool_results_for_context(tool_results)
+        payload["response_fulfilled"] = bool(fulfilled)
     if getattr(result, "reached_iteration_limit", False):
         payload["reached_iteration_limit"] = True
     if getattr(result, "raw_tool_payload_blocked", False):
@@ -24912,7 +25435,7 @@ def _codex_reauth_command() -> list[str]:
     return [sys.executable, "-u", "-m", "nullion.auth", "--reauth", "codex"]
 
 
-async def _stream_codex_reauth_events(*, request) -> AsyncIterator[dict[str, object]]:
+async def _stream_codex_reauth_events(*, request, runtime=None) -> AsyncIterator[dict[str, object]]:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     try:
         process = await asyncio.create_subprocess_exec(
@@ -24942,6 +25465,17 @@ async def _stream_codex_reauth_events(*, request) -> AsyncIterator[dict[str, obj
             yield {"type": "output", "text": text}
         returncode = await process.wait()
         if returncode == 0:
+            if runtime is not None:
+                try:
+                    from nullion.health_monitor import clear_recovered_service_doctor_actions
+
+                    clear_recovered_service_doctor_actions(
+                        runtime,
+                        "model_api",
+                        reason="Codex OAuth re-authentication succeeded",
+                    )
+                except Exception:
+                    logger.debug("Unable to clear recovered model Doctor actions after Codex reauth", exc_info=True)
             yield {"type": "complete", "ok": True}
         else:
             yield {"type": "complete", "ok": False, "error": f"Codex re-authentication exited with status {returncode}."}
