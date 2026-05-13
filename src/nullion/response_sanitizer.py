@@ -44,6 +44,10 @@ _LOCAL_WINDOWS_PATH_RE = re.compile(
     r"(?P<path>[A-Za-z]:\\Users\\[^\\\s`\"'<>:)]+\\[^\s`\"'<>)]*)"
 )
 _PRESERVE_DIRECTIVE_PREFIXES = ("MEDIA:", "ARTIFACT:")
+_RAW_FUNCTION_CALL_RE = re.compile(
+    r"<\s*function\b[\s\S]*?</\s*function\s*>|#\{\s*<\s*function\b[\s\S]*?</\s*function\s*>\s*\}",
+    flags=re.IGNORECASE,
+)
 
 
 def user_requested_raw_output(user_message: str | None) -> bool:
@@ -64,6 +68,8 @@ def sanitize_user_visible_reply(
     if reply is None or user_requested_raw_output(user_message):
         return reply
     raw = str(reply)
+    if _looks_like_raw_function_markup(raw):
+        return safe_raw_tool_payload_replacement(tool_results=list(tool_results or ()), source=source)
     parsed = _parse_bare_structured_payload(raw)
     if parsed is None:
         return _sanitize_local_paths(raw)
@@ -82,6 +88,8 @@ def is_raw_tool_payload_reply(
 
     if reply is None:
         return False
+    if _looks_like_raw_function_markup(str(reply)):
+        return True
     parsed = _parse_bare_structured_payload(str(reply))
     if parsed is None:
         return False
@@ -450,6 +458,16 @@ def _parse_bare_structured_payload(text: str) -> Any | None:
     except Exception:
         return None
     return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def _looks_like_raw_function_markup(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    fenced = re.fullmatch(r"```(?:xml|html|text)?\s*([\s\S]*?)\s*```", stripped, flags=re.IGNORECASE)
+    if fenced:
+        stripped = fenced.group(1).strip()
+    return _RAW_FUNCTION_CALL_RE.search(stripped) is not None
 
 
 def _looks_like_raw_tool_payload(parsed: Any, results: list[ToolResult]) -> bool:

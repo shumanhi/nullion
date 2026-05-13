@@ -2107,6 +2107,12 @@ def _write_credentials(creds: dict[str, object]) -> None:
     save_encrypted_credentials(dict(creds), db_path=db_path)
     _CREDENTIALS_CACHE_KEY = _credential_cache_key()
     _CREDENTIALS_CACHE_VALUE = dict(creds)
+    try:
+        from nullion import runtime_cache
+
+        runtime_cache.invalidate_prefix("stable_context")
+    except Exception:
+        pass
 
 
 def _split_model_entries(value: object) -> list[str]:

@@ -15,6 +15,7 @@ from nullion.chat_attachments import is_supported_chat_file
 from nullion.config import NullionSettings, load_settings
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.events import make_event
+from nullion.latency_phases import record_surface_latency_timing
 from nullion.messaging_adapters import (
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
@@ -87,7 +88,13 @@ def _optional_message_text(value: object) -> str | None:
     return text or None
 
 
-def _handle_messaging_ingress_result_with_dispatch(service, ingress, *, turn_dispatch_decision=None):
+def _handle_messaging_ingress_result_with_dispatch(
+    service,
+    ingress,
+    *,
+    turn_dispatch_decision=None,
+    text_delta_callback=None,
+):
     try:
         parameters = inspect.signature(handle_messaging_ingress_result).parameters
     except (TypeError, ValueError):
@@ -97,11 +104,12 @@ def _handle_messaging_ingress_result_with_dispatch(service, ingress, *, turn_dis
         or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
     )
     if accepts_dispatch:
-        return handle_messaging_ingress_result(
-            service,
-            ingress,
-            turn_dispatch_decision=turn_dispatch_decision,
-        )
+        kwargs = {"turn_dispatch_decision": turn_dispatch_decision}
+        if "text_delta_callback" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            kwargs["text_delta_callback"] = text_delta_callback
+        return handle_messaging_ingress_result(service, ingress, **kwargs)
     return handle_messaging_ingress_result(service, ingress)
 
 
@@ -182,6 +190,53 @@ async def _edit_discord_message(message, text: str) -> bool:
     except Exception:
         logger.debug("Discord task card edit failed", exc_info=True)
         return False
+
+
+class _DiscordTextDeltaStreamer:
+    def __init__(self, *, loop, channel) -> None:
+        self._loop = loop
+        self._channel = channel
+        self._message = None
+        self._parts: list[str] = []
+        self._last_update_at = 0.0
+        self._last_text = ""
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
+    async def _send_or_edit(self, text: str) -> bool:
+        rendered = sanitize_external_inline_markup(text or "")
+        if self._message is None:
+            send = getattr(self._channel, "send", None)
+            if send is None:
+                return False
+            self._message = await send(rendered)
+            return True
+        return await _edit_discord_message(self._message, rendered)
+
+    def emit(self, delta: str) -> None:
+        if not delta or self._channel is None:
+            return
+        self._parts.append(delta)
+        text = self.text
+        now = time.monotonic()
+        if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
+            return
+        self._last_text = text
+        self._last_update_at = now
+        try:
+            asyncio.run_coroutine_threadsafe(self._send_or_edit(text), self._loop).result(timeout=2)
+        except Exception:
+            logger.debug("Discord text streaming update failed", exc_info=True)
+
+    async def finish(self, final_text: str | None) -> bool:
+        text = str(final_text or "")
+        if not text or self._message is None:
+            return False
+        if self._last_text == text:
+            return True
+        return await self._send_or_edit(text)
 
 
 async def _deliver_discord_task_status(
@@ -417,6 +472,22 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         try:
             runtime = getattr(service, "runtime", None)
             if runtime is not None:
+                try:
+                    turn_id_value = getattr(getattr(turn_registration, "decision", None), "turn_id", None)
+                except NameError:
+                    turn_id_value = None
+                record_surface_latency_timing(
+                    runtime.store,
+                    surface="discord",
+                    conversation_id=channel_id,
+                    turn_id=turn_id_value,
+                    request_id=request_id,
+                    message_id=message_id,
+                    outcome=outcome,
+                    total_ms=total_ms,
+                    phases=timing_marks,
+                    logger=logger,
+                )
                 runtime.store.add_event(
                     make_event(
                         event_type="discord.turn_timing",
@@ -491,6 +562,7 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         model_client=getattr(service, "model_client", None),
     )
     _mark_timing("turn_registered")
+    text_streamer = _DiscordTextDeltaStreamer(loop=asyncio.get_running_loop(), channel=message.channel)
     try:
         await turn_registration.wait_for_dependencies()
         _mark_timing("wait_dependencies")
@@ -500,6 +572,7 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
                 service,
                 ingress,
                 turn_dispatch_decision=turn_registration.decision,
+                text_delta_callback=text_streamer.emit,
             )
             reply = turn_result.reply
         _mark_timing("handler_completed")
@@ -513,6 +586,18 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
         )
+        if getattr(turn_result, "reply_already_sent", False) and not delivery.attachments:
+            await text_streamer.finish(reply)
+            _record_discord_delivery_receipt(
+                channel_id=_optional_message_text(getattr(message.channel, "id", None)),
+                delivery=delivery,
+                transport_ok=True,
+                request_id=ingress.request_id,
+                message_id=ingress.message_id,
+            )
+            _mark_timing("delivery_complete")
+            _log_turn_timing(turn_outcome)
+            return
         reply_text = delivery.text
         delivery_receipt_recorded = False
         if delivery.attachments:

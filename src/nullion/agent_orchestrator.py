@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, TypedDict
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
@@ -239,6 +240,16 @@ def _model_tool_result_max_chars() -> int:
         except ValueError:
             pass
     return _DEFAULT_MODEL_TOOL_RESULT_MAX_CHARS
+
+
+def _latency_threshold_ms(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, "")
+    if raw.strip():
+        try:
+            return max(float(raw), 0.0)
+        except ValueError:
+            pass
+    return default
 
 
 def _json_safe_tool_value(value: object) -> object:
@@ -898,6 +909,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     runtime_store: Any
     max_iterations: int | None
     tool_result_callback: Callable[[ToolResult], None] | None
+    text_delta_callback: Callable[[str], None] | None
     cancellation_checker: Callable[[], bool] | None
     cleanup_scope: str
     cleanup_done: bool
@@ -934,6 +946,175 @@ def _agent_turn_was_cancelled(state: _AgentTurnGraphState) -> bool:
     except Exception:
         logger.debug("Agent turn cancellation checker failed", exc_info=True)
         return False
+
+
+def _tool_output_shape(output: object) -> dict[str, object]:
+    if isinstance(output, dict):
+        return {
+            "type": "dict",
+            "keys": sorted(str(key) for key in output.keys())[:40],
+            "key_count": len(output),
+        }
+    if isinstance(output, list):
+        return {"type": "list", "count": len(output)}
+    if isinstance(output, str):
+        return {"type": "str", "chars": len(output)}
+    if output is None:
+        return {"type": "none"}
+    return {"type": type(output).__name__}
+
+
+def _tool_source_domain(output: object) -> str | None:
+    if not isinstance(output, dict):
+        return None
+    for key in ("source_url", "url", "geocoding_source_url", "forecast_source_url"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            parsed = urlparse(value)
+            if parsed.netloc:
+                return parsed.netloc
+    source = output.get("source")
+    if isinstance(source, dict):
+        return _tool_source_domain(source)
+    return None
+
+
+def _message_payload_shape(messages: list[dict[str, Any]]) -> dict[str, int]:
+    text_chars = 0
+    block_count = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            text_chars += len(content)
+            block_count += 1
+            continue
+        if not isinstance(content, list):
+            continue
+        block_count += len(content)
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    text_chars += len(text)
+                nested = block.get("content")
+                if isinstance(nested, list):
+                    for nested_block in nested:
+                        if isinstance(nested_block, dict) and isinstance(nested_block.get("text"), str):
+                            text_chars += len(nested_block["text"])
+            elif isinstance(block, str):
+                text_chars += len(block)
+    return {"message_count": len(messages), "content_block_count": block_count, "text_chars": text_chars}
+
+
+def _safe_prompt_section_label(role: str, text: str, index: int) -> str:
+    if role != "system":
+        return role or f"message_{index}"
+    first_line = str(text or "").strip().splitlines()[0][:160] if str(text or "").strip() else ""
+    known_prefixes = (
+        ("You are Nullion", "capability_inventory"),
+        ("Runtime configuration", "runtime_config"),
+        ("Configured workspace connections", "workspace_connections"),
+        ("Enabled skill packs", "skill_packs"),
+        ("Skill access policy", "skill_access_policy"),
+        ("Web delivery contract", "delivery_contract"),
+        ("Chat delivery contract", "delivery_contract"),
+        ("Known user memory", "memory_context"),
+        ("Builder route hints", "builder_route_hints"),
+        ("Recent tool context", "recent_tool_context"),
+        ("Workspace", "workspace_context"),
+    )
+    for prefix, label in known_prefixes:
+        if first_line.startswith(prefix):
+            return label
+    return f"system_{index}"
+
+
+def _message_payload_breakdown(messages: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        chars = 0
+        blocks = 0
+        label_text = ""
+        if isinstance(content, str):
+            chars = len(content)
+            blocks = 1
+            label_text = content
+        elif isinstance(content, list):
+            blocks = len(content)
+            label_parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        chars += len(text)
+                        if not label_parts:
+                            label_parts.append(text)
+                    nested = block.get("content")
+                    if isinstance(nested, list):
+                        for nested_block in nested:
+                            if isinstance(nested_block, dict) and isinstance(nested_block.get("text"), str):
+                                nested_text = nested_block["text"]
+                                chars += len(nested_text)
+                                if not label_parts:
+                                    label_parts.append(nested_text)
+                elif isinstance(block, str):
+                    chars += len(block)
+                    if not label_parts:
+                        label_parts.append(block)
+            label_text = "\n".join(label_parts)
+        if chars <= 0:
+            continue
+        rows.append({
+            "index": index,
+            "role": role,
+            "label": _safe_prompt_section_label(role, label_text, index),
+            "text_chars": chars,
+            "content_block_count": blocks,
+        })
+    rows.sort(key=lambda row: int(row.get("text_chars") or 0), reverse=True)
+    return rows[: max(0, int(limit))]
+
+
+def _record_agent_tool_timing(
+    runtime_store: object,
+    *,
+    conversation_id: str,
+    iteration: int,
+    invocation: ToolInvocation,
+    result: ToolResult,
+    duration_ms: float,
+    artifact_count: int,
+) -> None:
+    add_conversation_event = getattr(runtime_store, "add_conversation_event", None)
+    if not callable(add_conversation_event):
+        return
+    output = getattr(result, "output", None)
+    error_text = getattr(result, "error", None)
+    try:
+        add_conversation_event(
+            {
+                "event_id": f"tool-timing:{conversation_id}:{iteration}:{invocation.tool_name}:{uuid4().hex}",
+                "conversation_id": conversation_id,
+                "event_type": "conversation.tool_timing",
+                "created_at": datetime.now(UTC).isoformat(),
+                "iteration": iteration,
+                "invocation_id": invocation.invocation_id,
+                "tool_name": invocation.tool_name,
+                "status": result.status,
+                "duration_ms": round(duration_ms, 1),
+                "argument_keys": sorted(str(key) for key in invocation.arguments.keys())[:40],
+                "output_shape": _tool_output_shape(output),
+                "source_domain": _tool_source_domain(output),
+                "artifact_count": artifact_count,
+                "error": str(error_text)[:240] if error_text else None,
+            }
+        )
+    except Exception:
+        logger.debug("Tool timing event recording failed", exc_info=True)
 
 
 def _cancelled_agent_turn_update(state: _AgentTurnGraphState) -> dict[str, object]:
@@ -1044,19 +1225,52 @@ def _execute_agent_turn_tool_uses(
             if tool_name == "terminal_exec" and runtime_store is not None
             else None
         )
+        tool_started_at = time.perf_counter()
         if runtime_store is not None:
             from nullion.runtime import invoke_tool_with_boundary_policy
 
             result = invoke_tool_with_boundary_policy(runtime_store, invocation, registry=tool_registry)
         else:
             result = tool_registry.invoke(invocation)
+        tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
         tool_results.append(result)
         if tool_result_callback is not None:
             try:
                 tool_result_callback(result)
             except Exception:
                 logger.debug("Tool result callback failed", exc_info=True)
-        artifacts.extend(_artifact_paths_from_tool_result(result, runtime_store=runtime_store))
+        new_artifacts = _artifact_paths_from_tool_result(result, runtime_store=runtime_store)
+        artifacts.extend(new_artifacts)
+        if runtime_store is not None:
+            _record_agent_tool_timing(
+                runtime_store,
+                conversation_id=conversation_id,
+                iteration=int(state.get("iterations") or 0),
+                invocation=invocation,
+                result=result,
+                duration_ms=tool_duration_ms,
+                artifact_count=len(new_artifacts),
+            )
+        logger.info(
+            "agent tool timing conversation_id=%s iteration=%s tool=%s status=%s duration_ms=%.1f artifacts=%s",
+            conversation_id,
+            int(state.get("iterations") or 0),
+            tool_name,
+            result.status,
+            tool_duration_ms,
+            len(new_artifacts),
+        )
+        if tool_duration_ms >= _latency_threshold_ms("NULLION_SLOW_TOOL_LOG_MS", 2000.0):
+            logger.warning(
+                "agent slow tool conversation_id=%s iteration=%s tool=%s status=%s duration_ms=%.1f source_domain=%s output_shape=%s",
+                conversation_id,
+                int(state.get("iterations") or 0),
+                tool_name,
+                result.status,
+                tool_duration_ms,
+                _tool_source_domain(getattr(result, "output", None)),
+                _tool_output_shape(getattr(result, "output", None)),
+            )
         if _agent_turn_was_cancelled(state):
             updated_state = dict(state)
             updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
@@ -1208,10 +1422,65 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
             reached_iteration_limit=True,
         )
     iterations += 1
-    response = state["orchestrator"].model_client.create(
-        messages=list(state.get("messages") or []),
-        tools=state["tool_registry"].list_tool_definitions(),
+    create_kwargs: dict[str, Any] = {
+        "messages": list(state.get("messages") or []),
+        "tools": state["tool_registry"].list_tool_definitions(),
+    }
+    text_delta_callback = state.get("text_delta_callback")
+    if text_delta_callback is not None:
+        create_kwargs["text_delta_callback"] = text_delta_callback
+    model_started_at = time.perf_counter()
+    response = state["orchestrator"].model_client.create(**create_kwargs)
+    model_duration_ms = (time.perf_counter() - model_started_at) * 1000
+    logger.info(
+        "agent model timing conversation_id=%s iteration=%s tools=%s duration_ms=%.1f stop_reason=%s",
+        state.get("conversation_id"),
+        iterations,
+        len(create_kwargs.get("tools") or []),
+        model_duration_ms,
+        response.get("stop_reason"),
     )
+    message_shape = _message_payload_shape(list(create_kwargs.get("messages") or []))
+    context_breakdown = _message_payload_breakdown(list(create_kwargs.get("messages") or []))
+    if (
+        model_duration_ms >= _latency_threshold_ms("NULLION_SLOW_MODEL_LOG_MS", 5000.0)
+        or message_shape["text_chars"] >= _latency_threshold_ms("NULLION_LARGE_CONTEXT_LOG_CHARS", 20_000.0)
+    ):
+        logger.warning(
+            "agent slow model conversation_id=%s iteration=%s tools=%s duration_ms=%.1f stop_reason=%s messages=%s blocks=%s text_chars=%s streaming=%s",
+            state.get("conversation_id"),
+            iterations,
+            len(create_kwargs.get("tools") or []),
+            model_duration_ms,
+            response.get("stop_reason"),
+            message_shape["message_count"],
+            message_shape["content_block_count"],
+            message_shape["text_chars"],
+            text_delta_callback is not None,
+        )
+    runtime_store = state.get("runtime_store")
+    add_conversation_event = getattr(runtime_store, "add_conversation_event", None)
+    if callable(add_conversation_event):
+        try:
+            add_conversation_event(
+                {
+                    "event_id": f"model-timing:{state.get('conversation_id') or ''}:{iterations}:{uuid4().hex}",
+                    "conversation_id": str(state.get("conversation_id") or ""),
+                    "event_type": "conversation.model_timing",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "iteration": iterations,
+                    "tool_count": len(create_kwargs.get("tools") or []),
+                    "message_count": message_shape["message_count"],
+                    "content_block_count": message_shape["content_block_count"],
+                    "text_chars": message_shape["text_chars"],
+                    "context_breakdown": context_breakdown,
+                    "streaming_enabled": text_delta_callback is not None,
+                    "duration_ms": round(model_duration_ms, 1),
+                    "stop_reason": response.get("stop_reason"),
+                }
+            )
+        except Exception:
+            logger.debug("Model timing event recording failed", exc_info=True)
     content = response.get("content") or []
     content_list = list(content) if isinstance(content, list) else []
     thinking_parts = list(state.get("thinking_parts") or [])
@@ -1618,6 +1887,7 @@ class AgentOrchestrator:
         approval_store,
         max_iterations: int | None = None,
         tool_result_callback: Callable[[ToolResult], None] | None = None,
+        text_delta_callback: Callable[[str], None] | None = None,
         cancellation_checker: Callable[[], bool] | None = None,
     ) -> TurnResult:
         runtime_store = _resolve_runtime_store(policy_store=policy_store, approval_store=approval_store)
@@ -1635,6 +1905,7 @@ class AgentOrchestrator:
                 "runtime_store": runtime_store,
                 "max_iterations": max_iterations,
                 "tool_result_callback": tool_result_callback,
+                "text_delta_callback": text_delta_callback,
                 "cancellation_checker": cancellation_checker,
                 "cleanup_scope": f"turn-{uuid4().hex}",
                 "cleanup_done": False,
@@ -2148,6 +2419,7 @@ class AgentOrchestrator:
         available_tools: list[str] | None = None,
         single_task_fast_path: bool = True,
         dag_plan: Any | None = None,
+        preferred_group_id: str | None = None,
     ) -> "DispatchResult":
         """Decompose *user_message* and dispatch tasks to mini-agents.
 
@@ -2208,6 +2480,13 @@ class AgentOrchestrator:
             available_tools=tools,
             dag_plan=dag_plan,
         )
+        preferred_group_id = str(preferred_group_id or "").strip()
+        if preferred_group_id and preferred_group_id != group.group_id:
+            group = replace(
+                group,
+                group_id=preferred_group_id,
+                tasks=[replace(task, group_id=preferred_group_id) for task in group.tasks],
+            )
         group = _apply_planner_timeout_policy(group, single_task_fast_path=single_task_fast_path)
         await self._task_registry.add_group(group)
         self._checkpoint_dispatch_state()

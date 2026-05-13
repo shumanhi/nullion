@@ -200,6 +200,16 @@ def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeSto
                 current[key] = _revocable_record_merge_value(current[key], value)
     for attr in ("events", "audit_records"):
         _merge_list_records(getattr(store, attr), getattr(previous, attr))
+    if getattr(previous, "builder_route_observations", None):
+        from nullion.builder_routes import trim_route_observations
+
+        by_id: dict[str, dict[str, object]] = {}
+        for row in [*previous.builder_route_observations, *store.builder_route_observations]:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("observation_id") or f"row:{len(by_id)}")
+            by_id[key] = dict(row)
+        store.builder_route_observations = trim_route_observations(by_id.values())
 
 _RUNTIME_STORE_COLLECTION_KEYS = (
 
@@ -222,6 +232,7 @@ _RUNTIME_STORE_COLLECTION_KEYS = (
     "mini_agent_runs",
     "missions",
     "builder_proposals",
+    "builder_route_observations",
     "skills",
     "user_facts",
     "preferences",
@@ -257,6 +268,7 @@ _SQLITE_RUNTIME_TABLES: dict[str, str] = {
     "mini_agent_runs": "mini_agent_runs",
     "missions": "tasks_missions",
     "builder_proposals": "builder_proposals",
+    "builder_route_observations": "builder_proposals",
     "skills": "runtime_skills",
     "user_facts": "memory",
     "preferences": "memory",
@@ -1628,6 +1640,14 @@ def _sqlite_collection_item_key(collection: str, index: int, item: object) -> st
     if collection in _ENCRYPTED_SQLITE_COLLECTIONS:
         return f"{index:012d}"
     if isinstance(item, dict):
+        if collection == "builder_route_observations":
+            observation_id = item.get("observation_id")
+            if isinstance(observation_id, str) and observation_id:
+                return observation_id
+        if collection == "conversation_events":
+            event_id = item.get("event_id")
+            if isinstance(event_id, str) and event_id:
+                return event_id
         for key in (
             "approval_id",
             "grant_id",
@@ -1647,6 +1667,7 @@ def _sqlite_collection_item_key(collection: str, index: int, item: object) -> st
             "frame_id",
             "event_id",
             "record_id",
+            "observation_id",
         ):
             value = item.get(key)
             if isinstance(value, str) and value:
@@ -1680,6 +1701,7 @@ def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path, *, merge_e
                     "boundary_policy_rules",
                     "events",
                     "audit_records",
+                    "builder_route_observations",
                 ),
             )
             _merge_previous_checkpoint_records(store, previous_store)
@@ -1863,6 +1885,7 @@ def build_runtime_store_payload(store: RuntimeStore) -> dict[str, object]:
         "mini_agent_runs": [_serialize_mini_agent_run(r) for r in store.list_mini_agent_runs()],
         "missions": [_serialize_mission(mission) for mission in store.list_missions()],
         "builder_proposals": [_serialize_builder_proposal_record(r) for r in store.list_builder_proposals()],
+        "builder_route_observations": store.list_builder_route_observations(),
         "skills": [_serialize_skill(skill) for skill in store.skills.values()],
         "user_facts": [_serialize_user_memory_entry(entry) for entry in store.user_facts.values()],
         "preferences": [_serialize_user_memory_entry(entry) for entry in store.preferences.values()],
@@ -1987,6 +2010,9 @@ def _runtime_store_from_payload(payload: dict[str, object]) -> RuntimeStore:
     for proposal in payload.get("builder_proposals", []):
         record = _deserialize_builder_proposal_record(proposal)
         store.builder_proposals[record.proposal_id] = record
+    for observation in payload.get("builder_route_observations", []):
+        if isinstance(observation, dict):
+            store.add_builder_route_observation(dict(observation))
     for skill in payload.get("skills", []):
         skill_record = _deserialize_skill(skill)
         store.skills[skill_record.skill_id] = skill_record

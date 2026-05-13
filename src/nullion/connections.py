@@ -33,6 +33,15 @@ def _provider_id_looks_external_connector(provider_id: object) -> bool:
     return normalized.startswith("skill_pack_connector_") or normalized.endswith("_connector_provider")
 
 
+def _structured_tools_for_connection(connection: "ProviderConnection") -> tuple[str, ...]:
+    if not _provider_id_looks_external_connector(connection.provider_id):
+        return ()
+    tools = ["connector_request"]
+    if connection.permission_mode == "write":
+        tools.append("email_send")
+    return tuple(tools)
+
+
 @dataclass(slots=True)
 class ProviderConnection:
     connection_id: str
@@ -270,6 +279,27 @@ def connection_for_principal(
     )
 
 
+def default_email_connector_provider_id(principal_id: str | None = None, *, path: Path | str | None = None) -> str | None:
+    """Return the write-capable external connector most likely to handle email."""
+    fallback_provider_id = ""
+    for connection in load_connection_registry(path=path).connections:
+        provider_id = str(connection.provider_id or "").strip()
+        if not provider_id or not connection.active:
+            continue
+        if not _provider_id_looks_external_connector(provider_id):
+            continue
+        scoped_connection = connection_for_principal(principal_id, provider_id, path=path)
+        if scoped_connection is None or scoped_connection.permission_mode != "write":
+            continue
+        lowered_provider = provider_id.lower()
+        display_name = str(scoped_connection.display_name or "").lower()
+        if "mail" in lowered_provider or "gmail" in lowered_provider or "mail" in display_name:
+            return provider_id
+        if not fallback_provider_id:
+            fallback_provider_id = provider_id
+    return fallback_provider_id or None
+
+
 def require_workspace_connection_for_principal(principal_id: str | None, provider_id: str) -> ProviderConnection | None:
     """Return a scoped connection, or allow legacy admin/global fallback.
 
@@ -335,6 +365,9 @@ def format_workspace_connections_for_prompt(
             if connection.permission_mode == "write"
             else "permission_mode=read_only"
         )
+        structured_tools = _structured_tools_for_connection(connection)
+        if structured_tools:
+            parts.append("typed_tools=" + ",".join(structured_tools))
         lines.append("- " + "; ".join(parts))
     return "\n".join(lines)
 

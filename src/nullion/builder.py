@@ -107,6 +107,30 @@ def builder_proposal_acceptance_benefit(proposal: BuilderProposal) -> str:
     )
 
 
+def format_builder_proposal_notification(record: BuilderProposalRecord) -> str:
+    """Short user-facing copy for a newly pending Builder proposal."""
+    proposal = record.proposal
+    approval_mode = str(getattr(proposal, "approval_mode", "") or "").strip().lower()
+    if approval_mode == "dependency":
+        action_label = "install a package"
+        accept_label = "install it"
+    elif approval_mode == "memory":
+        action_label = "save a memory"
+        accept_label = "save it"
+    else:
+        action_label = "save a reusable skill"
+        accept_label = "save it"
+    summary = str(getattr(proposal, "summary", "") or "").strip()
+    lines = [
+        f"Builder found an optional improvement: {proposal.title}",
+        f"What it would do: {summary or action_label}.",
+        f"Review it: /proposal {record.proposal_id}",
+        f"Approve: /accept-proposal {record.proposal_id} ({accept_label})",
+        f"Dismiss: /reject-proposal {record.proposal_id}",
+    ]
+    return "\n".join(lines)
+
+
 def _primary_trigger_for_packet(packet: BuilderInputPacket) -> str:
     if packet.successful_task:
         return "successful_task"
@@ -436,6 +460,7 @@ __all__ = [
     "builder_proposal_acceptance_benefit",
     "build_skill_refinement_proposal_snapshot",
     "evaluate_builder_decision",
+    "format_builder_proposal_notification",
     "format_builder_proposal_for_telegram",
     "format_skill_refinement_proposal_for_telegram",
     "render_builder_proposal_for_telegram",

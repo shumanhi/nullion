@@ -337,11 +337,22 @@ def format_tool_activity_line(tool_result: Any) -> str:
 
 
 def format_tool_activity_detail(tool_results: Iterable[Any]) -> str:
-    return "\n".join(
-        format_tool_activity_line(result)
-        for result in (tool_results or ())
-        if not should_suppress_tool_activity(result)
-    )
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for result in tool_results or ():
+        if should_suppress_tool_activity(result):
+            continue
+        line = format_tool_activity_line(result)
+        if line not in counts:
+            counts[line] = 0
+            order.append(line)
+        counts[line] += 1
+    lines = [
+        f"{line} × {count}" if count > 1 else line
+        for line in order
+        for count in (counts[line],)
+    ]
+    return "\n".join(lines)
 
 
 def format_tool_results_activity_detail(tool_results: Iterable[Any]) -> str:

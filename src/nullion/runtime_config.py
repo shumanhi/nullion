@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from nullion import __version__
+from nullion import runtime_cache
 from nullion.settings import Settings
 
 
@@ -192,6 +193,8 @@ def format_runtime_config_for_prompt(*, model_client: object | None = None) -> s
 
 
 def persist_model_name(model_name: str) -> None:
+    global _CREDENTIALS_CACHE_KEY
+    global _CREDENTIALS_CACHE_VALUE
     normalized = model_name.strip()
     if not normalized:
         raise ValueError("model name is required")
@@ -200,10 +203,15 @@ def persist_model_name(model_name: str) -> None:
     from nullion.credential_store import save_encrypted_credentials
 
     save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
+    _CREDENTIALS_CACHE_KEY = None
+    _CREDENTIALS_CACHE_VALUE = None
     os.environ["NULLION_MODEL"] = normalized
+    runtime_cache.invalidate_prefix("stable_context")
 
 
 def persist_admin_forced_model(model_name: str) -> None:
+    global _CREDENTIALS_CACHE_KEY
+    global _CREDENTIALS_CACHE_VALUE
     """Set the admin-forced model broadcast to all sessions.
 
     This becomes the effective model for any session that has not set its own
@@ -217,17 +225,25 @@ def persist_admin_forced_model(model_name: str) -> None:
     from nullion.credential_store import save_encrypted_credentials
 
     save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
+    _CREDENTIALS_CACHE_KEY = None
+    _CREDENTIALS_CACHE_VALUE = None
     os.environ["NULLION_ADMIN_FORCED_MODEL"] = normalized
+    runtime_cache.invalidate_prefix("stable_context")
 
 
 def clear_admin_forced_model() -> None:
+    global _CREDENTIALS_CACHE_KEY
+    global _CREDENTIALS_CACHE_VALUE
     """Remove the admin-forced model so sessions fall back to the global default."""
     creds = _load_credentials()
     creds.pop("admin_forced_model", None)
     from nullion.credential_store import save_encrypted_credentials
 
     save_encrypted_credentials(creds, db_path=_credentials_path().with_name("runtime.db"))
+    _CREDENTIALS_CACHE_KEY = None
+    _CREDENTIALS_CACHE_VALUE = None
     os.environ.pop("NULLION_ADMIN_FORCED_MODEL", None)
+    runtime_cache.invalidate_prefix("stable_context")
 
 
 __all__ = [

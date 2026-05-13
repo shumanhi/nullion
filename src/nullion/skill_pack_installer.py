@@ -8,6 +8,7 @@ from the pack.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,11 +17,13 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 
+logger = logging.getLogger(__name__)
 _PACK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$")
 _SUSPICIOUS_PATTERNS = (
     "curl ",
@@ -175,6 +178,53 @@ def list_installed_skill_packs(*, root: Path | None = None) -> tuple[InstalledSk
         except Exception:
             continue
     return tuple(pack for pack in packs if pack.pack_id)
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def enabled_skill_pack_signature(
+    enabled_pack_ids: tuple[str, ...] | list[str],
+    *,
+    root: Path | None = None,
+    max_paths: int = 200,
+) -> tuple[object, ...]:
+    """Return a conservative fingerprint for enabled skill-pack prompt content."""
+
+    installed = {pack.pack_id: pack for pack in list_installed_skill_packs(root=root)}
+    signatures: list[object] = []
+    for raw_pack_id in enabled_pack_ids:
+        try:
+            pack_id = normalize_pack_id(str(raw_pack_id))
+        except ValueError:
+            continue
+        builtin_prompt = BUILTIN_SKILL_PACK_PROMPTS.get(pack_id)
+        if builtin_prompt is not None:
+            signatures.append((pack_id, "builtin", sha256(builtin_prompt.encode("utf-8")).hexdigest()))
+            continue
+        pack = installed.get(pack_id)
+        if pack is None or not pack.path:
+            signatures.append((pack_id, "missing"))
+            continue
+        pack_path = Path(pack.path).resolve()
+        file_signatures: list[object] = []
+        for relative_path in list_skill_pack_reference_paths(pack_id, root=root, max_paths=max_paths):
+            file_path = pack_path / relative_path
+            file_signatures.append((relative_path, _file_signature(file_path)))
+        signatures.append(
+            (
+                pack_id,
+                str(pack_path),
+                _file_signature(pack_path / "nullion-skill-pack.json"),
+                tuple(file_signatures),
+            )
+        )
+    return tuple(signatures)
 
 
 def get_installed_skill_pack(pack_id: str, *, root: Path | None = None) -> InstalledSkillPack | None:
@@ -340,6 +390,96 @@ def format_enabled_skill_packs_for_prompt(
     )
 
 
+def _metadata_description_excerpt(text: str, *, max_chars: int = 180) -> str:
+    lines = [line.rstrip() for line in str(text or "").splitlines()]
+    in_description = False
+    collected: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if collected:
+                break
+            continue
+        if line.startswith("description:"):
+            value = line.partition(":")[2].strip().strip("|>- ")
+            if value:
+                collected.append(value)
+            in_description = True
+            continue
+        if in_description:
+            if raw_line[:1] and not raw_line.startswith((" ", "\t", "-", "  ")):
+                break
+            collected.append(line.lstrip("- ").strip())
+    summary = " ".join(part for part in collected if part).strip()
+    if not summary:
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line and not line.startswith(("---", "name:", "metadata:", "compatibility:", "Skill pack:")):
+                summary = line
+                break
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 12].rstrip() + " [truncated]"
+    return summary
+
+
+def format_compact_enabled_skill_packs_for_prompt(
+    enabled_pack_ids: tuple[str, ...] | list[str],
+    *,
+    root: Path | None = None,
+    max_total_chars: int = 2800,
+) -> str:
+    """Return compact stable skill-pack guidance for default chat context.
+
+    Full skill pack instructions are intentionally not pasted into every turn;
+    the model can fetch detailed reference text with ``skill_pack_read`` when a
+    structured tool plan needs it.
+    """
+    installed = {pack.pack_id: pack for pack in list_installed_skill_packs(root=root)}
+    lines: list[str] = [
+        "Enabled skill packs are reference instructions, not account access.",
+        "Use skill_pack_read for detailed installed-pack docs when a structured tool plan needs service-specific steps.",
+    ]
+    total_chars = sum(len(line) for line in lines)
+    for raw_pack_id in enabled_pack_ids:
+        try:
+            pack_id = normalize_pack_id(str(raw_pack_id))
+        except ValueError:
+            continue
+        summary = ""
+        detail_hint = ""
+        builtin_prompt = BUILTIN_SKILL_PACK_PROMPTS.get(pack_id)
+        if builtin_prompt:
+            summary = _metadata_description_excerpt(builtin_prompt)
+        else:
+            pack = installed.get(pack_id)
+            if pack is None or not pack.path:
+                continue
+            pack_path = Path(pack.path)
+            skill_files = sorted(pack_path.rglob("SKILL.md"))
+            if skill_files:
+                try:
+                    summary = _metadata_description_excerpt(skill_files[0].read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    summary = ""
+            reference_paths = list_skill_pack_reference_paths(pack.pack_id, root=root)
+            common_paths = [path for path in ("SKILL.md", "README.md") if path in reference_paths]
+            if common_paths:
+                detail_hint = " details: " + ", ".join(common_paths)
+            elif reference_paths:
+                detail_hint = f" details: {len(reference_paths)} reference file(s) via skill_pack_read"
+        line = f"- {pack_id}"
+        if summary:
+            line += f": {summary}"
+        if detail_hint:
+            line += f" ({detail_hint})"
+        if total_chars + len(line) > max_total_chars:
+            lines.append("- additional enabled skill packs omitted from compact prompt; use /skill-packs or skill_pack_read when needed")
+            break
+        lines.append(line)
+        total_chars += len(line)
+    return "\n".join(lines).strip() if len(lines) > 2 else ""
+
+
 def install_skill_pack(
     source: str,
     *,
@@ -383,6 +523,12 @@ def install_skill_pack(
         "warnings": warnings,
     }
     (destination / "nullion-skill-pack.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    try:
+        from nullion import runtime_cache
+
+        runtime_cache.invalidate_prefix("stable_context")
+    except Exception:
+        logger.debug("Could not invalidate stable context cache after skill pack install", exc_info=True)
     return InstalledSkillPack(
         pack_id=normalized_id,
         source=raw_source,
@@ -409,6 +555,12 @@ def uninstall_skill_pack(
     except ValueError as exc:
         raise ValueError("installed skill pack path is outside the configured skill pack root") from exc
     shutil.rmtree(destination)
+    try:
+        from nullion import runtime_cache
+
+        runtime_cache.invalidate_prefix("stable_context")
+    except Exception:
+        logger.debug("Could not invalidate stable context cache after skill pack uninstall", exc_info=True)
     return pack
 
 
@@ -550,8 +702,10 @@ __all__ = [
     "BUILTIN_SKILL_PACK_PROMPTS",
     "default_skill_pack_root",
     "derive_pack_id_from_source",
+    "format_compact_enabled_skill_packs_for_prompt",
     "format_enabled_skill_packs_for_prompt",
     "get_installed_skill_pack",
+    "enabled_skill_pack_signature",
     "install_skill_pack",
     "list_installed_skill_packs",
     "list_skill_pack_reference_paths",

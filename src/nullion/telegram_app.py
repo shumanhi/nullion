@@ -29,6 +29,7 @@ from nullion.approval_markers import split_tool_approval_marker, strip_tool_appr
 from nullion.artifacts import is_safe_artifact_path, split_media_reply_attachments
 from nullion.chat_attachments import VIDEO_EXTENSIONS, is_supported_chat_file
 from nullion.events import make_event
+from nullion.latency_phases import record_surface_latency_timing
 from nullion.config import NullionSettings, web_session_allow_duration_label, web_session_allow_expires_at
 from nullion.doctor_playbooks import execute_doctor_playbook_command
 from nullion.messaging_adapters import (
@@ -82,7 +83,7 @@ from nullion.model_clients import (
     build_model_client_from_settings,
 )
 from nullion.agent_orchestrator import AgentOrchestrator
-from nullion.builder import builder_proposal_acceptance_benefit
+from nullion.builder import format_builder_proposal_notification
 from nullion.runtime import PersistentRuntime, format_doctor_diagnosis_for_operator
 from nullion.runtime_persistence import load_runtime_store
 from nullion.telegram_formatting import format_telegram_text
@@ -524,6 +525,59 @@ async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool
         )
         await asyncio.sleep(0.02)
     return True
+
+
+class _TelegramTextDeltaStreamer:
+    def __init__(self, *, loop, message) -> None:
+        self._loop = loop
+        self._message = message
+        self._sent_message = None
+        self._parts: list[str] = []
+        self._last_update_at = 0.0
+        self._last_text = ""
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
+    async def _send_or_edit(self, text: str) -> bool:
+        rendered = sanitize_external_inline_markup(text or "")
+        if self._sent_message is None:
+            reply_text = getattr(self._message, "reply_text", None)
+            if reply_text is None:
+                return False
+            self._sent_message = await retry_messaging_delivery_operation(
+                lambda: reply_text(rendered, do_quote=_should_quote_reply(_message_text_or_caption(self._message)))
+            )
+            return True
+        edit_text = getattr(self._sent_message, "edit_text", None)
+        if edit_text is None:
+            return False
+        await retry_messaging_delivery_operation(lambda: edit_text(rendered))
+        return True
+
+    def emit(self, delta: str) -> None:
+        if not delta or self._message is None:
+            return
+        self._parts.append(delta)
+        text = self.text
+        now = time.monotonic()
+        if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
+            return
+        self._last_text = text
+        self._last_update_at = now
+        try:
+            asyncio.run_coroutine_threadsafe(self._send_or_edit(text), self._loop).result(timeout=2)
+        except Exception:
+            logger.debug("Telegram text streaming update failed", exc_info=True)
+
+    async def finish(self, final_text: str | None) -> bool:
+        text = str(final_text or "")
+        if not text or self._sent_message is None:
+            return False
+        if self._last_text == text:
+            return True
+        return await self._send_or_edit(text)
 
 
 def _is_valid_telegram_bot_token(value: str) -> bool:
@@ -1147,35 +1201,14 @@ _SUGGESTION_MAX_CHARS = 54
 
 
 def _extract_safe_alternatives(reply: str) -> list[str]:
-    """Return up to 3 tappable safe-alternative suggestions extracted from a refusal reply.
+    """Legacy prose extractor intentionally disabled.
 
-    Looks for bullet-point or numbered list items that follow a refusal phrase.
-    Returns an empty list if the reply doesn't look like a refusal.
+    Telegram buttons must come from typed product state such as approval,
+    doctor, help, or settings actions. Inferring tappable suggestions from model
+    prose can turn ordinary bullets, addresses, filenames, or internal details
+    into user actions.
     """
-    import re as _re
-    reply_lower = reply.lower()
-    if not any(phrase in reply_lower for phrase in _REFUSAL_PHRASES):
-        return []
-    alternatives: list[str] = []
-    for line in reply.splitlines():
-        stripped = line.strip()
-        # Bullet: "- text", "• text", "* text"
-        for prefix in ("- ", "• ", "* "):
-            if stripped.startswith(prefix):
-                text = stripped[len(prefix):].strip()
-                # Remove inline markdown bold/italic markers
-                text = _re.sub(r"[*_`]", "", text).strip()
-                if text and len(text) <= _SUGGESTION_MAX_CHARS:
-                    alternatives.append(text)
-                break
-        else:
-            # Numbered list: "1. text" or "1) text"
-            m = _re.match(r"^\d+[.)]\s+(.+)$", stripped)
-            if m:
-                text = _re.sub(r"[*_`]", "", m.group(1)).strip()
-                if text and len(text) <= _SUGGESTION_MAX_CHARS:
-                    alternatives.append(text)
-    return alternatives[:3]
+    return []
 
 
 def _build_suggestion_markup(alternatives: list[str]):
@@ -1230,13 +1263,7 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
     if new_proposal_ids:
         proposal = pending_builder_proposals[new_proposal_ids[0]]
         proposal_id = proposal.proposal_id
-        proposal_obj = proposal.proposal
-        card_text = (
-            f"Builder proposal pending: {proposal_id}\n"
-            f"Title: {proposal_obj.title}\n"
-            f"Summary: {proposal_obj.summary}\n"
-            f"{builder_proposal_acceptance_benefit(proposal_obj)}"
-        )
+        card_text = format_builder_proposal_notification(proposal)
         return DecisionCard(
             text=card_text,
             reply_markup=_build_decision_markup(
@@ -1967,6 +1994,9 @@ class _TelegramActivityStreamer:
                 logger.debug("Telegram activity update failed", exc_info=True)
         if self._status_message is None:
             return
+        if self._is_trivial_phase_only():
+            await self._delete_status_message()
+            return
         await self._update({"id": "respond", "label": "Writing response", "status": "done"})
 
     async def stop(self) -> bool:
@@ -2028,6 +2058,17 @@ class _TelegramActivityStreamer:
         except Exception:
             logger.debug("Telegram typing refresh after activity update failed", exc_info=True)
 
+    async def _delete_status_message(self) -> None:
+        status_message = self._status_message
+        self._status_message = None
+        delete = getattr(status_message, "delete", None) or getattr(status_message, "delete_message", None)
+        if delete is None:
+            return
+        try:
+            await retry_messaging_delivery_operation(delete)
+        except Exception:
+            logger.debug("Telegram trivial activity message delete failed", exc_info=True)
+
     @staticmethod
     def _detail_is_activity_sublist(detail: str) -> bool:
         for raw_line in str(detail or "").splitlines():
@@ -2035,6 +2076,32 @@ class _TelegramActivityStreamer:
             if line.startswith(("→", "✓", "⊗", "⊘", "!", "•", "☐", "⧁")):
                 return True
         return False
+
+    @staticmethod
+    def _compact_detail_lines(detail: str) -> str:
+        counts: dict[str, int] = {}
+        order: list[str] = []
+        for raw_line in str(detail or "").splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                continue
+            if line not in counts:
+                counts[line] = 0
+                order.append(line)
+            counts[line] += 1
+        return "\n".join(
+            f"{line} × {counts[line]}" if counts[line] > 1 else line
+            for line in order
+        )
+
+    def _has_typed_phase_events(self) -> bool:
+        return any(str(event_id).startswith("phase-") for event_id in self._events)
+
+    def _has_phase_tool_detail(self) -> bool:
+        event = self._events.get("phase-run-tools")
+        if not event:
+            return False
+        return bool((event.get("detail") or "").strip())
 
     def _has_grouped_tool_detail(self) -> bool:
         orchestrate = self._events.get("orchestrate")
@@ -2044,6 +2111,45 @@ class _TelegramActivityStreamer:
         return self._detail_is_activity_sublist(detail)
 
     @staticmethod
+    def _detail_has_meaningful_work(event_id: str, detail: str) -> bool:
+        text = str(detail or "").strip()
+        if not text:
+            return False
+        if event_id == "phase-check-attachments":
+            return not re.match(r"^0 attachments?$", text, flags=re.IGNORECASE)
+        if event_id in {"phase-prepare-artifacts", "artifacts"}:
+            return not re.match(r"^0 artifacts?$", text, flags=re.IGNORECASE)
+        if event_id in {"phase-run-tools", "orchestrate"}:
+            return True
+        return not re.match(r"^(handled by|known model health issue|save|context|model_start)$", text, flags=re.IGNORECASE)
+
+    def _is_trivial_phase_only(self) -> bool:
+        if self._saw_planner_status or not self._events:
+            return False
+        trivial_ids = {
+            "queued",
+            "prepare",
+            "phase-check-task-state",
+            "phase-check-attachments",
+            "phase-build-context",
+            "phase-start-model",
+            "phase-run-tools",
+            "phase-prepare-artifacts",
+            "phase-save-conversation",
+            "artifacts",
+            "memory",
+            "respond",
+        }
+        for event_id, event in self._events.items():
+            if event_id not in trivial_ids:
+                return False
+            if str(event.get("status") or "") in {"failed", "blocked"}:
+                return False
+            if self._detail_has_meaningful_work(event_id, event.get("detail") or ""):
+                return False
+        return True
+
+    @staticmethod
     def _should_hide_detail(event_id: str, event: dict[str, str]) -> bool:
         if event_id != "orchestrate" or event.get("status") != "running":
             return False
@@ -2051,11 +2157,14 @@ class _TelegramActivityStreamer:
 
     def _render(self) -> str:
         lines = ["Activity"]
-        hide_tool_events = self._has_grouped_tool_detail()
+        hide_tool_events = self._has_grouped_tool_detail() or self._has_phase_tool_detail()
+        hide_orchestrate = self._has_typed_phase_events()
         for event_id, event in self._events.items():
+            if hide_orchestrate and event_id == "orchestrate":
+                continue
             if hide_tool_events and event_id.startswith("tool-"):
                 continue
-            detail = "" if self._should_hide_detail(event_id, event) else event.get("detail") or ""
+            detail = "" if self._should_hide_detail(event_id, event) else self._compact_detail_lines(event.get("detail") or "")
             prefix = f"{_activity_icon(event.get('status', ''))} {event.get('label', 'Working')}"
             if "\n" in detail or self._detail_is_activity_sublist(detail):
                 lines.append(prefix)
@@ -2112,6 +2221,7 @@ def _call_handle_update_with_activity(
     *,
     attachments: list[dict[str, str]] | None = None,
     activity_callback=None,
+    text_delta_callback=None,
     append_activity_trace: bool = True,
     turn_dispatch_decision=None,
     cancellation_checker=None,
@@ -2138,6 +2248,8 @@ def _call_handle_update_with_activity(
             "activity_callback": activity_callback,
             "append_activity_trace": append_activity_trace,
         }
+        if "text_delta_callback" in parameters:
+            kwargs["text_delta_callback"] = text_delta_callback
         if "attachments" in parameters:
             kwargs["attachments"] = attachments
         if "turn_dispatch_decision" in parameters:
@@ -3150,6 +3262,7 @@ class ChatOperatorService:
         request_id: str | None = None,
         message_id: str | None = None,
         activity_callback=None,
+        text_delta_callback=None,
         append_activity_trace: bool = True,
         allow_mini_agents: bool = False,
         turn_dispatch_decision=None,
@@ -3182,6 +3295,7 @@ class ChatOperatorService:
                 agent_orchestrator=agent_orchestrator,
                 service=self,
                 activity_callback=activity_callback,
+                text_delta_callback=text_delta_callback,
                 append_activity_trace=append_activity_trace,
                 allow_mini_agents=allow_mini_agents,
                 turn_dispatch_decision=turn_dispatch_decision,
@@ -3208,6 +3322,7 @@ class ChatOperatorService:
         *,
         attachments: list[dict[str, str]] | None = None,
         activity_callback=None,
+        text_delta_callback=None,
         append_activity_trace: bool = True,
         turn_dispatch_decision=None,
         cancellation_checker=None,
@@ -3258,6 +3373,7 @@ class ChatOperatorService:
             request_id=request_id,
             message_id=message_id,
             activity_callback=activity_callback,
+            text_delta_callback=text_delta_callback,
             append_activity_trace=append_activity_trace,
             turn_dispatch_decision=turn_dispatch_decision,
             cancellation_checker=cancellation_checker,
@@ -3379,6 +3495,18 @@ class ChatOperatorService:
                 phase_data,
             )
             try:
+                record_surface_latency_timing(
+                    self.runtime.store,
+                    surface="telegram",
+                    conversation_id=early_conversation_id,
+                    turn_id=getattr(decision, "turn_id", None) if decision is not None else None,
+                    request_id=request_id_local,
+                    message_id=message_id_local,
+                    outcome=outcome,
+                    total_ms=total_ms,
+                    phases=timing_marks,
+                    logger=logger,
+                )
                 self.runtime.store.add_event(
                     make_event(
                         event_type="telegram.turn_timing",
@@ -3671,6 +3799,11 @@ class ChatOperatorService:
                                 return
                 handler_error = None
                 try:
+                    update_message = getattr(update, "message", None) or getattr(update, "effective_message", None)
+                    text_streamer = _TelegramTextDeltaStreamer(
+                        loop=asyncio.get_running_loop(),
+                        message=update_message,
+                    )
                     if activity_streamer is not None:
                         activity_streamer.emit({"id": "prepare", "label": "Preparing request", "status": "running"})
                     _mark_timing("handler_dispatched")
@@ -3680,6 +3813,7 @@ class ChatOperatorService:
                         update,
                         attachments=telegram_attachments,
                         activity_callback=activity_streamer.emit if activity_streamer is not None else None,
+                        text_delta_callback=text_streamer.emit,
                         append_activity_trace=activity_streamer is None and not planner_status_requested,
                         turn_dispatch_decision=turn_registration.decision,
                         cancellation_checker=turn_registration.is_cancelled,
@@ -3782,13 +3916,24 @@ class ChatOperatorService:
 
             if reply_activity_phase is RunActivityPhase.WAITING_APPROVAL:
                 logger.info("Telegram run entered waiting_approval phase (chat_id=%s)", chat_id_text)
+            activity_finish_task = None
             if activity_streamer is not None:
-                await activity_streamer.finish()
+                activity_finish_task = asyncio.create_task(activity_streamer.finish())
             if _should_skip_telegram_primary_reply_delivery(
                 suppress_primary_reply_delivery=suppress_primary_reply_delivery,
                 decision_card=decision_card,
             ):
+                if activity_finish_task is not None:
+                    await activity_finish_task
                 turn_outcome = "suppressed_by_planner_ack"
+                _log_turn_timing(turn_outcome)
+                return
+            if getattr(reply, "reply_already_sent", False):
+                if activity_finish_task is not None:
+                    await activity_finish_task
+                await text_streamer.finish(str(reply))
+                turn_outcome = "streamed_reply"
+                _mark_timing("delivery_complete")
                 _log_turn_timing(turn_outcome)
                 return
 
@@ -3901,6 +4046,16 @@ class ChatOperatorService:
             turn_outcome = "completed"
             _log_turn_timing(turn_outcome)
         finally:
+            if "activity_finish_task" in locals() and activity_finish_task is not None and not activity_finish_task.done():
+                def _consume_activity_finish_error(task) -> None:  # noqa: ANN001
+                    if task.cancelled():
+                        return
+                    try:
+                        task.exception()
+                    except Exception:
+                        logger.debug("Telegram activity finish task failed", exc_info=True)
+
+                activity_finish_task.add_done_callback(_consume_activity_finish_error)
             await self._activity_streams.unregister(conversation_id, activity_streamer)
             await _stop_typing_keepalive(typing_keepalive_task)
 

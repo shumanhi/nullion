@@ -20,11 +20,14 @@ class MessagingTurnState(TypedDict, total=False):
     ingress: adapters.MessagingIngress
     before_decision_snapshot: Any
     raw_reply: str | None
+    raw_reply_already_sent: bool
     visible_reply: str | None
     reply: str | None
+    reply_already_sent: bool
     delivery_contract: adapters.DeliveryContract
     status: Literal["running", "reply_ready", "no_reply"]
     turn_dispatch_decision: Any
+    text_delta_callback: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +35,7 @@ class MessagingTurnResult:
     reply: str | None
     delivery_contract: adapters.DeliveryContract
     status: Literal["reply_ready", "no_reply"]
+    reply_already_sent: bool = False
 
 
 def _capture_decision_snapshot_node(state: MessagingTurnState) -> dict[str, object]:
@@ -79,10 +83,15 @@ def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
     }
     if _handle_text_message_accepts_kw(handler, "turn_dispatch_decision"):
         kwargs["turn_dispatch_decision"] = state.get("turn_dispatch_decision")
+    if _handle_text_message_accepts_kw(handler, "text_delta_callback"):
+        kwargs["text_delta_callback"] = state.get("text_delta_callback")
     if _handle_text_message_accepts_kw(handler, "conversation_ingress_id"):
         kwargs["conversation_ingress_id"] = ingress.request_id or ingress.message_id
     reply = handler(**kwargs)
-    return {"raw_reply": reply}
+    return {
+        "raw_reply": reply,
+        "raw_reply_already_sent": bool(getattr(reply, "reply_already_sent", False)),
+    }
 
 
 def _finalize_reply_node(state: MessagingTurnState) -> dict[str, object]:
@@ -101,9 +110,12 @@ def _finalize_reply_node(state: MessagingTurnState) -> dict[str, object]:
         )
     reply = adapters._append_decision_fallbacks(visible_reply, fallbacks)
     adapters.save_messaging_chat_history(ingress, reply)
+    raw_reply_already_sent = bool(state.get("raw_reply_already_sent"))
+    reply_already_sent = raw_reply_already_sent and reply == str(raw_reply)
     return {
         "visible_reply": visible_reply,
         "reply": reply,
+        "reply_already_sent": reply_already_sent,
         "delivery_contract": adapters.delivery_contract_for_runtime_turn(
             getattr(state["service"], "runtime", None),
             ingress.operator_chat_id,
@@ -133,12 +145,14 @@ def run_messaging_turn_graph(
     ingress: adapters.MessagingIngress,
     *,
     turn_dispatch_decision=None,
+    text_delta_callback=None,
 ) -> MessagingTurnResult:
     final_state = _compiled_messaging_turn_graph().invoke(
         {
             "service": service,
             "ingress": ingress,
             "turn_dispatch_decision": turn_dispatch_decision,
+            "text_delta_callback": text_delta_callback,
         },
         config={"configurable": {"thread_id": ingress.request_id or ingress.operator_chat_id}},
     )
@@ -152,6 +166,7 @@ def run_messaging_turn_graph(
         reply=final_state.get("reply"),
         delivery_contract=delivery_contract,
         status=status,
+        reply_already_sent=bool(final_state.get("reply_already_sent")),
     )
 
 

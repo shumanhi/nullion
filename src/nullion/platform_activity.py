@@ -8,6 +8,7 @@ import time
 
 _PLANNER_COUNT_SUFFIX_RE = re.compile(r"\s*(?:[*•]|—|-)\s*\d+(?:\s+\S+)?\s*$", re.IGNORECASE)
 _PLANNER_PREFIX_RE = re.compile(r"^\s*planner\s+", re.IGNORECASE)
+_PLANNER_HEADING_PREFIX = "❖ PLANNER"
 _TOOL_STATUS_GLYPHS = {"✓", "→", "⊗", "⊘", "•"}
 _RUNNING_SPINNER_GLYPHS: tuple[str, ...] = ("◑", "◒", "◐", "◓")
 
@@ -224,13 +225,13 @@ def _render_platform_planner_summary(summary: str) -> str:
     first = lines[0].strip()
     if first.startswith("Planner:"):
         label = _render_platform_planner_label(first.split(":", 1)[1])
-        heading = "PLANNER"
+        heading = _PLANNER_HEADING_PREFIX
         if label:
             heading = f"{heading}  {label}"
         rest = [line.rstrip(":") if line.lstrip().startswith(("→", "->")) else line for line in lines[1:]]
         return "\n".join([heading, *rest]).strip()
     if first.casefold() == "planner":
-        return "\n".join(["PLANNER", *lines[1:]]).strip()
+        return "\n".join([_PLANNER_HEADING_PREFIX, *lines[1:]]).strip()
     return "\n".join(lines).strip()
 
 

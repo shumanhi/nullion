@@ -164,6 +164,7 @@ class RuntimeStore:
     mini_agent_runs: dict[str, MiniAgentRun] = field(default_factory=dict)
     missions: dict[str, MissionRecord] = field(default_factory=dict)
     builder_proposals: dict[str, BuilderProposalRecord] = field(default_factory=dict)
+    builder_route_observations: list[dict[str, Any]] = field(default_factory=list)
     skills: dict[str, SkillRecord] = field(default_factory=dict)
     user_facts: dict[str, UserMemoryEntry] = field(default_factory=dict)
     preferences: dict[str, UserMemoryEntry] = field(default_factory=dict)
@@ -638,6 +639,17 @@ class RuntimeStore:
 
     def list_builder_proposals(self) -> list[BuilderProposalRecord]:
         return list(self.builder_proposals.values())
+
+    def add_builder_route_observation(self, observation: dict[str, Any]) -> None:
+        if not isinstance(observation, dict):
+            return
+        from nullion.builder_routes import trim_route_observations
+
+        self.builder_route_observations.append(deepcopy(observation))
+        self.builder_route_observations = trim_route_observations(self.builder_route_observations)
+
+    def list_builder_route_observations(self) -> list[dict[str, Any]]:
+        return [deepcopy(row) for row in self.builder_route_observations]
 
     def set_skill_execution_plan(self, capsule_id: str, plan: SkillExecutionPlan) -> None:
         self.skill_execution_plans[capsule_id] = plan

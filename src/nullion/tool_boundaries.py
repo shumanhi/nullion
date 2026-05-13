@@ -140,6 +140,18 @@ def _account_boundary_fact(
     )
 
 
+def _email_send_account_target(invocation: "ToolInvocation") -> str:
+    provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+    if not provider_id:
+        try:
+            from nullion.connections import default_email_connector_provider_id
+
+            provider_id = default_email_connector_provider_id(invocation.principal_id) or ""
+        except Exception:
+            provider_id = ""
+    return f"{provider_id}:send" if provider_id else "email:send"
+
+
 def _filesystem_boundary_fact(*, tool_name: str, operation: str, raw_path: object) -> BoundaryFact | None:
     if not isinstance(raw_path, str) or not raw_path:
         return None
@@ -263,6 +275,29 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
         )
         if output_fact is not None:
             facts.append(output_fact)
+        return facts
+
+    if invocation.tool_name == "email_send":
+        facts = [
+            _account_boundary_fact(
+                tool_name=invocation.tool_name,
+                operation="send",
+                account_type="email",
+                target=_email_send_account_target(invocation),
+            )
+        ]
+        raw_paths = invocation.arguments.get("attachment_paths")
+        if isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        if isinstance(raw_paths, (list, tuple)):
+            for raw_path in raw_paths:
+                fact = _filesystem_boundary_fact(
+                    tool_name=invocation.tool_name,
+                    operation="read",
+                    raw_path=raw_path,
+                )
+                if fact is not None:
+                    facts.append(fact)
         return facts
 
     # Named account-scoped tools (email, calendar, contacts)

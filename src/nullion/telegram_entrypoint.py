@@ -627,13 +627,13 @@ def _build_runtime_service_from_settings(
         from nullion.connections import format_workspace_connections_for_prompt
         from nullion.runtime_config import format_runtime_config_for_prompt
         from nullion.skill_pack_catalog import skill_pack_access_prompt
-        from nullion.skill_pack_installer import format_enabled_skill_packs_for_prompt
-        from nullion.system_context import build_system_context_snapshot, format_system_context_for_prompt
+        from nullion.skill_pack_installer import format_compact_enabled_skill_packs_for_prompt
+        from nullion.system_context import build_system_context_snapshot, format_compact_system_context_for_prompt
         from nullion.workspace_storage import format_workspace_storage_for_prompt
 
         current_settings = _current_service_settings()
         history: list[dict] = []
-        caps_text = format_system_context_for_prompt(build_system_context_snapshot(tool_registry=tool_registry))
+        caps_text = format_compact_system_context_for_prompt(build_system_context_snapshot(tool_registry=tool_registry))
         dependency_text = format_installed_dependency_context(runtime)
         if dependency_text:
             caps_text = (caps_text + "\n\n" + dependency_text).strip()
@@ -655,9 +655,9 @@ def _build_runtime_service_from_settings(
         )
         if connections_text:
             history.append({"role": "system", "content": [{"type": "text", "text": connections_text}]})
-        skill_text = format_enabled_skill_packs_for_prompt(current_settings.enabled_skill_packs)
+        skill_text = format_compact_enabled_skill_packs_for_prompt(current_settings.enabled_skill_packs)
         access_text = (
-            skill_pack_access_prompt(current_settings.enabled_skill_packs, principal_id=conv_id)
+            skill_pack_access_prompt(current_settings.enabled_skill_packs, principal_id=conv_id, compact=True)
             if include_connector_context
             else ""
         )
@@ -863,33 +863,82 @@ def _build_runtime_service_from_settings(
             connector_provider_ids=connector_scope.provider_ids,
         )
         _record_agent_preflight("guarded_turn_start")
-        result = orchestrator.run_turn(
-            conversation_id=conv_id,
-            principal_id=conv_id,
-            user_message=prompt,
-            conversation_history=_cron_agent_history(
-                conv_id,
+        payload: dict[str, object] | None = None
+        if (
+            os.environ.get("NULLION_TASK_DECOMPOSITION_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+            and os.environ.get("NULLION_MULTI_AGENT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+            and hasattr(orchestrator, "dispatch_request_sync")
+        ):
+            try:
+                from nullion.task_decomposer import TaskDecomposer
+
+                available_tools = [
+                    str(tool.get("name", ""))
+                    for tool in execution_registry.list_tool_definitions()
+                    if tool.get("name")
+                ]
+                dag_plan = TaskDecomposer(model_client=getattr(orchestrator, "model_client", None)).plan_dag(
+                    prompt,
+                    available_tools=available_tools,
+                )
+                if getattr(dag_plan, "can_dispatch_when_requested", False):
+                    dispatch_result = orchestrator.dispatch_request_sync(
+                        conversation_id=conv_id,
+                        principal_id=conv_id,
+                        user_message=prompt,
+                        tool_registry=execution_registry,
+                        policy_store=runtime.store,
+                        approval_store=runtime.store,
+                        available_tools=available_tools,
+                        single_task_fast_path=False,
+                        dag_plan=dag_plan,
+                        preferred_group_id=planner_group_id or None,
+                    )
+                    if getattr(dispatch_result, "dispatched", True):
+                        payload = {
+                            "text": str(getattr(dispatch_result, "acknowledgment", "") or ""),
+                            "tool_results": [],
+                            "artifacts": [],
+                            "mini_agent_dispatch": True,
+                            "task_group_id": str(getattr(dispatch_result, "group_id", "") or ""),
+                            "planner_summary": str(getattr(dispatch_result, "planner_summary", "") or ""),
+                            "task_count": int(getattr(dispatch_result, "task_count", 0) or 0),
+                        }
+                        _record_agent_preflight(
+                            "mini_agent_dispatch",
+                            task_count=payload["task_count"],
+                            group_id=payload["task_group_id"],
+                        )
+            except Exception:
+                logger.debug("Telegram cron mini-agent dispatch failed; falling back to guarded turn", exc_info=True)
+        if payload is None:
+            result = orchestrator.run_turn(
+                conversation_id=conv_id,
+                principal_id=conv_id,
+                user_message=prompt,
+                conversation_history=_cron_agent_history(
+                    conv_id,
+                    tool_registry=execution_registry,
+                    include_connector_context=connector_scope.allow_connector_tools,
+                ),
                 tool_registry=execution_registry,
-                include_connector_context=connector_scope.allow_connector_tools,
-            ),
-            tool_registry=execution_registry,
-            policy_store=runtime.store,
-            approval_store=runtime.store,
-            tool_result_callback=_deliver_cron_planner_tool_activity if planner_status_preview else None,
-        )
-        _record_agent_preflight(
-            "guarded_turn_done",
-            tool_results=len(result.tool_results),
-        )
-        payload = {
-            "text": result.final_text or "",
-            "tool_results": list(result.tool_results),
-            "artifacts": list(result.artifacts),
-            "suspended_for_approval": result.suspended_for_approval,
-            "approval_id": result.approval_id,
-            "reached_iteration_limit": result.reached_iteration_limit,
-            "raw_tool_payload_blocked": getattr(result, "raw_tool_payload_blocked", False),
-        }
+                policy_store=runtime.store,
+                approval_store=runtime.store,
+                tool_result_callback=_deliver_cron_planner_tool_activity if planner_status_preview else None,
+            )
+            _record_agent_preflight(
+                "guarded_turn_done",
+                tool_results=len(result.tool_results),
+            )
+            payload = {
+                "text": result.final_text or "",
+                "tool_results": list(result.tool_results),
+                "artifacts": list(result.artifacts),
+                "suspended_for_approval": result.suspended_for_approval,
+                "approval_id": result.approval_id,
+                "reached_iteration_limit": result.reached_iteration_limit,
+                "raw_tool_payload_blocked": getattr(result, "raw_tool_payload_blocked", False),
+            }
         if (
             display_preview is None
             and planner_status_preview
@@ -907,7 +956,12 @@ def _build_runtime_service_from_settings(
                 "planner_preview_terminal_fallback_installed",
                 fallback_group_id=fallback_preview.group_id,
             )
-        if display_preview is not None and planner_group_id and callable(deliver_fn):
+        if (
+            display_preview is not None
+            and planner_group_id
+            and callable(deliver_fn)
+            and not payload.get("mini_agent_dispatch")
+        ):
             try:
                 planner_terminal_sent = True
                 deliver_fn(

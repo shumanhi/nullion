@@ -348,6 +348,7 @@ def skill_pack_access_prompt(
     enabled_pack_ids: tuple[str, ...] | list[str],
     *,
     principal_id: str | None = None,
+    compact: bool = False,
 ) -> str:
     enabled = {str(pack_id).strip().lower() for pack_id in enabled_pack_ids if str(pack_id).strip()}
     if not enabled:
@@ -359,14 +360,23 @@ def skill_pack_access_prompt(
         from nullion.connections import connection_for_principal
     except Exception:
         connection_for_principal = None
-    lines = [
-        "Skill access policy:",
-        "- Skill packs provide instructions only; account/API access requires matching tools and an allowed credential policy.",
-        "- Use a skill for account data only when its provider connection is available for this workspace or explicitly shared by admin.",
-        "- If a native account tool fails because its provider is missing or unauthorized, check enabled connector skills and active connector providers before telling the user the task cannot be done.",
-    ]
+    if compact:
+        lines = [
+            "Skill access policy: skill packs are instructions only; account data requires matching provider credentials.",
+        ]
+    else:
+        lines = [
+            "Skill access policy:",
+            "- Skill packs provide instructions only; account/API access requires matching tools and an allowed credential policy.",
+            "- Use a skill for account data only when its provider connection is available for this workspace or explicitly shared by admin.",
+            "- If a native account tool fails because its provider is missing or unauthorized, check enabled connector skills and active connector providers before telling the user the task cannot be done.",
+        ]
+    reference_only_count = 0
     for entry in entries:
         if not entry.requires_auth:
+            if compact:
+                reference_only_count += 1
+                continue
             lines.append(f"- {entry.pack_id}: reference-only skill; available to all workspaces.")
             continue
         provider_states: list[str] = []
@@ -403,7 +413,12 @@ def skill_pack_access_prompt(
             except Exception:
                 pass
         tools = ", ".join(entry.required_tools) if entry.required_tools else "provider-backed tools"
-        lines.append(f"- {entry.pack_id}: requires auth and {tools}; " + "; ".join(provider_states) + ".")
+        if compact:
+            lines.append(f"- {entry.pack_id}: auth={tools}; " + "; ".join(provider_states) + ".")
+        else:
+            lines.append(f"- {entry.pack_id}: requires auth and {tools}; " + "; ".join(provider_states) + ".")
+    if compact and reference_only_count:
+        lines.insert(1, f"- {reference_only_count} reference-only enabled skill pack(s) available without account credentials.")
     return "\n".join(lines)
 
 

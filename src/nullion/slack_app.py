@@ -15,6 +15,7 @@ from nullion.chat_attachments import is_supported_chat_file
 from nullion.config import NullionSettings, load_settings
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.events import make_event
+from nullion.latency_phases import record_surface_latency_timing
 from nullion.messaging_adapters import (
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
@@ -87,7 +88,13 @@ def _optional_event_text(value: object) -> str | None:
     return text or None
 
 
-def _handle_messaging_ingress_result_with_dispatch(service, ingress, *, turn_dispatch_decision=None):
+def _handle_messaging_ingress_result_with_dispatch(
+    service,
+    ingress,
+    *,
+    turn_dispatch_decision=None,
+    text_delta_callback=None,
+):
     try:
         parameters = inspect.signature(handle_messaging_ingress_result).parameters
     except (TypeError, ValueError):
@@ -97,11 +104,12 @@ def _handle_messaging_ingress_result_with_dispatch(service, ingress, *, turn_dis
         or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
     )
     if accepts_dispatch:
-        return handle_messaging_ingress_result(
-            service,
-            ingress,
-            turn_dispatch_decision=turn_dispatch_decision,
-        )
+        kwargs = {"turn_dispatch_decision": turn_dispatch_decision}
+        if "text_delta_callback" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            kwargs["text_delta_callback"] = text_delta_callback
+        return handle_messaging_ingress_result(service, ingress, **kwargs)
     return handle_messaging_ingress_result(service, ingress)
 
 
@@ -229,6 +237,47 @@ async def _update_slack_message(client, *, channel: str, ts: str, text: str) -> 
     except Exception:
         logger.debug("Slack working message update failed", exc_info=True)
         return False
+
+
+class _SlackTextDeltaStreamer:
+    def __init__(self, *, loop, client, channel: str, ts: str | None) -> None:
+        self._loop = loop
+        self._client = client
+        self._channel = channel
+        self._ts = ts
+        self._parts: list[str] = []
+        self._last_update_at = 0.0
+        self._last_text = ""
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
+    def emit(self, delta: str) -> None:
+        if not delta or self._client is None or not self._channel or not self._ts:
+            return
+        self._parts.append(delta)
+        text = self.text
+        now = time.monotonic()
+        if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
+            return
+        self._last_text = text
+        self._last_update_at = now
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _update_slack_message(self._client, channel=self._channel, ts=self._ts, text=_format_slack_reply(text)),
+                self._loop,
+            ).result(timeout=2)
+        except Exception:
+            logger.debug("Slack text streaming update failed", exc_info=True)
+
+    async def finish(self, final_text: str | None) -> bool:
+        text = str(final_text or "")
+        if not self._client or not self._channel or not self._ts or not text:
+            return False
+        if self._last_text == text:
+            return True
+        return await _update_slack_message(self._client, channel=self._channel, ts=self._ts, text=_format_slack_reply(text))
 
 
 async def _deliver_slack_task_status(
@@ -475,6 +524,22 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         try:
             runtime = getattr(service, "runtime", None)
             if runtime is not None:
+                try:
+                    turn_id_value = getattr(getattr(turn_registration, "decision", None), "turn_id", None)
+                except NameError:
+                    turn_id_value = None
+                record_surface_latency_timing(
+                    runtime.store,
+                    surface="slack",
+                    conversation_id=channel_id,
+                    turn_id=turn_id_value,
+                    request_id=request_id,
+                    message_id=message_id,
+                    outcome=outcome,
+                    total_ms=total_ms,
+                    phases=timing_marks,
+                    logger=logger,
+                )
                 runtime.store.add_event(
                     make_event(
                         event_type="slack.turn_timing",
@@ -548,6 +613,12 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         except Exception:
             logger.debug("Slack working message send failed", exc_info=True)
     _mark_timing("working_message")
+    text_streamer = _SlackTextDeltaStreamer(
+        loop=asyncio.get_running_loop(),
+        client=client,
+        channel=working_channel,
+        ts=working_ts,
+    )
 
     turn_registration = await GLOBAL_TURN_DISPATCH_TRACKER.register(
         ingress.operator_chat_id,
@@ -564,6 +635,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             service,
             ingress,
             turn_dispatch_decision=turn_registration.decision,
+            text_delta_callback=text_streamer.emit,
         )
         _mark_timing("handler_completed")
         if await turn_registration.is_superseded():
@@ -579,6 +651,18 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
         )
+        if getattr(turn_result, "reply_already_sent", False) and not delivery.attachments:
+            await text_streamer.finish(reply)
+            _record_slack_delivery_receipt(
+                channel=working_channel,
+                delivery=delivery,
+                transport_ok=True,
+                request_id=ingress.request_id,
+                message_id=ingress.message_id,
+            )
+            _mark_timing("delivery_complete")
+            _log_turn_timing(turn_outcome)
+            return
         reply_source = delivery.text or ""
         formatted_reply = _format_slack_reply(delivery.text or "")
         delivery_receipt_recorded = False
