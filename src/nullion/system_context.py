@@ -231,11 +231,44 @@ def format_system_context_for_prompt(snapshot: SystemContextSnapshot) -> str:
     return "\n\n".join(blocks)
 
 
+def format_compact_system_context_for_prompt(snapshot: SystemContextSnapshot) -> str:
+    """Compact stable context for chat turns that already pass full tool schemas."""
+    blocks: list[str] = []
+    installed_plugins = tuple(getattr(snapshot, "installed_plugins", ()) or ())
+    core_fallback_tool_names = tuple(getattr(snapshot, "core_fallback_tool_names", ()) or ())
+    available_tools = tuple(getattr(snapshot, "available_tools", ()) or ())
+    sections = tuple(getattr(snapshot, "sections", ()) or ())
+    if installed_plugins:
+        blocks.append("Installed plugins: " + ", ".join(installed_plugins))
+    if core_fallback_tool_names:
+        blocks.append(
+            "Core fallback tools: " + ", ".join(core_fallback_tool_names)
+        )
+    if available_tools:
+        tool_lines = []
+        for tool in available_tools:
+            suffix_parts = [str(getattr(tool, "availability", "") or "available")]
+            if getattr(tool, "requires_approval", False):
+                suffix_parts.append("approval")
+            capability_tags = tuple(getattr(tool, "capability_tags", ()) or ())
+            if capability_tags:
+                suffix_parts.append("tags=" + ",".join(str(tag) for tag in capability_tags))
+            tool_lines.append(f"- {getattr(tool, 'name', 'tool')} ({'; '.join(suffix_parts)})")
+        blocks.append("Available tool names:\n" + "\n".join(tool_lines))
+    for section in sections:
+        title = getattr(section, "title", "")
+        lines = tuple(getattr(section, "lines", ()) or ())
+        if title and lines:
+            blocks.append(f"{title}:\n" + "\n".join(f"- {line}" for line in lines))
+    return "\n\n".join(blocks)
+
+
 __all__ = [
     "CORE_FALLBACK_TOOL_NAMES",
     "SystemContextSection",
     "SystemContextSnapshot",
     "SystemContextToolSummary",
     "build_system_context_snapshot",
+    "format_compact_system_context_for_prompt",
     "format_system_context_for_prompt",
 ]

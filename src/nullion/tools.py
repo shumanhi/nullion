@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from email.message import EmailMessage
 from enum import Enum
 from fnmatch import fnmatch
 from html import unescape
@@ -25,7 +26,9 @@ import subprocess
 import tempfile
 import textwrap
 import threading
+from time import perf_counter
 from typing import Callable, Iterable, Protocol
+import base64
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode, urlparse
@@ -1062,6 +1065,28 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "required": ["url"],
             "additionalProperties": False,
         },
+        "weather_forecast": {
+            "type": "object",
+            "properties": {
+                "location_text": {
+                    "type": "string",
+                    "description": "Optional place name, address, city, or postal code to resolve before fetching forecast data.",
+                },
+                "latitude": {"type": "number", "description": "Optional decimal latitude."},
+                "longitude": {"type": "number", "description": "Optional decimal longitude."},
+                "forecast_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 7,
+                    "description": "Number of forecast days to return. Defaults to 3.",
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "Optional IANA timezone. Defaults to auto from Open-Meteo.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "connector_request": {
             "type": "object",
             "properties": {
@@ -1095,6 +1120,39 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 },
             },
             "required": ["provider_id", "url"],
+            "additionalProperties": False,
+        },
+        "email_send": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Recipient email address(es).",
+                },
+                "subject": {"type": "string", "description": "Email subject."},
+                "body": {"type": "string", "description": "Plain text email body."},
+                "cc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional CC email address(es).",
+                },
+                "bcc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional BCC email address(es).",
+                },
+                "attachment_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional local artifact/media paths to attach.",
+                },
+                "provider_id": {
+                    "type": "string",
+                    "description": "Optional connector provider id. Defaults to an active Google Mail connector.",
+                },
+            },
+            "required": ["to", "subject", "body"],
             "additionalProperties": False,
         },
         "skill_pack_read": {
@@ -2856,6 +2914,7 @@ class ToolExecutor:
         self._store.add_event(make_event("tool.invocation.started", invocation.principal_id, details))
         self._store.add_audit_record(make_audit_record("tool.invocation.started", invocation.principal_id, details))
 
+        started_at = perf_counter()
         try:
             result = self._registry.invoke(invocation)
         except Exception as exc:
@@ -2866,6 +2925,7 @@ class ToolExecutor:
                 output={"reason": "handler_exception"},
                 error=str(exc),
             )
+        duration_ms = (perf_counter() - started_at) * 1000
         result = normalize_tool_result(result)
         self._record_egress_outcome(invocation, result, egress_attempts)
         result = self._rewrite_network_denied_result_as_boundary_approval_required(invocation, result)
@@ -2899,6 +2959,31 @@ class ToolExecutor:
                 completed_details[detail_key] = str(value).strip().replace("\n", " ")[:240]
         self._store.add_event(make_event("tool.invocation.completed", invocation.principal_id, completed_details))
         self._store.add_audit_record(make_audit_record("tool.invocation.completed", invocation.principal_id, completed_details))
+        try:
+            from nullion.builder_routes import build_route_observation
+
+            observation = build_route_observation(
+                invocation=invocation,
+                result=result,
+                duration_ms=duration_ms,
+                capability_tags=getattr(spec, "capability_tags", ()) or (),
+            )
+            if observation is not None:
+                add_observation = getattr(self._store, "add_builder_route_observation", None)
+                if callable(add_observation):
+                    add_observation(observation)
+                logger.info(
+                    "tool route timing tool=%s source=%s status=%s duration_ms=%.1f reason=%s capsule_id=%s principal_id=%s",
+                    observation.get("tool_name"),
+                    observation.get("source_domain") or "unknown",
+                    observation.get("status"),
+                    float(observation.get("duration_ms") or 0.0),
+                    observation.get("reason") or "",
+                    observation.get("capsule_id") or "",
+                    observation.get("principal_id") or "",
+                )
+        except Exception:
+            logger.debug("Builder route observation failed", exc_info=True)
         return result
 
 
@@ -4680,6 +4765,223 @@ def register_web_fetch_tool(
     return registry
 
 
+def _json_get(url: str, timeout_seconds: int) -> dict[str, object]:
+    request = urllib.request.Request(url, headers={"User-Agent": "Nullion/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        payload = response.read(500_000)
+    decoded = json.loads(payload.decode("utf-8"))
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _coerce_float_arg(value: object, *, name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+
+
+def _resolve_open_meteo_location(
+    arguments: dict[str, object],
+    *,
+    json_get: Callable[[str, int], dict[str, object]],
+) -> dict[str, object]:
+    latitude = _coerce_float_arg(arguments.get("latitude"), name="latitude")
+    longitude = _coerce_float_arg(arguments.get("longitude"), name="longitude")
+    location_text = str(arguments.get("location_text") or "").strip()
+    if latitude is not None and longitude is not None:
+        return {
+            "latitude": latitude,
+            "longitude": longitude,
+            "name": location_text or f"{latitude:.4f},{longitude:.4f}",
+            "source_url": None,
+        }
+    if not location_text:
+        raise ValueError("Provide location_text or latitude and longitude.")
+    query = urlencode({"name": location_text, "count": 1, "language": "en", "format": "json"})
+    source_url = f"https://geocoding-api.open-meteo.com/v1/search?{query}"
+    payload = json_get(source_url, 10)
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise ValueError(f"Could not resolve location: {location_text}")
+    first = results[0]
+    if not isinstance(first, dict):
+        raise ValueError(f"Could not resolve location: {location_text}")
+    resolved_latitude = _coerce_float_arg(first.get("latitude"), name="latitude")
+    resolved_longitude = _coerce_float_arg(first.get("longitude"), name="longitude")
+    if resolved_latitude is None or resolved_longitude is None:
+        raise ValueError(f"Resolved location is missing coordinates: {location_text}")
+    label_parts = [
+        str(first.get("name") or "").strip(),
+        str(first.get("admin1") or "").strip(),
+        str(first.get("country") or "").strip(),
+    ]
+    label = ", ".join(part for part in label_parts if part) or location_text
+    return {
+        "latitude": resolved_latitude,
+        "longitude": resolved_longitude,
+        "name": label,
+        "country": first.get("country"),
+        "timezone": first.get("timezone"),
+        "source_url": source_url,
+    }
+
+
+def _weather_code_label(code: object) -> str:
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return "unknown"
+    labels = {
+        0: "clear sky",
+        1: "mainly clear",
+        2: "partly cloudy",
+        3: "overcast",
+        45: "fog",
+        48: "depositing rime fog",
+        51: "light drizzle",
+        53: "moderate drizzle",
+        55: "dense drizzle",
+        56: "light freezing drizzle",
+        57: "dense freezing drizzle",
+        61: "slight rain",
+        63: "moderate rain",
+        65: "heavy rain",
+        66: "light freezing rain",
+        67: "heavy freezing rain",
+        71: "slight snow",
+        73: "moderate snow",
+        75: "heavy snow",
+        77: "snow grains",
+        80: "slight rain showers",
+        81: "moderate rain showers",
+        82: "violent rain showers",
+        85: "slight snow showers",
+        86: "heavy snow showers",
+        95: "thunderstorm",
+        96: "thunderstorm with slight hail",
+        99: "thunderstorm with heavy hail",
+    }
+    return labels.get(value, f"weather code {value}")
+
+
+def _daily_open_meteo_forecast(payload: dict[str, object]) -> list[dict[str, object]]:
+    daily = payload.get("daily")
+    if not isinstance(daily, dict):
+        return []
+    dates = daily.get("time")
+    if not isinstance(dates, list):
+        return []
+    rows: list[dict[str, object]] = []
+    for index, date_value in enumerate(dates):
+        row: dict[str, object] = {"date": date_value}
+        for source_key, target_key in (
+            ("weather_code", "weather_code"),
+            ("temperature_2m_max", "temperature_max_f"),
+            ("temperature_2m_min", "temperature_min_f"),
+            ("precipitation_probability_max", "precipitation_probability_max"),
+            ("precipitation_sum", "precipitation_sum_in"),
+            ("wind_speed_10m_max", "wind_speed_max_mph"),
+            ("sunrise", "sunrise"),
+            ("sunset", "sunset"),
+        ):
+            values = daily.get(source_key)
+            if isinstance(values, list) and index < len(values):
+                row[target_key] = values[index]
+        row["summary"] = _weather_code_label(row.get("weather_code"))
+        rows.append(row)
+    return rows
+
+
+def _build_weather_forecast_handler(
+    json_get: Callable[[str, int], dict[str, object]],
+) -> ToolHandler:
+    def _handler(invocation: ToolInvocation) -> ToolResult:
+        try:
+            location = _resolve_open_meteo_location(invocation.arguments, json_get=json_get)
+            forecast_days = invocation.arguments.get("forecast_days", 3)
+            try:
+                days = min(7, max(1, int(forecast_days)))
+            except (TypeError, ValueError):
+                days = 3
+            timezone = str(invocation.arguments.get("timezone") or location.get("timezone") or "auto").strip() or "auto"
+            query = urlencode(
+                {
+                    "latitude": location["latitude"],
+                    "longitude": location["longitude"],
+                    "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max,sunrise,sunset",
+                    "temperature_unit": "fahrenheit",
+                    "wind_speed_unit": "mph",
+                    "precipitation_unit": "inch",
+                    "timezone": timezone,
+                    "forecast_days": days,
+                }
+            )
+            forecast_url = f"https://api.open-meteo.com/v1/forecast?{query}"
+            payload = json_get(forecast_url, 15)
+            output = {
+                "provider": "open-meteo",
+                "source_url": forecast_url,
+                "geocoding_source_url": location.get("source_url"),
+                "location": {
+                    "name": location.get("name"),
+                    "country": location.get("country"),
+                    "latitude": location.get("latitude"),
+                    "longitude": location.get("longitude"),
+                    "timezone": payload.get("timezone") or timezone,
+                },
+                "current": payload.get("current") if isinstance(payload.get("current"), dict) else {},
+                "daily": _daily_open_meteo_forecast(payload),
+                "units": {
+                    "temperature": "fahrenheit",
+                    "wind_speed": "mph",
+                    "precipitation": "inch",
+                },
+            }
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", output)
+        except Exception as exc:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {"reason": "weather_forecast_failed"},
+                str(exc),
+            )
+
+    return _handler
+
+
+def register_weather_forecast_tool(
+    registry: ToolRegistry,
+    *,
+    json_get: Callable[[str, int], dict[str, object]] | None = None,
+) -> ToolRegistry:
+    try:
+        registry.get_spec("weather_forecast")
+        return registry
+    except KeyError:
+        pass
+    registry.register(
+        ToolSpec(
+            name="weather_forecast",
+            description=(
+                "Fetch current and multi-day public forecast data from Open-Meteo using structured "
+                "coordinates or a resolvable location. Use for read-only weather forecast questions "
+                "before browser navigation or general web search when this tool is available."
+            ),
+            risk_level=ToolRiskLevel.LOW,
+            side_effect_class=ToolSideEffectClass.READ,
+            requires_approval=False,
+            timeout_seconds=20,
+            capability_tags=("public_web", "weather", "forecast"),
+        ),
+        _build_weather_forecast_handler(json_get or _json_get),
+    )
+    return registry
+
+
 
 def _build_kernel_tool_registry(
     *,
@@ -4833,6 +5135,8 @@ def _build_kernel_tool_registry(
         else _env_flag("NULLION_DIRECT_WEB_FETCH_ENABLED", default=False)
     ):
         register_web_fetch_tool(registry)
+    if _env_flag("NULLION_WEB_ACCESS_ENABLED"):
+        register_weather_forecast_tool(registry)
     if _connector_access_enabled():
         register_connector_plugin(registry)
     if _env_flag("NULLION_SKILL_PACK_ACCESS_ENABLED", default=False):
@@ -5039,27 +5343,47 @@ def _connector_credential_candidate_names(connection: object | None, provider_id
 def register_connector_plugin(registry: ToolRegistry) -> None:
     try:
         registry.get_spec("connector_request")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="connector_request",
+                description=(
+                    "Make an HTTP request to an installed connector/API gateway using the current workspace's "
+                    "configured connection credential. GET/HEAD are always read-only; POST, PUT, PATCH, and "
+                    "DELETE require that connection's permission mode to be read_write. Use enabled connector "
+                    "skill instructions, keep requests under that provider's configured base URL, and never "
+                    "reveal the credential value. Use public web/browser tools for generic public URLs instead."
+                ),
+                risk_level=ToolRiskLevel.HIGH,
+                side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
+                requires_approval=False,
+                timeout_seconds=20,
+                capability_tags=("connector",),
+            ),
+            _build_connector_request_handler(),
+        )
+    try:
+        registry.get_spec("email_send")
         return
     except KeyError:
         pass
     registry.mark_plugin_installed("connector_plugin")
     registry.register(
         ToolSpec(
-            name="connector_request",
+            name="email_send",
             description=(
-                "Make an HTTP request to an installed connector/API gateway using the current workspace's "
-                "configured connection credential. GET/HEAD are always read-only; POST, PUT, PATCH, and "
-                "DELETE require that connection's permission mode to be read_write. Use enabled connector "
-                "skill instructions, keep requests under that provider's configured base URL, and never "
-                "reveal the credential value. Use public web/browser tools for generic public URLs instead."
+                "Send a plain-text email, optionally with local artifact/media attachments, through an active "
+                "write-capable Google Mail connector. Use this for actual email delivery; use connector_request "
+                "only for lower-level connector APIs."
             ),
             risk_level=ToolRiskLevel.HIGH,
             side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
             requires_approval=False,
             timeout_seconds=20,
-            capability_tags=("connector",),
+            capability_tags=("email", "connector"),
         ),
-        _build_connector_request_handler(),
+        _build_connector_email_send_handler(),
     )
 
 
@@ -5104,6 +5428,78 @@ def _connector_request_method(raw_method: object) -> str:
 def _connector_connection_allows_write(connection: object | None) -> bool:
     mode = str(getattr(connection, "permission_mode", "read") or "read").strip().lower().replace("-", "_")
     return mode in {"write", "read_write", "readwrite", "rw", "read_and_write"}
+
+
+def _string_list_argument(raw_value: object) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        value = raw_value.strip()
+        return [value] if value else []
+    if isinstance(raw_value, (list, tuple)):
+        values: list[str] = []
+        for item in raw_value:
+            value = str(item or "").strip()
+            if value:
+                values.append(value)
+        return values
+    value = str(raw_value or "").strip()
+    return [value] if value else []
+
+
+def _default_email_connector_provider_id(principal_id: str | None) -> str:
+    try:
+        from nullion.connections import default_email_connector_provider_id
+
+        provider_id = default_email_connector_provider_id(principal_id)
+        if provider_id:
+            return provider_id
+    except Exception:
+        pass
+    raise RuntimeError("No active Google Mail connector is available for this workspace/principal.")
+
+
+def _email_send_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
+    base_urls = _connector_allowed_base_urls(connection, provider_id)
+    for base_url in base_urls:
+        parsed = urlparse(base_url)
+        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
+            return f"{parsed.scheme}://{parsed.netloc}/google-mail/gmail/v1/users/me/messages/send"
+    return "https://api.maton.ai/google-mail/gmail/v1/users/me/messages/send"
+
+
+def _email_message_for_invocation(invocation: ToolInvocation) -> tuple[EmailMessage, list[str]]:
+    recipients = _string_list_argument(invocation.arguments.get("to"))
+    if not recipients:
+        raise ValueError("Missing required argument: to")
+    subject = str(invocation.arguments.get("subject") or "").strip()
+    body = str(invocation.arguments.get("body") or "")
+    msg = EmailMessage()
+    msg["To"] = ", ".join(recipients)
+    cc = _string_list_argument(invocation.arguments.get("cc"))
+    bcc = _string_list_argument(invocation.arguments.get("bcc"))
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    if bcc:
+        msg["Bcc"] = ", ".join(bcc)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    attached_paths: list[str] = []
+    for raw_path in _string_list_argument(invocation.arguments.get("attachment_paths")):
+        resolved = Path(_resolve_virtual_workspace_path(raw_path, principal_id=invocation.principal_id)).expanduser()
+        if not resolved.exists() or not resolved.is_file():
+            raise FileNotFoundError(f"Attachment path does not exist or is not a file: {raw_path}")
+        content_type, _encoding = mimetypes.guess_type(str(resolved))
+        maintype, subtype = (content_type or "application/octet-stream").split("/", 1)
+        msg.add_attachment(
+            resolved.read_bytes(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=resolved.name,
+        )
+        attached_paths.append(str(resolved))
+    return msg, attached_paths
 
 
 def _connector_request_payload(invocation: ToolInvocation, method: str) -> tuple[bytes | None, dict[str, str]]:
@@ -5316,6 +5712,78 @@ def _build_connector_request_handler() -> ToolHandler:
             }
             try:
                 output["json"] = json.loads(body)
+            except Exception:
+                output["text"] = body[:20000]
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output=output,
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"provider_id": provider_id},
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_email_send_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_email_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            if not _connector_connection_allows_write(connection):
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"provider_id": provider_id, "permission_mode": "read"},
+                    error=(
+                        f"{provider_id} is configured as read-only for email_send. "
+                        "Change this connection's permission mode to read_write in Settings > Users > Connections "
+                        "before sending email."
+                    ),
+                )
+            message, attached_paths = _email_message_for_invocation(invocation)
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+            endpoint = _email_send_endpoint_for_provider(connection, provider_id)
+            url = _connector_request_url(endpoint, None, connection, provider_id)
+            resolution = _resolve_web_fetch_resolution(url)
+            payload = json.dumps({"raw": raw_message}).encode("utf-8")
+            headers = _connector_request_headers(connection, provider_id)
+            headers["Content-Type"] = "application/json"
+            request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            opener = _build_web_fetch_opener()
+            with _pinned_web_fetch_resolution(resolution):
+                with opener.open(request, timeout=20) as response:
+                    status_code = getattr(response, "status", 200)
+                    content_type = response.headers.get_content_type()
+                    body = response.read(1_000_000).decode("utf-8", "ignore")
+            output: dict[str, object] = {
+                "url": url,
+                "provider_id": provider_id,
+                "method": "POST",
+                "status_code": status_code,
+                "content_type": content_type,
+                "to": _string_list_argument(invocation.arguments.get("to")),
+                "subject": str(invocation.arguments.get("subject") or "").strip(),
+                "attachment_count": len(attached_paths),
+                "attachment_paths": attached_paths,
+            }
+            try:
+                parsed_json = json.loads(body)
+                if isinstance(parsed_json, dict):
+                    output["json"] = parsed_json
+                else:
+                    output["json"] = parsed_json
             except Exception:
                 output["text"] = body[:20000]
             return ToolResult(
@@ -6829,10 +7297,12 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
     def _foreground_cron_status_text(job: object, status: object) -> str:
         normalized = str(status or "").strip()
         name = str(getattr(job, "name", "") or "cron").strip()
+        if normalized in {"sent", "saved"}:
+            return f"Manual scheduled task run started: {name}. The result was delivered to the configured destination."
         if normalized == "silent":
             return "Cron ran successfully; no output was produced."
         if normalized == "deferred":
-            return "Cron started; the result will be delivered to this chat when ready."
+            return f"Manual scheduled task run started: {name}. The result will be delivered to this chat when ready."
         return ""
 
     def _call_cron_runner(runner: Callable[..., str | dict[str, object] | None], job: object, invocation: ToolInvocation):
@@ -7012,7 +7482,7 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         from nullion.response_fulfillment_contract import guaranteed_user_visible_text
 
         delivery_status = runner_output.get("cron_delivery_status") if isinstance(runner_output, dict) else ""
-        foreground_reply_suppressed = str(delivery_status or "").strip() in {"sent", "saved"}
+        foreground_reply_suppressed = False
         result_text = (
             ""
             if foreground_reply_suppressed
@@ -7053,6 +7523,7 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
             output["foreground_reply_suppressed"] = True
         if delivery_status:
             output["delivery_status"] = str(delivery_status)
+            output["cron_delivery_status"] = str(delivery_status)
         if (
             isinstance(runner_output, dict)
             and str(delivery_status or "").strip() == "deferred"
@@ -7245,6 +7716,7 @@ __all__ = [
     "register_media_plugin",
     "register_search_plugin",
     "register_reminder_tools",
+    "register_weather_forecast_tool",
     "register_web_extension",
     "register_workspace_plugin",
 ]

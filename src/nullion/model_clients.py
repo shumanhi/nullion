@@ -5,9 +5,10 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 import json
+import logging
 import os
 import time as _time
-from typing import Any
+from typing import Any, Callable
 
 try:  # pragma: no cover - import guard
     from openai import OpenAI
@@ -23,6 +24,8 @@ try:  # pragma: no cover - import guard
     import httpx as _httpx
 except Exception:  # pragma: no cover - import guard
     _httpx = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 def _image_block_data_url(block: dict[str, Any]) -> str | None:
@@ -483,7 +486,10 @@ class OpenAIChatCompletionsModelClient:
         max_tokens: int | None = None,
         system: str | None = None,
         timeout: float | None = None,
+        text_delta_callback: Callable[[str], None] | None = None,
     ):
+        if text_delta_callback is not None:
+            logger.debug("streaming_unavailable provider=openai_chat_completions model=%s", self.model)
         final_max_tokens = self.max_tokens if max_tokens is None else max_tokens
         # Only attach `tools` / `tool_choice` when we actually have tools.
         # OpenRouter's provider routing treats `tool_choice="auto"` as a
@@ -612,7 +618,10 @@ class AnthropicMessagesModelClient:
         max_tokens: int = 4096,
         system: str | None = None,
         timeout: float | None = None,
+        text_delta_callback: Callable[[str], None] | None = None,
     ):
+        if text_delta_callback is not None:
+            logger.debug("streaming_unavailable provider=anthropic_messages model=%s", self.model)
         extracted_system, serialized_messages = self._serialize_messages(list(messages))
         system_text = system or extracted_system
         final_max_tokens = self.max_tokens if max_tokens is None else max_tokens
@@ -815,6 +824,7 @@ class CodexResponsesModelClient:
         max_tokens: int | None = None,
         system: str | None = None,
         timeout: float | None = None,
+        text_delta_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         final_max_tokens = self.max_tokens if max_tokens is None else max_tokens
         if _httpx is None:  # pragma: no cover
@@ -906,7 +916,13 @@ class CodexResponsesModelClient:
                             break
 
                         if etype == "response.output_text.delta":
-                            text_parts.append(ev.get("delta", ""))
+                            delta = ev.get("delta", "")
+                            text_parts.append(delta)
+                            if text_delta_callback is not None and delta:
+                                try:
+                                    text_delta_callback(delta)
+                                except Exception:
+                                    logger.debug("Codex Responses text delta callback failed", exc_info=True)
                         elif etype in {
                             "response.reasoning_summary_text.delta",
                             "response.reasoning_text.delta",

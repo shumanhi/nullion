@@ -773,6 +773,27 @@ def format_installed_dependency_context(runtime: Any) -> str:
     return "\n".join([*header, *lines])
 
 
+def installed_dependency_context_signature(runtime: Any) -> tuple[object, ...]:
+    """Return a stable fingerprint for installed dependency prompt context."""
+
+    records = installed_dependency_context(runtime)
+    signature_rows: list[tuple[object, ...]] = []
+    for record in records:
+        signature_rows.append(
+            (
+                str(record.get("package") or ""),
+                str(record.get("import_name") or ""),
+                str(record.get("requirement") or ""),
+                str(record.get("installed_version") or ""),
+                str(record.get("summary") or ""),
+                str(record.get("docs_url") or ""),
+                str(record.get("github_url") or ""),
+                str(record.get("license") or ""),
+            )
+        )
+    return tuple(sorted(signature_rows))
+
+
 def create_custom_dependency_builder_proposal(
     runtime: Any,
     *,
@@ -925,6 +946,7 @@ __all__ = [
     "install_capability_dependency",
     "install_dependency",
     "installed_dependency_context",
+    "installed_dependency_context_signature",
     "propose_missing_dependencies_from_tool_results",
     "propose_missing_dependency",
     "resolve_dependency_spec",

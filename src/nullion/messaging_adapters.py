@@ -23,7 +23,7 @@ from nullion.artifacts import (
 from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
 from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, plan_attachment_format
-from nullion.builder import builder_proposal_acceptance_benefit
+from nullion.builder import format_builder_proposal_notification
 from nullion.chat_attachments import guess_media_type
 from nullion.chat_text import make_markdown_tables_chat_readable
 from nullion.config import NullionSettings
@@ -528,27 +528,7 @@ def _new_builder_proposal_text_fallbacks(runtime, before_ids: frozenset[str]) ->
         return ()
     fallbacks: list[str] = []
     for record in proposals:
-        proposal_id = str(getattr(record, "proposal_id", "") or "")
-        proposal = getattr(record, "proposal", None)
-        title = str(getattr(proposal, "title", "") or "Builder proposal")
-        summary = str(getattr(proposal, "summary", "") or "")
-        lines = [
-            "Builder proposal pending",
-            f"ID: {proposal_id}",
-            f"Title: {title}",
-        ]
-        if summary:
-            lines.append(f"Summary: {summary}")
-        if proposal is not None:
-            lines.append(builder_proposal_acceptance_benefit(proposal))
-        lines.extend([
-            "",
-            f"Inspect: /proposal {proposal_id}",
-            f"Accept: /accept-proposal {proposal_id}",
-            f"Reject: /reject-proposal {proposal_id}",
-            f"Archive: /archive-proposal {proposal_id}",
-        ])
-        fallbacks.append("\n".join(lines))
+        fallbacks.append(format_builder_proposal_notification(record))
     return tuple(fallbacks)
 
 
@@ -649,10 +629,21 @@ def _append_decision_fallbacks(reply: str | None, fallbacks: tuple[str, ...]) ->
     return f"{text}\n\n{suffix}" if text else suffix
 
 
-def handle_messaging_ingress_result(service, ingress: MessagingIngress, *, turn_dispatch_decision=None):
+def handle_messaging_ingress_result(
+    service,
+    ingress: MessagingIngress,
+    *,
+    turn_dispatch_decision=None,
+    text_delta_callback=None,
+):
     from nullion.messaging_turn_graph import run_messaging_turn_graph
 
-    return run_messaging_turn_graph(service, ingress, turn_dispatch_decision=turn_dispatch_decision)
+    return run_messaging_turn_graph(
+        service,
+        ingress,
+        turn_dispatch_decision=turn_dispatch_decision,
+        text_delta_callback=text_delta_callback,
+    )
 
 
 def handle_messaging_ingress(service, ingress: MessagingIngress, *, turn_dispatch_decision=None) -> str | None:

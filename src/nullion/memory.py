@@ -57,6 +57,19 @@ class _MemoryCaptureState(TypedDict, total=False):
     candidate: MemoryCandidate
 
 
+_EXPLICIT_REMEMBER_RE = re.compile(
+    r"^\s*(?:please\s+)?remember(?:\s+(?:this|that))?\s*(?:[:,\-]\s*|\s+)(?P<fact>.+?)\s*$",
+    re.I,
+)
+_DIRECT_MEMORY_FIELD_RE = re.compile(
+    r"^\s*(?P<key>[A-Za-z][A-Za-z0-9 _.\-/]{0,60})\s*(?:=|:)\s*(?P<value>.+?)\s*$"
+)
+_SECRET_OR_TOKEN_RE = re.compile(
+    r"\b(?:api[_ -]?key|bearer|password|secret|token|sk-[A-Za-z0-9_-]{12,})\b",
+    re.I,
+)
+
+
 def _slug_key(value: str, *, default: str = "memory") -> str:
     key = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     return key[:60] or default
@@ -138,7 +151,26 @@ def _memory_detect_candidates_node(state: _MemoryCaptureState) -> dict[str, obje
     stripped = state.get("stripped") or ""
     if not stripped:
         return {"candidate": MemoryCandidate()}
-    return {"candidate": MemoryCandidate()}
+    # This parser is intentionally scoped to the explicit-memory capture path.
+    # It does not route product behavior or split tasks; it only extracts the
+    # payload from a direct memory request that has already reached this graph.
+    match = _EXPLICIT_REMEMBER_RE.match(stripped)
+    if not match:
+        return {"candidate": MemoryCandidate()}
+    fact = match.group("fact").strip().strip("\"'")
+    if not fact or _SECRET_OR_TOKEN_RE.search(fact):
+        return {"candidate": MemoryCandidate(is_remember_request=True)}
+    field_match = _DIRECT_MEMORY_FIELD_RE.match(fact)
+    if field_match:
+        return {
+            "candidate": MemoryCandidate(
+                remember_fact=fact,
+                field_key=field_match.group("key").strip(),
+                field_value=field_match.group("value").strip().strip("\"'"),
+                is_remember_request=True,
+            )
+        }
+    return {"candidate": MemoryCandidate(remember_fact=fact, is_remember_request=True)}
 
 
 def _memory_zip_node(state: _MemoryCaptureState) -> dict[str, object]:
@@ -177,13 +209,26 @@ def _memory_remember_field_node(state: _MemoryCaptureState) -> dict[str, object]
     if not fact:
         return {}
     written = list(state.get("written") or [])
+    key = candidate.field_key
+    value = candidate.field_value
+    if key and value and _slug_key(key) not in {"zip", "zip_code"}:
+        written.append(
+            remember_text_fact(
+                state["store"],
+                owner=state["owner"],
+                key=key,
+                value=value,
+                source=state["source"],
+                kind=UserMemoryKind.PREFERENCE,
+            )
+        )
     return {"written": written}
 
 
 def _memory_freeform_fact_node(state: _MemoryCaptureState) -> dict[str, object]:
     candidate = state.get("candidate") or MemoryCandidate()
     fact = candidate.remember_fact
-    if not fact or candidate.zip_code:
+    if not fact or candidate.zip_code or candidate.field_key:
         return {}
     written = list(state.get("written") or [])
     entry = UserMemoryEntry(

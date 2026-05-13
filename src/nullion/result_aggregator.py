@@ -181,10 +181,15 @@ class ResultAggregator:
             return
         self._completed_groups.add(group.group_id)
         recovered_artifacts = finalize_delegated_artifacts(group)
+        preverified_artifacts = _artifact_paths_for_group_delivery(
+            group,
+            recovered_artifacts,
+            summary=None,
+        )
         summary = (
             _artifact_recovery_summary(group, recovered_artifacts)
             if recovered_artifacts
-            else await self._generate_summary(group)
+            else await self._generate_summary(group, deliverable_artifacts=preverified_artifacts)
         )
         requested_extension = _requested_attachment_extension_for_group(group, model_client=self._model_client)
         deliverable_artifacts = _artifact_paths_for_group_delivery(
@@ -208,7 +213,7 @@ class ResultAggregator:
         # Clean up group state.
         self._group_state.pop(gs.group_id, None)
 
-    async def _generate_summary(self, group: TaskGroup) -> str:
+    async def _generate_summary(self, group: TaskGroup, *, deliverable_artifacts: list[str] | None = None) -> str:
         """One-shot LLM call to synthesize a coherent final reply."""
         if self._model_client is None:
             return self._fallback_summary(group)
@@ -222,9 +227,22 @@ class ResultAggregator:
             else:
                 task_summaries.append(f"— {task.title}: (no result)")
 
+        verified_artifacts = [
+            str(path)
+            for path in (deliverable_artifacts or ())
+            if isinstance(path, str) and path.strip()
+        ]
+        artifact_context = ""
+        if verified_artifacts:
+            artifact_context = (
+                "\n\nRuntime-verified deliverable artifacts that will be attached:\n"
+                + "\n".join(f"- {path}" for path in verified_artifacts)
+                + "\nDo not say no artifact can be attached when this list is non-empty."
+            )
         prompt = (
             f"Original request: {group.original_message}\n\n"
             + "\n".join(task_summaries)
+            + artifact_context
         )
         try:
             response = self._model_client.create(

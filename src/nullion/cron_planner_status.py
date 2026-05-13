@@ -16,6 +16,7 @@ from pathlib import Path
 import time
 from typing import Any
 
+from nullion import runtime_cache
 from nullion.task_decomposer import TaskDecomposer
 from nullion.task_queue import TaskGroup, TaskPriority, TaskRecord, TaskStatus, make_group_id, make_task_id
 from nullion.task_status_format import format_task_status_line, format_task_status_summary
@@ -59,6 +60,9 @@ class _CachedPreviewEntry:
 
 _PREVIEW_CACHE: dict[tuple[str, tuple[str, ...]], _CachedPreviewEntry] = {}
 _PERSIST_CACHE_LOADED = False
+_PREVIEW_CACHE_NAMESPACE = "cron.planner_preview"
+_PREVIEW_CACHE_MESSAGE_NAMESPACE = "cron.planner_preview.message"
+_PREVIEW_CACHE_VERSION = "v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,10 +462,13 @@ def _load_persistent_preview_cache() -> None:
             template = _cached_template_from_payload(template_raw)
             if template is None:
                 continue
-            _PREVIEW_CACHE[(user_message, tools)] = _CachedPreviewEntry(
+            key = (user_message, tools)
+            entry = _CachedPreviewEntry(
                 created_at=created_at,
                 template=template,
             )
+            _PREVIEW_CACHE[key] = entry
+            _shared_preview_cache_set(key, entry)
         except Exception:
             logger.debug("cron planner preview persistent cache item parse failed", exc_info=True)
             continue
@@ -485,6 +492,89 @@ def _persist_preview_cache() -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     except Exception:
         logger.debug("cron planner preview persistent cache write failed", exc_info=True)
+
+
+def _preview_cache_entry_to_payload(entry: _CachedPreviewEntry) -> dict[str, object]:
+    return {
+        "created_at": entry.created_at.isoformat(),
+        "template": _cached_template_to_payload(entry.template),
+    }
+
+
+def _preview_cache_entry_from_payload(payload: object) -> _CachedPreviewEntry | None:
+    if not isinstance(payload, dict):
+        return None
+    template = _cached_template_from_payload(payload.get("template"))
+    if template is None:
+        return None
+    created_at_raw = str(payload.get("created_at") or "")
+    try:
+        created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else datetime.now(timezone.utc)
+    except ValueError:
+        created_at = datetime.now(timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return _CachedPreviewEntry(created_at=created_at, template=template)
+
+
+def _shared_preview_cache_get(key: tuple[str, tuple[str, ...]]) -> _CachedPreviewEntry | None:
+    ttl_seconds = _preview_cache_ttl_seconds()
+    cached = runtime_cache.get_json(
+        _PREVIEW_CACHE_NAMESPACE,
+        [key[0], list(key[1])],
+        version=_PREVIEW_CACHE_VERSION,
+        ttl_seconds=ttl_seconds if ttl_seconds > 0 else None,
+        persistent=True,
+    )
+    if not cached.hit:
+        return None
+    entry = _preview_cache_entry_from_payload(cached.value)
+    if entry is None:
+        return None
+    return entry
+
+
+def _shared_preview_cache_get_by_message(user_message: str, *, subject: str = "") -> _CachedPreviewEntry | None:
+    ttl_seconds = _preview_cache_ttl_seconds()
+    for candidate in _preview_cache_message_candidates(user_message, subject=subject):
+        cached = runtime_cache.get_json(
+            _PREVIEW_CACHE_MESSAGE_NAMESPACE,
+            [candidate],
+            version=_PREVIEW_CACHE_VERSION,
+            ttl_seconds=ttl_seconds if ttl_seconds > 0 else None,
+            persistent=True,
+        )
+        if not cached.hit:
+            continue
+        entry = _preview_cache_entry_from_payload(cached.value)
+        if entry is not None:
+            return entry
+    return None
+
+
+def _shared_preview_cache_set(key: tuple[str, tuple[str, ...]], entry: _CachedPreviewEntry) -> None:
+    payload = _preview_cache_entry_to_payload(entry)
+    ttl_seconds = _preview_cache_ttl_seconds()
+    ttl = ttl_seconds if ttl_seconds > 0 else None
+    runtime_cache.set_json(
+        _PREVIEW_CACHE_NAMESPACE,
+        [key[0], list(key[1])],
+        payload,
+        version=_PREVIEW_CACHE_VERSION,
+        ttl_seconds=ttl,
+        persistent=True,
+        max_entries=_PREVIEW_CACHE_MAX_ENTRIES,
+    )
+    for candidate in _preview_cache_message_candidates(key[0], subject=entry.template.subject):
+        runtime_cache.set_json(
+            _PREVIEW_CACHE_MESSAGE_NAMESPACE,
+            [candidate],
+            payload,
+            version=_PREVIEW_CACHE_VERSION,
+            ttl_seconds=ttl,
+            persistent=True,
+            max_entries=_PREVIEW_CACHE_MAX_ENTRIES,
+        )
 
 
 def _cached_template_to_payload(template: _CachedPreviewTemplate) -> dict[str, object]:
@@ -560,6 +650,10 @@ def _preview_cache_get(
     ttl_seconds = _preview_cache_ttl_seconds()
     entry = _PREVIEW_CACHE.get(key)
     if entry is None:
+        entry = _shared_preview_cache_get(key)
+        if entry is not None:
+            _PREVIEW_CACHE[key] = entry
+    if entry is None:
         return None
     if ttl_seconds > 0 and datetime.now(timezone.utc) - entry.created_at > timedelta(seconds=ttl_seconds):
         _PREVIEW_CACHE.pop(key, None)
@@ -583,6 +677,9 @@ def _preview_cache_get_by_message(user_message: str, *, subject: str = "") -> _C
             _persist_preview_cache()
             continue
         return entry.template
+    shared_entry = _shared_preview_cache_get_by_message(user_message, subject=subject)
+    if shared_entry is not None:
+        return shared_entry.template
     return None
 
 
@@ -590,8 +687,10 @@ def _preview_cache_set(
     key: tuple[str, tuple[str, ...]],
     template: _CachedPreviewTemplate,
 ) -> None:
-    _PREVIEW_CACHE[key] = _CachedPreviewEntry(created_at=datetime.now(timezone.utc), template=template)
+    entry = _CachedPreviewEntry(created_at=datetime.now(timezone.utc), template=template)
+    _PREVIEW_CACHE[key] = entry
     _trim_preview_cache()
+    _shared_preview_cache_set(key, entry)
     _persist_preview_cache()
 
 
