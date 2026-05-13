@@ -178,6 +178,25 @@ class RuntimeStore:
     conversation_commits: dict[str, set[str]] = field(default_factory=dict)
     conversation_ingress_ids: dict[str, set[str]] = field(default_factory=dict)
     conversation_events: list[dict[str, Any]] = field(default_factory=list)
+    _conversation_events_by_conversation: dict[str, list[dict[str, Any]]] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        self._rebuild_conversation_event_index()
+
+    def _rebuild_conversation_event_index(self) -> None:
+        index: dict[str, list[dict[str, Any]]] = {}
+        for event in self.conversation_events:
+            if not isinstance(event, dict):
+                continue
+            conversation_id = event.get("conversation_id")
+            if not isinstance(conversation_id, str):
+                continue
+            index.setdefault(conversation_id, []).append(event)
+        self._conversation_events_by_conversation = index
+
+    def set_conversation_events(self, events: list[dict[str, Any]]) -> None:
+        self.conversation_events = events
+        self._rebuild_conversation_event_index()
 
     def add_capsule(self, capsule: IntentCapsule) -> None:
         self.capsules[capsule.capsule_id] = capsule
@@ -452,22 +471,79 @@ class RuntimeStore:
         return set(self.conversation_ingress_ids.get(conversation_id, set()))
 
     def add_conversation_event(self, event: dict[str, Any]) -> None:
-        self.conversation_events.append(_normalize_conversation_event_record(event))
+        normalized = _normalize_conversation_event_record(event)
+        self.conversation_events.append(normalized)
+        conversation_id = normalized.get("conversation_id")
+        if isinstance(conversation_id, str):
+            self._conversation_events_by_conversation.setdefault(conversation_id, []).append(normalized)
 
     def list_conversation_events(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
         if conversation_id is None:
             events = self.conversation_events
         else:
-            events = [
-                event
-                for event in self.conversation_events
-                if event.get("conversation_id") == conversation_id
-            ]
+            events = self._conversation_events_by_conversation.get(conversation_id, [])
         return [deepcopy(event) for event in events]
 
-    def list_conversation_chat_turns(self, conversation_id: str) -> list[dict[str, str]]:
+    def list_recent_conversation_events(
+        self,
+        conversation_id: str | None = None,
+        *,
+        event_type: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        selected: list[dict[str, Any]] = []
+        events = self.conversation_events if conversation_id is None else self._conversation_events_by_conversation.get(
+            conversation_id, []
+        )
+        for event in reversed(events):
+            if event_type is not None and event.get("event_type") != event_type:
+                continue
+            selected.append(deepcopy(event))
+            if len(selected) >= limit:
+                break
+        selected.reverse()
+        return selected
+
+    def list_recent_conversation_events_after_reset(
+        self,
+        conversation_id: str,
+        *,
+        event_type: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        selected: list[dict[str, Any]] = []
+        for event in reversed(self._conversation_events_by_conversation.get(conversation_id, [])):
+            if event.get("event_type") == "conversation.session_reset":
+                break
+            if event_type is not None and event.get("event_type") != event_type:
+                continue
+            selected.append(deepcopy(event))
+            if len(selected) >= limit:
+                break
+        selected.reverse()
+        return selected
+
+    def list_conversation_chat_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, str]]:
         chat_turns: list[dict[str, str]] = []
-        for event in self.list_conversation_events(conversation_id):
+        events = (
+            self.list_recent_conversation_events_after_reset(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=limit,
+            )
+            if limit is not None
+            else self.list_conversation_events(conversation_id)
+        )
+        for event in events:
             if event.get("event_type") == "conversation.session_reset":
                 chat_turns = []
                 continue

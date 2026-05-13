@@ -19,6 +19,22 @@ def _default_credentials_path() -> Path:
 
 _CREDENTIALS_PATH = _default_credentials_path()
 _DEFAULT_CREDENTIALS_PATH = _CREDENTIALS_PATH
+_CREDENTIALS_CACHE_KEY: tuple[str, tuple[int, int] | None, str, tuple[int, int] | None] | None = None
+_CREDENTIALS_CACHE_VALUE: dict[str, object] | None = None
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _credential_cache_key() -> tuple[str, tuple[int, int] | None, str, tuple[int, int] | None]:
+    path = _credentials_path()
+    db_path = path.with_name("runtime.db")
+    return (str(path), _file_signature(path), str(db_path), _file_signature(db_path))
 
 
 def _credentials_path() -> Path:
@@ -56,13 +72,21 @@ def _env_enabled(name: str, default: bool = True) -> bool:
 
 
 def _load_credentials() -> dict[str, object]:
+    global _CREDENTIALS_CACHE_KEY
+    global _CREDENTIALS_CACHE_VALUE
+    cache_key = _credential_cache_key()
+    if cache_key == _CREDENTIALS_CACHE_KEY and _CREDENTIALS_CACHE_VALUE is not None:
+        return _CREDENTIALS_CACHE_VALUE
     try:
         from nullion.credential_store import migrate_credentials_json_to_db
 
         payload = migrate_credentials_json_to_db(_credentials_path(), db_path=_credentials_path().with_name("runtime.db"))
     except Exception:
         return {}
-    return payload if isinstance(payload, dict) else {}
+    credentials = payload if isinstance(payload, dict) else {}
+    _CREDENTIALS_CACHE_KEY = cache_key
+    _CREDENTIALS_CACHE_VALUE = credentials
+    return credentials
 
 
 def _first_model_entry(value: object) -> str:

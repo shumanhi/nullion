@@ -1754,6 +1754,8 @@ class AgentOrchestrator:
     def set_deliver_fn(self, fn: Any) -> None:
         """Set the callback used by the result aggregator to deliver text."""
         self._deliver_fn = fn
+        if self._result_aggregator is not None:
+            self._result_aggregator._deliver_fn = fn
 
     def set_checkpoint_fn(self, fn: Any) -> None:
         """Set the callback used to persist delegated-task state transitions."""

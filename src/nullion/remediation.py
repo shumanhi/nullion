@@ -151,6 +151,16 @@ register_playbook(RemediationPlaybook(
 ))
 
 register_playbook(RemediationPlaybook(
+    service_id="manual_cron_monitor",
+    recommendation_code="monitor_manual_cron",
+    summary="A manual scheduled task is still running",
+    issue_type=HealthIssueType.STALLED,
+    button_labels=["Inspect run", "Cancel run", "Retry workflow"],
+    button_commands=["doctor:inspect_run", "doctor:cancel_run", "doctor:retry_workflow"],
+    auto_heal_fn=None,
+))
+
+register_playbook(RemediationPlaybook(
     service_id="missing_capsule_reference",
     recommendation_code="repair_missing_capsule_reference",
     summary="A scheduled task references a missing capsule",

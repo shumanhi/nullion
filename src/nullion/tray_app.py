@@ -30,8 +30,37 @@ _ENV_FILE = _NULLION_HOME / ".env"
 _LOG_DIR = _NULLION_HOME / "logs"
 
 
-def _load_env(env_file: str | None) -> None:
-    path = Path(env_file).expanduser() if env_file else _ENV_FILE
+def _configured_nullion_home() -> Path:
+    configured = os.environ.get("NULLION_HOME")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return _NULLION_HOME
+
+
+def _default_env_file() -> Path:
+    return _configured_nullion_home() / ".env"
+
+
+def _env_web_host() -> str:
+    return os.environ.get("NULLION_WEB_HOST", _DEFAULT_HOST)
+
+
+def _env_web_port() -> int:
+    try:
+        return int(os.environ.get("NULLION_WEB_PORT", _DEFAULT_PORT))
+    except (TypeError, ValueError):
+        return _DEFAULT_PORT
+
+
+def _resolve_target_args(args) -> None:
+    if args.host is None:
+        args.host = _env_web_host()
+    if args.port is None:
+        args.port = _env_web_port()
+
+
+def _load_env(env_file: str | None, *, override: bool = False) -> None:
+    path = Path(env_file).expanduser() if env_file else _default_env_file()
     if not path.exists():
         return
     for raw_line in path.read_text(errors="ignore").splitlines():
@@ -43,7 +72,7 @@ def _load_env(env_file: str | None) -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
+        if key and (override or key not in os.environ):
             os.environ[key] = value
 
 
@@ -433,13 +462,14 @@ def cli() -> None:
 
 def _cli_impl() -> None:
     parser = argparse.ArgumentParser(prog="nullion-tray", description="Nullion tray/menu-bar companion")
-    parser.add_argument("--host", default=os.environ.get("NULLION_WEB_HOST", _DEFAULT_HOST))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("NULLION_WEB_PORT", _DEFAULT_PORT)))
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--env-file", default=os.environ.get("NULLION_ENV_FILE"))
     parser.add_argument("--poll-interval", type=float, default=10.0)
     args = parser.parse_args()
 
-    _load_env(args.env_file)
+    _load_env(args.env_file, override=bool(args.env_file) or bool(os.environ.get("NULLION_HOME")))
+    _resolve_target_args(args)
     return run_single_instance_entrypoint(
         "tray",
         lambda: _run_tray(args),

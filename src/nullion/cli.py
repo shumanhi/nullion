@@ -64,7 +64,7 @@ def _cli_impl() -> None:
 
     sub = parser.add_subparsers(dest="command")
     update_parser = sub.add_parser("update", help="Update Nullion to the latest release (auto-rollback on failure)")
-    update_parser.add_argument("--port", type=int, default=8742, help="Web UI port for health check")
+    update_parser.add_argument("--port", type=int, default=None, help="Web UI port for health check")
     update_parser.add_argument(
         "--ignore-checks",
         "--force",
@@ -93,8 +93,9 @@ def _cli_impl() -> None:
 
     # ── update subcommand ────────────────────────────────────────────────────
     if args.command == "update":
+        _load_env(args.env_file, override=bool(args.env_file))
         _run_update_cli(
-            getattr(args, "port", 8742),
+            getattr(args, "port", None) or _default_web_port(),
             ignore_check_failures=getattr(args, "ignore_check_failures", False),
             update_channel="hash" if getattr(args, "update_to_hash", False) else "release",
         )
@@ -504,11 +505,13 @@ def _print_skills(runtime) -> None:
 
 # ── bootstrap ─────────────────────────────────────────────────────────────────
 
-def _load_env(env_file: str | None) -> None:
+def _load_env(env_file: str | None, *, override: bool = False) -> None:
     """Load KEY=VALUE pairs from a .env file into os.environ."""
     from nullion.config import load_default_env_file_into_environ
 
-    load_default_env_file_into_environ(env_file)
+    loaded = load_default_env_file_into_environ(env_file, override=override)
+    if env_file and loaded is not None:
+        os.environ["NULLION_ENV_FILE"] = str(Path(env_file).expanduser())
 
 
 def _parse_env_file(path: Path) -> None:
@@ -657,6 +660,62 @@ _WINDOWS_TASKS = (
     "Nullion Telegram",
 )
 
+
+def _environment_nullion_home() -> Path:
+    configured = os.environ.get("NULLION_HOME")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return _NULLION_HOME
+
+
+def _environment_env_file() -> Path:
+    configured = os.environ.get("NULLION_ENV_FILE")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return _environment_nullion_home() / ".env"
+
+
+def _active_nullion_home() -> Path:
+    env_values = _active_env_file_values()
+    configured = env_values.get("NULLION_HOME")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    configured = os.environ.get("NULLION_HOME")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return _NULLION_HOME
+
+
+def _active_env_file() -> Path:
+    configured = os.environ.get("NULLION_ENV_FILE")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return _active_nullion_home() / ".env"
+
+
+def _active_log_dir() -> Path:
+    return _active_nullion_home() / "logs"
+
+
+def _active_env_file_values() -> dict[str, str]:
+    try:
+        from nullion.config import read_env_file_values
+
+        return read_env_file_values(_environment_env_file())
+    except Exception:
+        return {}
+
+
+def _active_webview_pid_file() -> Path:
+    return _active_nullion_home() / "webview.pid"
+
+
+def _lane_venv_script(home: Path, script: str) -> Path:
+    if os.name == "nt":
+        return home / "venv" / "Scripts" / f"{script}.exe"
+    return home / "venv" / "bin" / script
+
+
 def _launchd_plist() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / "com.nullion.web.plist"
 
@@ -774,7 +833,7 @@ def _nullion_ctl_impl() -> None:
 
     sub = parser.add_subparsers(dest="command")
     up = sub.add_parser("update", help="Safe update with auto-rollback")
-    up.add_argument("--port", type=int, default=8742)
+    up.add_argument("--port", type=int, default=None)
     up.add_argument(
         "--ignore-checks",
         "--force",
@@ -802,7 +861,7 @@ def _nullion_ctl_impl() -> None:
     tray = sub.add_parser("tray", help="Install, start, stop, or inspect the tray icon")
     tray_sub = tray.add_subparsers(dest="tray_command")
     tray_install = tray_sub.add_parser("install", help="Install and start the tray icon")
-    tray_install.add_argument("--port", type=int, default=8742, help="Web UI port")
+    tray_install.add_argument("--port", type=int, default=None, help="Web UI port")
     tray_sub.add_parser("start", help="Start the tray icon")
     tray_sub.add_parser("stop", help="Stop the tray icon")
     tray_sub.add_parser("status", help="Show tray service status")
@@ -811,7 +870,7 @@ def _nullion_ctl_impl() -> None:
 
     if args.command == "update":
         _run_update_cli(
-            getattr(args, "port", 8742),
+            getattr(args, "port", None) or _default_web_port(),
             ignore_check_failures=getattr(args, "ignore_check_failures", False),
             update_channel="hash" if getattr(args, "update_to_hash", False) else "release",
         )
@@ -1192,10 +1251,10 @@ def _install_windows_repair_tasks(*, start: bool, dry_run: bool) -> list[str]:
 
 def _tray_executable() -> Path | None:
     candidates: list[Path] = []
-    if os.name == "nt":
-        candidates.append(_NULLION_HOME / "venv" / "Scripts" / "nullion-tray.exe")
-    else:
-        candidates.append(_NULLION_HOME / "venv" / "bin" / "nullion-tray")
+    active_home = _active_nullion_home()
+    candidates.append(_lane_venv_script(active_home, "nullion-tray"))
+    if active_home != _NULLION_HOME:
+        candidates.append(_lane_venv_script(_NULLION_HOME, "nullion-tray"))
     found = shutil.which("nullion-tray")
     if found:
         candidates.append(Path(found))
@@ -1206,16 +1265,26 @@ def _tray_executable() -> Path | None:
 
 
 def _default_web_port() -> int:
-    try:
-        return int(os.environ.get("NULLION_WEB_PORT", "8742"))
-    except ValueError:
-        return 8742
+    env_values = _active_env_file_values()
+    for candidate in (
+        env_values.get("NULLION_WEB_PORT"),
+        os.environ.get("NULLION_WEB_PORT"),
+        "8742",
+    ):
+        if candidate is None:
+            continue
+        try:
+            return int(str(candidate).strip())
+        except ValueError:
+            continue
+    return 8742
 
 
-def _run_tray_cli(command: str | None, *, port: int = 8742) -> None:
+def _run_tray_cli(command: str | None, *, port: int | None = None) -> None:
     command = command or "status"
+    resolved_port = port or _default_web_port()
     if command == "install":
-        _install_tray_autostart(port=port, start=True)
+        _install_tray_autostart(port=resolved_port, start=True)
     elif command == "start":
         _start_tray_service()
     elif command == "stop":
@@ -1232,20 +1301,23 @@ def _install_tray_autostart(*, port: int = 8742, start: bool = True) -> bool:
     if exe is None:
         print("  Could not find nullion-tray. Run the installer/update again.")
         return False
+    env_file = _active_env_file()
+    home = _active_nullion_home()
+    log_dir = _active_log_dir()
     if sys.platform == "darwin":
-        _install_tray_launchd(exe=exe, port=port)
+        _install_tray_launchd(exe=exe, port=port, env_file=env_file, home=home, log_dir=log_dir)
         if start:
             return _start_tray_service()
         return True
     if os.name == "nt":
-        installed = _install_tray_windows_task(exe=exe, port=port)
+        installed = _install_tray_windows_task(exe=exe, port=port, env_file=env_file, home=home, log_dir=log_dir)
         if start:
             if installed:
                 return _start_tray_service()
             return _start_tray_directly(port=port)
         return installed
     print("  Tray auto-start installer is currently supported on macOS and Windows.")
-    print(f"  You can run manually with: {exe} --port {port}")
+    print(f"  You can run manually with: {exe} --port {port} --env-file {env_file}")
     return False
 
 
@@ -1260,7 +1332,7 @@ def _xml_escape(value: str) -> str:
     )
 
 
-def _install_tray_launchd(*, exe: Path, port: int) -> None:
+def _install_tray_launchd(*, exe: Path, port: int, env_file: Path, home: Path, log_dir: Path) -> None:
     plist = _launchd_plist_for_label("com.nullion.tray")
     plist.parent.mkdir(parents=True, exist_ok=True)
     # XML-escape every interpolated path. Even though our paths normally don't
@@ -1281,21 +1353,21 @@ def _install_tray_launchd(*, exe: Path, port: int) -> None:
                 <string>--port</string>
                 <string>{int(port)}</string>
                 <string>--env-file</string>
-                <string>{_xml_escape(_ENV_FILE)}</string>
+                <string>{_xml_escape(env_file)}</string>
             </array>
             <key>EnvironmentVariables</key>
             <dict>
                 <key>NULLION_ENV_FILE</key>
-                <string>{_xml_escape(_ENV_FILE)}</string>
+                <string>{_xml_escape(env_file)}</string>
                 <key>PATH</key>
                 <string>{_xml_escape(f"{exe.parent}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")}</string>
             </dict>
             <key>WorkingDirectory</key>
-            <string>{_xml_escape(_NULLION_HOME)}</string>
+            <string>{_xml_escape(home)}</string>
             <key>StandardOutPath</key>
-            <string>{_xml_escape(_LOG_DIR / "tray.log")}</string>
+            <string>{_xml_escape(log_dir / "tray.log")}</string>
             <key>StandardErrorPath</key>
-            <string>{_xml_escape(_LOG_DIR / "tray-error.log")}</string>
+            <string>{_xml_escape(log_dir / "tray-error.log")}</string>
             <key>RunAtLoad</key>
             <true/>
             <key>KeepAlive</key>
@@ -1343,18 +1415,18 @@ def _summarize_subprocess_error(result: subprocess.CompletedProcess[str]) -> str
     return detail.splitlines()[0].strip()
 
 
-def _install_tray_windows_task(*, exe: Path, port: int) -> bool:
-    wrapper = _NULLION_HOME / "start-nullion-tray.bat"
+def _install_tray_windows_task(*, exe: Path, port: int, env_file: Path, home: Path, log_dir: Path) -> bool:
+    wrapper = home / "start-nullion-tray.bat"
     wrapper.parent.mkdir(parents=True, exist_ok=True)
-    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
     wrapper.write_text(
         textwrap.dedent(
             f"""\
             @echo off
-            for /f "usebackq tokens=1,* delims==" %%A in ("{_ENV_FILE}") do (
+            for /f "usebackq tokens=1,* delims==" %%A in ("{env_file}") do (
                 if not "%%A"=="" if not "%%A:~0,1%"=="#" set "%%A=%%B"
             )
-            "{exe}" --port {port} --env-file "{_ENV_FILE}" >> "{_LOG_DIR / "tray.log"}" 2>> "{_LOG_DIR / "tray-error.log"}"
+            "{exe}" --port {port} --env-file "{env_file}" >> "{log_dir / "tray.log"}" 2>> "{log_dir / "tray-error.log"}"
             """
         )
     )
@@ -1381,7 +1453,7 @@ def _install_tray_windows_task(*, exe: Path, port: int) -> bool:
             print("  Retrying tray task without interactive-only mode.")
             continue
         print(f"  Could not install tray scheduled task: {_summarize_subprocess_error(result)}")
-    print(f"  Tray can still be started manually with: {exe} --port {port} --env-file {_ENV_FILE}")
+    print(f"  Tray can still be started manually with: {exe} --port {port} --env-file {env_file}")
     return False
 
 
@@ -1426,7 +1498,7 @@ def _start_tray_service() -> bool:
         if exe:
             try:
                 subprocess.Popen(
-                    [str(exe), "--port", str(_default_web_port())],
+                    [str(exe), "--port", str(_default_web_port()), "--env-file", str(_active_env_file())],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
@@ -1469,7 +1541,7 @@ def _start_tray_directly(*, port: int | None = None) -> bool:
         print(f"  Tray executable is missing: {exe}")
         return False
     port = port or _default_web_port()
-    command = [str(exe), "--port", str(port), "--env-file", str(_ENV_FILE)]
+    command = [str(exe), "--port", str(port), "--env-file", str(_active_env_file())]
     try:
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("  Started tray icon directly.")
@@ -1507,11 +1579,11 @@ def _web_ui_url(*, port: int = 8742) -> str:
     return f"http://localhost:{port}"
 
 
-def _kill_existing_webview() -> None:
+def _kill_existing_webview(*, pid_file: Path | None = None) -> None:
     """Terminate any prior nullion-webview single-instance so a fresh one can
     take its place. Used after `nullion update` restarts so the user sees the
     new version immediately instead of a stale focused window."""
-    pid_file = _NULLION_HOME / "webview.pid"
+    pid_file = pid_file or _active_webview_pid_file()
     if not pid_file.exists():
         return
     try:
@@ -1565,9 +1637,26 @@ def _kill_existing_webview() -> None:
         pass
 
 
+def _webview_executable() -> Path | None:
+    candidates: list[Path] = []
+    active_home = _active_nullion_home()
+    candidates.append(_lane_venv_script(active_home, "nullion-webview"))
+    if active_home != _NULLION_HOME:
+        candidates.append(_lane_venv_script(_NULLION_HOME, "nullion-webview"))
+    found = shutil.which("nullion-webview")
+    if found:
+        candidates.append(Path(found))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _open_native_webview(*, port: int = 8742, force_reload: bool = False) -> bool:
     if force_reload:
         _kill_existing_webview()
+    # Keep launch behavior deterministic across lanes and environments by
+    # invoking the active interpreter module entrypoint directly.
     command = [
         sys.executable,
         "-m",
@@ -1576,9 +1665,7 @@ def _open_native_webview(*, port: int = 8742, force_reload: bool = False) -> boo
         str(port),
         "--browser-fallback",
     ]
-    env_file = os.environ.get("NULLION_ENV_FILE")
-    if env_file:
-        command.extend(["--env-file", env_file])
+    command.extend(["--env-file", str(_active_env_file())])
     try:
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
@@ -1639,7 +1726,7 @@ def _close_webview_for_uninstall(*, dry_run: bool) -> str:
         return f"Skipped missing {pid_file}"
     if dry_run:
         return f"Would close Nullion webview from {pid_file}"
-    _kill_existing_webview()
+    _kill_existing_webview(pid_file=pid_file)
     return f"Closed Nullion webview from {pid_file}"
 
 

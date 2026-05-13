@@ -57,6 +57,7 @@ from nullion.chat_response_contract import (
 )
 from nullion.chat_streaming import TELEGRAM_CHAT_CAPABILITIES, streaming_enabled_by_default
 from nullion.config import NullionSettings
+from nullion.config import normalize_reasoning_effort
 from nullion.conversation_runtime import (
     ConversationBranch,
     ConversationBranchStatus,
@@ -73,7 +74,7 @@ from nullion.memory import (
     memory_entries_for_owner,
     memory_owner_for_messaging,
 )
-from nullion.mini_agent_routing import should_route_without_mini_agents
+from nullion.mini_agent_routing import should_keep_dag_plan_in_direct_turn, should_route_without_mini_agents
 from nullion.operator_commands import (
     handle_operator_command,
     is_operator_command_text,
@@ -147,13 +148,45 @@ logger = logging.getLogger(__name__)
 ActivityCallback = Callable[[dict[str, str]], None]
 _MAX_CHAT_TURNS = 6
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 4
+_MAX_APPROVAL_PROMPT_TURNS = 20
 _MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
 _MAX_ARTIFACT_FOLLOWUP_CANDIDATES = 12
+_CHAT_STABLE_CONTEXT_CACHE_MAX_ENTRIES = 32
 _DIAGNOSTIC_ATTACHMENT_SUFFIXES = frozenset({".log"})
 _PRIMARY_RENDERED_ARTIFACT_SUFFIXES = frozenset(
     {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm"}
 )
 _TEXT_SIDECAR_ARTIFACT_SUFFIXES = frozenset({".txt", ".md"})
+
+
+def _chat_model_issue_reply(runtime: PersistentRuntime, *, message: str) -> str | None:
+    """Return a short fast-fail message when model service issues are already pending."""
+    try:
+        actions = runtime.store.list_doctor_actions()
+    except Exception:
+        return None
+    _ = message
+    for action in actions:
+        if str(action.get("status") or "").strip().lower() != "pending":
+            continue
+        recommendation_code = str(action.get("recommendation_code") or "").strip().lower()
+        details = action.get("details") or {}
+        service_id = str(details.get("service_id") or "").strip().lower() if isinstance(details, dict) else ""
+        if (
+            recommendation_code == "model_api_unreachable"
+            or recommendation_code == "model_quota_exhausted"
+            or service_id == "model_api"
+        ):
+            if recommendation_code == "model_quota_exhausted":
+                return (
+                    "Model provider quota is currently exhausted. "
+                    "Check billing/model settings, then retry your request."
+                )
+            return (
+                "Chat backend is temporarily unavailable due to model API connectivity. "
+                "Try again after the service recovers."
+            )
+    return None
 _OPEN_TASK_FRAME_STATUSES = frozenset(
     {
         TaskFrameStatus.ACTIVE,
@@ -183,6 +216,104 @@ def _strip_media_directives_from_context(text: str) -> str:
     return "\n".join(lines)
 
 
+def _chat_freeze_for_cache(value: object) -> object:
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (str(key), _chat_freeze_for_cache(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_chat_freeze_for_cache(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_chat_freeze_for_cache(item) for item in value), key=repr))
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "value"):
+        return str(getattr(value, "value"))
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _chat_stable_context_cache_get(cache_key: tuple[object, ...]) -> object | None:
+    if cache_key not in _CHAT_STABLE_CONTEXT_CACHE:
+        return None
+    return _CHAT_STABLE_CONTEXT_CACHE[cache_key]
+
+
+def _chat_stable_context_cache_set(cache_key: tuple[object, ...], value: object | None) -> None:
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        if len(_CHAT_STABLE_CONTEXT_CACHE) >= _CHAT_STABLE_CONTEXT_CACHE_MAX_ENTRIES:
+            _CHAT_STABLE_CONTEXT_CACHE.clear()
+        _CHAT_STABLE_CONTEXT_CACHE[cache_key] = value
+
+
+def _chat_tool_registry_signature(tool_registry: object) -> object:
+    try:
+        definitions = tool_registry.list_tool_definitions()
+    except Exception:
+        try:
+            specs = tool_registry.list_specs()
+            definitions = [
+                {
+                    "name": getattr(spec, "name", ""),
+                    "description": getattr(spec, "description", ""),
+                    "capability_tags": tuple(getattr(spec, "capability_tags", ()) or ()),
+                    "side_effect_class": getattr(
+                        getattr(spec, "side_effect_class", None),
+                        "value",
+                        "",
+                    ),
+                    "risk_level": getattr(
+                        getattr(spec, "risk_level", None),
+                        "value",
+                        "",
+                    ),
+                    "requires_approval": bool(getattr(spec, "requires_approval", False)),
+                }
+                for spec in specs
+            ]
+        except Exception:
+            return (type(tool_registry).__name__, "unavailable")
+    return _chat_freeze_for_cache(definitions)
+
+
+def _chat_settings_signature(settings: object | None) -> tuple[object, ...]:
+    if settings is None:
+        return ("none",)
+    model = getattr(settings, "model", None)
+    provider_bindings = tuple(
+        sorted(
+            (
+                str(getattr(binding, "capability", "") or ""),
+                str(getattr(binding, "provider", "") or ""),
+            )
+            for binding in (getattr(settings, "provider_bindings", ()) or ())
+        )
+    )
+    return (
+        tuple(getattr(settings, "enabled_plugins", ()) or ()),
+        provider_bindings,
+        tuple(getattr(settings, "enabled_skill_packs", ()) or ()),
+        str(getattr(settings, "workspace_root", "") or ""),
+        tuple(getattr(settings, "allowed_roots", ()) or ()),
+        str(getattr(settings, "web_session_allow_duration", "") or ""),
+        str(getattr(model, "provider", "") or ""),
+        str(getattr(model, "openai_model", "") or ""),
+        str(getattr(model, "openai_base_url", "") or ""),
+        str(getattr(model, "reasoning_effort", "") or ""),
+        bool(str(getattr(model, "openai_api_key", "") or "").strip()),
+        bool(str(getattr(model, "anthropic_api_key", "") or "").strip()),
+        bool(str(getattr(model, "codex_refresh_token", "") or "").strip()),
+        str(getattr(settings, "web_access_enabled", "") or ""),
+        bool(str(getattr(settings, "web_search_enabled", "") or "").strip()),
+        bool(str(getattr(settings, "terminal_access_enabled", "") or "").strip()),
+        bool(str(getattr(settings, "image_generation_enabled", "") or "").strip()),
+    )
+
+
 def _feature_enabled(name: str, *, default: bool = True) -> bool:
     import os
 
@@ -205,6 +336,8 @@ _PATTERN_REFLECTION_CONFIDENCE_THRESHOLD = 0.58
 _NEWLY_LEARNED_SKILLS: WeakKeyDictionary = WeakKeyDictionary()  # runtime → list[title]
 # Retained for API compatibility; free-form skill matching is disabled.
 _SKILL_INJECT_MIN_SCORE = LEARNED_SKILL_INJECT_MIN_SCORE
+_CHAT_STABLE_CONTEXT_CACHE: dict[tuple[object, ...], str | None] = {}
+_CHAT_STABLE_CONTEXT_CACHE_LOCK = threading.RLock()
 # Memory compaction: only run every N turns to avoid an LLM call each turn.
 _COMPACTION_CHECK_INTERVAL = 10
 _builder_turn_counter: int = 0
@@ -271,10 +404,192 @@ def _is_explicit_approval_reply(message: str) -> bool:
 
 
 def _requested_attachment_extension(prompt: str, *, model_client: object | None = None) -> str | None:
-    del model_client
     if is_slash_prefixed_literal_message(prompt):
         return None
-    return plan_attachment_format(prompt).extension
+    return plan_attachment_format(prompt, model_client=model_client).extension
+
+
+def _messaging_feature_enabled(name: str, *, default: bool = True) -> bool:
+    if name.startswith("NULLION_MESSAGING_"):
+        if os.environ.get(name) is not None:
+            try:
+                return _feature_enabled(name, default=default)
+            except TypeError:
+                return _feature_enabled(name)
+        web_variant = name.replace("NULLION_MESSAGING_", "NULLION_WEB_")
+        if os.environ.get(web_variant) is not None:
+            try:
+                return _feature_enabled(web_variant, default=default)
+            except TypeError:
+                return _feature_enabled(web_variant)
+    try:
+        return _feature_enabled(name, default=default)
+    except TypeError:
+        return _feature_enabled(name)
+
+
+def _messaging_interactive_fast_reasoning_effort() -> str | None:
+    raw = (
+        os.environ.get("NULLION_MESSAGING_INTERACTIVE_FAST_REASONING_EFFORT")
+        or os.environ.get("NULLION_WEB_INTERACTIVE_FAST_REASONING_EFFORT")
+    )
+    return normalize_reasoning_effort((raw or "").strip() or "low")
+
+
+def _messaging_interactive_fast_max_tokens() -> int | None:
+    raw_value = (
+        os.environ.get("NULLION_MESSAGING_INTERACTIVE_FAST_MAX_TOKENS")
+        or os.environ.get("NULLION_WEB_INTERACTIVE_FAST_MAX_TOKENS")
+    )
+    if raw_value is None:
+        return None
+    value_text = str(raw_value).strip()
+    if not value_text:
+        return None
+    try:
+        value = int(value_text)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return max(64, value)
+
+
+def _model_client_with_reasoning_effort(
+    model_client: object | None,
+    reasoning_effort: str | None,
+    *,
+    max_tokens: int | None = None,
+):
+    effort = normalize_reasoning_effort(reasoning_effort)
+    if model_client is None:
+        return model_client
+    updates: dict[str, object] = {}
+    if effort and hasattr(model_client, "reasoning_effort") and getattr(model_client, "reasoning_effort", None) != effort:
+        updates["reasoning_effort"] = effort
+    if max_tokens is not None and hasattr(model_client, "max_tokens") and getattr(model_client, "max_tokens", None) != max_tokens:
+        updates["max_tokens"] = max_tokens
+    if not updates:
+        return model_client
+    try:
+        return replace(model_client, **updates)
+    except Exception:
+        logger.debug("Could not clone model client with interactive reasoning profile", exc_info=True)
+        return model_client
+
+
+def _model_client_with_interactive_fast_profile(model_client: object | None):
+    if model_client is None:
+        return None
+    fast_model = (
+        os.environ.get("NULLION_MESSAGING_INTERACTIVE_FAST_MODEL")
+        or os.environ.get("NULLION_WEB_INTERACTIVE_FAST_MODEL", "").strip()
+    )
+    fast_model = fast_model.strip()
+    profiled_client = model_client
+    if fast_model and getattr(model_client, "model", None) != fast_model:
+        try:
+            from nullion.model_clients import clone_model_client_with_model
+
+            profiled_client = clone_model_client_with_model(model_client, fast_model)
+        except Exception:
+            logger.debug("Could not clone model client with interactive fast model", exc_info=True)
+            profiled_client = model_client
+    return _model_client_with_reasoning_effort(
+        profiled_client,
+        _messaging_interactive_fast_reasoning_effort(),
+        max_tokens=_messaging_interactive_fast_max_tokens(),
+    )
+
+
+def _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision: object | None) -> bool:
+    if turn_dispatch_decision is None:
+        return False
+    if getattr(turn_dispatch_decision, "dependency_turn_ids", None):
+        return True
+    disposition = getattr(turn_dispatch_decision, "disposition", None)
+    disposition_value = str(getattr(disposition, "value", disposition) or "")
+    return disposition_value in {
+        ConversationTurnDisposition.CONTINUE.value,
+        ConversationTurnDisposition.REVISE.value,
+        ConversationTurnDisposition.INTERRUPT.value,
+        ConversationTurnDisposition.BACKGROUND_FOLLOW_UP.value,
+    }
+
+
+def _messaging_turn_fast_profile_candidate(
+    *,
+    evidence,
+    config_action: object,
+    allow_mini_agents: bool,
+    force_mini_agent_dispatch: bool,
+    turn_dispatch_decision: object | None,
+) -> bool:
+    if not _messaging_feature_enabled("NULLION_MESSAGING_INTERACTIVE_FAST_PROFILE_ENABLED", default=True):
+        return False
+    if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
+        return False
+    if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
+        return False
+    return not (
+        getattr(evidence, "has_url_target", False)
+        or getattr(evidence, "has_attachments", False)
+        or getattr(evidence, "artifact_requested", False)
+        or getattr(evidence, "context_linked", False)
+    )
+
+
+def _messaging_turn_skip_tool_scope_decision(
+    *,
+    evidence,
+    config_action: object,
+    allow_mini_agents: bool,
+    force_mini_agent_dispatch: bool,
+    turn_dispatch_decision: object | None,
+) -> bool:
+    if not _messaging_feature_enabled("NULLION_MESSAGING_TOOL_SCOPE_DECISION_ENABLED", default=True):
+        return False
+    if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
+        return False
+    if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
+        return False
+    if (
+        getattr(evidence, "has_url_target", False)
+        or getattr(evidence, "has_attachments", False)
+        or getattr(evidence, "artifact_requested", False)
+        or getattr(evidence, "context_linked", False)
+    ):
+        return False
+    return True
+
+
+def _turn_tool_scope_requires_special_tools(tool_registry: object) -> bool:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    return bool(
+        getattr(decision, "allow_web_tools", False)
+        or getattr(decision, "allow_scheduler_tools", False)
+        or getattr(decision, "allow_connector_tools", False)
+        or getattr(decision, "allow_skill_pack_tools", False)
+    )
+
+
+def _orchestrator_with_interactive_fast_profile(orchestrator, *, enabled: bool, tool_registry: object):
+    if not enabled or orchestrator is None or _turn_tool_scope_requires_special_tools(tool_registry):
+        return orchestrator
+    current_client = getattr(orchestrator, "model_client", None)
+    profiled_client = _model_client_with_interactive_fast_profile(current_client)
+    if profiled_client is None or profiled_client is current_client:
+        return orchestrator
+    try:
+        from nullion.agent_orchestrator import AgentOrchestrator
+
+        if isinstance(orchestrator, AgentOrchestrator):
+            return AgentOrchestrator(model_client=profiled_client)
+    except Exception:
+        logger.debug("Could not clone orchestrator with interactive fast profile", exc_info=True)
+    return orchestrator
 
 
 
@@ -652,7 +967,9 @@ def _approval_id_from_command(command: str) -> str | None:
 
 def _source_prompt_for_approval(runtime: PersistentRuntime, *, chat_id: str | None, approval_id: str) -> str | None:
     conversation_id = _conversation_id_for_chat(chat_id)
-    for turn in reversed(runtime.list_conversation_chat_turns(conversation_id)):
+    for turn in reversed(
+        runtime.list_conversation_chat_turns(conversation_id, limit=_MAX_APPROVAL_PROMPT_TURNS),
+    ):
         user_message = turn.get("user")
         assistant_reply = turn.get("assistant")
         if not isinstance(user_message, str) or not isinstance(assistant_reply, str):
@@ -985,7 +1302,7 @@ def _local_chat_reply_body(prompt: str) -> str | None:
 
 def _restore_chat_thread_from_store(runtime: PersistentRuntime, *, chat_id: str | None) -> list[dict[str, str]]:
     conversation_id = _conversation_id_for_chat(chat_id)
-    restored = runtime.list_conversation_chat_turns(conversation_id)
+    restored = runtime.list_conversation_chat_turns(conversation_id, limit=_MAX_CHAT_TURNS)
     if len(restored) > _MAX_CHAT_TURNS:
         restored = restored[-_MAX_CHAT_TURNS:]
     return restored
@@ -1862,7 +2179,7 @@ def _filter_artifact_descriptors_for_requested_format(
     *,
     requested_extension: str | None = None,
 ):
-    requested_extension = requested_extension or _requested_attachment_extension(prompt)
+    del prompt
     if requested_extension is None:
         return descriptors
     matching_descriptors = [
@@ -1962,6 +2279,15 @@ def _suppress_unrequested_diagnostic_media_reply(
 
 
 def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: str | None = None) -> str:
+    cache_key = (
+        id(runtime),
+        str(principal_id or ""),
+        _chat_settings_signature(_load_settings_if_available()),
+    )
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        if cache_key in _CHAT_STABLE_CONTEXT_CACHE:
+            return _chat_stable_context_cache_get(cache_key) or ""
+
     artifact_root = artifact_root_for_principal(principal_id)
     legacy_artifact_root = artifact_root_for_runtime(runtime)
     workspace_storage_text = format_workspace_storage_for_prompt(principal_id=principal_id)
@@ -1972,7 +2298,7 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         workspace_registry_text = format_workspace_registry_for_prompt(settings=load_settings())
     except Exception:
         workspace_registry_text = None
-    return (
+    caps_text = (
         "Chat delivery contract:\n"
         f"- When the user asks you to send, attach, upload, or deliver a file, write it with file_write under this workspace artifact directory only: {artifact_root}\n"
         f"- Legacy artifact directory still supported for older turns: {legacy_artifact_root}\n"
@@ -1991,7 +2317,18 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         "- Never answer only 'Done', 'OK', or 'Completed'. Always include the requested answer, file status, or concrete result.\n"
         "- If a tool result has status denied or error, treat it as failed and ask for the needed approval or report the failure."
         )
-    )
+        )
+    _chat_stable_context_cache_set(cache_key, caps_text)
+    return caps_text
+
+
+def _load_settings_if_available() -> object | None:
+    try:
+        from nullion.config import load_settings
+
+        return load_settings()
+    except Exception:
+        return None
 
 
 def _chat_capability_inventory_prompt(
@@ -1999,6 +2336,17 @@ def _chat_capability_inventory_prompt(
     *,
     tool_registry: object | None = None,
 ) -> str | None:
+    if tool_registry is None:
+        tool_registry = getattr(runtime, "active_tool_registry", None)
+    cache_key = (
+        id(runtime),
+        _chat_tool_registry_signature(tool_registry),
+        _chat_settings_signature(_load_settings_if_available()),
+    )
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        if cache_key in _CHAT_STABLE_CONTEXT_CACHE:
+            return _chat_stable_context_cache_get(cache_key)
+
     registry = tool_registry or getattr(runtime, "active_tool_registry", None)
     if registry is None:
         return None
@@ -2020,7 +2368,7 @@ def _chat_capability_inventory_prompt(
         return None
     if not caps_text:
         return None
-    return (
+    cached_text = (
         "Live capability inventory:\n"
         "Use only the tools registered in this turn. If a capability-specific tool is unavailable, "
         "fall back to the core local tools when the task can still be completed locally; only say what "
@@ -2028,10 +2376,18 @@ def _chat_capability_inventory_prompt(
         "backed tool; connections are references, not raw credentials.\n\n"
         f"{caps_text}"
     )
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        _chat_stable_context_cache_set(cache_key, cached_text)
+    return cached_text
 
 
-def _artifact_paths_from_tool_results(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> list[str]:
+def _artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    include_search_matches: bool = False,
+) -> list[str]:
     paths: list[str] = []
+    search_match_paths: list[str] = []
     for result in tool_results or ():
         if normalize_tool_status(result.status) != "completed":
             continue
@@ -2040,6 +2396,17 @@ def _artifact_paths_from_tool_results(tool_results: list[ToolResult] | tuple[Too
             path = output.get("path")
             if isinstance(path, str) and path.strip():
                 paths.append(path)
+        if result.tool_name == "file_search":
+            matches = output.get("matches")
+            if isinstance(matches, (list, tuple)):
+                for match in matches:
+                    if isinstance(match, str) and match.strip():
+                        search_match_paths.append(match)
+                        continue
+                    if isinstance(match, dict):
+                        candidate = match.get("path")
+                        if isinstance(candidate, str) and candidate.strip():
+                            search_match_paths.append(candidate)
         for key in ("artifact_path",):
             value = output.get(key)
             if isinstance(value, str) and value.strip():
@@ -2048,32 +2415,42 @@ def _artifact_paths_from_tool_results(tool_results: list[ToolResult] | tuple[Too
             values = output.get(key)
             if isinstance(values, (list, tuple)):
                 paths.extend(value for value in values if isinstance(value, str) and value.strip())
+    if include_search_matches and not paths and search_match_paths:
+        paths.extend(search_match_paths)
     return list(dict.fromkeys(paths))
 
 
-def _artifact_paths_mentioned_in_reply(
-    runtime: PersistentRuntime,
-    *,
+_REPLY_FILENAME_CANDIDATE_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][A-Za-z0-9._ -]{0,120}\.[A-Za-z0-9]{1,16})(?![\w/-])")
+_AUTO_ATTACH_FILENAME_SUFFIXES = _PRIMARY_RENDERED_ARTIFACT_SUFFIXES - _TEXT_SIDECAR_ARTIFACT_SUFFIXES - _DIAGNOSTIC_ATTACHMENT_SUFFIXES
+
+
+def _artifact_candidate_paths_from_reply(
     reply: str,
-    principal_id: str | None = None,
-) -> list[str]:
-    reply_text = str(reply or "")
-    if not reply_text:
-        return []
-    paths: list[str] = []
-    roots = (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))
-    for artifact_root in roots:
-        try:
-            candidates = sorted(path for path in artifact_root.iterdir() if path.is_file())
-        except OSError:
+    *,
+    principal_id: str | None,
+    runtime: PersistentRuntime,
+) -> tuple[Path, ...]:
+    roots = tuple(dict.fromkeys((artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))))
+    candidates: list[Path] = []
+    for path in _reply_media_candidate_paths(reply):
+        if path.is_absolute():
+            candidates.append(path)
             continue
-        for path in candidates:
-            if path.name not in reply_text:
-                continue
-            descriptor = artifact_descriptor_for_path(path, artifact_root=artifact_root)
-            if descriptor is not None:
-                paths.append(descriptor.path)
-    return list(dict.fromkeys(paths))
+        for root in roots:
+            candidate = root / path
+            if candidate.is_file():
+                candidates.append(candidate)
+                break
+    for match in _REPLY_FILENAME_CANDIDATE_RE.finditer(str(reply or "")):
+        filename = Path(match.group(1).strip("`'\"<>")).name
+        if not filename or Path(filename).suffix.lower() not in _AUTO_ATTACH_FILENAME_SUFFIXES:
+            continue
+        for root in roots:
+            candidate = root / filename
+            if candidate.is_file():
+                candidates.append(candidate)
+                break
+    return tuple(dict.fromkeys(candidates))
 
 
 def _should_suppress_foreground_reply(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
@@ -2095,22 +2472,35 @@ def _append_chat_artifacts_to_reply(
     required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
 ) -> str:
     requested_extension = (tuple(required_attachment_extensions or ()) or (None,))[0]
+    initial_reply_candidate_paths = _artifact_candidate_paths_from_reply(
+        reply,
+        principal_id=principal_id,
+        runtime=runtime,
+    )
+    reply_has_media_directives = bool(_reply_media_candidate_paths(reply))
     reply = _suppress_unrequested_diagnostic_media_reply(
         runtime,
         reply=reply,
         requested_extension=requested_extension,
         principal_id=principal_id,
     )
-    reply_media_paths = tuple(str(path) for path in _artifact_paths_from_reply_for_delivery(reply, principal_id=principal_id))
-    candidate_paths = [
-        *reply_media_paths,
+    reply_candidate_paths = _artifact_candidate_paths_from_reply(
+        reply,
+        principal_id=principal_id,
+        runtime=runtime,
+    ) or initial_reply_candidate_paths
+    reply_media_paths = tuple(str(path) for path in reply_candidate_paths)
+    artifact_roots = tuple(dict.fromkeys((artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))))
+    candidate_paths = list(reply_media_paths) or [
         *(artifact_paths or ()),
-        *_artifact_paths_from_tool_results(tool_results),
-        *_artifact_paths_mentioned_in_reply(runtime, reply=reply, principal_id=principal_id),
+        *_artifact_paths_from_tool_results(
+            tool_results,
+            include_search_matches=bool(requested_extension),
+        ),
     ]
     descriptors = []
     seen_ids: set[str] = set()
-    for artifact_root in (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)):
+    for artifact_root in artifact_roots:
         for descriptor in artifact_descriptors_for_paths(candidate_paths, artifact_root=artifact_root):
             if descriptor.artifact_id in seen_ids:
                 continue
@@ -2119,7 +2509,7 @@ def _append_chat_artifacts_to_reply(
     descriptors = _filter_artifact_descriptors_for_requested_format(
         prompt,
         descriptors,
-        requested_extension=requested_extension,
+        requested_extension=requested_extension or (None if reply_media_paths else _requested_attachment_extension(prompt)),
     )
     descriptors = _filter_text_sidecar_artifact_descriptors(
         descriptors,
@@ -2135,7 +2525,7 @@ def _append_chat_artifacts_to_reply(
     ]
     if not descriptors:
         return reply
-    if reply_media_paths:
+    if reply_has_media_directives and reply_media_paths:
         selected_paths = tuple(str(getattr(descriptor, "path", "") or "") for descriptor in descriptors)
         if selected_paths == reply_media_paths:
             return reply
@@ -2515,12 +2905,16 @@ def _compact_tool_output_for_context(tool_name: str, output: object) -> object:
 
 def _recent_tool_context_prompt(runtime: PersistentRuntime, conversation_id: str) -> str | None:
     try:
-        events = runtime.store.list_conversation_events(conversation_id)
+        events = runtime.store.list_recent_conversation_events(
+            conversation_id,
+            event_type="conversation.chat_turn",
+            limit=_MAX_RECENT_TOOL_CONTEXT_TURNS,
+        )
     except Exception:
         events = []
     records: list[dict[str, object]] = []
     for event in events:
-        if not isinstance(event, dict) or event.get("event_type") != "conversation.chat_turn":
+        if not isinstance(event, dict):
             continue
         tool_results = event.get("tool_results")
         if not isinstance(tool_results, list) or not tool_results:
@@ -3076,19 +3470,31 @@ def _task_titles_from_status_summary(summary: object) -> list[str]:
 
 
 def _enabled_skill_pack_prompt(settings: NullionSettings | None) -> str | None:
-    try:
-        if settings is None:
-            from nullion.config import load_settings
+    loaded_settings = _load_settings_if_available() if settings is None else settings
+    cache_key = (
+        "skill_pack_prompt",
+        _chat_settings_signature(loaded_settings),
+    )
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        if cache_key in _CHAT_STABLE_CONTEXT_CACHE:
+            return _chat_stable_context_cache_get(cache_key)
 
-            settings = load_settings()
+    try:
+        if loaded_settings is None:
+            loaded_settings = _load_settings_if_available()
+        if loaded_settings is None:
+            return None
         from nullion.skill_pack_installer import format_enabled_skill_packs_for_prompt
         from nullion.skill_pack_catalog import skill_pack_access_prompt
 
-        text = format_enabled_skill_packs_for_prompt(tuple(settings.enabled_skill_packs))
-        access_text = skill_pack_access_prompt(tuple(settings.enabled_skill_packs))
+        text = format_enabled_skill_packs_for_prompt(tuple(loaded_settings.enabled_skill_packs))
+        access_text = skill_pack_access_prompt(tuple(loaded_settings.enabled_skill_packs))
         if access_text:
             text = (text + "\n\n" + access_text).strip()
-        return text or None
+        cached_text = text or None
+        with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+            _chat_stable_context_cache_set(cache_key, cached_text)
+        return cached_text
     except Exception:
         logger.debug("Skill pack prompt lookup failed (non-fatal)", exc_info=True)
         return None
@@ -3132,6 +3538,7 @@ def _render_chat_turn(
     allow_mini_agents: bool = False,
     turn_dispatch_decision: object | None = None,
     cancellation_checker: Callable[[], bool] | None = None,
+    conversation_ingress_id: str | None = None,
 ) -> str:
     prompt = _chat_prompt_for_message(message)
     if prompt is None:
@@ -3164,7 +3571,7 @@ def _render_chat_turn(
         turn = getattr(conversation_result_value, "turn", None)
         # These logs intentionally include ids, routing facts, and phase timings
         # but not the raw user prompt. They are for production latency triage.
-        logger.info(
+        logger.warning(
             "messaging turn slow timing chat_id=%s conversation_id=%s request_id=%s message_id=%s turn_id=%s dispatch_reason=%s dispatch_linked=%s disposition=%s disposition_reason=%s outcome=%s tools=%s artifacts=%s total_ms=%.1f phases=%s",
             chat_id,
             conversation_id_value,
@@ -3221,6 +3628,7 @@ def _render_chat_turn(
         ambiguity_fallback_reason=ambiguity_fallback_reason,
         ambiguity_classifier=ambiguity_classifier,
         ambiguity_classifier_reason=ambiguity_classifier_reason,
+        checkpoint=False,
         **_conversation_dispatch_kwargs(turn_dispatch_decision),
     )
     _mark_timing("turn_record")
@@ -3301,11 +3709,42 @@ def _render_chat_turn(
         has_attachments=bool(normalized_attachments),
         requested_extensions=requested_attachment_extensions,
     )
-    active_turn_tool_registry = scoped_turn_tool_registry(
-        runtime.active_tool_registry or ToolRegistry(),
+    fast_profile_candidate = _messaging_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
-        model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
-        user_message=effective_prompt,
+        config_action=None,
+        allow_mini_agents=allow_mini_agents,
+        force_mini_agent_dispatch=False,
+        turn_dispatch_decision=turn_dispatch_decision,
+    )
+    _mark_timing("fast_profile_candidate")
+    _mark_timing("tool_scope_decision_check_start")
+    skip_tool_scope_decision = _messaging_turn_skip_tool_scope_decision(
+        evidence=turn_tool_evidence,
+        config_action=None,
+        allow_mini_agents=allow_mini_agents,
+        force_mini_agent_dispatch=False,
+        turn_dispatch_decision=turn_dispatch_decision,
+    )
+    base_tool_registry = runtime.active_tool_registry or ToolRegistry()
+    if skip_tool_scope_decision:
+        active_turn_tool_registry = base_tool_registry
+        _mark_timing("tool_scope_decision_skipped")
+    else:
+        _mark_timing("tool_scope_decision_allowed")
+        tool_scope_model_client = getattr(agent_orchestrator, "model_client", None) or model_client
+        if fast_profile_candidate:
+            tool_scope_model_client = _model_client_with_interactive_fast_profile(tool_scope_model_client)
+        active_turn_tool_registry = scoped_turn_tool_registry(
+            base_tool_registry,
+            evidence=turn_tool_evidence,
+            model_client=tool_scope_model_client,
+            user_message=effective_prompt,
+        )
+        _mark_timing("tool_scope_registry_done")
+    agent_orchestrator = _orchestrator_with_interactive_fast_profile(
+        agent_orchestrator,
+        enabled=fast_profile_candidate,
+        tool_registry=active_turn_tool_registry,
     )
     screenshot_reply = _telegram_screenshot_reply_if_requested(
         runtime,
@@ -3636,6 +4075,14 @@ def _render_chat_turn(
             if (
                 dispatch_dag_plan is not None
                 and (
+                    planner_requested
+                    or not should_keep_dag_plan_in_direct_turn(
+                        dispatch_dag_plan,
+                        available_tools=dispatch_available_tools,
+                        requested_extensions=requested_attachment_extensions,
+                    )
+                )
+                and (
                     getattr(dispatch_dag_plan, "can_dispatch", False)
                     or (
                         planner_requested
@@ -3964,7 +4411,9 @@ def _render_chat_turn(
                     "detail": result_detail,
                 })
             if turn_outcome is TurnOutcome.SUCCESS and _should_suppress_foreground_reply(activity_tool_results):
-                runtime.checkpoint()
+                if conversation_ingress_id and conversation_id:
+                    runtime.store.add_conversation_ingress_id(conversation_id, conversation_ingress_id)
+                runtime.checkpoint(force=True)
                 _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
                 _mark_timing("save")
                 _log_timing_if_slow(
@@ -4001,7 +4450,9 @@ def _render_chat_turn(
                     tool_results=activity_tool_results,
                 )
             _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
-            runtime.checkpoint()
+            if conversation_ingress_id and conversation_id:
+                runtime.store.add_conversation_ingress_id(conversation_id, conversation_ingress_id)
+            runtime.checkpoint(force=True)
             _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
             _mark_timing("save")
             _log_timing_if_slow(
@@ -4294,6 +4745,7 @@ def handle_chat_operator_message(
     allow_mini_agents: bool = False,
     turn_dispatch_decision: object | None = None,
     cancellation_checker: Callable[[], bool] | None = None,
+    conversation_ingress_id: str | None = None,
 ) -> str | None:
     message = text.strip()
     if not message:
@@ -4356,6 +4808,9 @@ def handle_chat_operator_message(
         if not chat_enabled:
             logger.info("Ignored non-command Telegram text (chat_id=%s, text=%s)", chat_id, message)
             return None
+        health_reply = _chat_model_issue_reply(runtime, message=message)
+        if health_reply is not None:
+            return health_reply
         reply = _render_chat_turn(
             runtime,
             message=f"/chat {message}",
@@ -4371,6 +4826,7 @@ def handle_chat_operator_message(
             allow_mini_agents=False,
             turn_dispatch_decision=turn_dispatch_decision,
             cancellation_checker=cancellation_checker,
+            conversation_ingress_id=conversation_ingress_id,
         )
         result = _classify_command_result("/chat", reply)
         logger.info(
@@ -4418,6 +4874,8 @@ def handle_chat_operator_message(
     elif planner_command.requested:
         if not chat_enabled:
             reply = "Telegram chat is disabled."
+        elif (health_reply := _chat_model_issue_reply(runtime, message=message)) is not None:
+            reply = health_reply
         elif not planner_command.prompt:
             reply = "Usage: /planner <message>"
         else:
@@ -4436,10 +4894,13 @@ def handle_chat_operator_message(
                 allow_mini_agents=True,
                 turn_dispatch_decision=turn_dispatch_decision,
                 cancellation_checker=cancellation_checker,
+                conversation_ingress_id=conversation_ingress_id,
             )
     elif _normalize_command_head(message) == "/chat":
         if not chat_enabled:
             reply = "Telegram chat is disabled."
+        elif (health_reply := _chat_model_issue_reply(runtime, message=message)) is not None:
+            reply = health_reply
         else:
             reply = _render_chat_turn(
                 runtime,
@@ -4456,6 +4917,7 @@ def handle_chat_operator_message(
                 allow_mini_agents=False,
                 turn_dispatch_decision=turn_dispatch_decision,
                 cancellation_checker=cancellation_checker,
+                conversation_ingress_id=conversation_ingress_id,
             )
     else:
         reply = handle_operator_command(

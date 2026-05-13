@@ -6,6 +6,7 @@ import base64
 from dataclasses import dataclass
 import json
 import os
+import time as _time
 from typing import Any
 
 try:  # pragma: no cover - import guard
@@ -128,6 +129,11 @@ _TRIMMED_TEXT_MARKER = "\n...[context trimmed]...\n"
 
 def _json_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _codex_max_output_tokens_unsupported(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return "unsupported parameter" in lowered and "max_output_tokens" in lowered
 
 
 def _chat_completions_input_budget_chars() -> int:
@@ -282,6 +288,7 @@ class OpenAIChatCompletionsModelClient:
     client: Any
     model: str
     provider: str | None = None
+    max_tokens: int | None = None
     reasoning_effort: str | None = None
 
     @staticmethod
@@ -468,8 +475,16 @@ class OpenAIChatCompletionsModelClient:
         text_blocks = [{"type": "text", "text": text_value}] if text_value else []
         return "end_turn", [*thinking_blocks, *text_blocks]
 
-    def create(self, *, messages, tools, max_tokens: int | None = None, system: str | None = None):
-        del max_tokens
+    def create(
+        self,
+        *,
+        messages,
+        tools,
+        max_tokens: int | None = None,
+        system: str | None = None,
+        timeout: float | None = None,
+    ):
+        final_max_tokens = self.max_tokens if max_tokens is None else max_tokens
         # Only attach `tools` / `tool_choice` when we actually have tools.
         # OpenRouter's provider routing treats `tool_choice="auto"` as a
         # required-feature signal — sending it with an empty tool list makes
@@ -489,12 +504,15 @@ class OpenAIChatCompletionsModelClient:
             "model": self.model,
             "messages": serialized_messages,
         }
+        if isinstance(final_max_tokens, int) and final_max_tokens > 0:
+            kwargs["max_tokens"] = final_max_tokens
         kwargs.update(_chat_reasoning_kwargs(self.provider, self.model, self.reasoning_effort))
         serialized_tools = self._serialize_tool_definitions(list(tools))
         if serialized_tools:
             kwargs["tools"] = serialized_tools
             kwargs["tool_choice"] = "auto"
-        response = self.client.chat.completions.create(**kwargs)
+        client = self.client.with_options(timeout=timeout) if timeout and hasattr(self.client, "with_options") else self.client
+        response = client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         stop_reason, content = self._content_blocks_from_choice(choice)
         return {"stop_reason": stop_reason, "content": content}
@@ -506,6 +524,7 @@ class AnthropicMessagesModelClient:
 
     client: Any
     model: str
+    max_tokens: int | None = None
     reasoning_effort: str | None = None
 
     @staticmethod
@@ -585,21 +604,32 @@ class AnthropicMessagesModelClient:
             "content": content_blocks,
         }
 
-    def create(self, *, messages, tools, max_tokens: int = 4096, system: str | None = None):
+    def create(
+        self,
+        *,
+        messages,
+        tools,
+        max_tokens: int = 4096,
+        system: str | None = None,
+        timeout: float | None = None,
+    ):
         extracted_system, serialized_messages = self._serialize_messages(list(messages))
         system_text = system or extracted_system
+        final_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+        effective_max_tokens = 4096 if not isinstance(final_max_tokens, int) else max(final_max_tokens, 0)
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": serialized_messages,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
         }
-        kwargs.update(_anthropic_thinking_kwargs(self.reasoning_effort, max_tokens))
+        kwargs.update(_anthropic_thinking_kwargs(self.reasoning_effort, effective_max_tokens))
         if system_text:
             kwargs["system"] = system_text
         serialized_tools = self._serialize_tool_definitions(list(tools))
         if serialized_tools:
             kwargs["tools"] = serialized_tools
-        return self._parse_response(self.client.messages.create(**kwargs))
+        client = self.client.with_options(timeout=timeout) if timeout and hasattr(self.client, "with_options") else self.client
+        return self._parse_response(client.messages.create(**kwargs))
 
 
 
@@ -618,6 +648,7 @@ class CodexResponsesModelClient:
     #                       runtime never silently picks a vendor model.)
 
     _ENDPOINT: str = "https://chatgpt.com/backend-api/codex/responses"
+    max_tokens: int | None = None
     reasoning_effort: str | None = None
 
     @staticmethod
@@ -783,8 +814,9 @@ class CodexResponsesModelClient:
         tools: Any,
         max_tokens: int | None = None,
         system: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        del max_tokens
+        final_max_tokens = self.max_tokens if max_tokens is None else max_tokens
         if _httpx is None:  # pragma: no cover
             raise ModelClientConfigurationError("httpx package is not installed")
 
@@ -818,6 +850,8 @@ class CodexResponsesModelClient:
             "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
+        if isinstance(final_max_tokens, int) and final_max_tokens > 0:
+            body["max_output_tokens"] = final_max_tokens
         effort = _normalize_reasoning_effort(self.reasoning_effort)
         if effort:
             body["reasoning"] = {"effort": effort}
@@ -832,101 +866,118 @@ class CodexResponsesModelClient:
             "User-Agent": "Mozilla/5.0",
         }
 
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        tool_blocks: list[dict[str, Any]] = []
-        # track in-progress function call by item index
-        fn_calls: dict[int, dict[str, Any]] = {}
+        def _invoke(payload: dict[str, Any]) -> dict[str, Any]:
+            text_parts: list[str] = []
+            thinking_parts: list[str] = []
+            tool_blocks: list[dict[str, Any]] = []
+            # track in-progress function call by item index
+            fn_calls: dict[int, dict[str, Any]] = {}
+            deadline = (_time.monotonic() + float(timeout)) if timeout and timeout > 0 else None
 
-        with _httpx.Client(timeout=120.0) as client:
-            with client.stream("POST", self._ENDPOINT, json=body, headers=headers) as resp:
-                if resp.status_code >= 400:
-                    detail = resp.read().decode("utf-8", errors="replace")
-                    detail = " ".join(detail.split())
-                    if len(detail) > 500:
-                        detail = detail[:497].rstrip() + "..."
-                    raise ModelClientConfigurationError(
-                        f"Codex Responses request failed with HTTP {resp.status_code}: {detail or resp.reason_phrase}"
-                    )
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines():
-                    line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        ev = json.loads(data_str)
-                    except Exception:
-                        continue
+            with _httpx.Client(timeout=float(timeout or 120.0)) as client:
+                with client.stream("POST", self._ENDPOINT, json=payload, headers=headers) as resp:
+                    if resp.status_code >= 400:
+                        detail = resp.read().decode("utf-8", errors="replace")
+                        detail = " ".join(detail.split())
+                        if len(detail) > 500:
+                            detail = detail[:497].rstrip() + "..."
+                        raise ModelClientConfigurationError(
+                            f"Codex Responses request failed with HTTP {resp.status_code}: {detail or resp.reason_phrase}"
+                        )
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        if deadline is not None and _time.monotonic() >= deadline:
+                            raise ModelClientConfigurationError(
+                                "Codex Responses request exceeded timeout budget while streaming."
+                            )
+                        line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            ev = json.loads(data_str)
+                        except Exception:
+                            continue
 
-                    etype = ev.get("type", "")
+                        etype = ev.get("type", "")
+                        if etype == "response.completed":
+                            break
 
-                    if etype == "response.output_text.delta":
-                        text_parts.append(ev.get("delta", ""))
-                    elif etype in {
-                        "response.reasoning_summary_text.delta",
-                        "response.reasoning_text.delta",
-                    }:
-                        thinking_parts.append(ev.get("delta", ""))
+                        if etype == "response.output_text.delta":
+                            text_parts.append(ev.get("delta", ""))
+                        elif etype in {
+                            "response.reasoning_summary_text.delta",
+                            "response.reasoning_text.delta",
+                        }:
+                            thinking_parts.append(ev.get("delta", ""))
 
-                    elif etype == "response.output_item.added":
-                        item = ev.get("item", {})
-                        if item.get("type") == "function_call":
-                            idx = ev.get("output_index", len(fn_calls))
-                            fn_calls[idx] = {
-                                "id": item.get("call_id") or item.get("id", ""),
-                                "name": item.get("name", ""),
-                                "arguments": item.get("arguments", ""),
-                            }
-                        elif item.get("type") in {"reasoning", "thinking"}:
-                            for block in item.get("summary", []) or item.get("content", []):
-                                if isinstance(block, dict) and isinstance(block.get("text"), str):
-                                    thinking_parts.append(block["text"])
+                        elif etype == "response.output_item.added":
+                            item = ev.get("item", {})
+                            if item.get("type") == "function_call":
+                                idx = ev.get("output_index", len(fn_calls))
+                                fn_calls[idx] = {
+                                    "id": item.get("call_id") or item.get("id", ""),
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                }
+                            elif item.get("type") in {"reasoning", "thinking"}:
+                                for block in item.get("summary", []) or item.get("content", []):
+                                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                                        thinking_parts.append(block["text"])
 
-                    elif etype == "response.function_call_arguments.delta":
-                        idx = ev.get("output_index", -1)
-                        if idx in fn_calls:
-                            fn_calls[idx]["arguments"] += ev.get("delta", "")
+                        elif etype == "response.function_call_arguments.delta":
+                            idx = ev.get("output_index", -1)
+                            if idx in fn_calls:
+                                fn_calls[idx]["arguments"] += ev.get("delta", "")
 
-                    elif etype == "response.output_item.done":
-                        item = ev.get("item", {})
-                        if item.get("type") == "function_call":
-                            call_id = item.get("call_id") or item.get("id", "")
-                            args_str = item.get("arguments", "{}")
-                            parsed_input = _parse_tool_arguments(args_str)
-                            tool_blocks.append({
-                                "type": "tool_use",
-                                "id": call_id,
-                                "name": item.get("name", ""),
-                                "input": parsed_input,
-                            })
+                        elif etype == "response.output_item.done":
+                            item = ev.get("item", {})
+                            if item.get("type") == "function_call":
+                                call_id = item.get("call_id") or item.get("id", "")
+                                args_str = item.get("arguments", "{}")
+                                parsed_input = _parse_tool_arguments(args_str)
+                                tool_blocks.append({
+                                    "type": "tool_use",
+                                    "id": call_id,
+                                    "name": item.get("name", ""),
+                                    "input": parsed_input,
+                                })
 
         # Also flush any fn_calls that didn't get an output_item.done
-        seen_ids = {b["id"] for b in tool_blocks}
-        for fc in fn_calls.values():
-            if fc["id"] not in seen_ids:
-                args_str = fc.get("arguments", "{}")
-                parsed_input = _parse_tool_arguments(args_str)
-                tool_blocks.append({
-                    "type": "tool_use",
-                    "id": fc["id"],
-                    "name": fc["name"],
-                    "input": parsed_input,
-                })
+            seen_ids = {b["id"] for b in tool_blocks}
+            for fc in fn_calls.values():
+                if fc["id"] not in seen_ids:
+                    args_str = fc.get("arguments", "{}")
+                    parsed_input = _parse_tool_arguments(args_str)
+                    tool_blocks.append({
+                        "type": "tool_use",
+                        "id": fc["id"],
+                        "name": fc["name"],
+                        "input": parsed_input,
+                    })
 
-        content_blocks: list[dict[str, Any]] = []
-        full_thinking = "".join(thinking_parts).strip()
-        if full_thinking:
-            content_blocks.append({"type": "thinking", "text": full_thinking})
-        full_text = "".join(text_parts)
-        if full_text:
-            content_blocks.append({"type": "text", "text": full_text})
-        content_blocks.extend(tool_blocks)
+            content_blocks: list[dict[str, Any]] = []
+            full_thinking = "".join(thinking_parts).strip()
+            if full_thinking:
+                content_blocks.append({"type": "thinking", "text": full_thinking})
+            full_text = "".join(text_parts)
+            if full_text:
+                content_blocks.append({"type": "text", "text": full_text})
+            content_blocks.extend(tool_blocks)
 
-        stop_reason = "tool_use" if tool_blocks else "end_turn"
-        return {"stop_reason": stop_reason, "content": content_blocks}
+            stop_reason = "tool_use" if tool_blocks else "end_turn"
+            return {"stop_reason": stop_reason, "content": content_blocks}
+
+        try:
+            return _invoke(body)
+        except ModelClientConfigurationError as exc:
+            if "max_output_tokens" in body and _codex_max_output_tokens_unsupported(str(exc)):
+                retry_body = dict(body)
+                retry_body.pop("max_output_tokens", None)
+                return _invoke(retry_body)
+            raise
 
 
 def build_model_client_from_settings(

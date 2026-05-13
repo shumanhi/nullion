@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 PROBE_INTERVAL_SECONDS = 30
 _ESCALATION_THRESHOLD = 2   # consecutive failures before creating a doctor action
 _DEFAULT_TERMINAL_AUTH_BACKOFF_SECONDS = 15 * 60
+_DEFAULT_TERMINAL_QUOTA_BACKOFF_SECONDS = 15 * 60
+_MODEL_RECOVERY_RECOMMENDATION_CODES = {
+    "model_api_unreachable",
+    "model_quota_exhausted",
+}
 
 
 @dataclass(slots=True)
@@ -127,9 +132,15 @@ class HealthMonitor:
     def _escalate(self, result: ProbeResult) -> None:
         """Attempt auto-heal; if that fails, create a doctor action card."""
         from nullion.remediation import playbook_for_service
-        playbook = playbook_for_service(result.service_id)
+        details = result.details if isinstance(result.details, dict) else {}
+        playbook_service_id = (
+            "model_quota"
+            if result.service_id == "model_api" and details.get("category") == "quota"
+            else result.service_id
+        )
+        playbook = playbook_for_service(playbook_service_id)
         if playbook is None:
-            logger.debug("Health monitor: no playbook for service %s — skipping escalation", result.service_id)
+            logger.debug("Health monitor: no playbook for service %s — skipping escalation", playbook_service_id)
             return
 
         if playbook.auto_heal_fn is not None:
@@ -150,6 +161,7 @@ class HealthMonitor:
                 message=playbook.summary,
                 details={
                     "service_id": result.service_id,
+                    "playbook_service_id": playbook_service_id,
                     "error": result.error or "",
                     "recommendation_code": playbook.recommendation_code,
                     "remediation_actions": playbook.button_labels,
@@ -166,19 +178,47 @@ class HealthMonitor:
     def _auto_resolve_doctor_action(self, service_id: str) -> None:
         """Cancel any pending doctor action for this service now that it has recovered."""
         try:
-            for action in self._runtime.store.list_doctor_actions():
-                details = action.get("details") or {}
-                if (
-                    str(action.get("status")) == "pending"
-                    and str(details.get("service_id", "")) == service_id
-                ):
-                    self._runtime.cancel_doctor_action(
-                        str(action["action_id"]),
-                        reason=f"{service_id} recovered automatically",
-                    )
-                    logger.info("Health monitor: auto-resolved doctor action for %s", service_id)
+            cleared = clear_recovered_service_doctor_actions(
+                self._runtime,
+                service_id,
+                reason=f"{service_id} recovered automatically",
+            )
+            if cleared:
+                logger.info("Health monitor: auto-resolved %d doctor action(s) for %s", cleared, service_id)
         except Exception as exc:
             logger.warning("Health monitor: failed to auto-resolve action for %s: %s", service_id, exc)
+
+
+def _doctor_action_matches_recovered_service(action: dict, service_id: str) -> bool:
+    if str(action.get("status") or "").strip().lower() != "pending":
+        return False
+    normalized_service_id = str(service_id or "").strip().lower()
+    details = action.get("details") or {}
+    details_service_id = str(details.get("service_id") or "").strip().lower() if isinstance(details, dict) else ""
+    if details_service_id == normalized_service_id:
+        return True
+    recommendation_code = str(action.get("recommendation_code") or "").strip().lower()
+    if normalized_service_id == "model_api" and recommendation_code in _MODEL_RECOVERY_RECOMMENDATION_CODES:
+        return True
+    text_fields = " ".join(
+        str(action.get(field) or "")
+        for field in ("reason", "source_reason", "error")
+    ).lower()
+    return bool(normalized_service_id and f"service_id={normalized_service_id}" in text_fields)
+
+
+def clear_recovered_service_doctor_actions(runtime, service_id: str, *, reason: str | None = None) -> int:
+    """Close stale Doctor service actions after a verified recovery signal."""
+    cleared = 0
+    for action in list(runtime.store.list_doctor_actions()):
+        if not _doctor_action_matches_recovered_service(action, service_id):
+            continue
+        runtime.cancel_doctor_action(
+            str(action["action_id"]),
+            reason=reason or f"{service_id} recovered",
+        )
+        cleared += 1
+    return cleared
 
 
 class _HealthResultState(TypedDict, total=False):
@@ -200,11 +240,27 @@ def _terminal_auth_backoff_seconds() -> float:
         return float(_DEFAULT_TERMINAL_AUTH_BACKOFF_SECONDS)
 
 
-def _is_terminal_model_auth_failure(result: ProbeResult) -> bool:
+def _terminal_quota_backoff_seconds(result: ProbeResult) -> float:
+    details = result.details if isinstance(result.details, dict) else {}
+    retry_after = details.get("retry_after_seconds")
+    if isinstance(retry_after, (int, float)):
+        return max(0.0, float(retry_after) + 5.0)
+    raw = os.environ.get("NULLION_HEALTH_MONITOR_QUOTA_BACKOFF_SECONDS")
+    if raw is None:
+        return float(_DEFAULT_TERMINAL_QUOTA_BACKOFF_SECONDS)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(_DEFAULT_TERMINAL_QUOTA_BACKOFF_SECONDS)
+
+
+def _is_terminal_model_failure(result: ProbeResult) -> bool:
     if result.service_id != "model_api":
         return False
     details = result.details if isinstance(result.details, dict) else {}
     if details.get("category") == "auth" and details.get("terminal") is True:
+        return True
+    if details.get("category") == "quota" and details.get("terminal") is True:
         return True
     if details.get("http_status") == 401 and str(details.get("provider_code") or "") in {
         "token_invalidated",
@@ -249,7 +305,7 @@ def _health_result_failure_node(state: _HealthResultState) -> dict[str, object]:
     service_id = state["service_id"]
     monitor = state["monitor"]
     count = monitor._failure_counts.get(service_id, 0) + 1
-    terminal_failure = _is_terminal_model_auth_failure(state["result"])
+    terminal_failure = _is_terminal_model_failure(state["result"])
     if terminal_failure:
         count = max(count, _ESCALATION_THRESHOLD)
     monitor._failure_counts[service_id] = count
@@ -260,10 +316,15 @@ def _health_result_failure_node(state: _HealthResultState) -> dict[str, object]:
         state["result"].error,
     )
     if terminal_failure:
-        backoff_seconds = _terminal_auth_backoff_seconds()
+        details = state["result"].details if isinstance(state["result"].details, dict) else {}
+        backoff_seconds = (
+            _terminal_quota_backoff_seconds(state["result"])
+            if details.get("category") == "quota"
+            else _terminal_auth_backoff_seconds()
+        )
         monitor._pause_probe(service_id, backoff_seconds)
         logger.warning(
-            "Health monitor: %s probe paused for %.0fs after terminal auth failure",
+            "Health monitor: %s probe paused for %.0fs after terminal model failure",
             service_id,
             backoff_seconds,
         )

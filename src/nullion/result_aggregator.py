@@ -31,6 +31,7 @@ from nullion.artifacts import (
     artifact_root_for_principal,
     media_candidate_paths_from_text,
 )
+from nullion.attachment_format_graph import plan_attachment_format
 from nullion.delegated_artifact_workflow import finalize_delegated_artifacts
 from nullion.mini_agent_runner import ProgressUpdate
 from nullion.task_queue import TaskGroup, TaskRecord, TaskRegistry, TaskStatus
@@ -185,11 +186,15 @@ class ResultAggregator:
             if recovered_artifacts
             else await self._generate_summary(group)
         )
+        requested_extension = _requested_attachment_extension_for_group(group, model_client=self._model_client)
         deliverable_artifacts = _artifact_paths_for_group_delivery(
             group,
             recovered_artifacts,
             summary=summary,
+            requested_extension=requested_extension,
         )
+        if requested_extension and not deliverable_artifacts:
+            summary = _missing_requested_artifact_summary(group, requested_extension)
         await self._deliver(
             gs.conversation_id,
             _summary_with_original_request_context(group, summary),
@@ -296,38 +301,84 @@ def _artifact_paths_for_group_delivery(
     recovered_artifacts: list[str] | tuple[str, ...],
     *,
     summary: str | None = None,
+    requested_extension: str | None = None,
 ) -> list[str]:
-    paths: list[str] = []
+    explicit_paths: list[str] = []
+    artifact_task_paths: list[str] = []
+    all_text_paths: list[str] = []
     for task in group.tasks:
         result = task.result
         if result is None:
             continue
-        paths.extend(str(path) for path in (result.artifacts or []) if isinstance(path, str) and path.strip())
-    paths.extend(str(path) for path in (recovered_artifacts or []) if isinstance(path, str) and path.strip())
+        task_paths = [str(path) for path in (result.artifacts or []) if isinstance(path, str) and path.strip()]
+        explicit_paths.extend(task_paths)
+        if _task_has_artifact_delivery_scope(task):
+            artifact_task_paths.extend(task_paths)
+    explicit_paths.extend(str(path) for path in (recovered_artifacts or []) if isinstance(path, str) and path.strip())
+    artifact_task_paths.extend(str(path) for path in (recovered_artifacts or []) if isinstance(path, str) and path.strip())
     roots = _artifact_roots_for_group(group)
     summary_paths = _existing_artifacts_referenced_by_text(str(summary or ""), artifact_roots=roots)
-    if summary_paths:
-        return summary_paths
-    if paths:
+    for task in group.tasks:
+        result = task.result
+        if result is None:
+            continue
+        for text in _task_result_text_fragments(result):
+            found = _existing_artifacts_referenced_by_text(text, artifact_roots=roots)
+            all_text_paths.extend(found)
+            if _task_has_artifact_delivery_scope(task):
+                artifact_task_paths.extend(found)
+    requested_extension = _normalize_requested_extension(requested_extension)
+    candidate_groups = (
+        summary_paths,
+        artifact_task_paths,
+        explicit_paths,
+        all_text_paths,
+    )
+    if requested_extension:
+        for candidates in candidate_groups:
+            matching = _filter_artifact_paths_by_extension(candidates, requested_extension)
+            if matching:
+                return matching
+        return []
+    for candidates in candidate_groups:
+        if candidates:
+            return list(dict.fromkeys(candidates))
+    return []
+
+
+def _requested_attachment_extension_for_group(group: TaskGroup, *, model_client: Any | None) -> str | None:
+    del model_client
+    try:
+        return plan_attachment_format(group.original_message, model_client=None).extension
+    except Exception:
+        logger.debug("Could not plan requested attachment extension for group %s", group.group_id, exc_info=True)
+        return None
+
+
+def _normalize_requested_extension(extension: str | None) -> str | None:
+    text = str(extension or "").strip().lower()
+    if not text:
+        return None
+    return text if text.startswith(".") else f".{text}"
+
+
+def _filter_artifact_paths_by_extension(paths: list[str] | tuple[str, ...], extension: str) -> list[str]:
+    normalized = _normalize_requested_extension(extension)
+    if normalized is None:
         return list(dict.fromkeys(paths))
-    artifact_task_paths: list[str] = []
-    for task in group.tasks:
-        if not _task_has_artifact_delivery_scope(task):
-            continue
-        result = task.result
-        if result is None:
-            continue
-        for text in _task_result_text_fragments(result):
-            artifact_task_paths.extend(_existing_artifacts_referenced_by_text(text, artifact_roots=roots))
-    if artifact_task_paths:
-        return list(dict.fromkeys(artifact_task_paths))
-    for task in group.tasks:
-        result = task.result
-        if result is None:
-            continue
-        for text in _task_result_text_fragments(result):
-            paths.extend(_existing_artifacts_referenced_by_text(text, artifact_roots=roots))
-    return list(dict.fromkeys(paths))
+    return list(
+        dict.fromkeys(
+            path for path in paths if Path(str(path)).suffix.lower() == normalized
+        )
+    )
+
+
+def _missing_requested_artifact_summary(group: TaskGroup, requested_extension: str) -> str:
+    normalized = _normalize_requested_extension(requested_extension) or str(requested_extension)
+    return (
+        f"I could not attach the requested {normalized} file because no verified "
+        f"{normalized} artifact was produced for this run."
+    )
 
 
 def _artifact_roots_for_group(group: TaskGroup) -> tuple[Path, ...]:

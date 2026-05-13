@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import time
 from typing import Iterable
 
 from nullion.tools import ToolInvocation, ToolResult
@@ -25,6 +26,7 @@ CRON_EXECUTION_BLOCKED_TOOLS = frozenset(
 )
 CRON_EXECUTION_CONNECTOR_CAPABILITY_TAGS = frozenset({"connector"})
 CRON_EXECUTION_CONNECTOR_TOOLS = frozenset({"connector_request"})
+CRON_CONNECTOR_SCOPE_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +101,11 @@ class CronExecutionToolRegistry:
             return True
         return self._allow_connector_tools
 
-    def _is_available_spec(self, spec: object) -> bool:
+    @staticmethod
+    def _requires_approval(spec: object) -> bool:
+        return bool(getattr(spec, "requires_approval", False))
+
+    def _is_invokable_spec(self, spec: object) -> bool:
         spec_name = str(getattr(spec, "name", "") or "").strip()
         return (
             self._is_allowed_by_structured_plan(spec_name)
@@ -107,9 +113,14 @@ class CronExecutionToolRegistry:
             and self._is_connector_spec_available(spec)
         )
 
+    def _is_listed_spec(self, spec: object) -> bool:
+        # Keep approval-gated tools visible to planner/decomposer surfaces so
+        # structured plans can request them and trigger the normal approval flow.
+        return self._is_invokable_spec(spec)
+
     def get_spec(self, name: str):
         spec = self._delegate.get_spec(name)
-        if not self._is_available_spec(spec):
+        if not self._is_invokable_spec(spec):
             raise KeyError(f"Unknown tool: {name}")
         return spec
 
@@ -117,7 +128,7 @@ class CronExecutionToolRegistry:
         return [
             spec
             for spec in self._delegate.list_specs()
-            if self._is_available_spec(spec)
+            if self._is_listed_spec(spec)
         ]
 
     def list_tool_definitions(self, *args, **kwargs) -> list[dict[str, object]]:
@@ -273,6 +284,18 @@ def _connected_connector_provider_summaries(principal_id: str | None) -> tuple[d
     return tuple(summaries)
 
 
+def _has_structured_connector_scope_evidence(
+    *,
+    planned_tool_names: Iterable[str] | None,
+) -> bool:
+    planned_tools = {
+        str(tool_name or "").strip()
+        for tool_name in (planned_tool_names or ())
+        if str(tool_name or "").strip()
+    }
+    return bool(planned_tools.intersection(CRON_EXECUTION_CONNECTOR_TOOLS))
+
+
 def _extract_response_text(response: object) -> str:
     if not isinstance(response, dict):
         return ""
@@ -337,12 +360,24 @@ def build_cron_connector_scope_decision(
     user_message: str,
     principal_id: str,
     registry,
+    planned_tool_names: Iterable[str] | None = None,
 ) -> CronConnectorScopeDecision:
     """Return connector scope from structured model output plus runtime connections."""
     if model_client is None or not _registry_has_connector_tools(registry):
         return CronConnectorScopeDecision()
+    started = time.perf_counter()
     provider_summaries = _connected_connector_provider_summaries(principal_id)
     if not provider_summaries:
+        return CronConnectorScopeDecision()
+    planned_tool_names_tuple = tuple(planned_tool_names or ())
+    if planned_tool_names_tuple and not _has_structured_connector_scope_evidence(
+        planned_tool_names=planned_tool_names_tuple,
+    ):
+        logger.info(
+            "cron connector scope skipped principal_id=%s providers=%d reason=no_structured_connector_evidence",
+            principal_id,
+            len(provider_summaries),
+        )
         return CronConnectorScopeDecision()
     connected_provider_ids = {
         str(provider.get("provider_id") or "").strip()
@@ -375,16 +410,33 @@ def build_cron_connector_scope_decision(
             tools=[],
             max_tokens=180,
             system=system,
+            timeout=CRON_CONNECTOR_SCOPE_TIMEOUT_SECONDS,
         )
     except Exception:
         logger.debug("Cron connector-scope decision failed; hiding connector tools", exc_info=True)
         return CronConnectorScopeDecision()
+    elapsed_ms = (time.perf_counter() - started) * 1000
     decision = _parse_cron_connector_scope_decision(
         _extract_response_text(response),
         connected_provider_ids=connected_provider_ids,
     )
     if not decision.valid:
+        logger.info(
+            "cron connector scope skipped principal_id=%s elapsed_ms=%.1f providers=%d reason=invalid_model_response",
+            principal_id,
+            elapsed_ms,
+            len(provider_summaries),
+        )
         return CronConnectorScopeDecision()
+    logger.info(
+        "cron connector scope decided principal_id=%s elapsed_ms=%.1f allow=%s providers=%d selected=%d confidence=%.2f",
+        principal_id,
+        elapsed_ms,
+        decision.allow_connector_tools,
+        len(provider_summaries),
+        len(decision.provider_ids),
+        decision.confidence,
+    )
     return decision
 
 

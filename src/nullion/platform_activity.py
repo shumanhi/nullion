@@ -7,7 +7,9 @@ import re
 import time
 
 _PLANNER_COUNT_SUFFIX_RE = re.compile(r"\s*(?:[*•]|—|-)\s*\d+(?:\s+\S+)?\s*$", re.IGNORECASE)
+_PLANNER_PREFIX_RE = re.compile(r"^\s*planner\s+", re.IGNORECASE)
 _TOOL_STATUS_GLYPHS = {"✓", "→", "⊗", "⊘", "•"}
+_RUNNING_SPINNER_GLYPHS: tuple[str, ...] = ("◑", "◒", "◐", "◓")
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +27,7 @@ class PlatformTaskCardState:
     summary: str = ""
     activity: dict[str, str] = field(default_factory=dict)
     last_emit_at: float = 0.0
+    spinner_frame: int = 0
 
 
 class PlatformTaskCardStore:
@@ -78,7 +81,12 @@ class PlatformTaskCardStore:
         ):
             return None
         state.last_emit_at = now
-        return render_task_card_text(state.summary, state.activity.values() if include_activity else ())
+        summary_text, next_spinner_frame = _animate_running_status_summary(
+            state.summary,
+            spinner_frame=state.spinner_frame,
+        )
+        state.spinner_frame = next_spinner_frame
+        return render_task_card_text(summary_text, state.activity.values() if include_activity else ())
 
     def clear(self, *, target_id: str, group_id: str) -> None:
         target = str(target_id or "").strip()
@@ -150,6 +158,27 @@ def render_task_card_text(summary: str, activity_lines: object = ()) -> str:
     return "\n\n".join([summary_text, _render_platform_activity_section(activity)])
 
 
+def _animate_running_status_summary(summary: str, *, spinner_frame: int) -> tuple[str, int]:
+    raw = str(summary or "")
+    if not raw:
+        return "", spinner_frame
+    lines = raw.splitlines()
+    glyph = _RUNNING_SPINNER_GLYPHS[spinner_frame % len(_RUNNING_SPINNER_GLYPHS)]
+    changed = False
+    animated: list[str] = []
+    for line in lines:
+        leading = len(line) - len(line.lstrip(" "))
+        stripped = line[leading:]
+        if len(stripped) >= 2 and stripped[0] in _RUNNING_SPINNER_GLYPHS and stripped[1] == " ":
+            animated.append(f"{line[:leading]}{glyph}{stripped[1:]}")
+            changed = True
+        else:
+            animated.append(line)
+    if not changed:
+        return raw, 0
+    return "\n".join(animated), (spinner_frame + 1) % len(_RUNNING_SPINNER_GLYPHS)
+
+
 def _compact_platform_activity_line(line: str) -> str:
     text = str(line or "").strip()
     if not text:
@@ -206,7 +235,9 @@ def _render_platform_planner_summary(summary: str) -> str:
 
 
 def _render_platform_planner_label(label: str) -> str:
-    return _PLANNER_COUNT_SUFFIX_RE.sub("", str(label or "").strip()).upper()
+    compact = _PLANNER_COUNT_SUFFIX_RE.sub("", str(label or "").strip())
+    compact = _PLANNER_PREFIX_RE.sub("", compact).strip()
+    return compact.upper()
 
 
 __all__ = [

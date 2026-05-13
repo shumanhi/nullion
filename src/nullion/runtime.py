@@ -255,12 +255,21 @@ class WorkerResultCommitResult:
     reason: str | None = None
 
 
+def _runtime_checkpoint_file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
 @dataclass(slots=True, weakref_slot=True, eq=False)
 class PersistentRuntime:
     store: RuntimeStore
     checkpoint_path: Path
     started_at: datetime
     last_checkpoint_fingerprint: str | None = None
+    last_checkpoint_file_signature: tuple[int, int] | None = None
     live_tool_registry: ToolRegistry | None = None
     model_client: Any | None = None
 
@@ -286,12 +295,12 @@ class PersistentRuntime:
     def active_tool_registry(self, value: ToolRegistry | None) -> None:
         self.live_tool_registry = value
 
-    def checkpoint(self) -> Path:
+    def checkpoint(self, *, force: bool = False) -> Path:
         measure_sqlite = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
         started_at = perf_counter()
-        fingerprint = render_runtime_store_payload_json(self.store)
+        fingerprint = None if force else render_runtime_store_payload_json(self.store)
         fingerprint_ms = (perf_counter() - started_at) * 1000
-        if fingerprint == self.last_checkpoint_fingerprint and self.checkpoint_path.exists():
+        if not force and fingerprint == self.last_checkpoint_fingerprint and self.checkpoint_path.exists():
             if measure_sqlite:
                 logger.debug(
                     "runtime checkpoint skipped path=%s fingerprint_ms=%.1f",
@@ -299,18 +308,25 @@ class PersistentRuntime:
                     fingerprint_ms,
                 )
             return self.checkpoint_path
+        current_file_signature = _runtime_checkpoint_file_signature(self.checkpoint_path)
+        merge_existing = (
+            current_file_signature is not None
+            and current_file_signature != self.last_checkpoint_file_signature
+        )
         save_started_at = perf_counter()
-        saved_path = checkpoint_runtime_store(self.store, self.checkpoint_path)
+        saved_path = checkpoint_runtime_store(self.store, self.checkpoint_path, merge_existing=merge_existing)
         save_ms = (perf_counter() - save_started_at) * 1000
         self.last_checkpoint_fingerprint = fingerprint
+        self.last_checkpoint_file_signature = _runtime_checkpoint_file_signature(saved_path)
         total_ms = (perf_counter() - started_at) * 1000
         if measure_sqlite:
             logger.info(
-                "runtime checkpoint saved path=%s fingerprint_ms=%.1f save_ms=%.1f total_ms=%.1f",
+                "runtime checkpoint saved path=%s fingerprint_ms=%.1f save_ms=%.1f total_ms=%.1f merge_existing=%s",
                 saved_path.name,
                 fingerprint_ms,
                 save_ms,
                 total_ms,
+                merge_existing,
             )
         return saved_path
 
@@ -320,8 +336,8 @@ class PersistentRuntime:
     def latest_restore_metadata(self) -> dict[str, object] | None:
         return get_latest_runtime_restore_metadata(self.store)
 
-    def list_conversation_chat_turns(self, conversation_id: str) -> list[dict[str, str]]:
-        return list_conversation_chat_turns(self.store, conversation_id)
+    def list_conversation_chat_turns(self, conversation_id: str, limit: int | None = None) -> list[dict[str, str]]:
+        return list_conversation_chat_turns(self.store, conversation_id, limit=limit)
 
     def render_status_for_telegram(
         self,
@@ -359,9 +375,10 @@ class PersistentRuntime:
         self.checkpoint()
         return result
 
-    def process_conversation_message(self, **kwargs) -> ConversationMessageResult:
+    def process_conversation_message(self, *, checkpoint: bool = True, **kwargs) -> ConversationMessageResult:
         result = process_conversation_message(self.store, **kwargs)
-        self.checkpoint()
+        if checkpoint:
+            self.checkpoint()
         return result
 
     def create_worker_result_envelope(self, **kwargs) -> WorkerResultEnvelope:
@@ -3715,8 +3732,12 @@ def process_conversation_message(
 
 
 
-def list_conversation_chat_turns(store: RuntimeStore, conversation_id: str) -> list[dict[str, str]]:
-    return store.list_conversation_chat_turns(conversation_id)
+def list_conversation_chat_turns(
+    store: RuntimeStore,
+    conversation_id: str,
+    limit: int | None = None,
+) -> list[dict[str, str]]:
+    return store.list_conversation_chat_turns(conversation_id, limit=limit)
 
 
 
@@ -4087,8 +4108,8 @@ def run_due_scheduled_tasks(store: RuntimeStore, now: datetime):
 
 
 
-def checkpoint_runtime_store(store: RuntimeStore, path: str | Path) -> Path:
-    return save_runtime_store(store, path)
+def checkpoint_runtime_store(store: RuntimeStore, path: str | Path, *, merge_existing: bool = True) -> Path:
+    return save_runtime_store(store, path, merge_existing=merge_existing)
 
 
 
@@ -4340,6 +4361,7 @@ def bootstrap_persistent_runtime(path: str | Path) -> PersistentRuntime:
         checkpoint_path=checkpoint_path,
         started_at=datetime.now(UTC),
         last_checkpoint_fingerprint=fingerprint,
+        last_checkpoint_file_signature=_runtime_checkpoint_file_signature(checkpoint_path),
     )
 
 

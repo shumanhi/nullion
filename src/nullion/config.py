@@ -156,6 +156,10 @@ def _read_env_file(path: str | Path) -> dict[str, str]:
     return env_values
 
 
+def read_env_file_values(path: str | Path) -> dict[str, str]:
+    return _read_env_file(path)
+
+
 def load_env_file_into_environ(path: str | Path, *, override: bool = False) -> dict[str, str]:
     env_values = _read_env_file(path)
     for key, value in env_values.items():
