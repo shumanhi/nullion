@@ -221,10 +221,20 @@ The same idea is used across web, Telegram, Slack, and Discord:
 Planner cards and verbose activity are separate controls. The Planner card
 setting controls whether supported chat surfaces show the request summary and
 task checklist. Verbose controls the extra activity feed below that card.
+When planner cards are enabled, Web, Telegram, Slack, and Discord render the
+planner header, request summary, task count/title, and task rows from typed
+task-status state. If verbose activity is off, the Activity section is omitted;
+if verbose activity is on, the same card includes compact, deduped tool and
+mini-agent activity below it.
 
 Use `/planner <message>` when you want a request to run through the explicit
 step-by-step planner path. It is not a visibility toggle; it starts a planned
 task using the message that follows the command.
+
+`/verbose` accepts only `on`, `off`, or `status`. It never toggles planner-card
+visibility. Terminal success, failure, timeout, and artifact completion still
+need a final user-visible result or verified artifact receipt even when planner
+or activity cards were already shown.
 
 ![Nullion web console showing planner cards, activity, generated artifacts, approvals, schedules, and runtime controls](https://www.nullion.ai/assets/nullion-web-console-real.png)
 

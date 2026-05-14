@@ -1758,7 +1758,7 @@ prompt_read -rp "  Enter 1, 2, 3, or 4: " BROWSER_CHOICE
 case "$BROWSER_CHOICE" in
     1)
         BROWSER_BACKEND="auto"
-        BROWSER_CDP_URL="http://localhost:9222"
+        BROWSER_CDP_URL="http://127.0.0.1:9222"
         BROWSER_PREFERRED="brave"
         print_ok "Brave selected."
         if ! browser_installed brave; then
@@ -1768,7 +1768,7 @@ case "$BROWSER_CHOICE" in
         ;;
     2)
         BROWSER_BACKEND="auto"
-        BROWSER_CDP_URL="http://localhost:9222"
+        BROWSER_CDP_URL="http://127.0.0.1:9222"
         BROWSER_PREFERRED="chrome"
         print_ok "Chrome selected."
         if ! browser_installed chrome; then

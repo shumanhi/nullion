@@ -184,10 +184,24 @@ Start with:
 NULLION_ENABLED_PLUGINS=browser_plugin
 NULLION_BROWSER_ENABLED=true
 NULLION_BROWSER_BACKEND=auto
+NULLION_BROWSER_PREFERRED=brave
+NULLION_BROWSER_CDP_URL=http://127.0.0.1:9222
 ```
 
-Use `auto` first. Switch to `playwright` for a clean headless browser, or `cdp`
-when you intentionally want to attach to an existing Chrome/Brave session.
+Use `auto` first. It attaches to a reachable local CDP browser, otherwise it
+launches a visible browser and falls back to headless Chromium only when no
+local browser is available. In Settings, choose Browser mode separately from
+Visible browser app so Brave, Chrome, and Edge are explicit choices.
+
+Use `cdp` only when you intentionally want to attach to an existing browser
+already running with remote debugging enabled. The default CDP endpoint is
+`http://127.0.0.1:9222`; this avoids `localhost` resolving to `::1` on macOS.
+
+Use `playwright` for a clean headless Chromium session.
+
+If Open agent browser says it cannot connect to an existing browser on
+`http://127.0.0.1:9222`, either switch Browser mode to Auto visible browser or
+start Brave, Chrome, or Edge with remote debugging on port 9222.
 
 ### Web research feels slower than search
 

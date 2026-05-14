@@ -335,6 +335,7 @@ def _render_status(runtime: PersistentRuntime) -> str:
     pressure = compute_approval_pressure(snapshot)
     cfg = current_runtime_config(model_client=getattr(runtime, "model_client", None))
     active_missions = sum(1 for mission in snapshot.get("missions", []) if str(mission.get("status")) in {"running", "waiting_approval", "blocked"})
+    active_mini_agents = int(counts.get("active_mini_agent_runs", 0) or 0)
     pending_approvals = pressure["pending_approval_requests"]
     active_grants = sum(1 for grant in snapshot.get("permission_grants", []) if grant.get("grant_state") == "active")
     lines = [
@@ -342,7 +343,7 @@ def _render_status(runtime: PersistentRuntime) -> str:
         "",
         f"Model: {cfg.provider} / {cfg.model}",
         f"Version: {__version__}",
-        f"Runtime: {counts['running_capsules']} running, {active_missions} active mission(s)",
+        f"Runtime: {counts['running_capsules']} running, {active_missions} active mission(s), {active_mini_agents} active mini-agent(s)",
         f"Approvals: {pending_approvals} pending, {active_grants} active permission(s)",
         f"Doctor: {counts['pending_doctor_actions']} pending action(s)",
         f"Sentinel: {counts['open_sentinel_escalations']} open escalation(s)",

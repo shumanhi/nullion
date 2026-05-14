@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 from uuid import uuid4
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable, TypedDict
 
@@ -208,6 +208,27 @@ _WEB_CHECKPOINT_LOCK = threading.RLock()
 _WEB_CHECKPOINT_INFLIGHT: set[int] = set()
 _WEB_CHECKPOINT_DIRTY: set[int] = set()
 _WEB_TURN_SLOW_LOG_MS = 1200.0
+_DEFAULT_BROWSER_CDP_URL = "http://127.0.0.1:9222"
+
+
+def _normalize_browser_cdp_url(raw_url: object | None) -> str:
+    raw = str(raw_url or "").strip() or _DEFAULT_BROWSER_CDP_URL
+    parsed = urlparse(raw)
+    if parsed.hostname in {"localhost", "::1"}:
+        return urlunparse(parsed._replace(netloc=f"127.0.0.1:{parsed.port or 9222}"))
+    return raw
+
+
+def _friendly_browser_open_error(raw_error: object, *, backend: str) -> str:
+    message = str(raw_error or "Browser navigation failed.").strip() or "Browser navigation failed."
+    lowered = message.lower()
+    if backend == "cdp" and ("econnrefused" in lowered or "connect_over_cdp" in lowered):
+        cdp_url = _normalize_browser_cdp_url(os.environ.get("NULLION_BROWSER_CDP_URL"))
+        return (
+            f"Could not connect to an existing browser on {cdp_url}. "
+            "Start Brave, Chrome, or Edge with remote debugging enabled, or switch Browser mode to Auto visible browser."
+        )
+    return message
 
 _WEB_STABLE_CONTEXT_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
@@ -222,7 +243,9 @@ _WEB_STABLE_CONTEXT_ENV_KEYS = (
     "NULLION_ANTHROPIC_API_KEY",
     "NULLION_ANTHROPIC_MODEL",
     "NULLION_BROWSER_BACKEND",
+    "NULLION_BROWSER_CDP_URL",
     "NULLION_BROWSER_ENABLED",
+    "NULLION_BROWSER_PREFERRED",
     "NULLION_BRAVE_SEARCH_API_KEY",
     "NULLION_CHECKPOINT_PATH",
     "NULLION_CODEX_REFRESH_TOKEN",
@@ -4079,13 +4102,21 @@ _HTML = r"""<!DOCTYPE html>
   .feat-info { flex: 1; min-width: 0; }
   .feat-name { font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 2px; }
   .feat-desc { font-size: 12px; color: var(--muted); line-height: 1.4; }
-  .feat-row select {
+  .feat-row select,
+  .feat-row input[type="text"] {
     background-color: var(--surface2); border: 1px solid var(--border);
     color: var(--text); border-radius: 7px; padding: 5px 10px;
     font-size: 12px; font-family: inherit; outline: none; flex-shrink: 0;
-    transition: border-color 0.15s;
+    transition: border-color 0.15s, background-color 0.15s;
+    min-height: 32px; box-sizing: border-box;
   }
-  .feat-row select:focus { border-color: var(--accent); }
+  .feat-row input[type="text"] {
+    width: min(280px, 46vw);
+    max-width: 100%;
+  }
+  .feat-row input[type="text"]::placeholder { color: var(--muted); opacity: 0.75; }
+  .feat-row select:focus,
+  .feat-row input[type="text"]:focus { border-color: var(--accent); }
   #composer-mode,
   .logs-toolbar select,
   .permission-expiry select,
@@ -4109,6 +4140,7 @@ _HTML = r"""<!DOCTYPE html>
   .logs-toolbar select::-ms-expand,
   .permission-expiry select::-ms-expand,
   .feat-row select::-ms-expand { display: none; }
+  .feat-row[hidden] { display: none; }
 
   /* Save feedback */
   #save-feedback {
@@ -4578,15 +4610,34 @@ _HTML = r"""<!DOCTYPE html>
           <div class="settings-panel-title">Browser</div>
           <div class="feat-row">
             <div class="feat-info">
-              <div class="feat-name">Browser backend</div>
-              <div class="feat-desc">Attach Nullion to your browser for web automation. Leave blank to disable.</div>
+              <div class="feat-name">Browser mode</div>
+              <div class="feat-desc">Choose how Nullion opens browser automation sessions.</div>
             </div>
-            <select id="cfg-browser-backend">
+            <select id="cfg-browser-backend" onchange="updateBrowserSettingsVisibility()">
               <option value="">Disabled</option>
-              <option value="auto">Auto (attach to running browser)</option>
-              <option value="cdp">CDP (Chrome/Brave/Edge on port 9222)</option>
-              <option value="playwright">Playwright (headless Chromium)</option>
+              <option value="auto">Auto visible browser</option>
+              <option value="cdp">Existing browser on CDP URL</option>
+              <option value="playwright">Headless Chromium</option>
             </select>
+          </div>
+          <div class="feat-row" id="cfg-browser-preferred-row" hidden>
+            <div class="feat-info">
+              <div class="feat-name">Visible browser app</div>
+              <div class="feat-desc">Used when Auto launches a browser.</div>
+            </div>
+            <select id="cfg-browser-preferred">
+              <option value="">System default</option>
+              <option value="brave">Brave</option>
+              <option value="chrome">Chrome</option>
+              <option value="edge">Edge</option>
+            </select>
+          </div>
+          <div class="feat-row" id="cfg-browser-cdp-row" hidden>
+            <div class="feat-info">
+              <div class="feat-name">Existing browser URL</div>
+              <div class="feat-desc">Advanced CDP endpoint for a browser already running with remote debugging.</div>
+            </div>
+            <input id="cfg-browser-cdp-url" type="text" placeholder="http://127.0.0.1:9222">
           </div>
         </div>
 
@@ -12334,6 +12385,14 @@ function mediaEnabledForProvider(selectId) {
   return Boolean(select && (select.value === 'local_auto' || select.value === 'model'));
 }
 
+function updateBrowserSettingsVisibility() {
+  const mode = document.getElementById('cfg-browser-backend')?.value || '';
+  const preferredRow = document.getElementById('cfg-browser-preferred-row');
+  const cdpRow = document.getElementById('cfg-browser-cdp-row');
+  if (preferredRow) preferredRow.hidden = mode !== 'auto';
+  if (cdpRow) cdpRow.hidden = mode !== 'cdp';
+}
+
 async function loadConfig(options = {}) {
   try {
     const cfg = await API('/api/config');
@@ -12445,6 +12504,11 @@ async function loadConfig(options = {}) {
     if (cfg.browser_backend !== undefined) {
       document.getElementById('cfg-browser-backend').value = cfg.browser_backend || '';
     }
+    const browserPreferredEl = document.getElementById('cfg-browser-preferred');
+    if (browserPreferredEl) browserPreferredEl.value = cfg.browser_preferred || '';
+    const browserCdpUrlEl = document.getElementById('cfg-browser-cdp-url');
+    if (browserCdpUrlEl) browserCdpUrlEl.value = cfg.browser_cdp_url || 'http://127.0.0.1:9222';
+    updateBrowserSettingsVisibility();
     document.getElementById('cfg-workspace-root').value = cfg.workspace_root || '';
     document.getElementById('cfg-allowed-roots').value = cfg.allowed_roots || '';
     document.getElementById('cfg-search-provider').value = cfg.search_provider || 'builtin_search_provider';
@@ -12896,7 +12960,13 @@ async function launchAgentBrowser() {
     setTimeout(() => setStatus(true, previous || 'Connected'), 1800);
   } catch (e) {
     setStatus(true, previous || 'Connected');
-    alert(`Could not open agent browser: ${e.message || e}`);
+    await confirmAction({
+      title: 'Could not open agent browser',
+      message: e.message || String(e),
+      confirmText: 'OK',
+      cancelText: null,
+      icon: 'warn',
+    });
   } finally {
     await loadHeaderConfig();
   }
@@ -14107,6 +14177,8 @@ async function saveConfig() {
     show_thinking:    document.getElementById('cfg-show-thinking').checked,
     web_session_allow_duration: document.getElementById('cfg-web-session-allow-duration').value,
     browser_backend: document.getElementById('cfg-browser-backend').value,
+    browser_preferred: document.getElementById('cfg-browser-preferred')?.value || '',
+    browser_cdp_url: document.getElementById('cfg-browser-cdp-url')?.value.trim() || '',
     workspace_root:  document.getElementById('cfg-workspace-root').value.trim(),
     allowed_roots:   document.getElementById('cfg-allowed-roots').value.trim(),
     search_provider: document.getElementById('cfg-search-provider').value,
@@ -17359,7 +17431,7 @@ def create_app(runtime, orchestrator, registry):
     def _cron_fire(job):
         """Fire a cron by sending its task string through a synthetic agent turn."""
         try:
-            result = _run_cron_agent_turn(job, label="Scheduled task", allow_mini_agents=True)
+            result = _run_cron_agent_turn(job, label="Scheduled task", allow_mini_agents=False)
             if isinstance(result, dict) and (result.get("cron_delivery_failed") or result.get("cron_run_failed")):
                 raise RuntimeError("cron delivery failed")
         except Exception as exc:
@@ -17388,7 +17460,7 @@ def create_app(runtime, orchestrator, registry):
                 return _run_cron_agent_turn(
                     job,
                     label="Manual scheduled task run",
-                    allow_mini_agents=True,
+                    allow_mini_agents=False,
                     manual_delivery_channel="web",
                     manual_delivery_target=manual_target or "web:operator",
                     planner_status_preview=True,
@@ -19221,6 +19293,10 @@ def create_app(runtime, orchestrator, registry):
         data_retention_days = _data_retention_days_config_value()
         data_retention_types = _data_retention_types_config_value()
         browser_backend = (creds.get("browser_backend", "") if creds else "") or os.environ.get("NULLION_BROWSER_BACKEND", "")
+        browser_preferred = (creds.get("browser_preferred", "") if creds else "") or os.environ.get("NULLION_BROWSER_PREFERRED", "")
+        browser_cdp_url = _normalize_browser_cdp_url(
+            (creds.get("browser_cdp_url", "") if creds else "") or os.environ.get("NULLION_BROWSER_CDP_URL", "")
+        )
         provider_bindings = os.environ.get("NULLION_PROVIDER_BINDINGS", "")
         search_provider = "builtin_search_provider"
         for part in provider_bindings.split(","):
@@ -19453,6 +19529,8 @@ def create_app(runtime, orchestrator, registry):
             "web_session_allow_duration": _web_session_allow_duration_value(),
             "web_session_allow_label": _web_session_allow_duration_label(),
             "browser_backend": browser_backend,
+            "browser_preferred": browser_preferred,
+            "browser_cdp_url": browser_cdp_url,
             "browser_tools_available": _tool_registered("browser_navigate"),
             "workspace_root":  workspace_root,
             "allowed_roots":   allowed_roots,
@@ -19899,7 +19977,7 @@ def create_app(runtime, orchestrator, registry):
         )
         if normalize_tool_status(result.status) != "completed":
             return JSONResponse(
-                {"ok": False, "error": result.error or "Browser navigation failed."},
+                {"ok": False, "backend": backend, "error": _friendly_browser_open_error(result.error, backend=backend)},
                 status_code=500,
             )
         return JSONResponse(
@@ -20314,6 +20392,8 @@ def create_app(runtime, orchestrator, registry):
         # Update encrypted credentials if provider/key/model/browser changed
         provider_enabled = body.get("model_provider_enabled")  # bool or None
         browser_backend_val = body.get("browser_backend")  # None = not sent, "" = clear
+        browser_preferred_val = body.get("browser_preferred")  # None = not sent, "" = clear
+        browser_cdp_url_val = body.get("browser_cdp_url")  # None = not sent, "" = use default
         # Disabling a provider must NOT promote it to the active provider just
         # because the user happened to be viewing it in the dropdown. The
         # Model dropdown serves dual duty (configure-this-one and set-active),
@@ -20331,6 +20411,8 @@ def create_app(runtime, orchestrator, registry):
             or media_models_body is not None
             or media_providers_enabled_body is not None
             or browser_backend_val is not None
+            or browser_preferred_val is not None
+            or browser_cdp_url_val is not None
             or provider_enabled is not None
         )
         updates: dict[str, str] = {}
@@ -20423,6 +20505,21 @@ def create_app(runtime, orchestrator, registry):
                         creds.pop("browser_backend", None)
                         os.environ.pop("NULLION_BROWSER_BACKEND", None)
                         updates["NULLION_BROWSER_BACKEND"] = ""
+                if browser_preferred_val is not None:
+                    browser_preferred = str(browser_preferred_val or "").strip().lower()
+                    if browser_preferred:
+                        creds["browser_preferred"] = browser_preferred
+                        os.environ["NULLION_BROWSER_PREFERRED"] = browser_preferred
+                        updates["NULLION_BROWSER_PREFERRED"] = browser_preferred
+                    else:
+                        creds.pop("browser_preferred", None)
+                        os.environ.pop("NULLION_BROWSER_PREFERRED", None)
+                        updates["NULLION_BROWSER_PREFERRED"] = ""
+                if browser_cdp_url_val is not None:
+                    browser_cdp_url = _normalize_browser_cdp_url(browser_cdp_url_val)
+                    creds["browser_cdp_url"] = browser_cdp_url
+                    os.environ["NULLION_BROWSER_CDP_URL"] = browser_cdp_url
+                    updates["NULLION_BROWSER_CDP_URL"] = browser_cdp_url
                 _write_credentials_json(creds)
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": f"Could not write credentials: {exc}"}, status_code=500)
@@ -20769,7 +20866,7 @@ def create_app(runtime, orchestrator, registry):
         # Skip the hot-swap when this save is purely a toggle-off of a
         # non-active provider — nothing about the active client changed.
         _model_keys = {"model_provider", "api_key", "model_name", "reasoning_effort"}
-        _browser_keys = {"browser_backend", "browser_enabled"}
+        _browser_keys = {"browser_backend", "browser_enabled", "browser_preferred", "browser_cdp_url"}
         _web_research_keys = {
             "search_provider",
             "brave_search_key",

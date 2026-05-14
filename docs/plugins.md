@@ -21,7 +21,7 @@ separately, `calendar_plugin`; both may bind to `google_workspace_provider`.
 | Plugin | Capability | Status | Provider options |
 | --- | --- | --- | --- |
 | `search_plugin` | Search public web pages when an API-backed provider has credentials | Available | `brave_search_provider`; `google_custom_search_provider`; `perplexity_search_provider`; browser fallback when no API-backed provider is configured |
-| `browser_plugin` | Agent browser sessions, screenshots, page inspection | Available | Playwright; Chrome/Brave CDP |
+| `browser_plugin` | Agent browser sessions, screenshots, page inspection | Available | Auto visible browser; existing CDP URL; Playwright headless Chromium |
 | `workspace_plugin` | File/project workspace tools inside allowed roots | Available | Local filesystem |
 | `media_plugin` | Audio transcription, image OCR, optional image generation | Available | Local media tools |
 | `email_plugin` | Search/read email | Preview | Google Workspace preview; Microsoft 365 and IMAP/SMTP planned |
@@ -41,6 +41,8 @@ NULLION_ENABLED_PLUGINS=search_plugin,browser_plugin,workspace_plugin,media_plug
 NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider,media_plugin=local_media_provider
 NULLION_BROWSER_ENABLED=true
 NULLION_BROWSER_BACKEND=auto
+NULLION_BROWSER_PREFERRED=brave
+NULLION_BROWSER_CDP_URL=http://127.0.0.1:9222
 NULLION_WORKSPACE_ROOT=/Users/you/Projects
 NULLION_ALLOWED_ROOTS=/Users/you/Projects,/Users/you/.nullion/.nullion-artifacts
 ```
