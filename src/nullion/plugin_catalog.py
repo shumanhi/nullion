@@ -94,7 +94,7 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
                 notes="Connects to a configured local browser debug session.",
             ),
         ),
-        setup_hint="Set NULLION_BROWSER_ENABLED=true and choose NULLION_BROWSER_BACKEND=auto, playwright, or cdp.",
+        setup_hint="Set NULLION_BROWSER_ENABLED=true, choose NULLION_BROWSER_BACKEND=auto, playwright, or cdp, and set NULLION_BROWSER_PREFERRED plus NULLION_BROWSER_CDP_URL when using a visible browser.",
     ),
     PluginCatalogEntry(
         plugin_id="workspace_plugin",

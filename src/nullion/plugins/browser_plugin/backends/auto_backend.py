@@ -6,21 +6,27 @@ then connects via CDP so the user can watch.
 Falls back to Playwright headless if Chrome is not found on this system.
 
 Environment vars:
-  NULLION_BROWSER_CDP_URL   override CDP URL (default: http://localhost:9222)
+  NULLION_BROWSER_CDP_URL   override CDP URL (default: http://127.0.0.1:9222)
   NULLION_BROWSER_HEADLESS  set to "true" to force headless Playwright fallback
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import time
 from typing import Any
+from urllib.parse import urlparse, urlunparse
+from urllib.request import urlopen
 
 
 _CDP_PORT = 9222
+_DEFAULT_CDP_HOST = "127.0.0.1"
+_BROWSER_KINDS = ("chrome", "chromium", "brave", "edge")
 
 # Candidate Chrome/Chromium paths by platform
 _CHROME_CANDIDATES: dict[str, list[str]] = {
@@ -45,6 +51,28 @@ _CHROME_CANDIDATES: dict[str, list[str]] = {
 }
 
 
+def _browser_kind_from_text(value: str | None) -> str | None:
+    text = (value or "").lower()
+    if "brave" in text:
+        return "brave"
+    if "microsoft edge" in text or "msedge" in text or "edge" in text:
+        return "edge"
+    if "chromium" in text:
+        return "chromium"
+    if "google chrome" in text or "chrome" in text:
+        return "chrome"
+    return None
+
+
+def _preferred_browser_kind() -> str | None:
+    preferred = os.environ.get("NULLION_BROWSER_PREFERRED", "").strip().lower()
+    return preferred if preferred in _BROWSER_KINDS else None
+
+
+def _candidate_matches_preference(candidate: str, preferred: str | None) -> bool:
+    return not preferred or _browser_kind_from_text(candidate) == preferred
+
+
 def _find_chrome() -> str | None:
     explicit_path = os.environ.get("NULLION_BROWSER_PATH", "").strip()
     if explicit_path and os.path.exists(explicit_path):
@@ -52,9 +80,9 @@ def _find_chrome() -> str | None:
 
     system = platform.system()
     candidates = list(_CHROME_CANDIDATES.get(system, []))
-    preferred = os.environ.get("NULLION_BROWSER_PREFERRED", "").strip().lower()
+    preferred = _preferred_browser_kind()
     if preferred:
-        candidates.sort(key=lambda candidate: 0 if preferred in candidate.lower() else 1)
+        candidates.sort(key=lambda candidate: 0 if _candidate_matches_preference(candidate, preferred) else 1)
 
     for candidate in candidates:
         if os.path.isabs(candidate):
@@ -68,39 +96,143 @@ def _find_chrome() -> str | None:
 
 
 def _cdp_url() -> str:
-    return os.environ.get("NULLION_BROWSER_CDP_URL", f"http://localhost:{_CDP_PORT}")
+    from nullion.plugins.browser_plugin.backends.cdp_backend import normalized_cdp_url
+
+    return normalized_cdp_url(os.environ.get("NULLION_BROWSER_CDP_URL", f"http://{_DEFAULT_CDP_HOST}:{_CDP_PORT}"))
+
+
+def _cdp_endpoint() -> tuple[str, int]:
+    parsed = urlparse(_cdp_url())
+    host = parsed.hostname or _DEFAULT_CDP_HOST
+    if host in {"localhost", "::1"}:
+        host = _DEFAULT_CDP_HOST
+    return host, parsed.port or _CDP_PORT
+
+
+def _set_cdp_port(port: int) -> None:
+    parsed = urlparse(_cdp_url())
+    host = parsed.hostname or _DEFAULT_CDP_HOST
+    if host in {"localhost", "::1"}:
+        host = _DEFAULT_CDP_HOST
+    os.environ["NULLION_BROWSER_CDP_URL"] = urlunparse(parsed._replace(netloc=f"{host}:{port}"))
 
 
 def _cdp_port() -> int:
-    from urllib.parse import urlparse
-
-    parsed = urlparse(_cdp_url())
-    return parsed.port or _CDP_PORT
+    return _cdp_endpoint()[1]
 
 
 def _is_cdp_reachable() -> bool:
     """Quick TCP check — is something already listening on the CDP port?"""
-    import socket
-    port = _cdp_port()
+    host, port = _cdp_endpoint()
     try:
-        with socket.create_connection(("localhost", port), timeout=1):
+        with socket.create_connection((host, port), timeout=1):
             return True
     except OSError:
         return False
 
 
+def _port_is_available(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+
+
+def _next_available_cdp_port(start: int) -> int:
+    host, _port = _cdp_endpoint()
+    if host in {"::1", "localhost"}:
+        host = _DEFAULT_CDP_HOST
+    for port in range(max(start, 1024), max(start, 1024) + 50):
+        if _port_is_available(host, port):
+            return port
+    raise RuntimeError("Could not find an available local CDP port for the selected browser.")
+
+
+def _cdp_browser_kind_from_version() -> str | None:
+    url = _cdp_url().rstrip("/") + "/json/version"
+    try:
+        with urlopen(url, timeout=1) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _browser_kind_from_text(
+        " ".join(
+            str(payload.get(key) or "")
+            for key in ("Browser", "User-Agent")
+        )
+    )
+
+
+def _cdp_owner_browser_kind() -> str | None:
+    """Best-effort local process owner check for the configured CDP port."""
+    system = platform.system()
+    if system not in {"Darwin", "Linux"}:
+        return None
+    _host, port = _cdp_endpoint()
+    try:
+        lsof = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return None
+    pids = [
+        line[1:].strip()
+        for line in lsof.stdout.splitlines()
+        if line.startswith("p") and line[1:].strip().isdigit()
+    ]
+    for pid in pids:
+        try:
+            ps = subprocess.run(
+                ["ps", "-p", pid, "-o", "comm="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+        except Exception:
+            continue
+        kind = _browser_kind_from_text(ps.stdout)
+        if kind:
+            return kind
+    return None
+
+
+def _running_cdp_matches_preference() -> bool:
+    preferred = _preferred_browser_kind()
+    if not preferred:
+        return True
+    running = _cdp_owner_browser_kind() or _cdp_browser_kind_from_version()
+    return running is None or running == preferred
+
+
 _launched_proc: subprocess.Popen | None = None
+
+
+def _browser_profile_dir(chrome_path: str) -> str:
+    configured = os.environ.get("NULLION_BROWSER_USER_DATA_DIR", "").strip()
+    if configured:
+        return os.path.expanduser(configured)
+    kind = _browser_kind_from_text(chrome_path) or "chrome"
+    return os.path.expanduser(f"~/.nullion/browser-profile-{kind}")
 
 
 def _launch_chrome(chrome_path: str) -> None:
     global _launched_proc
-    if _is_cdp_reachable():
+    if _is_cdp_reachable() and _running_cdp_matches_preference():
         return  # already running
+    if _is_cdp_reachable():
+        _set_cdp_port(_next_available_cdp_port(_cdp_port() + 1))
 
-    user_data_dir = os.environ.get(
-        "NULLION_BROWSER_USER_DATA_DIR",
-        os.path.expanduser("~/.nullion/browser-profile"),
-    )
+    user_data_dir = _browser_profile_dir(chrome_path)
     os.makedirs(user_data_dir, exist_ok=True)
     port = _cdp_port()
 
@@ -161,7 +293,7 @@ class AutoBackend:
 
             if not force_headless:
                 # 1. CDP already reachable?
-                if _is_cdp_reachable():
+                if _is_cdp_reachable() and _running_cdp_matches_preference():
                     self._backend = self._make_cdp()
                     return self._backend
 

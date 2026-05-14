@@ -2234,7 +2234,7 @@ $BrowserChoice = Read-Host "  Enter 1, 2, 3, or 4"
 switch ($BrowserChoice) {
     "1" {
         $BROWSER_BACKEND = "auto"
-        $BROWSER_CDP_URL = "http://localhost:9222"
+        $BROWSER_CDP_URL = "http://127.0.0.1:9222"
         $BROWSER_PREFERRED = "brave"
         Write-Ok "Brave selected."
         if (-not (Test-BrowserInstalled "brave")) {
@@ -2244,7 +2244,7 @@ switch ($BrowserChoice) {
     }
     "2" {
         $BROWSER_BACKEND = "auto"
-        $BROWSER_CDP_URL = "http://localhost:9222"
+        $BROWSER_CDP_URL = "http://127.0.0.1:9222"
         $BROWSER_PREFERRED = "chrome"
         Write-Ok "Chrome selected."
         if (-not (Test-BrowserInstalled "chrome")) {

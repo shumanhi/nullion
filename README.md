@@ -240,6 +240,8 @@ NULLION_ENABLED_PLUGINS=search_plugin,browser_plugin,workspace_plugin,media_plug
 NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider,media_plugin=local_media_provider
 NULLION_BROWSER_ENABLED=true
 NULLION_BROWSER_BACKEND=auto
+NULLION_BROWSER_PREFERRED=brave
+NULLION_BROWSER_CDP_URL=http://127.0.0.1:9222
 NULLION_WORKSPACE_ROOT=/Users/you/Projects
 NULLION_ALLOWED_ROOTS=/Users/you/Projects,/Users/you/.nullion/.nullion-artifacts
 # Recommended audio default: installer-managed whisper.cpp + ffmpeg with

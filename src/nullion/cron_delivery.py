@@ -38,6 +38,7 @@ _HTML_LOCAL_IMAGE_SRC_RE = re.compile(
     r"(?P<prefix><img\b[^>]*?\bsrc\s*=\s*)(?P<quote>[\"'])(?P<src>[^\"']+)(?P=quote)",
     re.IGNORECASE,
 )
+_CRON_ARTIFACT_PATH_RE = re.compile(r"(?<![\w./-])(?:[~\w./:-]*/)?artifacts/[^\s`\"'<>]+")
 _HTML_INLINE_IMAGE_EXTENSIONS = frozenset({".apng", ".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"})
 
 # Cron delivery contract for future agents:
@@ -693,6 +694,44 @@ def _append_media_directives(text: str, deliverable_paths: tuple[str, ...]) -> s
     return "\n\n".join(parts)
 
 
+def _cron_internal_state_path(path_text: object) -> bool:
+    path = Path(str(path_text or "").strip().strip("`'\"<>.,)")).expanduser()
+    parts = _path_parts(str(path))
+    if "artifacts" not in parts:
+        return False
+    suffix = path.suffix.lower()
+    if suffix in {".json", ".jsonl", ".db", ".sqlite", ".sqlite3"}:
+        return True
+    name = path.name.casefold()
+    return any(token in name for token in ("checkpoint", "state", "cache", "snapshot"))
+
+
+def _filter_internal_state_paths_from_text(text: str, deliverable_paths: tuple[str, ...]) -> str:
+    from nullion.artifacts import media_candidate_paths_from_text
+
+    deliverable = {str(Path(path).expanduser()) for path in deliverable_paths}
+    kept: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        candidate_paths = tuple(
+            dict.fromkeys(
+                [
+                    *(str(path) for path in media_candidate_paths_from_text(raw_line)),
+                    *(
+                        match.group(0).rstrip(".,;:)]}")
+                        for match in _CRON_ARTIFACT_PATH_RE.finditer(raw_line)
+                    ),
+                ]
+            )
+        )
+        if candidate_paths and all(
+            str(Path(str(path)).expanduser()) not in deliverable and _cron_internal_state_path(path)
+            for path in candidate_paths
+        ):
+            continue
+        kept.append(raw_line)
+    return "\n".join(kept).strip()
+
+
 def cron_delivery_text_from_result(result: dict[str, object], *, principal_id: str | None = None) -> str:
     """Return deliverable cron text after filtering state-file-only media.
 
@@ -713,6 +752,7 @@ def cron_delivery_text_from_result(result: dict[str, object], *, principal_id: s
     text = _filter_state_media_from_text(text, state_filenames)
     text = _filter_html_support_media_from_text(text, support_assets)
     text = _strip_split_artifact_directives(text, deliverable_paths)
+    text = _filter_internal_state_paths_from_text(text, deliverable_paths)
     return _append_media_directives(text, deliverable_paths)
 
 
@@ -723,13 +763,19 @@ def cron_delivery_artifact_paths_from_result(
     principal_id: str | None = None,
 ) -> tuple[str, ...]:
     """Return concrete artifact paths that this cron delivery is about to expose."""
-    from nullion.artifacts import media_candidate_paths_from_text
+    from nullion.artifacts import parse_media_directive_line
 
     state_filenames = _workspace_state_filenames(result)
     paths = list(_structured_tool_artifact_paths(result, state_filenames))
-    for path in media_candidate_paths_from_text(str(text or "")):
-        resolved = _resolve_cron_media_path(path, principal_id=principal_id) if principal_id else None
-        paths.append(str(resolved or path))
+    for raw_line in str(text or "").splitlines():
+        directive = parse_media_directive_line(raw_line)
+        if directive is None:
+            continue
+        resolved = _resolve_cron_media_path(directive.path, principal_id=principal_id) if principal_id else None
+        path_text = str(resolved or directive.path)
+        if _cron_internal_state_path(path_text):
+            continue
+        paths.append(path_text)
     deliverable_paths, _support_assets = _prepare_cron_deliverable_paths_for_delivery(
         tuple(dict.fromkeys(path for path in paths if path))
     )

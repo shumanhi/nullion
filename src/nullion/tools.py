@@ -7482,7 +7482,11 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         from nullion.response_fulfillment_contract import guaranteed_user_visible_text
 
         delivery_status = runner_output.get("cron_delivery_status") if isinstance(runner_output, dict) else ""
-        foreground_reply_suppressed = False
+        foreground_reply_suppressed = str(delivery_status or "").strip() in {
+            "saved",
+            "sent",
+            "partial_success",
+        }
         result_text = (
             ""
             if foreground_reply_suppressed
