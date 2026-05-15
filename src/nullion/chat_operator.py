@@ -29,6 +29,7 @@ from nullion.artifacts import (
     is_safe_artifact_path,
     media_candidate_paths_from_text,
     parse_media_directive_line,
+    promote_supporting_asset_artifact_paths,
     split_media_reply_attachments,
 )
 from nullion.attachment_format_graph import plan_attachment_format
@@ -147,6 +148,8 @@ from nullion.turn_context_policy import (
     scoped_turn_tool_registry,
     should_include_prior_turn_messages,
     tool_registry_allows_skill_pack_context,
+    turn_tool_scope_decision_may_apply,
+    turn_tool_evidence_needs_model_scope_decision,
     turn_is_context_linked,
 )
 from nullion.users import (
@@ -673,6 +676,7 @@ def _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision: o
 def _messaging_turn_fast_profile_candidate(
     *,
     evidence,
+    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -683,18 +687,20 @@ def _messaging_turn_fast_profile_candidate(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return False
+        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     return not (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     )
 
 
 def _messaging_turn_skip_tool_scope_decision(
     *,
     evidence,
+    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -705,12 +711,13 @@ def _messaging_turn_skip_tool_scope_decision(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return False
+        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     if (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     ):
         return False
     return True
@@ -1478,6 +1485,23 @@ def _build_conversation_context(thread: list[dict[str, str]]) -> str | None:
     return "\n\n".join(parts)
 
 
+def _reply_context_prompt(reply_context: dict[str, object] | None) -> str | None:
+    if not isinstance(reply_context, dict):
+        return None
+    platform = str(reply_context.get("platform") or "").strip()
+    reply_to_message_id = str(reply_context.get("reply_to_message_id") or "").strip()
+    reply_to_text = str(reply_context.get("reply_to_text") or "").strip()
+    if not platform and not reply_to_message_id and not reply_to_text:
+        return None
+    source = "assistant" if reply_context.get("reply_to_from_bot") is True else "message"
+    parts = [f"Structured reply context: this {platform or 'chat'} message is a direct reply"]
+    if reply_to_message_id:
+        parts.append(f"to message id {reply_to_message_id}")
+    if reply_to_text:
+        parts.append(f"from {source}: {_trim_context_text(reply_to_text, 2000)}")
+    return " ".join(parts) + "."
+
+
 
 def _messaging_channel_and_identity_for_chat(chat_id: str | None) -> tuple[str, str | None]:
     if chat_id is None:
@@ -1605,6 +1629,26 @@ def _should_include_conversation_context(result, thread: list[dict[str, str]]) -
     # Keep recent chat available so terse replies can answer the assistant's
     # previous question without forcing the turn to continue a task branch.
     return bool(thread)
+
+
+def _conversation_context_boundary_prompt(result) -> str | None:
+    turn = getattr(result, "turn", None)
+    if turn is None:
+        return None
+    disposition = getattr(turn, "disposition", None)
+    disposition_value = str(getattr(disposition, "value", disposition) or "")
+    parent_turn_id = getattr(turn, "parent_turn_id", None)
+    if disposition_value != ConversationTurnDisposition.INDEPENDENT.value or parent_turn_id:
+        return None
+    return (
+        "Conversation routing context: the runtime recorded this message as a new independent turn "
+        "with no linked active or prior task. The recent transcript is background memory only. "
+        "Do not treat an earlier artifact, scheduled job, task, branch, or file as the selected target "
+        "unless the current user message identifies it with explicit runtime evidence such as an "
+        "attachment, URL, slash/operator command, approval/action state, artifact descriptor, current "
+        "active task-frame state, or an unambiguous name/id supplied by the user. If the referent is "
+        "not determined by that evidence, ask a brief clarification instead of choosing a previous topic."
+    )
 
 
 def _should_include_recent_tool_context(result) -> bool:
@@ -1778,6 +1822,20 @@ def _chat_thread_has_structured_relationship_evidence(thread: list[dict[str, str
     return False
 
 
+def _chat_current_turn_has_structured_followup_evidence(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    attachments: Iterable[object] | None,
+    ambiguity_fallback_reason: str | None,
+) -> bool:
+    return (
+        bool(attachments)
+        or bool(ambiguity_fallback_reason)
+        or _chat_has_open_task_frame(runtime, conversation_id=conversation_id)
+    )
+
+
 def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None, prompt: str):
     conversation_id = _conversation_id_for_chat(chat_id)
     ambiguity_reason = _task_frame_referencable_artifact_reason(runtime, conversation_id=conversation_id)
@@ -1809,12 +1867,13 @@ def _chat_ambiguity_classifier(
     *,
     model_client: object | None,
     structured_followup_evidence: bool = False,
+    reply_context_text: str | None = None,
 ):
     previous_user_message = _previous_user_message(thread)
+    reply_anchor_text = reply_context_text.strip() if isinstance(reply_context_text, str) else ""
     if (
         model_client is None
-        or not isinstance(previous_user_message, str)
-        or not previous_user_message.strip()
+        or not ((isinstance(previous_user_message, str) and previous_user_message.strip()) or reply_anchor_text)
     ):
         return None, None
     previous_assistant_message = None
@@ -1826,7 +1885,7 @@ def _chat_ambiguity_classifier(
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
             return None
-        active_turn_text = previous_user_message
+        active_turn_text = reply_anchor_text or previous_user_message
         ctx_previous_assistant = getattr(ctx, "previous_assistant_message", None)
         assistant_context = (
             ctx_previous_assistant.strip()
@@ -1837,7 +1896,7 @@ def _chat_ambiguity_classifier(
         if not has_structured_evidence:
             if not (assistant_context and _is_bare_confirmation_reply(text) and _assistant_requests_confirmation(assistant_context)):
                 return None
-            active_turn_text = f"{previous_user_message}\nAssistant: {assistant_context}"
+            active_turn_text = f"{active_turn_text}\nAssistant: {assistant_context}"
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 
@@ -2333,6 +2392,23 @@ def _artifact_delivery_label(
     return "files"
 
 
+def _should_preserve_artifact_reply_caption(reply: str) -> bool:
+    """Keep substantive final prose when attaching artifacts.
+
+    The artifact delivery boundary adds MEDIA directives after the model has
+    already produced its user-facing reply. If that reply is asking the user for
+    a decision, replacing it with a generic attachment caption hides the next
+    action the user needs to take.
+    """
+
+    text = str(reply or "").strip()
+    if not text:
+        return False
+    non_media_lines = [line.strip() for line in text.splitlines() if not line.strip().startswith("MEDIA:")]
+    visible_text = "\n".join(line for line in non_media_lines if line).strip()
+    return bool(visible_text) and any(marker in visible_text for marker in ("?", "？"))
+
+
 def _filter_artifact_descriptors_for_requested_format(
     prompt: str,
     descriptors,
@@ -2563,6 +2639,11 @@ def _artifact_paths_from_tool_results(
             path = output.get("path")
             if isinstance(path, str) and path.strip():
                 paths.append(path)
+        if result.tool_name == "image_generate":
+            for key in ("path", "output_path"):
+                path = output.get(key)
+                if isinstance(path, str) and path.strip():
+                    paths.append(path)
         if result.tool_name == "file_search":
             matches = output.get("matches")
             if isinstance(matches, (list, tuple)):
@@ -2628,6 +2709,62 @@ def _should_suppress_foreground_reply(tool_results: list[ToolResult] | tuple[Too
     return False
 
 
+def _completed_email_send_summaries(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    summaries: list[str] = []
+    for result in tool_results or ():
+        if result.tool_name != "email_send" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        recipients = output.get("to")
+        if isinstance(recipients, str):
+            recipient_text = recipients.strip()
+        elif isinstance(recipients, (list, tuple)):
+            recipient_text = ", ".join(str(value).strip() for value in recipients if str(value).strip())
+        else:
+            recipient_text = ""
+        subject = str(output.get("subject") or "").strip()
+        status_code = output.get("status_code")
+        provider_text = " via Maton/Gmail" if "maton" in str(output.get("provider_id") or output.get("url") or "").lower() else ""
+        message_payload = output.get("json")
+        message_id = ""
+        if isinstance(message_payload, dict):
+            message_id = str(message_payload.get("id") or "").strip()
+        summary = f"Email sent to {recipient_text or 'the requested recipient'}"
+        if subject:
+            summary += f' with subject "{subject}"'
+        summary += provider_text
+        if status_code:
+            summary += f" (status {status_code}"
+            if message_id:
+                summary += f", message id {message_id}"
+            summary += ")"
+        elif message_id:
+            summary += f" (message id {message_id})"
+        summary += "."
+        summaries.append(summary)
+    return tuple(dict.fromkeys(summaries))
+
+
+def _prepend_completed_email_send_summaries(
+    reply: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str:
+    summaries = _completed_email_send_summaries(tool_results)
+    if not summaries:
+        return reply
+    reply_text = str(reply or "")
+    lowered_reply = reply_text.lower()
+    if (
+        "email sent" in lowered_reply
+        or "sent the email" in lowered_reply
+        or "i sent the email" in lowered_reply
+    ) and "did not send" not in lowered_reply:
+        return reply_text
+    return "\n\n".join([*summaries, reply_text]).strip()
+
+
 def _append_chat_artifacts_to_reply(
     runtime: PersistentRuntime,
     *,
@@ -2665,6 +2802,9 @@ def _append_chat_artifacts_to_reply(
             include_search_matches=bool(requested_extension),
         ),
     ]
+    promoted_candidate_paths = promote_supporting_asset_artifact_paths(candidate_paths, artifact_roots=artifact_roots)
+    supporting_assets_promoted = promoted_candidate_paths != candidate_paths
+    candidate_paths = promoted_candidate_paths
     descriptors = []
     seen_ids: set[str] = set()
     for artifact_root in artifact_roots:
@@ -2676,7 +2816,8 @@ def _append_chat_artifacts_to_reply(
     descriptors = _filter_artifact_descriptors_for_requested_format(
         prompt,
         descriptors,
-        requested_extension=requested_extension or (None if reply_media_paths else _requested_attachment_extension(prompt)),
+        requested_extension=requested_extension
+        or (None if reply_media_paths or supporting_assets_promoted else _requested_attachment_extension(prompt)),
     )
     descriptors = _filter_text_sidecar_artifact_descriptors(
         descriptors,
@@ -2696,6 +2837,15 @@ def _append_chat_artifacts_to_reply(
         selected_paths = tuple(str(getattr(descriptor, "path", "") or "") for descriptor in descriptors)
         if selected_paths == reply_media_paths:
             return reply
+    media_lines = [f"MEDIA:{descriptor.path}" for descriptor in descriptors]
+    if _should_preserve_artifact_reply_caption(reply):
+        visible_reply = (
+            _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id)
+            if reply_has_media_directives
+            else str(reply or "").strip()
+        )
+        visible_reply = _prepend_completed_email_send_summaries(visible_reply, tool_results)
+        return "\n\n".join([visible_reply, "\n".join(media_lines)])
     attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
     visible_reply = f"Done — attached the requested {attachment_label}."
     if _image_generation_setup_failed(tool_results):
@@ -2703,7 +2853,7 @@ def _append_chat_artifacts_to_reply(
             "\n\nI created the images with a local fallback because API image generation is not configured.\n\n"
             f"{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}"
         )
-    media_lines = [f"MEDIA:{descriptor.path}" for descriptor in descriptors]
+    visible_reply = _prepend_completed_email_send_summaries(visible_reply, tool_results)
     return "\n\n".join([visible_reply, "\n".join(media_lines)])
 
 
@@ -3440,10 +3590,13 @@ def _append_builder_proposal_nudge(runtime: PersistentRuntime, reply: str) -> st
     if len(proposal_ids) == 1:
         nudge = format_builder_proposal_notification(proposals[0])
     else:
-        latest = proposal_ids[-1]
         nudge = (
-            f"Builder found {len(proposal_ids)} optional improvements. "
-            f"Review them with /proposals. Latest: /proposal {latest}"
+            "────────────────\n"
+            "🧱 Builder suggestions\n"
+            f"{len(proposal_ids)} optional improvements are waiting.\n\n"
+            "Actions\n"
+            "- Review all: /proposals\n"
+            "- Review newest: /proposal latest"
         )
 
     if reply:
@@ -3454,8 +3607,7 @@ def _append_builder_proposal_nudge(runtime: PersistentRuntime, reply: str) -> st
 def _append_runtime_nudges(runtime: PersistentRuntime, *, prompt: str, reply: str) -> str:
     del prompt
     learned = _pop_learned_skills_notification(runtime)
-    with_learning_nudge = f"{reply}\n\n{learned}" if learned and reply else (learned or reply)
-    return _append_builder_proposal_nudge(runtime, with_learning_nudge)
+    return f"{reply}\n\n{learned}" if learned and reply else (learned or reply)
 
 
 
@@ -3797,6 +3949,7 @@ def _render_chat_turn(
     turn_dispatch_decision: object | None = None,
     cancellation_checker: Callable[[], bool] | None = None,
     conversation_ingress_id: str | None = None,
+    reply_context: dict[str, object] | None = None,
 ) -> str:
     prompt = _chat_prompt_for_message(message)
     if prompt is None:
@@ -3897,19 +4050,26 @@ def _render_chat_turn(
         return reply
 
     thread = _get_chat_thread(runtime, chat_id)
-    previous_assistant_message = _previous_assistant_message(thread)
+    reply_context_prompt = _reply_context_prompt(reply_context)
+    reply_context_text = (
+        str(reply_context.get("reply_to_text") or "").strip()
+        if isinstance(reply_context, dict)
+        else ""
+    )
+    previous_assistant_message = reply_context_text or _previous_assistant_message(thread)
     ambiguity_fallback, ambiguity_fallback_reason = _chat_ambiguity_fallback(runtime, chat_id=chat_id, prompt=prompt)
     conversation_id = _conversation_id_for_chat(chat_id)
-    structured_followup_evidence = (
-        bool(attachments)
-        or bool(ambiguity_fallback_reason)
-        or _chat_has_open_task_frame(runtime, conversation_id=conversation_id)
-        or _chat_thread_has_structured_relationship_evidence(thread)
-    )
+    structured_followup_evidence = _chat_current_turn_has_structured_followup_evidence(
+        runtime,
+        conversation_id=conversation_id,
+        attachments=attachments,
+        ambiguity_fallback_reason=ambiguity_fallback_reason,
+    ) or bool(reply_context_prompt) or _chat_thread_has_structured_relationship_evidence(thread)
     ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(
         thread,
         model_client=model_client,
         structured_followup_evidence=structured_followup_evidence,
+        reply_context_text=reply_context_text,
     )
     conversation_result = runtime.process_conversation_message(
         conversation_id=conversation_id,
@@ -3917,6 +4077,7 @@ def _render_chat_turn(
         user_message=prompt,
         request_id=request_id,
         message_id=message_id,
+        reply_context=reply_context,
         previous_assistant_message=previous_assistant_message,
         ambiguity_fallback=ambiguity_fallback,
         ambiguity_fallback_reason=ambiguity_fallback_reason,
@@ -3977,6 +4138,8 @@ def _render_chat_turn(
         return _append_runtime_nudges(runtime, prompt=prompt, reply=reply)
 
     conversation_context = _build_conversation_context(thread) if _should_include_conversation_context(conversation_result, thread) else None
+    if reply_context_prompt:
+        conversation_context = "\n\n".join(part for part in (conversation_context, reply_context_prompt) if part)
     memory_context = _memory_context_for_chat(runtime, chat_id=chat_id, settings=settings)
     prior_user_message = _previous_user_message(thread)
     task_frame_prompt = _effective_prompt_from_task_frame(
@@ -4014,6 +4177,7 @@ def _render_chat_turn(
     )
     fast_profile_candidate = _messaging_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
+        user_message=effective_prompt,
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -4023,6 +4187,7 @@ def _render_chat_turn(
     _mark_timing("tool_scope_decision_check_start")
     skip_tool_scope_decision = _messaging_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
+        user_message=effective_prompt,
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -4030,7 +4195,12 @@ def _render_chat_turn(
     )
     base_tool_registry = runtime.active_tool_registry or ToolRegistry()
     if skip_tool_scope_decision:
-        active_turn_tool_registry = base_tool_registry
+        active_turn_tool_registry = scoped_turn_tool_registry(
+            base_tool_registry,
+            evidence=turn_tool_evidence,
+            model_client=None,
+            user_message=effective_prompt,
+        )
         _mark_timing("tool_scope_decision_skipped")
     else:
         _mark_timing("tool_scope_decision_allowed")
@@ -4200,6 +4370,7 @@ def _render_chat_turn(
         event = {
             "id": f"tool-{tool_activity_count}",
             "label": result.tool_name,
+            "tool_name": result.tool_name,
             "status": event_status,
         }
         if detail:
@@ -4326,6 +4497,17 @@ def _render_chat_turn(
                 orchestrator_conversation_history.append({
                     "role": "system",
                     "content": [{"type": "text", "text": recent_tool_context}],
+                })
+            context_boundary = _conversation_context_boundary_prompt(conversation_result)
+            if context_boundary:
+                orchestrator_conversation_history.append({
+                    "role": "system",
+                    "content": [{"type": "text", "text": context_boundary}],
+                })
+            if reply_context_prompt:
+                orchestrator_conversation_history.append({
+                    "role": "system",
+                    "content": [{"type": "text", "text": reply_context_prompt}],
                 })
             if _should_include_conversation_context(conversation_result, thread):
                 for past_turn in thread:
@@ -5107,6 +5289,7 @@ def handle_chat_operator_message(
     turn_dispatch_decision: object | None = None,
     cancellation_checker: Callable[[], bool] | None = None,
     conversation_ingress_id: str | None = None,
+    reply_context: dict[str, object] | None = None,
 ) -> str | None:
     message = text.strip()
     if not message:
@@ -5180,6 +5363,7 @@ def handle_chat_operator_message(
             settings=settings,
             request_id=request_id,
             message_id=message_id,
+            reply_context=reply_context,
             model_client=model_client,
             agent_orchestrator=agent_orchestrator,
             activity_callback=activity_callback,
@@ -5249,6 +5433,7 @@ def handle_chat_operator_message(
                 settings=settings,
                 request_id=request_id,
                 message_id=message_id,
+                reply_context=reply_context,
                 model_client=model_client,
                 agent_orchestrator=agent_orchestrator,
                 activity_callback=activity_callback,
@@ -5273,6 +5458,7 @@ def handle_chat_operator_message(
                 settings=settings,
                 request_id=request_id,
                 message_id=message_id,
+                reply_context=reply_context,
                 model_client=model_client,
                 agent_orchestrator=agent_orchestrator,
                 activity_callback=activity_callback,

@@ -83,11 +83,11 @@ from nullion.model_clients import (
     build_model_client_from_settings,
 )
 from nullion.agent_orchestrator import AgentOrchestrator
-from nullion.builder import format_builder_proposal_notification
+from nullion.builder import builder_proposal_acceptance_benefit
 from nullion.runtime import PersistentRuntime, format_doctor_diagnosis_for_operator
 from nullion.runtime_persistence import load_runtime_store
 from nullion.telegram_formatting import format_telegram_text
-from nullion.telegram_transport import build_telegram_bot, configure_telegram_application_builder
+from nullion.telegram_transport import build_telegram_bot, configure_telegram_application_builder, telegram_request_timeout_kwargs
 from nullion.chat_operator import (
     _chat_model_issue_reply,
     _chat_prompt_for_message,
@@ -158,6 +158,28 @@ def _message_text_or_caption(message) -> str | None:
     return getattr(message, "caption", None)
 
 
+def _telegram_reply_context(message) -> dict[str, object] | None:
+    replied = getattr(message, "reply_to_message", None)
+    if replied is None:
+        return None
+    context: dict[str, object] = {
+        "platform": "telegram",
+        "reply_to_message_id": getattr(replied, "message_id", None),
+    }
+    replied_text = _message_text_or_caption(replied)
+    if isinstance(replied_text, str) and replied_text.strip():
+        context["reply_to_text"] = replied_text.strip()
+    replied_user = getattr(replied, "from_user", None)
+    if replied_user is not None:
+        is_bot = getattr(replied_user, "is_bot", None)
+        if is_bot is not None:
+            context["reply_to_from_bot"] = bool(is_bot)
+        username = getattr(replied_user, "username", None)
+        if isinstance(username, str) and username.strip():
+            context["reply_to_username"] = username.strip()
+    return {key: value for key, value in context.items() if value is not None}
+
+
 def _telegram_request_id(update) -> str | None:
     update_id = getattr(update, "update_id", None)
     if update_id is None:
@@ -200,10 +222,25 @@ def _principal_id_for_telegram_message(message, settings: NullionSettings | None
 _TELEGRAM_ATTACHMENT_CAPTION_LIMIT = 1024
 
 
+def _telegram_document_timeout_kwargs() -> dict[str, float | int]:
+    timeouts = telegram_request_timeout_kwargs()
+    kwargs: dict[str, float | int] = {}
+    for key in ("connect_timeout", "read_timeout", "pool_timeout"):
+        value = timeouts.get(key)
+        if value is not None:
+            kwargs[key] = value
+    media_write_timeout = timeouts.get("media_write_timeout") or timeouts.get("write_timeout")
+    if media_write_timeout is not None:
+        kwargs["write_timeout"] = media_write_timeout
+    return kwargs
+
+
 async def _reply_document_attachment(message, attachment_path: Path, **kwargs) -> None:
+    delivery_kwargs = {**_telegram_document_timeout_kwargs(), **kwargs}
+
     async def operation() -> object:
         with attachment_path.open("rb") as document:
-            return await message.reply_document(document, **kwargs)
+            return await message.reply_document(document, **delivery_kwargs)
 
     await retry_messaging_delivery_operation(operation, attempts=1)
 
@@ -300,6 +337,17 @@ def _cache_runtime_checkpoint_signature(runtime: PersistentRuntime) -> None:
     _CHECKPOINT_FILE_SIGNATURES[str(path)] = signature
     try:
         runtime.last_checkpoint_file_signature = signature
+    except Exception:
+        pass
+
+
+def _mark_runtime_checkpoint_signature_stale(runtime: PersistentRuntime) -> None:
+    try:
+        runtime.last_checkpoint_file_signature = None
+    except Exception:
+        pass
+    try:
+        runtime.last_checkpoint_fingerprint = None
     except Exception:
         pass
 
@@ -675,6 +723,7 @@ _CALLBACK_ACTION_CODES = {
     "always_allow": "aa",
     "deny": "dn",
     "accept": "ac",
+    "review": "rv",
     "archive": "ar",
     "start": "st",
     "complete": "cp",
@@ -761,6 +810,21 @@ def _doctor_decision_actions(action: dict[str, object]) -> tuple[tuple[str, str]
     if remediation_actions:
         return remediation_actions + (("Mark resolved", "complete"), ("Dismiss", "cancel"))
     return (("Mark in progress", "start"), ("Mark resolved", "complete"), ("Dismiss", "cancel"))
+
+
+def _builder_proposal_card_text(record) -> str:
+    proposal = record.proposal
+    summary = str(getattr(proposal, "summary", "") or "").strip()
+    if summary and summary[-1] not in ".!?":
+        summary += "."
+    lines = [
+        "Builder suggestion",
+        str(getattr(proposal, "title", "") or "Optional improvement").strip(),
+    ]
+    if summary:
+        lines.extend(["", summary])
+    lines.extend(["", builder_proposal_acceptance_benefit(proposal), "", "Tap an action below."])
+    return "\n".join(line for line in lines if line is not None)
 
 
 def _doctor_action_is_closed(action: dict[str, object] | None) -> bool:
@@ -1143,12 +1207,9 @@ def _doctor_suggestion_text(action: dict[str, object]) -> str:
 
 
 def _doctor_card_text(action: dict[str, object]) -> str:
-    action_id = str(action.get("action_id") or "")
     status = str(action.get("status") or "pending").replace("_", " ")
     severity = str(action.get("severity") or "unknown")
     meta = f"{status} · {severity} severity"
-    if action_id:
-        meta += f" · {action_id[:12]}"
     lines = [
         f"Doctor: {_doctor_title_text(action)}",
         meta,
@@ -1263,14 +1324,14 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
     if new_proposal_ids:
         proposal = pending_builder_proposals[new_proposal_ids[0]]
         proposal_id = proposal.proposal_id
-        card_text = format_builder_proposal_notification(proposal)
         return DecisionCard(
-            text=card_text,
+            text=_builder_proposal_card_text(proposal),
             reply_markup=_build_decision_markup(
                 kind="proposal",
                 record_id=proposal_id,
-                actions=(("Accept", "accept"), ("Reject", "reject"), ("Archive", "archive")),
+                actions=(("Review", "review"), ("Approve", "accept"), ("Dismiss", "reject")),
             ),
+            supplemental=True,
         )
 
     pending_doctor_actions = {
@@ -1555,6 +1616,15 @@ async def _deliver_reply(
     raise AttributeError("Telegram message object has no reply_text or edit_text method")
 
 
+def _log_background_delivery_error(task) -> None:  # noqa: ANN001
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except Exception:
+        logger.warning("Background Telegram supplemental delivery failed", exc_info=True)
+
+
 def _telegram_streaming_mode(runtime: PersistentRuntime, *, chat_id: str | None) -> ChatStreamingMode:
     return select_chat_streaming_mode(
         TELEGRAM_CHAT_CAPABILITIES,
@@ -1656,6 +1726,27 @@ def _should_skip_telegram_primary_reply_delivery(
     decision_card: DecisionCard | None,
 ) -> bool:
     return bool(suppress_primary_reply_delivery and decision_card is None)
+
+
+def _should_live_stream_telegram_activity(
+    runtime: PersistentRuntime,
+    *,
+    chat_id: str | None,
+    message,
+    text: str | None,
+    planner_status_requested: bool,
+) -> bool:
+    if message is None or not isinstance(text, str):
+        return False
+    if planner_status_requested:
+        return _telegram_allows_status_streaming(runtime, chat_id=chat_id)
+    return (
+        activity_trace_enabled_for_chat(runtime, chat_id=chat_id)
+        and (
+            not is_operator_command_text(text)
+            or text.strip().lower().startswith("/chat ")
+        )
+    )
 
 
 async def _send_or_edit_telegram_status_message(
@@ -2851,6 +2942,7 @@ def _execute_decision_action(
 
     if kind == "proposal":
         command = {
+            "review": f"/proposal {record_id}",
             "accept": f"/accept-proposal {record_id}",
             "reject": f"/reject-proposal {record_id}",
             "archive": f"/archive-proposal {record_id}",
@@ -2859,6 +2951,7 @@ def _execute_decision_action(
             raise ValueError(f"Unsupported proposal action: {action}")
         reply = handle_operator_command(service.runtime, command)
         acknowledgement = {
+            "review": "Review",
             "accept": "Accepted",
             "reject": "Rejected",
             "archive": "Archived",
@@ -2981,13 +3074,8 @@ def _natural_overlap_ack(prompt: str, *, dispatch_decision: TurnDispatchDecision
             "Okay — I’ll attach that to the active task.",
             "On it — I’ll continue from the active result.",
         )
-    else:
-        variants = (
-            "Got it — I started another task.",
-            "Okay — I’ll run that alongside the active work.",
-            "On it — I’ll handle that in parallel.",
-        )
-    return variants[sum(ord(char) for char in prompt.strip().lower()) % len(variants)]
+        return variants[sum(ord(char) for char in prompt.strip().lower()) % len(variants)]
+    return ""
 
 
 
@@ -3009,8 +3097,28 @@ def _busy_chat_ack_text(
         return None
     if _local_chat_reply_body(prompt) is not None:
         return None
-    return _natural_overlap_ack(prompt, dispatch_decision=dispatch_decision)
+    ack = _natural_overlap_ack(prompt, dispatch_decision=dispatch_decision)
+    return ack or None
 
+
+def _foreground_working_ack_text(
+    text: str | None,
+    *,
+    chat_id: str | None,
+    settings: NullionSettings,
+) -> str | None:
+    if text is None:
+        return None
+    prompt = _chat_prompt_for_message(text)
+    if prompt is None:
+        return None
+    if not settings.telegram.chat_enabled:
+        return None
+    if not _is_authorized_chat(chat_id, settings):
+        return None
+    if _local_chat_reply_body(prompt) is not None:
+        return None
+    return "Working on your request now. You can keep sending requests."
 
 
 class MissingTelegramBotTokenError(ValueError):
@@ -3267,6 +3375,7 @@ class ChatOperatorService:
         allow_mini_agents: bool = False,
         turn_dispatch_decision=None,
         cancellation_checker=None,
+        reply_context: dict[str, object] | None = None,
     ) -> str | None:
         started_at = time.perf_counter()
         timing_marks: list[str] = []
@@ -3291,6 +3400,7 @@ class ChatOperatorService:
                 settings=self.settings,
                 request_id=request_id,
                 message_id=message_id,
+                reply_context=reply_context,
                 model_client=model_client,
                 agent_orchestrator=agent_orchestrator,
                 service=self,
@@ -3363,6 +3473,7 @@ class ChatOperatorService:
 
         request_id = _telegram_request_id(update)
         message_id = _telegram_message_id(message=message, chat_id=chat_id)
+        reply_context = _telegram_reply_context(message)
 
         _mark_timing("ids_ready")
 
@@ -3372,6 +3483,7 @@ class ChatOperatorService:
             attachments=attachments,
             request_id=request_id,
             message_id=message_id,
+            reply_context=reply_context,
             activity_callback=activity_callback,
             text_delta_callback=text_delta_callback,
             append_activity_trace=append_activity_trace,
@@ -3619,6 +3731,7 @@ class ChatOperatorService:
         if request_id is None:
             request_id = _telegram_request_id(update)
         message_id = _telegram_message_id(message=message, chat_id=chat_id_text)
+        reply_context = _telegram_reply_context(message)
         dedupe_key = _ingress_dedupe_key(request_id=request_id, message_id=message_id)
         request_id_local = request_id
         message_id_local = message_id
@@ -3638,17 +3751,43 @@ class ChatOperatorService:
             _log_turn_timing(turn_outcome)
             return
 
+        busy_ack = None
+        busy_ack_sent = False
+        if self._inflight_chat_by_id[inflight_key] > 0:
+            busy_ack = _foreground_working_ack_text(
+                text_for_ack,
+                chat_id=chat_id_text,
+                settings=self.settings,
+            )
+        if busy_ack is not None and message is not None:
+            try:
+                await retry_messaging_delivery_operation(
+                    lambda: message.reply_text(busy_ack, do_quote=_should_quote_reply(text_for_ack))
+                )
+                busy_ack_sent = True
+            except Exception:
+                _report_runner_health_issue(
+                    self.runtime,
+                    issue_type=HealthIssueType.ERROR,
+                    message="Telegram operator queued acknowledgment delivery failed.",
+                    chat_id=chat_id_text,
+                    text=text_for_ack,
+                    stage="ack_delivery",
+                    detail="Failed to send queued chat acknowledgment.",
+                )
+                raise
+
         turn_registration = await self._turn_dispatch_tracker.register(
             conversation_id or f"telegram:{inflight_key}",
             text_for_ack or "",
             turn_id=dedupe_key or message_id or request_id,
             model_client=self.model_client,
+            reply_context=reply_context,
         )
         turn_registration_local = turn_registration
         _mark_timing("turn_registered")
 
-        busy_ack = None
-        if self._inflight_chat_by_id[inflight_key] > 0:
+        if busy_ack is None and self._inflight_chat_by_id[inflight_key] > 0:
             busy_ack = _busy_chat_ack_text(
                 text_for_ack,
                 chat_id=chat_id_text,
@@ -3658,11 +3797,17 @@ class ChatOperatorService:
         self._inflight_chat_by_id[inflight_key] += 1
         should_decrement = True
 
-        if busy_ack is not None and message is not None:
+        if (
+            busy_ack is not None
+            and message is not None
+            and not busy_ack_sent
+            and turn_registration.decision.should_wait
+        ):
             try:
                 await retry_messaging_delivery_operation(
-                    lambda: message.reply_text(busy_ack, do_quote=False)
+                    lambda: message.reply_text(busy_ack, do_quote=_should_quote_reply(text_for_ack))
                 )
+                busy_ack_sent = True
             except Exception:
                 _report_runner_health_issue(
                     self.runtime,
@@ -3681,21 +3826,56 @@ class ChatOperatorService:
         )
         _mark_timing("typing_keepalive_started")
         planner_status_requested = isinstance(text_for_ack, str) and parse_planner_command(text_for_ack).requested
-        should_live_stream_activity = (
-            message is not None
-            and activity_trace_enabled_for_chat(self.runtime, chat_id=chat_id_text)
-            and isinstance(text_for_ack, str)
-            and not planner_status_requested
-            and (
-                not is_operator_command_text(text_for_ack)
-                or text_for_ack.strip().lower().startswith("/chat ")
-            )
+        should_live_stream_activity = _should_live_stream_telegram_activity(
+            self.runtime,
+            chat_id=chat_id_text,
+            message=message,
+            text=text_for_ack,
+            planner_status_requested=planner_status_requested,
         )
         activity_streamer = (
             _TelegramActivityStreamer(message, runtime=self.runtime, typing_text=text_for_ack)
             if should_live_stream_activity
             else None
         )
+        tool_working_ack_sent = False
+        telegram_loop = asyncio.get_running_loop()
+
+        def _emit_activity_with_tool_ack(event: dict[str, str]) -> None:
+            nonlocal tool_working_ack_sent
+            if activity_streamer is not None:
+                activity_streamer.emit(event)
+            event_id = str(event.get("id") or "")
+            event_tool_name = str(event.get("tool_name") or "")
+            if (
+                tool_working_ack_sent
+                or busy_ack is not None
+                or message is None
+                or not (
+                    event_id.startswith("tool-")
+                    or event_id == "mini-agents"
+                    or bool(event_tool_name)
+                )
+            ):
+                return
+            working_ack = _foreground_working_ack_text(
+                text_for_ack,
+                chat_id=chat_id_text,
+                settings=self.settings,
+            )
+            if working_ack is None:
+                return
+            tool_working_ack_sent = True
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    retry_messaging_delivery_operation(
+                        lambda: message.reply_text(working_ack, do_quote=_should_quote_reply(text_for_ack))
+                    ),
+                    telegram_loop,
+                )
+            except Exception:
+                logger.debug("Telegram working acknowledgement delivery failed", exc_info=True)
+
         await self._activity_streams.register(conversation_id, activity_streamer)
         _mark_timing("activity_streamer_registered")
 
@@ -3706,6 +3886,7 @@ class ChatOperatorService:
         reply_activity_phase = RunActivityPhase.ACTIVE
         keep_typing_until_delivery = False
         suppress_primary_reply_delivery = False
+        ingress_checkpoint_deferred = False
 
         try:
             async with turn_registration:
@@ -3805,6 +3986,13 @@ class ChatOperatorService:
                         message=update_message,
                     )
                     if activity_streamer is not None:
+                        if planner_status_requested:
+                            activity_streamer.emit({
+                                "id": "planner",
+                                "label": "Planner",
+                                "status": "running",
+                                "detail": "Building and running the plan",
+                            })
                         activity_streamer.emit({"id": "prepare", "label": "Preparing request", "status": "running"})
                     _mark_timing("handler_dispatched")
                     reply = await asyncio.to_thread(
@@ -3812,7 +4000,7 @@ class ChatOperatorService:
                         self,
                         update,
                         attachments=telegram_attachments,
-                        activity_callback=activity_streamer.emit if activity_streamer is not None else None,
+                        activity_callback=_emit_activity_with_tool_ack if activity_streamer is not None else None,
                         text_delta_callback=text_streamer.emit,
                         append_activity_trace=activity_streamer is None and not planner_status_requested,
                         turn_dispatch_decision=turn_registration.decision,
@@ -3883,8 +4071,8 @@ class ChatOperatorService:
                 if handler_error is None and dedupe_key is not None and conversation_id is not None:
                     if not self.runtime.store.has_conversation_ingress_id(conversation_id, dedupe_key):
                         self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
-                        self.runtime.checkpoint()
-                        _cache_runtime_checkpoint_signature(self.runtime)
+                        _mark_runtime_checkpoint_signature_stale(self.runtime)
+                        ingress_checkpoint_deferred = True
                 if handler_error is None:
                     decision_card = _new_decision_card(self.runtime, decision_snapshot)
                     if decision_card is None:
@@ -3925,6 +4113,9 @@ class ChatOperatorService:
             ):
                 if activity_finish_task is not None:
                     await activity_finish_task
+                if ingress_checkpoint_deferred:
+                    await asyncio.to_thread(self.runtime.checkpoint)
+                    _cache_runtime_checkpoint_signature(self.runtime)
                 turn_outcome = "suppressed_by_planner_ack"
                 _log_turn_timing(turn_outcome)
                 return
@@ -3932,6 +4123,9 @@ class ChatOperatorService:
                 if activity_finish_task is not None:
                     await activity_finish_task
                 await text_streamer.finish(str(reply))
+                if ingress_checkpoint_deferred:
+                    await asyncio.to_thread(self.runtime.checkpoint)
+                    _cache_runtime_checkpoint_signature(self.runtime)
                 turn_outcome = "streamed_reply"
                 _mark_timing("delivery_complete")
                 _log_turn_timing(turn_outcome)
@@ -3960,6 +4154,9 @@ class ChatOperatorService:
                     chat_id,
                     text,
                 )
+                if ingress_checkpoint_deferred:
+                    await asyncio.to_thread(self.runtime.checkpoint)
+                    _cache_runtime_checkpoint_signature(self.runtime)
                 turn_outcome = "reply_dropped_missing_message"
                 _log_turn_timing(turn_outcome)
                 return
@@ -3997,17 +4194,29 @@ class ChatOperatorService:
                     phase="telegram_primary",
                 )
                 if delivery_plan.supplemental_card is not None:
-                    await _deliver_reply(
-                        message,
-                        delivery_plan.supplemental_card.text,
-                        decision_card=delivery_plan.supplemental_card,
-                        principal_id=principal_id,
-                        request_id=request_id,
-                        turn_id=turn_registration.turn_id,
-                        phase="telegram_supplemental",
+                    supplemental_task = asyncio.create_task(
+                        _deliver_reply(
+                            message,
+                            delivery_plan.supplemental_card.text,
+                            decision_card=delivery_plan.supplemental_card,
+                            principal_id=principal_id,
+                            request_id=request_id,
+                            turn_id=turn_registration.turn_id,
+                            phase="telegram_supplemental",
+                        )
                     )
+                    supplemental_task.add_done_callback(_log_background_delivery_error)
                 _mark_timing("delivery_complete")
+                if ingress_checkpoint_deferred:
+                    await asyncio.to_thread(self.runtime.checkpoint)
+                    _cache_runtime_checkpoint_signature(self.runtime)
             except Exception:
+                if ingress_checkpoint_deferred:
+                    try:
+                        await asyncio.to_thread(self.runtime.checkpoint)
+                        _cache_runtime_checkpoint_signature(self.runtime)
+                    except Exception:
+                        logger.debug("Failed to persist deferred Telegram ingress checkpoint", exc_info=True)
                 chat = getattr(message, "chat", None)
                 chat_id = None if chat is None else getattr(chat, "id", None)
                 _report_runner_health_issue(

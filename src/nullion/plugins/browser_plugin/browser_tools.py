@@ -43,7 +43,7 @@ _BROWSER_LOOP_LOCK = threading.Lock()
 # fails fast instead of starving the worker thread pool.
 _MAX_CONCURRENT_BROWSER_OPS = 8
 _BROWSER_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_BROWSER_OPS)
-_LOCAL_PREVIEW_SUFFIXES = frozenset({".html", ".htm"})
+_LOCAL_PREVIEW_SUFFIXES = frozenset({".html", ".htm", ".pdf"})
 
 
 def _ensure_browser_loop() -> asyncio.AbstractEventLoop:

@@ -28,6 +28,7 @@ class MessagingTurnState(TypedDict, total=False):
     status: Literal["running", "reply_ready", "no_reply"]
     turn_dispatch_decision: Any
     text_delta_callback: Any
+    activity_callback: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +86,8 @@ def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
         kwargs["turn_dispatch_decision"] = state.get("turn_dispatch_decision")
     if _handle_text_message_accepts_kw(handler, "text_delta_callback"):
         kwargs["text_delta_callback"] = state.get("text_delta_callback")
+    if _handle_text_message_accepts_kw(handler, "activity_callback"):
+        kwargs["activity_callback"] = state.get("activity_callback")
     if _handle_text_message_accepts_kw(handler, "conversation_ingress_id"):
         kwargs["conversation_ingress_id"] = ingress.request_id or ingress.message_id
     reply = handler(**kwargs)
@@ -146,6 +149,7 @@ def run_messaging_turn_graph(
     *,
     turn_dispatch_decision=None,
     text_delta_callback=None,
+    activity_callback=None,
 ) -> MessagingTurnResult:
     final_state = _compiled_messaging_turn_graph().invoke(
         {
@@ -153,6 +157,7 @@ def run_messaging_turn_graph(
             "ingress": ingress,
             "turn_dispatch_decision": turn_dispatch_decision,
             "text_delta_callback": text_delta_callback,
+            "activity_callback": activity_callback,
         },
         config={"configurable": {"thread_id": ingress.request_id or ingress.operator_chat_id}},
     )

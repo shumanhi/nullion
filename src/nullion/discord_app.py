@@ -46,6 +46,9 @@ from nullion.users import resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
+_WORKING_ACK_TEXT = "Working on your request now. You can keep sending requests."
+
+
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
 _DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
 _NULLION_DISCORD_TURN_SLOW_LOG_MS = "NULLION_DISCORD_TURN_SLOW_LOG_MS"
@@ -94,6 +97,7 @@ def _handle_messaging_ingress_result_with_dispatch(
     *,
     turn_dispatch_decision=None,
     text_delta_callback=None,
+    activity_callback=None,
 ):
     try:
         parameters = inspect.signature(handle_messaging_ingress_result).parameters
@@ -109,6 +113,10 @@ def _handle_messaging_ingress_result_with_dispatch(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
         ):
             kwargs["text_delta_callback"] = text_delta_callback
+        if "activity_callback" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            kwargs["activity_callback"] = activity_callback
         return handle_messaging_ingress_result(service, ingress, **kwargs)
     return handle_messaging_ingress_result(service, ingress)
 
@@ -563,6 +571,28 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
     )
     _mark_timing("turn_registered")
     text_streamer = _DiscordTextDeltaStreamer(loop=asyncio.get_running_loop(), channel=message.channel)
+    loop = asyncio.get_running_loop()
+    tool_working_ack_sent = False
+
+    def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
+        nonlocal tool_working_ack_sent
+        event_id = str(event.get("id") or "")
+        event_tool_name = str(event.get("tool_name") or "")
+        if (
+            tool_working_ack_sent
+            or message.channel is None
+            or not (event_id.startswith("tool-") or event_id == "mini-agents" or event_tool_name)
+        ):
+            return
+        tool_working_ack_sent = True
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _send_discord_text_with_plain_fallback(message.channel, _WORKING_ACK_TEXT),
+                loop,
+            )
+        except Exception:
+            logger.debug("Discord working message scheduling failed", exc_info=True)
+
     try:
         await turn_registration.wait_for_dependencies()
         _mark_timing("wait_dependencies")
@@ -573,6 +603,7 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
                 ingress,
                 turn_dispatch_decision=turn_registration.decision,
                 text_delta_callback=text_streamer.emit,
+                activity_callback=emit_working_ack_for_tool_activity,
             )
             reply = turn_result.reply
         _mark_timing("handler_completed")

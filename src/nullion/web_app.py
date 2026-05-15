@@ -188,6 +188,8 @@ from nullion.turn_context_policy import (
     should_include_prior_turn_messages,
     tool_registry_allows_connector_context,
     tool_registry_allows_skill_pack_context,
+    turn_tool_scope_decision_may_apply,
+    turn_tool_evidence_needs_model_scope_decision,
 )
 
 logger = logging.getLogger(__name__)
@@ -7339,6 +7341,8 @@ async function connect() {
       try { data = JSON.parse(event.data || '{}'); } catch (_) { return; }
       if (data.type === 'chunk') {
         appendBotChunk(data.text || '', data.turn_id || null);
+      } else if (data.type === 'notice') {
+        addAssistantNotice('Nullion', data.text || '');
       } else if (data.type === 'thinking') {
         addThinkingBlock(data.text || '', data.turn_id || null);
       } else if (data.type === 'activity') {
@@ -7998,13 +8002,22 @@ function addArtifactLinks(bubble, artifacts) {
       return;
     }
     if (!artifact.url) return;
-    const link = document.createElement('a');
-    link.className = 'artifact-link';
-    link.href = artifact.url;
-    link.download = artifact.name || '';
-    link.addEventListener('click', (event) => downloadArtifact(event, artifact.url, artifact.name || 'nullion-artifact'));
-    link.textContent = `Download ${artifact.name || 'file'}`;
-    wrap.appendChild(link);
+    if (artifact.preview_url) {
+      const openLink = document.createElement('a');
+      openLink.className = 'artifact-link';
+      openLink.href = artifact.preview_url;
+      openLink.target = '_blank';
+      openLink.rel = 'noopener noreferrer';
+      openLink.textContent = `Open ${artifact.name || 'file'}`;
+      wrap.appendChild(openLink);
+    }
+    const downloadLink = document.createElement('a');
+    downloadLink.className = 'artifact-link';
+    downloadLink.href = artifact.url;
+    downloadLink.download = artifact.name || '';
+    downloadLink.addEventListener('click', (event) => downloadArtifact(event, artifact.url, artifact.name || 'nullion-artifact'));
+    downloadLink.textContent = `Download ${artifact.name || 'file'}`;
+    wrap.appendChild(downloadLink);
   });
   if (wrap.children.length) {
     bubble.appendChild(wrap);
@@ -15627,8 +15640,43 @@ def _web_artifact_descriptors(
         _WEB_ARTIFACTS[descriptor.artifact_id] = Path(descriptor.path)
         payload = descriptor.to_dict()
         payload["url"] = f"/api/artifacts/{descriptor.artifact_id}"
+        if _is_previewable_web_artifact(descriptor):
+            payload["preview_url"] = f"/api/artifacts/{descriptor.artifact_id}/preview"
         payloads.append(payload)
     return payloads
+
+
+def _is_previewable_web_artifact(descriptor) -> bool:
+    media_type = str(getattr(descriptor, "media_type", "") or "").lower()
+    name = str(getattr(descriptor, "name", "") or "").lower()
+    return (
+        media_type in {"application/pdf", "text/html"}
+        or media_type.startswith("text/")
+        or name.endswith((".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".json"))
+    )
+
+
+def _inline_artifact_headers(descriptor) -> dict[str, str]:
+    filename = Path(str(getattr(descriptor, "name", "") or "artifact")).name or "artifact"
+    quoted_name = quote(filename)
+    headers = {
+        "Content-Disposition": f"inline; filename*=UTF-8''{quoted_name}",
+        "X-Content-Type-Options": "nosniff",
+    }
+    media_type = str(getattr(descriptor, "media_type", "") or "").lower()
+    name = filename.lower()
+    if media_type == "text/html" or name.endswith((".html", ".htm")):
+        headers["Content-Security-Policy"] = (
+            "sandbox allow-scripts allow-forms allow-popups allow-downloads; "
+            "default-src 'self' data: blob:; "
+            "img-src 'self' data: blob:; "
+            "style-src 'self' 'unsafe-inline' data:; "
+            "script-src 'unsafe-inline' 'unsafe-eval' data: blob:; "
+            "connect-src 'none'; "
+            "base-uri 'none'; "
+            "form-action 'none'"
+        )
+    return headers
 
 
 _WEB_PLAIN_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[^\s`'\"<>|]+)")
@@ -16875,15 +16923,16 @@ def create_app(runtime, orchestrator, registry):
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-            response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline'; "   # inline JS used by the SPA
-                "style-src 'self' 'unsafe-inline'; "    # inline styles
-                "img-src 'self' data: blob:; "
-                "connect-src 'self'; "
-                "frame-ancestors 'none'; "
-                "base-uri 'self';"
-            )
+            if "Content-Security-Policy" not in response.headers:
+                response.headers["Content-Security-Policy"] = (
+                    "default-src 'self'; "
+                    "script-src 'self' 'unsafe-inline'; "   # inline JS used by the SPA
+                    "style-src 'self' 'unsafe-inline'; "    # inline styles
+                    "img-src 'self' data: blob:; "
+                    "connect-src 'self'; "
+                    "frame-ancestors 'none'; "
+                    "base-uri 'self';"
+                )
             return response
 
     app.add_middleware(_SecurityHeadersMiddleware)
@@ -17825,6 +17874,20 @@ def create_app(runtime, orchestrator, registry):
         if path is None or descriptor is None or not path.is_file():
             return JSONResponse({"ok": False, "error": "artifact not found"}, status_code=404)
         return FileResponse(path, media_type=descriptor.media_type, filename=descriptor.name)
+
+    @app.get("/api/artifacts/{artifact_id}/preview")
+    async def preview_artifact(artifact_id: str):
+        path = _web_artifact_path_for_id(runtime, artifact_id)
+        descriptor = None if path is None else _web_artifact_descriptor_for_path(runtime, path)
+        if path is None or descriptor is None or not path.is_file():
+            return JSONResponse({"ok": False, "error": "artifact not found"}, status_code=404)
+        if not _is_previewable_web_artifact(descriptor):
+            return JSONResponse({"ok": False, "error": "artifact is not previewable"}, status_code=415)
+        return FileResponse(
+            path,
+            media_type=descriptor.media_type,
+            headers=_inline_artifact_headers(descriptor),
+        )
 
     @app.post("/api/artifacts/{artifact_id}/save")
     async def save_artifact(artifact_id: str):
@@ -21574,11 +21637,25 @@ def create_app(runtime, orchestrator, registry):
     @app.post("/api/chat")
     async def chat_http(request: Request):
         """HTTP chat fallback for environments where WebSocket upgrades fail."""
+        conv_id = "web:0"
         try:
-            payload = await request.json()
+            try:
+                payload = await request.json()
+            except Exception as exc:
+                _report_web_client_issue(
+                    runtime,
+                    issue_type="warning",
+                    message="Invalid JSON payload posted to /api/chat.",
+                    details={"conversation_id": conv_id, "error": _short_error_text(exc)},
+                )
+                return JSONResponse({"type": "error", "text": "Invalid JSON payload."}, status_code=400)
+
+            if not isinstance(payload, dict):
+                return JSONResponse({"type": "error", "text": "Invalid JSON payload."}, status_code=400)
+
+            conv_id = str(payload.get("conversation_id", conv_id) or conv_id)
             user_text = str(payload.get("text", "")).strip()
-            attachments = payload.get("attachments") if isinstance(payload, dict) else []
-            conv_id = str(payload.get("conversation_id", "web:0"))
+            attachments = payload.get("attachments")
             if not user_text:
                 return JSONResponse({"type": "error", "text": "Message is empty."}, status_code=400)
 
@@ -21802,7 +21879,23 @@ def create_app(runtime, orchestrator, registry):
                 if show_thinking_enabled and str(text or "").strip():
                     await send_websocket_event(turn_payload({"type": "thinking", "text": str(text).strip()}))
 
+            web_working_notice_sent = False
+
             def emit_activity_event(event: dict[str, str]) -> None:
+                nonlocal web_working_notice_sent
+                event_id = str(event.get("id") or "")
+                if not web_working_notice_sent and (event_id.startswith("tool-") or event_id == "mini-agents"):
+                    web_working_notice_sent = True
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            send_websocket_event(turn_payload({
+                                "type": "notice",
+                                "text": "Working on your request now. You can keep sending requests.",
+                            })),
+                            loop,
+                        ).result(timeout=2)
+                    except Exception:
+                        logger.debug("Unable to send web working notice", exc_info=True)
                 if not activity_trace_enabled:
                     return
                 try:
@@ -22443,6 +22536,26 @@ def _web_dispatch_kwargs(turn_dispatch_decision: object | None) -> dict[str, obj
         "dispatch_dependency_turn_ids": dependency_turn_ids,
         "dispatch_reason": getattr(turn_dispatch_decision, "reason", None),
     }
+
+
+def _web_conversation_context_boundary_prompt(conversation_result: object | None) -> str | None:
+    turn = getattr(conversation_result, "turn", None)
+    if turn is None:
+        return None
+    disposition = getattr(turn, "disposition", None)
+    disposition_value = str(getattr(disposition, "value", disposition) or "")
+    parent_turn_id = getattr(turn, "parent_turn_id", None)
+    if disposition_value != ConversationTurnDisposition.INDEPENDENT.value or parent_turn_id:
+        return None
+    return (
+        "Conversation routing context: the runtime recorded this message as a new independent turn "
+        "with no linked active or prior task. The recent transcript is background memory only. "
+        "Do not treat an earlier artifact, scheduled job, task, branch, or file as the selected target "
+        "unless the current user message identifies it with explicit runtime evidence such as an "
+        "attachment, URL, slash/operator command, approval/action state, artifact descriptor, current "
+        "active task-frame state, or an unambiguous name/id supplied by the user. If the referent is "
+        "not determined by that evidence, ask a brief clarification instead of choosing a previous topic."
+    )
 
 
 def _start_web_task_frame(
@@ -24901,6 +25014,7 @@ def _web_dispatch_requires_existing_turn_context(turn_dispatch_decision: object 
 def _web_turn_fast_profile_candidate(
     *,
     evidence,
+    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -24911,18 +25025,20 @@ def _web_turn_fast_profile_candidate(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _web_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return False
+        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     return not (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     )
 
 
 def _web_turn_skip_tool_scope_decision(
     *,
     evidence,
+    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -24933,12 +25049,13 @@ def _web_turn_skip_tool_scope_decision(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _web_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return False
+        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     if (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     ):
         return False
     return True
@@ -25271,6 +25388,7 @@ def _run_turn_sync(
     _mark_timing("tool_evidence")
     fast_profile_candidate = _web_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
+        user_message=user_text,
         config_action=config_action,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=force_mini_agent_dispatch,
@@ -25280,13 +25398,19 @@ def _run_turn_sync(
     _mark_timing("tool_scope_decision_check_start")
     skip_tool_scope_decision = _web_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
+        user_message=user_text,
         config_action=config_action,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=force_mini_agent_dispatch,
         turn_dispatch_decision=turn_dispatch_decision,
     )
     if skip_tool_scope_decision:
-        turn_tool_registry = registry
+        turn_tool_registry = scoped_turn_tool_registry(
+            registry,
+            evidence=turn_tool_evidence,
+            model_client=None,
+            user_message=user_text,
+        )
         _mark_timing("tool_scope_decision_skipped")
     else:
         _mark_timing("tool_scope_decision_allowed")
@@ -25427,6 +25551,12 @@ def _run_turn_sync(
         history_prefix.append({
             "role": "system",
             "content": [{"type": "text", "text": recent_tool_context}],
+        })
+    context_boundary = _web_conversation_context_boundary_prompt(web_conversation_result)
+    if context_boundary:
+        history_prefix.append({
+            "role": "system",
+            "content": [{"type": "text", "text": context_boundary}],
         })
     skill_hint = _build_web_skill_hint(runtime, user_text)
     if skill_hint is not None:

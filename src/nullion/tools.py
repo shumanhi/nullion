@@ -34,6 +34,7 @@ import urllib.request
 from urllib.parse import urlencode, urlparse
 
 from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
+from nullion.artifacts import promote_supporting_asset_artifact_paths
 from nullion.approval_context import FLOW_TRIGGER_CONTEXT_KEY, build_trigger_flow_context
 from nullion.approvals import (
     ApprovalRequest,
@@ -4278,7 +4279,8 @@ def _build_workspace_summary_handler(
             include_principal_workspace=include_principal_workspace,
         )
         max_entries = _env_int("NULLION_WORKSPACE_SUMMARY_MAX_ENTRIES", 20_000, minimum=1)
-        max_sample_files = _env_int("NULLION_WORKSPACE_SUMMARY_SAMPLE_FILES", 200, minimum=0)
+        max_sample_files = _env_int("NULLION_WORKSPACE_SUMMARY_SAMPLE_FILES", 40, minimum=0)
+        max_extensions = _env_int("NULLION_WORKSPACE_SUMMARY_EXTENSIONS", 40, minimum=1)
         seen_directories: set[Path] = set()
         seen_files: set[Path] = set()
         extensions: Counter[str] = Counter()
@@ -4331,22 +4333,30 @@ def _build_workspace_summary_handler(
                     if len(sample_files) < max_sample_files:
                         sample_files.append(display_path)
 
+        extension_rows = [
+            {"extension": extension, "count": count}
+            for extension, count in sorted(extensions.items(), key=lambda item: (-item[1], item[0]))
+        ]
+
+        output = {
+            "roots": [str(root) for root in roots],
+            "file_count": len(seen_files),
+            "directory_count": len(seen_directories),
+            "scanned_entries": scanned_entries,
+            "truncated": truncated,
+            "extensions": extension_rows[:max_extensions],
+            "sample_files": sorted(sample_files),
+        }
+        if len(extension_rows) > max_extensions:
+            output["extensions_truncated"] = {"shown": max_extensions, "total": len(extension_rows)}
+        if len(seen_files) > max_sample_files:
+            output["sample_files_truncated"] = {"shown": max_sample_files, "total": len(seen_files)}
+
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={
-                "roots": [str(root) for root in roots],
-                "file_count": len(seen_files),
-                "directory_count": len(seen_directories),
-                "scanned_entries": scanned_entries,
-                "truncated": truncated,
-                "extensions": [
-                    {"extension": extension, "count": count}
-                    for extension, count in sorted(extensions.items())
-                ],
-                "sample_files": sorted(sample_files),
-            },
+            output=output,
             error=None,
         )
 
@@ -4400,7 +4410,10 @@ def _terminal_deliverable_artifact_paths_since(
             except OSError:
                 continue
     candidates.sort(key=lambda item: (item[0], item[1]))
-    return [path for _mtime, path in candidates[-_MAX_TERMINAL_DISCOVERED_ARTIFACTS:]]
+    return promote_supporting_asset_artifact_paths(
+        [path for _mtime, path in candidates[-_MAX_TERMINAL_DISCOVERED_ARTIFACTS:]],
+        artifact_roots=tuple(Path(root).expanduser().resolve() for root in roots),
+    )
 
 
 def _build_terminal_exec_handler(
@@ -6978,6 +6991,23 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
 
 
 def _build_list_crons_handler():
+    def _cron_display_line(job: object) -> str:
+        name = str(getattr(job, "name", "") or "Untitled scheduled task").strip()
+        schedule = str(getattr(job, "schedule", "") or "").strip()
+        workspace_id = str(getattr(job, "workspace_id", "") or "").strip()
+        enabled = bool(getattr(job, "enabled", False))
+        next_run = str(getattr(job, "next_run", "") or "").strip()
+        status = "enabled" if enabled else "disabled"
+        parts = [f"- {name}", f"Status: {status}"]
+        if schedule:
+            parts.append(f"Schedule: {schedule}")
+        if next_run:
+            parts.append(f"Next run: {next_run}")
+        if workspace_id:
+            parts.append(f"Workspace: {workspace_id}")
+        parts.append(f'Run by name: run_cron name="{name}"')
+        return " · ".join(parts)
+
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.connections import workspace_id_for_principal
         from nullion.crons import list_crons
@@ -6997,13 +7027,13 @@ def _build_list_crons_handler():
         lines = []
         crons = []
         for j in jobs:
-            status = "✓ enabled" if j.enabled else "✗ disabled"
-            next_r = f"  next={j.next_run}" if j.next_run else ""
-            lines.append(f"  [{j.id}] {j.name} | workspace={j.workspace_id} | {j.schedule} | {status}{next_r}")
+            lines.append(_cron_display_line(j))
+            run_by_name = f'run_cron name="{j.name}"'
             crons.append(
                 {
                     "id": j.id,
                     "name": j.name,
+                    "display_name": j.name,
                     "schedule": j.schedule,
                     "workspace_id": j.workspace_id,
                     "delivery_channel": j.delivery_channel,
@@ -7011,6 +7041,11 @@ def _build_list_crons_handler():
                     "enabled": j.enabled,
                     "next_run": j.next_run,
                     "last_run": j.last_run,
+                    "run_by_name": run_by_name,
+                    "presentation_hint": (
+                        "Show this scheduled task by name first. Do not lead with the raw id. "
+                        "Mention the raw id only if there are duplicate names or the user asks for ids."
+                    ),
                     "task": j.task,
                     "has_task": bool(str(j.task or "").strip()),
                     "has_last_result": bool(str(j.last_result or "").strip()),
@@ -7682,7 +7717,8 @@ def register_cron_tools(
         ToolSpec(
             name="run_cron",
             description=(
-                "Run an existing scheduled cron job immediately. Prefer id from list_crons. "
+                "Run an existing scheduled cron job immediately. Prefer the exact visible cron name from list_crons. "
+                "Use id only when names are ambiguous or the user explicitly provides an id. "
                 "Required args: id or name. Name matching is conservative and punctuation-insensitive; "
                 "ambiguous names return candidate ids instead of running a job."
             ),

@@ -187,22 +187,39 @@ def _cli_impl() -> None:
 
 # ── update command ───────────────────────────────────────────────────────────
 
-def _wait_for_web_health(port: int = 8742, *, timeout: float = 45.0, interval: float = 1.5) -> bool:
+def _wait_for_web_health(
+    port: int = 8742,
+    *,
+    timeout: float = 45.0,
+    interval: float = 1.5,
+    expected_commit: str | None = None,
+) -> bool:
     import json
     import time
     import urllib.request
 
     deadline = time.monotonic() + timeout
-    url = f"http://localhost:{port}/api/health"
+    health_url = f"http://127.0.0.1:{port}/api/health"
+    version_url = f"http://127.0.0.1:{port}/api/version"
+    expected = (expected_commit or "").strip().lower()
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=min(interval, 2.0)) as response:
+            with urllib.request.urlopen(health_url, timeout=min(interval, 2.0)) as response:
                 if getattr(response, "status", 200) >= 400:
                     time.sleep(interval)
                     continue
                 payload = json.loads(response.read())
-                if payload.get("status") == "ok":
+                if payload.get("status") == "ok" and not expected:
                     return True
+            if expected:
+                with urllib.request.urlopen(version_url, timeout=min(interval, 2.0)) as response:
+                    if getattr(response, "status", 200) >= 400:
+                        time.sleep(interval)
+                        continue
+                    version_payload = json.loads(response.read())
+                    current = str(version_payload.get("current") or "").strip().lower()
+                    if current and (current == expected or current.startswith(expected) or expected.startswith(current)):
+                        return True
         except Exception:
             pass
         time.sleep(interval)
@@ -259,7 +276,8 @@ def _run_update_cli(
             if answer in ("", "y", "yes"):
                 print(f"  {CYAN}Restarting…{RESET}")
                 _service_cmd(_detect_service_manager(), "restart")
-                if _wait_for_web_health(port):
+                expected_commit = str(getattr(result, "to_commit", "") or "")
+                if _wait_for_web_health(port, expected_commit=expected_commit):
                     print(f"  {GREEN}Web UI is healthy on port {port}.{RESET}")
                     # Real version change + restart: drop the stale webview
                     # so the user sees the new code.

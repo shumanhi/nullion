@@ -8,9 +8,15 @@ import mimetypes
 import os
 from pathlib import Path
 import tempfile
+from typing import Iterable
+from urllib.parse import quote
 from uuid import uuid4
 
 _MIN_HTML_ARTIFACT_BYTES = 64
+_MAX_SUPPORTING_ASSET_HTML_CANDIDATES = 20
+_MAX_SUPPORTING_ASSET_HTML_BYTES = 1_500_000
+_HTML_ARTIFACT_SUFFIXES = frozenset({".html", ".htm"})
+_IMAGE_ARTIFACT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"})
 _BLOCKED_DOWNLOAD_SUFFIXES = frozenset(
     {
         ".bash",
@@ -102,7 +108,7 @@ def artifact_descriptor_for_path(path: Path, *, artifact_root: Path) -> Artifact
         return None
     if resolved_path.suffix.lower() in _BLOCKED_DOWNLOAD_SUFFIXES:
         return None
-    if resolved_path.suffix.lower() in {".html", ".htm"}:
+    if resolved_path.suffix.lower() in _HTML_ARTIFACT_SUFFIXES:
         sample = resolved_path.read_text(encoding="utf-8", errors="ignore")[:512].strip().lower()
         if stat.st_size < _MIN_HTML_ARTIFACT_BYTES or "<html" not in sample:
             return None
@@ -135,6 +141,137 @@ def artifact_descriptors_for_paths(
         if descriptor is not None:
             descriptors.append(descriptor)
     return descriptors
+
+
+def promote_supporting_asset_artifact_paths(
+    artifact_paths: list[str] | tuple[str, ...] | None,
+    *,
+    artifact_roots: Iterable[Path],
+) -> list[str]:
+    """Replace HTML supporting image assets with the HTML artifact that owns them."""
+
+    resolved_paths = _resolve_artifact_candidate_paths(artifact_paths, artifact_roots=artifact_roots)
+    if not resolved_paths:
+        return []
+    image_paths = [path for path in resolved_paths if path.suffix.lower() in _IMAGE_ARTIFACT_SUFFIXES]
+    if not image_paths:
+        return [str(path) for path in resolved_paths]
+
+    html_candidates = _referencing_html_candidates(resolved_paths, image_paths, artifact_roots=artifact_roots)
+    if not html_candidates:
+        return [str(path) for path in resolved_paths]
+
+    supporting_assets: set[Path] = set()
+    owning_html: list[Path] = []
+    seen_html: set[Path] = set()
+    for html_path in html_candidates:
+        try:
+            if html_path.stat().st_size > _MAX_SUPPORTING_ASSET_HTML_BYTES:
+                continue
+            html_text = html_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for image_path in image_paths:
+            if _html_references_asset(html_path, html_text, image_path):
+                supporting_assets.add(image_path)
+                if html_path not in seen_html:
+                    seen_html.add(html_path)
+                    owning_html.append(html_path)
+
+    if not supporting_assets:
+        return [str(path) for path in resolved_paths]
+
+    selected: list[Path] = []
+    for path in resolved_paths:
+        if path in supporting_assets:
+            continue
+        if path not in selected:
+            selected.append(path)
+    for html_path in owning_html:
+        if html_path not in selected:
+            selected.append(html_path)
+    return [str(path) for path in selected]
+
+
+def _resolve_artifact_candidate_paths(
+    artifact_paths: list[str] | tuple[str, ...] | None,
+    *,
+    artifact_roots: Iterable[Path],
+) -> list[Path]:
+    roots = tuple(dict.fromkeys(Path(root).expanduser().resolve() for root in artifact_roots))
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for raw_path in artifact_paths or ():
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        path = Path(raw_path).expanduser()
+        candidates = [path] if path.is_absolute() else [root / path for root in roots]
+        for candidate in candidates:
+            try:
+                resolved_candidate = candidate.resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if not resolved_candidate.is_file() or resolved_candidate in seen:
+                continue
+            if not any(path_is_within(resolved_candidate, root) for root in roots):
+                continue
+            seen.add(resolved_candidate)
+            resolved.append(resolved_candidate)
+            break
+    return resolved
+
+
+def _referencing_html_candidates(
+    resolved_paths: list[Path],
+    image_paths: list[Path],
+    *,
+    artifact_roots: Iterable[Path],
+) -> list[Path]:
+    roots = tuple(dict.fromkeys(Path(root).expanduser().resolve() for root in artifact_roots))
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(candidate: Path) -> None:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return
+        if resolved in seen or not resolved.is_file() or resolved.suffix.lower() not in _HTML_ARTIFACT_SUFFIXES:
+            return
+        if not any(path_is_within(resolved, root) for root in roots):
+            return
+        seen.add(resolved)
+        candidates.append(resolved)
+
+    for path in resolved_paths:
+        add(path)
+    for image_path in image_paths:
+        add(image_path.with_suffix(".html"))
+        parent = image_path.parent
+        for html_path in sorted(parent.glob("*.htm*"))[:_MAX_SUPPORTING_ASSET_HTML_CANDIDATES]:
+            add(html_path)
+        for html_path in sorted(parent.parent.glob("*.htm*"))[:_MAX_SUPPORTING_ASSET_HTML_CANDIDATES]:
+            add(html_path)
+
+    try:
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    return candidates[:_MAX_SUPPORTING_ASSET_HTML_CANDIDATES]
+
+
+def _html_references_asset(html_path: Path, html_text: str, asset_path: Path) -> bool:
+    try:
+        relative = os.path.relpath(asset_path, html_path.parent).replace(os.sep, "/")
+    except ValueError:
+        return False
+    references = {
+        relative,
+        f"./{relative}",
+        quote(relative),
+        quote(f"./{relative}"),
+    }
+    return any(reference in html_text for reference in references)
 
 
 def artifact_path_for_generated_file(runtime, *, suffix: str, stem: str = "nullion-artifact") -> Path:
