@@ -46,6 +46,9 @@ from nullion.users import resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
+_WORKING_ACK_TEXT = "Working on your request now. You can keep sending requests."
+
+
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
 _DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
 _NULLION_SLACK_TURN_SLOW_LOG_MS = "NULLION_SLACK_TURN_SLOW_LOG_MS"
@@ -94,6 +97,7 @@ def _handle_messaging_ingress_result_with_dispatch(
     *,
     turn_dispatch_decision=None,
     text_delta_callback=None,
+    activity_callback=None,
 ):
     try:
         parameters = inspect.signature(handle_messaging_ingress_result).parameters
@@ -109,6 +113,10 @@ def _handle_messaging_ingress_result_with_dispatch(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
         ):
             kwargs["text_delta_callback"] = text_delta_callback
+        if "activity_callback" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            kwargs["activity_callback"] = activity_callback
         return handle_messaging_ingress_result(service, ingress, **kwargs)
     return handle_messaging_ingress_result(service, ingress)
 
@@ -605,13 +613,36 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
 
     working_channel = str(event.get("channel") or "").strip()
     working_ts = None
-    if client is not None and working_channel:
+    loop = asyncio.get_running_loop()
+    tool_working_ack_sent = False
+
+    def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
+        nonlocal tool_working_ack_sent, working_ts, working_channel
+        event_id = str(event.get("id") or "")
+        event_tool_name = str(event.get("tool_name") or "")
+        if (
+            tool_working_ack_sent
+            or client is None
+            or not working_channel
+            or not (event_id.startswith("tool-") or event_id == "mini-agents" or event_tool_name)
+        ):
+            return
+        tool_working_ack_sent = True
+
+        async def _send() -> None:
+            nonlocal working_ts, working_channel
+            try:
+                response = await say(_WORKING_ACK_TEXT)
+                working_ts = _slack_response_field(response, "ts")
+                working_channel = _slack_response_field(response, "channel") or working_channel
+            except Exception:
+                logger.debug("Slack working message send failed", exc_info=True)
+
         try:
-            working_response = await say("Working...")
-            working_ts = _slack_response_field(working_response, "ts")
-            working_channel = _slack_response_field(working_response, "channel") or working_channel
+            asyncio.run_coroutine_threadsafe(_send(), loop)
         except Exception:
-            logger.debug("Slack working message send failed", exc_info=True)
+            logger.debug("Slack working message scheduling failed", exc_info=True)
+
     _mark_timing("working_message")
     text_streamer = _SlackTextDeltaStreamer(
         loop=asyncio.get_running_loop(),
@@ -636,6 +667,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             ingress,
             turn_dispatch_decision=turn_registration.decision,
             text_delta_callback=text_streamer.emit,
+            activity_callback=emit_working_ack_for_tool_activity,
         )
         _mark_timing("handler_completed")
         if await turn_registration.is_superseded():

@@ -15,6 +15,7 @@ TASK_STATUS_BLOCKED = "☐"
 TASK_STATUS_WAITING_INPUT = "▤"
 TASK_STATUS_SUBLIST_PREFIX = ""
 DEFAULT_TASK_STATUS_SUBJECT_LIMIT = 120
+NEXT_REQUEST_HINT = "you can send the next request anytime"
 
 
 def compact_task_status_subject(subject: str, *, limit: int = DEFAULT_TASK_STATUS_SUBJECT_LIMIT) -> str:
@@ -62,6 +63,7 @@ def format_task_status_summary(
     subject: str = "",
     status_lines: dict[str, str] | None = None,
     default_status: TaskStatus | str | None = None,
+    include_next_request_hint: bool = False,
 ) -> str:
     task_list = list(tasks)
     lines: list[str] = []
@@ -72,9 +74,12 @@ def format_task_status_summary(
         lines.append(f"For: {subject_text}")
     count_label = f"{len(task_list)} task{'s' if len(task_list) != 1 else ''}"
     if planner_summary.lower().startswith("parallel mission"):
-        lines.append(f"→ Running {count_label} in parallel:")
+        header = f"→ Running {count_label} in parallel"
     else:
-        lines.append(f"→ Working on {count_label}:")
+        header = f"→ Working on {count_label}"
+    if include_next_request_hint:
+        header = f"{header} - {NEXT_REQUEST_HINT}"
+    lines.append(f"{header}:")
     known_lines = status_lines or {}
     for task in task_list:
         fallback = format_task_status_line(
@@ -111,6 +116,7 @@ __all__ = [
     "TASK_STATUS_RUNNING",
     "TASK_STATUS_SUBLIST_PREFIX",
     "TASK_STATUS_WAITING_INPUT",
+    "NEXT_REQUEST_HINT",
     "compact_task_status_subject",
     "format_task_status_activity_detail",
     "format_task_status_line",

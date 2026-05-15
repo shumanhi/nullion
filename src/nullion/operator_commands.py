@@ -441,13 +441,21 @@ def _run_doctor_diagnose(runtime: PersistentRuntime) -> str:
 
 def _sorted_doctor_actions(runtime: PersistentRuntime) -> list[dict]:
     snapshot = build_runtime_status_snapshot(runtime.store)
-    return list(snapshot.get("doctor_actions", []))
+    actions = list(snapshot.get("doctor_actions", []))
+    actions.sort(
+        key=lambda action: str(action.get("updated_at") or action.get("created_at") or ""),
+        reverse=True,
+    )
+    return actions
 
 
 def _resolve_doctor_action(runtime: PersistentRuntime, token: str | None) -> dict | None:
     if token is None:
         return None
     normalized_token = _normalize_mention_suffix(token)
+    if normalized_token.lower() in {"latest", "newest"}:
+        actions = _sorted_doctor_actions(runtime)
+        return actions[0] if actions else None
     direct = runtime.store.get_doctor_action(normalized_token)
     if direct is not None:
         return direct
@@ -469,7 +477,7 @@ def _render_doctor_action(runtime: PersistentRuntime, token: str | None) -> str:
     action_id = str(action.get("action_id") or "")
     lines = [
         "🩺 Doctor action",
-        f"ID: {action_id}",
+        f"Reference: {_humanize_operator_label(action.get('summary')) or 'Health action'}",
         f"Status: {_humanize_operator_label(action.get('status'))}",
         f"Severity: {_humanize_operator_label(action.get('severity'))}",
         f"Type: {_humanize_operator_label(action.get('action_type'))}",
@@ -1651,6 +1659,13 @@ def _resolve_builder_proposal_token(runtime: PersistentRuntime, token: str | Non
     if token is None:
         return None
     normalized_token = _normalize_mention_suffix(token)
+    if normalized_token.lower() in {"latest", "newest"}:
+        proposals = sorted(
+            list_builder_proposals(runtime.store),
+            key=lambda record: getattr(record, "created_at", None) or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        return proposals[0] if proposals else None
     direct = get_builder_proposal(runtime.store, normalized_token)
     if direct is not None:
         return direct
@@ -1676,7 +1691,6 @@ def _render_builder_proposal(runtime: PersistentRuntime, token: str | None) -> s
         record.proposal.title,
         "",
         record.proposal.summary,
-        f"Proposal ID: {record.proposal_id}",
         f"Status: {record.status}",
     ]
     if record.status == "accepted" and record.accepted_skill_id:
@@ -1705,19 +1719,19 @@ def _accept_builder_proposal(runtime: PersistentRuntime, token: str | None) -> s
         except (KeyError, ValueError, RuntimeError) as exc:
             return str(exc)
         return (
-            f"Accepted Builder proposal {record.proposal_id}.\n"
+            f"Accepted Builder proposal: {record.proposal.title}.\n"
             f"Installed dependency: {result.get('package')} {result.get('installed_version') or ''}".rstrip()
         )
     if record.proposal.approval_mode != "skill":
         return (
-            f"Builder proposal {record.proposal_id} is a {record.proposal.approval_mode} proposal and cannot be accepted as a skill.\n"
-            f"Use /reject-proposal {record.proposal_id} or /archive-proposal {record.proposal_id}."
+            f"Builder proposal {record.proposal.title} is a {record.proposal.approval_mode} proposal and cannot be accepted as a skill.\n"
+            "Use /reject-proposal latest or /archive-proposal latest."
         )
     try:
         skill = runtime.accept_stored_builder_skill_proposal(record.proposal_id, actor="operator")
     except ValueError as exc:
         return str(exc)
-    return f"Accepted Builder proposal {record.proposal_id}.\nSaved skill: {skill.title}"
+    return f"Accepted Builder proposal: {record.proposal.title}.\nSaved skill: {skill.title}"
 
 
 def _reject_builder_proposal(runtime: PersistentRuntime, token: str | None) -> str:
@@ -1734,7 +1748,7 @@ def _reject_builder_proposal(runtime: PersistentRuntime, token: str | None) -> s
     except ValueError as exc:
         return str(exc)
     runtime.checkpoint()
-    return f"Rejected Builder proposal {record.proposal_id}."
+    return f"Rejected Builder proposal: {record.proposal.title}."
 
 
 def _archive_builder_proposal(runtime: PersistentRuntime, token: str | None) -> str:
@@ -1751,7 +1765,7 @@ def _archive_builder_proposal(runtime: PersistentRuntime, token: str | None) -> 
     except ValueError as exc:
         return str(exc)
     runtime.checkpoint()
-    return f"Archived Builder proposal {record.proposal_id}."
+    return f"Archived Builder proposal: {record.proposal.title}."
 
 
 def _memory_timestamp(entry: UserMemoryEntry) -> datetime | None:

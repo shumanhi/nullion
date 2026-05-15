@@ -555,7 +555,6 @@ def _new_doctor_action_text_fallbacks(runtime, before_ids: frozenset[str]) -> tu
         severity = str(action.get("severity") or "unknown")
         lines = [
             "Doctor action pending",
-            f"ID: {action_id}",
             f"Severity: {severity}",
             f"Summary: {summary}",
         ]
@@ -563,14 +562,14 @@ def _new_doctor_action_text_fallbacks(runtime, before_ids: frozenset[str]) -> tu
         if remediation_actions:
             lines.extend(["", "Actions you can run from this chat:"])
             lines.extend(
-                f"{index}. {label}: /doctor run {action_id} {command}"
+                f"{index}. {label}: /doctor run latest {command}"
                 for index, (label, command) in enumerate(remediation_actions, start=1)
             )
         lines.extend([
             "",
-            f"Inspect: /doctor {action_id}",
-            f"Mark resolved: /doctor complete {action_id}",
-            f"Dismiss: /doctor dismiss {action_id}",
+            "Inspect: /doctor latest",
+            "Mark resolved: /doctor complete latest",
+            "Dismiss: /doctor dismiss latest",
         ])
         fallbacks.append("\n".join(lines))
     return tuple(fallbacks)
@@ -635,6 +634,7 @@ def handle_messaging_ingress_result(
     *,
     turn_dispatch_decision=None,
     text_delta_callback=None,
+    activity_callback=None,
 ):
     from nullion.messaging_turn_graph import run_messaging_turn_graph
 
@@ -643,6 +643,7 @@ def handle_messaging_ingress_result(
         ingress,
         turn_dispatch_decision=turn_dispatch_decision,
         text_delta_callback=text_delta_callback,
+        activity_callback=activity_callback,
     )
 
 

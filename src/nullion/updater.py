@@ -116,6 +116,8 @@ class UpdateResult:
     rolled_back:    bool = False
     from_version:   str  = ""
     to_version:     str  = ""
+    from_commit:    str  = ""
+    to_commit:      str  = ""
     error:          str  = ""
     snapshot_path:   str  = ""
     steps:          list[UpdateProgress] = field(default_factory=list)
@@ -191,6 +193,13 @@ def _latest_release_tag(cwd: Path | None = None) -> str:
     raise RuntimeError("No release tags found. Use `nullion update --hash` to update to the latest repository commit.")
 
 
+def _nearest_reachable_release_tag(ref: str = "HEAD", cwd: Path | None = None) -> str:
+    code, out = _git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", ref, cwd=cwd)
+    if code != 0 or not out.strip():
+        raise RuntimeError(out or f"could not resolve release tag for {ref}")
+    return out.strip()
+
+
 def _update_target(channel: str = "release", cwd: Path | None = None) -> UpdateTarget:
     """Resolve the update target.
 
@@ -240,7 +249,22 @@ def _commit_relation(local_commit: str, remote_commit: str, cwd: Path | None = N
 def _snapshot_name() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def snapshot() -> Path:
+def _release_rollback_ref_for_snapshot(from_ref: str = "HEAD", cwd: Path | None = None) -> str | None:
+    """Return the shipped release tag that should be used for rollback.
+
+    A release-channel update can be started from an installer checkout that is
+    accidentally one or more commits past the last tag. Rollback should return
+    that installation to the prior shipped release, not preserve the branch
+    commit that contaminated the source checkout.
+    """
+    try:
+        return _nearest_reachable_release_tag(from_ref, cwd=cwd)
+    except Exception as exc:
+        log.warning("Could not resolve release rollback tag for %s: %s", from_ref, exc)
+        return None
+
+
+def snapshot(*, rollback_ref: str | None = None, rollback_label: str | None = None) -> Path:
     """Freeze current pip state and record git commit. Returns snapshot dir."""
     tag  = _snapshot_name()
     snap = _backup_dir() / tag
@@ -256,6 +280,13 @@ def snapshot() -> Path:
     # git commit
     commit = _current_commit_full()
     (snap / "git_commit.txt").write_text(commit)
+    if rollback_ref:
+        code, out = _git("rev-parse", "--verify", f"{rollback_ref}^{{commit}}")
+        if code != 0:
+            raise RuntimeError(out or f"could not resolve rollback ref {rollback_ref}")
+        rollback_commit = out.strip().splitlines()[-1].strip()
+        (snap / "rollback_git_commit.txt").write_text(rollback_commit)
+        (snap / "rollback_label.txt").write_text(rollback_label or rollback_ref)
 
     # keep only last 3 snapshots
     snaps = sorted(_backup_dir().glob("2*"))
@@ -497,7 +528,9 @@ def _restore_snapshot_requirements(req_file: Path) -> subprocess.CompletedProces
 def rollback(snap: Path) -> bool:
     """Restore pip state and git commit from snapshot. Returns True on success."""
     try:
-        commit_file = snap / "git_commit.txt"
+        commit_file = snap / "rollback_git_commit.txt"
+        if not commit_file.exists():
+            commit_file = snap / "git_commit.txt"
         req_file    = snap / "requirements.txt"
         if commit_file.exists():
             try:
@@ -967,10 +1000,9 @@ async def _update_fetch_node(state: _UpdateWorkflowState) -> dict[str, object]:
         to_label = target.label
         relation = await _update_run_blocking(lambda: _commit_relation(from_commit, to_commit))
         state = {**state, "steps": steps}
-        if relation in {"current", "ahead"}:
+        if relation == "current" or (relation == "ahead" and target.channel == "hash"):
             if target.channel == "release":
-                suffix = " Use `nullion update --hash` to install unreleased commits." if relation == "ahead" else ""
-                message = f"Already on latest release {to_label} at {from_label}.{suffix}"
+                message = f"Already on latest release {to_label} at {from_label}."
             else:
                 suffix = "" if relation == "current" else " Local checkout is ahead of origin/main."
                 message = f"Already up to date at {from_label}.{suffix}"
@@ -982,8 +1014,22 @@ async def _update_fetch_node(state: _UpdateWorkflowState) -> dict[str, object]:
                 "from_label": from_label,
                 "to_label": to_label,
                 "target": target,
-                "result": UpdateResult(success=True, from_version=from_label, to_version=from_label, steps=steps),
+                "result": UpdateResult(
+                    success=True,
+                    from_version=from_label,
+                    to_version=from_label,
+                    from_commit=from_commit,
+                    to_commit=from_commit,
+                    steps=steps,
+                ),
             }
+        if relation == "ahead" and target.channel == "release":
+            steps = _update_emit(
+                state,
+                "fetch",
+                f"Local checkout is ahead of release {to_label}; source will be reset to the shipped release.",
+            )
+            state = {**state, "steps": steps}
         if relation == "diverged":
             steps = _update_emit(state, "fetch", "Update history changed; source will be reset after backup.")
             state = {**state, "steps": steps}
@@ -1016,7 +1062,20 @@ async def _update_snapshot_node(state: _UpdateWorkflowState) -> dict[str, object
     try:
         state = {**state, "steps": steps}
         steps = _update_emit(state, "snapshot", f"Saving backup of current version ({from_label})...")
-        snap = await _update_run_blocking(snapshot)
+        rollback_ref: str | None = None
+        rollback_label: str | None = None
+        if str(state.get("update_channel") or "release") == "release":
+            rollback_ref = await _update_run_blocking(_release_rollback_ref_for_snapshot)
+            if rollback_ref:
+                rollback_label = await _update_run_blocking(lambda: _version_label(rollback_ref))
+                if rollback_label and rollback_label != from_label:
+                    state = {**state, "steps": steps}
+                    steps = _update_emit(
+                        state,
+                        "snapshot",
+                        f"Rollback target normalized to release {rollback_label}.",
+                    )
+        snap = await _update_run_blocking(lambda: snapshot(rollback_ref=rollback_ref, rollback_label=rollback_label))
         state = {**state, "steps": steps}
         steps = _update_emit(state, "snapshot", f"Backup saved to {snap.name}")
     except Exception as exc:
@@ -1029,6 +1088,8 @@ async def _update_snapshot_node(state: _UpdateWorkflowState) -> dict[str, object
                 success=False,
                 from_version=from_label,
                 to_version=to_label,
+                from_commit=str(state.get("from_commit") or ""),
+                to_commit=str(state.get("to_commit") or ""),
                 error=str(exc),
                 snapshot_path=str(snap) if snap else "",
                 steps=steps,
@@ -1086,6 +1147,8 @@ async def _update_apply_node(state: _UpdateWorkflowState) -> dict[str, object]:
                 rolled_back=ok,
                 from_version=from_label,
                 to_version=to_label,
+                from_commit=str(state.get("from_commit") or ""),
+                to_commit=str(state.get("to_commit") or ""),
                 error=str(exc),
                 snapshot_path=str(snap) if snap else "",
                 steps=steps,
@@ -1131,6 +1194,8 @@ async def _update_migrate_node(state: _UpdateWorkflowState) -> dict[str, object]
                 rolled_back=ok,
                 from_version=from_label,
                 to_version=to_label,
+                from_commit=str(state.get("from_commit") or ""),
+                to_commit=str(state.get("to_commit") or ""),
                 error=str(exc),
                 snapshot_path=str(snap) if snap else "",
                 steps=steps,
@@ -1195,6 +1260,8 @@ async def _update_health_node(state: _UpdateWorkflowState) -> dict[str, object]:
                     rolled_back=False,
                     from_version=from_label,
                     to_version=to_label,
+                    from_commit=str(state.get("from_commit") or ""),
+                    to_commit=str(state.get("to_commit") or ""),
                     snapshot_path=str(snap) if snap else "",
                     steps=steps,
                 ),
@@ -1211,6 +1278,8 @@ async def _update_health_node(state: _UpdateWorkflowState) -> dict[str, object]:
                 rolled_back=ok,
                 from_version=from_label,
                 to_version=to_label,
+                from_commit=str(state.get("from_commit") or ""),
+                to_commit=str(state.get("to_commit") or ""),
                 error="Health check failed after update.",
                 snapshot_path=str(snap) if snap else "",
                 steps=steps,
@@ -1229,6 +1298,8 @@ async def _update_health_node(state: _UpdateWorkflowState) -> dict[str, object]:
             success=True,
             from_version=from_label,
             to_version=to_label,
+            from_commit=str(state.get("from_commit") or ""),
+            to_commit=str(state.get("to_commit") or ""),
             snapshot_path=str(snap) if snap else "",
             steps=steps,
         ),

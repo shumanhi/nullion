@@ -46,6 +46,7 @@ from nullion.tools import ToolInvocation, ToolRegistry, ToolResult
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL_TOOL_RESULT_MAX_CHARS = 87_420
+_ALWAYS_COMPACT_MODEL_TOOL_OUTPUTS = frozenset({"terminal_exec", "workspace_summary"})
 
 
 _ARTIFACT_RECOVERY_TOOLS = frozenset(
@@ -274,6 +275,33 @@ def _compact_tool_output_for_model_context(tool_name: str, output: object) -> ob
     safe_output = _json_safe_tool_value(output)
     if not isinstance(safe_output, dict):
         return _truncate_text(str(safe_output or ""), 12_000)
+    if tool_name == "workspace_summary":
+        extensions = safe_output.get("extensions")
+        compact_extensions = extensions
+        if isinstance(extensions, list):
+            compact_extensions = sorted(
+                extensions,
+                key=lambda item: int(item.get("count") or 0) if isinstance(item, dict) else 0,
+                reverse=True,
+            )[:40]
+        sample_files = safe_output.get("sample_files")
+        compact_sample_files = sample_files
+        if isinstance(sample_files, list):
+            compact_sample_files = sample_files[:40]
+        compact = {
+            key: safe_output.get(key)
+            for key in ("roots", "file_count", "directory_count", "scanned_entries", "truncated")
+            if safe_output.get(key) is not None
+        }
+        if compact_extensions is not None:
+            compact["extensions"] = compact_extensions
+            if isinstance(extensions, list) and len(extensions) > 40:
+                compact["extensions_truncated"] = {"shown": 40, "total": len(extensions)}
+        if compact_sample_files is not None:
+            compact["sample_files"] = compact_sample_files
+            if isinstance(sample_files, list) and len(sample_files) > 40:
+                compact["sample_files_truncated"] = {"shown": 40, "total": len(sample_files)}
+        return compact
     if tool_name == "web_fetch":
         compact = {
             key: safe_output.get(key)
@@ -302,7 +330,7 @@ def _compact_tool_output_for_model_context(tool_name: str, output: object) -> ob
         for key in ("stdout", "stderr"):
             value = safe_output.get(key)
             if isinstance(value, str) and value.strip():
-                compact[key] = _truncate_text(value, 24_000)
+                compact[key] = _truncate_text(value, 4_000)
         return compact
     return _compact_tool_output_for_repair(tool_name, safe_output)
 
@@ -310,7 +338,11 @@ def _compact_tool_output_for_model_context(tool_name: str, output: object) -> ob
 def _tool_result_message_payload(result: ToolResult) -> str:
     payload: dict[str, Any] = {
         "status": result.status,
-        "output": _json_safe_tool_value(result.output),
+        "output": (
+            _compact_tool_output_for_model_context(result.tool_name, result.output)
+            if result.tool_name in _ALWAYS_COMPACT_MODEL_TOOL_OUTPUTS
+            else _json_safe_tool_value(result.output)
+        ),
     }
     security = model_security_envelope(result.tool_name, result.output)
     if security is not None:
@@ -803,6 +835,19 @@ def _repeated_tool_failure_message(
     repeated_count: int,
 ) -> str:
     tool_label = str(result.tool_name or "tool").replace("_", " ").strip() or "tool"
+    if result.tool_name == "connector_request":
+        output = result.output if isinstance(result.output, dict) else {}
+        provider_id = str(output.get("provider_id") or "").strip()
+        provider_text = f" for `{provider_id}`" if provider_id else ""
+        error_text = str(result.error or "").strip()
+        if len(error_text) > 220:
+            error_text = error_text[:217].rstrip() + "..."
+        detail = f" Last error: {error_text}" if error_text else ""
+        return (
+            f"The connector request{provider_text} failed {repeated_count} times, so I stopped retrying it. "
+            f"{detail}".rstrip()
+            + " I need to use a different available tool path or a correctly configured connector for this request."
+        )
     return (
         f"I stopped because the same {tool_label} step failed {repeated_count} times in a row. "
         "I did not keep retrying the same action."
@@ -2519,6 +2564,7 @@ class AgentOrchestrator:
             planner_summary=planner_summary,
             subject=user_message,
             default_status=TaskStatus.PENDING,
+            include_next_request_hint=True,
         )
         task_status_detail = format_task_status_activity_detail(
             group.tasks,

@@ -367,6 +367,7 @@ class AsyncTurnDispatchTracker:
         turn_id: object | None = None,
         task: asyncio.Task | None = None,
         model_client: object | None = None,
+        reply_context: dict[str, object] | None = None,
     ) -> ActiveTurnRegistration:
         conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
         turn_key = _normalize_key(turn_id, fallback=f"turn-{uuid4().hex[:12]}")
@@ -379,7 +380,14 @@ class AsyncTurnDispatchTracker:
         active_turn_ids = tuple(active_order)
         active_turn_texts = tuple(active_texts_by_id.get(active_turn_id, "") for active_turn_id in active_order)
         dispatch_started_at = time.perf_counter()
-        if active_turn_ids:
+        if reply_context:
+            decision = TurnDispatchDecision(
+                policy=TurnDispatchPolicy.PARALLEL,
+                dependency_turn_ids=(),
+                disposition=ConversationTurnDisposition.INDEPENDENT,
+                reason="explicit_reply_context",
+            )
+        elif active_turn_ids:
             decision = await asyncio.to_thread(
                 route_turn_dispatch_with_context,
                 str(text or ""),

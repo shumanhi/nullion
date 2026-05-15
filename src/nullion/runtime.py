@@ -3406,6 +3406,7 @@ def process_conversation_message(
     ambiguity_classifier: TurnDispositionAmbiguityClassifier | None = None,
     ambiguity_classifier_reason: str | None = None,
     previous_assistant_message: str | None = None,
+    reply_context: dict[str, object] | None = None,
     dispatch_disposition: ConversationTurnDisposition | str | None = None,
     dispatch_dependency_turn_ids: tuple[str, ...] = (),
     dispatch_reason: str | None = None,
@@ -3587,7 +3588,11 @@ def process_conversation_message(
         "chat_id": chat_id,
         "user_message": user_message,
         "disposition_reason": disposition_reason,
+        "reply_context": reply_context,
         **dispatch_event_fields,
+    }
+    message_received_payload = {
+        key: value for key, value in message_received_payload.items() if value is not None
     }
     store.add_event(
         make_event(
@@ -3614,6 +3619,7 @@ def process_conversation_message(
         branch_id=resolved_branch_id,
         chat_id=chat_id,
         disposition_reason=disposition_reason,
+        reply_context=reply_context,
         **dispatch_event_fields,
     )
 
@@ -3692,8 +3698,10 @@ def process_conversation_message(
         "disposition_reason": disposition_reason,
         "chat_id": chat_id,
         "superseded_branch_id": superseded_branch_id,
+        "reply_context": reply_context,
         **dispatch_event_fields,
     }
+    payload = {key: value for key, value in payload.items() if value is not None}
     store.add_event(
         make_event(
             event_type="conversation.turn_recorded",
@@ -3717,6 +3725,7 @@ def process_conversation_message(
         branch_id=resolved_branch_id,
         parent_turn_id=parent_turn_id,
         disposition_reason=disposition_reason,
+        reply_context=reply_context,
         **dispatch_event_fields,
     )
 

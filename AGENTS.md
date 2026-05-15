@@ -29,6 +29,7 @@
 - Do not assume users have a second provider or a "fast lane" model. The default path must remain reliable when only one provider/model is configured.
 - If fallback planner cards are needed, they are resilience-only and must not replace root-cause performance fixes.
 - Add regression tests that cover timeout, clarification, and valid multi-task planner outcomes without relying on English trigger words.
+- Latency is a release-critical product requirement. Do not fix routing, scheduler, connector, planner, or activity bugs by adding a model/classifier call to every ordinary request. First look for typed runtime signals, cached decisions with correct invalidation, existing task/frame state, tool result schemas, stored job/artifact descriptors, and other cheap structured routes. If a new model decision is unavoidable, gate it behind structured evidence and add tests proving unrelated plain turns stay on the fast path.
 
 ## Repo Boundaries
 
@@ -70,6 +71,13 @@
 - The local ops dashboard lives in `/Users/himanc/Projects/nullion-test/scripts/local_ops_dashboard.py` on port `2020`. It may expose user-clicked controls for dev and stage operations, including copying prod DB to stage. It must not silently mutate prod.
 - Treat all prod and stage homes, launchd plists/services, tray/web/Telegram processes, editable-package pointers, config, credentials, runtime DBs, JSON mirrors, and browser profiles as protected running-instance state.
 - Read-only inspection is allowed when debugging: logs, process lists, launchd status, package metadata, curl GETs, DB reads, and config reads. Do not write to prod or stage files, call mutating endpoints, restart services, or run `pip install -e` into their venvs without explicit user approval for that exact action.
+- If the user explicitly asks to patch or restart prod for testing, restart all relevant prod launchd services and verify the new processes before telling the user to test:
+  - `launchctl kickstart -k gui/$(id -u)/com.nullion.web`
+  - `launchctl kickstart -k gui/$(id -u)/com.nullion.tray 2>/dev/null || true`
+  - `launchctl kickstart -k gui/$(id -u)/ai.nullion.telegram`
+  - Verify fresh PIDs with `launchctl print gui/$(id -u)/com.nullion.web` and `launchctl print gui/$(id -u)/ai.nullion.telegram`.
+  - Verify the loaded code path with the prod venv, for example `/Users/himanc/.nullion/venv/bin/python -c "import nullion.telegram_app as t; print(t.__file__)"`.
+  - Verify the web service responds on prod port `8742`, for example `curl -fsS http://127.0.0.1:8742/api/status`.
 - Do not use `/Users/himanc/Test/nullion` for code changes. That folder is not the working app repo.
 
 ## Pull Requests

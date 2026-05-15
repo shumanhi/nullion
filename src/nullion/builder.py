@@ -121,12 +121,20 @@ def format_builder_proposal_notification(record: BuilderProposalRecord) -> str:
         action_label = "save a reusable skill"
         accept_label = "save it"
     summary = str(getattr(proposal, "summary", "") or "").strip()
+    summary_text = summary or action_label
+    if summary_text and summary_text[-1] not in ".!?":
+        summary_text += "."
     lines = [
-        f"Builder found an optional improvement: {proposal.title}",
-        f"What it would do: {summary or action_label}.",
-        f"Review it: /proposal {record.proposal_id}",
-        f"Approve: /accept-proposal {record.proposal_id} ({accept_label})",
-        f"Dismiss: /reject-proposal {record.proposal_id}",
+        "────────────────",
+        "🧱 Builder suggestion",
+        f"Optional improvement: {proposal.title}",
+        f"What it would do: {summary_text}",
+        builder_proposal_acceptance_benefit(proposal),
+        "",
+        "Actions",
+        "- Review: /proposal latest",
+        f"- Approve: /accept-proposal latest ({accept_label})",
+        "- Dismiss: /reject-proposal latest",
     ]
     return "\n".join(lines)
 
