@@ -63,6 +63,7 @@ from nullion.policy import (
 from nullion.prompt_injection import scan_tool_output
 from nullion.redaction import redact_value
 from nullion.runtime_store import RuntimeStore
+from nullion.skill_pack_catalog import normalize_enabled_skill_pack_ids
 from nullion.tips import MEDIA_PROVIDER_SETUP_TIP, format_setup_tip
 from nullion.tool_boundaries import extract_boundary_facts
 
@@ -2202,8 +2203,14 @@ def _connector_access_enabled() -> bool:
     raw = os.environ.get("NULLION_CONNECTOR_ACCESS_ENABLED")
     if raw is not None and raw.strip():
         return _env_flag("NULLION_CONNECTOR_ACCESS_ENABLED")
-    enabled_packs = str(os.environ.get("NULLION_ENABLED_SKILL_PACKS") or "").lower()
-    if "connector" in enabled_packs or "api-gateway" in enabled_packs:
+    enabled_packs = normalize_enabled_skill_pack_ids(
+        [
+            item
+            for item in str(os.environ.get("NULLION_ENABLED_SKILL_PACKS") or "").split(",")
+            if item.strip()
+        ]
+    )
+    if "nullion/connector-skills" in enabled_packs or "maton-ai/api-gateway-skill" in enabled_packs:
         return True
     try:
         from nullion.connections import load_connection_registry
@@ -2960,7 +2967,16 @@ class ToolExecutor:
                 output={"reason": "capability_not_granted", "allowed_tools": list(self._allowed_tool_names)},
             )
 
-        spec = self._registry.get_spec(invocation.tool_name)
+        try:
+            spec = self._registry.get_spec(invocation.tool_name)
+        except KeyError:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"reason": "tool_not_available"},
+                error=f"Tool is not available in this turn: {invocation.tool_name}",
+            )
 
         tool_decision = (
             self._sentinel_policy.decision_for_risk(

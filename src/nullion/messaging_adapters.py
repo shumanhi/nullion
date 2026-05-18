@@ -568,8 +568,7 @@ def _new_doctor_action_text_fallbacks(runtime, before_ids: frozenset[str]) -> tu
         lines.extend([
             "",
             "Inspect: /doctor latest",
-            "Mark resolved: /doctor complete latest",
-            "Dismiss: /doctor dismiss latest",
+            "Hide: /doctor dismiss latest",
         ])
         fallbacks.append("\n".join(lines))
     return tuple(fallbacks)

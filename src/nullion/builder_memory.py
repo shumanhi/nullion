@@ -100,7 +100,7 @@ _EMAIL_ADDRESS_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.
 _OPERATIONAL_MEMORY_VALUE_RE = re.compile(
     r"\b(?:"
     r"audience metrics|can be triggered on request|configured destination|delivery saves|failed metric sources|"
-    r"gh api|list_crons|public awareness|run_cron|scheduled cron|scheduled monitor|scheduled task|"
+    r"list_crons|public awareness|run_cron|scheduled cron|scheduled monitor|scheduled task|"
     r"traffic metrics|web scraping"
     r")\b",
     re.I,

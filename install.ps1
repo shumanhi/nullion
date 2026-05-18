@@ -2724,19 +2724,32 @@ Save-MediaCheckpoint
 
 # Skill pack setup
 Write-Host ""
-Write-Host "  Choose skill packs to enable:" -ForegroundColor White
-Write-Host "  All built-in skill packs ship with Nullion and are selected by default."
+Write-Host "  Skill packs:" -ForegroundColor White
+Write-Host "  Core skill packs ship with Nullion and are always installed."
 Write-Host "  Skill packs add workflow guidance only; account access still requires"
 Write-Host "  workspace-scoped provider connections and enabled tools."
 Write-Host ""
 
+$CORE_SKILL_PACKS = @(
+    "nullion/web-research",
+    "nullion/browser-automation",
+    "nullion/files-and-docs",
+    "nullion/pdf-documents",
+    "nullion/email-calendar",
+    "nullion/github-code",
+    "nullion/media-local",
+    "nullion/productivity-memory",
+    "nullion/connector-skills"
+)
 $selectedSkillPacks = New-Object System.Collections.Generic.List[string]
 function Add-SkillPackChoice {
     param([string]$PackId)
-    if ($PackId -and -not $selectedSkillPacks.Contains($PackId)) {
-        [void]$selectedSkillPacks.Add($PackId)
+    $normalized = "$PackId".Trim().ToLowerInvariant()
+    if ($normalized -and -not $selectedSkillPacks.Contains($normalized)) {
+        [void]$selectedSkillPacks.Add($normalized)
     }
 }
+foreach ($pack in $CORE_SKILL_PACKS) { Add-SkillPackChoice $pack }
 
 function Install-CustomSkillPackNow {
     param([string]$Source, [string]$PackId = "")
@@ -2756,47 +2769,28 @@ print(pack.pack_id)
 
 function Request-SkillPackChoices {
     if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
-        Write-Info "No interactive terminal detected; using all default skill packs."
-        return @("1", "2", "3", "4", "5", "6", "7", "8", "9")
+        Write-Info "No interactive terminal detected; using core skill packs."
+        return @()
     }
 
     $items = @(
-        @{ Title = "Web research"; Detail = "Search, fetch, source-backed answers"; Badge = ""; Choice = "1" },
-        @{ Title = "Browser automation"; Detail = "Web navigation, forms, screenshots"; Badge = ""; Choice = "2" },
-        @{ Title = "Files and documents"; Detail = "Local files, docs, sheets, decks"; Badge = ""; Choice = "3" },
-        @{ Title = "PDF documents"; Detail = "PDF generation, conversion, verification, delivery"; Badge = ""; Choice = "4" },
-        @{ Title = "Email and calendar"; Detail = "Inbox triage, replies, scheduling"; Badge = ""; Choice = "5" },
-        @{ Title = "GitHub and code review"; Detail = "Repos, PRs, issues, release notes"; Badge = ""; Choice = "6" },
-        @{ Title = "Local media"; Detail = "Audio transcription, OCR, image workflows"; Badge = ""; Choice = "7" },
-        @{ Title = "Productivity and memory"; Detail = "Tasks, routines, preferences, reminders"; Badge = ""; Choice = "8" },
-        @{ Title = "Connector/API skills"; Detail = "Maton, Composio, Nango, Activepieces, n8n, custom APIs"; Badge = ""; Choice = "9" },
-        @{ Title = "Install custom skill pack"; Detail = "Git URL, GitHub folder, or local folder with SKILL.md"; Badge = ""; Choice = "10" },
-        @{ Title = "No default skill packs"; Detail = "Start with no enabled reference packs"; Badge = ""; Choice = "11" }
+        @{ Title = "Install custom skill pack"; Detail = "Git URL, GitHub folder, or local folder with SKILL.md"; Badge = ""; Choice = "1" }
     )
 
     foreach ($item in $items) {
-        $badge = $item.Badge
-        if (-not $badge -and [int]$item.Choice -le 9) { $badge = "[default]" }
-        Write-MenuItem $item.Choice $item.Title $item.Detail $badge
+        Write-MenuItem $item.Choice $item.Title $item.Detail $item.Badge
     }
     Write-Host ""
-    Write-Info "Press Enter to use the default packs (1-9), or enter choices like 1,3,6."
-    $rawChoices = (Read-Host "  Skill packs [1,2,3,4,5,6,7,8,9]").Trim()
-    if (-not $rawChoices) { $rawChoices = "1,2,3,4,5,6,7,8,9" }
+    Write-Info "Core skill packs are already installed and cannot be deselected."
+    $rawChoices = (Read-Host "  Optional custom skill packs [Enter for none, 1 to add]").Trim()
 
     $choices = New-Object System.Collections.Generic.List[string]
     foreach ($choice in ($rawChoices -split '[^0-9]+')) {
         if (-not $choice) { continue }
-        if ($choice -eq "11") {
-            $choices.Clear()
-            [void]$choices.Add("11")
-            break
-        }
         if (($items | Where-Object { $_.Choice -eq $choice }) -and -not $choices.Contains($choice)) {
             [void]$choices.Add($choice)
         }
     }
-    if ($choices.Count -eq 0) { [void]$choices.Add("11") }
     return $choices.ToArray()
 }
 
@@ -2816,21 +2810,9 @@ if ($ExistingSkillPacks) {
 if (-not $SKIP_SKILL_SETUP) {
 $SkillChoices = Request-SkillPackChoices
 
-if ($SkillChoices -contains "11") {
-    Write-Info "Skipped default skill packs. You can enable them later in Settings."
-} else {
     foreach ($choice in $SkillChoices) {
         switch ($choice) {
-            "1" { Add-SkillPackChoice "nullion/web-research" }
-            "2" { Add-SkillPackChoice "nullion/browser-automation" }
-            "3" { Add-SkillPackChoice "nullion/files-and-docs" }
-            "4" { Add-SkillPackChoice "nullion/pdf-documents" }
-            "5" { Add-SkillPackChoice "nullion/email-calendar" }
-            "6" { Add-SkillPackChoice "nullion/github-code" }
-            "7" { Add-SkillPackChoice "nullion/media-local" }
-            "8" { Add-SkillPackChoice "nullion/productivity-memory" }
-            "9" { Add-SkillPackChoice "nullion/connector-skills" }
-            "10" {
+            "1" {
                 $CustomSkillPackSource = (Read-Host "  Skill pack source URL/path").Trim()
                 $CustomSkillPackId = (Read-Host "  Pack id [auto]").Trim()
                 if ($CustomSkillPackSource) {
@@ -2847,7 +2829,6 @@ if ($SkillChoices -contains "11") {
             default { Write-Info "Ignoring unknown skill choice: $choice" }
         }
     }
-}
 }
 
 $ENABLED_SKILL_PACKS = ($selectedSkillPacks -join ",")

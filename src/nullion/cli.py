@@ -362,6 +362,7 @@ def _run_skill_pack_cli(args) -> None:
 
 
 def _enable_skill_pack_id(pack_id: str) -> str:
+    from nullion.skill_pack_catalog import normalize_enabled_skill_pack_ids
     from nullion.skill_pack_installer import BUILTIN_SKILL_PACK_PROMPTS, get_installed_skill_pack, normalize_pack_id
 
     normalized = normalize_pack_id(pack_id)
@@ -378,8 +379,16 @@ def _enable_skill_pack_id(pack_id: str) -> str:
                 break
     if normalized not in current:
         current.append(normalized)
-    _merge_env_updates(env_path, {"NULLION_ENABLED_SKILL_PACKS": ", ".join(current)})
-    os.environ["NULLION_ENABLED_SKILL_PACKS"] = ", ".join(current)
+    enabled_value = ", ".join(normalize_enabled_skill_pack_ids(tuple(current)))
+    _merge_env_updates(
+        env_path,
+        {
+            "NULLION_ENABLED_SKILL_PACKS": enabled_value,
+            "NULLION_SKILL_PACK_ACCESS_ENABLED": "true",
+        },
+    )
+    os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_value
+    os.environ["NULLION_SKILL_PACK_ACCESS_ENABLED"] = "true"
     return normalized
 
 

@@ -160,7 +160,13 @@ from nullion.run_activity import (
 from nullion.artifact_workflow_graph import run_pre_chat_artifact_workflow
 from nullion.screenshot_delivery import ScreenshotDeliveryResult
 from nullion.skill_usage import build_learned_skill_usage_hint
-from nullion.skill_pack_catalog import list_available_skill_packs, list_skill_pack_auth_providers, skill_pack_access_prompt
+from nullion.skill_pack_catalog import (
+    is_builtin_nullion_skill_pack_id,
+    list_available_skill_packs,
+    list_skill_pack_auth_providers,
+    normalize_enabled_skill_pack_ids,
+    skill_pack_access_prompt,
+)
 from nullion.skill_pack_installer import (
     install_skill_pack,
     list_installed_skill_packs,
@@ -733,6 +739,7 @@ def _open_local_directory(path: Path) -> None:
 
 
 _RUNTIME_HISTORY_SYNC_MTIMES: dict[str, float] = {}
+_RUNTIME_HISTORY_SYNC_CHECKED_AT: dict[str, float] = {}
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 4
 _MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
 
@@ -1055,6 +1062,8 @@ def _install_log_buffer_handler() -> None:
 
 def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
     """Best-effort backfill from runtime conversation events into web history."""
+    if os.environ.get("NULLION_HISTORY_RUNTIME_SYNC_ON_READ", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
     checkpoint_path = Path(
         getattr(runtime, "checkpoint_path", None) or Path.home() / ".nullion" / "runtime.db"
     )
@@ -1065,6 +1074,12 @@ def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
         cache_key = str(checkpoint_path.resolve())
         if _RUNTIME_HISTORY_SYNC_MTIMES.get(cache_key) == mtime:
             return
+        now_monotonic = time.monotonic()
+        last_checked = _RUNTIME_HISTORY_SYNC_CHECKED_AT.get(cache_key, 0.0)
+        sync_interval = float(os.environ.get("NULLION_HISTORY_RUNTIME_SYNC_INTERVAL_S", "60") or 60)
+        if last_checked and now_monotonic - last_checked < max(5.0, sync_interval):
+            return
+        _RUNTIME_HISTORY_SYNC_CHECKED_AT[cache_key] = now_monotonic
         if checkpoint_path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
             events = load_runtime_store(checkpoint_path).list_conversation_events()
         else:
@@ -1348,6 +1363,7 @@ _HTML = r"""<!DOCTYPE html>
   }
   .ahchan-item:hover { background: var(--surface); }
   .ahchan-item.active { background: rgba(99,102,241,.18); color: var(--accent2); }
+  .ahchan-item.loading { opacity: .72; cursor: wait; }
   .ahchan-item .ahchan-name { font-weight: 600; }
   .ahchan-item .ahchan-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
 
@@ -1386,6 +1402,25 @@ _HTML = r"""<!DOCTYPE html>
   .ahcal-day.selected::after { background: #fff; }
   .ahcal-day.today { border: 1px solid var(--accent2); color: var(--accent2); }
   .ahcal-day.other-month { opacity: .3; cursor: default; }
+  .ah-loading {
+    color: var(--muted); font-size: 12px; padding: 14px 18px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .ah-loading::before {
+    content: ""; width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid currentColor; border-right-color: transparent;
+    animation: btn-spin .8s linear infinite;
+  }
+  .ahcal-grid-loading .ahcal-day { opacity: .35; pointer-events: none; }
+  .ahcal-skeleton {
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; padding-top: 8px;
+  }
+  .ahcal-skeleton span {
+    aspect-ratio: 1; border-radius: 50%;
+    background: linear-gradient(90deg, rgba(255,255,255,.05), rgba(255,255,255,.11), rgba(255,255,255,.05));
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
 
   /* Right — conversations + messages */
   #allhist-right {
@@ -1406,6 +1441,7 @@ _HTML = r"""<!DOCTYPE html>
   }
   .ahconv-row:last-child { border-bottom: none; }
   .ahconv-row:hover, .ahconv-row.active { background: var(--surface2); }
+  .ahconv-row.loading { opacity: .72; cursor: wait; }
   .ahconv-title { font-size: 13px; font-weight: 600; color: var(--text); }
   .ahconv-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .ahdate-actions {
@@ -2048,6 +2084,7 @@ _HTML = r"""<!DOCTYPE html>
     display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px;
     align-items: start; min-width: 0; margin: 0;
   }
+  .skill-pack-choice.core { grid-template-columns: minmax(0, 1fr); }
   .skill-pack-option input { margin-top: 2px; accent-color: var(--accent2); }
   .skill-pack-main { min-width: 0; display: grid; gap: 5px; }
   .skill-pack-action { display: flex; justify-content: flex-end; align-items: center; min-height: 32px; }
@@ -3393,6 +3430,26 @@ _HTML = r"""<!DOCTYPE html>
   }
   .card-btn.primary:hover { opacity: 0.85; }
   .card-btn:disabled { opacity: 0.45; cursor: default; }
+  button[aria-busy="true"],
+  button.is-loading {
+    position: relative;
+    opacity: 0.75;
+    cursor: wait !important;
+  }
+  button[aria-busy="true"]::before,
+  button.is-loading::before {
+    content: "";
+    display: inline-block;
+    width: 0.75em;
+    height: 0.75em;
+    margin-right: 0.45em;
+    border-radius: 50%;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    vertical-align: -0.1em;
+    animation: btn-spin 0.8s linear infinite;
+  }
+  @keyframes btn-spin { to { transform: rotate(360deg); } }
   .update-actions {
     display: flex; gap: 10px; justify-content: center; align-items: center;
     flex-wrap: wrap;
@@ -5262,14 +5319,14 @@ _HTML = r"""<!DOCTYPE html>
               <div class="doctor-storage-alert" id="doctor-cleanup-alert">
                 <span>Auto cleanup is off. Enable auto clean or clean data now for better performance.</span>
                 <span class="doctor-storage-alert-actions">
-                  <button class="mini-btn good" type="button" onclick="enableDoctorAutoClean()">Enable auto clean</button>
-                  <button class="mini-btn" type="button" onclick="runDoctorCleanupNow()">Clean data now</button>
+                  <button class="mini-btn good" type="button" onclick="enableDoctorAutoClean(this)">Enable auto clean</button>
+                  <button class="mini-btn" type="button" onclick="runDoctorCleanupNow(this)">Clean data now</button>
                 </span>
               </div>
               <div class="form-hint" style="margin:12px 0 16px">Safe fixes should report what changed in chat after they run. Pending Doctor items also appear under Attention items.</div>
               <div class="doctor-action-row">
-                <button class="image-artifact-btn" type="button" onclick="runDoctorDiagnose()">Run diagnose</button>
-                <button class="image-artifact-btn" type="button" onclick="runDoctorCleanupNow()">Clean up now</button>
+                <button class="image-artifact-btn" type="button" onclick="runDoctorDiagnose(this)">Run diagnose</button>
+                <button class="image-artifact-btn" type="button" onclick="runDoctorCleanupNow(this)">Clean up now</button>
               </div>
               <div class="settings-command-list">
                 <div class="settings-command"><span>Ask Doctor to inspect the system</span><code>/doctor diagnose</code></div>
@@ -6002,8 +6059,8 @@ _HTML = r"""<!DOCTYPE html>
     <div class="modal-footer">
       <span id="save-feedback"></span>
       <div style="display:flex;gap:8px;">
-        <button class="card-btn" onclick="closeSettings()">Cancel</button>
-        <button class="card-btn primary" onclick="saveConfig()">Save changes</button>
+        <button class="card-btn" id="settings-cancel-btn" onclick="closeSettings()">Cancel</button>
+        <button class="card-btn primary" id="settings-save-btn" onclick="saveConfig()">Save changes</button>
       </div>
     </div>
   </div>
@@ -6060,6 +6117,32 @@ window.fetch = async (input, init = {}) => {
   return response;
 };
 const API = (path) => fetch(path).then(r => r.json());
+let _configFetchPromise = null;
+let _lastConfigPayload = null;
+let _headerConfigFetchPromise = null;
+let _lastHeaderConfigPayload = null;
+async function fetchConfig({force = false} = {}) {
+  if (!force && _lastConfigPayload) return _lastConfigPayload;
+  if (!force && _configFetchPromise) return _configFetchPromise;
+  _configFetchPromise = API('/api/config')
+    .then(cfg => {
+      _lastConfigPayload = cfg || {};
+      return _lastConfigPayload;
+    })
+    .finally(() => { _configFetchPromise = null; });
+  return _configFetchPromise;
+}
+async function fetchHeaderConfig({force = false} = {}) {
+  if (!force && _lastHeaderConfigPayload) return _lastHeaderConfigPayload;
+  if (!force && _headerConfigFetchPromise) return _headerConfigFetchPromise;
+  _headerConfigFetchPromise = API('/api/config/header')
+    .then(cfg => {
+      _lastHeaderConfigPayload = cfg || {};
+      return _lastHeaderConfigPayload;
+    })
+    .finally(() => { _headerConfigFetchPromise = null; });
+  return _headerConfigFetchPromise;
+}
 // ── Nullion SVG icon library ──────────────────────────────────────────────────
 const NI = {
   _svg: (d, extra='') => `<svg class="ni${extra}" viewBox="0 0 72 72" aria-hidden="true">${d}</svg>`,
@@ -6298,6 +6381,33 @@ function chatTurnInFlight() {
 function setSendButtonDisabled(disabled) {
   const sendBtn = document.getElementById('send-btn');
   if (sendBtn) sendBtn.disabled = Boolean(disabled);
+}
+
+function setActionButtonLoading(button, loadingText = 'Working...') {
+  if (!button) return () => {};
+  const originalText = button.dataset.originalText || button.textContent || '';
+  if (!button.dataset.originalText) button.dataset.originalText = originalText;
+  button.disabled = true;
+  button.classList.add('is-loading');
+  button.setAttribute('aria-busy', 'true');
+  button.textContent = loadingText || originalText || 'Working...';
+  let restored = false;
+  return (nextText = null) => {
+    if (restored) return;
+    restored = true;
+    button.disabled = false;
+    button.classList.remove('is-loading');
+    button.removeAttribute('aria-busy');
+    button.textContent = nextText || originalText;
+    delete button.dataset.originalText;
+  };
+}
+
+function finishActionButton(button, text = 'Done') {
+  if (!button) return;
+  button.classList.remove('is-loading');
+  button.setAttribute('aria-busy', 'false');
+  button.textContent = text;
 }
 
 function beginTurnUi(turnId, text) {
@@ -8673,24 +8783,35 @@ function renderSkillPackOptions(catalog, enabledValue) {
     container.innerHTML = entries.map((entry) => {
       const id = String(entry.pack_id || '').trim();
       if (!id) return '';
-      const checked = enabled.has(id) ? ' checked' : '';
-      const status = entry.status ? `<span>${escHtml(entry.status)}</span>` : '';
+      const isCore = String(entry.status || '').toLowerCase() === 'built-in';
+      const checked = enabled.has(id) || isCore ? ' checked' : '';
+      const statusLabel = isCore ? 'core' : entry.status;
+      const status = statusLabel ? `<span>${escHtml(statusLabel)}</span>` : '';
       const isInstalled = String(entry.status || '').toLowerCase() === 'installed';
-      const canRemove = isInstalled || enabled.has(id);
+      const canRemove = !isCore && (isInstalled || enabled.has(id));
       const removeLabel = isInstalled ? 'Uninstall' : 'Remove';
       const removeAction = canRemove
         ? `<button class="mini-btn danger" type="button" onclick="uninstallSkillPackFromSettings('${escAttr(id)}', this)">${removeLabel}</button>`
         : '';
-      return `
-        <div class="skill-pack-option">
-          <label class="skill-pack-choice">
+      const choiceMarkup = isCore
+        ? `<div class="skill-pack-choice core">
+            <span class="skill-pack-main">
+              <span class="skill-pack-title">${escHtml(entry.name || id)}</span>
+              <span class="skill-pack-summary">${escHtml(entry.summary || 'Reference instructions for repeatable workflows.')}</span>
+              <span class="skill-pack-foot"><code>${escHtml(id)}</code>${status}</span>
+            </span>
+          </div>`
+        : `<label class="skill-pack-choice">
             <input type="checkbox" class="cfg-skill-pack-choice" data-skill-pack-id="${escAttr(id)}" value="${escAttr(id)}"${checked}>
             <span class="skill-pack-main">
               <span class="skill-pack-title">${escHtml(entry.name || id)}</span>
               <span class="skill-pack-summary">${escHtml(entry.summary || 'Reference instructions for repeatable workflows.')}</span>
               <span class="skill-pack-foot"><code>${escHtml(id)}</code>${status}</span>
             </span>
-          </label>
+          </label>`;
+      return `
+        <div class="skill-pack-option" data-skill-pack-id="${escAttr(id)}" data-skill-pack-core="${isCore ? 'true' : 'false'}">
+          ${choiceMarkup}
           <div class="skill-pack-action">${removeAction}</div>
         </div>`;
     }).join('');
@@ -9033,51 +9154,45 @@ async function proposeCustomCapabilityDependency() {
 }
 
 async function acceptBuilderProposal(proposalId, buttonEl = null) {
-  const prevText = buttonEl ? buttonEl.textContent : null;
-  if (buttonEl) buttonEl.disabled = true;
+  const restoreButton = setActionButtonLoading(buttonEl, 'Working...');
   try {
-    if (buttonEl) buttonEl.textContent = 'Working...';
     const r = await fetch(`/api/builder/proposals/${encodeURIComponent(proposalId)}/accept`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Accept failed');
+    finishActionButton(buttonEl, 'Accepted');
     await loadBuilderDoctorSettingsSummary();
     await refreshDashboard();
   } catch (e) {
+    restoreButton();
     alert(`Accept failed: ${e.message || e}`);
-  } finally {
-    if (buttonEl) {
-      buttonEl.disabled = false;
-      buttonEl.textContent = prevText || 'Review & install';
-    }
   }
 }
 
 async function rejectBuilderProposal(proposalId, buttonEl = null) {
-  const prevText = buttonEl ? buttonEl.textContent : null;
-  if (buttonEl) buttonEl.disabled = true;
+  const restoreButton = setActionButtonLoading(buttonEl, 'Skipping...');
   try {
-    if (buttonEl) buttonEl.textContent = 'Working...';
     const r = await fetch(`/api/builder/proposals/${encodeURIComponent(proposalId)}/reject`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Reject failed');
+    finishActionButton(buttonEl, 'Skipped');
     await loadBuilderDoctorSettingsSummary();
     await refreshDashboard();
   } catch (e) {
+    restoreButton();
     alert(`Reject failed: ${e.message || e}`);
-  } finally {
-    if (buttonEl) {
-      buttonEl.disabled = false;
-      buttonEl.textContent = prevText || 'Skip';
-    }
   }
 }
 
 function collectSkillPackConfig() {
+  const core = Array.from(document.querySelectorAll('.skill-pack-option[data-skill-pack-core="true"]'))
+    .map((item) => item.getAttribute('data-skill-pack-id') || '')
+    .map((value) => value.trim())
+    .filter(Boolean);
   const selected = Array.from(document.querySelectorAll('.cfg-skill-pack-choice:checked'))
     .map((input) => input.value.trim())
     .filter(Boolean);
   const custom = document.getElementById('cfg-custom-skill-packs');
-  const ids = Array.from(new Set([...selected, ...parseSkillPackIds(custom ? custom.value : '')]));
+  const ids = Array.from(new Set([...core, ...selected, ...parseSkillPackIds(custom ? custom.value : '')]));
   const value = ids.join(', ');
   const hidden = document.getElementById('cfg-enabled-skill-packs');
   if (hidden) hidden.value = value;
@@ -9410,8 +9525,8 @@ function decisionItemHtml(a) {
       ${decisionDetailHtml(a)}
       ${meta ? `<div class="decision-meta">${escHtml(meta)}</div>` : ''}
       ${(canAllow || canRevoke) ? `<div class="control-actions">
-        ${canAllow ? `<button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','once')">Allow once</button><button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','always')">Always allow</button>` : ''}
-        ${canRevoke ? `<button class="mini-btn danger" onclick="revokeDecision('${escHtml(a.approval_id)}')">Revoke permission</button>` : ''}
+        ${canAllow ? `<button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','once',null,this)">Allow once</button><button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','always',null,this)">Always allow</button>` : ''}
+        ${canRevoke ? `<button class="mini-btn danger" onclick="revokeDecision('${escHtml(a.approval_id)}',this)">Revoke permission</button>` : ''}
       </div>` : ''}
     </div>`;
 }
@@ -9662,29 +9777,92 @@ function renderAttentionModal(data = {}) {
     : '<div class="empty"><strong>No attention items</strong>Nothing needs a decision right now.</div>';
 }
 
-async function revokePermission(kind, id) {
+function applyRevokedPermissionToDashboard(kind, id, payload = {}) {
+  const data = _lastDashboardData || {};
+  if (!id) return;
+  if (Array.isArray(data.permission_grants)) {
+    data.permission_grants.forEach(item => {
+      if (kind === 'grant' && item.grant_id === id) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_rules)) {
+    data.boundary_rules.forEach(item => {
+      if ((kind === 'boundary-rule' && item.rule_id === id) || (Array.isArray(payload.revoked_rule_ids) && payload.revoked_rule_ids.includes(item.rule_id))) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_permits)) {
+    data.boundary_permits.forEach(item => {
+      if ((kind === 'boundary-permit' && item.permit_id === id) || (Array.isArray(payload.revoked_permit_ids) && payload.revoked_permit_ids.includes(item.permit_id))) item.active = false;
+    });
+  }
+  renderPermissions(data);
+  renderDecisionHistory(data.approvals || []);
+  if (attentionModalIsOpen()) renderAttentionModal(data);
+}
+
+function applyRevokedDecisionToDashboard(approvalId, payload = {}) {
+  const data = _lastDashboardData || {};
+  const revokedGrantIds = new Set(payload.revoked_grant_ids || []);
+  const revokedRuleIds = new Set(payload.revoked_rule_ids || []);
+  const revokedPermitIds = new Set(payload.revoked_permit_ids || []);
+  if (Array.isArray(data.permission_grants)) {
+    data.permission_grants.forEach(item => {
+      if (item.approval_id === approvalId || revokedGrantIds.has(item.grant_id)) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_rules)) {
+    data.boundary_rules.forEach(item => {
+      if (revokedRuleIds.has(item.rule_id)) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_permits)) {
+    data.boundary_permits.forEach(item => {
+      if (item.approval_id === approvalId || revokedPermitIds.has(item.permit_id)) item.active = false;
+    });
+  }
+  if (Array.isArray(data.approvals)) {
+    data.approvals.forEach(item => {
+      if (item.approval_id !== approvalId) return;
+      item.active_grant_ids = [];
+      item.active_boundary_rule_ids = [];
+      item.active_boundary_permit_ids = [];
+    });
+  }
+  renderPermissions(data);
+  renderDecisionHistory(data.approvals || []);
+  if (attentionModalIsOpen()) renderAttentionModal(data);
+}
+
+async function revokePermission(kind, id, buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Revoking...');
   try {
     const r = await fetch(`/api/permissions/${kind}/${id}/revoke`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Revoke failed');
-    await refreshDashboard();
+    finishActionButton(buttonEl, 'Revoked');
+    applyRevokedPermissionToDashboard(kind, id, data);
   } catch (e) {
+    restoreButton();
     alert(`Revoke failed: ${e.message || e}`);
   }
 }
 
-async function revokeDecision(approvalId) {
+async function revokeDecision(approvalId, buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Revoking...');
   try {
     const r = await fetch(`/api/decisions/${approvalId}/revoke`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Revoke failed');
-    await refreshDashboard();
+    finishActionButton(buttonEl, 'Revoked');
+    applyRevokedDecisionToDashboard(approvalId, data);
   } catch (e) {
+    restoreButton();
     alert(`Revoke failed: ${e.message || e}`);
   }
 }
 
-async function allowDecision(approvalId, mode = 'once', expires = null) {
+async function allowDecision(approvalId, mode = 'once', expires = null, buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, mode === 'always' ? 'Allowing...' : 'Allowing...');
   try {
     const r = await fetch(`/api/decisions/${approvalId}/allow`, {
       method: 'POST',
@@ -9693,8 +9871,10 @@ async function allowDecision(approvalId, mode = 'once', expires = null) {
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Allow failed');
-    await refreshDashboard();
+    finishActionButton(buttonEl, 'Allowed');
+    scheduleDashboardRefresh(5000);
   } catch (e) {
+    restoreButton();
     alert(`Allow failed: ${e.message || e}`);
   }
 }
@@ -9800,7 +9980,7 @@ function renderPermissions(data) {
       <div class="control-meta">${escHtml(meta)}</div>
       ${(isRule || isPermit) ? targetCodeBlockHtml(item.selector, targetLabel, 'control-code-block') : ''}
       ${whenLabel ? `<div class="control-time">${escHtml(whenLabel)}</div>` : ''}
-      <div class="control-actions"><button class="mini-btn danger" onclick="revokePermission('${revokeKind}','${escHtml(id)}')">Revoke</button></div>
+      <div class="control-actions"><button class="mini-btn danger" onclick="revokePermission('${revokeKind}','${escHtml(id)}',this)">Revoke</button></div>
     </div>`;
   };
   renderDynamicList(el, items, permissionItemHtml, { key: 'permissions', title: `Permissions · ${items.length}` });
@@ -9827,7 +10007,7 @@ async function increaseMemoryLimits(btn) {
     icon: 'warn',
   });
   if (!ok) return;
-  if (btn) btn.disabled = true;
+  const restoreButton = setActionButtonLoading(btn, 'Increasing...');
   try {
     const r = await fetch('/api/memory/increase-limits', { method: 'POST' });
     const data = await r.json().catch(() => ({}));
@@ -9838,7 +10018,7 @@ async function increaseMemoryLimits(btn) {
   } catch (e) {
     alert(`Could not increase memory: ${e.message || e}`);
   } finally {
-    if (btn) btn.disabled = false;
+    restoreButton();
   }
 }
 
@@ -9850,7 +10030,7 @@ async function runSmartMemoryCleanup(btn) {
     icon: 'trash',
   });
   if (!ok) return;
-  if (btn) btn.disabled = true;
+  const restoreButton = setActionButtonLoading(btn, 'Cleaning...');
   try {
     const r = await fetch('/api/memory/smart-cleanup', { method: 'POST' });
     const data = await r.json().catch(() => ({}));
@@ -9860,7 +10040,7 @@ async function runSmartMemoryCleanup(btn) {
   } catch (e) {
     alert(`Cleanup failed: ${e.message || e}`);
   } finally {
-    if (btn) btn.disabled = false;
+    restoreButton();
   }
 }
 
@@ -10010,13 +10190,15 @@ function cardHasPendingAction(kind, id) {
 }
 
 function doctorActionButtonHtml(kind, id, action, label, title, className = 'mini-btn') {
-  const disabled = cardHasPendingAction(kind, id) ? ' disabled aria-busy="true"' : '';
-  return `<button class="${escAttr(className)}" title="${escAttr(title)}"${disabled} onclick="updateDoctorItem('${escAttr(kind)}','${escAttr(id)}','${escAttr(action)}')">${escHtml(label)}</button>`;
+  const pending = cardHasPendingAction(kind, id);
+  const disabled = pending ? ' disabled aria-busy="true"' : '';
+  return `<button class="${escAttr(className)}${pending ? ' is-loading' : ''}" title="${escAttr(title)}"${disabled} onclick="updateDoctorItem('${escAttr(kind)}','${escAttr(id)}','${escAttr(action)}')">${escHtml(pending ? 'Working...' : label)}</button>`;
 }
 
 function taskActionButtonHtml(kind, id, title) {
-  const disabled = pendingCardActions.has(pendingActionKey(`task:${kind}`, id, 'kill')) ? ' disabled aria-busy="true"' : '';
-  return `<button class="mini-btn danger" title="Stop this task and clear it from active work."${disabled} data-task-kind="${escAttr(kind)}" data-task-id="${escAttr(id)}" data-task-title="${escAttr(title)}" onclick="killTaskFromButton(this)">Kill</button>`;
+  const pending = pendingCardActions.has(pendingActionKey(`task:${kind}`, id, 'kill'));
+  const disabled = pending ? ' disabled aria-busy="true"' : '';
+  return `<button class="mini-btn danger${pending ? ' is-loading' : ''}" title="Stop this task and clear it from active work."${disabled} data-task-kind="${escAttr(kind)}" data-task-id="${escAttr(id)}" data-task-title="${escAttr(title)}" onclick="killTaskFromButton(this)">${pending ? 'Killing...' : 'Kill'}</button>`;
 }
 
 function askDoctorAboutItem(id) {
@@ -10089,8 +10271,8 @@ function doctorItemHtml(item) {
     doctorActionButtonHtml('doctor', id, actionName, labelText, 'Run this Doctor playbook action.', 'mini-btn good')
   ).join('');
   const actions = isEscalation
-    ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Mark reviewed', 'Mark this Sentinel item as reviewed.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Mark resolved', 'Close this Sentinel item after it has been handled.', 'mini-btn good')}`)
-    : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
+    ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Review details', 'Review this Sentinel item.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Close', 'Close this Sentinel item.', 'mini-btn good')}`)
+    : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Hide', 'Hide this Doctor item.')}`);
   return `<div class="control-card">
     <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
     <div class="doctor-body">
@@ -10132,8 +10314,8 @@ function renderDoctor(data) {
       doctorActionButtonHtml('doctor', id, actionName, labelText, 'Run this Doctor playbook action.', 'mini-btn good')
     ).join('');
     const actions = isEscalation
-      ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Mark reviewed', 'Mark this Sentinel item as reviewed.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Mark resolved', 'Close this Sentinel item after it has been handled.', 'mini-btn good')}`)
-      : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
+      ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Review details', 'Review this Sentinel item.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Close', 'Close this Sentinel item.', 'mini-btn good')}`)
+      : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Hide', 'Hide this Doctor item.')}`);
     return `<div class="control-card">
       <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
       <div class="doctor-body">
@@ -10221,7 +10403,7 @@ async function refreshDashboard() {
   if (dashboardRefreshPromise) return dashboardRefreshPromise;
   dashboardRefreshPromise = (async () => {
     try {
-    const data = await API('/api/status');
+    const data = await API('/api/status?full=1');
     _lastDashboardData = data;
     renderMission(data);
     renderApprovals(data.approvals || []);
@@ -10261,7 +10443,7 @@ function connectDashboardEvents() {
   dashboardEvents.onmessage = (event) => {
     let data = {};
     try { data = JSON.parse(event.data || '{}'); } catch (_) { data = {}; }
-    if (!data.type || data.type === 'status_changed' || data.type === 'connected') {
+    if (data.type === 'status_changed') {
       scheduleDashboardRefresh(0);
     }
   };
@@ -11496,6 +11678,13 @@ function applyMessagingStatus(cfg) {
 let settingsBaselineSnapshot = '';
 let settingsDirtyExplicit = false;
 let settingsSnapshotReady = false;
+let settingsSaveInProgress = false;
+let preferencesLoaded = false;
+let profileSettingsLoaded = false;
+let usersTabLoaded = false;
+let connectionsTabLoaded = false;
+let builderDoctorSummaryLoaded = false;
+let domainPolicyPreviewLoaded = false;
 
 function settingsStateSnapshot() {
   const overlay = document.getElementById('settings-overlay');
@@ -11531,6 +11720,12 @@ function markSettingsClean() {
   settingsSnapshotReady = true;
 }
 
+function markSettingsCleanAfterLazyLoad() {
+  if (document.getElementById('settings-overlay')?.style.display === 'flex' && !settingsDirtyExplicit && !settingsSaveInProgress) {
+    markSettingsClean();
+  }
+}
+
 function markSettingsDirty() {
   if (document.getElementById('settings-overlay')?.style.display === 'flex') {
     settingsDirtyExplicit = true;
@@ -11538,22 +11733,19 @@ function markSettingsDirty() {
 }
 
 function settingsHaveUnsavedChanges() {
-  if (settingsDirtyExplicit) return true;
-  if (!settingsSnapshotReady) return false;
-  return settingsStateSnapshot() !== settingsBaselineSnapshot;
+  return settingsDirtyExplicit;
 }
 
 async function refreshSettingsBaseline({force = false} = {}) {
+  const fb = document.getElementById('save-feedback');
+  if (!settingsDirtyExplicit && !settingsSaveInProgress && fb) { fb.textContent = 'Loading settings...'; fb.className = ''; }
   const loads = [
     loadConfig({skipSettingsApplyIfDirty: !force}),
-    loadBuilderDoctorSettingsSummary(),
-    loadPreferences(),
-    loadUsersTab(),
-    loadConnectionsTab(),
   ];
   await Promise.allSettled(loads);
   if (force || !settingsDirtyExplicit) markSettingsClean();
   else settingsSnapshotReady = true;
+  if (!settingsDirtyExplicit && !settingsSaveInProgress && fb && fb.textContent === 'Loading settings...') fb.textContent = '';
 }
 
 function openSettings() {
@@ -11561,10 +11753,13 @@ function openSettings() {
   overlay.style.display = 'flex';
   settingsSnapshotReady = false;
   settingsDirtyExplicit = false;
+  renderSkillPackOptions(DEFAULT_SKILL_PACK_CATALOG, '');
+  renderCapabilityDependencies([]);
   refreshSettingsBaseline();
 }
 
 async function closeSettings() {
+  if (settingsSaveInProgress) return;
   if (settingsHaveUnsavedChanges()) {
     const discard = await confirmAction({
       title: 'Discard unsaved settings?',
@@ -11594,6 +11789,14 @@ function showTab(name, btn) {
   document.getElementById('tab-' + name).classList.add('active');
   if (btn) btn.classList.add('active');
   if (name === 'builder' || name === 'doctor') loadBuilderDoctorSettingsSummary();
+  if (name === 'preferences') loadPreferences();
+  if (name === 'security') {
+    loadPreferences();
+    loadDomainPolicyPreview();
+  }
+  if (name === 'profile') loadProfileSettings();
+  if (name === 'users') loadUsersTab();
+  if (name === 'setup') loadConnectionsTab();
   if (name === 'logs') loadLogs();
 }
 
@@ -11689,22 +11892,21 @@ function applyDataRetentionConfig(value) {
 }
 
 async function loadBuilderDoctorSettingsSummary() {
+  if (builderDoctorSummaryLoaded) return;
   try {
-    const data = await API('/api/status');
-    const proposals = data.builder_proposals || [];
-    const skills = data.skills || [];
-    const doctorActions = data.doctor_actions || [];
-    const recommendations = data.doctor_recommendations || [];
-    const openProposals = proposals.filter(item => !['accepted', 'rejected', 'dismissed', 'completed', 'cancelled'].includes(String(item.status || '').toLowerCase()));
-    const openDoctorActions = doctorActions.filter(item => !['completed', 'cancelled', 'failed', 'dismissed', 'resolved'].includes(String(item.status || '').toLowerCase()));
-    const attention = Number(data.health && data.health.attention_needed || 0);
-    setTextIfPresent('builder-settings-proposals', proposals.length);
-    setTextIfPresent('builder-settings-skills', skills.length);
-    setTextIfPresent('builder-settings-open', openProposals.length);
-    setTextIfPresent('builder-settings-learned', skills.length);
-    setTextIfPresent('doctor-settings-actions', doctorActions.length);
-    setTextIfPresent('doctor-settings-recommendations', recommendations.length);
-    setTextIfPresent('doctor-settings-open', openDoctorActions.length);
+    const data = await API('/api/settings/summary');
+    builderDoctorSummaryLoaded = true;
+    const builder = data.builder || {};
+    const doctor = data.doctor || {};
+    const health = data.health || {};
+    const attention = Number(health.attention_needed || 0);
+    setTextIfPresent('builder-settings-proposals', Number(builder.proposals || 0));
+    setTextIfPresent('builder-settings-skills', Number(builder.skills || 0));
+    setTextIfPresent('builder-settings-open', Number(builder.open_proposals || 0));
+    setTextIfPresent('builder-settings-learned', Number(builder.skills || 0));
+    setTextIfPresent('doctor-settings-actions', Number(doctor.actions || 0));
+    setTextIfPresent('doctor-settings-recommendations', Number(doctor.recommendations || 0));
+    setTextIfPresent('doctor-settings-open', Number(doctor.open_actions || 0));
     setTextIfPresent('doctor-settings-attention', attention);
     const storage = data.storage || {};
     const status = String(storage.status || 'good').toLowerCase();
@@ -11719,7 +11921,8 @@ async function loadBuilderDoctorSettingsSummary() {
   } catch (e) { /* status panel is best-effort */ }
 }
 
-async function runDoctorDiagnose() {
+async function runDoctorDiagnose(buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Diagnosing...');
   try {
     const res = await fetch('/api/doctor/diagnose', { method: 'POST' });
     const data = await res.json().catch(() => ({}));
@@ -11738,10 +11941,13 @@ async function runDoctorDiagnose() {
     recordActivity('Doctor diagnose failed', message);
     const fb = document.getElementById('save-feedback');
     if (fb) { fb.textContent = message; fb.className = 'err'; }
+  } finally {
+    restoreButton();
   }
 }
 
-async function runDoctorCleanupNow() {
+async function runDoctorCleanupNow(buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Cleaning...');
   try {
     const payload = {
       data_retention_days: dataRetentionDaysPayloadValue(),
@@ -11783,14 +11989,21 @@ async function runDoctorCleanupNow() {
     recordActivity('Doctor cleanup failed', message);
     const fb = document.getElementById('save-feedback');
     if (fb) { fb.textContent = message; fb.className = 'err'; }
+  } finally {
+    restoreButton();
   }
 }
 
-async function enableDoctorAutoClean() {
+async function enableDoctorAutoClean(buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Enabling...');
   const toggle = document.getElementById('cfg-smart-cleanup-enabled');
-  if (toggle) toggle.checked = true;
-  await saveConfig();
-  await runDoctorCleanupNow();
+  try {
+    if (toggle) toggle.checked = true;
+    await saveConfig();
+    await runDoctorCleanupNow();
+  } finally {
+    restoreButton();
+  }
 }
 
 // Populated from loadConfig — tracks provider credential state
@@ -12519,7 +12732,7 @@ function updateBrowserSettingsVisibility() {
 
 async function loadConfig(options = {}) {
   try {
-    const cfg = await API('/api/config');
+    const cfg = await fetchConfig({force: options.force === true});
     renderHeaderConfig(cfg);
     if (options.skipSettingsApplyIfDirty && settingsDirtyExplicit) {
       return cfg;
@@ -12738,23 +12951,33 @@ async function loadConfig(options = {}) {
     // media refresh after defaults and setup availability are hydrated, or
     // model-backed helper suggestions may not appear until the next click.
     refreshMediaHelperOptionsFromInventory();
-    // Load profile separately
-    window.__nullionProfileLoaded = false;
-    try {
-      const p = await API('/api/profile');
-      document.getElementById('cfg-profile-name').value    = p.name    || '';
-      document.getElementById('cfg-profile-email').value   = p.email   || '';
-      document.getElementById('cfg-profile-phone').value   = p.phone   || '';
-      document.getElementById('cfg-profile-address').value = p.address || '';
-      document.getElementById('cfg-profile-notes').value   = p.notes   || '';
-      window.__nullionProfileLoaded = true;
-    } catch(e) { /* silent */ }
   } catch (e) { /* silent */ }
+}
+
+async function loadProfileSettings(options = {}) {
+  if (profileSettingsLoaded) return;
+  if (options.skipSettingsApplyIfDirty && settingsDirtyExplicit) return;
+  try {
+    const p = await API('/api/profile');
+    if (settingsDirtyExplicit) {
+      window.__nullionProfileLoaded = true;
+      profileSettingsLoaded = true;
+      return;
+    }
+    document.getElementById('cfg-profile-name').value    = p.name    || '';
+    document.getElementById('cfg-profile-email').value   = p.email   || '';
+    document.getElementById('cfg-profile-phone').value   = p.phone   || '';
+    document.getElementById('cfg-profile-address').value = p.address || '';
+    document.getElementById('cfg-profile-notes').value   = p.notes   || '';
+    window.__nullionProfileLoaded = true;
+    profileSettingsLoaded = true;
+    markSettingsCleanAfterLazyLoad();
+  } catch(e) { /* silent */ }
 }
 
 async function loadHeaderConfig() {
   try {
-    renderHeaderConfig(await API('/api/config'));
+    renderHeaderConfig(await fetchHeaderConfig());
   } catch (e) { /* silent */ }
 }
 
@@ -13055,6 +13278,7 @@ async function launchAgentBrowser() {
       icon: 'warn',
     });
   } finally {
+    if (btn) btn.disabled = false;
     await loadHeaderConfig();
   }
 }
@@ -13239,15 +13463,18 @@ function loadMoreDomainPolicyList(mode) {
   renderDomainPolicyList(mode === 'allow' ? 'pref-domain-allow-list' : 'pref-domain-block-list', domainPolicyStatusCache, mode);
 }
 
-async function loadDomainPolicyPreview() {
+async function loadDomainPolicyPreview({force = false} = {}) {
+  if (domainPolicyPreviewLoaded && !force) return;
   try {
-    const data = await API('/api/status');
+    const data = await API('/api/status?full=1');
+    domainPolicyPreviewLoaded = true;
     domainPolicyStatusCache = {
       boundary_rules: data.boundary_rules || [],
       boundary_permits: data.boundary_permits || [],
     };
     renderDomainPolicyList('pref-domain-allow-list', domainPolicyStatusCache, 'allow');
     renderDomainPolicyList('pref-domain-block-list', domainPolicyStatusCache, 'deny');
+    markSettingsCleanAfterLazyLoad();
   } catch (_) {}
 }
 
@@ -13261,7 +13488,7 @@ async function addDomainPolicy(mode, selector) {
   });
   const data = await res.json();
   if (!res.ok || data.ok === false) throw new Error(data.error || 'Could not add domain');
-  await loadDomainPolicyPreview();
+  await loadDomainPolicyPreview({force: true});
 }
 
 async function revokeDomainPolicy(ruleId, permissionKind = 'boundary-rule') {
@@ -13270,7 +13497,7 @@ async function revokeDomainPolicy(ruleId, permissionKind = 'boundary-rule') {
   const res = await fetch(`/api/permissions/${encodeURIComponent(kind)}/${encodeURIComponent(ruleId)}/revoke`, {method:'POST'});
   const data = await res.json();
   if (!res.ok || data.ok === false) throw new Error(data.error || 'Could not remove domain');
-  await loadDomainPolicyPreview();
+  await loadDomainPolicyPreview({force: true});
 }
 
 document.querySelectorAll('.domain-add-form').forEach(form => {
@@ -13280,14 +13507,14 @@ document.querySelectorAll('.domain-add-form').forEach(form => {
     const button = form.querySelector('.domain-add-btn');
     const mode = form.dataset.mode || 'allow';
     if (!input || !button) return;
-    button.disabled = true;
+    const restoreButton = setActionButtonLoading(button, 'Adding...');
     try {
       await addDomainPolicy(mode, input.value);
       input.value = '';
     } catch (err) {
       alert(`Domain update failed: ${err.message || err}`);
     } finally {
-      button.disabled = false;
+      restoreButton();
     }
   });
 });
@@ -13296,11 +13523,11 @@ document.querySelectorAll('.domain-chip-list').forEach(list => {
   list.addEventListener('click', async e => {
     const button = e.target.closest('.domain-remove-btn');
     if (!button) return;
-    button.disabled = true;
+    const restoreButton = setActionButtonLoading(button, 'Removing...');
     try {
       await revokeDomainPolicy(button.dataset.ruleId || '', button.dataset.permissionKind || 'boundary-rule');
     } catch (err) {
-      button.disabled = false;
+      restoreButton();
       alert(`Domain update failed: ${err.message || err}`);
     }
   });
@@ -13315,8 +13542,14 @@ document.querySelectorAll('.domain-search-input').forEach(input => {
 });
 
 async function loadPreferences() {
+  if (preferencesLoaded) return;
   try {
     const p = await API('/api/preferences');
+    if (settingsDirtyExplicit) {
+      preferencesLoaded = true;
+      return;
+    }
+    preferencesLoaded = true;
     const browserTimezone = (() => {
       try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; }
       catch (_) { return ''; }
@@ -13341,8 +13574,8 @@ async function loadPreferences() {
     document.getElementById('pref-timezone').value    = p.timezone || p.system_timezone || browserTimezone || 'UTC';
     document.getElementById('pref-dateformat').value  = p.date_format || 'YYYY-MM-DD';
     document.getElementById('pref-timeformat').value  = p.time_format || '12h';
+    markSettingsCleanAfterLazyLoad();
   } catch(e) { /* silent */ }
-  await loadDomainPolicyPreview();
 }
 
 async function savePreferences() {
@@ -13813,14 +14046,17 @@ function updateNewUserChannelFields() {
 }
 
 async function loadUsersTab() {
+  if (usersTabLoaded) return;
   try {
     const data = await API('/api/users');
+    usersTabLoaded = true;
     usersRegistry = {
       multi_user_enabled: !!data.multi_user_enabled,
       users: Array.isArray(data.users) ? data.users : [],
     };
     updateNewUserChannelFields();
     renderUsersTab();
+    markSettingsCleanAfterLazyLoad();
   } catch (e) {
     const list = document.getElementById('users-list');
     if (list) list.innerHTML = `<div class="empty"><strong>Could not load users</strong>${escHtml(e.message || e)}</div>`;
@@ -13828,12 +14064,15 @@ async function loadUsersTab() {
 }
 
 async function loadConnectionsTab() {
+  if (connectionsTabLoaded) return;
   try {
     const data = await API('/api/connections');
+    connectionsTabLoaded = true;
     connectionRegistry = {
       connections: Array.isArray(data.connections) ? data.connections : [],
     };
     renderConnectionsTab();
+    markSettingsCleanAfterLazyLoad();
   } catch (_) {
     connectionRegistry = { connections: [] };
     renderConnectionsTab();
@@ -14184,6 +14423,12 @@ async function saveConnections() {
   renderConnectionsTab();
 }
 
+async function ensureSettingsStoresLoadedForSave() {
+  // Saving must never pull lazy stores into the hot path after the user has
+  // started editing; late loads can overwrite the values they just typed.
+  await Promise.resolve();
+}
+
 async function checkForUpdates() {
   try {
     const v = await API('/api/version');
@@ -14197,7 +14442,19 @@ async function checkForUpdates() {
 
 async function saveConfig() {
   const fb = document.getElementById('save-feedback');
-  fb.textContent = 'Saving…'; fb.className = '';
+  const saveBtn = document.getElementById('settings-save-btn');
+  const cancelBtn = document.getElementById('settings-cancel-btn');
+  if (settingsSaveInProgress) return;
+  settingsSaveInProgress = true;
+  const previousSaveText = saveBtn ? saveBtn.textContent : '';
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+  }
+  if (cancelBtn) cancelBtn.disabled = true;
+  fb.textContent = 'Saving settings...'; fb.className = '';
+
+  await ensureSettingsStoresLoadedForSave();
 
   const tgToken = document.getElementById('cfg-tg-token').value;
   const slackBotToken = document.getElementById('cfg-slack-bot-token').value;
@@ -14294,9 +14551,9 @@ async function saveConfig() {
   if (payload.search_provider === 'perplexity_search_provider' && perplexitySearchKey && !perplexitySearchKey.startsWith('•')) payload.perplexity_search_key = perplexitySearchKey;
 
   // Save preferences (run in parallel with config save; surface errors)
-  const prefsSave = savePreferences().catch(e => { throw new Error('Prefs: ' + e.message); });
-  const usersSave = saveUsers().catch(e => { throw new Error('Users: ' + e.message); });
-  const connectionsSave = saveConnections().catch(e => { throw new Error('Connections: ' + e.message); });
+  const prefsSave = preferencesLoaded ? savePreferences().catch(e => { throw new Error('Prefs: ' + e.message); }) : Promise.resolve();
+  const usersSave = usersTabLoaded ? saveUsers().catch(e => { throw new Error('Users: ' + e.message); }) : Promise.resolve();
+  const connectionsSave = connectionsTabLoaded ? saveConnections().catch(e => { throw new Error('Connections: ' + e.message); }) : Promise.resolve();
 
   // Save profile
   const profilePayload = {
@@ -14307,7 +14564,15 @@ async function saveConfig() {
     notes:   document.getElementById('cfg-profile-notes').value.trim(),
     _allow_clear: window.__nullionProfileLoaded === true,
   };
-  fetch('/api/profile', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(profilePayload) });
+  const profileSave = fetch('/api/profile', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(profilePayload),
+  }).then(async res => {
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) throw new Error(data.error || 'Profile save failed');
+    return data;
+  });
 
   try {
     const [res] = await Promise.all([
@@ -14319,17 +14584,29 @@ async function saveConfig() {
       prefsSave,
       usersSave,
       connectionsSave,
+      profileSave,
     ]);
     const data = await res.json();
     if (data.ok) {
+      _lastConfigPayload = null;
+      _lastHeaderConfigPayload = null;
       fb.textContent = '✓ Saved'; fb.className = 'ok';
-      setTimeout(() => { fb.textContent = ''; }, 3000);
+      setTimeout(() => {
+        if (fb.textContent === '✓ Saved') fb.textContent = '';
+      }, 8000);
       await refreshSettingsBaseline({force: true}); // refresh to show updated status and reset unsaved-change warning
     } else {
       fb.textContent = '✗ ' + (data.error || 'Save failed'); fb.className = 'err';
     }
   } catch (e) {
     fb.textContent = '✗ ' + (e.message || 'Save failed'); fb.className = 'err';
+  } finally {
+    settingsSaveInProgress = false;
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = previousSaveText || 'Save changes';
+    }
+    if (cancelBtn) cancelBtn.disabled = false;
   }
 }
 
@@ -15230,8 +15507,31 @@ let _ahChannel = null;
 let _ahCalYear  = null;
 let _ahCalMonth = null;
 let _ahCalDays  = {};
+let _ahRequestSeq = 0;
+let _ahMessageRequestSeq = 0;
+const _ahChannelsCache = [];
+const _ahCalendarCache = new Map();
+const _ahConversationCache = new Map();
+const _ahMessageCache = new Map();
 const _MONTH_NAMES = ['January','February','March','April','May','June',
   'July','August','September','October','November','December'];
+
+function _ahCacheKey(...parts) {
+  return parts.map(p => String(p || '')).join('|');
+}
+
+function _ahLoading(text = 'Loading...') {
+  return '<div class="ah-loading">' + escHtml(text) + '</div>';
+}
+
+function _ahCalendarSkeleton() {
+  return '<div class="ahcal-skeleton">' + '<span></span>'.repeat(35) + '</div>';
+}
+
+function _ahSetCalendarLoading(isLoading) {
+  const grid = document.getElementById('allhist-cal-grid');
+  if (grid) grid.classList.toggle('ahcal-grid-loading', Boolean(isLoading));
+}
 
 function _localDateKey(date) {
   const d = date instanceof Date ? date : new Date(date);
@@ -15244,6 +15544,7 @@ function openAllHistory() {
   const now = new Date();
   _ahCalYear  = now.getFullYear();
   _ahCalMonth = now.getMonth();
+  if (_ahChannelsCache.length) _paintAhChannels(_ahChannelsCache);
   _loadAhChannels();
 }
 
@@ -15253,10 +15554,20 @@ function closeAllHistory() {
 
 async function _loadAhChannels() {
   const list = document.getElementById('allhist-chan-list');
-  list.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">Loading\u2026</div>';
+  if (!_ahChannelsCache.length) list.innerHTML = _ahLoading('Loading channels...');
   try {
     const data = await fetch('/api/history/channels').then(r => r.json());
     const channels = data.channels || [];
+    _ahChannelsCache.splice(0, _ahChannelsCache.length, ...channels);
+    _paintAhChannels(channels);
+  } catch (e) {
+    list.innerHTML = '<div style="padding:12px 14px;color:#ef4444;font-size:12px">Failed to load.</div>';
+  }
+}
+
+function _paintAhChannels(channels) {
+  const list = document.getElementById('allhist-chan-list');
+  if (!list) return;
     if (!channels.length) {
       list.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">No history yet.</div>';
       return;
@@ -15270,6 +15581,7 @@ async function _loadAhChannels() {
         ? new Date(ch.last_message_at).toLocaleDateString(undefined, {month:'short', day:'numeric'})
         : '';
       const icon = ch.channel === 'web' ? '\uD83C\uDF10'
+                 : ch.channel === 'api' ? 'API'
                  : ch.channel.startsWith('telegram:') ? '\u2708\uFE0F'
                  : ch.channel.startsWith('slack:') ? '\uD83D\uDCAC'
                  : ch.channel.startsWith('discord:') ? '\uD83C\uDFAE'
@@ -15284,35 +15596,53 @@ async function _loadAhChannels() {
     if (!_ahChannel && channels.length) {
       _selectAhChannel(channels[0].channel, channels[0].channel_label);
     }
-  } catch (e) {
-    list.innerHTML = '<div style="padding:12px 14px;color:#ef4444;font-size:12px">Failed to load.</div>';
-  }
 }
 
 function _selectAhChannel(channel, label) {
   _ahChannel = channel;
+  const requestSeq = ++_ahRequestSeq;
   document.querySelectorAll('.ahchan-item').forEach(el =>
     el.classList.toggle('active', el.dataset.channel === channel));
+  const activeChannel = document.querySelector('.ahchan-item.active');
+  if (activeChannel) activeChannel.classList.add('loading');
   document.getElementById('allhist-right-title').textContent = label || channel;
-  document.getElementById('allhist-conv-list').innerHTML = '';
+  document.getElementById('allhist-conv-list').innerHTML = _ahLoading('Loading calendar...');
   document.getElementById('allhist-messages').innerHTML =
     '<div id="allhist-empty">Pick a day on the calendar to see conversations.</div>';
-  _renderAhCalendar();
+  _renderAhCalendar(requestSeq);
 }
 
-async function _renderAhCalendar() {
+async function _renderAhCalendar(requestSeq = ++_ahRequestSeq) {
   const ym = _ahCalYear + '-' + String(_ahCalMonth + 1).padStart(2, '0');
   document.getElementById('allhist-cal-month').textContent =
     _MONTH_NAMES[_ahCalMonth] + ' ' + _ahCalYear;
   _ahCalDays = {};
   if (_ahChannel) {
+    const cacheKey = _ahCacheKey(_ahChannel, ym);
+    const cached = _ahCalendarCache.get(cacheKey);
+    if (cached) {
+      _ahCalDays = cached;
+      _ahSetCalendarLoading(false);
+      _paintAhCalendar(ym);
+      document.getElementById('allhist-conv-list').innerHTML = '';
+      document.querySelectorAll('.ahchan-item.loading').forEach(el => el.classList.remove('loading'));
+      return;
+    }
+    _ahSetCalendarLoading(true);
+    document.getElementById('allhist-cal-days').innerHTML = _ahCalendarSkeleton();
     try {
       const data = await fetch(
         '/api/history/calendar/' + encodeURIComponent(_ahChannel) + '?month=' + ym
       ).then(r => r.json());
+      if (requestSeq !== _ahRequestSeq) return;
       _ahCalDays = data.days || {};
+      _ahCalendarCache.set(cacheKey, _ahCalDays);
     } catch (_) {}
   }
+  if (requestSeq !== _ahRequestSeq) return;
+  _ahSetCalendarLoading(false);
+  document.querySelectorAll('.ahchan-item.loading').forEach(el => el.classList.remove('loading'));
+  document.getElementById('allhist-conv-list').innerHTML = '';
   _paintAhCalendar(ym);
 }
 
@@ -15341,13 +15671,18 @@ function _paintAhCalendar(ym) {
 }
 
 function ahCalMove(delta) {
+  const requestSeq = ++_ahRequestSeq;
   _ahCalMonth += delta;
   if (_ahCalMonth < 0)  { _ahCalMonth = 11; _ahCalYear--; }
   if (_ahCalMonth > 11) { _ahCalMonth = 0;  _ahCalYear++; }
-  _renderAhCalendar();
+  document.getElementById('allhist-conv-list').innerHTML = _ahLoading('Loading calendar...');
+  document.getElementById('allhist-messages').innerHTML =
+    '<div id="allhist-empty">Pick a day on the calendar to see conversations.</div>';
+  _renderAhCalendar(requestSeq);
 }
 
 async function _selectAhDate(dateStr) {
+  const requestSeq = ++_ahRequestSeq;
   document.querySelectorAll('.ahcal-day.selected').forEach(el => el.classList.remove('selected'));
   document.querySelectorAll('#allhist-cal-days .ahcal-day').forEach(el => {
     if (!el.classList.contains('other-month')) {
@@ -15358,12 +15693,18 @@ async function _selectAhDate(dateStr) {
   });
   const convList = document.getElementById('allhist-conv-list');
   const msgPane  = document.getElementById('allhist-messages');
-  convList.innerHTML = '<div style="padding:10px 18px;color:var(--muted);font-size:12px">Loading\u2026</div>';
-  msgPane.innerHTML  = '';
+  convList.innerHTML = _ahLoading('Loading conversations...');
+  msgPane.innerHTML  = _ahLoading('Loading messages...');
   try {
-    const data = await fetch(
-      '/api/history/conversations/' + encodeURIComponent(_ahChannel) + '/' + dateStr
-    ).then(r => r.json());
+    const cacheKey = _ahCacheKey(_ahChannel, dateStr);
+    let data = _ahConversationCache.get(cacheKey);
+    if (!data) {
+      data = await fetch(
+        '/api/history/conversations/' + encodeURIComponent(_ahChannel) + '/' + dateStr
+      ).then(r => r.json());
+      _ahConversationCache.set(cacheKey, data);
+    }
+    if (requestSeq !== _ahRequestSeq) return;
     const convs = data.conversations || [];
     const totalMessages = convs.reduce((sum, c) => sum + (Number(c.message_count) || 0), 0);
     if (!convs.length) {
@@ -15414,6 +15755,11 @@ async function deleteAhDate(dateStr, btn) {
     );
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Delete failed');
+    _ahCalendarCache.delete(_ahCacheKey(_ahChannel, _ahCalYear + '-' + String(_ahCalMonth + 1).padStart(2, '0')));
+    _ahConversationCache.delete(_ahCacheKey(_ahChannel, dateStr));
+    for (const key of Array.from(_ahMessageCache.keys())) {
+      if (key.endsWith('|' + dateStr)) _ahMessageCache.delete(key);
+    }
     document.getElementById('allhist-conv-list').innerHTML =
       '<div style="padding:10px 18px;color:var(--muted);font-size:12px">Deleted ' +
       (data.deleted || 0) + ' conversation' + (data.deleted === 1 ? '' : 's') + ' for ' + escHtml(dateStr) + '.</div>';
@@ -15429,14 +15775,22 @@ async function deleteAhDate(dateStr, btn) {
 }
 
 async function _loadAhMessages(convId, rowEl, dateStr = '') {
+  const requestSeq = ++_ahMessageRequestSeq;
   document.querySelectorAll('.ahconv-row').forEach(r => r.classList.remove('active'));
-  if (rowEl) rowEl.classList.add('active');
+  if (rowEl) rowEl.classList.add('active', 'loading');
   const msgPane = document.getElementById('allhist-messages');
-  msgPane.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:14px">Loading\u2026</div>';
+  msgPane.innerHTML = _ahLoading('Loading messages...');
   try {
     const url = '/api/chat/history/' + encodeURIComponent(convId)
       + (dateStr ? '?date=' + encodeURIComponent(dateStr) : '');
-    const data = await fetch(url).then(r => r.json());
+    const cacheKey = _ahCacheKey(convId, dateStr);
+    let data = _ahMessageCache.get(cacheKey);
+    if (!data) {
+      data = await fetch(url).then(r => r.json());
+      _ahMessageCache.set(cacheKey, data);
+    }
+    if (requestSeq !== _ahMessageRequestSeq) return;
+    if (rowEl) rowEl.classList.remove('loading');
     const msgs = data.messages || [];
     if (!msgs.length) {
       msgPane.innerHTML = '<div id="allhist-empty">No messages found.</div>';
@@ -15459,6 +15813,7 @@ async function _loadAhMessages(convId, rowEl, dateStr = '') {
     });
     msgPane.scrollTop = msgPane.scrollHeight;
   } catch (e) {
+    if (rowEl) rowEl.classList.remove('loading');
     msgPane.innerHTML = '<div style="color:#ef4444;font-size:12px;padding:14px">Failed.</div>';
   }
 }
@@ -15558,10 +15913,10 @@ function renderCronsTab(jobs) {
         <div class="cron-meta cron-task">${escHtml(j.task.slice(0, 120))}${j.task.length > 120 ? '…' : ''}</div>
       </div>
       <label class="cron-toggle" title="${j.enabled ? 'Enabled — click to disable' : 'Disabled — click to enable'}">
-        <input type="checkbox" ${j.enabled ? 'checked' : ''} onchange="toggleCronItem('${j.id}', this.checked)">
+        <input type="checkbox" ${j.enabled ? 'checked' : ''} onchange="toggleCronItem('${j.id}', this.checked, this)">
         <span class="cron-slider"></span>
       </label>
-      <button class="cron-del" title="Delete cron" onclick="deleteCronItem('${j.id}')">✕</button>
+      <button class="cron-del" title="Delete cron" onclick="deleteCronItem('${j.id}', this)">✕</button>
     </div>
   `).join('');
 }
@@ -15592,7 +15947,8 @@ function renderCronsDash(jobs) {
   `, { key: 'scheduled', title: `Scheduled tasks · ${jobs.length}`, className: 'control-list' });
 }
 
-async function toggleCronItem(id, enabled) {
+async function toggleCronItem(id, enabled, inputEl = null) {
+  if (inputEl) inputEl.disabled = true;
   try {
     const r = await fetch('/api/crons/' + id, {
       method: 'PATCH',
@@ -15600,12 +15956,18 @@ async function toggleCronItem(id, enabled) {
       body: JSON.stringify({enabled}),
     });
     const d = await r.json();
-    if (!d.ok) { alert('Toggle failed: ' + (d.error || 'unknown error')); return; }
+    if (!d.ok) { throw new Error(d.error || 'unknown error'); }
     await loadCronsTab();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) {
+    if (inputEl) {
+      inputEl.checked = !enabled;
+      inputEl.disabled = false;
+    }
+    alert('Toggle failed: ' + e.message);
+  }
 }
 
-async function deleteCronItem(id) {
+async function deleteCronItem(id, buttonEl = null) {
   const ok = await confirmAction({
     title: 'Delete this cron?',
     message: 'The scheduled task will stop running.',
@@ -15613,12 +15975,16 @@ async function deleteCronItem(id) {
     icon: 'trash',
   });
   if (!ok) return;
+  const restoreButton = setActionButtonLoading(buttonEl, 'Deleting...');
   try {
     const r = await fetch('/api/crons/' + id, { method: 'DELETE' });
     const d = await r.json();
-    if (!d.ok) { alert('Delete failed: ' + (d.error || 'unknown error')); return; }
+    if (!d.ok) { throw new Error(d.error || 'unknown error'); }
     await loadCronsTab();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) {
+    restoreButton();
+    alert('Delete failed: ' + e.message);
+  }
 }
 
 function showCronForm() {
@@ -15660,6 +16026,8 @@ async function submitCronForm() {
     errEl.style.display = 'block';
     return;
   }
+  const saveBtn = document.querySelector('#cron-form .btn-sm:not(.btn-ghost)');
+  const restoreButton = setActionButtonLoading(saveBtn, 'Saving...');
   try {
     const r = await fetch('/api/crons', {
       method: 'POST',
@@ -15678,11 +16046,13 @@ async function submitCronForm() {
     if (!d.ok) {
       errEl.textContent = d.error || 'Failed to create cron.';
       errEl.style.display = 'block';
+      restoreButton();
       return;
     }
     hideCronForm();
     await loadCronsTab();
   } catch(e) {
+    restoreButton();
     errEl.textContent = 'Error: ' + e.message;
     errEl.style.display = 'block';
   }
@@ -15692,15 +16062,17 @@ async function submitCronForm() {
 setInterval(() => fetch('/api/crons').then(r => r.json()).then(renderCronsDash).catch(()=>{}), 120000);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+addDefaultBotGreeting();
 connect();
-refreshDashboard();
-connectDashboardEvents();
 loadHeaderConfig();
-setInterval(refreshDashboard, 30000);
+setTimeout(_restoreConversation, 50);
+setTimeout(() => {
+  refreshDashboard();
+  connectDashboardEvents();
+}, 1000);
+setInterval(refreshDashboard, 120000);
 setInterval(updateElapsedCounters, 1000);
-checkForUpdates();
-loadCronsTab();
-_restoreConversation();
+setTimeout(checkForUpdates, 1200);
 </script>
 </body>
 </html>
@@ -18525,32 +18897,10 @@ def create_app(runtime, orchestrator, registry):
         return None
 
     def _status_cache_fingerprint() -> str | None:
+        # Keep cache validation cheap. Mutating API routes explicitly invalidate
+        # this cache, so a full memory scan here only makes every status poll slow.
         checkpoint_fingerprint = getattr(runtime, "last_checkpoint_fingerprint", None)
-        try:
-            owner = memory_owner_for_web_admin()
-            memory_signature = [
-                (
-                    entry.entry_id,
-                    str(getattr(entry, "kind", "")),
-                    entry.updated_at.isoformat() if getattr(entry, "updated_at", None) else "",
-                    int(getattr(entry, "use_count", 0) or 0),
-                    float(getattr(entry, "use_score", 0.0) or 0.0),
-                )
-                for entry in memory_entries_for_owner(runtime.store, owner)
-            ]
-        except Exception:
-            memory_signature = []
-        try:
-            return json.dumps(
-                {
-                    "checkpoint": checkpoint_fingerprint,
-                    "dashboard_memory": sorted(memory_signature),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        except Exception:
-            return checkpoint_fingerprint
+        return str(checkpoint_fingerprint or "")
 
     @app.middleware("http")
     async def _invalidate_status_cache_after_api_mutation(request: Request, call_next):
@@ -18563,8 +18913,97 @@ def create_app(runtime, orchestrator, registry):
             _invalidate_status_cache()
         return response
 
+    def _lite_status_payload() -> dict[str, object]:
+        try:
+            from nullion.runtime import build_runtime_status_snapshot
+
+            snapshot = build_runtime_status_snapshot(runtime.store)
+            counts = snapshot.get("counts", {})
+        except Exception:
+            counts = {}
+        return {
+            "approvals": [],
+            "permission_grants": [],
+            "boundary_rules": [],
+            "boundary_permits": [],
+            "builder_proposals": [],
+            "builder_route_observations": [],
+            "latency_timings": [],
+            "latency_breakdowns": [],
+            "doctor_actions": [],
+            "doctor_recommendations": [],
+            "sentinel_escalations": [],
+            "task_frames": [],
+            "mini_agent_tasks": [],
+            "skills": [],
+            "memory": [],
+            "health": {"attention_needed": 0, "counts": counts},
+            "storage": {},
+            "tool_count": 0,
+            "status_meta": {"lite": True, "cache_ttl_s": _status_cache_ttl_s(), "limits": {}, "truncated": {}},
+        }
+
+    def _settings_summary_payload() -> dict[str, object]:
+        store = runtime.store
+        builder_records = list(getattr(store, "builder_proposals", {}).values())
+        builder_open = [
+            record
+            for record in builder_records
+            if str(getattr(record, "status", "") or "").lower() in {"pending", "warning", "needs_attention"}
+        ]
+        skills = getattr(store, "skills", {})
+        doctor_actions = list(getattr(store, "list_doctor_actions", lambda: [])())
+        doctor_recommendations = list(getattr(store, "list_doctor_recommendations", lambda: [])())
+        open_doctor_actions = [
+            action
+            for action in doctor_actions
+            if str(action.get("status", "") if isinstance(action, dict) else getattr(action, "status", "")).lower()
+            not in {"completed", "cancelled", "failed", "dismissed", "resolved"}
+        ]
+        try:
+            from nullion.runtime import build_runtime_status_snapshot
+
+            counts = build_runtime_status_snapshot(store).get("counts", {})
+        except Exception:
+            counts = {}
+        attention = (
+            int(counts.get("pending_approval_requests", 0) or 0)
+            + int(counts.get("pending_doctor_actions", 0) or 0)
+            + int(counts.get("open_sentinel_escalations", 0) or 0)
+        )
+        attention += sum(
+            1
+            for record in builder_records
+            if str(getattr(record, "status", "") or "").lower() == "pending"
+            and str(getattr(getattr(record, "proposal", None), "approval_mode", "") or "").lower() == "dependency"
+        )
+        storage = _storage_status_payload(runtime)
+        if storage.get("needs_cleanup") and not storage.get("auto_cleanup_enabled"):
+            attention += 1
+        return {
+            "builder": {
+                "proposals": len(builder_records),
+                "open_proposals": len(builder_open),
+                "skills": len(skills) if isinstance(skills, dict) else 0,
+            },
+            "doctor": {
+                "actions": len(doctor_actions),
+                "open_actions": len(open_doctor_actions),
+                "recommendations": len(doctor_recommendations),
+            },
+            "health": {"attention_needed": attention, "counts": counts},
+            "storage": storage,
+        }
+
+    @app.get("/api/settings/summary")
+    async def settings_summary():
+        return JSONResponse(_settings_summary_payload(), headers={"X-Nullion-Status-Cache": "settings-summary"})
+
     @app.get("/api/status")
-    async def status():
+    async def status(request: Request):
+        full = str(request.query_params.get("full") or "").strip().lower() in {"1", "true", "yes", "full"}
+        if not full:
+            return JSONResponse(_lite_status_payload(), headers={"X-Nullion-Status-Cache": "lite"})
         nonlocal status_cache_payload, status_cache_created_at
         cache_ttl_s = _status_cache_ttl_s()
         async with status_cache_lock:
@@ -18907,24 +19346,27 @@ def create_app(runtime, orchestrator, registry):
             })
         builder_route_observations = []
         try:
-            builder_route_observations = store.list_builder_route_observations()[:_status_limit("builder_route_observations", 100)]
+            builder_route_observations = store.list_builder_route_observations()[:_status_limit("builder_route_observations", 25)]
         except Exception:
             logger.debug("web status: failed to list Builder route observations", exc_info=True)
         latency_events: list[dict[str, object]] = []
         latency_timings = []
+        latency_timing_limit = _status_limit("latency_timings", 25)
+        latency_breakdown_limit = _status_limit("latency_breakdowns", 5)
         try:
-            latency_events = [
-                dict(event)
-                for event in store.list_conversation_events()
-                if isinstance(event, dict)
-                and str(event.get("event_type") or "") in {
-                    "conversation.model_timing",
-                    "conversation.latency_timing",
-                    "conversation.tool_timing",
-                }
-            ]
+            timing_event_limit = max(25, latency_timing_limit, latency_breakdown_limit * 8)
+            for event_type in (
+                "conversation.latency_timing",
+                "conversation.model_timing",
+                "conversation.tool_timing",
+            ):
+                latency_events.extend(
+                    dict(event)
+                    for event in store.list_recent_conversation_events(event_type=event_type, limit=timing_event_limit)
+                    if isinstance(event, dict)
+                )
             latency_events.sort(key=lambda event: str(event.get("created_at") or ""), reverse=True)
-            latency_timings = latency_events[:_status_limit("latency_timings", 100)]
+            latency_timings = latency_events[:latency_timing_limit]
         except Exception:
             logger.debug("web status: failed to list latency timing events", exc_info=True)
         memory_pressure = None
@@ -19043,7 +19485,7 @@ def create_app(runtime, orchestrator, registry):
             "latency_timings": latency_timings,
             "latency_breakdowns": _build_latency_breakdowns(
                 latency_events,
-                limit=_status_limit("latency_breakdowns", 50),
+                limit=latency_breakdown_limit,
             ),
             "doctor_actions": doctor_actions,
             "doctor_recommendations": doctor_recommendations,
@@ -19062,11 +19504,11 @@ def create_app(runtime, orchestrator, registry):
             "boundary_rules": _status_limit("boundary_rules", 500),
             "boundary_permits": _status_limit("boundary_permits", 500),
             "builder_proposals": _status_limit("builder_proposals", 250),
-            "builder_route_observations": _status_limit("builder_route_observations", 100),
-            "latency_timings": _status_limit("latency_timings", 100),
-            "latency_breakdowns": _status_limit("latency_breakdowns", 50),
+            "builder_route_observations": _status_limit("builder_route_observations", 25),
+            "latency_timings": latency_timing_limit,
+            "latency_breakdowns": latency_breakdown_limit,
             "doctor_actions": _status_limit("doctor_actions", 250),
-            "doctor_recommendations": _status_limit("doctor_recommendations", 250),
+            "doctor_recommendations": _status_limit("doctor_recommendations", 50),
             "sentinel_escalations": _status_limit("sentinel_escalations", 250),
             "task_frames": _status_limit("task_frames", 500),
             "mini_agent_tasks": _status_limit("mini_agent_tasks", 500),
@@ -19198,7 +19640,7 @@ def create_app(runtime, orchestrator, registry):
             if permission_kind == "grant":
                 runtime.revoke_permission_grant(permission_id, actor="operator", reason="Revoked from web UI")
                 _invalidate_status_cache()
-                return JSONResponse({"ok": True})
+                return JSONResponse({"ok": True, "revoked": 1, "revoked_grant_ids": [permission_id]})
             elif permission_kind in {"boundary-rule", "boundary-permit"}:
                 from nullion.runtime import revoke_related_boundary_permission
 
@@ -19211,7 +19653,7 @@ def create_app(runtime, orchestrator, registry):
                 )
                 runtime.checkpoint()
                 _invalidate_status_cache()
-                return JSONResponse({"ok": True, "revoked": revoked})
+                return JSONResponse({"ok": True, "revoked": revoked, "permission_kind": permission_kind, "permission_id": permission_id})
             else:
                 return JSONResponse({"ok": False, "error": "unknown permission kind"}, status_code=400)
         except KeyError:
@@ -19281,10 +19723,14 @@ def create_app(runtime, orchestrator, registry):
     async def revoke_decision_permissions(approval_id: str):
         try:
             revoked = 0
+            revoked_grant_ids: list[str] = []
+            revoked_rule_ids: list[str] = []
+            revoked_permit_ids: list[str] = []
             for grant in runtime.store.list_permission_grants():
                 if grant.approval_id == approval_id and grant.revoked_at is None:
                     runtime.revoke_permission_grant(grant.grant_id, actor="operator", reason="Revoked from web UI")
                     revoked += 1
+                    revoked_grant_ids.append(grant.grant_id)
             approval = runtime.store.get_approval_request(approval_id)
             from nullion.policy import permission_scope_principal
             ctx = approval.context if approval is not None and isinstance(approval.context, dict) else {}
@@ -19303,13 +19749,21 @@ def create_app(runtime, orchestrator, registry):
                 if matches_approval or matches_selector:
                     runtime.store.add_boundary_policy_rule(replace(rule, revoked_at=datetime.now(UTC)))
                     revoked += 1
+                    revoked_rule_ids.append(rule.rule_id)
             for permit in runtime.store.list_boundary_permits():
                 if permit.approval_id == approval_id and permit.revoked_at is None:
                     runtime.store.add_boundary_permit(replace(permit, revoked_at=datetime.now(UTC)))
                     revoked += 1
+                    revoked_permit_ids.append(permit.permit_id)
             runtime.checkpoint()
             _invalidate_status_cache()
-            return JSONResponse({"ok": True, "revoked": revoked})
+            return JSONResponse({
+                "ok": True,
+                "revoked": revoked,
+                "revoked_grant_ids": revoked_grant_ids,
+                "revoked_rule_ids": revoked_rule_ids,
+                "revoked_permit_ids": revoked_permit_ids,
+            })
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -19633,8 +20087,14 @@ def create_app(runtime, orchestrator, registry):
             or _active_connector_connection_exists()
         ) else "false"
 
+    def _normalized_enabled_skill_pack_value(enabled_value: str) -> str:
+        pack_ids = tuple(item.strip() for item in str(enabled_value or "").split(",") if item.strip())
+        return ", ".join(normalize_enabled_skill_pack_ids(pack_ids))
+
     def _remove_enabled_skill_pack(pack_id: str) -> str:
         normalized = normalize_pack_id(pack_id)
+        if is_builtin_nullion_skill_pack_id(normalized):
+            return _normalized_enabled_skill_pack_value(os.environ.get("NULLION_ENABLED_SKILL_PACKS", ""))
         remaining: list[str] = []
         for raw in os.environ.get("NULLION_ENABLED_SKILL_PACKS", "").split(","):
             value = raw.strip()
@@ -19646,18 +20106,16 @@ def create_app(runtime, orchestrator, registry):
             except ValueError:
                 pass
             remaining.append(value)
-        return ", ".join(dict.fromkeys(remaining))
+        return _normalized_enabled_skill_pack_value(", ".join(dict.fromkeys(remaining)))
 
     def _apply_enabled_skill_packs(enabled_value: str) -> dict[str, str]:
+        enabled_value = _normalized_enabled_skill_pack_value(enabled_value)
         updates = {
             "NULLION_ENABLED_SKILL_PACKS": enabled_value,
-            "NULLION_SKILL_PACK_ACCESS_ENABLED": "true" if enabled_value.strip() else "false",
+            "NULLION_SKILL_PACK_ACCESS_ENABLED": "true",
             "NULLION_CONNECTOR_ACCESS_ENABLED": _connector_access_value_for_skill_packs(enabled_value),
         }
-        if enabled_value.strip():
-            os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_value
-        else:
-            os.environ.pop("NULLION_ENABLED_SKILL_PACKS", None)
+        os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_value
         os.environ["NULLION_SKILL_PACK_ACCESS_ENABLED"] = updates["NULLION_SKILL_PACK_ACCESS_ENABLED"]
         os.environ["NULLION_CONNECTOR_ACCESS_ENABLED"] = updates["NULLION_CONNECTOR_ACCESS_ENABLED"]
         _write_env_updates(_find_env_path(), updates)
@@ -19720,6 +20178,88 @@ def create_app(runtime, orchestrator, registry):
             item["available_to_agent"] = bool(item.get("installed")) and not disabled
             payloads.append(item)
         return payloads
+
+    @app.get("/api/config/header")
+    async def get_header_config():
+        """Return only the lightweight config needed by the always-visible header."""
+        creds = _read_credentials_json()
+        stored_keys_raw = creds.get("keys")
+        stored_keys = stored_keys_raw if isinstance(stored_keys_raw, dict) else {}
+        oai_key = (
+            os.environ.get("OPENAI_API_KEY", "")
+            or (creds.get("api_key", "") if creds.get("provider") == "openai" else "")
+            or str(stored_keys.get("openai") or "")
+        )
+        ant_key = (
+            os.environ.get("ANTHROPIC_API_KEY", "")
+            or (creds.get("api_key", "") if creds.get("provider") == "anthropic" else "")
+            or str(stored_keys.get("anthropic") or "")
+        )
+        raw_provider = (
+            os.environ.get("NULLION_MODEL_PROVIDER")
+            or creds.get("provider")
+            or ("openai" if oai_key else ("anthropic" if ant_key else "openai"))
+        )
+        provider, codex_token = _model_provider_and_codex_token_for_config(
+            raw_provider,
+            oai_key=str(oai_key),
+            creds=creds,
+            stored_keys=stored_keys,
+        )
+        provider_models_raw = creds.get("models")
+        if not isinstance(provider_models_raw, dict):
+            provider_models_raw = {}
+        provider_models: dict[str, str] = {
+            k: str(v or "") for k, v in provider_models_raw.items() if isinstance(k, str)
+        }
+        legacy_model = creds.get("model", "")
+        if legacy_model and provider and not provider_models.get(provider):
+            provider_models[provider] = legacy_model
+        model_name = (
+            _primary_model_entry(os.environ.get("NULLION_MODEL"))
+            or _primary_model_entry(provider_models.get(provider, ""))
+            or _primary_model_entry(legacy_model)
+        )
+        providers_enabled = (
+            {k: bool(v) for k, v in (creds.get("providers_enabled") or {}).items() if isinstance(k, str)}
+            if isinstance(creds.get("providers_enabled"), dict) else {}
+        )
+        providers_configured = {
+            "anthropic": bool(ant_key),
+            "openai": bool(str(oai_key).startswith("sk-")),
+            "openrouter": bool(os.environ.get("OPENROUTER_API_KEY", "") or os.environ.get("NULLION_OPENROUTER_API_KEY", "") or str(stored_keys.get("openrouter") or "")),
+            "openrouter-key": bool(os.environ.get("OPENROUTER_API_KEY", "") or os.environ.get("NULLION_OPENROUTER_API_KEY", "") or str(stored_keys.get("openrouter") or "")),
+            "gemini": bool(os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("NULLION_GEMINI_API_KEY", "") or str(stored_keys.get("gemini") or "")),
+            "ollama": bool(os.environ.get("OLLAMA_API_KEY", "") or os.environ.get("NULLION_OLLAMA_API_KEY", "") or str(stored_keys.get("ollama") or "") or provider == "ollama"),
+            "groq": bool(os.environ.get("GROQ_API_KEY", "") or os.environ.get("NULLION_GROQ_API_KEY", "") or str(stored_keys.get("groq") or "")),
+            "mistral": bool(os.environ.get("MISTRAL_API_KEY", "") or str(stored_keys.get("mistral") or "")),
+            "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY", "") or os.environ.get("NULLION_DEEPSEEK_API_KEY", "") or str(stored_keys.get("deepseek") or "")),
+            "xai": bool(os.environ.get("XAI_API_KEY", "") or os.environ.get("NULLION_XAI_API_KEY", "") or str(stored_keys.get("xai") or "")),
+            "together": bool(os.environ.get("TOGETHER_API_KEY", "") or os.environ.get("NULLION_TOGETHER_API_KEY", "") or str(stored_keys.get("together") or "")),
+            "custom": bool(creds.get("base_url")),
+            "codex": bool(codex_token),
+        }
+        if provider and provider not in providers_configured:
+            providers_configured[provider] = True
+        active_provider_enabled = providers_enabled.get(provider, creds.get("provider_enabled", True))
+        browser_backend = (creds.get("browser_backend", "") if creds else "") or os.environ.get("NULLION_BROWSER_BACKEND", "")
+        return JSONResponse({
+            "model_provider": provider,
+            "model_provider_enabled": (
+                False
+                if (os.environ.get("NULLION_MODEL_PROVIDER_DISABLED", "").strip().lower()
+                    not in ("", "0", "false", "no", "off"))
+                else bool(active_provider_enabled)
+            ),
+            "model_name": model_name,
+            "provider_models": provider_models,
+            "providers_enabled": providers_enabled,
+            "providers_configured": providers_configured,
+            "browser_backend": browser_backend,
+            "browser_tools_available": _tool_registered("browser_navigate"),
+            "activity_trace": os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED", "false").lower() not in ("0", "false", "no", "off"),
+            "show_thinking": os.environ.get("NULLION_SHOW_THINKING_ENABLED", "false").lower() not in ("0", "false", "no", "off"),
+        })
 
     @app.get("/api/config")
     async def get_config():
@@ -20112,7 +20652,9 @@ def create_app(runtime, orchestrator, registry):
             "video_input_provider": video_input_provider,
             "video_input_model": video_input_model,
             "video_input_model_options": video_input_model_options,
-            "enabled_skill_packs": os.environ.get("NULLION_ENABLED_SKILL_PACKS", ""),
+            "enabled_skill_packs": _normalized_enabled_skill_pack_value(
+                os.environ.get("NULLION_ENABLED_SKILL_PACKS", "")
+            ),
             "installed_skill_packs": [
                 {
                     "pack_id": pack.pack_id,
@@ -20222,6 +20764,11 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": False, "error": "pack_id is required"}, status_code=400)
         try:
             normalized_id = normalize_pack_id(pack_id)
+            if is_builtin_nullion_skill_pack_id(normalized_id):
+                return JSONResponse(
+                    {"ok": False, "error": "Core Nullion skill packs cannot be removed."},
+                    status_code=400,
+                )
             removed_pack = uninstall_skill_pack(normalized_id)
             enabled_value = _remove_enabled_skill_pack(normalized_id)
             updates = _apply_enabled_skill_packs(enabled_value)
@@ -21183,36 +21730,9 @@ def create_app(runtime, orchestrator, registry):
                 os.environ.pop(env_name, None)
 
         if "enabled_skill_packs" in body:
-            enabled_skill_packs = str(body.get("enabled_skill_packs") or "")
-            skill_pack_access = "true" if enabled_skill_packs.strip() else "false"
-            has_connector_connection = False
-            try:
-                from nullion.connections import load_connection_registry
-
-                has_connector_connection = any(
-                    (
-                        str(getattr(connection, "provider_id", "")).strip().lower().startswith("skill_pack_connector_")
-                        or str(getattr(connection, "provider_id", "")).strip().lower().endswith("_connector_provider")
-                    )
-                    for connection in load_connection_registry().connections
-                    if getattr(connection, "active", True)
-                )
-            except Exception:
-                has_connector_connection = False
-            connector_access = "true" if (
-                "connector" in enabled_skill_packs.lower()
-                or "api-gateway" in enabled_skill_packs.lower()
-                or has_connector_connection
-            ) else "false"
-            updates["NULLION_SKILL_PACK_ACCESS_ENABLED"] = skill_pack_access
-            updates["NULLION_CONNECTOR_ACCESS_ENABLED"] = connector_access
-            updates["NULLION_ENABLED_SKILL_PACKS"] = enabled_skill_packs
-            os.environ["NULLION_SKILL_PACK_ACCESS_ENABLED"] = skill_pack_access
-            os.environ["NULLION_CONNECTOR_ACCESS_ENABLED"] = connector_access
-            if enabled_skill_packs.strip():
-                os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_skill_packs
-            else:
-                os.environ.pop("NULLION_ENABLED_SKILL_PACKS", None)
+            enabled_skill_packs = _normalized_enabled_skill_pack_value(str(body.get("enabled_skill_packs") or ""))
+            skill_pack_updates = _apply_enabled_skill_packs(enabled_skill_packs)
+            updates.update(skill_pack_updates)
 
         for key, env_name in [
             ("audio_transcribe_enabled", "NULLION_AUDIO_TRANSCRIBE_ENABLED"),
@@ -21657,13 +22177,15 @@ def create_app(runtime, orchestrator, registry):
 
     @app.post("/api/preferences")
     async def post_preferences(request: Request):
-        from nullion.preferences import load_preferences, save_preferences, Preferences, _DEFAULTS
+        from nullion.preferences import _DEFAULTS, load_preferences, save_preferences
         body = await request.json()
         current = load_preferences().to_dict()
         # Merge in only known keys
         for k in _DEFAULTS:
             if k in body:
                 current[k] = body[k]
+        if "timezone" in body:
+            current["timezone_source"] = "explicit"
         try:
             save_preferences(current)
         except Exception as exc:
@@ -22138,7 +22660,7 @@ def create_app(runtime, orchestrator, registry):
     @app.post("/api/chat")
     async def chat_http(request: Request):
         """HTTP chat fallback for environments where WebSocket upgrades fail."""
-        conv_id = "web:0"
+        conv_id = "api:0"
         try:
             try:
                 payload = await request.json()
@@ -26615,6 +27137,12 @@ def _cli_impl() -> None:
         checkpoint_path = Path(args.checkpoint).expanduser()
         os.environ["NULLION_CHECKPOINT_PATH"] = str(checkpoint_path)
         os.environ.setdefault("NULLION_HOME", str(checkpoint_path.parent))
+    try:
+        from nullion.preferences import ensure_preferences_timezone
+
+        ensure_preferences_timezone()
+    except Exception:
+        logger.debug("Could not initialize timezone preference", exc_info=True)
 
     return run_single_instance_entrypoint(
         "web",
