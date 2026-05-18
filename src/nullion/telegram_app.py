@@ -31,7 +31,7 @@ from nullion.chat_attachments import VIDEO_EXTENSIONS, is_supported_chat_file
 from nullion.events import make_event
 from nullion.latency_phases import record_surface_latency_timing
 from nullion.config import NullionSettings, web_session_allow_duration_label, web_session_allow_expires_at
-from nullion.doctor_playbooks import execute_doctor_playbook_command
+from nullion.doctor_playbooks import execute_doctor_playbook_command, format_doctor_action_inspection
 from nullion.messaging_adapters import (
     DeliveryContract,
     build_platform_delivery_receipt,
@@ -726,6 +726,7 @@ _CALLBACK_ACTION_CODES = {
     "accept": "ac",
     "review": "rv",
     "archive": "ar",
+    "inspect": "ix",
     "start": "st",
     "complete": "cp",
     "cancel": "cx",
@@ -809,8 +810,8 @@ def _doctor_decision_actions(action: dict[str, object]) -> tuple[tuple[str, str]
         str(action.get("recommendation_code") or "")
     )
     if remediation_actions:
-        return remediation_actions + (("Mark resolved", "complete"), ("Dismiss", "cancel"))
-    return (("Mark in progress", "start"), ("Mark resolved", "complete"), ("Dismiss", "cancel"))
+        return remediation_actions + (("Ask Doctor", "inspect"), ("Hide", "cancel"))
+    return (("Ask Doctor", "inspect"), ("Hide", "cancel"))
 
 
 def _builder_proposal_card_text(record) -> str:
@@ -3149,14 +3150,12 @@ def _execute_decision_action(
         if _doctor_action_is_closed(current):
             status = str(current.get("status") or "closed").replace("_", " ")
             return "Already closed", f"{_doctor_card_text(current)}\n\nThis card is already {status}."
-        if action == "start":
-            updated = service.runtime.start_doctor_action(record_id)
-            logger.info("Started Doctor action %s, status=%s", record_id, updated.get("status"))
-            return "Started", _doctor_card_text(updated)
+        if action in {"inspect", "start"}:
+            return "Doctor guidance", format_doctor_action_inspection(service.runtime, current)
         if action == "complete":
             updated = service.runtime.complete_doctor_action(record_id)
             logger.info("Completed Doctor action %s, status=%s", record_id, updated.get("status"))
-            return "Completed", "Action completed."
+            return "Closed", "Doctor closed this item."
         if action == "cancel":
             service.runtime.cancel_doctor_action(record_id, reason="Dismissed from Telegram")
             logger.info("Dismissed Doctor action %s", record_id)
@@ -4453,8 +4452,20 @@ class ChatOperatorService:
                     supplemental_task.add_done_callback(_log_background_delivery_error)
                 _mark_timing("delivery_complete")
                 if ingress_checkpoint_deferred:
-                    await asyncio.to_thread(self.runtime.checkpoint)
-                    _cache_runtime_checkpoint_signature(self.runtime)
+                    try:
+                        await asyncio.to_thread(self.runtime.checkpoint)
+                        _cache_runtime_checkpoint_signature(self.runtime)
+                    except Exception:
+                        logger.exception("Failed to persist deferred Telegram ingress checkpoint after reply delivery")
+                        _report_runner_health_issue(
+                            self.runtime,
+                            issue_type=HealthIssueType.ERROR,
+                            message="Telegram checkpoint failed after reply delivery.",
+                            chat_id=chat_id_text,
+                            text=_message_text_or_caption(message),
+                            stage="checkpoint",
+                            detail="Reply was sent, but runtime persistence failed.",
+                        )
             except Exception:
                 if ingress_checkpoint_deferred:
                     try:

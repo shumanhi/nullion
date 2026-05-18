@@ -2022,7 +2022,23 @@ def save_runtime_store(
     target = Path(path)
     if _is_sqlite_runtime_path(target):
         with _runtime_store_file_lock(target):
-            return _save_runtime_store_sqlite(store, target, merge_existing=merge_existing, payload=payload)
+            try:
+                return _save_runtime_store_sqlite(store, target, merge_existing=merge_existing, payload=payload)
+            except sqlite3.DatabaseError as exc:
+                error_text = str(exc).lower()
+                if (
+                    "malformed" not in error_text
+                    and "database disk image" not in error_text
+                    and "file is not a database" not in error_text
+                ):
+                    raise
+                if target.exists():
+                    backup = target.with_name(
+                        f"{target.name}.corrupt-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+                    )
+                    shutil.move(str(target), str(backup))
+                    logger.error("Runtime SQLite checkpoint was corrupt; moved aside to %s", backup)
+                return _save_runtime_store_sqlite(store, target, merge_existing=False, payload=payload)
     with _runtime_store_file_lock(target):
         previous_payload = target.read_text(encoding="utf-8") if target.exists() else None
         merged_previous = False

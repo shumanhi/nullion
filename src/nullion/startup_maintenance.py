@@ -32,6 +32,8 @@ class StartupMaintenanceResult:
     doctor_rows_removed: int = 0
     doctor_last_resort_cleared: bool = False
     vacuumed: bool = False
+    timezone_initialized: bool = False
+    timezone: str | None = None
     warnings: list[str] | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -44,6 +46,14 @@ def run_startup_maintenance(checkpoint_path: str | Path) -> dict[str, object]:
     """Run idempotent startup repairs against an installed runtime DB."""
     checkpoint = Path(checkpoint_path).expanduser()
     result = StartupMaintenanceResult(checkpoint_path=str(checkpoint), warnings=[])
+    try:
+        from nullion.preferences import ensure_preferences_timezone
+
+        prefs = ensure_preferences_timezone()
+        result.timezone_initialized = True
+        result.timezone = prefs.timezone
+    except Exception as exc:
+        result.warnings = [*(result.warnings or []), f"timezone initialization skipped: {exc}"]
     if checkpoint.suffix.lower() not in _SQLITE_SUFFIXES:
         result.skipped = True
         result.reason = "not_sqlite_runtime"
@@ -114,7 +124,7 @@ def run_startup_maintenance(checkpoint_path: str | Path) -> dict[str, object]:
         result.warnings = [str(exc)]
         return result.as_dict()
 
-    if result.backup_path and _env_flag("NULLION_STARTUP_MAINTENANCE_VACUUM", default=True):
+    if result.backup_path and _env_flag("NULLION_STARTUP_MAINTENANCE_VACUUM", default=False):
         try:
             with sqlite3.connect(str(checkpoint), timeout=timeout) as conn:
                 conn.execute("VACUUM")

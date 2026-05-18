@@ -14,6 +14,11 @@ _API_BACKED_SEARCH_PROVIDERS = {
     "google_search_provider",
     "perplexity_search_provider",
 }
+_KEYLESS_SEARCH_PROVIDERS = {
+    "builtin_search_provider",
+    "duckduckgo_instant_answer_provider",
+    "duckduckgo_search_provider",
+}
 
 
 def _truthy_env(name: str, *, default: bool = False) -> bool:
@@ -69,6 +74,11 @@ def browser_disabled() -> bool:
 
 
 def should_register_search_plugin(settings: Any) -> bool:
+    if not web_access_enabled():
+        return False
+    provider = configured_search_provider(settings)
+    if provider in _KEYLESS_SEARCH_PROVIDERS:
+        return True
     return api_backed_search_configured(settings)
 
 

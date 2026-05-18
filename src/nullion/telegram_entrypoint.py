@@ -62,6 +62,18 @@ _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
 _DEFAULT_CHECKPOINT_PATH = Path.home() / ".nullion" / "runtime.db"
 _MANUAL_CRON_DOCTOR_MONITOR_SECONDS_ENV = "NULLION_MANUAL_CRON_DOCTOR_MONITOR_SECONDS"
 _DEFAULT_MANUAL_CRON_DOCTOR_MONITOR_SECONDS = 900.0
+_MANUAL_CRON_DISPATCH_TIMEOUT_SECONDS_ENV = "NULLION_MANUAL_CRON_DISPATCH_TIMEOUT_SECONDS"
+_DEFAULT_MANUAL_CRON_DISPATCH_TIMEOUT_SECONDS = 180.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ManualCronRunAssessment:
+    state: str
+    issue_type: object
+    summary: str
+    detail: str
+    task_counts: dict[str, int]
+    active_tasks: list[str]
 
 
 def _manual_cron_doctor_monitor_seconds() -> float:
@@ -80,14 +92,100 @@ def _manual_cron_doctor_monitor_seconds() -> float:
     return max(0.0, parsed)
 
 
-def _manual_cron_monitoring_text(job, *, elapsed_seconds: float) -> str:
+def _manual_cron_dispatch_timeout_seconds() -> float:
+    raw_value = os.environ.get(_MANUAL_CRON_DISPATCH_TIMEOUT_SECONDS_ENV, "").strip()
+    if not raw_value:
+        return _DEFAULT_MANUAL_CRON_DISPATCH_TIMEOUT_SECONDS
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r",
+            _MANUAL_CRON_DISPATCH_TIMEOUT_SECONDS_ENV,
+            raw_value,
+        )
+        return _DEFAULT_MANUAL_CRON_DISPATCH_TIMEOUT_SECONDS
+    return max(1.0, parsed)
+
+
+def _manual_cron_run_assessment(orchestrator, group_id: str) -> _ManualCronRunAssessment | None:
+    from nullion.health import HealthIssueType
+    from nullion.task_queue import TaskStatus
+
+    registry = getattr(orchestrator, "_task_registry", None)
+    group = registry.get_group(group_id) if registry is not None and hasattr(registry, "get_group") else None
+    if group is None:
+        return _ManualCronRunAssessment(
+            state="no_runtime_group",
+            issue_type=HealthIssueType.STALLED,
+            summary="Doctor cannot find the scheduled task run state yet",
+            detail="The manual scheduled task has not exposed a task group to the runtime monitor.",
+            task_counts={},
+            active_tasks=[],
+        )
+    tasks = list(getattr(group, "tasks", ()) or ())
+    if tasks and all(getattr(task, "is_terminal", lambda: False)() for task in tasks):
+        return None
+
+    counts: dict[str, int] = {}
+    active_tasks: list[str] = []
+    for task in tasks:
+        status = getattr(getattr(task, "status", None), "value", str(getattr(task, "status", "") or "unknown"))
+        counts[status] = counts.get(status, 0) + 1
+        if status in {TaskStatus.RUNNING.value, TaskStatus.QUEUED.value, TaskStatus.PENDING.value, TaskStatus.BLOCKED.value}:
+            title = str(getattr(task, "title", "") or getattr(task, "task_id", "") or "task").strip()
+            if title and len(active_tasks) < 3:
+                active_tasks.append(title)
+
+    if any(status in counts for status in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value)):
+        return _ManualCronRunAssessment(
+            state="errored",
+            issue_type=HealthIssueType.ERROR,
+            summary="Doctor found a scheduled task failure",
+            detail="One or more cron subtasks reached a failed or cancelled state.",
+            task_counts=counts,
+            active_tasks=active_tasks,
+        )
+    if counts.get(TaskStatus.RUNNING.value) or counts.get(TaskStatus.COMPLETE.value):
+        return _ManualCronRunAssessment(
+            state="healthy_long_running",
+            issue_type=HealthIssueType.DEGRADED,
+            summary="Doctor is watching a long scheduled task that is still making progress",
+            detail="The cron has active or completed subtasks, so Nullion will keep it running.",
+            task_counts=counts,
+            active_tasks=active_tasks,
+        )
+    return _ManualCronRunAssessment(
+        state="stalled_before_progress",
+        issue_type=HealthIssueType.STALLED,
+        summary="Doctor found a scheduled task that has not made progress yet",
+        detail="The cron has queued, pending, or blocked subtasks but no running or completed work.",
+        task_counts=counts,
+        active_tasks=active_tasks,
+    )
+
+
+def _manual_cron_monitoring_text(job, *, elapsed_seconds: float, assessment: _ManualCronRunAssessment) -> str:
     name = str(getattr(job, "name", "") or "scheduled task").strip()
     elapsed = int(max(0, elapsed_seconds))
+    active = ", ".join(assessment.active_tasks)
+    counts = ", ".join(f"{key}: {value}" for key, value in sorted(assessment.task_counts.items()))
+    evidence = []
+    if counts:
+        evidence.append(f"Task state: {counts}")
+    if active:
+        evidence.append(f"Active work: {active}")
+    evidence_text = "\n".join(evidence)
+    keep_running = (
+        "It has not been stopped because the runtime evidence shows valid progress."
+        if assessment.state == "healthy_long_running"
+        else "It has not been stopped automatically; Doctor will keep watching the runtime evidence."
+    )
     return (
-        "Doctor is monitoring this manual scheduled task because it is still running "
-        f"after {elapsed} seconds. It has not been stopped; Nullion will keep working "
-        "and will deliver the result when the run finishes."
+        f"{assessment.summary} after {elapsed} seconds. {keep_running} "
+        "Nullion will deliver the result when the run finishes."
         f"\n\nTask: {name}"
+        + (f"\n{evidence_text}" if evidence_text else "")
     )
 
 
@@ -99,13 +197,12 @@ def _report_manual_cron_monitoring(
     channel: str,
     target: str,
     elapsed_seconds: float,
+    assessment: _ManualCronRunAssessment,
 ) -> None:
-    from nullion.health import HealthIssueType
-
     runtime.report_health_issue(
-        issue_type=HealthIssueType.STALLED,
+        issue_type=assessment.issue_type,
         source="manual_cron",
-        message="A manual scheduled task is still running",
+        message=assessment.summary,
         details={
             "recommendation_code": "monitor_manual_cron",
             "cron_id": str(getattr(job, "id", "") or ""),
@@ -115,6 +212,10 @@ def _report_manual_cron_monitoring(
             "delivery_channel": str(channel or ""),
             "delivery_target": str(target or ""),
             "elapsed_seconds": int(max(0, elapsed_seconds)),
+            "assessment_state": assessment.state,
+            "task_counts": json.dumps(assessment.task_counts, sort_keys=True),
+            "active_tasks": ", ".join(assessment.active_tasks),
+            "detail": assessment.detail,
         },
     )
 
@@ -979,6 +1080,7 @@ def _build_runtime_service_from_settings(
             )
             try:
                 dispatch_result = orchestrator.dispatch_request_sync(
+                    timeout_s=_manual_cron_dispatch_timeout_seconds(),
                     conversation_id=conv_id,
                     principal_id=conv_id,
                     user_message=prompt,
@@ -1181,6 +1283,9 @@ def _build_runtime_service_from_settings(
                 monitor_fired.set()
                 channel = _manual_effective_channel(job)
                 target = _manual_delivery_target(job, channel)
+                assessment = _manual_cron_run_assessment(orchestrator, manual_group_id)
+                if assessment is None:
+                    return
                 try:
                     _report_manual_cron_monitoring(
                         runtime,
@@ -1189,6 +1294,7 @@ def _build_runtime_service_from_settings(
                         channel=channel,
                         target=target,
                         elapsed_seconds=monitor_seconds,
+                        assessment=assessment,
                     )
                 except Exception:
                     logger.debug("Could not report manual cron monitoring signal", exc_info=True)
@@ -1197,7 +1303,11 @@ def _build_runtime_service_from_settings(
                         job,
                         channel,
                         target,
-                        _manual_cron_monitoring_text(job, elapsed_seconds=monitor_seconds),
+                        _manual_cron_monitoring_text(
+                            job,
+                            elapsed_seconds=monitor_seconds,
+                            assessment=assessment,
+                        ),
                         run_label="Doctor monitoring",
                     )
                 except Exception:
@@ -1463,6 +1573,12 @@ def main(
     checkpoint = Path(checkpoint_path)
     env_path_value = None if env_path is None else Path(env_path)
     startup_settings = load_settings(env_path=env_path)
+    try:
+        from nullion.preferences import ensure_preferences_timezone
+
+        ensure_preferences_timezone()
+    except Exception:
+        logger.debug("Could not initialize timezone preference", exc_info=True)
     if not startup_settings.telegram.chat_enabled:
         logger.info(
             "Nullion Telegram operator disabled by NULLION_TELEGRAM_CHAT_ENABLED=false "

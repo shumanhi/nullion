@@ -727,6 +727,7 @@ def _messaging_turn_fast_profile_candidate(
     *,
     evidence,
     user_message: str = "",
+    memory_context: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -737,19 +738,24 @@ def _messaging_turn_fast_profile_candidate(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        return not turn_tool_scope_decision_may_apply(
+            evidence,
+            user_message=user_message,
+            memory_context=memory_context,
+        )
     return not (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
-        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message, memory_context=memory_context)
     )
 
 
 def _messaging_turn_skip_tool_scope_decision(
     *,
     evidence,
+    memory_context: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -766,7 +772,7 @@ def _messaging_turn_skip_tool_scope_decision(
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
-        or turn_tool_scope_decision_may_apply(evidence)
+        or turn_tool_scope_decision_may_apply(evidence, memory_context=memory_context)
     ):
         return False
     return True
@@ -3608,7 +3614,7 @@ def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id:
                 scopes.append("connector")
             elif tool_name == "skill_pack_read":
                 scopes.append("skill_pack")
-            elif tool_name in {"list_crons", "run_cron", "create_cron", "update_cron", "delete_cron"}:
+            elif tool_name in {"list_crons", "list_reminders", "run_cron", "set_reminder", "create_cron", "update_cron", "delete_cron"}:
                 scopes.append("scheduler")
             elif tool_name.startswith("browser_") or tool_name in {"web_fetch", "web_search"}:
                 scopes.append("web")
@@ -4484,6 +4490,7 @@ def _render_chat_turn(
     fast_profile_candidate = _messaging_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
         user_message=effective_prompt,
+        memory_context=memory_context or "",
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -4493,6 +4500,7 @@ def _render_chat_turn(
     _mark_timing("tool_scope_decision_check_start")
     skip_tool_scope_decision = _messaging_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
+        memory_context=memory_context or "",
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -4505,6 +4513,7 @@ def _render_chat_turn(
             evidence=turn_tool_evidence,
             model_client=None,
             user_message=effective_prompt,
+            memory_context=memory_context or "",
         )
         _mark_timing("tool_scope_decision_skipped")
     else:
@@ -4517,6 +4526,7 @@ def _render_chat_turn(
             evidence=turn_tool_evidence,
             model_client=tool_scope_model_client,
             user_message=effective_prompt,
+            memory_context=memory_context or "",
         )
         _mark_timing("tool_scope_registry_done")
     try:
@@ -4658,6 +4668,12 @@ def _render_chat_turn(
             if result.tool_name == "list_crons" and isinstance(result.output.get("crons"), list):
                 count = len(result.output.get("crons") or [])
                 detail = f"{count} scheduled task{'s' if count != 1 else ''}"
+            elif result.tool_name == "list_reminders" and isinstance(result.output.get("reminders"), list):
+                count = len(result.output.get("reminders") or [])
+                detail = f"{count} reminder{'s' if count != 1 else ''}"
+            elif result.tool_name == "set_reminder":
+                display = result.output.get("due_at_display")
+                detail = f"reminder set for {display}" if display else "reminder set"
             elif result.tool_name == "run_cron":
                 delivery_status = result.output.get("delivery_status")
                 if isinstance(delivery_status, str) and delivery_status.strip():

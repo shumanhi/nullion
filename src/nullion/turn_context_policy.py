@@ -81,6 +81,7 @@ _CONNECTOR_TYPED_TOOLS = frozenset({
 _SCHEDULER_READ_TOOLS = frozenset({"list_crons", "list_reminders"})
 _SCHEDULER_RUN_TOOLS = frozenset({"run_cron"})
 _SCHEDULER_MUTATE_TOOLS = frozenset({
+    "set_reminder",
     "create_cron",
     "update_cron",
     "delete_cron",
@@ -154,6 +155,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "list_crons",
                         "list_reminders",
                         "run_cron",
+                        "set_reminder",
                         "create_cron",
                         "update_cron",
                         "delete_cron",
@@ -185,7 +187,7 @@ _WEB_ACTIONS = frozenset({"none", "open_url", "live_research", "browser_interact
 _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
 _SKILL_PACK_ACTIONS = frozenset({"none", "reference", "connector"})
 _TOOL_SCOPE_DECISION_CACHE_NAMESPACE = "tool_scope.decision"
-_TOOL_SCOPE_DECISION_CACHE_VERSION = "v7"
+_TOOL_SCOPE_DECISION_CACHE_VERSION = "v8"
 _TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS = 24 * 60 * 60
 def _normalize_connector_app_id(value: object) -> str:
     return str(value or "").strip().lower()
@@ -498,6 +500,7 @@ class ScopedTurnToolRegistry:
                     [
                         "list_crons",
                         "list_reminders",
+                        "set_reminder",
                         "create_cron",
                         "update_cron",
                         "delete_cron",
@@ -1091,6 +1094,7 @@ def _tool_scope_model_signature(model_client: object | None) -> object:
 def _tool_scope_cache_key(
     *,
     user_message: str,
+    memory_context: str = "",
     evidence: TurnToolEvidence,
     registry: object,
     model_client: object | None,
@@ -1099,6 +1103,7 @@ def _tool_scope_cache_key(
 ) -> dict[str, object]:
     return {
         "user_turn": str(user_message or ""),
+        "memory_context": str(memory_context or "")[:1200],
         "evidence": {
             "context_linked": evidence.context_linked,
             "has_url_target": evidence.has_url_target,
@@ -1118,14 +1123,20 @@ def build_turn_tool_scope_decision(
     *,
     model_client: object | None,
     user_message: str,
+    memory_context: str = "",
     evidence: TurnToolEvidence,
     registry,
     force_model_decision: bool = False,
 ) -> TurnToolScopeDecision:
+    has_memory_context = bool(str(memory_context or "").strip())
     if (
         model_client is None
         or not _registry_has_scoped_special_tools(registry)
-        or (not force_model_decision and not turn_tool_evidence_needs_model_scope_decision(evidence))
+        or (
+            not force_model_decision
+            and not has_memory_context
+            and not turn_tool_evidence_needs_model_scope_decision(evidence)
+        )
     ):
         return TurnToolScopeDecision()
     active_connector_providers = _active_connector_provider_context()
@@ -1142,6 +1153,7 @@ def build_turn_tool_scope_decision(
         skill_pack_index = ""
     cache_key = _tool_scope_cache_key(
         user_message=user_message,
+        memory_context=memory_context,
         evidence=evidence,
         registry=registry,
         model_client=model_client,
@@ -1167,6 +1179,7 @@ def build_turn_tool_scope_decision(
         "prior_tool_scopes": list(evidence.prior_tool_scopes),
         "active_connector_providers": active_connector_providers,
         "installed_skill_pack_index": skill_pack_index,
+        "known_user_memory": str(memory_context or "")[:1200],
         "available_special_tool_scopes": [
             "web_or_browser",
             "scheduler",
@@ -1187,7 +1200,9 @@ def build_turn_tool_scope_decision(
         "For browser workflows that must prove visible page state, include browser_assert_page_state in requested_tool_names when registered. "
         "For screenshot capture of a current or prior browser page, include browser_screenshot in requested_tool_names when registered. "
         "Use web_action=none when the request can be answered without web/browser tools. "
+        "Use known_user_memory only as durable user preference context for this same turn; do not treat it as a separate task. "
         "Use scheduler actions only for scheduled-task or reminder control. "
+        "For one-off reminder creation, request/use set_reminder; use create_cron only for recurring scheduled jobs. "
         "Do not choose scheduler just because a saved task could answer the domain. "
         "Use connector only when the request needs a connected external API/account and active_connector_providers lists an active_app_ids value that can satisfy it. "
         "When using connector, include exact app IDs from active_app_ids in connector_app_ids. "
@@ -1270,10 +1285,12 @@ def scoped_turn_tool_registry(
     evidence: TurnToolEvidence,
     model_client: object | None = None,
     user_message: str | None = None,
+    memory_context: str = "",
 ):
     decision = build_turn_tool_scope_decision(
         model_client=model_client,
         user_message=user_message or "",
+        memory_context=memory_context,
         evidence=evidence,
         registry=registry,
     )
@@ -1292,9 +1309,14 @@ def turn_tool_evidence_needs_model_scope_decision(evidence: TurnToolEvidence) ->
     )
 
 
-def turn_tool_scope_decision_may_apply(evidence: TurnToolEvidence, *, user_message: str = "") -> bool:
+def turn_tool_scope_decision_may_apply(
+    evidence: TurnToolEvidence,
+    *,
+    user_message: str = "",
+    memory_context: str = "",
+) -> bool:
     del user_message
-    return turn_tool_evidence_needs_model_scope_decision(evidence)
+    return bool(str(memory_context or "").strip()) or turn_tool_evidence_needs_model_scope_decision(evidence)
 
 
 def tool_registry_allows_skill_pack_context(registry) -> bool:

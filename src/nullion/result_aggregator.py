@@ -178,6 +178,7 @@ class ResultAggregator:
         if group.group_id in self._completed_groups:
             return
         self._completed_groups.add(group.group_id)
+        await self._deliver_status(gs, group)
         recovered_artifacts = finalize_delegated_artifacts(group)
         preverified_artifacts = _artifact_paths_for_group_delivery(
             group,

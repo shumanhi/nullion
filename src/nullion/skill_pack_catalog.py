@@ -260,9 +260,32 @@ def builtin_nullion_skill_pack_ids() -> tuple[str, ...]:
     return tuple(entry.pack_id for entry in SKILL_PACK_CATALOG if entry.source_url == "built-in")
 
 
+def is_builtin_nullion_skill_pack_id(pack_id: str) -> bool:
+    normalized = str(pack_id or "").strip().lower()
+    return normalized in set(builtin_nullion_skill_pack_ids())
+
+
 def default_enabled_skill_pack_ids() -> tuple[str, ...]:
-    """Skill packs enabled by default; users can disable any of them in setup or Settings."""
+    """Skill packs that are always present in every Nullion install."""
     return builtin_nullion_skill_pack_ids()
+
+
+def normalize_enabled_skill_pack_ids(enabled_pack_ids: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Return enabled pack ids with core built-ins preserved.
+
+    Built-in Nullion packs are not optional add-ons. They are part of the
+    shipped runtime and must survive empty env files, older saved settings, and
+    direct config API writes.
+    """
+    ordered: list[str] = list(default_enabled_skill_pack_ids())
+    seen = set(ordered)
+    for raw in enabled_pack_ids:
+        pack_id = str(raw or "").strip().lower()
+        if not pack_id or pack_id in seen:
+            continue
+        ordered.append(pack_id)
+        seen.add(pack_id)
+    return tuple(ordered)
 
 
 def get_skill_pack_catalog_entry(pack_id: str) -> SkillPackCatalogEntry | None:
@@ -429,8 +452,10 @@ __all__ = [
     "builtin_nullion_skill_pack_ids",
     "default_enabled_skill_pack_ids",
     "get_skill_pack_catalog_entry",
+    "is_builtin_nullion_skill_pack_id",
     "list_skill_pack_auth_providers",
     "list_available_skill_packs",
     "list_skill_pack_catalog",
+    "normalize_enabled_skill_pack_ids",
     "skill_pack_access_prompt",
 ]
