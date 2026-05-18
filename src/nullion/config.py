@@ -486,10 +486,19 @@ def load_settings(
             raw_url = stored.get("base_url")
             if isinstance(raw_url, str) and raw_url.strip():
                 openai_base_url = raw_url.strip()
+        effective_provider_for_model = effective_provider
+        if (
+            isinstance(effective_provider_for_model, str)
+            and effective_provider_for_model.strip().lower() == "openai"
+            and isinstance(openai_api_key, str)
+            and openai_api_key.strip()
+            and not openai_api_key.strip().startswith("sk-")
+        ):
+            effective_provider_for_model = "codex"
         if not openai_model:
             raw_model = stored.get("model") or (
-                stored_models.get(effective_provider, "")
-                if effective_provider else ""
+                stored_models.get(effective_provider_for_model, "")
+                if effective_provider_for_model else ""
             )
             if isinstance(raw_model, str) and raw_model.strip():
                 openai_model = _first_csv_setting(raw_model)

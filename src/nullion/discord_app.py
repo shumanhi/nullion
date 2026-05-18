@@ -39,7 +39,7 @@ from nullion.platform_activity import (
     platform_activity_capabilities,
     should_deliver_task_status,
 )
-from nullion.run_activity import activity_trace_enabled, task_planner_feed_mode
+from nullion.run_activity import activity_trace_enabled
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
 from nullion.users import resolve_messaging_user
@@ -682,6 +682,17 @@ async def run_discord_app(
     settings = load_settings(env_path=env_path)
     bot_token = _require_discord_settings(settings)
     service = service_builder(checkpoint_path=checkpoint_path, env_path=env_path)
+    try:
+        from nullion.startup_warmup import schedule_chat_startup_warmup
+
+        schedule_chat_startup_warmup(
+            service.runtime,
+            registry=getattr(service, "tool_registry", None),
+            settings=settings,
+            surface="discord",
+        )
+    except Exception:
+        logger.debug("Could not schedule Discord chat startup warmup", exc_info=True)
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -756,7 +767,7 @@ async def run_discord_app(
                 task_card_store=_task_card_store,
                 status_messages=_status_messages,
                 status_locks=_status_locks,
-                planner_feed_enabled=task_planner_feed_mode() != "off",
+                planner_feed_enabled=True,
                 include_activity=activity_trace_enabled(),
             )
         if kwargs.get("is_artifact"):

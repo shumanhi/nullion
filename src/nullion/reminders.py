@@ -34,9 +34,14 @@ def current_reminder_chat_id() -> str | None:
 def reminder_timezone(timezone_name: str | None = None) -> tzinfo:
     """Return the timezone reminders should use for user-facing times."""
     try:
-        from nullion.preferences import load_preferences, resolve_timezone
+        from nullion.preferences import detect_system_timezone, load_preferences, resolve_timezone
 
-        return resolve_timezone(timezone_name or load_preferences().timezone)
+        saved_timezone = str(timezone_name or load_preferences().timezone or "").strip()
+        if saved_timezone.upper() == "UTC":
+            detected_timezone = detect_system_timezone(default="UTC")
+            if detected_timezone != "UTC":
+                return resolve_timezone(detected_timezone)
+        return resolve_timezone(saved_timezone)
     except Exception:
         return UTC
 

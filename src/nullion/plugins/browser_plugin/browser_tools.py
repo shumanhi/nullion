@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,8 @@ from nullion.artifacts import artifact_path_for_generated_workspace_file, path_i
 from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy, BrowserPolicyViolation
 from nullion.plugins.browser_plugin.browser_session import BrowserBackend, BrowserScreenshotResult, BrowserSessionPool
 from nullion.tools import ToolInvocation, ToolResult
-from nullion.workspace_storage import workspace_storage_roots_for_principal
+from nullion.connections import workspace_id_for_principal
+from nullion.workspace_storage import sanitize_workspace_id, workspace_storage_roots_for_principal
 
 
 def _ok(invocation: ToolInvocation, output: dict[str, Any]) -> ToolResult:
@@ -44,6 +47,485 @@ _BROWSER_LOOP_LOCK = threading.Lock()
 _MAX_CONCURRENT_BROWSER_OPS = 8
 _BROWSER_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_BROWSER_OPS)
 _LOCAL_PREVIEW_SUFFIXES = frozenset({".html", ".htm", ".pdf"})
+
+
+def _browser_snapshot_script(*, max_elements: int = 120) -> str:
+    return f"""
+(() => {{
+  const maxElements = {int(max_elements)};
+  window.__nullionBrowserElementSeq = window.__nullionBrowserElementSeq || 0;
+  const selector = [
+    'a[href]', 'button', 'input', 'textarea', 'select', 'summary',
+    '[role]', '[contenteditable="true"]', '[tabindex]:not([tabindex="-1"])'
+  ].join(',');
+  const textOf = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+  const visible = (el) => {{
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  }};
+  const includeHiddenEditable = (el) => {{
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    const hasName = Boolean(
+      el.getAttribute('aria-label') || el.getAttribute('placeholder') ||
+      el.getAttribute('name') || (el.labels && el.labels.length)
+    );
+    return hasName && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  }};
+  const labelFor = (el) => {{
+    const labels = [];
+    const ariaLabelledBy = el.getAttribute('aria-labelledby');
+    if (ariaLabelledBy) {{
+      for (const id of ariaLabelledBy.split(/\\s+/)) {{
+        const labelEl = document.getElementById(id);
+        if (labelEl) labels.push(textOf(labelEl.innerText || labelEl.textContent));
+      }}
+    }}
+    const aria = el.getAttribute('aria-label');
+    if (aria) labels.push(aria);
+    if (el.labels) for (const label of el.labels) labels.push(textOf(label.innerText || label.textContent));
+    const id = el.getAttribute('id');
+    if (id) {{
+      const label = document.querySelector(`label[for="${{CSS.escape(id)}}"]`);
+      if (label) labels.push(textOf(label.innerText || label.textContent));
+    }}
+    const closestLabel = el.closest('label');
+    if (closestLabel) labels.push(textOf(closestLabel.innerText || closestLabel.textContent));
+    const placeholder = el.getAttribute('placeholder');
+    if (placeholder) labels.push(placeholder);
+    const title = el.getAttribute('title');
+    if (title) labels.push(title);
+    const name = el.getAttribute('name');
+    if (name) labels.push(name);
+    return textOf(labels.find(Boolean) || '');
+  }};
+  const roleFor = (el) => {{
+    const explicit = el.getAttribute('role');
+    if (explicit) return explicit;
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'a') return 'link';
+    if (tag === 'button' || type === 'button' || type === 'submit') return 'button';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'input') return type === 'checkbox' ? 'checkbox' : type === 'radio' ? 'radio' : 'textbox';
+    if (el.isContentEditable) return 'textbox';
+    return '';
+  }};
+  const editable = (el) => {{
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    return el.isContentEditable || tag === 'textarea' || tag === 'select' ||
+      (tag === 'input' && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden'].includes(type));
+  }};
+  const disabled = (el) => Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
+  const elements = [];
+  for (const el of Array.from(document.querySelectorAll(selector))) {{
+    const isEditable = editable(el);
+    const isVisible = visible(el);
+    if (!isVisible && !(isEditable && includeHiddenEditable(el))) continue;
+    if (!el.dataset.nullionEid) el.dataset.nullionEid = `n-${{++window.__nullionBrowserElementSeq}}`;
+    const rect = el.getBoundingClientRect();
+    elements.push({{
+      element_id: el.dataset.nullionEid,
+      tag: el.tagName.toLowerCase(),
+      role: roleFor(el),
+      label: labelFor(el),
+      text: textOf(el.innerText || el.textContent).slice(0, 240),
+      value: 'value' in el ? String(el.value || '') : '',
+      placeholder: el.getAttribute('placeholder') || '',
+      name: el.getAttribute('name') || '',
+      type: el.getAttribute('type') || '',
+      visible: isVisible,
+      disabled: disabled(el),
+      editable: isEditable,
+      expanded: el.getAttribute('aria-expanded'),
+      aria_controls: el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '',
+      checked: 'checked' in el ? Boolean(el.checked) : undefined,
+      rect: {{
+        x: Math.round(rect.x), y: Math.round(rect.y),
+        width: Math.round(rect.width), height: Math.round(rect.height)
+      }}
+    }});
+    if (elements.length >= maxElements) break;
+  }}
+  const active = document.activeElement && document.activeElement.dataset
+    ? document.activeElement.dataset.nullionEid || ''
+    : '';
+  return {{url: location.href, title: document.title, active_element_id: active, element_count: elements.length, elements}};
+}})()
+"""
+
+
+def _browser_click_id_script(element_id: str) -> str:
+    return f"""
+(() => {{
+  const elementId = {json.dumps(element_id)};
+  const el = document.querySelector(`[data-nullion-eid="${{CSS.escape(elementId)}}"]`);
+  if (!el) return {{ok: false, reason: 'element_not_found', element_id: elementId}};
+  if (el.disabled || el.getAttribute('aria-disabled') === 'true') {{
+    return {{ok: false, reason: 'element_disabled', element_id: elementId}};
+  }}
+  const before = {{text: (el.innerText || el.textContent || '').trim(), value: 'value' in el ? String(el.value || '') : ''}};
+  el.scrollIntoView({{block: 'center', inline: 'center'}});
+  if (typeof el.focus === 'function') el.focus({{preventScroll: true}});
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {{
+    el.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}}));
+  }}
+  const active = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.nullionEid || '' : '';
+  const after = {{text: (el.innerText || el.textContent || '').trim(), value: 'value' in el ? String(el.value || '') : ''}};
+  return {{ok: true, clicked: true, element_id: elementId, active_element_id: active, before, after}};
+}})()
+"""
+
+
+def _browser_type_id_script(element_id: str, text: str, *, clear: bool = True) -> str:
+    return f"""
+(() => {{
+  const elementId = {json.dumps(element_id)};
+  const text = {json.dumps(text)};
+  const clear = {json.dumps(bool(clear))};
+  const el = document.querySelector(`[data-nullion-eid="${{CSS.escape(elementId)}}"]`);
+  if (!el) return {{ok: false, reason: 'element_not_found', element_id: elementId}};
+  if (el.disabled || el.getAttribute('aria-disabled') === 'true') {{
+    return {{ok: false, reason: 'element_disabled', element_id: elementId}};
+  }}
+  const tag = el.tagName.toLowerCase();
+  const editable = el.isContentEditable || tag === 'textarea' || tag === 'select' || tag === 'input';
+  if (!editable) return {{ok: false, reason: 'element_not_editable', element_id: elementId}};
+  el.scrollIntoView({{block: 'center', inline: 'center'}});
+  if (typeof el.focus === 'function') el.focus({{preventScroll: true}});
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const before = 'value' in el ? String(el.value || '') : String(el.textContent || '');
+  if ('value' in el) {{
+    const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(el, clear ? text : before + text);
+    else el.value = clear ? text : before + text;
+  }} else {{
+    el.textContent = clear ? text : before + text;
+  }}
+  el.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: text}}));
+  el.dispatchEvent(new Event('change', {{bubbles: true}}));
+  const after = 'value' in el ? String(el.value || '') : String(el.textContent || '');
+  const beforeNorm = normalize(before);
+  const afterNorm = normalize(after);
+  const textNorm = normalize(text);
+  const verified = Boolean(
+    textNorm && (
+      afterNorm.includes(textNorm) ||
+      textNorm.includes(afterNorm) ||
+      (afterNorm && afterNorm !== beforeNorm)
+    )
+  );
+  return {{
+    ok: true,
+    element_id: elementId,
+    before_value: before,
+    after_value: after,
+    typed: text.length,
+    verified,
+    verification: afterNorm.includes(textNorm) ? 'exact_or_contains' : afterNorm !== beforeNorm ? 'changed' : 'unverified'
+  }};
+}})()
+"""
+
+
+def _browser_select_combobox_script(
+    *,
+    query: str,
+    expected_text: str,
+    element_id: str | None = None,
+    label: str | None = None,
+    placeholder: str | None = None,
+    name: str | None = None,
+) -> str:
+    return f"""
+(async () => {{
+  const args = {json.dumps({
+      "query": query,
+      "expectedText": expected_text,
+      "elementId": element_id or "",
+      "label": label or "",
+      "placeholder": placeholder or "",
+      "name": name or "",
+  })};
+  const textOf = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+  const normalize = (value) => textOf(value).toLowerCase()
+    .replace(/\\bwest\\b/g, 'w').replace(/\\beast\\b/g, 'e')
+    .replace(/\\bnorth\\b/g, 'n').replace(/\\bsouth\\b/g, 's')
+    .replace(/[^a-z0-9]+/g, ' ').trim();
+  const tokens = (value) => normalize(value).split(/\\s+/).filter(Boolean);
+  const expectedTokens = new Set(tokens(args.expectedText || args.query));
+  const numericTokens = [...expectedTokens].filter((token) => /\\d/.test(token));
+  const wordTokens = [...expectedTokens].filter((token) => !/\\d/.test(token));
+  const meaningfulWordTokens = wordTokens.filter((token) => token.length >= 3);
+  const compatible = (candidate) => {{
+    const candidateTokens = new Set(tokens(candidate));
+    const normalizedCandidate = normalize(candidate);
+    const normalizedExpected = normalize(args.expectedText || args.query);
+    if (normalizedCandidate.includes(normalizedExpected)) return true;
+    if (numericTokens.length && normalizedExpected.includes(normalizedCandidate)) return true;
+    if (numericTokens.length) {{
+      if (!numericTokens.every((token) => candidateTokens.has(token))) return false;
+      return !meaningfulWordTokens.length || meaningfulWordTokens.some((token) => candidateTokens.has(token));
+    }}
+    if (meaningfulWordTokens.length > 1) return meaningfulWordTokens.every((token) => candidateTokens.has(token));
+    if (meaningfulWordTokens.length === 1) return candidateTokens.has(meaningfulWordTokens[0]);
+    return wordTokens.length > 0 && wordTokens.every((token) => candidateTokens.has(token));
+  }};
+  const score = (candidate) => {{
+    const candidateTokens = new Set(tokens(candidate));
+    let value = 0;
+    for (const token of expectedTokens) if (candidateTokens.has(token)) value += /\\d/.test(token) ? 4 : 1;
+    return value;
+  }};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (el) => {{
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  }};
+  const disabled = (el) => Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
+  const labelFor = (el) => {{
+    const pieces = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name')];
+    if (el.labels) for (const candidate of el.labels) pieces.push(textOf(candidate.innerText || candidate.textContent));
+    const id = el.getAttribute('id');
+    if (id) {{
+      const label = document.querySelector(`label[for="${{CSS.escape(id)}}"]`);
+      if (label) pieces.push(textOf(label.innerText || label.textContent));
+    }}
+    return normalize(pieces.filter(Boolean).join(' '));
+  }};
+  const desiredLabel = normalize([args.label, args.placeholder, args.name].filter(Boolean).join(' '));
+  const candidates = Array.from(document.querySelectorAll('input, textarea, [role="combobox"], [contenteditable="true"]'))
+    .filter((el) => visible(el) && !disabled(el));
+  let el = args.elementId ? document.querySelector(`[data-nullion-eid="${{CSS.escape(args.elementId)}}"]`) : null;
+  if (el && (!visible(el) || disabled(el))) el = null;
+  if (!el && desiredLabel) {{
+    el = candidates.find((candidate) => labelFor(candidate).includes(desiredLabel) || desiredLabel.includes(labelFor(candidate)));
+  }}
+  if (!el) el = candidates[0] || null;
+  if (!el) return {{ok: false, reason: 'combobox_not_found'}};
+  if (!el.dataset.nullionEid) {{
+    window.__nullionBrowserElementSeq = window.__nullionBrowserElementSeq || 0;
+    el.dataset.nullionEid = `n-${{++window.__nullionBrowserElementSeq}}`;
+  }}
+  const before = 'value' in el ? String(el.value || '') : textOf(el.textContent);
+  el.scrollIntoView({{block: 'center', inline: 'center'}});
+  const populate = (value) => {{
+    if (typeof el.focus === 'function') el.focus({{preventScroll: true}});
+    if ('value' in el) {{
+      const proto = el.tagName.toLowerCase() === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(el, value);
+      else el.value = value;
+    }} else {{
+      el.textContent = value;
+    }}
+    el.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: value}}));
+    el.dispatchEvent(new KeyboardEvent('keydown', {{bubbles: true, cancelable: true, key: 'ArrowDown'}}));
+    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+  }};
+  populate(args.query);
+  const readOptions = () => {{
+    const controlledId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '';
+    const optionSelectors = [
+      controlledId ? `#${{CSS.escape(controlledId)}} [role="option"]` : '',
+      '[role="listbox"] [role="option"]',
+      '[role="option"]',
+      '[data-testid*="option" i]',
+      '[data-baseweb*="menu" i] [role="option"]',
+      '[data-baseweb*="menu" i] li',
+      '[data-baseweb*="menu" i] div',
+      'li'
+    ].filter(Boolean);
+    const seen = new Set();
+    const options = [];
+    for (const selector of optionSelectors) {{
+      for (const option of Array.from(document.querySelectorAll(selector))) {{
+        if (!visible(option)) continue;
+        const text = textOf(option.innerText || option.textContent);
+        if (!text || seen.has(text)) continue;
+        seen.add(text);
+        options.push({{text, element: option, score: score(text), compatible: compatible(text)}});
+        if (options.length >= 20) break;
+      }}
+      if (options.length >= 20) break;
+    }}
+    return options;
+  }};
+  let options = [];
+  for (let attempt = 0; attempt < 25; attempt++) {{
+    options = readOptions();
+    if (options.some((option) => option.compatible)) break;
+    await sleep(150);
+  }}
+  if (!options.some((option) => option.compatible) && args.expectedText && normalize(args.expectedText) !== normalize(args.query)) {{
+    populate(args.expectedText);
+    for (let attempt = 0; attempt < 25; attempt++) {{
+      options = readOptions();
+      if (options.some((option) => option.compatible)) break;
+      await sleep(150);
+    }}
+  }}
+  const selected = options.filter((option) => option.compatible).sort((a, b) => b.score - a.score)[0];
+  if (!selected) {{
+    const after = 'value' in el ? String(el.value || '') : textOf(el.textContent);
+    const pageText = textOf(document.body.innerText || '');
+    if (options.length === 0 && (compatible(after) || pageText.includes(args.expectedText || args.query))) {{
+      return {{
+        ok: true,
+        element_id: el.dataset.nullionEid,
+        before_value: before,
+        after_value: after,
+        selected_text: after || args.expectedText || args.query,
+        verified: true,
+        options: options.map((option) => option.text).slice(0, 12),
+        already_committed: true
+      }};
+    }}
+    return {{
+      ok: false,
+      reason: 'no_compatible_option',
+      element_id: el.dataset.nullionEid,
+      before_value: before,
+      query: args.query,
+      expected_text: args.expectedText,
+      options: options.map((option) => option.text).slice(0, 12)
+    }};
+  }}
+  selected.element.scrollIntoView({{block: 'center', inline: 'center'}});
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {{
+    selected.element.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}}));
+  }}
+  if (typeof selected.element.click === 'function') selected.element.click();
+  await sleep(100);
+  const after = 'value' in el ? String(el.value || '') : textOf(el.textContent);
+  const pageText = textOf(document.body.innerText || '');
+  const verified = compatible(selected.text) && (compatible(after) || pageText.includes(selected.text));
+  return {{
+    ok: true,
+    element_id: el.dataset.nullionEid,
+    before_value: before,
+    after_value: after,
+    selected_text: selected.text,
+    verified,
+    options: options.map((option) => option.text).slice(0, 12)
+  }};
+}})()
+"""
+
+
+def _browser_assert_page_state_script(*, required: list[str], forbidden: list[str]) -> str:
+    return f"""
+(() => {{
+  const args = {json.dumps({"required": required, "forbidden": forbidden})};
+  const textOf = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+  const normalize = (value) => textOf(value).toLowerCase()
+    .replace(/\\bwest\\b/g, 'w').replace(/\\beast\\b/g, 'e')
+    .replace(/\\bnorth\\b/g, 'n').replace(/\\bsouth\\b/g, 's')
+    .replace(/[^a-z0-9]+/g, ' ').trim();
+  const tokens = (value) => normalize(value).split(/\\s+/).filter(Boolean);
+  const visible = (el) => {{
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  }};
+  const labelFor = (el) => {{
+    const pieces = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('title')];
+    if (el.labels) for (const label of el.labels) pieces.push(textOf(label.innerText || label.textContent));
+    const id = el.getAttribute('id');
+    if (id) {{
+      const label = document.querySelector(`label[for="${{CSS.escape(id)}}"]`);
+      if (label) pieces.push(textOf(label.innerText || label.textContent));
+    }}
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy) {{
+      for (const labelId of labelledBy.split(/\\s+/)) {{
+        const label = document.getElementById(labelId);
+        if (label) pieces.push(textOf(label.innerText || label.textContent));
+      }}
+    }}
+    const seen = new Set();
+    return textOf(pieces.filter(Boolean).map((piece) => textOf(piece)).filter((piece) => {{
+      const key = normalize(piece);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }}).join(' '));
+  }};
+  const rawCandidates = [];
+  for (const el of Array.from(document.querySelectorAll('body, main, section, article, p, span, div, input, textarea, select, button, a, [role], [contenteditable="true"]'))) {{
+    if (el !== document.body && !visible(el)) continue;
+    const pieces = [];
+    if (el === document.body) {{
+      pieces.push(textOf(el.innerText || el.textContent));
+    }} else {{
+      const label = labelFor(el);
+      const text = textOf(el.innerText || el.textContent);
+      const value = 'value' in el ? textOf(el.value) : '';
+      if (label && value) pieces.push(`${{label}} ${{value}}`);
+      if (label && text) pieces.push(`${{label}} ${{text}}`);
+      if (value) pieces.push(value);
+      if (text) pieces.push(text);
+      if (el.tagName.toLowerCase() === 'select') {{
+        const selected = el.selectedOptions && el.selectedOptions[0]
+          ? textOf(el.selectedOptions[0].innerText || el.selectedOptions[0].textContent)
+          : '';
+        if (selected) pieces.push(selected);
+      }}
+    }}
+    for (const piece of pieces) if (piece) rawCandidates.push(piece);
+  }}
+  const seen = new Set();
+  const candidates = rawCandidates
+    .map((candidate) => textOf(candidate))
+    .filter(Boolean)
+    .filter((candidate) => {{
+      const key = normalize(candidate);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }})
+    .sort((a, b) => normalize(a).length - normalize(b).length)
+    .slice(0, 80);
+  const compatible = (expected, candidate) => {{
+    const expectedNorm = normalize(expected);
+    const candidateNorm = normalize(candidate);
+    if (!expectedNorm || !candidateNorm) return false;
+    if (candidateNorm.includes(expectedNorm) || expectedNorm.includes(candidateNorm)) return true;
+    const expectedTokens = new Set(tokens(expected));
+    const candidateTokens = new Set(tokens(candidate));
+    const numericTokens = [...expectedTokens].filter((token) => /\\d/.test(token));
+    const wordTokens = [...expectedTokens].filter((token) => !/\\d/.test(token));
+    const meaningfulWordTokens = wordTokens.filter((token) => token.length >= 3);
+    if (numericTokens.length) {{
+      if (!numericTokens.every((token) => candidateTokens.has(token))) return false;
+      return !meaningfulWordTokens.length || meaningfulWordTokens.some((token) => candidateTokens.has(token));
+    }}
+    if (meaningfulWordTokens.length > 1) return meaningfulWordTokens.every((token) => candidateTokens.has(token));
+    if (meaningfulWordTokens.length === 1) return candidateTokens.has(meaningfulWordTokens[0]);
+    return wordTokens.length > 0 && wordTokens.every((token) => candidateTokens.has(token));
+  }};
+  const findMatch = (expected) => candidates.find((candidate) => compatible(expected, candidate)) || '';
+  const required = args.required.map((expected) => ({{expected, match: findMatch(expected)}}));
+  const forbidden = args.forbidden.map((expected) => ({{expected, match: findMatch(expected)}}));
+  const missing = required.filter((item) => !item.match);
+  const forbiddenFound = forbidden.filter((item) => item.match);
+  return {{
+    ok: missing.length === 0 && forbiddenFound.length === 0,
+    url: location.href,
+    title: document.title,
+    required,
+    forbidden,
+    missing,
+    forbidden_found: forbiddenFound,
+    candidates: candidates.slice(0, 20)
+  }};
+}})()
+"""
 
 
 def _ensure_browser_loop() -> asyncio.AbstractEventLoop:
@@ -127,9 +609,17 @@ class BrowserTools:
         self._policy = policy
         self._cleanup_lock = threading.Lock()
         self._sessions_by_scope: dict[str, set[str]] = {}
+        self._element_snapshot_lock = threading.Lock()
+        self._element_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
 
     def _session_id(self, invocation: ToolInvocation) -> str:
         raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
+        if self._uses_shared_default_session():
+            if raw_session_id.startswith("isolated:"):
+                suffix = raw_session_id.removeprefix("isolated:").strip()
+                if suffix:
+                    return f"isolated-{hashlib.sha256(suffix.encode('utf-8')).hexdigest()[:16]}"
+            return self._workspace_default_session_id(invocation)
         if raw_session_id and raw_session_id != "default":
             return raw_session_id
         scope = self._cleanup_scope(invocation)
@@ -139,7 +629,22 @@ class BrowserTools:
     def _cleanup_scope(self, invocation: ToolInvocation) -> str:
         return str(invocation.capsule_id or invocation.principal_id or "global")
 
+    def _uses_shared_default_session(self) -> bool:
+        backend_name = str(getattr(self._backend, "BACKEND_NAME", "") or "").strip().lower()
+        if backend_name == "cdp":
+            return True
+        if backend_name == "auto":
+            return os.environ.get("NULLION_BROWSER_HEADLESS", "").strip().lower() != "true"
+        return False
+
+    def _workspace_default_session_id(self, invocation: ToolInvocation) -> str:
+        workspace_id = sanitize_workspace_id(workspace_id_for_principal(invocation.principal_id))
+        digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:16]
+        return f"workspace-{digest}"
+
     def _remember_session(self, invocation: ToolInvocation, session_id: str) -> None:
+        if session_id.startswith("workspace-") and self._uses_shared_default_session():
+            return
         scope = self._cleanup_scope(invocation)
         with self._cleanup_lock:
             self._sessions_by_scope.setdefault(scope, set()).add(session_id)
@@ -153,6 +658,49 @@ class BrowserTools:
                     empty_scopes.append(scope)
             for scope in empty_scopes:
                 self._sessions_by_scope.pop(scope, None)
+        with self._element_snapshot_lock:
+            self._element_snapshots.pop(session_id, None)
+
+    def _remember_element_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> None:
+        elements = snapshot.get("elements")
+        if not isinstance(elements, list):
+            return
+        remembered: dict[str, dict[str, Any]] = {}
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            element_id = str(element.get("element_id") or "").strip()
+            if element_id:
+                remembered[element_id] = dict(element)
+        if remembered:
+            with self._element_snapshot_lock:
+                self._element_snapshots[session_id] = remembered
+
+    def _cached_element(self, session_id: str, element_id: str) -> dict[str, Any] | None:
+        with self._element_snapshot_lock:
+            cached = self._element_snapshots.get(session_id, {}).get(element_id)
+        return dict(cached) if isinstance(cached, dict) else None
+
+    @staticmethod
+    def _semantic_target_from_cached_element(element: dict[str, Any] | None, *, for_click: bool) -> dict[str, object]:
+        if not element:
+            return {}
+        target: dict[str, object] = {}
+        for key in ("label", "placeholder", "name"):
+            value = str(element.get(key) or "").strip()
+            if value:
+                target[key] = value
+        role = str(element.get("role") or "").strip()
+        text = str(element.get("text") or "").strip()
+        if role:
+            target["role"] = role
+        if for_click and text:
+            target["text"] = text
+            if role and "name" not in target:
+                target["name"] = text
+        elif text and not target:
+            target["text"] = text
+        return target
 
     def close_tracked_sessions(self, scope_id: str | None = None) -> None:
         with self._cleanup_lock:
@@ -172,6 +720,15 @@ class BrowserTools:
                 continue
 
     # ── Tools ─────────────────────────────────────────────────────────────────
+
+    def browser_open(self, invocation: ToolInvocation) -> ToolResult:
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            result = _run(self._backend.open(session_id))
+            return _ok(invocation, {"result": result, "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Open failed: {e}")
 
     def browser_navigate(self, invocation: ToolInvocation) -> ToolResult:
         url = invocation.arguments.get("url", "")
@@ -205,6 +762,27 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Click failed: {e}")
 
+    def browser_click_element(self, invocation: ToolInvocation) -> ToolResult:
+        target = {
+            key: invocation.arguments.get(key)
+            for key in ("selector", "label", "placeholder", "role", "name", "text")
+            if invocation.arguments.get(key)
+        }
+        if not target:
+            return _fail(invocation, "Missing target: provide selector, label, placeholder, text, or role/name")
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            click_element = getattr(self._backend, "click_element", None)
+            if callable(click_element):
+                _run(click_element(session_id, target))
+            else:
+                selector = str(target.get("selector") or target.get("label") or target.get("text") or target.get("name") or "")
+                _run(self._backend.click(session_id, selector))
+            return _ok(invocation, {"clicked": target, "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Click failed: {e}")
+
     def browser_type(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector", "")
         text = invocation.arguments.get("text", "")
@@ -217,6 +795,205 @@ class BrowserTools:
             return _ok(invocation, {"typed": len(str(text)), "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"Type failed: {e}")
+
+    def browser_type_field(self, invocation: ToolInvocation) -> ToolResult:
+        text = invocation.arguments.get("text", "")
+        target = {
+            key: invocation.arguments.get(key)
+            for key in ("selector", "label", "placeholder", "role", "name")
+            if invocation.arguments.get(key)
+        }
+        if not target:
+            return _fail(invocation, "Missing target: provide selector, label, placeholder, or role/name")
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            type_field = getattr(self._backend, "type_field", None)
+            if callable(type_field):
+                _run(type_field(session_id, target, str(text)))
+            else:
+                selector = str(target.get("selector") or target.get("label") or target.get("name") or "")
+                _run(self._backend.type_text(session_id, selector, str(text)))
+            return _ok(invocation, {"typed": len(str(text)), "target": target, "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Type failed: {e}")
+
+    def browser_snapshot(self, invocation: ToolInvocation) -> ToolResult:
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        max_elements = int(invocation.arguments.get("max_elements") or 120)
+        if max_elements < 1:
+            return _fail(invocation, "max_elements must be at least 1")
+        max_elements = min(max_elements, 250)
+        try:
+            result = _run(self._backend.run_js(session_id, _browser_snapshot_script(max_elements=max_elements)))
+            if not isinstance(result, dict):
+                return _fail(invocation, "Snapshot returned an invalid result.")
+            self._remember_element_snapshot(session_id, result)
+            return _ok(invocation, {"snapshot": result, "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Snapshot failed: {e}")
+
+    def browser_click_id(self, invocation: ToolInvocation) -> ToolResult:
+        element_id = str(invocation.arguments.get("element_id") or "").strip()
+        if not element_id:
+            return _fail(invocation, "Missing required argument: element_id")
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            result = _run(self._backend.run_js(session_id, _browser_click_id_script(element_id)))
+            if not isinstance(result, dict) or not result.get("ok"):
+                reason = result.get("reason") if isinstance(result, dict) else "invalid_result"
+                target = self._semantic_target_from_cached_element(
+                    self._cached_element(session_id, element_id),
+                    for_click=True,
+                )
+                click_element = getattr(self._backend, "click_element", None)
+                if target and callable(click_element):
+                    try:
+                        _run(click_element(session_id, target))
+                        return _ok(
+                            invocation,
+                            {
+                                "clicked": element_id,
+                                "session_id": session_id,
+                                "recovered_by": "cached_semantic_target",
+                                "target": target,
+                                "previous_error": reason,
+                            },
+                        )
+                    except Exception as fallback_error:
+                        return _fail(invocation, f"Click failed: {reason}; fallback failed: {fallback_error}")
+                return _fail(invocation, f"Click failed: {reason}")
+            return _ok(invocation, {"result": result, "clicked": element_id, "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Click failed: {e}")
+
+    def browser_type_id(self, invocation: ToolInvocation) -> ToolResult:
+        element_id = str(invocation.arguments.get("element_id") or "").strip()
+        text = str(invocation.arguments.get("text") or "")
+        clear = bool(invocation.arguments.get("clear", True))
+        if not element_id:
+            return _fail(invocation, "Missing required argument: element_id")
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            cached_element = self._cached_element(session_id, element_id)
+            if cached_element and cached_element.get("visible") is False and cached_element.get("editable") is True:
+                target = self._semantic_target_from_cached_element(cached_element, for_click=False)
+                type_field = getattr(self._backend, "type_field", None)
+                if target and callable(type_field):
+                    try:
+                        _run(type_field(session_id, target, text))
+                        return _ok(
+                            invocation,
+                            {
+                                "typed": len(text),
+                                "session_id": session_id,
+                                "recovered_by": "hidden_cached_semantic_target",
+                                "target": target,
+                            },
+                        )
+                    except Exception:
+                        pass
+            result = _run(self._backend.run_js(session_id, _browser_type_id_script(element_id, text, clear=clear)))
+            if not isinstance(result, dict) or not result.get("ok"):
+                reason = result.get("reason") if isinstance(result, dict) else "invalid_result"
+                cached_element = self._cached_element(session_id, element_id)
+                if cached_element and cached_element.get("editable") is False:
+                    return _fail(invocation, f"Type failed: {reason}")
+                target = self._semantic_target_from_cached_element(cached_element, for_click=False)
+                type_field = getattr(self._backend, "type_field", None)
+                if target and callable(type_field):
+                    try:
+                        _run(type_field(session_id, target, text))
+                        return _ok(
+                            invocation,
+                            {
+                                "typed": len(text),
+                                "session_id": session_id,
+                                "recovered_by": "cached_semantic_target",
+                                "target": target,
+                                "previous_error": reason,
+                            },
+                        )
+                    except Exception as fallback_error:
+                        return _fail(invocation, f"Type failed: {reason}; fallback failed: {fallback_error}")
+                return _fail(invocation, f"Type failed: {reason}")
+            if not result.get("verified"):
+                target = self._semantic_target_from_cached_element(
+                    self._cached_element(session_id, element_id),
+                    for_click=False,
+                )
+                type_field = getattr(self._backend, "type_field", None)
+                if target and callable(type_field):
+                    try:
+                        _run(type_field(session_id, target, text))
+                        return _ok(
+                            invocation,
+                            {
+                                "result": result,
+                                "typed": len(text),
+                                "session_id": session_id,
+                                "recovered_by": "cached_semantic_target",
+                                "target": target,
+                                "previous_error": "field value did not verify after input",
+                            },
+                        )
+                    except Exception as fallback_error:
+                        return _fail(
+                            invocation,
+                            f"Type failed: field value did not verify after input; fallback failed: {fallback_error}",
+                        )
+                return _fail(invocation, "Type failed: field value did not verify after input")
+            return _ok(invocation, {"result": result, "typed": len(text), "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Type failed: {e}")
+
+    def browser_select_combobox(self, invocation: ToolInvocation) -> ToolResult:
+        query = str(invocation.arguments.get("query") or "").strip()
+        expected_text = str(invocation.arguments.get("expected_text") or query).strip()
+        element_id = str(invocation.arguments.get("element_id") or "").strip() or None
+        label = str(invocation.arguments.get("label") or "").strip() or None
+        placeholder = str(invocation.arguments.get("placeholder") or "").strip() or None
+        name = str(invocation.arguments.get("name") or "").strip() or None
+        if not query:
+            return _fail(invocation, "Missing required argument: query")
+        if not (element_id or label or placeholder or name):
+            return _fail(invocation, "Missing target: provide element_id, label, placeholder, or name")
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            script = _browser_select_combobox_script(
+                query=query,
+                expected_text=expected_text,
+                element_id=element_id,
+                label=label,
+                placeholder=placeholder,
+                name=name,
+            )
+            result = _run(self._backend.run_js(session_id, script))
+            if not isinstance(result, dict) or not result.get("ok"):
+                reason = result.get("reason") if isinstance(result, dict) else "invalid_result"
+                output = {"result": result, "session_id": session_id} if isinstance(result, dict) else {"session_id": session_id}
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output=output,
+                    error=f"Combobox selection failed: {reason}",
+                )
+            if not result.get("verified"):
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"result": result, "session_id": session_id},
+                    error="Combobox selection failed: selected value did not verify",
+                )
+            return _ok(invocation, {"result": result, "selected": result.get("selected_text"), "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Combobox selection failed: {e}")
 
     def browser_extract_text(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector") or None
@@ -294,16 +1071,51 @@ class BrowserTools:
     def browser_wait_for(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector") or None
         url_pattern = invocation.arguments.get("url_pattern") or None
+        text = invocation.arguments.get("text") or None
         timeout = float(invocation.arguments.get("timeout", 10.0))
-        if not selector and not url_pattern:
-            return _fail(invocation, "Provide selector or url_pattern")
+        if not selector and not url_pattern and not text:
+            return _fail(invocation, "Provide selector, url_pattern, or text")
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:
-            _run(self._backend.wait_for(session_id, selector, url_pattern, timeout))
-            return _ok(invocation, {"waited_for": selector or url_pattern, "session_id": session_id})
+            wait_for = getattr(self._backend, "wait_for")
+            try:
+                _run(wait_for(session_id, selector, url_pattern, text, timeout))
+            except TypeError:
+                _run(wait_for(session_id, selector, url_pattern, timeout))
+            return _ok(invocation, {"waited_for": selector or url_pattern or text, "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"Wait failed: {e}")
+
+    def browser_assert_page_state(self, invocation: ToolInvocation) -> ToolResult:
+        raw_required = invocation.arguments.get("required") or invocation.arguments.get("required_text") or []
+        raw_forbidden = invocation.arguments.get("forbidden") or invocation.arguments.get("forbidden_text") or []
+        required = [str(raw_required)] if isinstance(raw_required, str) else [str(item) for item in raw_required if str(item).strip()]
+        forbidden = [str(raw_forbidden)] if isinstance(raw_forbidden, str) else [str(item) for item in raw_forbidden if str(item).strip()]
+        if not required and not forbidden:
+            return _fail(invocation, "Provide required or forbidden page text/state assertions")
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            result = _run(
+                self._backend.run_js(
+                    session_id,
+                    _browser_assert_page_state_script(required=required, forbidden=forbidden),
+                )
+            )
+            if not isinstance(result, dict):
+                return _fail(invocation, "Page state assertion returned an invalid result.")
+            if not result.get("ok"):
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"result": result, "session_id": session_id},
+                    error="Page state assertion failed",
+                )
+            return _ok(invocation, {"result": result, "verified": True, "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Page state assertion failed: {e}")
 
     def browser_find(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector", "")

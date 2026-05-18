@@ -31,7 +31,7 @@ from typing import Callable, Iterable, Protocol
 import base64
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
 from nullion.artifacts import promote_supporting_asset_artifact_paths
@@ -42,6 +42,7 @@ from nullion.approvals import (
     create_approval_request,
     is_boundary_permit_active,
     is_permission_grant_active,
+    revoke_permission_grant as revoke_permission_grant_record,
 )
 from nullion.audit import make_audit_record
 from nullion.events import make_event
@@ -792,6 +793,18 @@ ToolHandler = Callable[[ToolInvocation], ToolResult]
 ToolCleanupHook = Callable[[str | None], None]
 
 
+def _clear_deep_agent_profile_cache() -> None:
+    try:
+        from nullion.deep_agent_profiles import clear_deep_agent_profile_caches
+
+        clear_deep_agent_profile_caches()
+        from nullion.cron_delivery import clear_cron_execution_metadata_caches
+
+        clear_cron_execution_metadata_caches()
+    except Exception:
+        logger.debug("Could not clear Deep Agents profile cache", exc_info=True)
+
+
 _TEXT_FILE_WRITE_BLOCKED_EXTENSIONS = frozenset({
     ".doc",
     ".docx",
@@ -1222,6 +1235,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 "start": {"type": "string", "description": "Inclusive ISO-8601 start datetime."},
                 "end": {"type": "string", "description": "Exclusive ISO-8601 end datetime."},
                 "max": {"type": "integer", "minimum": 1, "description": "Maximum number of events to return."},
+                "provider_id": {
+                    "type": "string",
+                    "description": "Optional connector provider id. Defaults to an active calendar-capable connector.",
+                },
             },
             "required": ["start", "end"],
             "additionalProperties": False,
@@ -2040,10 +2057,12 @@ class ToolRegistry:
             raise ValueError(f"Tool already registered: {spec.name}")
         self._specs[spec.name] = spec
         self._handlers[spec.name] = handler
+        _clear_deep_agent_profile_cache()
 
     def unregister(self, name: str) -> None:
         self._specs.pop(name, None)
         self._handlers.pop(name, None)
+        _clear_deep_agent_profile_cache()
 
     def get_spec(self, name: str) -> ToolSpec:
         return self._specs[name]
@@ -2279,11 +2298,17 @@ def _account_tool_failure_output(
 
 
 def _connector_request_boundary_preapproved(invocation: "ToolInvocation", fact: BoundaryFact) -> bool:
-    if invocation.tool_name != "connector_request":
-        return False
     provider_id = str(invocation.arguments.get("provider_id") or "").strip()
     if not provider_id:
-        return False
+        if invocation.tool_name in {"email_search", "email_read"}:
+            try:
+                from nullion.connections import default_email_connector_provider_id
+
+                provider_id = default_email_connector_provider_id(invocation.principal_id) or ""
+            except Exception:
+                provider_id = ""
+        if not provider_id:
+            return False
     try:
         from nullion.connections import connection_for_principal
 
@@ -2291,6 +2316,14 @@ def _connector_request_boundary_preapproved(invocation: "ToolInvocation", fact: 
     except Exception:
         connection = None
     if connection is None or not getattr(connection, "active", True):
+        return False
+    if invocation.tool_name in {"email_search", "email_read"}:
+        return (
+            fact.kind is BoundaryKind.ACCOUNT_ACCESS
+            and fact.operation == "read"
+            and fact.target == provider_id
+        )
+    if invocation.tool_name != "connector_request":
         return False
     if fact.kind is BoundaryKind.ACCOUNT_ACCESS:
         if fact.operation != "read":
@@ -2512,6 +2545,8 @@ class ToolExecutor:
         return False
 
     def _has_required_tool_grant(self, invocation: ToolInvocation) -> bool:
+        if invocation.tool_name == "email_send":
+            return bool(self._matching_email_send_review_grants(invocation))
         return self._has_active_grant(
             principal_id=invocation.principal_id,
             permissions=(
@@ -2521,7 +2556,54 @@ class ToolExecutor:
             ),
         )
 
+    def _matching_email_send_review_grants(self, invocation: ToolInvocation):
+        current_arguments = redact_value(dict(invocation.arguments or {}))
+        matching_approval_ids: set[str] = set()
+        for approval in self._store.list_approval_requests():
+            if getattr(getattr(approval, "status", None), "value", getattr(approval, "status", "")) != "approved":
+                continue
+            if approval.requested_by != invocation.principal_id:
+                continue
+            if approval.action != "use_tool" or approval.resource != "email_send":
+                continue
+            context = approval.context if isinstance(approval.context, dict) else {}
+            if context.get("tool_arguments") == current_arguments:
+                matching_approval_ids.add(approval.approval_id)
+        if not matching_approval_ids:
+            return []
+        grants = []
+        principal_ids = {
+            invocation.principal_id,
+            permission_scope_principal(invocation.principal_id),
+            OPERATOR_PERMISSION_PRINCIPAL,
+        }
+        for grant in self._store.list_permission_grants():
+            if grant.approval_id not in matching_approval_ids:
+                continue
+            if grant.principal_id not in principal_ids:
+                continue
+            if grant.permission not in {"tool:email_send", "tool.email_send", "email_send"}:
+                continue
+            if is_permission_grant_active(grant):
+                grants.append(grant)
+        return grants
+
+    def _revoke_email_send_review_grants(self, invocation: ToolInvocation) -> None:
+        for grant in self._matching_email_send_review_grants(invocation):
+            try:
+                self._store.add_permission_grant(
+                    revoke_permission_grant_record(
+                        grant,
+                        revoked_by="runtime",
+                        revoked_at=datetime.now(UTC),
+                        reason="Email send review approval consumed.",
+                    )
+                )
+            except Exception:
+                logger.debug("Could not revoke consumed email_send approval grant", exc_info=True)
+
     def _find_pending_tool_approval(self, invocation: ToolInvocation):
+        current_arguments = redact_value(dict(invocation.arguments or {})) if invocation.tool_name == "email_send" else None
         for approval in self._store.list_approval_requests():
             if approval.status.value != "pending":
                 continue
@@ -2531,6 +2613,10 @@ class ToolExecutor:
                 continue
             if approval.resource != invocation.tool_name:
                 continue
+            if current_arguments is not None:
+                context = approval.context if isinstance(approval.context, dict) else {}
+                if context.get("tool_arguments") != current_arguments:
+                    continue
             return approval
         return None
 
@@ -2928,6 +3014,8 @@ class ToolExecutor:
             )
         duration_ms = (perf_counter() - started_at) * 1000
         result = normalize_tool_result(result)
+        if invocation.tool_name == "email_send" and result.status != "denied":
+            self._revoke_email_send_review_grants(invocation)
         self._record_egress_outcome(invocation, result, egress_attempts)
         result = self._rewrite_network_denied_result_as_boundary_approval_required(invocation, result)
         if invocation.tool_name != "terminal_exec" and result.status != "denied":
@@ -4812,12 +4900,26 @@ def _resolve_open_meteo_location(
         }
     if not location_text:
         raise ValueError("Provide location_text or latitude and longitude.")
-    query = urlencode({"name": location_text, "count": 1, "language": "en", "format": "json"})
-    source_url = f"https://geocoding-api.open-meteo.com/v1/search?{query}"
-    payload = json_get(source_url, 10)
-    results = payload.get("results")
+    source_url = ""
+    results: object = None
+    searched_locations: list[str] = []
+    candidate_locations = [location_text]
+    zip_match = re.search(r"(?<!\d)(\d{5})(?:-\d{4})?(?!\d)", location_text)
+    if zip_match:
+        zip_code = zip_match.group(1)
+        if zip_code != location_text:
+            candidate_locations.append(zip_code)
+    for candidate_location in dict.fromkeys(candidate_locations):
+        searched_locations.append(candidate_location)
+        query = urlencode({"name": candidate_location, "count": 1, "language": "en", "format": "json"})
+        source_url = f"https://geocoding-api.open-meteo.com/v1/search?{query}"
+        payload = json_get(source_url, 10)
+        results = payload.get("results")
+        if isinstance(results, list) and results:
+            break
     if not isinstance(results, list) or not results:
-        raise ValueError(f"Could not resolve location: {location_text}")
+        searched = ", ".join(searched_locations)
+        raise ValueError(f"Could not resolve location: {location_text}" + (f" (tried: {searched})" if searched else ""))
     first = results[0]
     if not isinstance(first, dict):
         raise ValueError(f"Could not resolve location: {location_text}")
@@ -5377,6 +5479,60 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
             _build_connector_request_handler(),
         )
     try:
+        registry.get_spec("email_search")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="email_search",
+                description=(
+                    "Search messages through an active Google Mail connector. Use this for inbox checks, "
+                    "triage, and finding messages before reading them."
+                ),
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=20,
+                capability_tags=("email", "connector", "account_read"),
+            ),
+            _build_connector_email_search_handler(),
+        )
+    try:
+        registry.get_spec("email_read")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="email_read",
+                description="Read one message through an active Google Mail connector using an id from email_search.",
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=20,
+                capability_tags=("email", "connector", "account_read"),
+            ),
+            _build_connector_email_read_handler(),
+        )
+    try:
+        registry.get_spec("calendar_list")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="calendar_list",
+                description=(
+                    "List calendar events through an active Google Calendar connector for a specific time window. "
+                    "Use this for checking the user's calendar, agenda, schedule, or availability."
+                ),
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=20,
+                capability_tags=("calendar", "connector", "account_read"),
+            ),
+            _build_connector_calendar_list_handler(),
+        )
+    try:
         registry.get_spec("email_send")
         return
     except KeyError:
@@ -5392,7 +5548,7 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
             ),
             risk_level=ToolRiskLevel.HIGH,
             side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
-            requires_approval=False,
+            requires_approval=True,
             timeout_seconds=20,
             capability_tags=("email", "connector"),
         ),
@@ -5472,6 +5628,36 @@ def _default_email_connector_provider_id(principal_id: str | None) -> str:
     raise RuntimeError("No active Google Mail connector is available for this workspace/principal.")
 
 
+def _default_calendar_connector_provider_id(principal_id: str | None) -> str:
+    try:
+        from nullion.connections import connection_for_principal, load_connection_registry
+    except Exception:
+        raise RuntimeError("No active calendar connector is available for this workspace/principal.")
+    fallback_provider_id = ""
+    try:
+        connections = load_connection_registry().connections
+    except Exception:
+        connections = ()
+    for connection in connections:
+        provider_id = str(getattr(connection, "provider_id", "") or "").strip()
+        if not provider_id or not getattr(connection, "active", True):
+            continue
+        lowered_provider = provider_id.lower()
+        if not (lowered_provider.startswith("skill_pack_connector_") or lowered_provider.endswith("_connector_provider")):
+            continue
+        scoped_connection = connection_for_principal(principal_id, provider_id)
+        if scoped_connection is None:
+            continue
+        display_name = str(getattr(scoped_connection, "display_name", "") or "").lower()
+        if "calendar" in lowered_provider or "calendar" in display_name:
+            return provider_id
+        if not fallback_provider_id:
+            fallback_provider_id = provider_id
+    if fallback_provider_id:
+        return fallback_provider_id
+    raise RuntimeError("No active calendar connector is available for this workspace/principal.")
+
+
 def _email_send_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
     base_urls = _connector_allowed_base_urls(connection, provider_id)
     for base_url in base_urls:
@@ -5479,6 +5665,170 @@ def _email_send_endpoint_for_provider(connection: object | None, provider_id: st
         if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
             return f"{parsed.scheme}://{parsed.netloc}/google-mail/gmail/v1/users/me/messages/send"
     return "https://api.maton.ai/google-mail/gmail/v1/users/me/messages/send"
+
+
+def _email_messages_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
+    base_urls = _connector_allowed_base_urls(connection, provider_id)
+    for base_url in base_urls:
+        parsed = urlparse(base_url)
+        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
+            return f"{parsed.scheme}://{parsed.netloc}/google-mail/gmail/v1/users/me/messages"
+    return "https://api.maton.ai/google-mail/gmail/v1/users/me/messages"
+
+
+def _calendar_events_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
+    base_urls = _connector_allowed_base_urls(connection, provider_id)
+    for base_url in base_urls:
+        parsed = urlparse(base_url)
+        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
+            return f"{parsed.scheme}://{parsed.netloc}/google-calendar/calendar/v3/calendars/primary/events"
+    return "https://api.maton.ai/google-calendar/calendar/v3/calendars/primary/events"
+
+
+def _connector_json_request(
+    invocation: ToolInvocation,
+    *,
+    provider_id: str,
+    url: str,
+    params: dict[str, object] | None = None,
+    method: str = "GET",
+    json_payload: object | None = None,
+) -> dict[str, object]:
+    connection = _connector_connection_for_invocation(invocation, provider_id)
+    normalized_method = _connector_request_method(method)
+    if normalized_method not in _CONNECTOR_READ_METHODS and not _connector_connection_allows_write(connection):
+        raise RuntimeError(f"{provider_id} is configured as read-only for connector_request.")
+    request_url = _connector_request_url(url, params or {}, connection, provider_id)
+    resolution = _resolve_web_fetch_resolution(request_url)
+    headers = _connector_request_headers(connection, provider_id)
+    data = None
+    if json_payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(json_payload).encode("utf-8")
+    request = urllib.request.Request(request_url, data=data, headers=headers, method=normalized_method)
+    opener = _build_web_fetch_opener()
+    with _pinned_web_fetch_resolution(resolution):
+        with opener.open(request, timeout=_connector_request_timeout_seconds()) as response:
+            body = response.read(1_000_000).decode("utf-8", "ignore")
+    payload = json.loads(body or "{}")
+    if not isinstance(payload, dict):
+        raise RuntimeError("connector returned non-object JSON")
+    return payload
+
+
+def _connector_request_timeout_seconds() -> int:
+    try:
+        raw = int(os.environ.get("NULLION_CONNECTOR_REQUEST_TIMEOUT_SECONDS", "12"))
+    except ValueError:
+        raw = 12
+    return max(3, min(raw, 30))
+
+
+def _gmail_header_map(message: dict[str, object]) -> dict[str, str]:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return {}
+    headers = payload.get("headers")
+    if not isinstance(headers, list):
+        return {}
+    wanted = {"from", "to", "cc", "subject", "date"}
+    mapped: dict[str, str] = {}
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        name = str(header.get("name") or "").strip().lower()
+        value = str(header.get("value") or "").strip()
+        if name in wanted and value:
+            mapped[name] = value
+    return mapped
+
+
+def _gmail_decode_body_data(data: object) -> str:
+    if not isinstance(data, str) or not data.strip():
+        return ""
+    padded = data + ("=" * ((4 - len(data) % 4) % 4))
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _gmail_message_body_text(message: dict[str, object], *, limit: int = 6000) -> str:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    candidates: list[tuple[str, str]] = []
+
+    def visit(part: object) -> None:
+        if not isinstance(part, dict):
+            return
+        mime_type = str(part.get("mimeType") or "").strip().lower()
+        body = part.get("body")
+        if isinstance(body, dict):
+            text = _gmail_decode_body_data(body.get("data"))
+            if text.strip():
+                candidates.append((mime_type, text))
+        for child in part.get("parts") if isinstance(part.get("parts"), list) else []:
+            visit(child)
+
+    visit(payload)
+    text = next((value for mime, value in candidates if mime == "text/plain"), "")
+    if not text:
+        html = next((value for mime, value in candidates if mime == "text/html"), "")
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = unescape(text)
+    if not text and candidates:
+        text = candidates[0][1]
+    return " ".join(text.split())[:limit]
+
+
+def _compact_gmail_message(message: dict[str, object], *, include_body: bool = False) -> dict[str, object]:
+    compact: dict[str, object] = {
+        "id": message.get("id"),
+        "threadId": message.get("threadId"),
+    }
+    headers = _gmail_header_map(message)
+    if headers:
+        compact["headers"] = headers
+        for key in ("from", "subject", "date"):
+            if key in headers:
+                compact[key] = headers[key]
+    snippet = message.get("snippet")
+    if isinstance(snippet, str) and snippet.strip():
+        compact["snippet"] = snippet.strip()
+    label_ids = message.get("labelIds")
+    if isinstance(label_ids, list):
+        compact["labelIds"] = [str(item) for item in label_ids[:12]]
+    if include_body:
+        body = _gmail_message_body_text(message)
+        if body:
+            compact["body"] = body
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def _compact_google_calendar_event(event: dict[str, object]) -> dict[str, object]:
+    compact: dict[str, object] = {
+        "id": event.get("id"),
+        "summary": event.get("summary"),
+        "status": event.get("status"),
+        "start": event.get("start"),
+        "end": event.get("end"),
+        "location": event.get("location"),
+        "description": event.get("description"),
+        "htmlLink": event.get("htmlLink"),
+    }
+    attendees = event.get("attendees")
+    if isinstance(attendees, list):
+        compact["attendees"] = [
+            {
+                key: attendee.get(key)
+                for key in ("email", "displayName", "responseStatus")
+                if isinstance(attendee, dict) and attendee.get(key) not in (None, "", [], {})
+            }
+            for attendee in attendees[:20]
+            if isinstance(attendee, dict)
+        ]
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
 
 def _email_message_for_invocation(invocation: ToolInvocation) -> tuple[EmailMessage, list[str]]:
@@ -5740,6 +6090,205 @@ def _build_connector_request_handler() -> ToolHandler:
                 tool_name=invocation.tool_name,
                 status="failed",
                 output={"provider_id": provider_id},
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_email_search_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_query = invocation.arguments.get("query")
+        raw_limit = invocation.arguments.get("limit", 10)
+        if not isinstance(raw_query, str) or not raw_query.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: query",
+            )
+        if not isinstance(raw_limit, int) or raw_limit <= 0:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="limit must be a positive integer",
+            )
+        limit = min(raw_limit, 10)
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_email_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
+            listing = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params={"q": raw_query.strip(), "maxResults": limit},
+            )
+            raw_messages = listing.get("messages")
+            messages = raw_messages if isinstance(raw_messages, list) else []
+            results: list[dict[str, object]] = []
+            for item in messages[:limit]:
+                if not isinstance(item, dict):
+                    continue
+                message_id = str(item.get("id") or "").strip()
+                if not message_id:
+                    continue
+                detail = _connector_json_request(
+                    invocation,
+                    provider_id=provider_id,
+                    url=f"{endpoint}/{quote(message_id, safe='')}",
+                    params={"format": "full"},
+                )
+                results.append(_compact_gmail_message(detail, include_body=False))
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "query": raw_query.strip(),
+                    "provider_id": provider_id,
+                    "resultSizeEstimate": listing.get("resultSizeEstimate"),
+                    "results": results,
+                },
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=_account_tool_failure_output(invocation.principal_id, query=raw_query),
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_email_read_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_id = invocation.arguments.get("id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: id",
+            )
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_email_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
+            message = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=f"{endpoint}/{quote(raw_id.strip(), safe='')}",
+                params={"format": "full"},
+            )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "id": raw_id.strip(),
+                    "provider_id": provider_id,
+                    "message": _compact_gmail_message(message, include_body=True),
+                },
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=_account_tool_failure_output(invocation.principal_id, message_id=raw_id),
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_calendar_list_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_start = invocation.arguments.get("start")
+        raw_end = invocation.arguments.get("end")
+        raw_max = invocation.arguments.get("max", 10)
+        if not isinstance(raw_start, str) or not raw_start.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: start",
+            )
+        if not isinstance(raw_end, str) or not raw_end.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: end",
+            )
+        if not isinstance(raw_max, int) or raw_max <= 0:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="max must be a positive integer",
+            )
+        limit = min(raw_max, 50)
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_calendar_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            endpoint = _calendar_events_endpoint_for_provider(connection, provider_id)
+            listing = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params={
+                    "timeMin": raw_start.strip(),
+                    "timeMax": raw_end.strip(),
+                    "maxResults": limit,
+                    "singleEvents": "true",
+                    "orderBy": "startTime",
+                },
+            )
+            raw_items = listing.get("items")
+            items = raw_items if isinstance(raw_items, list) else []
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "provider_id": provider_id,
+                    "start": raw_start.strip(),
+                    "end": raw_end.strip(),
+                    "max": limit,
+                    "result_count": len(items[:limit]),
+                    "results": [
+                        _compact_google_calendar_event(item)
+                        for item in items[:limit]
+                        if isinstance(item, dict)
+                    ],
+                },
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=_account_tool_failure_output(invocation.principal_id),
                 error=str(exc),
             )
 
@@ -6141,6 +6690,7 @@ def register_email_plugin(
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
                 timeout_seconds=20,
+                capability_tags=("email", "connector", "account_read"),
             ),
             _build_email_search_handler(email_searcher),
         )
@@ -6151,14 +6701,15 @@ def register_email_plugin(
             registry.register(
                 ToolSpec(
                     name="email_read",
-                    description="Read a single email message via the configured provider.",
-                    risk_level=ToolRiskLevel.LOW,
-                    side_effect_class=ToolSideEffectClass.READ,
-                    requires_approval=False,
-                    timeout_seconds=20,
-                ),
-                _build_email_read_handler(email_reader),
-            )
+                description="Read a single email message via the configured provider.",
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=20,
+                capability_tags=("email", "connector", "account_read"),
+            ),
+            _build_email_read_handler(email_reader),
+        )
     return registry
 
 
@@ -6178,14 +6729,15 @@ def register_calendar_plugin(
         registry.register(
             ToolSpec(
                 name="calendar_list",
-                description="List calendar events via the configured provider.",
-                risk_level=ToolRiskLevel.LOW,
-                side_effect_class=ToolSideEffectClass.READ,
-                requires_approval=False,
-                timeout_seconds=20,
-            ),
-            _build_calendar_list_handler(calendar_lister),
-        )
+            description="List calendar events via the configured provider.",
+            risk_level=ToolRiskLevel.LOW,
+            side_effect_class=ToolSideEffectClass.READ,
+            requires_approval=False,
+            timeout_seconds=20,
+            capability_tags=("calendar", "connector", "account_read"),
+        ),
+        _build_calendar_list_handler(calendar_lister),
+    )
     return registry
 
 
@@ -6550,6 +7102,7 @@ def register_media_plugin(
                     side_effect_class=ToolSideEffectClass.WRITE,
                     requires_approval=False,
                     timeout_seconds=120,
+                    capability_tags=("media", "image_generation"),
                 ),
                 _build_image_generate_handler(image_generator),
             )
@@ -6801,6 +7354,8 @@ def _build_list_reminders_handler(runtime) -> ToolHandler:
     """Return a handler that lists all pending (undelivered) reminders."""
 
     def handler(invocation: ToolInvocation) -> ToolResult:
+        from nullion.reminders import reminder_due_at_output
+
         try:
             all_reminders = runtime.store.list_reminders()
             pending = [
@@ -6808,6 +7363,7 @@ def _build_list_reminders_handler(runtime) -> ToolHandler:
                     "task_id": r.task_id,
                     "text": r.text,
                     "due_at": r.due_at.isoformat(),
+                    **reminder_due_at_output(r.due_at),
                     "chat_id": r.chat_id,
                 }
                 for r in all_reminders
@@ -6885,12 +7441,20 @@ def register_reminder_tools(
     registry.register(
         ToolSpec(
             name="list_reminders",
-            description="List all pending (not yet delivered) reminders.",
+            description=(
+                "List all pending one-off reminders. This is not for scheduled cron jobs; "
+                "use list_crons/run_cron for cron jobs."
+            ),
             risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.READ,
             requires_approval=False,
             timeout_seconds=10,
             capability_tags=("scheduler", "reminder"),
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
         ),
         _build_list_reminders_handler(runtime),
     )
@@ -6926,7 +7490,7 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
 
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.cron_delivery import normalize_cron_delivery_channel
-        from nullion.crons import add_cron
+        from nullion.crons import add_cron, cron_display_fields
         args = invocation.arguments or {}
         name     = str(args.get("name", "")).strip()
         schedule = str(args.get("schedule", "")).strip()
@@ -6968,7 +7532,10 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
                 output={},
                 error=f"Failed to create cron: {exc}",
             )
-        next_info = f"  Next run: {job.next_run}" if job.next_run else ""
+        display = cron_display_fields(job)
+        schedule_description = display["schedule_description"]
+        next_description = display["next_run_description"]
+        next_info = f" Next run: {next_description}." if next_description else ""
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
@@ -6983,7 +7550,12 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
                 "delivery_target": job.delivery_target,
                 "enabled": job.enabled,
                 "next_run": job.next_run,
-                "message": f"Cron created: '{job.name}' (id={job.id}) in workspace {job.workspace_id} — runs `{job.schedule}`{next_info}",
+                "schedule_description": schedule_description,
+                "next_run_description": next_description,
+                "message": (
+                    f"Cron created: '{job.name}' in workspace {job.workspace_id}. "
+                    f"Schedule: {schedule_description}.{next_info}"
+                ),
             },
             error=None,
         )
@@ -6991,18 +7563,19 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
 
 
 def _build_list_crons_handler():
-    def _cron_display_line(job: object) -> str:
+    def _cron_display_line(index: int, job: object, display: dict[str, str]) -> str:
         name = str(getattr(job, "name", "") or "Untitled scheduled task").strip()
         schedule = str(getattr(job, "schedule", "") or "").strip()
         workspace_id = str(getattr(job, "workspace_id", "") or "").strip()
         enabled = bool(getattr(job, "enabled", False))
         next_run = str(getattr(job, "next_run", "") or "").strip()
         status = "enabled" if enabled else "disabled"
-        parts = [f"- {name}", f"Status: {status}"]
+        parts = [f"{index}. {name}", f"Status: {status}"]
         if schedule:
-            parts.append(f"Schedule: {schedule}")
+            parts.append(f"Schedule: {display['schedule_description']}")
         if next_run:
-            parts.append(f"Next run: {next_run}")
+            next_description = display["next_run_description"] or next_run
+            parts.append(f"Next run: {next_description}")
         if workspace_id:
             parts.append(f"Workspace: {workspace_id}")
         parts.append(f'Run by name: run_cron name="{name}"')
@@ -7010,7 +7583,7 @@ def _build_list_crons_handler():
 
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.connections import workspace_id_for_principal
-        from nullion.crons import list_crons
+        from nullion.crons import cron_display_fields, cron_display_timezone, list_crons
 
         args = invocation.arguments or {}
         include_all = bool(args.get("include_all_workspaces", False))
@@ -7026,25 +7599,29 @@ def _build_list_crons_handler():
             )
         lines = []
         crons = []
-        for j in jobs:
-            lines.append(_cron_display_line(j))
+        cron_tz = cron_display_timezone()
+        for index, j in enumerate(jobs, start=1):
+            display = cron_display_fields(j, tz=cron_tz)
+            lines.append(_cron_display_line(index, j, display))
             run_by_name = f'run_cron name="{j.name}"'
             crons.append(
                 {
+                    "selection_index": index,
                     "id": j.id,
                     "name": j.name,
                     "display_name": j.name,
-                    "schedule": j.schedule,
                     "workspace_id": j.workspace_id,
                     "delivery_channel": j.delivery_channel,
                     "delivery_target": j.delivery_target,
                     "enabled": j.enabled,
-                    "next_run": j.next_run,
+                    "schedule_description": display["schedule_description"],
+                    "next_run_description": display["next_run_description"],
                     "last_run": j.last_run,
                     "run_by_name": run_by_name,
                     "presentation_hint": (
-                        "Show this scheduled task by name first. Do not lead with the raw id. "
-                        "Mention the raw id only if there are duplicate names or the user asks for ids."
+                        "Show schedule_description and next_run_description for timing. "
+                        "Do not show cron expressions, raw ids, ISO timestamps, or UTC conversions unless the user asks for technical details. "
+                        "When asking the user to choose, show numbered options and accept the number."
                     ),
                     "task": j.task,
                     "has_task": bool(str(j.task or "").strip()),
@@ -7262,7 +7839,9 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         return DEFAULT_CRON_NO_OUTPUT_MESSAGE
 
     def _cron_lookup_parts(value: object) -> tuple[str, tuple[str, ...]]:
-        text = str(value or "").casefold()
+        from nullion.text_match import ascii_match_text
+
+        text = ascii_match_text(value).casefold()
         tokens: list[str] = []
         current: list[str] = []
         for char in text:
@@ -7273,7 +7852,13 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
                 current = []
         if current:
             tokens.append("".join(current))
-        return "".join(tokens), tuple(tokens)
+        expanded_tokens: list[str] = []
+        for token in tokens:
+            expanded_tokens.append(token)
+            for suffix in ("ing", "ers", "er", "ed", "s"):
+                if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+                    expanded_tokens.append(token[: -len(suffix)])
+        return "".join(tokens), tuple(dict.fromkeys(expanded_tokens))
 
     def _cron_name_match_rank(query: str, candidate_name: str) -> int | None:
         query_text = str(query or "").strip()
@@ -7297,19 +7882,110 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
             return 3
         return None
 
+    def _cron_reference_match_rank(query: str, candidate_text: str) -> int | None:
+        rank = _cron_name_match_rank(query, candidate_text)
+        if rank is not None:
+            return rank
+        _query_compact, query_tokens = _cron_lookup_parts(query)
+        _candidate_compact, candidate_tokens = _cron_lookup_parts(candidate_text)
+        overlap = set(query_tokens).intersection(candidate_tokens)
+        if len(overlap) >= 2:
+            return 5
+        fuzzy_overlap = _fuzzy_cron_token_overlap(query_tokens, candidate_tokens)
+        if len(fuzzy_overlap) >= 1 and len(query_tokens) <= 4:
+            return 6
+        return None
+
+    def _fuzzy_cron_token_overlap(query_tokens: tuple[str, ...], candidate_tokens: tuple[str, ...]) -> set[str]:
+        from difflib import SequenceMatcher
+
+        matches: set[str] = set()
+        candidate_set = {token for token in candidate_tokens if len(token) >= 6}
+        for query_token in query_tokens:
+            if len(query_token) < 6:
+                continue
+            for candidate_token in candidate_set:
+                length_delta = abs(len(query_token) - len(candidate_token))
+                if length_delta > max(2, len(candidate_token) // 4):
+                    continue
+                if SequenceMatcher(None, query_token, candidate_token).ratio() >= 0.86:
+                    matches.add(query_token)
+                    break
+        return matches
+
+    def _significant_cron_tokens(value: object) -> set[str]:
+        _compact, tokens = _cron_lookup_parts(value)
+        return {token for token in tokens if len(token) >= 5}
+
+    def _cron_search_text(candidate: object) -> str:
+        return " ".join(
+            (
+                str(getattr(candidate, "name", "") or ""),
+                str(getattr(candidate, "task", "") or ""),
+            )
+        )
+
+    def _descriptive_cron_matches(query: str, jobs: list[object]) -> list[object]:
+        query_tokens = _significant_cron_tokens(query)
+        if not query_tokens:
+            return []
+        scored: list[tuple[int, object]] = []
+        for candidate in jobs:
+            if not bool(getattr(candidate, "enabled", True)):
+                continue
+            candidate_tokens = _significant_cron_tokens(_cron_search_text(candidate))
+            overlap = query_tokens.intersection(candidate_tokens)
+            fuzzy_overlap = _fuzzy_cron_token_overlap(tuple(query_tokens), tuple(candidate_tokens))
+            score = len(overlap) * 2 + len(fuzzy_overlap)
+            if score:
+                scored.append((score, candidate))
+        if not scored:
+            return []
+        best_score = max(score for score, _candidate in scored)
+        return [candidate for score, candidate in scored if score == best_score]
+
     def _unique_cron_name_match(query: str, jobs: list[object]) -> tuple[object | None, list[object]]:
         ranked: list[tuple[int, object]] = []
         for candidate in jobs:
             rank = _cron_name_match_rank(query, str(getattr(candidate, "name", "") or ""))
+            if rank is None and bool(getattr(candidate, "enabled", True)):
+                search_rank = _cron_reference_match_rank(query, _cron_search_text(candidate))
+                if search_rank is not None:
+                    rank = search_rank + 2
             if rank is not None:
                 ranked.append((rank, candidate))
         if not ranked:
+            descriptive_matches = _descriptive_cron_matches(query, jobs)
+            if len(descriptive_matches) == 1:
+                return descriptive_matches[0], descriptive_matches
+            if descriptive_matches:
+                return None, descriptive_matches
             return None, []
         best_rank = min(rank for rank, _candidate in ranked)
         matches = [candidate for rank, candidate in ranked if rank == best_rank]
         if len(matches) == 1:
             return matches[0], matches
+        descriptive_matches = _descriptive_cron_matches(query, matches)
+        if len(descriptive_matches) == 1:
+            return descriptive_matches[0], descriptive_matches
+        if descriptive_matches:
+            return None, descriptive_matches
         return None, matches
+
+    def _numbered_cron_matches(matches: list[object]) -> list[dict[str, object]]:
+        return [
+            {
+                "selection_index": index,
+                "id": item.id,
+                "name": item.name,
+                "schedule": item.schedule,
+                "workspace_id": item.workspace_id,
+                "enabled": item.enabled,
+                "next_run": item.next_run,
+                "reply_with": str(index),
+            }
+            for index, item in enumerate(matches, start=1)
+        ]
 
     def _foreground_cron_result_view(text: str) -> tuple[str, int]:
         from nullion.artifacts import parse_media_directive_line
@@ -7405,6 +8081,7 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
                     "final_text",
                     "message",
                     "result_text",
+                    "status_delivered",
                 })
             return {
                 key: value
@@ -7448,25 +8125,20 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         if job is None and raw_name:
             job, matches = _unique_cron_name_match(raw_name, list_crons(workspace_id=workspace_id))
             if job is None and matches:
+                numbered_matches = _numbered_cron_matches(matches)
                 return ToolResult(
                     invocation_id=invocation.invocation_id,
                     tool_name=invocation.tool_name,
                     status="failed",
                     output={
                         "name": raw_name,
-                        "matches": [
-                            {
-                                "id": item.id,
-                                "name": item.name,
-                                "schedule": item.schedule,
-                                "workspace_id": item.workspace_id,
-                                "enabled": item.enabled,
-                                "next_run": item.next_run,
-                            }
-                            for item in matches
-                        ],
+                        "matches": numbered_matches,
+                        "message": "\n".join(
+                            f"{item['selection_index']}. {item['name']}" for item in numbered_matches
+                        ),
+                        "presentation_hint": "Ask the user to choose by number.",
                     },
-                    error="Multiple crons matched that name; use id from list_crons.",
+                    error="Multiple crons matched; ask the user to choose by number.",
                 )
         if job is None:
             lookup = raw_id or raw_name
@@ -7575,6 +8247,8 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
             planner_summary = str(runner_output.get("planner_summary") or "").strip()
             if planner_summary:
                 output["planner_summary"] = planner_summary
+            if runner_output.get("status_delivered") is True:
+                output["status_delivered"] = True
         if removed_media_count:
             output["foreground_media_directive_count"] = removed_media_count
         if isinstance(runner_output, dict):
@@ -7717,16 +8391,29 @@ def register_cron_tools(
         ToolSpec(
             name="run_cron",
             description=(
-                "Run an existing scheduled cron job immediately. Prefer the exact visible cron name from list_crons. "
-                "Use id only when names are ambiguous or the user explicitly provides an id. "
-                "Required args: id or name. Name matching is conservative and punctuation-insensitive; "
-                "ambiguous names return candidate ids instead of running a job."
+                "Run an existing scheduled cron job immediately. Use the exact visible cron name from list_crons "
+                "when it is known, or pass the user's partial/descriptive reference as name so the scheduler can "
+                "resolve it against the structured cron records. Use id only when names are ambiguous or the user "
+                "explicitly provides an id. Required args: id or name. Matching is conservative and "
+                "punctuation-insensitive; ambiguous references return numbered candidate options instead of "
+                "running a job."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
             side_effect_class=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout_seconds=120,
             capability_tags=("scheduler", "cron"),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Exact cron id when known."},
+                    "name": {
+                        "type": "string",
+                        "description": "Exact, partial, or descriptive cron name/reference to resolve conservatively.",
+                    },
+                },
+                "additionalProperties": False,
+            },
         ),
         _build_run_cron_handler(cron_runner),
     )

@@ -31,6 +31,7 @@ def _make_spec(
     side_effect: ToolSideEffectClass = ToolSideEffectClass.READ,
     requires_approval: bool = False,
     timeout: int = 30,
+    input_schema: dict[str, object] | None = None,
 ) -> ToolSpec:
     return ToolSpec(
         name=name,
@@ -39,7 +40,37 @@ def _make_spec(
         side_effect_class=side_effect,
         requires_approval=requires_approval,
         timeout_seconds=timeout,
+        input_schema=input_schema,
     )
+
+
+def _object_schema(
+    properties: dict[str, object],
+    *,
+    required: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            **properties,
+            "session_id": {
+                "type": "string",
+                "description": "Optional browser session id. Omit for the current workspace browser session.",
+            },
+        },
+        "required": required or [],
+        "additionalProperties": False,
+    }
+
+
+_BROWSER_TARGET_PROPERTIES: dict[str, object] = {
+    "selector": {"type": "string", "description": "CSS or Playwright selector. Prefer semantic fields when available."},
+    "label": {"type": "string", "description": "Accessible label text for the element or field."},
+    "placeholder": {"type": "string", "description": "Placeholder text for an input field."},
+    "role": {"type": "string", "description": "ARIA role such as button, textbox, link, combobox, or option."},
+    "name": {"type": "string", "description": "Accessible name used with role, or visible name fallback."},
+    "text": {"type": "string", "description": "Visible text for a clickable element."},
+}
 
 
 def register_browser_tools(
@@ -71,34 +102,191 @@ def register_browser_tools(
 
     registry.register(
         _make_spec(
+            "browser_open",
+            "Open or focus the configured agent browser session without navigating away from the current page.",
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.READ,
+            timeout=10,
+            input_schema=_object_schema({}),
+        ),
+        tools.browser_open,
+    )
+    registry.register(
+        _make_spec(
             "browser_navigate",
             "Navigate to an HTTP/HTTPS URL, or to a local HTML file generated inside this workspace, in the browser. Returns when the page has loaded.",
             risk=ToolRiskLevel.MEDIUM,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
+            input_schema=_object_schema(
+                {
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP/HTTPS URL, or a local HTML file path/file URL inside this workspace.",
+                    }
+                },
+                required=["url"],
+            ),
         ),
         tools.browser_navigate,
     )
     registry.register(
         _make_spec(
             "browser_click",
-            "Click an element on the current page identified by a CSS selector.",
+            "Click an element on the current page identified by a CSS or Playwright selector. Prefer browser_click_element for QA/navigation.",
             risk=ToolRiskLevel.MEDIUM,
             side_effect=ToolSideEffectClass.WRITE,
             requires_approval=False,
             timeout=15,
+            input_schema=_object_schema(
+                {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the element to click, such as button[type=submit] or [aria-label='Search'].",
+                    }
+                },
+                required=["selector"],
+            ),
         ),
         tools.browser_click,
     )
     registry.register(
         _make_spec(
+            "browser_click_element",
+            "Click an element using semantic page targets: label, visible text, role/name, placeholder, or selector. Prefer this over raw CSS for QA/navigation.",
+            risk=ToolRiskLevel.MEDIUM,
+            side_effect=ToolSideEffectClass.WRITE,
+            requires_approval=False,
+            timeout=15,
+            input_schema=_object_schema(_BROWSER_TARGET_PROPERTIES),
+        ),
+        tools.browser_click_element,
+    )
+    registry.register(
+        _make_spec(
             "browser_type",
-            "Type text into a field identified by a CSS selector.",
+            "Type text into a field identified by a CSS or Playwright selector. Prefer browser_type_field for QA/navigation.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.WRITE,
             timeout=10,
+            input_schema=_object_schema(
+                {
+                    "selector": {"type": "string", "description": "CSS selector for the input or editable element."},
+                    "text": {"type": "string", "description": "Text to type into the selected element."},
+                },
+                required=["selector", "text"],
+            ),
         ),
         tools.browser_type,
+    )
+    registry.register(
+        _make_spec(
+            "browser_type_field",
+            "Type text into a field using semantic page targets: label, placeholder, role/name, or selector. Prefer this over raw CSS for QA/navigation.",
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.WRITE,
+            timeout=15,
+            input_schema=_object_schema(
+                {
+                    **{key: value for key, value in _BROWSER_TARGET_PROPERTIES.items() if key != "text"},
+                    "text": {"type": "string", "description": "Text to type into the matched field."},
+                },
+                required=["text"],
+            ),
+        ),
+        tools.browser_type_field,
+    )
+    registry.register(
+        _make_spec(
+            "browser_snapshot",
+            "Inspect the current page and return visible interactive elements with stable element_id values for reliable follow-up actions.",
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.READ,
+            timeout=10,
+            input_schema=_object_schema(
+                {
+                    "max_elements": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 250,
+                        "description": "Maximum number of visible interactive elements to return. Defaults to 120.",
+                    }
+                }
+            ),
+        ),
+        tools.browser_snapshot,
+    )
+    registry.register(
+        _make_spec(
+            "browser_click_id",
+            "Click a visible page element by element_id from browser_snapshot. Prefer this after taking a snapshot.",
+            risk=ToolRiskLevel.MEDIUM,
+            side_effect=ToolSideEffectClass.WRITE,
+            requires_approval=False,
+            timeout=10,
+            input_schema=_object_schema(
+                {
+                    "element_id": {
+                        "type": "string",
+                        "description": "Stable element_id returned by browser_snapshot.",
+                    }
+                },
+                required=["element_id"],
+            ),
+        ),
+        tools.browser_click_id,
+    )
+    registry.register(
+        _make_spec(
+            "browser_type_id",
+            "Type into an editable page element by element_id from browser_snapshot and verify the field value changed.",
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.WRITE,
+            timeout=10,
+            input_schema=_object_schema(
+                {
+                    "element_id": {
+                        "type": "string",
+                        "description": "Stable element_id returned by browser_snapshot.",
+                    },
+                    "text": {"type": "string", "description": "Text to enter into the field."},
+                    "clear": {
+                        "type": "boolean",
+                        "description": "Clear the existing value before typing. Defaults to true.",
+                    },
+                },
+                required=["element_id", "text"],
+            ),
+        ),
+        tools.browser_type_id,
+    )
+    registry.register(
+        _make_spec(
+            "browser_select_combobox",
+            "Fill a dynamic combobox/autocomplete field, select a compatible visible option, and fail instead of choosing the wrong option.",
+            risk=ToolRiskLevel.MEDIUM,
+            side_effect=ToolSideEffectClass.WRITE,
+            requires_approval=False,
+            timeout=15,
+            input_schema=_object_schema(
+                {
+                    "element_id": {
+                        "type": "string",
+                        "description": "Optional stable element_id returned by browser_snapshot.",
+                    },
+                    "label": {"type": "string", "description": "Accessible label for the combobox."},
+                    "placeholder": {"type": "string", "description": "Placeholder text for the combobox."},
+                    "name": {"type": "string", "description": "Name attribute for the combobox."},
+                    "query": {"type": "string", "description": "Text to type into the combobox."},
+                    "expected_text": {
+                        "type": "string",
+                        "description": "Expected selected option/value. Defaults to query.",
+                    },
+                },
+                required=["query"],
+            ),
+        ),
+        tools.browser_select_combobox,
     )
     registry.register(
         _make_spec(
@@ -107,6 +295,14 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            input_schema=_object_schema(
+                {
+                    "selector": {
+                        "type": "string",
+                        "description": "Optional CSS selector. If omitted, extract visible text from the whole page.",
+                    }
+                }
+            ),
         ),
         tools.browser_extract_text,
     )
@@ -118,6 +314,15 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            input_schema=_object_schema(
+                {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "viewport", "full_page"],
+                        "description": "Screenshot mode. Defaults to auto.",
+                    }
+                }
+            ),
         ),
         tools.browser_screenshot,
     )
@@ -128,18 +333,75 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=5,
+            input_schema=_object_schema(
+                {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down"],
+                        "description": "Scroll direction.",
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Pixel amount to scroll. Defaults to 600.",
+                    },
+                },
+                required=["direction"],
+            ),
         ),
         tools.browser_scroll,
     )
     registry.register(
         _make_spec(
             "browser_wait_for",
-            "Wait for a CSS selector to appear or for the URL to match a pattern.",
+            "Wait for any page condition: a CSS selector, URL glob, or visible page text. Use multiple conditions when a site may update in place instead of navigating.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
+            input_schema=_object_schema(
+                {
+                    "selector": {"type": "string", "description": "CSS selector to wait for."},
+                    "url_pattern": {
+                        "type": "string",
+                        "description": "Optional URL glob pattern to wait for.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Visible page text to wait for, useful when a form updates without changing URL.",
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "minimum": 0.1,
+                        "description": "Timeout in seconds. Defaults to 10.",
+                    },
+                }
+            ),
         ),
         tools.browser_wait_for,
+    )
+    registry.register(
+        _make_spec(
+            "browser_assert_page_state",
+            "Verify the current page visibly contains required state and omits forbidden state before reporting a browser task complete. Use after form selection, price/result screens, and before screenshots that must prove the requested state.",
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.READ,
+            timeout=10,
+            input_schema=_object_schema(
+                {
+                    "required": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Visible text or selected values that must be present. Address-like values require compatible numeric tokens.",
+                    },
+                    "forbidden": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Visible text or selected values that must not be present.",
+                    },
+                }
+            ),
+        ),
+        tools.browser_assert_page_state,
     )
     registry.register(
         _make_spec(
@@ -148,6 +410,15 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            input_schema=_object_schema(
+                {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for elements to find.",
+                    }
+                },
+                required=["selector"],
+            ),
         ),
         tools.browser_find,
     )
@@ -159,6 +430,15 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.WRITE,
             requires_approval=True,
             timeout=15,
+            input_schema=_object_schema(
+                {
+                    "script": {
+                        "type": "string",
+                        "description": "JavaScript expression or function body to execute in the current page.",
+                    }
+                },
+                required=["script"],
+            ),
         ),
         tools.browser_run_js,
     )
@@ -169,6 +449,7 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.WRITE,
             timeout=5,
+            input_schema=_object_schema({}),
         ),
         tools.browser_close,
     )

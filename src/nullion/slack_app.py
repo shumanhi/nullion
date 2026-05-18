@@ -39,7 +39,7 @@ from nullion.platform_activity import (
     platform_activity_capabilities,
     should_deliver_task_status,
 )
-from nullion.run_activity import activity_trace_enabled, task_planner_feed_mode
+from nullion.run_activity import activity_trace_enabled
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
 from nullion.users import resolve_messaging_user
@@ -789,6 +789,17 @@ async def run_slack_app(
     settings = load_settings(env_path=env_path)
     bot_token, app_token = _require_slack_settings(settings)
     service = service_builder(checkpoint_path=checkpoint_path, env_path=env_path)
+    try:
+        from nullion.startup_warmup import schedule_chat_startup_warmup
+
+        schedule_chat_startup_warmup(
+            service.runtime,
+            registry=getattr(service, "tool_registry", None),
+            settings=settings,
+            surface="slack",
+        )
+    except Exception:
+        logger.debug("Could not schedule Slack chat startup warmup", exc_info=True)
 
     app = AsyncApp(token=bot_token, signing_secret=settings.slack.signing_secret)
     _task_card_store = PlatformTaskCardStore(platform_activity_capabilities("slack"))
@@ -811,7 +822,7 @@ async def run_slack_app(
                 task_card_store=_task_card_store,
                 status_messages=_status_messages,
                 status_locks=_status_locks,
-                planner_feed_enabled=task_planner_feed_mode() != "off",
+                planner_feed_enabled=True,
                 include_activity=activity_trace_enabled(),
             )
         outbound_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text

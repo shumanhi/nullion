@@ -111,8 +111,7 @@ def should_deliver_task_status(
     planner_feed_enabled: bool,
     include_activity: bool,
 ) -> bool:
-    if not planner_feed_enabled:
-        return False
+    _ = planner_feed_enabled
     kind = str(status_kind or "task_summary").strip()
     if kind == "task_summary":
         return True

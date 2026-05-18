@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from nullion.artifacts import artifact_descriptors_for_paths, media_candidate_paths_from_text
-from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS
+from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, is_domain_suffix_extension
 from nullion.messaging_adapters import delivery_contract_for_turn
 from nullion.task_frames import TaskFrameStatus
 from nullion.tools import ToolResult, normalize_tool_status
@@ -17,6 +17,15 @@ from nullion.tools import ToolResult, normalize_tool_status
 
 USER_VISIBLE_TEXT_KEYS = ("result_text", "delivery_text", "final_text", "text", "message", "summary", "content", "stdout")
 EMPTY_USER_VISIBLE_TEXTS = frozenset({"", "(no reply)", "no reply"})
+STRUCTURED_ARTIFACT_PRODUCER_TOOLS = frozenset(
+    {
+        "file_write",
+        "pdf_create",
+        "pdf_edit",
+        "image_generate",
+        "browser_screenshot",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +96,11 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
     for result in tool_results or ():
         if normalize_tool_status(getattr(result, "status", None)) != "completed":
             continue
+        tool_name = str(getattr(result, "tool_name", "") or "")
         output = result.output if isinstance(result.output, dict) else {}
-        if result.tool_name == "file_write":
+        if tool_name == "browser_screenshot":
+            continue
+        if tool_name in STRUCTURED_ARTIFACT_PRODUCER_TOOLS and result.tool_name == "file_write":
             path = output.get("path")
             if isinstance(path, str) and path.strip():
                 paths.append(path)
@@ -156,6 +168,8 @@ def _normalize_required_extensions(required_attachment_extensions: Iterable[str]
             continue
         if not normalized.startswith("."):
             normalized = f".{normalized}"
+        if is_domain_suffix_extension(normalized):
+            continue
         if normalized not in extensions:
             extensions.append(normalized)
     return tuple(extensions)
@@ -260,6 +274,8 @@ def evaluate_response_fulfillment(
     artifact_roots: Iterable[Path] = (),
     platform_artifact_count: int = 0,
     required_attachment_extensions: Iterable[str] | None = None,
+    required_tool_names: Iterable[str] | None = None,
+    excluded_artifact_paths: Iterable[str] | None = None,
 ) -> ResponseFulfillmentDecision:
     """Validate that a final response is backed by required runtime evidence."""
     frame = _active_frame_for_contract(store, conversation_id)
@@ -272,6 +288,11 @@ def evaluate_response_fulfillment(
 
     explicit_required_extensions = _normalize_required_extensions(required_attachment_extensions)
     required_tools: set[str] = set()
+    required_tools.update(
+        str(tool_name or "").strip()
+        for tool_name in (required_tool_names or ())
+        if str(tool_name or "").strip()
+    )
     requires_artifact = False
     artifact_kind = explicit_required_extensions[0].removeprefix(".") if explicit_required_extensions else "file"
     if frame is not None:
@@ -284,10 +305,21 @@ def evaluate_response_fulfillment(
     if explicit_required_extensions:
         requires_artifact = True
 
+    excluded_paths = {
+        str(Path(path).expanduser())
+        for path in (excluded_artifact_paths or ())
+        if str(path or "").strip()
+    }
     combined_artifact_paths = [
         *(artifact_paths or ()),
         *artifact_paths_from_tool_results(result for result, _status in normalized_results),
     ]
+    if excluded_paths:
+        combined_artifact_paths = [
+            path
+            for path in combined_artifact_paths
+            if str(path or "").strip() and str(Path(path).expanduser()) not in excluded_paths
+        ]
     delivery_contract = delivery_contract_for_turn(
         None,
         reply=reply,

@@ -2924,9 +2924,7 @@ if ($EMAIL_CALENDAR_ENABLED) {
 }
 $envLines += "NULLION_ENABLED_PLUGINS=`"$enabledPlugins`""
 $envLines += "NULLION_PROVIDER_BINDINGS=`"$providerBindings`""
-$envLines += "NULLION_ACTIVITY_TRACE_ENABLED=true"
-$envLines += "NULLION_TASK_PLANNER_FEED_MODE=task"
-$envLines += "NULLION_TASK_PLANNER_FEED_ENABLED=true"
+$envLines += "NULLION_ACTIVITY_TRACE_ENABLED=false"
 if ($MEDIA_ENABLED) {
     if ($MEDIA_OPENAI_KEY)            { $envLines += "NULLION_MEDIA_OPENAI_API_KEY=`"$MEDIA_OPENAI_KEY`"" }
     if ($MEDIA_ANTHROPIC_KEY)         { $envLines += "NULLION_MEDIA_ANTHROPIC_API_KEY=`"$MEDIA_ANTHROPIC_KEY`"" }

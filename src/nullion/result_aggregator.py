@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections import defaultdict
@@ -31,7 +32,7 @@ from nullion.artifacts import (
     artifact_root_for_principal,
     media_candidate_paths_from_text,
 )
-from nullion.attachment_format_graph import plan_attachment_format
+from nullion.attachment_format_graph import is_domain_suffix_extension, plan_attachment_format
 from nullion.delegated_artifact_workflow import finalize_delegated_artifacts
 from nullion.mini_agent_runner import ProgressUpdate
 from nullion.task_queue import TaskGroup, TaskRecord, TaskRegistry, TaskStatus
@@ -43,22 +44,19 @@ _SUMMARY_SYSTEM_PROMPT = """\
 You are summarizing the results of parallel sub-tasks for the user.
 Given the original request and a list of completed task outputs, write a concise, \
 direct reply (1–4 sentences) that answers the original request. \
-Mention any failures. Include file paths for any artifacts produced. \
+Mention any failures only when they change the user-visible outcome. Do not include file paths, \
+MEDIA directives, markdown links, or quoted empty filenames. If runtime-verified deliverable \
+artifacts will be attached, refer to them generically as attached files; the system will attach \
+them separately. Do not mention scratch, raw, or intermediate file paths. \
 Do not enumerate every step — just deliver the answer. Speak as the main agent."""
 
 # Minimum seconds between consecutive progress-note edits for the same group.
 MIN_PROGRESS_INTERVAL_S: float = 3.0
+DEFAULT_FINAL_SUMMARY_TIMEOUT_S: float = 12.0
 _FILENAME_TOKEN_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w .()@+-]{0,180}\.[A-Za-z0-9]{1,16})(?![\w./-])")
-_ARTIFACT_DELIVERY_TOOLS = frozenset(
-    {
-        "browser_screenshot",
-        "file_write",
-        "image_generate",
-        "pdf_create",
-        "pdf_edit",
-        "render",
-    }
-)
+_ARTIFACT_DELIVERY_ROLES = frozenset({"deliverable", "deliver_receipt", "verify"})
+_ARTIFACT_PRODUCER_TOOLS = frozenset({"file_write", "document_create", "spreadsheet_create", "presentation_create"})
+_INTERNAL_ARTIFACT_SUFFIXES = frozenset({".json", ".jsonl", ".db", ".sqlite", ".sqlite3"})
 
 
 @dataclass
@@ -200,6 +198,9 @@ class ResultAggregator:
         )
         if requested_extension and not deliverable_artifacts:
             summary = _missing_requested_artifact_summary(group, requested_extension)
+        summary = _strip_attached_artifact_references(summary, deliverable_artifacts)
+        if not deliverable_artifacts:
+            summary = _strip_unverified_attachment_claims(summary)
         await self._deliver(
             gs.conversation_id,
             _summary_with_original_request_context(group, summary),
@@ -237,7 +238,7 @@ class ResultAggregator:
             artifact_context = (
                 "\n\nRuntime-verified deliverable artifacts that will be attached:\n"
                 + "\n".join(f"- {path}" for path in verified_artifacts)
-                + "\nDo not say no artifact can be attached when this list is non-empty."
+                + "\nDo not include these paths in the reply. Say attached file or attached files instead."
             )
         prompt = (
             f"Original request: {group.original_message}\n\n"
@@ -245,16 +246,26 @@ class ResultAggregator:
             + artifact_context
         )
         try:
-            response = self._model_client.create(
-                messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-                tools=[],
-                max_tokens=512,
-                system=_SUMMARY_SYSTEM_PROMPT,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._model_client.create,
+                    messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+                    tools=[],
+                    max_tokens=512,
+                    system=_SUMMARY_SYSTEM_PROMPT,
+                ),
+                timeout=_final_summary_timeout_seconds(),
             )
             content = response.get("content") or []
             parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
             text = "".join(parts).strip()
             return text or self._fallback_summary(group)
+        except TimeoutError:
+            logger.warning(
+                "ResultAggregator: summary LLM call timed out for group %s; using fallback summary",
+                group.group_id,
+            )
+            return self._fallback_summary(group)
         except Exception as exc:
             logger.debug("ResultAggregator: summary LLM call failed: %s", exc)
             return self._fallback_summary(group)
@@ -308,9 +319,98 @@ def _summary_with_original_request_context(group: TaskGroup, summary: str) -> st
     return f'Result for "{request}":\n{text}'
 
 
+def _final_summary_timeout_seconds() -> float:
+    raw_value = os.environ.get("NULLION_RESULT_SUMMARY_TIMEOUT_SECONDS", "").strip()
+    if not raw_value:
+        return DEFAULT_FINAL_SUMMARY_TIMEOUT_S
+    try:
+        return max(0.5, float(raw_value))
+    except ValueError:
+        return DEFAULT_FINAL_SUMMARY_TIMEOUT_S
+
+
+def _strip_attached_artifact_references(summary: str, artifact_paths: list[str] | tuple[str, ...]) -> str:
+    text = str(summary or "").strip()
+    if not text:
+        return text
+    text = re.sub(r"\b(?:MEDIA|ARTIFACT):?\s+[^ \n\r\t]+", "attached file", text)
+    kept_lines = [
+        line
+        for line in text.splitlines()
+        if not line.strip().startswith("MEDIA:")
+    ]
+    text = "\n".join(kept_lines).strip()
+    for path in artifact_paths or ():
+        path_text = str(path or "").strip()
+        if not path_text:
+            continue
+        text = text.replace(path_text, "attached file")
+        text = text.replace(Path(path_text).name, "attached file")
+    text = re.sub(r"`\s*`", "attached file", text)
+    text = re.sub(r"\battached file(?:\s*(?:,|and)\s*attached file)+\b", "attached files", text)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    normalized_sentences: list[str] = []
+    for sentence in sentences:
+        lowered = sentence.lower()
+        if " attached" in lowered and "artifact" in lowered:
+            normalized_sentences.append("The verified report is attached.")
+        else:
+            normalized_sentences.append(sentence)
+    text = " ".join(sentence for sentence in normalized_sentences if sentence).strip()
+    if len([path for path in (artifact_paths or ()) if str(path or "").strip()]) == 1:
+        text = re.sub(r"\b(files|reports|artifacts)\s+are attached\b", "file is attached", text, flags=re.IGNORECASE)
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        normalized_sentences = []
+        for sentence in sentences:
+            lowered = sentence.lower()
+            if " attached" in lowered and " and " in lowered:
+                normalized_sentences.append("The requested file is attached.")
+            else:
+                normalized_sentences.append(sentence)
+        text = " ".join(sentence for sentence in normalized_sentences if sentence).strip()
+    return text.strip()
+
+
+def _strip_unverified_attachment_claims(summary: str) -> str:
+    text = str(summary or "").strip()
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept: list[str] = []
+    for sentence in sentences:
+        lowered = sentence.lower()
+        mentions_attachment = any(
+            marker in lowered
+            for marker in (
+                " attached",
+                " is attached",
+                " are attached",
+                "attachment",
+                "media:",
+                "artifact:",
+            )
+        )
+        mentions_file = any(
+            marker in lowered
+            for marker in (
+                "file",
+                "pdf",
+                "html",
+                "report copy",
+                "artifact",
+                "media:",
+                "artifact:",
+            )
+        )
+        if mentions_attachment and mentions_file:
+            continue
+        kept.append(sentence)
+    return " ".join(sentence for sentence in kept if sentence).strip() or text
+
+
 def _artifact_recovery_summary(group: TaskGroup, artifact_paths: list[str]) -> str:
     if len(artifact_paths) == 1:
-        return f"I created the requested file from the completed task output and attached it: {artifact_paths[0]}"
+        return "I created the requested file from the completed task output and attached it."
     return f"I created {len(artifact_paths)} requested files from the completed task output and attached them."
 
 
@@ -323,14 +423,17 @@ def _artifact_paths_for_group_delivery(
 ) -> list[str]:
     explicit_paths: list[str] = []
     artifact_task_paths: list[str] = []
+    scheduled_fallback_paths: list[str] = []
     all_text_paths: list[str] = []
+    scheduled_group = _is_scheduled_task_request(group.original_message)
+    leaf_task_ids = _leaf_task_ids(group)
     for task in group.tasks:
         result = task.result
         if result is None:
             continue
         task_paths = [str(path) for path in (result.artifacts or []) if isinstance(path, str) and path.strip()]
         explicit_paths.extend(task_paths)
-        if _task_has_artifact_delivery_scope(task):
+        if _task_has_artifact_delivery_scope(task) or (task.task_id in leaf_task_ids and not scheduled_group):
             artifact_task_paths.extend(task_paths)
     explicit_paths.extend(str(path) for path in (recovered_artifacts or []) if isinstance(path, str) and path.strip())
     artifact_task_paths.extend(str(path) for path in (recovered_artifacts or []) if isinstance(path, str) and path.strip())
@@ -340,27 +443,61 @@ def _artifact_paths_for_group_delivery(
         result = task.result
         if result is None:
             continue
+        task_produces_artifacts = bool(
+            set(str(tool).lower() for tool in (getattr(task, "allowed_tools", None) or ()))
+            & _ARTIFACT_PRODUCER_TOOLS
+        )
         for text in _task_result_text_fragments(result):
+            media_found = _existing_media_artifacts_referenced_by_text(text, artifact_roots=roots)
+            if media_found and (
+                not scheduled_group
+                or _task_has_artifact_delivery_scope(task)
+                or task_produces_artifacts
+            ):
+                artifact_task_paths.extend(media_found)
+            elif scheduled_group and task.task_id not in leaf_task_ids:
+                scheduled_fallback_paths.extend(media_found)
             found = _existing_artifacts_referenced_by_text(text, artifact_roots=roots)
             all_text_paths.extend(found)
-            if _task_has_artifact_delivery_scope(task):
+            if (
+                _task_has_artifact_delivery_scope(task)
+                or task_produces_artifacts
+                or (task.task_id in leaf_task_ids and not scheduled_group)
+                or (task.task_id not in leaf_task_ids and found and not scheduled_group)
+            ):
                 artifact_task_paths.extend(found)
+            elif scheduled_group and task.task_id not in leaf_task_ids:
+                scheduled_fallback_paths.extend(found)
     requested_extension = _normalize_requested_extension(requested_extension)
-    candidate_groups = (
-        summary_paths,
-        artifact_task_paths,
-        explicit_paths,
-        all_text_paths,
-    )
     if requested_extension:
+        candidate_groups = (
+            (artifact_task_paths, summary_paths, scheduled_fallback_paths, explicit_paths, all_text_paths)
+            if scheduled_group
+            else (artifact_task_paths, explicit_paths, summary_paths, all_text_paths)
+        )
         for candidates in candidate_groups:
             matching = _filter_artifact_paths_by_extension(candidates, requested_extension)
             if matching:
+                if scheduled_group and not _group_has_explicit_artifact_delivery(group):
+                    return _collapse_same_format_scheduled_artifacts(matching)
                 return matching
+        if scheduled_group:
+            summary_fallback = _filter_internal_artifact_paths(summary_paths)
+            if summary_fallback:
+                return list(dict.fromkeys(summary_fallback))
         return []
+    candidate_groups = (
+        (artifact_task_paths, summary_paths, scheduled_fallback_paths, explicit_paths)
+        if scheduled_group
+        else (artifact_task_paths,)
+    )
     for candidates in candidate_groups:
+        candidates = _filter_internal_artifact_paths(candidates)
         if candidates:
-            return list(dict.fromkeys(candidates))
+            candidates = list(dict.fromkeys(candidates))
+            if scheduled_group and not _group_has_explicit_artifact_delivery(group):
+                return _collapse_same_format_scheduled_artifacts(candidates)
+            return candidates
     return []
 
 
@@ -377,18 +514,65 @@ def _normalize_requested_extension(extension: str | None) -> str | None:
     text = str(extension or "").strip().lower()
     if not text:
         return None
-    return text if text.startswith(".") else f".{text}"
+    normalized = text if text.startswith(".") else f".{text}"
+    return None if is_domain_suffix_extension(normalized) else normalized
 
 
 def _filter_artifact_paths_by_extension(paths: list[str] | tuple[str, ...], extension: str) -> list[str]:
     normalized = _normalize_requested_extension(extension)
     if normalized is None:
-        return list(dict.fromkeys(paths))
+        return _filter_internal_artifact_paths(paths)
     return list(
         dict.fromkeys(
             path for path in paths if Path(str(path)).suffix.lower() == normalized
         )
     )
+
+
+def _filter_internal_artifact_paths(paths: list[str] | tuple[str, ...]) -> list[str]:
+    return list(dict.fromkeys(path for path in paths if not _is_internal_artifact_path(path)))
+
+
+def _group_has_explicit_artifact_delivery(group: TaskGroup) -> bool:
+    return any(_task_has_artifact_delivery_scope(task) for task in getattr(group, "tasks", ()) or ())
+
+
+def _collapse_same_format_scheduled_artifacts(paths: list[str] | tuple[str, ...]) -> list[str]:
+    """For scheduled runs, keep one unmarked deliverable per file format.
+
+    Parallel cron subtasks can independently produce equivalent report files.
+    Without an explicit artifact-delivery contract, same-extension candidates
+    are alternate deliverables, not separate user-requested files.
+    """
+
+    ordered = list(dict.fromkeys(str(path) for path in paths if str(path or "").strip()))
+    grouped: dict[str, list[str]] = {}
+    for path in ordered:
+        suffix = Path(path).suffix.lower()
+        grouped.setdefault(suffix or path, []).append(path)
+    collapsed: list[str] = []
+    for candidates in grouped.values():
+        if len(candidates) == 1:
+            collapsed.append(candidates[0])
+            continue
+        collapsed.append(max(candidates, key=_artifact_sort_key))
+    return list(dict.fromkeys(collapsed))
+
+
+def _artifact_sort_key(path: str) -> tuple[float, int]:
+    try:
+        stat = Path(path).expanduser().stat()
+        return (float(stat.st_mtime), len(Path(path).name))
+    except OSError:
+        return (0.0, len(str(path)))
+
+
+def _is_internal_artifact_path(path: object) -> bool:
+    try:
+        candidate = Path(str(path))
+    except (TypeError, ValueError):
+        return True
+    return candidate.suffix.lower() in _INTERNAL_ARTIFACT_SUFFIXES
 
 
 def _missing_requested_artifact_summary(group: TaskGroup, requested_extension: str) -> str:
@@ -418,8 +602,27 @@ def _artifact_roots_for_group(group: TaskGroup) -> tuple[Path, ...]:
 
 
 def _task_has_artifact_delivery_scope(task: TaskRecord) -> bool:
-    allowed_tools = {str(tool) for tool in (getattr(task, "allowed_tools", None) or [])}
-    return bool(allowed_tools.intersection(_ARTIFACT_DELIVERY_TOOLS))
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if bool(metadata.get("requires_artifact_delivery") or metadata.get("required_artifact_kind")):
+        return True
+    artifact_role = str(metadata.get("artifact_role") or "").strip()
+    return artifact_role in _ARTIFACT_DELIVERY_ROLES
+
+
+def _leaf_task_ids(group: TaskGroup) -> set[str]:
+    dependency_ids: set[str] = set()
+    task_ids: set[str] = set()
+    for task in group.tasks:
+        task_id = str(getattr(task, "task_id", "") or "").strip()
+        if task_id:
+            task_ids.add(task_id)
+        dependency_ids.update(
+            str(dep).strip()
+            for dep in (getattr(task, "dependencies", None) or ())
+            if str(dep).strip()
+        )
+    return task_ids - dependency_ids
 
 
 def _task_result_text_fragments(result: Any) -> tuple[str, ...]:
@@ -458,6 +661,15 @@ def _existing_artifacts_referenced_by_text(text: str, *, artifact_roots: tuple[P
     for name in _filename_tokens_from_text(text):
         for root in artifact_roots:
             paths.extend(_resolve_candidate_artifact_path(root / name, artifact_roots=(root,)))
+    return list(dict.fromkeys(paths))
+
+
+def _existing_media_artifacts_referenced_by_text(text: str, *, artifact_roots: tuple[Path, ...]) -> list[str]:
+    if not text or not artifact_roots:
+        return []
+    paths: list[str] = []
+    for candidate in media_candidate_paths_from_text(text):
+        paths.extend(_resolve_candidate_artifact_path(candidate, artifact_roots=artifact_roots))
     return list(dict.fromkeys(paths))
 
 

@@ -137,7 +137,7 @@ from nullion.skill_usage import (
 )
 from nullion.suspended_turns import SuspendedTurn
 from nullion.task_decomposer import TaskDecomposer
-from nullion.task_frames import TaskFrameStatus, TaskFrameOperation
+from nullion.task_frames import TaskFrameStatus, TaskFrameOperation, extract_url_target
 from nullion.task_planner import TaskPlanner
 from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
@@ -145,9 +145,11 @@ from nullion.turn_relationship_evidence import has_structured_turn_relationship_
 from nullion.turn_context_policy import (
     build_turn_tool_evidence,
     is_slash_prefixed_literal_message,
+    materialize_mini_agent_tool_scope_registry,
     scoped_turn_tool_registry,
     should_include_prior_turn_messages,
     tool_registry_allows_skill_pack_context,
+    tool_registry_allows_skill_pack_prompt_context,
     turn_tool_scope_decision_may_apply,
     turn_tool_evidence_needs_model_scope_decision,
     turn_is_context_linked,
@@ -176,12 +178,24 @@ _MAX_APPROVAL_PROMPT_TURNS = 20
 _MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
 _MAX_ARTIFACT_FOLLOWUP_CANDIDATES = 12
 _CHAT_STABLE_CONTEXT_CACHE_MAX_ENTRIES = 32
+_CHAT_STABLE_CONTEXT_CACHE_VERSION = "v7"
 _DIAGNOSTIC_ATTACHMENT_SUFFIXES = frozenset({".log"})
 _PRIMARY_RENDERED_ARTIFACT_SUFFIXES = frozenset(
     {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm"}
 )
 _TEXT_SIDECAR_ARTIFACT_SUFFIXES = frozenset({".txt", ".md"})
 _MODEL_ISSUE_SIGNAL_MAX_AGE_SECONDS = 30 * 60
+_MODEL_ISSUE_RECOVERED_AT_BY_RUNTIME: dict[str, datetime] = {}
+
+
+def _model_issue_runtime_key(runtime: PersistentRuntime) -> str:
+    checkpoint_path = getattr(runtime, "checkpoint_path", None)
+    if checkpoint_path:
+        try:
+            return str(Path(checkpoint_path).resolve())
+        except Exception:
+            return str(checkpoint_path)
+    return f"runtime:{id(runtime)}"
 
 
 def _recent_model_issue_doctor_records(runtime: PersistentRuntime) -> list[dict[str, object]]:
@@ -219,6 +233,7 @@ def _recent_model_issue_doctor_records(runtime: PersistentRuntime) -> list[dict[
     except Exception:
         return []
     now = datetime.now(UTC)
+    recovered_at = _MODEL_ISSUE_RECOVERED_AT_BY_RUNTIME.get(_model_issue_runtime_key(runtime))
     for updated_at, payload in rows:
         try:
             updated = datetime.fromisoformat(str(updated_at))
@@ -227,6 +242,8 @@ def _recent_model_issue_doctor_records(runtime: PersistentRuntime) -> list[dict[
         except ValueError:
             continue
         if (now - updated).total_seconds() > _MODEL_ISSUE_SIGNAL_MAX_AGE_SECONDS:
+            continue
+        if recovered_at is not None and updated <= recovered_at:
             continue
         try:
             record = json.loads(str(payload))
@@ -237,7 +254,29 @@ def _recent_model_issue_doctor_records(runtime: PersistentRuntime) -> list[dict[
     return records
 
 
-def _chat_model_issue_reply(runtime: PersistentRuntime, *, message: str) -> str | None:
+def _recover_stale_model_issue_if_possible(runtime: PersistentRuntime, model_client: object | None) -> bool:
+    if model_client is None:
+        return False
+    try:
+        from nullion.health_monitor import clear_recovered_service_doctor_actions
+        from nullion.health_probes import make_model_api_probe
+
+        result = make_model_api_probe(model_client)()
+        if not result.ok:
+            return False
+        clear_recovered_service_doctor_actions(
+            runtime,
+            "model_api",
+            reason="model API probe recovered during chat preflight",
+        )
+        _MODEL_ISSUE_RECOVERED_AT_BY_RUNTIME[_model_issue_runtime_key(runtime)] = datetime.now(UTC)
+        return True
+    except Exception:
+        logger.debug("Could not verify model API recovery during chat preflight", exc_info=True)
+        return False
+
+
+def _chat_model_issue_reply(runtime: PersistentRuntime, *, message: str, model_client: object | None = None) -> str | None:
     """Return a short fast-fail message when model service issues are already pending."""
     try:
         pending_actions = [dict(action) for action in runtime.store.list_doctor_actions()]
@@ -251,10 +290,14 @@ def _chat_model_issue_reply(runtime: PersistentRuntime, *, message: str) -> str 
             continue
         reply = _model_issue_reply_for_doctor_record(action)
         if reply is not None:
+            if _recover_stale_model_issue_if_possible(runtime, model_client):
+                return None
             return reply
     for action in recent_signal_records:
         reply = _model_issue_reply_for_doctor_record(action)
         if reply is not None:
+            if _recover_stale_model_issue_if_possible(runtime, model_client):
+                return None
             return reply
     return None
 
@@ -355,7 +398,7 @@ def _chat_stable_context_cache_get(cache_key: tuple[object, ...], *, db_path: st
     cached = runtime_cache.get_json(
         "stable_context.messaging",
         cache_key,
-        version="v6",
+        version=_CHAT_STABLE_CONTEXT_CACHE_VERSION,
         persistent=bool(db_path),
         db_path=db_path,
     )
@@ -374,7 +417,7 @@ def _chat_stable_context_cache_set(cache_key: tuple[object, ...], value: object 
         "stable_context.messaging",
         cache_key,
         value,
-        version="v6",
+        version=_CHAT_STABLE_CONTEXT_CACHE_VERSION,
         persistent=bool(db_path),
         db_path=db_path,
         max_entries=_CHAT_STABLE_CONTEXT_CACHE_MAX_ENTRIES,
@@ -558,11 +601,18 @@ def _requested_attachment_extension(
     *,
     model_client: object | None = None,
     allow_model_planning: bool = False,
+    source_attachment_names: Iterable[str] | None = None,
 ) -> str | None:
     if is_slash_prefixed_literal_message(prompt):
         return None
     planner_model_client = model_client if allow_model_planning else None
-    return plan_attachment_format(prompt, model_client=planner_model_client).extension
+    planning_prompt = str(prompt or "")
+    for raw_name in source_attachment_names or ():
+        name = Path(str(raw_name or "").strip()).name
+        if not name:
+            continue
+        planning_prompt = planning_prompt.replace(name, "attached file")
+    return plan_attachment_format(planning_prompt, model_client=planner_model_client).extension
 
 
 def _messaging_feature_enabled(name: str, *, default: bool = True) -> bool:
@@ -700,7 +750,6 @@ def _messaging_turn_fast_profile_candidate(
 def _messaging_turn_skip_tool_scope_decision(
     *,
     evidence,
-    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -711,13 +760,13 @@ def _messaging_turn_skip_tool_scope_decision(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        return False
     if (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
-        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        or turn_tool_scope_decision_may_apply(evidence)
     ):
         return False
     return True
@@ -1622,6 +1671,60 @@ def _remember_explicit_memory(
             logger.debug("Unable to checkpoint explicit chat memory", exc_info=True)
 
 
+def _chat_turn_memory_min_user_chars() -> int:
+    try:
+        return max(int(os.environ.get("NULLION_MEMORY_NO_TOOL_MIN_USER_CHARS", "16") or "16"), 0)
+    except ValueError:
+        return 16
+
+
+def _schedule_chat_turn_memory_capture(
+    runtime: PersistentRuntime,
+    agent_orchestrator,
+    *,
+    owner: str,
+    user_message: str,
+    assistant_reply: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+) -> None:
+    """Persist explicit durable preferences from ordinary chat turns off-path."""
+    if not _feature_enabled("NULLION_MEMORY_ENABLED"):
+        return
+    if tool_results:
+        return
+    if _is_internal_scheduled_task_context(user_message):
+        return
+    if len(str(user_message or "").strip()) < _chat_turn_memory_min_user_chars():
+        return
+    model_client = getattr(agent_orchestrator, "model_client", None)
+    if model_client is None:
+        return
+
+    def _worker() -> None:
+        try:
+            from nullion.builder_memory import capture_turn_memory_claims_verified
+
+            capture_turn_memory_claims_verified(
+                runtime,
+                model_client,
+                owner=owner,
+                user_message=user_message,
+                assistant_reply=assistant_reply,
+            )
+        except Exception:
+            logger.debug("Chat background memory capture failed (non-fatal)", exc_info=True)
+
+    try:
+        from nullion.builder_background import schedule_builder_background_task
+
+        if schedule_builder_background_task("chat-turn-memory-capture", _worker):
+            return
+    except Exception:
+        logger.debug("Unable to schedule chat memory capture", exc_info=True)
+
+    threading.Thread(target=_worker, name="nullion-chat-memory-capture", daemon=True).start()
+
+
 
 def _should_include_conversation_context(result, thread: list[dict[str, str]]) -> bool:
     _ = result
@@ -1829,11 +1932,17 @@ def _chat_current_turn_has_structured_followup_evidence(
     attachments: Iterable[object] | None,
     ambiguity_fallback_reason: str | None,
 ) -> bool:
-    return (
-        bool(attachments)
-        or bool(ambiguity_fallback_reason)
-        or _chat_has_open_task_frame(runtime, conversation_id=conversation_id)
-    )
+    _ = (runtime, conversation_id, ambiguity_fallback_reason)
+    return bool(attachments)
+
+
+def _chat_message_is_compact_context_reply(prompt: object) -> bool:
+    text = str(prompt or "").strip()
+    if not text:
+        return False
+    if has_structured_turn_relationship_evidence(text):
+        return False
+    return len(text) <= 12 and len(text.split()) <= 3
 
 
 def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None, prompt: str):
@@ -1845,21 +1954,6 @@ def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None,
         return None
 
     return fallback, ambiguity_reason
-
-
-def _is_bare_confirmation_reply(text: str) -> bool:
-    normalized = _normalize_local_intent_text(text)
-    if normalized in {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "confirm", "confirmed", "approve", "approved", "go", "proceed"}:
-        return True
-    stripped = text.strip()
-    return bool(stripped) and all(character in {"✓", "✔", "✅", "+"} for character in stripped)
-
-
-def _assistant_requests_confirmation(text: str | None) -> bool:
-    if not isinstance(text, str) or not text.strip():
-        return False
-    normalized = _normalize_local_intent_text(text)
-    return any(marker in normalized for marker in ("please confirm", "confirm before", "confirm that", "confirm you want", "please approve"))
 
 
 def _chat_ambiguity_classifier(
@@ -1876,27 +1970,13 @@ def _chat_ambiguity_classifier(
         or not ((isinstance(previous_user_message, str) and previous_user_message.strip()) or reply_anchor_text)
     ):
         return None, None
-    previous_assistant_message = None
-    if thread:
-        candidate = thread[-1].get("assistant")
-        if isinstance(candidate, str) and candidate.strip():
-            previous_assistant_message = candidate.strip()
-
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
             return None
         active_turn_text = reply_anchor_text or previous_user_message
-        ctx_previous_assistant = getattr(ctx, "previous_assistant_message", None)
-        assistant_context = (
-            ctx_previous_assistant.strip()
-            if isinstance(ctx_previous_assistant, str) and ctx_previous_assistant.strip()
-            else previous_assistant_message
-        )
         has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
         if not has_structured_evidence:
-            if not (assistant_context and _is_bare_confirmation_reply(text) and _assistant_requests_confirmation(assistant_context)):
-                return None
-            active_turn_text = f"{active_turn_text}\nAssistant: {assistant_context}"
+            return None
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 
@@ -2382,7 +2462,11 @@ def _artifact_delivery_label(
 ) -> str:
     tool_names = {result.tool_name for result in tool_results or ()}
     descriptor_names = [str(getattr(descriptor, "name", "") or "").lower() for descriptor in descriptors]
-    if "browser_screenshot" in tool_names or any("screenshot" in name for name in descriptor_names):
+    if (
+        "browser_screenshot" in tool_names
+        and descriptors
+        and all(str(getattr(descriptor, "media_type", "") or "").startswith("image/") for descriptor in descriptors)
+    ) or (descriptor_names and all("screenshot" in name for name in descriptor_names)):
         return "screenshot"
     if descriptors and all(str(getattr(descriptor, "media_type", "") or "").startswith("image/") for descriptor in descriptors):
         return "image" if len(descriptors) == 1 else "images"
@@ -2469,10 +2553,12 @@ def _suppress_unrequested_diagnostic_media_reply(
     reply: str,
     requested_extension: str | None,
     principal_id: str | None = None,
+    suppress_paths: set[str] | None = None,
 ) -> str:
     if not isinstance(reply, str) or not reply.strip():
         return reply
     artifact_roots = (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))
+    suppressed = {str(Path(path).expanduser()) for path in suppress_paths or () if str(path or "").strip()}
 
     def resolve(path: Path) -> Path:
         if path.is_absolute():
@@ -2485,6 +2571,8 @@ def _suppress_unrequested_diagnostic_media_reply(
 
     def should_drop(path: Path) -> bool:
         resolved = resolve(path)
+        if str(resolved.expanduser()) in suppressed:
+            return True
         if not _is_unrequested_diagnostic_attachment(resolved, requested_extension=requested_extension):
             return False
         return any(artifact_descriptor_for_path(resolved, artifact_root=root) is not None for root in artifact_roots)
@@ -2553,6 +2641,7 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         "- For read-only diagnostics, inspect with read-only commands and return the findings in chat instead of writing helper files.\n"
         "- When inspecting local files, search the narrowest concrete folder available; do not recursively scan the system root or the user's home folder.\n"
         "- Do not say the chat platform cannot attach files. Nullion will attach completed artifact files after your turn.\n"
+        "- Use scheduler tools for scheduled-task listing, updates, and manual runs. Do not inspect or mutate the cron database with terminal_exec to perform scheduler operations.\n"
         "- Never answer only 'Done', 'OK', or 'Completed'. Always include the requested answer, file status, or concrete result.\n"
         "- If a tool result has status denied or error, treat it as failed and ask for the needed approval or report the failure."
         )
@@ -2613,10 +2702,21 @@ def _chat_capability_inventory_prompt(
         return None
     cached_text = (
         "Live capability inventory:\n"
-        "Use only the tools registered in this turn. If a capability-specific tool is unavailable, "
-        "fall back to the core local tools when the task can still be completed locally; only say what "
-        "is missing when no local path exists. External account data still requires a matching provider-"
-        "backed tool; connections are references, not raw credentials.\n\n"
+        "Use only the tools registered in this turn. When request_tool_scope is visible and the exact "
+        "tool family needed for the user's request is not yet visible, call request_tool_scope first, then "
+        "continue with the newly registered tools. Do not tell the user you cannot use a browser, shell, "
+        "scheduler, calendar, email, connector, weather, image, or file capability merely because the exact "
+        "tool is not currently visible; request the matching scope first. If a capability-specific tool is "
+        "unavailable after scope request, fall back to registered core tools when they can still complete "
+        "the task locally. Browser tools may be used when the user can log in or the target is public; "
+        "for live website or browser-app tasks, attempt the browser/web tool path before substituting a "
+        "rough estimate or saying live checking is unavailable. "
+        "terminal tools may be used for local command-line paths when registered and approved. If every "
+        "tool path is blocked, suggest concrete next steps such as connecting the provider, installing or "
+        "enabling the matching skill, logging in through the agent browser, or providing a public target. "
+        "If a browser fallback reaches a sign-in page, explicitly offer the agent-browser login path "
+        "instead of only asking for more identifiers. External account connections are references, not raw "
+        "credentials.\n\n"
         f"{caps_text}"
     )
     with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
@@ -2631,13 +2731,26 @@ def _artifact_paths_from_tool_results(
 ) -> list[str]:
     paths: list[str] = []
     search_match_paths: list[str] = []
+    completed_email_attachment_paths = {
+        str(Path(path).expanduser())
+        for result in tool_results or ()
+        if result.tool_name == "email_send" and normalize_tool_status(result.status) == "completed"
+        for path in _string_paths_from_value((result.output if isinstance(result.output, dict) else {}).get("attachment_paths"))
+    }
     for result in tool_results or ():
         if normalize_tool_status(result.status) != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name == "browser_screenshot":
+            continue
+        if result.tool_name == "email_send":
+            for path in _string_paths_from_value(output.get("attachment_paths")):
+                paths.append(path)
         if result.tool_name == "file_write":
             path = output.get("path")
             if isinstance(path, str) and path.strip():
+                if completed_email_attachment_paths and _is_email_delivery_confirmation_artifact(path):
+                    continue
                 paths.append(path)
         if result.tool_name == "image_generate":
             for key in ("path", "output_path"):
@@ -2666,6 +2779,118 @@ def _artifact_paths_from_tool_results(
     if include_search_matches and not paths and search_match_paths:
         paths.extend(search_match_paths)
     return list(dict.fromkeys(paths))
+
+
+def _completed_email_attachment_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            path
+            for result in tool_results or ()
+            if result.tool_name == "email_send" and normalize_tool_status(result.status) == "completed"
+            for path in _string_paths_from_value((result.output if isinstance(result.output, dict) else {}).get("attachment_paths"))
+        )
+    )
+
+
+def _browser_screenshot_artifact_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    paths: set[str] = set()
+    for result in tool_results or ():
+        if result.tool_name != "browser_screenshot" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for key in ("path", "artifact_path"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.add(str(Path(value).expanduser()))
+        values = output.get("artifact_paths")
+        if isinstance(values, (list, tuple)):
+            paths.update(str(Path(value).expanduser()) for value in values if isinstance(value, str) and value.strip())
+    return paths
+
+
+def _filter_suppressed_artifact_paths(
+    paths: list[str] | tuple[str, ...],
+    *,
+    suppress_paths: set[str],
+) -> list[str]:
+    if not suppress_paths:
+        return list(paths)
+    suppressed = {str(Path(path).expanduser()) for path in suppress_paths if str(path or "").strip()}
+    return [
+        path
+        for path in paths
+        if str(path or "").strip() and str(Path(path).expanduser()) not in suppressed
+    ]
+
+
+def _source_attachment_paths(attachments: Iterable[object] | None) -> set[str]:
+    paths: set[str] = set()
+    for attachment in attachments or ():
+        path = str(getattr(attachment, "path", "") or "").strip()
+        if path:
+            paths.add(str(Path(path).expanduser()))
+    return paths
+
+
+def _latest_browser_extract_text_excerpt(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    max_chars: int = 3500,
+) -> str | None:
+    for result in reversed(tuple(tool_results or ())):
+        if result.tool_name != "browser_extract_text" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output
+        candidates: tuple[object, ...]
+        if isinstance(output, str):
+            candidates = (output,)
+        elif isinstance(output, dict):
+            candidates = (
+                output.get("text"),
+                output.get("visible_text"),
+                output.get("content"),
+                output.get("body"),
+            )
+        else:
+            candidates = ()
+        for value in candidates:
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if not text:
+                continue
+            if len(text) <= max_chars:
+                return text
+            return text[:max_chars].rstrip() + "\n\n..."
+    return None
+
+
+def _string_paths_from_value(value: object) -> tuple[str, ...]:
+    if isinstance(value, str) and value.strip():
+        return (value.strip(),)
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item).strip() for item in value if isinstance(item, str) and item.strip())
+    return ()
+
+
+def _is_email_delivery_confirmation_artifact(path_text: object) -> bool:
+    path = Path(str(path_text or "").strip())
+    name = path.name.casefold()
+    return path.suffix.lower() == ".txt" and "confirmation" in name
+
+
+def _filter_email_confirmation_paths(
+    paths: tuple[Path, ...],
+    *,
+    email_attachment_paths: tuple[str, ...],
+) -> tuple[Path, ...]:
+    if not email_attachment_paths:
+        return paths
+    return tuple(path for path in paths if not _is_email_delivery_confirmation_artifact(path))
 
 
 _REPLY_FILENAME_CANDIDATE_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][A-Za-z0-9._ -]{0,120}\.[A-Za-z0-9]{1,16})(?![\w/-])")
@@ -2725,23 +2950,9 @@ def _completed_email_send_summaries(
         else:
             recipient_text = ""
         subject = str(output.get("subject") or "").strip()
-        status_code = output.get("status_code")
-        provider_text = " via Maton/Gmail" if "maton" in str(output.get("provider_id") or output.get("url") or "").lower() else ""
-        message_payload = output.get("json")
-        message_id = ""
-        if isinstance(message_payload, dict):
-            message_id = str(message_payload.get("id") or "").strip()
-        summary = f"Email sent to {recipient_text or 'the requested recipient'}"
+        summary = f"✉️ Email sent to {recipient_text or 'the requested recipient'}"
         if subject:
             summary += f' with subject "{subject}"'
-        summary += provider_text
-        if status_code:
-            summary += f" (status {status_code}"
-            if message_id:
-                summary += f", message id {message_id}"
-            summary += ")"
-        elif message_id:
-            summary += f" (message id {message_id})"
         summary += "."
         summaries.append(summary)
     return tuple(dict.fromkeys(summaries))
@@ -2756,12 +2967,17 @@ def _prepend_completed_email_send_summaries(
         return reply
     reply_text = str(reply or "")
     lowered_reply = reply_text.lower()
+    if any(summary in reply_text for summary in summaries):
+        return reply_text
     if (
         "email sent" in lowered_reply
+        or "email was sent" in lowered_reply
         or "sent the email" in lowered_reply
         or "i sent the email" in lowered_reply
+        or "message id" in lowered_reply
+        or "status 200" in lowered_reply
     ) and "did not send" not in lowered_reply:
-        return reply_text
+        return "\n\n".join(summaries).strip()
     return "\n\n".join([*summaries, reply_text]).strip()
 
 
@@ -2774,12 +2990,24 @@ def _append_chat_artifacts_to_reply(
     principal_id: str | None = None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
+    source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> str:
     requested_extension = (tuple(required_attachment_extensions or ()) or (None,))[0]
+    email_attachment_paths = _completed_email_attachment_paths(tool_results)
+    browser_screenshot_paths = _browser_screenshot_artifact_paths(tool_results)
+    source_paths = {str(Path(path).expanduser()) for path in source_attachment_paths or () if str(path or "").strip()}
+    suppressed_screenshot_paths: set[str] = set()
     initial_reply_candidate_paths = _artifact_candidate_paths_from_reply(
         reply,
         principal_id=principal_id,
         runtime=runtime,
+    )
+    initial_reply_candidate_paths = _filter_email_confirmation_paths(
+        initial_reply_candidate_paths,
+        email_attachment_paths=email_attachment_paths,
+    )
+    initial_reply_candidate_paths = tuple(
+        path for path in initial_reply_candidate_paths if str(path.expanduser()) not in source_paths
     )
     reply_has_media_directives = bool(_reply_media_candidate_paths(reply))
     reply = _suppress_unrequested_diagnostic_media_reply(
@@ -2787,24 +3015,48 @@ def _append_chat_artifacts_to_reply(
         reply=reply,
         requested_extension=requested_extension,
         principal_id=principal_id,
+        suppress_paths=set(),
     )
     reply_candidate_paths = _artifact_candidate_paths_from_reply(
         reply,
         principal_id=principal_id,
         runtime=runtime,
-    ) or initial_reply_candidate_paths
+    )
+    if not reply_candidate_paths and not suppressed_screenshot_paths:
+        reply_candidate_paths = initial_reply_candidate_paths
+    reply_candidate_paths = _filter_email_confirmation_paths(
+        reply_candidate_paths,
+        email_attachment_paths=email_attachment_paths,
+    )
+    reply_candidate_paths = tuple(path for path in reply_candidate_paths if str(path.expanduser()) not in source_paths)
     reply_media_paths = tuple(str(path) for path in reply_candidate_paths)
     artifact_roots = tuple(dict.fromkeys((artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))))
-    candidate_paths = list(reply_media_paths) or [
+    base_candidate_paths = list(reply_media_paths) or [
         *(artifact_paths or ()),
         *_artifact_paths_from_tool_results(
             tool_results,
             include_search_matches=bool(requested_extension),
         ),
     ]
+    non_screenshot_candidate_paths = _filter_suppressed_artifact_paths(
+        base_candidate_paths,
+        suppress_paths={*browser_screenshot_paths, *source_paths},
+    )
+    screenshot_is_primary_delivery = bool(browser_screenshot_paths) and requested_extension == ".png"
+    suppressed_screenshot_paths = set() if screenshot_is_primary_delivery else browser_screenshot_paths
+    candidate_paths = list(base_candidate_paths)
+    if screenshot_is_primary_delivery and not candidate_paths:
+        candidate_paths = sorted(browser_screenshot_paths)
+    candidate_paths = _filter_suppressed_artifact_paths(
+        candidate_paths,
+        suppress_paths={*suppressed_screenshot_paths, *source_paths},
+    )
     promoted_candidate_paths = promote_supporting_asset_artifact_paths(candidate_paths, artifact_roots=artifact_roots)
     supporting_assets_promoted = promoted_candidate_paths != candidate_paths
-    candidate_paths = promoted_candidate_paths
+    candidate_paths = _filter_suppressed_artifact_paths(
+        promoted_candidate_paths,
+        suppress_paths={*suppressed_screenshot_paths, *source_paths},
+    )
     descriptors = []
     seen_ids: set[str] = set()
     for artifact_root in artifact_roots:
@@ -2832,6 +3084,10 @@ def _append_chat_artifacts_to_reply(
         )
     ]
     if not descriptors:
+        if suppressed_screenshot_paths:
+            extracted_text = _latest_browser_extract_text_excerpt(tool_results)
+            if extracted_text:
+                return extracted_text
         return reply
     if reply_has_media_directives and reply_media_paths:
         selected_paths = tuple(str(getattr(descriptor, "path", "") or "") for descriptor in descriptors)
@@ -2926,6 +3182,8 @@ def _enforce_chat_response_fulfillment(
     artifact_paths: list[str] | tuple[str, ...] | None = None,
     principal_id: str | None = None,
     required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
+    required_tool_names: tuple[str, ...] | list[str] | None = None,
+    source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> str:
     decision = evaluate_response_fulfillment(
         store=runtime.store,
@@ -2936,6 +3194,8 @@ def _enforce_chat_response_fulfillment(
         artifact_paths=artifact_paths,
         artifact_roots=(artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)),
         required_attachment_extensions=required_attachment_extensions,
+        required_tool_names=required_tool_names,
+        excluded_artifact_paths=source_attachment_paths,
     )
     return decision.reply
 
@@ -2950,6 +3210,7 @@ def _needs_required_attachment_repair(
     artifact_paths: list[str] | tuple[str, ...] | None = None,
     principal_id: str | None = None,
     required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
+    source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> bool:
     if not required_attachment_extensions:
         return False
@@ -2962,6 +3223,7 @@ def _needs_required_attachment_repair(
         artifact_paths=artifact_paths,
         artifact_roots=(artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)),
         required_attachment_extensions=required_attachment_extensions,
+        excluded_artifact_paths=source_attachment_paths,
     )
     return (
         not decision.satisfied
@@ -3909,6 +4171,40 @@ def _enabled_skill_pack_prompt(settings: NullionSettings | None) -> str | None:
         return None
 
 
+def _enabled_skill_pack_index_prompt(settings: NullionSettings | None) -> str | None:
+    loaded_settings = _load_settings_if_available() if settings is None else settings
+    cache_key = (
+        "skill_pack_index_prompt",
+        _chat_settings_signature(loaded_settings),
+        _chat_enabled_skill_pack_signature(loaded_settings),
+    )
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        if cache_key in _CHAT_STABLE_CONTEXT_CACHE:
+            return _chat_stable_context_cache_get(cache_key)
+    cached = _chat_stable_context_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        if loaded_settings is None:
+            loaded_settings = _load_settings_if_available()
+        if loaded_settings is None:
+            return None
+        from nullion.skill_pack_installer import format_cached_enabled_skill_pack_index_for_prompt
+
+        text = format_cached_enabled_skill_pack_index_for_prompt(
+            tuple(loaded_settings.enabled_skill_packs),
+            max_total_chars=900,
+        )
+        cached_text = text or None
+        with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+            _chat_stable_context_cache_set(cache_key, cached_text)
+        return cached_text
+    except Exception:
+        logger.debug("Skill pack index lookup failed (non-fatal)", exc_info=True)
+        return None
+
+
 def _auto_accept_proposal(runtime: PersistentRuntime, proposal, *, source: str) -> None:
     """Store a builder proposal and immediately auto-accept it as a skill.
 
@@ -3950,6 +4246,7 @@ def _render_chat_turn(
     cancellation_checker: Callable[[], bool] | None = None,
     conversation_ingress_id: str | None = None,
     reply_context: dict[str, object] | None = None,
+    defer_checkpoint: bool = False,
 ) -> str:
     prompt = _chat_prompt_for_message(message)
     if prompt is None:
@@ -4043,6 +4340,13 @@ def _render_chat_turn(
         reply = _append_runtime_nudges(runtime, prompt=prompt, reply=local_reply)
         _remember_chat_turn(runtime, chat_id=chat_id, user_message=prompt, assistant_reply=reply)
         _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        _schedule_chat_turn_memory_capture(
+            runtime,
+            agent_orchestrator,
+            owner=_memory_owner_for_chat(chat_id, settings),
+            user_message=prompt,
+            assistant_reply=reply,
+        )
         runtime.checkpoint()
         _mark_timing("local_reply")
         _log_timing_if_slow("local_reply", conversation_id_value=_conversation_id_for_chat(chat_id))
@@ -4157,11 +4461,13 @@ def _render_chat_turn(
             _requested_attachment_extension(
                 effective_prompt,
                 model_client=model_client,
-                allow_model_planning=bool(normalized_attachments),
+                allow_model_planning=bool(normalized_attachments) or extract_url_target(effective_prompt) is not None,
+                source_attachment_names=(attachment.name for attachment in normalized_attachments),
             ),
         )
         if extension
     )
+    source_attachment_paths = _source_attachment_paths(normalized_attachments)
     _mark_timing("attachment_extension")
     user_content_blocks = (
         chat_attachment_content_blocks(effective_prompt, normalized_attachments)
@@ -4187,7 +4493,6 @@ def _render_chat_turn(
     _mark_timing("tool_scope_decision_check_start")
     skip_tool_scope_decision = _messaging_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
-        user_message=effective_prompt,
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -4278,6 +4583,7 @@ def _render_chat_turn(
                 principal_id=principal_id,
                 tool_results=artifact_result.tool_results,
                 required_attachment_extensions=requested_attachment_extensions,
+                source_attachment_paths=source_attachment_paths,
             )
         else:
             detail = artifact_result.error or "Image generation provider failed."
@@ -4292,6 +4598,7 @@ def _render_chat_turn(
                 artifact_paths=artifact_result.artifact_paths,
                 principal_id=principal_id,
                 required_attachment_extensions=requested_attachment_extensions,
+                source_attachment_paths=source_attachment_paths,
             )
         update_active_task_frame_from_outcomes(
             runtime.store,
@@ -4458,9 +4765,19 @@ def _render_chat_turn(
                         "role": "system",
                         "content": [{"type": "text", "text": _user_context_text}],
                     })
+                _skill_pack_index_text = (
+                    _enabled_skill_pack_index_prompt(settings)
+                    if tool_registry_allows_skill_pack_context(active_turn_tool_registry)
+                    else None
+                )
+                if _skill_pack_index_text:
+                    orchestrator_conversation_history.append({
+                        "role": "system",
+                        "content": [{"type": "text", "text": _skill_pack_index_text}],
+                    })
                 _skill_pack_text = (
                     _enabled_skill_pack_prompt(settings)
-                    if tool_registry_allows_skill_pack_context(active_turn_tool_registry)
+                    if tool_registry_allows_skill_pack_prompt_context(active_turn_tool_registry)
                     else None
                 )
                 if _skill_pack_text:
@@ -4492,7 +4809,11 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": route_hints}],
                 })
-            recent_tool_context = _recent_tool_context_prompt(runtime, conversation_id)
+            recent_tool_context = (
+                _recent_tool_context_prompt(runtime, conversation_id)
+                if _should_include_recent_tool_context(conversation_result)
+                else None
+            )
             if recent_tool_context:
                 orchestrator_conversation_history.append({
                     "role": "system",
@@ -4577,6 +4898,11 @@ def _render_chat_turn(
             ):
                 model_for_dispatch = getattr(agent_orchestrator, "model_client", None)
                 if model_for_dispatch is not None:
+                    active_turn_tool_registry = materialize_mini_agent_tool_scope_registry(
+                        active_turn_tool_registry,
+                        model_client=model_for_dispatch,
+                        user_message=effective_prompt,
+                    )
                     dispatch_available_tools = [
                         str(tool.get("name", ""))
                         for tool in active_turn_tool_registry.list_tool_definitions()
@@ -4629,6 +4955,12 @@ def _render_chat_turn(
                     available_tools=dispatch_available_tools,
                     single_task_fast_path=False,
                     dag_plan=dispatch_dag_plan,
+                    requires_artifact_delivery=bool(requested_attachment_extensions),
+                    required_artifact_kind=(
+                        str(requested_attachment_extensions[0]).lstrip(".")
+                        if requested_attachment_extensions
+                        else None
+                    ),
                 )
                 _mark_timing("mini_agent_dispatch")
                 if getattr(dispatch_result, "dispatched", True):
@@ -4672,11 +5004,17 @@ def _render_chat_turn(
                             status="running",
                             output={
                                 "summary": f"Dispatched {task_count} helper task(s).",
+                                "task_group_id": str(getattr(dispatch_result, "group_id", "") or ""),
                                 "tasks": dispatched_task_titles,
                                 "status_delivered": bool(getattr(dispatch_result, "status_delivered", False)),
                             },
                         )
                     ]
+                    status_delivery_confirmed = bool(getattr(dispatch_result, "status_delivered", False))
+                    if activity_tool_results:
+                        mini_agents_output = activity_tool_results[-1].output
+                        if isinstance(mini_agents_output, dict):
+                            mini_agents_output["status_delivery_confirmed"] = status_delivery_confirmed
                     reply = dispatch_result.acknowledgment or (
                         f"Working on {task_count} task(s)."
                     )
@@ -4731,6 +5069,7 @@ def _render_chat_turn(
                         principal_id=principal_id,
                         tool_results=mission_result.tool_results,
                         required_attachment_extensions=requested_attachment_extensions,
+                        source_attachment_paths=source_attachment_paths,
                     )
                     mission_outcome = TurnOutcome.SUCCESS
                 turn_outcome = mission_outcome
@@ -4751,6 +5090,7 @@ def _render_chat_turn(
                         artifact_paths=mission_result.artifacts,
                         principal_id=principal_id,
                         required_attachment_extensions=requested_attachment_extensions,
+                        source_attachment_paths=source_attachment_paths,
                     )
                     attachment_failure = attachment_processing_failure_reply(
                         effective_prompt,
@@ -4809,6 +5149,7 @@ def _render_chat_turn(
                             principal_id=principal_id,
                             tool_results=turn_result.tool_results,
                             required_attachment_extensions=requested_attachment_extensions,
+                            source_attachment_paths=source_attachment_paths,
                         )
                     turn_outcome = TurnOutcome.SUCCESS
                 update_active_task_frame_from_outcomes(
@@ -4828,6 +5169,7 @@ def _render_chat_turn(
                         artifact_paths=turn_result.artifacts,
                         principal_id=principal_id,
                         required_attachment_extensions=requested_attachment_extensions,
+                        source_attachment_paths=source_attachment_paths,
                     ):
                         repair_history = [
                             *orchestrator_conversation_history,
@@ -4863,6 +5205,7 @@ def _render_chat_turn(
                                 principal_id=principal_id,
                                 tool_results=turn_result.tool_results,
                                 required_attachment_extensions=requested_attachment_extensions,
+                                source_attachment_paths=source_attachment_paths,
                             )
                             thinking_text = thinking_text or getattr(repair_result, "thinking_text", None)
                     if turn_outcome is TurnOutcome.SUCCESS:
@@ -4875,6 +5218,7 @@ def _render_chat_turn(
                             artifact_paths=turn_result.artifacts,
                             principal_id=principal_id,
                             required_attachment_extensions=requested_attachment_extensions,
+                            source_attachment_paths=source_attachment_paths,
                         )
                         update_active_task_frame_from_outcomes(
                             runtime.store,
@@ -4932,11 +5276,12 @@ def _render_chat_turn(
                     runtime.store.add_conversation_ingress_id(conversation_id, conversation_ingress_id)
                 phase_tracker.emit(PHASE_SAVE_CONVERSATION, "running")
                 turn_latency.mark("save_start", once=True)
-                runtime.checkpoint(force=True)
+                if not defer_checkpoint:
+                    runtime.checkpoint(force=True)
                 _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
                 phase_tracker.done(PHASE_SAVE_CONVERSATION, "save")
                 turn_latency.mark("save_done", once=True)
-                _mark_timing("save")
+                _mark_timing("save_deferred" if defer_checkpoint else "save")
                 _log_timing_if_slow(
                     "suppressed",
                     conversation_id_value=conversation_id,
@@ -4982,13 +5327,23 @@ def _render_chat_turn(
                     tool_results=activity_tool_results,
                 )
             _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+            if not _turn_is_suspended:
+                _schedule_chat_turn_memory_capture(
+                    runtime,
+                    agent_orchestrator,
+                    owner=_memory_owner_for_chat(chat_id, settings),
+                    user_message=prompt,
+                    assistant_reply=reply,
+                    tool_results=activity_tool_results,
+                )
             if conversation_ingress_id and conversation_id:
                 runtime.store.add_conversation_ingress_id(conversation_id, conversation_ingress_id)
-            runtime.checkpoint(force=True)
+            if not defer_checkpoint:
+                runtime.checkpoint(force=True)
             _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
             phase_tracker.done(PHASE_SAVE_CONVERSATION, "save")
             turn_latency.mark("save_done", once=True)
-            _mark_timing("save")
+            _mark_timing("save_deferred" if defer_checkpoint else "save")
             _log_timing_if_slow(
                 "completed",
                 conversation_id_value=conversation_id,
@@ -5072,6 +5427,7 @@ def _render_chat_turn(
                     principal_id=principal_id,
                     tool_results=live_tool_results,
                     required_attachment_extensions=requested_attachment_extensions,
+                    source_attachment_paths=source_attachment_paths,
                 )
                 reply = _enforce_chat_response_fulfillment(
                     runtime,
@@ -5081,6 +5437,7 @@ def _render_chat_turn(
                     tool_results=live_tool_results,
                     principal_id=principal_id,
                     required_attachment_extensions=requested_attachment_extensions,
+                    source_attachment_paths=source_attachment_paths,
                 )
                 attachment_failure = attachment_processing_failure_reply(
                     effective_prompt,
@@ -5118,6 +5475,14 @@ def _render_chat_turn(
                 )
                 _remember_chat_turn(runtime, chat_id=chat_id, user_message=prompt, assistant_reply=reply, conversation_turn_id=conversation_result.turn.turn_id)
                 _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+                _schedule_chat_turn_memory_capture(
+                    runtime,
+                    agent_orchestrator,
+                    owner=_memory_owner_for_chat(chat_id, settings),
+                    user_message=prompt,
+                    assistant_reply=reply,
+                    tool_results=live_tool_results,
+                )
                 runtime.checkpoint()
                 _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
                 return _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply)
@@ -5201,6 +5566,7 @@ def _render_chat_turn(
             principal_id=principal_id,
             tool_results=live_tool_results,
             required_attachment_extensions=requested_attachment_extensions,
+            source_attachment_paths=source_attachment_paths,
         )
         reply = _enforce_chat_response_fulfillment(
             runtime,
@@ -5210,6 +5576,7 @@ def _render_chat_turn(
             tool_results=live_tool_results,
             principal_id=principal_id,
             required_attachment_extensions=requested_attachment_extensions,
+            source_attachment_paths=source_attachment_paths,
         )
         attachment_failure = attachment_processing_failure_reply(
             effective_prompt,
@@ -5264,6 +5631,14 @@ def _render_chat_turn(
         conversation_turn_id=conversation_result.turn.turn_id,
     )
     _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+    _schedule_chat_turn_memory_capture(
+        runtime,
+        agent_orchestrator,
+        owner=_memory_owner_for_chat(chat_id, settings),
+        user_message=prompt,
+        assistant_reply=reply,
+        tool_results=live_tool_results,
+    )
     runtime.checkpoint()
     _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
     return _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply)
@@ -5352,7 +5727,7 @@ def handle_chat_operator_message(
         if not chat_enabled:
             logger.info("Ignored non-command Telegram text (chat_id=%s, text=%s)", chat_id, message)
             return None
-        health_reply = _chat_model_issue_reply(runtime, message=message)
+        health_reply = _chat_model_issue_reply(runtime, message=message, model_client=model_client)
         if health_reply is not None:
             return health_reply
         reply = _render_chat_turn(
@@ -5373,6 +5748,7 @@ def handle_chat_operator_message(
             turn_dispatch_decision=turn_dispatch_decision,
             cancellation_checker=cancellation_checker,
             conversation_ingress_id=conversation_ingress_id,
+            defer_checkpoint=channel_name in {"telegram", "slack", "discord"},
         )
         result = _classify_command_result("/chat", reply)
         logger.info(
@@ -5420,7 +5796,7 @@ def handle_chat_operator_message(
     elif planner_command.requested:
         if not chat_enabled:
             reply = "Telegram chat is disabled."
-        elif (health_reply := _chat_model_issue_reply(runtime, message=message)) is not None:
+        elif (health_reply := _chat_model_issue_reply(runtime, message=message, model_client=model_client)) is not None:
             reply = health_reply
         elif not planner_command.prompt:
             reply = "Usage: /planner <message>"
@@ -5447,7 +5823,7 @@ def handle_chat_operator_message(
     elif _normalize_command_head(message) == "/chat":
         if not chat_enabled:
             reply = "Telegram chat is disabled."
-        elif (health_reply := _chat_model_issue_reply(runtime, message=message)) is not None:
+        elif (health_reply := _chat_model_issue_reply(runtime, message=message, model_client=model_client)) is not None:
             reply = health_reply
         else:
             reply = _render_chat_turn(

@@ -24,11 +24,28 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Callable
 
 log = logging.getLogger(__name__)
+
+_DOW_NAMES = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+_MONTH_NAMES = (
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
 
 def _nullion_home() -> Path:
     configured = str(os.environ.get("NULLION_HOME") or "").strip()
@@ -41,6 +58,7 @@ _DEFAULT_WORKSPACE_ID = "workspace_admin"
 _CRON_COLLECTION = "cron_jobs"
 _CRON_TABLE = "reminders_crons"
 _STORE_FRESHNESS_SKEW = timedelta(seconds=1)
+_LOCAL_CRON_SCHEDULE_CUTOFF = datetime(2026, 5, 15, 12, 45, tzinfo=timezone.utc)
 
 # ── Data model ─────────────────────────────────────────────────────────────────
 
@@ -53,6 +71,7 @@ class CronJob:
     workspace_id: str = _DEFAULT_WORKSPACE_ID
     delivery_channel: str = "" # web | telegram; blank means legacy/default routing
     delivery_target: str = ""  # chat id, conversation id, or other channel-specific target
+    schedule_timezone: str = "" # blank means legacy UTC schedule for pre-local-time jobs
     enabled:     bool  = True
     created_at:  str   = ""
     last_run:    str | None = None
@@ -89,22 +108,55 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _compute_next_run(schedule: str, after: datetime | None = None) -> str | None:
-    """Return ISO-8601 string for the next fire time, or None on error."""
+def _cron_timezone() -> tzinfo:
+    try:
+        from nullion.preferences import detect_system_timezone, load_preferences, resolve_timezone
+
+        saved_timezone = str(load_preferences().timezone or "").strip()
+        if saved_timezone.upper() == "UTC":
+            detected_timezone = detect_system_timezone(default="UTC")
+            if detected_timezone != "UTC":
+                return resolve_timezone(detected_timezone)
+        return resolve_timezone(saved_timezone)
+    except Exception:
+        log.debug("Could not resolve cron timezone; falling back to UTC.", exc_info=True)
+        return timezone.utc
+
+
+def cron_display_timezone() -> tzinfo:
+    return _cron_timezone()
+
+
+def _cron_base_time(after: datetime | None = None, *, tz: tzinfo | None = None) -> tuple[datetime, tzinfo]:
+    tz = tz or _cron_timezone()
     if after is None:
         after = datetime.now(timezone.utc)
+    if after.tzinfo is None:
+        after = after.replace(tzinfo=tz)
+    return after.astimezone(tz), tz
+
+
+def _cron_fire_time_iso(dt: datetime, tz: tzinfo) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)  # type: ignore[arg-type]
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _compute_next_run(schedule: str, after: datetime | None = None, *, tz: tzinfo | None = None) -> str | None:
+    """Return ISO-8601 string for the next fire time, or None on error."""
+    local_after, cron_tz = _cron_base_time(after, tz=tz)
     # 1. Try croniter (best accuracy)
     try:
         from croniter import croniter          # type: ignore[import]
-        cron = croniter(schedule, after)
-        return cron.get_next(datetime).replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
+        cron = croniter(schedule, local_after)
+        return _cron_fire_time_iso(cron.get_next(datetime), cron_tz)
     except ImportError:
         pass
     except Exception as exc:
         log.debug("croniter failed for %r: %s — falling back", schedule, exc)
 
     # 2. Lightweight fallback: parse and advance minute-by-minute (max 1 week)
-    return _fallback_next_run(schedule, after)
+    return _fallback_next_run(schedule, local_after, tz=cron_tz)
 
 
 _CRON_RE = re.compile(
@@ -138,25 +190,259 @@ def _field_matches(spec: str, value: int, lo: int, hi: int) -> bool:
     return False
 
 
-def _fallback_next_run(schedule: str, after: datetime) -> str | None:
+def _fallback_next_run(schedule: str, after: datetime, *, tz: tzinfo | None = None) -> str | None:
     m = _CRON_RE.match(schedule.strip())
     if not m:
         return None
+    if tz is None:
+        tz = after.tzinfo or timezone.utc
+    if after.tzinfo is None:
+        after = after.replace(tzinfo=tz)  # type: ignore[arg-type]
     min_spec, hr_spec, dom_spec, mon_spec, dow_spec = m.groups()
     # Advance minute by minute; cap at 1 week to avoid infinite loops
     dt = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
     limit = after + timedelta(days=7)
     while dt <= limit:
+        cron_dow = int(dt.strftime("%w"))
         if (
             _field_matches(mon_spec, dt.month,  1, 12)
             and _field_matches(dom_spec, dt.day,   1, 31)
-            and _field_matches(dow_spec, dt.weekday(), 0, 6)
+            and _field_matches(dow_spec, cron_dow, 0, 7)
             and _field_matches(hr_spec,  dt.hour,  0, 23)
             and _field_matches(min_spec, dt.minute, 0, 59)
         ):
-            return dt.isoformat(timespec="seconds")
+            return _cron_fire_time_iso(dt, tz)
         dt += timedelta(minutes=1)
     return None
+
+
+def _timezone_display_name(tz: tzinfo) -> str:
+    return str(getattr(tz, "key", None) or tz.tzname(datetime.now(tz)) or "local time")
+
+
+def _format_local_time(hour: int, minute: int) -> str:
+    suffix = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    return f"{display_hour}:{minute:02d} {suffix}"
+
+
+def _parse_cron_field_values(spec: str, lo: int, hi: int) -> list[int] | None:
+    spec = str(spec or "").strip()
+    if not spec:
+        return None
+    if spec == "*":
+        return list(range(lo, hi + 1))
+    values: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            return None
+        step = 1
+        if "/" in part:
+            base, step_text = part.split("/", 1)
+            try:
+                step = int(step_text)
+            except ValueError:
+                return None
+            if step <= 0:
+                return None
+        else:
+            base = part
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            start_text, end_text = base.split("-", 1)
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError:
+                return None
+        else:
+            try:
+                start = end = int(base)
+            except ValueError:
+                return None
+        if start < lo or end > hi or start > end:
+            return None
+        values.update(range(start, end + 1, step))
+    return sorted(values)
+
+
+def _join_words(items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def _parse_job_created_at(job: CronJob) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(job.created_at or ""))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _resolve_timezone_name(name: str) -> tzinfo | None:
+    try:
+        from nullion.preferences import resolve_timezone
+
+        return resolve_timezone(name)
+    except Exception:
+        return None
+
+
+def _job_schedule_timezone(job: CronJob) -> tzinfo:
+    configured = str(getattr(job, "schedule_timezone", "") or "").strip()
+    if configured:
+        return _resolve_timezone_name(configured) or timezone.utc
+    created_at = _parse_job_created_at(job)
+    if created_at is None or created_at < _LOCAL_CRON_SCHEDULE_CUTOFF:
+        return timezone.utc
+    return _cron_timezone()
+
+
+def _cron_expression_for_display(schedule: str, *, source_tz: tzinfo, display_tz: tzinfo) -> str:
+    if source_tz == display_tz:
+        return schedule
+    m = _CRON_RE.match(str(schedule or "").strip())
+    if not m:
+        return schedule
+    min_spec, hr_spec, dom_spec, mon_spec, dow_spec = m.groups()
+    minutes = _parse_cron_field_values(min_spec, 0, 59)
+    hours = _parse_cron_field_values(hr_spec, 0, 23)
+    dows = _parse_cron_field_values(dow_spec, 0, 7)
+    if minutes is None or hours is None or dows is None:
+        return schedule
+    if dom_spec != "*" or mon_spec != "*":
+        return schedule
+
+    converted_hours: set[int] = set()
+    converted_dows: set[int] = set()
+    source_dates = [datetime(2026, 5, 10 + offset, tzinfo=source_tz) for offset in range(7)]
+    dow_is_wildcard = len(dows) >= 7
+    for source_date in source_dates:
+        cron_dow = int(source_date.strftime("%w"))
+        if not dow_is_wildcard and cron_dow not in {0 if day == 7 else day for day in dows}:
+            continue
+        for hour in hours:
+            local_dt = source_date.replace(hour=hour, minute=0).astimezone(display_tz)
+            converted_hours.add(local_dt.hour)
+            if not dow_is_wildcard:
+                converted_dows.add(int(local_dt.strftime("%w")))
+
+    if not converted_hours:
+        return schedule
+
+    def _field(values: set[int]) -> str:
+        return ",".join(str(value) for value in sorted(values))
+
+    display_dow_spec = "*" if dow_is_wildcard else _field(converted_dows)
+    return f"{min_spec} {_field(converted_hours)} * * {display_dow_spec}"
+
+
+def describe_cron_schedule(schedule: str, *, tz: tzinfo | None = None) -> str:
+    """Return a user-facing schedule summary for a 5-field cron expression."""
+    m = _CRON_RE.match(str(schedule or "").strip())
+    if not m:
+        return "Custom schedule"
+    min_spec, hr_spec, dom_spec, mon_spec, dow_spec = m.groups()
+    minutes = _parse_cron_field_values(min_spec, 0, 59)
+    hours = _parse_cron_field_values(hr_spec, 0, 23)
+    doms = _parse_cron_field_values(dom_spec, 1, 31)
+    months = _parse_cron_field_values(mon_spec, 1, 12)
+    dows = _parse_cron_field_values(dow_spec, 0, 7)
+    if None in (minutes, hours, doms, months, dows):
+        return "Custom schedule"
+    assert minutes is not None and hours is not None and doms is not None and months is not None and dows is not None
+
+    every_minute = len(minutes) == 60
+    every_hour = len(hours) == 24
+    every_day = len(doms) == 31 and len(dows) >= 7
+    every_month = len(months) == 12
+    if every_minute and every_hour:
+        phrase = "Every minute"
+    elif min_spec.startswith("*/") and every_hour:
+        phrase = f"Every {min_spec[2:]} minutes"
+    elif len(minutes) == 1 and every_hour:
+        phrase = "Every hour"
+        if minutes[0]:
+            phrase += f" at :{minutes[0]:02d}"
+    elif len(minutes) == 1 and len(hours) == 1:
+        phrase = f"At {_format_local_time(hours[0], minutes[0])}"
+    elif len(minutes) == 1 and len(hours) <= 4:
+        phrase = "At " + _join_words([_format_local_time(hour, minutes[0]) for hour in hours])
+    else:
+        phrase = "Custom schedule"
+
+    qualifiers: list[str] = []
+    if len(dows) < 7:
+        normalized_dows = sorted({0 if day == 7 else day for day in dows})
+        qualifiers.append("on " + _join_words([_DOW_NAMES[day] for day in normalized_dows]))
+    elif len(doms) < 31:
+        qualifiers.append("on day " + _join_words([str(day) for day in doms]))
+    if len(months) < 12:
+        qualifiers.append("in " + _join_words([_MONTH_NAMES[month] for month in months]))
+    if qualifiers:
+        phrase += " " + " ".join(qualifiers)
+    tz_name = _timezone_display_name(tz or _cron_timezone())
+    return f"{phrase} ({tz_name})"
+
+
+def describe_cron_next_run(next_run: str | None, *, tz: tzinfo | None = None) -> str:
+    if not next_run:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(next_run))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(tz or _cron_timezone())
+        return f"{local_dt.strftime('%b')} {local_dt.day}, {local_dt.year} at {_format_local_time(local_dt.hour, local_dt.minute)}"
+    except Exception:
+        return ""
+
+
+def cron_display_fields(job: CronJob, *, tz: tzinfo | None = None) -> dict[str, str]:
+    tz = tz or _cron_timezone()
+    schedule_tz = _job_schedule_timezone(job)
+    display_schedule = _cron_expression_for_display(job.schedule, source_tz=schedule_tz, display_tz=tz)
+    return {
+        "schedule_description": describe_cron_schedule(display_schedule, tz=tz),
+        "next_run_description": describe_cron_next_run(job.next_run, tz=tz),
+    }
+
+
+def _compute_job_next_run(job: CronJob, *, after: datetime | None = None) -> str | None:
+    return _compute_next_run(job.schedule, after=after, tz=_job_schedule_timezone(job))
+
+
+def _refresh_future_next_runs_for_timezone(jobs: list[CronJob]) -> bool:
+    now = datetime.now(timezone.utc)
+    changed = False
+    for job in jobs:
+        if not str(getattr(job, "schedule_timezone", "") or "").strip():
+            job.schedule_timezone = _timezone_display_name(_job_schedule_timezone(job))
+            changed = True
+        if not job.enabled:
+            continue
+        current_next = job.next_run_dt()
+        if current_next is not None and current_next.astimezone(timezone.utc) <= now:
+            continue
+        expected_next = _compute_job_next_run(job, after=now)
+        if expected_next and expected_next != job.next_run:
+            job.next_run = expected_next
+            changed = True
+    return changed
+
+
+def _return_crons(jobs: list[CronJob], *, persist_refreshed: bool = True) -> list[CronJob]:
+    if persist_refreshed and _refresh_future_next_runs_for_timezone(jobs):
+        _save_crons_db(jobs)
+    return jobs
 
 
 # ── Storage ────────────────────────────────────────────────────────────────────
@@ -282,13 +568,13 @@ def _load_legacy_crons_json() -> tuple[list[CronJob], datetime] | None:
         return None
 
 
-def load_crons() -> list[CronJob]:
+def load_crons(*, refresh_next_runs: bool = True) -> list[CronJob]:
     db_snapshot = _load_crons_db_snapshot()
     legacy_snapshot = _load_legacy_crons_json()
     if db_snapshot is None:
         if legacy_snapshot is not None and legacy_snapshot[0]:
             _save_crons_db(legacy_snapshot[0])
-            return legacy_snapshot[0]
+            return _return_crons(legacy_snapshot[0], persist_refreshed=refresh_next_runs)
         return []
     if legacy_snapshot is not None:
         legacy_jobs, legacy_updated_at = legacy_snapshot
@@ -301,7 +587,7 @@ def load_crons() -> list[CronJob]:
                 "Runtime DB had no cron rows; restored %d cron(s) from legacy JSON mirror.",
                 len(legacy_jobs),
             )
-            return legacy_jobs
+            return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
         if json_updated_at is not None and (
             db_updated_at is None or json_updated_at > db_updated_at + _STORE_FRESHNESS_SKEW
         ):
@@ -311,21 +597,21 @@ def load_crons() -> list[CronJob]:
                     "Ignoring newer empty cron JSON mirror because runtime DB still has %d cron(s).",
                     len(db_jobs),
                 )
-                return db_jobs
+                return _return_crons(db_jobs, persist_refreshed=refresh_next_runs)
             save_crons(legacy_jobs)
             log.info(
                 "Imported %d cron(s) from newer legacy JSON mirror into runtime DB.",
                 len(legacy_jobs),
             )
-            return legacy_jobs
+            return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
         if legacy_updated_at and db_updated_at is None and legacy_jobs and not db_jobs:
             _save_crons_db(legacy_jobs)
-            return legacy_jobs
-    return db_snapshot[0]
+            return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
+    return _return_crons(db_snapshot[0], persist_refreshed=refresh_next_runs)
 
 
-def list_crons(*, workspace_id: str | None = None) -> list[CronJob]:
-    jobs = load_crons()
+def list_crons(*, workspace_id: str | None = None, refresh_next_runs: bool = True) -> list[CronJob]:
+    jobs = load_crons(refresh_next_runs=refresh_next_runs)
     if workspace_id is None:
         return jobs
     requested_workspace = str(workspace_id or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID
@@ -416,6 +702,7 @@ def add_cron(
         workspace_id=str(workspace_id or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID,
         delivery_channel=normalize_cron_delivery_channel(delivery_channel),
         delivery_target=str(delivery_target or "").strip(),
+        schedule_timezone=_timezone_display_name(_cron_timezone()),
         enabled=enabled,
         created_at=_now_iso(),
         next_run=_compute_next_run(schedule) if enabled else None,
@@ -443,7 +730,7 @@ def toggle_cron(cron_id: str, enabled: bool) -> CronJob | None:
     for job in jobs:
         if job.id == cron_id:
             job.enabled = enabled
-            job.next_run = _compute_next_run(job.schedule) if enabled else None
+            job.next_run = _compute_job_next_run(job) if enabled else None
             save_crons(jobs)
             return job
     return None
@@ -462,10 +749,12 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
                     if k == "delivery_channel":
                         v = normalize_cron_delivery_channel(v)
                     setattr(job, k, v)
+            if "schedule" in kwargs:
+                job.schedule_timezone = _timezone_display_name(_cron_timezone())
             job.workspace_id = str(job.workspace_id or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID
             # Validate after applying changes so we check the final state.
             _validate_cron_fields(job.name, job.schedule, job.task)
-            job.next_run = _compute_next_run(job.schedule) if job.enabled else None
+            job.next_run = _compute_job_next_run(job) if job.enabled else None
             save_crons(jobs)
             return job
     return None
@@ -533,14 +822,14 @@ class CronScheduler:
 
             # Ensure next_run is populated
             if not job.next_run:
-                job.next_run = _compute_next_run(job.schedule, after=now)
+                job.next_run = _compute_job_next_run(job, after=now)
                 changed = True
                 continue
 
             next_dt = job.next_run_dt()
             if next_dt is None:
                 # Corrupt next_run — recompute
-                job.next_run = _compute_next_run(job.schedule, after=now)
+                job.next_run = _compute_job_next_run(job, after=now)
                 changed = True
                 continue
 
@@ -549,7 +838,7 @@ class CronScheduler:
                 # Advance next_run and persist BEFORE firing so a crash mid-fire
                 # doesn't cause a double-fire on the next scheduler tick.
                 job.last_run = _now_iso()
-                job.next_run = _compute_next_run(job.schedule, after=now)
+                job.next_run = _compute_job_next_run(job, after=now)
                 save_crons(jobs)
                 changed = False  # already saved
                 try:

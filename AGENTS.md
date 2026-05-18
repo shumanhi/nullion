@@ -14,6 +14,8 @@
 - Keep safety/security detectors separate from product routing. Security filters may inspect text, but must not decide task decomposition or artifact delivery.
 - Add tests proving equivalent behavior works without English-specific trigger words.
 - Activity/status summaries should show that a tool was used, including tools like `list_crons`, without exposing the tool's full output when that output contains internal task prose, paths, files, artifacts, credentials, connector payloads, or other non-deliverable state.
+- Durable user preferences that affect safety or consent, such as requiring confirmation before sending emails, must be saved as memory and injected into future turns across supported chat surfaces. Capture them through structured memory extraction or explicit memory tooling, not product-routing keyword checks.
+- Any user-facing prompt that asks the user to choose from multiple options or provide one of several possible inputs must present numbered options and must allow a numeric reply such as `1`, `2`, or `3`. Do not require exact text names or internal ids as the only path for a normal user.
 
 ## Planner Cards And Activity Display
 
@@ -30,6 +32,9 @@
 - If fallback planner cards are needed, they are resilience-only and must not replace root-cause performance fixes.
 - Add regression tests that cover timeout, clarification, and valid multi-task planner outcomes without relying on English trigger words.
 - Latency is a release-critical product requirement. Do not fix routing, scheduler, connector, planner, or activity bugs by adding a model/classifier call to every ordinary request. First look for typed runtime signals, cached decisions with correct invalidation, existing task/frame state, tool result schemas, stored job/artifact descriptors, and other cheap structured routes. If a new model decision is unavoidable, gate it behind structured evidence and add tests proving unrelated plain turns stay on the fast path.
+- Startup should proactively warm cheap, reusable runtime facts that chat turns commonly need, including tool registry shape, cron metadata, compact installed-skill indexes, system context, and platform chat context. Do not move this work into the hot path for every ordinary chat request unless the cache is missing or invalid.
+- Tool scoping must follow this order: use the cached compact installed-skill/capability index for cheap awareness, make a structured scope decision or `request_tool_scope` call only when the visible tools are insufficient, then load exact skill docs or connector context only after that structured scope is selected. Never load full skill-pack text, connector inventories, or scheduler/job details on every simple chat turn.
+- Do not hardcode product behavior, URL rewrites, endpoint defaults, workflow assumptions, retries, or output fixes for third-party skill packs, connector providers, external APIs, or vendor-specific routes inside Nullion core. Core may enforce generic safety, schema, permission, boundary, delivery, and tool-contract rules only. If a third-party skill pack or connector returns the wrong default behavior, fix the installed skill pack, connector metadata, adapter configuration, or skill documentation instead of encoding that provider's semantics in Nullion core.
 
 ## Repo Boundaries
 
@@ -96,6 +101,10 @@
 
 ## Verification Guardrails
 
+- For live behavior reports from prod, stage, dev, Telegram, Web, Slack, Discord, or cron delivery, inspect runtime evidence before guessing or patching: relevant logs, `runtime.db` events/tool timings, process/import path, active lane, provider/connector status, and exact user-visible error text. Do not diagnose from screenshots or assumptions alone when logs/runtime state are available.
+- For user-visible delivery bugs, verify with the live API or platform boundary after patching, not only helper tests. Reuse the same prompt shape and surface that failed when the user authorizes it.
+- For tool-scope, connector, media-generation, scheduler, weather, or artifact-delivery regressions, record the exact failed turn before guessing. The failure chain must include the selected surface, conversation id or request id when available, scoped tool list/tool count, tool results, artifacts, and timing.
+- Artifact delivery regressions must be tested against prior fixed cases before handoff: generated cron reports, email/send receipts with attachments, platform captions, and internal sidecar/state-file suppression.
 - The active pre-commit hook is `.githooks/pre-commit`, selected by `core.hooksPath=.githooks`.
 - The app pre-commit hook blocks `test/`, `tests/`, `test_*.py`, and `*_test.py` from this repo.
 - The app pre-commit hook runs the private suite in `../nullion-test/tests` with coverage unless `NULLION_SKIP_PRIVATE_TESTS=1` is set.
@@ -107,6 +116,11 @@
 - Docker, installer, GUI, browser, and end-to-end checks should live in `nullion-test` and run inside containers or CI runners, not directly against the host desktop.
 - GitHub Actions Windows and Linux installer checks belong in `nullion-test`.
 - New E2E tests must exercise the real product boundary that failed. For UI bugs, start the app server and drive the browser with Playwright; for API/workflow bugs, call the real FastAPI route or runner against a real `PersistentRuntime`/SQLite store; for delivery bugs, verify the actual artifact/upload/receipt bytes or rendered UI state.
+- Latency regressions require measured E2E coverage, not only helper assertions. When fixing a latency-sensitive chat, routing, connector, scheduler, planner, or activity path, add or update an E2E that runs multiple representative requests, records elapsed time, asserts an average/p95-style threshold, and simulates the previously slow dependency so the test fails if that dependency re-enters the hot path.
+- Plain chat requests must remain on the fast path even when optional providers, connectors, skill packs, crons, or planner features are installed. Do not let the existence of a configured capability alone trigger extra model calls, connector inventory loads, network probes, broad database scans, or task decomposition.
+- Tool-scope fixes must preserve low-latency simple chat. Do not make every plain turn load full skill-pack text, connector inventories, or a broad tool classifier. Prefer cached compact capability indexes, startup warmup, and exact-tool loading only after structured scope selection or safe local tool metadata makes it appropriate.
+- When a user-visible tool-scope bug is fixed, add or update a live stage chat contract in `nullion-test` that sends real `/api/chat` requests against stage and checks both the visible reply/artifact result and backing runtime tool evidence. The live probe must include a simple-turn latency average plus the affected tool family and at least one adjacent tool family when practical.
+- Do not mark a tool-scope or delivery fix ready based only on helper/unit tests. Before handoff, run the focused local tests and, when stage is available or the user asks for live validation, run the opt-in live stage probe with `NULLION_LIVE_STAGE_E2E=1` or the matching script directly.
 - Do not add E2E tests that only mock the function under test or assert a helper in isolation. Unit tests may use helpers, but E2E coverage must prove the user-visible path changes state and renders or delivers the expected result.
 - E2E assertions should include the visible user outcome and the backing runtime evidence when possible, such as a card disappearing plus the stored action status changing, or a dashboard hiding junk memory plus durable memory still rendering.
 - Prefer deterministic local fakes only at external network/provider boundaries. Keep Nullion routing, persistence, status APIs, browser UI, task state, and artifact handling real inside the test.

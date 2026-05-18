@@ -101,6 +101,13 @@ def _cdp_url() -> str:
     return normalized_cdp_url(os.environ.get("NULLION_BROWSER_CDP_URL", f"http://{_DEFAULT_CDP_HOST}:{_CDP_PORT}"))
 
 
+def _cdp_url_for(host: str, port: int) -> str:
+    parsed = urlparse(_cdp_url())
+    if host in {"localhost", "::1"}:
+        host = _DEFAULT_CDP_HOST
+    return urlunparse(parsed._replace(netloc=f"{host}:{port}"))
+
+
 def _cdp_endpoint() -> tuple[str, int]:
     parsed = urlparse(_cdp_url())
     host = parsed.hostname or _DEFAULT_CDP_HOST
@@ -124,6 +131,11 @@ def _cdp_port() -> int:
 def _is_cdp_reachable() -> bool:
     """Quick TCP check — is something already listening on the CDP port?"""
     host, port = _cdp_endpoint()
+    return _is_cdp_reachable_at(host, port)
+
+
+def _is_cdp_reachable_at(host: str, port: int) -> bool:
+    """Quick TCP check — is something already listening on a CDP port?"""
     try:
         with socket.create_connection((host, port), timeout=1):
             return True
@@ -151,8 +163,8 @@ def _next_available_cdp_port(start: int) -> int:
     raise RuntimeError("Could not find an available local CDP port for the selected browser.")
 
 
-def _cdp_browser_kind_from_version() -> str | None:
-    url = _cdp_url().rstrip("/") + "/json/version"
+def _cdp_browser_kind_from_version_url(base_url: str) -> str | None:
+    url = base_url.rstrip("/") + "/json/version"
     try:
         with urlopen(url, timeout=1) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
@@ -168,12 +180,21 @@ def _cdp_browser_kind_from_version() -> str | None:
     )
 
 
+def _cdp_browser_kind_from_version() -> str | None:
+    return _cdp_browser_kind_from_version_url(_cdp_url())
+
+
 def _cdp_owner_browser_kind() -> str | None:
     """Best-effort local process owner check for the configured CDP port."""
+    _host, port = _cdp_endpoint()
+    return _cdp_owner_browser_kind_for_port(port)
+
+
+def _cdp_owner_browser_kind_for_port(port: int) -> str | None:
+    """Best-effort local process owner check for a CDP port."""
     system = platform.system()
     if system not in {"Darwin", "Linux"}:
         return None
-    _host, port = _cdp_endpoint()
     try:
         lsof = subprocess.run(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
@@ -214,6 +235,43 @@ def _running_cdp_matches_preference() -> bool:
     return running is None or running == preferred
 
 
+def _preferred_cdp_scan_ports(host: str, current_port: int) -> list[int]:
+    configured_default = _CDP_PORT
+    ports = [current_port, configured_default]
+    ports.extend(range(configured_default + 1, configured_default + 50))
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for port in ports:
+        if port in seen or not (1024 <= port <= 65535):
+            continue
+        seen.add(port)
+        ordered.append(port)
+    return ordered
+
+
+def _find_reachable_preferred_cdp_port() -> int | None:
+    preferred = _preferred_browser_kind()
+    if not preferred:
+        return None
+    host, current_port = _cdp_endpoint()
+    for port in _preferred_cdp_scan_ports(host, current_port):
+        if not _is_cdp_reachable_at(host, port):
+            continue
+        base_url = _cdp_url_for(host, port)
+        running = _cdp_owner_browser_kind_for_port(port) or _cdp_browser_kind_from_version_url(base_url)
+        if running == preferred:
+            return port
+    return None
+
+
+def _reuse_preferred_cdp_if_available() -> bool:
+    port = _find_reachable_preferred_cdp_port()
+    if port is None:
+        return False
+    _set_cdp_port(port)
+    return True
+
+
 _launched_proc: subprocess.Popen | None = None
 
 
@@ -229,6 +287,8 @@ def _launch_chrome(chrome_path: str) -> None:
     global _launched_proc
     if _is_cdp_reachable() and _running_cdp_matches_preference():
         return  # already running
+    if _reuse_preferred_cdp_if_available():
+        return
     if _is_cdp_reachable():
         _set_cdp_port(_next_available_cdp_port(_cdp_port() + 1))
 
@@ -244,10 +304,6 @@ def _launch_chrome(chrome_path: str) -> None:
         "--no-default-browser-check",
         "--disable-default-apps",
     ]
-
-    # On macOS open a new window even if Chrome is already running
-    if platform.system() == "Darwin":
-        args.append("--new-window")
 
     _launched_proc = subprocess.Popen(
         args,
@@ -296,6 +352,9 @@ class AutoBackend:
                 if _is_cdp_reachable() and _running_cdp_matches_preference():
                     self._backend = self._make_cdp()
                     return self._backend
+                if _reuse_preferred_cdp_if_available():
+                    self._backend = self._make_cdp()
+                    return self._backend
 
                 # 2. Launch Chrome if available
                 chrome = _find_chrome()
@@ -319,6 +378,10 @@ class AutoBackend:
 
     # ── Delegate all BrowserBackend protocol methods ──────────────────────────
 
+    async def open(self, session_id: str) -> str:
+        b = await self._ensure_backend()
+        return await b.open(session_id)
+
     async def navigate(self, session_id: str, url: str) -> str:
         b = await self._ensure_backend()
         return await b.navigate(session_id, url)
@@ -327,9 +390,17 @@ class AutoBackend:
         b = await self._ensure_backend()
         await b.click(session_id, selector)
 
+    async def click_element(self, session_id: str, target: dict[str, Any]) -> None:
+        b = await self._ensure_backend()
+        await b.click_element(session_id, target)
+
     async def type_text(self, session_id: str, selector: str, text: str) -> None:
         b = await self._ensure_backend()
         await b.type_text(session_id, selector, text)
+
+    async def type_field(self, session_id: str, target: dict[str, Any], text: str) -> None:
+        b = await self._ensure_backend()
+        await b.type_field(session_id, target, text)
 
     async def extract_text(self, session_id: str, selector: str | None) -> str:
         b = await self._ensure_backend()
@@ -348,10 +419,14 @@ class AutoBackend:
         session_id: str,
         selector: str | None,
         url_pattern: str | None,
+        text: str | None,
         timeout: float,
     ) -> None:
         b = await self._ensure_backend()
-        await b.wait_for(session_id, selector, url_pattern, timeout)
+        try:
+            await b.wait_for(session_id, selector, url_pattern, text, timeout)
+        except TypeError:
+            await b.wait_for(session_id, selector, url_pattern, timeout)
 
     async def find(self, session_id: str, selector: str) -> list[dict[str, str]]:
         b = await self._ensure_backend()

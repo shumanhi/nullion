@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
 import mimetypes
 import inspect
 from pathlib import Path
@@ -21,7 +22,9 @@ from langgraph.graph import END, START, StateGraph
 SUPPORTED_CRON_DELIVERY_CHANNELS = frozenset({"web", "telegram", "slack", "discord"})
 MESSAGING_CRON_DELIVERY_CHANNELS = frozenset({"telegram", "slack", "discord"})
 MAX_CRON_TEXT_ARTIFACT_CHARS = 12000
+MAX_CRON_ATTACHMENT_FALLBACK_CHARS = 420
 DEFAULT_CRON_NO_OUTPUT_MESSAGE = "Cron ran successfully; no output was produced."
+CRON_DELIVERY_REPLY_PREFIX = "⏰ "
 SCHEDULED_TASK_DELIVERY_PREFIX = "⏰ Scheduled task:"
 CRON_INTERNAL_CAPABILITY_TAGS = frozenset({"scheduler"})
 CRON_INTERNAL_REFERENCE_TOOLS = frozenset({"skill_pack_read"})
@@ -31,9 +34,12 @@ CRON_DELIVERABLE_ARTIFACT_TOOLS = frozenset(
         "pdf_create",
         "pdf_edit",
         "image_generate",
-        "terminal_exec",
     }
 )
+_CRON_DISPATCH_TOOL_SHAPE_CACHE_SIZE = 64
+_CRON_DISPATCH_PLAN_CACHE_NAMESPACE = "cron.dispatch_plan"
+_CRON_DISPATCH_PLAN_CACHE_VERSION = "v1"
+_CRON_DISPATCH_PLAN_CACHE_MAX_ENTRIES = 128
 _HTML_LOCAL_IMAGE_SRC_RE = re.compile(
     r"(?P<prefix><img\b[^>]*?\bsrc\s*=\s*)(?P<quote>[\"'])(?P<src>[^\"']+)(?P=quote)",
     re.IGNORECASE,
@@ -84,6 +90,371 @@ def cron_agent_prompt(job: object, *, label: str) -> str:
         "- If the task says to alert only on new data or meaningful changes, return no output when nothing changed.\n"
         f"- If no output behavior is specified and there is nothing specific to report, send: {DEFAULT_CRON_NO_OUTPUT_MESSAGE}"
     )
+
+
+def _cron_tool_definition_shape(tool_definitions: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    shape: list[tuple[str, tuple[str, ...]]] = []
+    for definition in tool_definitions or ():
+        if not isinstance(definition, dict):
+            continue
+        name = str(definition.get("name") or "").strip()
+        if not name:
+            continue
+        tags = tuple(
+            sorted(
+                {
+                    str(tag).strip().lower()
+                    for tag in (definition.get("capability_tags") or ())
+                    if str(tag).strip()
+                }
+            )
+        )
+        shape.append((name, tags))
+    return tuple(sorted(shape))
+
+
+@lru_cache(maxsize=_CRON_DISPATCH_TOOL_SHAPE_CACHE_SIZE)
+def _cached_cron_dispatch_tool_names(
+    shape: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[str, ...]:
+    return tuple(name for name, _tags in shape)
+
+
+def clear_cron_execution_metadata_caches() -> None:
+    """Clear compact cron execution metadata caches after tool-registry changes."""
+
+    _cached_cron_dispatch_tool_names.cache_clear()
+    try:
+        from nullion import runtime_cache
+
+        runtime_cache.invalidate_namespace(_CRON_DISPATCH_PLAN_CACHE_NAMESPACE)
+    except Exception:
+        pass
+
+
+def cron_deep_agent_dispatch_plan(
+    job: object,
+    *,
+    label: str,
+    tool_registry: object,
+    planner_preview: object | None = None,
+):
+    """Build a scheduled-job DAG without an execution-time planner/model call."""
+
+    from nullion.task_decomposer import DagPlan, DecomposedTask
+    from nullion.task_queue import TaskPriority
+
+    try:
+        tool_definitions = tool_registry.list_tool_definitions()
+    except Exception:
+        tool_definitions = []
+    allowed_tools = list(_cached_cron_dispatch_tool_names(_cron_tool_definition_shape(tool_definitions)))
+    title = str(getattr(job, "name", "") or "Scheduled task").strip() or "Scheduled task"
+    description = cron_agent_prompt(job, label=label)
+    cache_key = _cron_dispatch_plan_cache_key(job, tool_definitions)
+    preview_plan = _cron_dispatch_plan_from_preview(
+        planner_preview,
+        description=description,
+        fallback_tools=allowed_tools,
+    )
+    if preview_plan is not None:
+        _cron_dispatch_plan_cache_set(cache_key, preview_plan)
+        return preview_plan
+    cached_plan = _cron_dispatch_plan_cache_get(
+        cache_key,
+        description=description,
+        fallback_tools=allowed_tools,
+    )
+    if cached_plan is not None:
+        return cached_plan
+    return DagPlan(
+        disposition="single_turn",
+        tasks=[
+            DecomposedTask(
+                title=f"Run {title}"[:50],
+                description=description,
+                tool_scope=allowed_tools,
+                priority=TaskPriority.NORMAL,
+                dep_indices=[],
+                context_key_in=None,
+                context_key_out=None,
+                required_inputs=[],
+                can_start=True,
+                metadata={
+                    "scheduled_task_run": True,
+                    "no_user_input_requests": True,
+                    "authoritative_scheduled_task_context": True,
+                    "deep_agent_profiles": ["scheduled_job"],
+                    "tool_capability_tags": ("scheduler", "cron"),
+                },
+            )
+        ],
+        routing_evidence=["scheduled_task_runtime"],
+    )
+
+
+def _cron_dispatch_plan_cache_key(job: object, tool_definitions: object) -> list[object]:
+    return [
+        str(getattr(job, "id", "") or "").strip(),
+        _short_hash(str(getattr(job, "name", "") or "")),
+        _short_hash(str(getattr(job, "task", "") or "")),
+        [
+            [name, list(tags)]
+            for name, tags in _cron_tool_definition_shape(tool_definitions)
+        ],
+    ]
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _cron_dispatch_plan_cache_set(cache_key: list[object], plan: object) -> None:
+    payload = _cron_dispatch_plan_to_cache_payload(plan)
+    if payload is None:
+        return
+    try:
+        from nullion import runtime_cache
+
+        runtime_cache.set_json(
+            _CRON_DISPATCH_PLAN_CACHE_NAMESPACE,
+            cache_key,
+            payload,
+            version=_CRON_DISPATCH_PLAN_CACHE_VERSION,
+            persistent=True,
+            max_entries=_CRON_DISPATCH_PLAN_CACHE_MAX_ENTRIES,
+        )
+    except Exception:
+        pass
+
+
+def _cron_dispatch_plan_cache_get(
+    cache_key: list[object],
+    *,
+    description: str,
+    fallback_tools: list[str],
+):
+    try:
+        from nullion import runtime_cache
+
+        cached = runtime_cache.get_json(
+            _CRON_DISPATCH_PLAN_CACHE_NAMESPACE,
+            cache_key,
+            version=_CRON_DISPATCH_PLAN_CACHE_VERSION,
+            persistent=True,
+        )
+    except Exception:
+        return None
+    if not cached.hit:
+        return None
+    return _cron_dispatch_plan_from_cache_payload(
+        cached.value,
+        description=description,
+        fallback_tools=fallback_tools,
+    )
+
+
+def _cron_dispatch_plan_to_cache_payload(plan: object) -> dict[str, object] | None:
+    tasks = []
+    for task in getattr(plan, "tasks", []) or []:
+        title = str(getattr(task, "title", "") or "").strip()
+        if not title:
+            return None
+        tasks.append(
+            {
+                "title": title,
+                "tool_scope": [
+                    str(tool).strip()
+                    for tool in (getattr(task, "tool_scope", None) or [])
+                    if str(tool).strip()
+                ],
+                "dep_indices": [
+                    int(index)
+                    for index in (getattr(task, "dep_indices", None) or [])
+                    if isinstance(index, int)
+                ],
+                "context_key_in": getattr(task, "context_key_in", None),
+                "context_key_out": getattr(task, "context_key_out", None),
+            }
+        )
+    if not tasks:
+        return None
+    return {
+        "disposition": str(getattr(plan, "disposition", "") or "sequential_mission"),
+        "tasks": tasks,
+    }
+
+
+def _cron_dispatch_plan_from_cache_payload(
+    payload: object,
+    *,
+    description: str,
+    fallback_tools: list[str],
+):
+    if not isinstance(payload, dict):
+        return None
+    raw_tasks = payload.get("tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        return None
+    from nullion.task_decomposer import DagPlan, DecomposedTask
+    from nullion.task_queue import TaskPriority
+
+    planned_tasks: list[DecomposedTask] = []
+    for item in raw_tasks:
+        if not isinstance(item, dict):
+            return None
+        title = str(item.get("title") or "").strip()
+        if not title:
+            return None
+        cached_tools = [
+            str(tool).strip()
+            for tool in (item.get("tool_scope") or [])
+            if str(tool).strip()
+        ]
+        scoped_tools = list(dict.fromkeys([*cached_tools, *fallback_tools]))
+        dep_indices = [
+            int(index)
+            for index in (item.get("dep_indices") or [])
+            if isinstance(index, int)
+        ]
+        planned_tasks.append(
+            DecomposedTask(
+                title=title[:50],
+                description=_scheduled_task_subtask_description(
+                    description,
+                    title=title,
+                    details=title,
+                ),
+                tool_scope=scoped_tools,
+                priority=TaskPriority.NORMAL,
+                dep_indices=dep_indices,
+                context_key_in=item.get("context_key_in") if isinstance(item.get("context_key_in"), str) else None,
+                context_key_out=item.get("context_key_out") if isinstance(item.get("context_key_out"), str) else None,
+                required_inputs=[],
+                can_start=True,
+                metadata={
+                    "scheduled_task_run": True,
+                    "no_user_input_requests": True,
+                    "authoritative_scheduled_task_context": True,
+                    "deep_agent_profiles": ["scheduled_job"],
+                    "tool_capability_tags": ("scheduler", "cron"),
+                    "cached_cron_dispatch_plan": True,
+                },
+            )
+        )
+    disposition = str(payload.get("disposition") or "").strip()
+    if disposition not in {"single_turn", "sequential_mission", "parallel_mission"}:
+        disposition = "single_turn" if len(planned_tasks) == 1 else "sequential_mission"
+    return DagPlan(
+        disposition=disposition,
+        tasks=planned_tasks,
+        routing_evidence=["cached_cron_dispatch_plan", "scheduled_task_runtime"],
+    )
+
+
+def _cron_dispatch_plan_from_preview(
+    planner_preview: object | None,
+    *,
+    description: str,
+    fallback_tools: list[str],
+):
+    from nullion.task_decomposer import DagPlan, DecomposedTask
+    from nullion.task_queue import TaskPriority
+
+    group = getattr(planner_preview, "group", None)
+    tasks = list(getattr(group, "tasks", None) or [])
+    metadata = getattr(group, "planner_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    planner_kind = str(metadata.get("planner") or "").strip()
+    if not tasks:
+        return None
+    if planner_kind == "cron_metadata_fallback":
+        return None
+    if planner_kind and planner_kind != "model_dag":
+        return None
+    if not planner_kind and len(tasks) <= 1:
+        return None
+    task_index_by_id = {str(getattr(task, "task_id", "")): index for index, task in enumerate(tasks)}
+    planned_tasks: list[DecomposedTask] = []
+    for task in tasks:
+        task_title = str(getattr(task, "title", "") or "Run scheduled task").strip() or "Run scheduled task"
+        task_description = str(getattr(task, "description", "") or "").strip()
+        task_tools = [str(tool).strip() for tool in (getattr(task, "allowed_tools", None) or ()) if str(tool).strip()]
+        scoped_tools = list(dict.fromkeys([*task_tools, *fallback_tools]))
+        dep_indices = [
+            task_index_by_id[dep_id]
+            for dep_id in (str(dep).strip() for dep in (getattr(task, "dependencies", None) or ()))
+            if dep_id in task_index_by_id
+        ]
+        planned_tasks.append(
+            DecomposedTask(
+                title=task_title[:50],
+                description=_scheduled_task_subtask_description(
+                    description,
+                    title=task_title,
+                    details=task_description,
+                ),
+                tool_scope=scoped_tools,
+                priority=getattr(task, "priority", TaskPriority.NORMAL) or TaskPriority.NORMAL,
+                dep_indices=dep_indices,
+                context_key_in=getattr(task, "context_key_in", None),
+                context_key_out=getattr(task, "context_key_out", None),
+                required_inputs=[],
+                can_start=True,
+                metadata={
+                    **dict(getattr(task, "metadata", None) or {}),
+                    "scheduled_task_run": True,
+                    "no_user_input_requests": True,
+                    "authoritative_scheduled_task_context": True,
+                    "deep_agent_profiles": ["scheduled_job"],
+                    "tool_capability_tags": ("scheduler", "cron"),
+                },
+            )
+        )
+    disposition = str(metadata.get("disposition") or "").strip()
+    if not disposition:
+        disposition = _cron_preview_disposition(planner_preview)
+    if disposition not in {"single_turn", "sequential_mission", "parallel_mission"}:
+        disposition = "single_turn" if len(planned_tasks) == 1 else "sequential_mission"
+    return DagPlan(
+        disposition=disposition,
+        tasks=planned_tasks,
+        routing_evidence=["model_structured_plan", "scheduled_task_runtime", "cron_planner_preview"],
+    )
+
+
+def _scheduled_task_subtask_description(authoritative_context: str, *, title: str, details: str) -> str:
+    """Attach the stored cron context to every planner subtask before execution."""
+
+    lines = [
+        "Scheduled job authoritative context:",
+        str(authoritative_context or "").strip(),
+        "",
+        "Assigned planner subtask:",
+        f"Title: {str(title or 'Run scheduled task').strip()}",
+    ]
+    if str(details or "").strip():
+        lines.append(f"Details: {str(details).strip()}")
+    lines.extend(
+        [
+            "",
+            "Complete this subtask using the scheduled job context above. Do not ask the user to clarify "
+            "fields already contained in the scheduled job context. If the subtask is blocked, return a "
+            "concise failure or evidence summary instead of requesting user input.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _cron_preview_disposition(planner_preview: object | None) -> str:
+    summary = str(getattr(planner_preview, "planner_summary", "") or "").strip().lower()
+    if "parallel mission" in summary:
+        return "parallel_mission"
+    if "sequential mission" in summary:
+        return "sequential_mission"
+    if "single turn" in summary:
+        return "single_turn"
+    return ""
 
 
 def scheduled_task_delivery_text(job: object, text: str, *, run_label: str | None = None) -> str:
@@ -221,6 +592,19 @@ def cron_delivery_text(text: str, artifacts: object = None) -> str:
     internal state/checkpoints; agents must make requested deliverables explicit.
     """
     return _cron_text_artifact_content(artifacts) or str(text or "")
+
+
+def cron_delivery_reply_text(text: str) -> str:
+    """Mark a final delivered cron reply without changing normal chat output."""
+
+    raw = str(text or "")
+    stripped = raw.lstrip()
+    if not stripped:
+        return ""
+    if stripped.startswith(CRON_DELIVERY_REPLY_PREFIX.strip()):
+        return raw
+    leading = raw[: len(raw) - len(stripped)]
+    return f"{leading}{CRON_DELIVERY_REPLY_PREFIX}{stripped}"
 
 
 def _path_parts(path_text: str) -> tuple[str, ...]:
@@ -732,6 +1116,62 @@ def _filter_internal_state_paths_from_text(text: str, deliverable_paths: tuple[s
     return "\n".join(kept).strip()
 
 
+def _cron_text_artifact_path_candidates(text: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        for match in _CRON_ARTIFACT_PATH_RE.finditer(raw_line):
+            path_text = match.group(0).rstrip(".,;:)]}")
+            if path_text:
+                candidates.append(path_text)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _text_referenced_deliverable_paths(
+    text: str,
+    *,
+    principal_id: str | None,
+    state_filenames: set[str],
+) -> tuple[str, ...]:
+    if not principal_id:
+        return ()
+    paths: list[str] = []
+    for path_text in _cron_text_artifact_path_candidates(text):
+        if _cron_internal_state_path(path_text) or _is_state_artifact_media(path_text, state_filenames):
+            continue
+        resolved = _resolve_cron_media_path(Path(path_text), principal_id=principal_id)
+        if resolved is None:
+            continue
+        if _cron_internal_state_path(str(resolved)) or _is_state_artifact_media(str(resolved), state_filenames):
+            continue
+        paths.append(str(resolved))
+    return tuple(dict.fromkeys(paths))
+
+
+def _strip_deliverable_artifact_paths_from_text(text: str, deliverable_paths: tuple[str, ...]) -> str:
+    if not deliverable_paths:
+        return text
+    deliverable_names = {Path(path).name for path in deliverable_paths}
+    kept: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        candidates = _cron_text_artifact_path_candidates(raw_line)
+        if not candidates:
+            kept.append(raw_line)
+            continue
+        remaining = raw_line
+        line_has_deliverable = False
+        for candidate in candidates:
+            if Path(candidate).name not in deliverable_names:
+                continue
+            remaining = remaining.replace(candidate, "")
+            line_has_deliverable = True
+        if not line_has_deliverable:
+            kept.append(raw_line)
+            continue
+        if remaining.strip(" \t:-_*•>") and len(remaining.strip()) > 24:
+            kept.append(remaining.rstrip())
+    return "\n".join(kept).strip()
+
+
 def cron_delivery_text_from_result(result: dict[str, object], *, principal_id: str | None = None) -> str:
     """Return deliverable cron text after filtering state-file-only media.
 
@@ -747,12 +1187,24 @@ def cron_delivery_text_from_result(result: dict[str, object], *, principal_id: s
     text = _normalize_split_artifact_directives(text)
     text = _resolve_relative_media_directives(text, principal_id=principal_id)
     state_filenames = _workspace_state_filenames(result)
-    deliverable_paths = _structured_tool_artifact_paths(result, state_filenames)
+    deliverable_paths = tuple(
+        dict.fromkeys(
+            [
+                *_structured_tool_artifact_paths(result, state_filenames),
+                *_text_referenced_deliverable_paths(
+                    text,
+                    principal_id=principal_id,
+                    state_filenames=state_filenames,
+                ),
+            ]
+        )
+    )
     deliverable_paths, support_assets = _prepare_cron_deliverable_paths_for_delivery(deliverable_paths)
     text = _filter_state_media_from_text(text, state_filenames)
     text = _filter_html_support_media_from_text(text, support_assets)
     text = _strip_split_artifact_directives(text, deliverable_paths)
     text = _filter_internal_state_paths_from_text(text, deliverable_paths)
+    text = _strip_deliverable_artifact_paths_from_text(text, deliverable_paths)
     return _append_media_directives(text, deliverable_paths)
 
 
@@ -767,6 +1219,13 @@ def cron_delivery_artifact_paths_from_result(
 
     state_filenames = _workspace_state_filenames(result)
     paths = list(_structured_tool_artifact_paths(result, state_filenames))
+    paths.extend(
+        _text_referenced_deliverable_paths(
+            text or "",
+            principal_id=principal_id,
+            state_filenames=state_filenames,
+        )
+    )
     for raw_line in str(text or "").splitlines():
         directive = parse_media_directive_line(raw_line)
         if directive is None:
@@ -803,6 +1262,29 @@ def _cron_delivery_text_without_media_directives(text: str) -> str:
         kept.append(lines[index])
         index += 1
     return "\n".join(kept).strip()
+
+
+def _cron_attachment_fallback_text(text: str) -> str:
+    """Return a compact fallback when artifact upload fails.
+
+    The original delivery attempt may already have emitted a long caption or
+    status body before the upload failed. Keep the fallback deliberately short
+    so Telegram does not receive a second full report dump.
+    """
+    fallback_body = _cron_delivery_text_without_media_directives(text)
+    fallback_body = " ".join(fallback_body.split())
+    if len(fallback_body) > MAX_CRON_ATTACHMENT_FALLBACK_CHARS:
+        fallback_body = f"{fallback_body[:MAX_CRON_ATTACHMENT_FALLBACK_CHARS].rstrip()}..."
+    if fallback_body:
+        return (
+            "The scheduled task ran, but I could not attach the report file. "
+            "I am not resending the full report here to avoid duplicate long messages.\n\n"
+            f"Preview: {fallback_body}"
+        )
+    return (
+        "The scheduled task ran, but I could not attach the report file. "
+        "I am not resending the full report here to avoid duplicate long messages."
+    )
 
 
 def cron_artifact_validation_block_reason(
@@ -1021,7 +1503,7 @@ def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, objec
     callbacks.save_web_delivery(
         state["job"],
         state["conversation_id"],
-        state.get("text") or "",
+        cron_delivery_reply_text(str(state.get("text") or "")),
         state.get("artifacts"),
         result,
     )
@@ -1042,7 +1524,7 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
     callbacks = state["callbacks"]
     result = dict(state.get("result") or {})
     attempts = int(state.get("send_attempts") or 0) + 1
-    text = cron_delivery_text(str(state.get("text") or ""), state.get("artifacts"))
+    text = cron_delivery_reply_text(cron_delivery_text(str(state.get("text") or ""), state.get("artifacts")))
     if _send_platform_delivery(
         callbacks.send_platform_delivery,
         state["job"],
@@ -1062,7 +1544,7 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
         result["cron_delivery_status"] = "sent"
         return {"result": result, "send_attempts": attempts}
     if media_candidate_paths_from_text(text):
-        fallback_text = _cron_delivery_text_without_media_directives(text)
+        fallback_text = _cron_attachment_fallback_text(text)
         if fallback_text and _send_platform_delivery(
             callbacks.send_platform_delivery,
             state["job"],
@@ -1172,13 +1654,16 @@ __all__ = [
     "MESSAGING_CRON_DELIVERY_CHANNELS",
     "SUPPORTED_CRON_DELIVERY_CHANNELS",
     "configured_delivery_target",
+    "clear_cron_execution_metadata_caches",
     "cron_agent_prompt",
     "cron_conversation_id",
     "cron_artifact_validation_block_reason",
     "cron_delivery_artifact_paths_from_result",
+    "cron_delivery_reply_text",
     "cron_delivery_target",
     "cron_delivery_text",
     "cron_delivery_text_from_result",
+    "cron_deep_agent_dispatch_plan",
     "cron_structured_result_block_reason",
     "effective_cron_delivery_channel",
     "normalize_cron_delivery_channel",

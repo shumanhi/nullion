@@ -13,11 +13,11 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_display import (
     approval_display_from_request,
     approval_inline_code,
@@ -64,7 +64,7 @@ from nullion.platform_activity import (
     platform_activity_capabilities,
     should_deliver_task_status,
 )
-from nullion.run_activity import RunActivityPhase, classify_run_activity_phase, task_planner_feed_mode
+from nullion.run_activity import RunActivityPhase, classify_run_activity_phase
 from nullion.health import HealthIssueType
 from nullion.operator_commands import (
     chat_model_option_for_token,
@@ -676,6 +676,7 @@ _CLOSED_DOCTOR_ACTION_STATUSES = {
     DOCTOR_ACTION_CANCELLED,
     DOCTOR_ACTION_FAILED,
 }
+_TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS: set[str] = set()
 _TELEGRAM_NOTIFIED_DOCTOR_ACTION_IDS: set[str] = set()
 _TELEGRAM_DOCTOR_NOTIFICATION_SEVERITIES = frozenset({"medium", "high", "critical"})
 
@@ -995,6 +996,9 @@ def _build_models_card(runtime: PersistentRuntime) -> DecisionCard | None:
 
 
 def _approval_card_actions(approval) -> tuple[tuple[str, str], ...]:
+    context = getattr(approval, "context", None)
+    if isinstance(context, dict) and context.get("tool_name") == "email_send":
+        return (("Send email", "allow_once"), ("Deny", "deny"))
     tool_name, detail = _approval_card_fields(approval)
     if _approval_is_web_request(tool_name, detail):
         return (
@@ -1093,11 +1097,8 @@ def _approval_card_text(approval) -> str:
     tool_name, detail = _approval_card_fields(approval)
     lines = [
         display.title,
-        _approval_copy_for(tool_name, detail),
+        display.copy or _approval_copy_for(tool_name, detail),
     ]
-    trigger_label = approval_trigger_flow_label(approval)
-    if trigger_label:
-        lines.extend(["", f"Triggered by: {approval_inline_code(trigger_label)}"])
     target_url = _approval_target_url(detail)
     if _approval_is_web_request(tool_name, detail) and target_url:
         lines.extend(
@@ -1321,9 +1322,15 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
         if proposal.status == "pending"
     }
     new_proposal_ids = sorted(set(pending_builder_proposals) - set(before.pending_builder_proposal_ids))
+    new_proposal_ids = [
+        proposal_id
+        for proposal_id in new_proposal_ids
+        if proposal_id not in _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS
+    ]
     if new_proposal_ids:
         proposal = pending_builder_proposals[new_proposal_ids[0]]
         proposal_id = proposal.proposal_id
+        _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS.add(proposal_id)
         return DecisionCard(
             text=_builder_proposal_card_text(proposal),
             reply_markup=_build_decision_markup(
@@ -1634,7 +1641,7 @@ def _telegram_streaming_mode(runtime: PersistentRuntime, *, chat_id: str | None)
 
 def _telegram_allows_status_streaming(runtime: PersistentRuntime, *, chat_id: str | None) -> bool:
     _ = (runtime, chat_id)
-    return task_planner_feed_mode() != "off"
+    return True
 
 
 def _telegram_conversation_id(chat_id: str | None) -> str | None:
@@ -1698,9 +1705,89 @@ def _chat_turn_planner_status_was_delivered(event: dict[str, object] | None) -> 
         if not isinstance(result, dict) or result.get("tool_name") != "Mini-Agents":
             continue
         output = result.get("output")
-        if isinstance(output, dict) and output.get("status_delivered") is True:
+        if isinstance(output, dict) and output.get("status_delivery_confirmed") is True:
             return True
     return False
+
+
+def _chat_turn_planner_summary_card(event: dict[str, object] | None) -> tuple[str, str] | None:
+    if not isinstance(event, dict):
+        return None
+    assistant_reply = str(event.get("assistant_reply") or "").strip()
+    if not assistant_reply:
+        return None
+    tool_results = event.get("tool_results")
+    if not isinstance(tool_results, list):
+        return None
+    group_id = ""
+    for result in tool_results:
+        if not isinstance(result, dict) or result.get("tool_name") != "Mini-Agents":
+            continue
+        output = result.get("output")
+        if not isinstance(output, dict):
+            continue
+        group_id = str(output.get("task_group_id") or "").strip()
+        if group_id:
+            break
+    if not group_id:
+        return None
+    return group_id, assistant_reply
+
+
+def _planner_summary_card_from_reply(reply: str | None, *, fallback_group_id: object = None) -> tuple[str, str] | None:
+    text = str(reply or "").strip()
+    if not text:
+        return None
+    if "PLANNER" not in text.upper() and not text.lower().startswith("planner:"):
+        return None
+    group_id = str(fallback_group_id or "").strip() or f"planner-{uuid.uuid4().hex[:8]}"
+    return group_id, text
+
+
+def _chat_turn_deferred_cron_planner_status(event: dict[str, object] | None) -> tuple[str, str] | None:
+    if not isinstance(event, dict):
+        return None
+    tool_results = event.get("tool_results")
+    if not isinstance(tool_results, list):
+        return None
+    for result in tool_results:
+        if not isinstance(result, dict) or result.get("tool_name") != "run_cron":
+            continue
+        output = result.get("output")
+        if not isinstance(output, dict):
+            continue
+        if str(output.get("delivery_status") or output.get("cron_delivery_status") or "").strip() != "deferred":
+            continue
+        if output.get("mini_agent_dispatch") is not True:
+            continue
+        if output.get("status_delivered") is True:
+            continue
+        group_id = str(output.get("task_group_id") or "").strip()
+        nested = output.get("result")
+        if isinstance(nested, dict) and nested.get("status_delivered") is True:
+            continue
+        planner_status_text = str(output.get("planner_status_text") or "").strip()
+        if not planner_status_text:
+            cron_name = str(output.get("name") or "").strip()
+            nested_text = nested.get("text") if isinstance(nested, dict) else None
+            subject = str(
+                cron_name
+                or output.get("planner_summary")
+                or nested_text
+                or output.get("text")
+                or output.get("result_text")
+                or output.get("message")
+                or "Scheduled task"
+            ).strip()
+            planner_status_text = (
+                "Planner: Scheduled task\n"
+                f"For: {subject}\n"
+                "→ Working on 1 task:\n"
+                "  ◐ Run scheduled task"
+            )
+        if group_id and planner_status_text:
+            return group_id, planner_status_text
+    return None
 
 
 def _should_suppress_planner_status_ack(
@@ -1714,7 +1801,9 @@ def _should_suppress_planner_status_ack(
     if not _chat_turn_is_running_planner_ack(event):
         return False
     delivered = bool(status_stream_delivered) or _chat_turn_planner_status_was_delivered(event)
-    return delivered and (
+    if not delivered:
+        return False
+    return (
         activity_trace_enabled_for_chat(runtime, chat_id=chat_id)
         or _telegram_allows_status_streaming(runtime, chat_id=chat_id)
     )
@@ -1728,6 +1817,58 @@ def _should_skip_telegram_primary_reply_delivery(
     return bool(suppress_primary_reply_delivery and decision_card is None)
 
 
+def _should_deliver_explicit_planner_summary_card(
+    event: dict[str, object] | None,
+    *,
+    suppress_primary_reply_delivery: bool,
+    status_stream_delivered: bool = False,
+) -> bool:
+    if status_stream_delivered or _chat_turn_planner_status_was_delivered(event):
+        return False
+    return _chat_turn_planner_summary_card(event) is not None or bool(suppress_primary_reply_delivery)
+
+
+async def _deliver_telegram_planner_summary_card(
+    runtime: PersistentRuntime,
+    *,
+    bot_token: str,
+    chat_id: str | None,
+    group_id: str,
+    reply: str,
+    force: bool = False,
+) -> bool:
+    if not chat_id or not group_id or not bot_token:
+        return False
+    if not force and not _telegram_allows_status_streaming(runtime, chat_id=chat_id):
+        return False
+    include_activity = activity_trace_enabled_for_chat(runtime, chat_id=chat_id)
+    if not force and not should_deliver_task_status(
+        status_kind="task_summary",
+        planner_feed_enabled=True,
+        include_activity=include_activity,
+    ):
+        return False
+    rendered_status = PlatformTaskCardStore(platform_activity_capabilities("telegram")).update(
+        target_id=chat_id,
+        group_id=group_id,
+        status_kind="task_summary",
+        text=reply,
+        include_activity=include_activity,
+    )
+    if not rendered_status:
+        return False
+    await _send_or_edit_telegram_task_status_message(
+        bot_token,
+        {},
+        chat_id=chat_id,
+        group_id=group_id,
+        text=rendered_status,
+        runtime=runtime,
+        bot_token=bot_token,
+    )
+    return True
+
+
 def _should_live_stream_telegram_activity(
     runtime: PersistentRuntime,
     *,
@@ -1739,7 +1880,7 @@ def _should_live_stream_telegram_activity(
     if message is None or not isinstance(text, str):
         return False
     if planner_status_requested:
-        return _telegram_allows_status_streaming(runtime, chat_id=chat_id)
+        return False
     return (
         activity_trace_enabled_for_chat(runtime, chat_id=chat_id)
         and (
@@ -1895,7 +2036,7 @@ async def _send_or_edit_telegram_task_status_message(
         await _stop_typing_keepalive(typing_tasks.pop(key, None))
 
 
-def _schedule_or_run_telegram_status_delivery(delivery_factory) -> bool:
+def _schedule_or_run_telegram_status_delivery(delivery_factory, *, confirm: bool = False) -> bool:
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1905,6 +2046,32 @@ def _schedule_or_run_telegram_status_delivery(delivery_factory) -> bool:
         except Exception:
             logger.debug("Telegram planner status delivery failed outside polling loop", exc_info=True)
             return False
+    if confirm:
+        delivered = False
+        delivery_error: BaseException | None = None
+
+        def _run_confirmed_delivery() -> None:
+            nonlocal delivered, delivery_error
+            try:
+                asyncio.run(delivery_factory(False))
+                delivered = True
+            except BaseException as exc:
+                delivery_error = exc
+
+        thread = threading.Thread(target=_run_confirmed_delivery, name="telegram-status-delivery-confirm", daemon=True)
+        thread.start()
+        thread.join(timeout=10.0)
+        if thread.is_alive():
+            logger.debug("Telegram planner status delivery confirmation timed out")
+            return False
+        if delivery_error is not None:
+            logger.debug(
+                "Telegram planner status delivery confirmation failed",
+                exc_info=(type(delivery_error), delivery_error, delivery_error.__traceback__),
+            )
+            return False
+        return delivered
+
     async def _deliver_in_background() -> None:
         try:
             await delivery_factory(True)
@@ -2941,6 +3108,20 @@ def _execute_decision_action(
         raise ValueError(f"Unsupported approval action: {action}")
 
     if kind == "proposal":
+        get_proposal = getattr(service.runtime, "get_builder_proposal", None)
+        if callable(get_proposal):
+            record = get_proposal(record_id)
+            if record is None:
+                return "Expired", "That Builder suggestion is no longer available."
+            status = str(getattr(record, "status", "") or "").strip().lower()
+            if status != "pending":
+                if status == "accepted":
+                    return "Already accepted", "That Builder suggestion is already accepted."
+                if status == "rejected":
+                    return "Already dismissed", "That Builder suggestion was already dismissed."
+                if status == "archived":
+                    return "Already archived", "That Builder suggestion was already archived."
+                return "Already handled", "That Builder suggestion is no longer pending."
         command = {
             "review": f"/proposal {record_id}",
             "accept": f"/accept-proposal {record_id}",
@@ -3121,6 +3302,14 @@ def _foreground_working_ack_text(
     return "Working on your request now. You can keep sending requests."
 
 
+def _telegram_tool_event_should_emit_working_ack(event: dict[str, str]) -> bool:
+    event_id = str(event.get("id") or "")
+    event_tool_name = str(event.get("tool_name") or "")
+    if event_tool_name == "run_cron":
+        return False
+    return event_id.startswith("tool-") or event_id == "mini-agents" or bool(event_tool_name)
+
+
 class MissingTelegramBotTokenError(ValueError):
     """Raised when Telegram runtime settings are missing a bot token."""
 
@@ -3145,6 +3334,7 @@ class ChatOperatorService:
     _turn_dispatch_tracker: AsyncTurnDispatchTracker = field(default_factory=AsyncTurnDispatchTracker)
     _activity_streams: _TelegramActivityRegistry = field(default_factory=_TelegramActivityRegistry)
     _seen_ingress_ids: set[str] = field(default_factory=set)
+    _working_ack_delivery_inflight_chats: set[str] = field(default_factory=set)
     _first_run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _live_config_signature_cache: tuple[object, ...] | None = None
 
@@ -3224,6 +3414,16 @@ class ChatOperatorService:
         )
         signature.append(env_snapshot)
         return tuple(signature)
+
+    def _claim_working_ack_delivery(self, chat_id: str | None) -> bool:
+        key = str(chat_id or "default")
+        if key in self._working_ack_delivery_inflight_chats:
+            return False
+        self._working_ack_delivery_inflight_chats.add(key)
+        return True
+
+    def _release_working_ack_delivery(self, chat_id: str | None) -> None:
+        self._working_ack_delivery_inflight_chats.discard(str(chat_id or "default"))
 
     def _apply_live_settings(self, next_settings: NullionSettings) -> None:
         for settings_field in fields(NullionSettings):
@@ -3676,7 +3876,7 @@ class ChatOperatorService:
             or not is_operator_command_text(text_for_ack)
         ) and self.settings.telegram.chat_enabled:
             _mark_timing("model_health_precheck_started")
-            health_reply = _chat_model_issue_reply(self.runtime, message=text_for_ack)
+            health_reply = _chat_model_issue_reply(self.runtime, message=text_for_ack, model_client=self.model_client)
             _mark_timing("model_health_precheck_complete")
             if health_reply is not None:
                 if message is not None:
@@ -3689,7 +3889,15 @@ class ChatOperatorService:
                 turn_outcome = "model_health_gate"
                 _log_turn_timing(turn_outcome)
                 return
-        if text_for_ack is not None and _refresh_runtime_from_checkpoint(
+        should_refresh_checkpoint = bool(
+            text_for_ack is not None
+            and (
+                is_stop_command_text(text_for_ack)
+                or str(text_for_ack).startswith("/")
+                or is_operator_command_text(str(text_for_ack))
+            )
+        )
+        if should_refresh_checkpoint and _refresh_runtime_from_checkpoint(
             self.runtime,
             min_interval_seconds=(
                 _float_env_ms(_NULLION_TELEGRAM_CHECKPOINT_REFRESH_MIN_INTERVAL_MS, default=60000.0) / 1000.0
@@ -3753,29 +3961,6 @@ class ChatOperatorService:
 
         busy_ack = None
         busy_ack_sent = False
-        if self._inflight_chat_by_id[inflight_key] > 0:
-            busy_ack = _foreground_working_ack_text(
-                text_for_ack,
-                chat_id=chat_id_text,
-                settings=self.settings,
-            )
-        if busy_ack is not None and message is not None:
-            try:
-                await retry_messaging_delivery_operation(
-                    lambda: message.reply_text(busy_ack, do_quote=_should_quote_reply(text_for_ack))
-                )
-                busy_ack_sent = True
-            except Exception:
-                _report_runner_health_issue(
-                    self.runtime,
-                    issue_type=HealthIssueType.ERROR,
-                    message="Telegram operator queued acknowledgment delivery failed.",
-                    chat_id=chat_id_text,
-                    text=text_for_ack,
-                    stage="ack_delivery",
-                    detail="Failed to send queued chat acknowledgment.",
-                )
-                raise
 
         turn_registration = await self._turn_dispatch_tracker.register(
             conversation_id or f"telegram:{inflight_key}",
@@ -3845,17 +4030,11 @@ class ChatOperatorService:
             nonlocal tool_working_ack_sent
             if activity_streamer is not None:
                 activity_streamer.emit(event)
-            event_id = str(event.get("id") or "")
-            event_tool_name = str(event.get("tool_name") or "")
             if (
                 tool_working_ack_sent
                 or busy_ack is not None
                 or message is None
-                or not (
-                    event_id.startswith("tool-")
-                    or event_id == "mini-agents"
-                    or bool(event_tool_name)
-                )
+                or not _telegram_tool_event_should_emit_working_ack(event)
             ):
                 return
             working_ack = _foreground_working_ack_text(
@@ -3865,15 +4044,22 @@ class ChatOperatorService:
             )
             if working_ack is None:
                 return
+            if not self._claim_working_ack_delivery(chat_id_text):
+                return
             tool_working_ack_sent = True
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    retry_messaging_delivery_operation(
+
+            async def _send_working_ack() -> None:
+                try:
+                    await retry_messaging_delivery_operation(
                         lambda: message.reply_text(working_ack, do_quote=_should_quote_reply(text_for_ack))
-                    ),
-                    telegram_loop,
-                )
+                    )
+                finally:
+                    self._release_working_ack_delivery(chat_id_text)
+
+            try:
+                asyncio.run_coroutine_threadsafe(_send_working_ack(), telegram_loop)
             except Exception:
+                self._release_working_ack_delivery(chat_id_text)
                 logger.debug("Telegram working acknowledgement delivery failed", exc_info=True)
 
         await self._activity_streams.register(conversation_id, activity_streamer)
@@ -3995,14 +4181,19 @@ class ChatOperatorService:
                             })
                         activity_streamer.emit({"id": "prepare", "label": "Preparing request", "status": "running"})
                     _mark_timing("handler_dispatched")
+                    activity_callback = _emit_activity_with_tool_ack
                     reply = await asyncio.to_thread(
                         _call_handle_update_with_activity,
                         self,
                         update,
                         attachments=telegram_attachments,
-                        activity_callback=_emit_activity_with_tool_ack if activity_streamer is not None else None,
+                        activity_callback=activity_callback,
                         text_delta_callback=text_streamer.emit,
-                        append_activity_trace=activity_streamer is None and not planner_status_requested,
+                        append_activity_trace=(
+                            activity_streamer is None
+                            and not planner_status_requested
+                            and activity_trace_enabled_for_chat(self.runtime, chat_id=chat_id_text)
+                        ),
                         turn_dispatch_decision=turn_registration.decision,
                         cancellation_checker=turn_registration.is_cancelled,
                     )
@@ -4072,7 +4263,7 @@ class ChatOperatorService:
                     if not self.runtime.store.has_conversation_ingress_id(conversation_id, dedupe_key):
                         self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
                         _mark_runtime_checkpoint_signature_stale(self.runtime)
-                        ingress_checkpoint_deferred = True
+                    ingress_checkpoint_deferred = True
                 if handler_error is None:
                     decision_card = _new_decision_card(self.runtime, decision_snapshot)
                     if decision_card is None:
@@ -4107,6 +4298,60 @@ class ChatOperatorService:
             activity_finish_task = None
             if activity_streamer is not None:
                 activity_finish_task = asyncio.create_task(activity_streamer.finish())
+            if (
+                handler_error is None
+                and planner_status_requested
+                and isinstance(reply, str)
+                and reply.strip()
+            ):
+                latest_planner_event = _latest_chat_turn_for_reply(
+                    self.runtime,
+                    chat_id=chat_id_text,
+                    reply=reply,
+                )
+                planner_card = _chat_turn_planner_summary_card(latest_planner_event)
+                if planner_card is None:
+                    planner_card = _planner_summary_card_from_reply(
+                        reply,
+                        fallback_group_id=turn_registration.turn_id or request_id or message_id,
+                    )
+                planner_status_confirmed = _chat_turn_planner_status_was_delivered(latest_planner_event)
+                if planner_status_confirmed:
+                    suppress_primary_reply_delivery = _chat_turn_is_running_planner_ack(latest_planner_event)
+                elif _should_deliver_explicit_planner_summary_card(
+                    latest_planner_event,
+                    suppress_primary_reply_delivery=suppress_primary_reply_delivery,
+                    status_stream_delivered=planner_status_confirmed,
+                ) or planner_card is not None:
+                    planner_group_id = (
+                        planner_card[0]
+                        if planner_card is not None
+                        else str(turn_registration.turn_id or request_id or message_id or "planner")
+                    )
+                    planner_reply = planner_card[1] if planner_card is not None else str(reply)
+                    delivered_planner_card = await _deliver_telegram_planner_summary_card(
+                        self.runtime,
+                        bot_token=self.bot_token,
+                        chat_id=chat_id_text,
+                        group_id=planner_group_id,
+                        reply=planner_reply,
+                        force=True,
+                    )
+                    if delivered_planner_card:
+                        suppress_primary_reply_delivery = True
+            if handler_error is None and not planner_status_requested and isinstance(reply, str):
+                cron_planner_status = _chat_turn_deferred_cron_planner_status(
+                    _latest_chat_turn_for_reply(self.runtime, chat_id=chat_id_text, reply=reply)
+                )
+                if cron_planner_status is not None:
+                    group_id, planner_text = cron_planner_status
+                    await _deliver_telegram_planner_summary_card(
+                        self.runtime,
+                        bot_token=self.bot_token,
+                        chat_id=chat_id_text,
+                        group_id=group_id,
+                        reply=planner_text,
+                    )
             if _should_skip_telegram_primary_reply_delivery(
                 suppress_primary_reply_delivery=suppress_primary_reply_delivery,
                 decision_card=decision_card,
@@ -4536,7 +4781,7 @@ class ChatOperatorService:
                         or not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id)
                         or not should_deliver_task_status(
                             status_kind=status_kind,
-                            planner_feed_enabled=task_planner_feed_mode() != "off",
+                            planner_feed_enabled=True,
                             include_activity=include_activity,
                         )
                     ):
@@ -4566,7 +4811,10 @@ class ChatOperatorService:
                             typing_tasks=_status_typing_tasks if use_loop_bound_state else None,
                         )
 
-                    return _schedule_or_run_telegram_status_delivery(_deliver_status)
+                    return _schedule_or_run_telegram_status_delivery(
+                        _deliver_status,
+                        confirm=status_kind == "task_summary",
+                    )
                 # Final results and artifacts are awaited so delivery failures
                 # surface to the result aggregator instead of disappearing.
                 principal_id = principal_id_for_messaging_identity("telegram", chat_id, _service_ref.settings)

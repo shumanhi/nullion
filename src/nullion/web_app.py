@@ -85,6 +85,7 @@ from nullion.config import (
 from nullion.cron_delivery import (
     CronRunDeliveryCallbacks,
     cron_agent_prompt,
+    cron_deep_agent_dispatch_plan,
     cron_delivery_artifact_paths_from_result,
     cron_delivery_target,
     cron_delivery_text,
@@ -155,8 +156,6 @@ from nullion.run_activity import (
     format_skill_usage_activity_detail,
     format_tool_activity_detail,
     format_tool_results_activity_detail,
-    task_planner_feed_enabled,
-    task_planner_feed_mode,
 )
 from nullion.artifact_workflow_graph import run_pre_chat_artifact_workflow
 from nullion.screenshot_delivery import ScreenshotDeliveryResult
@@ -184,10 +183,12 @@ from nullion.turn_relationship_evidence import has_structured_turn_relationship_
 from nullion.turn_context_policy import (
     build_turn_tool_evidence,
     is_slash_prefixed_literal_message,
+    materialize_mini_agent_tool_scope_registry,
     scoped_turn_tool_registry,
     should_include_prior_turn_messages,
     tool_registry_allows_connector_context,
     tool_registry_allows_skill_pack_context,
+    tool_registry_allows_skill_pack_prompt_context,
     turn_tool_scope_decision_may_apply,
     turn_tool_evidence_needs_model_scope_decision,
 )
@@ -211,6 +212,12 @@ _WEB_CHECKPOINT_INFLIGHT: set[int] = set()
 _WEB_CHECKPOINT_DIRTY: set[int] = set()
 _WEB_TURN_SLOW_LOG_MS = 1200.0
 _DEFAULT_BROWSER_CDP_URL = "http://127.0.0.1:9222"
+_PREFERRED_BROWSER_DEFAULT_CDP_PORTS = {
+    "chrome": 9222,
+    "chromium": 9222,
+    "brave": 9223,
+    "edge": 9224,
+}
 
 
 def _normalize_browser_cdp_url(raw_url: object | None) -> str:
@@ -219,6 +226,21 @@ def _normalize_browser_cdp_url(raw_url: object | None) -> str:
     if parsed.hostname in {"localhost", "::1"}:
         return urlunparse(parsed._replace(netloc=f"127.0.0.1:{parsed.port or 9222}"))
     return raw
+
+
+def _browser_cdp_url_for_preference(raw_url: object | None, preferred: object | None) -> str:
+    cdp_url = _normalize_browser_cdp_url(raw_url)
+    preferred_kind = str(preferred or "").strip().lower()
+    preferred_port = _PREFERRED_BROWSER_DEFAULT_CDP_PORTS.get(preferred_kind)
+    parsed = urlparse(cdp_url)
+    current_port = parsed.port or 9222
+    known_default_ports = set(_PREFERRED_BROWSER_DEFAULT_CDP_PORTS.values())
+    if not preferred_port or current_port not in known_default_ports or current_port == preferred_port:
+        return cdp_url
+    host = parsed.hostname or "127.0.0.1"
+    if host in {"localhost", "::1"}:
+        host = "127.0.0.1"
+    return urlunparse(parsed._replace(netloc=f"{host}:{preferred_port}"))
 
 
 def _friendly_browser_open_error(raw_error: object, *, backend: str) -> str:
@@ -504,7 +526,10 @@ def _web_stable_context_history_prefix(
         from nullion.config import load_settings as load_app_settings
         from nullion.builder_capabilities import format_installed_dependency_context
         from nullion.connections import format_workspace_connections_for_prompt
-        from nullion.skill_pack_installer import format_compact_enabled_skill_packs_for_prompt
+        from nullion.skill_pack_installer import (
+            format_cached_enabled_skill_pack_index_for_prompt,
+            format_compact_enabled_skill_packs_for_prompt,
+        )
         from nullion.web_research_policy import format_web_research_guidance
     except Exception:
         return []
@@ -522,6 +547,10 @@ def _web_stable_context_history_prefix(
         include_skill_packs = tool_registry_allows_skill_pack_context(turn_tool_registry)
     except Exception:
         include_skill_packs = False
+    try:
+        include_skill_pack_prompt = tool_registry_allows_skill_pack_prompt_context(turn_tool_registry)
+    except Exception:
+        include_skill_pack_prompt = False
 
     enabled_skill_packs = tuple(getattr(app_settings, "enabled_skill_packs", ()) or ())
     cache_principal_id = "web:admin" if str(principal_id or "").startswith("web:") else principal_id
@@ -530,6 +559,7 @@ def _web_stable_context_history_prefix(
         _web_runtime_cache_identity(runtime),
         include_connections,
         include_skill_packs,
+        include_skill_pack_prompt,
         _web_model_client_signature(model_client),
         _web_tool_registry_signature(turn_tool_registry),
         _web_settings_signature(app_settings),
@@ -545,7 +575,7 @@ def _web_stable_context_history_prefix(
     cached_result = runtime_cache.get_json(
         "stable_context.web",
         cache_key,
-        version="v6",
+        version="v7",
         persistent=True,
         db_path=_web_runtime_cache_db_path(runtime),
     )
@@ -567,8 +597,14 @@ def _web_stable_context_history_prefix(
             principal_id=principal_id,
             include_external_connectors=include_connections,
         )
-        skill_pack_text = ""
+        skill_pack_index_text = ""
         if include_skill_packs:
+            skill_pack_index_text = format_cached_enabled_skill_pack_index_for_prompt(
+                enabled_skill_packs,
+                max_total_chars=900,
+            )
+        skill_pack_text = ""
+        if include_skill_pack_prompt:
             skill_pack_text = format_compact_enabled_skill_packs_for_prompt(enabled_skill_packs)
             access_text = (
                 skill_pack_access_prompt(enabled_skill_packs, principal_id=principal_id, compact=True)
@@ -594,10 +630,15 @@ def _web_stable_context_history_prefix(
                     "Below is the live inventory of tools registered in this session. "
                     "Only claim a tool is unavailable if it does NOT appear in this list. "
                     "Never say you cannot do something that an available tool directly supports. "
-                    "If a capability-specific tool is unavailable, say what is missing instead of "
-                    "trying to synthesize account access through terminal, file, or web tools. "
-                    "External account data requires a matching provider-backed tool; connections "
-                    "are references, not raw credentials.\n\n"
+                    "If a capability-specific tool is unavailable or fails, fall back to registered "
+                    "core tools when they can still complete the task locally. Browser tools may be "
+                    "used when the user can log in or the target is public; terminal tools may be used "
+                    "for local command-line paths when registered and approved. If every tool path is "
+                    "blocked, suggest concrete next steps such as connecting the provider, installing "
+                    "or enabling the matching skill, logging in through the agent browser, or providing "
+                    "a public target. If a browser fallback reaches a sign-in page, explicitly offer "
+                    "the agent-browser login path instead of only asking for more identifiers. External "
+                    "account connections are references, not raw credentials.\n\n"
                     + caps_text
                 )
             )
@@ -605,6 +646,8 @@ def _web_stable_context_history_prefix(
             entries.append(_web_system_text_message(config_text))
         if connections_text:
             entries.append(_web_system_text_message(connections_text))
+        if skill_pack_index_text:
+            entries.append(_web_system_text_message(skill_pack_index_text))
         if skill_pack_text:
             entries.append(_web_system_text_message(skill_pack_text))
     except Exception:
@@ -618,7 +661,7 @@ def _web_stable_context_history_prefix(
         "stable_context.web",
         cache_key,
         _web_clone_prompt_messages(entries),
-        version="v6",
+        version="v7",
         persistent=True,
         db_path=_web_runtime_cache_db_path(runtime),
         max_entries=_WEB_STABLE_CONTEXT_CACHE_MAX_ENTRIES,
@@ -2584,6 +2627,14 @@ _HTML = r"""<!DOCTYPE html>
   .bubble li { padding-left: 2px; }
   .bubble li.message-list-depth-2 { margin-left: 18px; }
   .bubble li.message-list-depth-3 { margin-left: 36px; }
+  .message-quote {
+    margin: 8px 0 10px; padding: 8px 12px;
+    border-left: 3px solid rgba(96,165,250,0.62);
+    border-radius: 0 8px 8px 0;
+    background: rgba(96,165,250,0.08);
+    color: var(--text);
+    white-space: normal;
+  }
   .builder-notice {
     margin-top: 13px;
     padding-top: 9px;
@@ -2803,6 +2854,10 @@ _HTML = r"""<!DOCTYPE html>
     border: 1px solid var(--border); color: var(--text); font-size: 12px;
     line-height: 1.45; word-break: break-word;
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+  }
+  .approval-detail.email-review {
+    white-space: pre-wrap;
+    font-family: var(--mono);
   }
   .approval-trigger {
     display: flex; align-items: center; gap: 7px; min-width: 0;
@@ -4232,9 +4287,9 @@ _HTML = r"""<!DOCTYPE html>
       </div>
       <div class="mission-actions">
         <div class="runtime-toggle-group" aria-label="Response visibility">
-          <button id="verbose-mode-btn" class="runtime-toggle" type="button" title="Verbose mode is On" aria-label="Verbose mode is On" data-tooltip="Verbose mode is On" onclick="cycleVerboseMode()">
+          <button id="verbose-mode-btn" class="runtime-toggle off" type="button" title="Verbose mode is Off" aria-label="Verbose mode is Off" data-tooltip="Verbose mode is Off" onclick="cycleVerboseMode()">
             <span class="runtime-toggle-light" aria-hidden="true"></span>
-            <span id="verbose-mode-label">Verbose: On</span>
+            <span id="verbose-mode-label">Verbose: Off</span>
           </button>
           <label id="chat-streaming-btn" class="runtime-toggle" title="Chat streaming is on" aria-label="Chat streaming is on" data-tooltip="Chat streaming is on">
             <input type="checkbox" id="chat-streaming-toggle" checked onchange="toggleChatStreaming(this.checked)">
@@ -5086,14 +5141,7 @@ _HTML = r"""<!DOCTYPE html>
                   <div class="pref-row-title">Verbose</div>
                   <div class="pref-row-desc">Show activity details during chat runs.</div>
                 </div>
-                <label class="toggle-switch"><input type="checkbox" id="cfg-verbose-enabled" checked onchange="setVerboseMode(this.checked ? 'on' : 'off')"><span class="toggle-slider"></span></label>
-              </div>
-              <div class="pref-row">
-                <div>
-                  <div class="pref-row-title">Planner card</div>
-                  <div class="pref-row-desc">Show live task cards for planned work.</div>
-                </div>
-                <label class="toggle-switch"><input type="checkbox" id="cfg-task-planner-feed-enabled" checked onchange="toggleTaskPlannerFeed(this.checked)"><span class="toggle-slider"></span></label>
+                <label class="toggle-switch"><input type="checkbox" id="cfg-verbose-enabled" onchange="setVerboseMode(this.checked ? 'on' : 'off')"><span class="toggle-slider"></span></label>
               </div>
               <div class="pref-row">
                 <div>
@@ -6164,7 +6212,6 @@ let _messageMetadataByTurn = new Map();
 let _pendingUserMessageMetadata = null;
 let _setupMediaAvailability = {};
 let activityTraceEnabled = true;
-let taskPlannerFeedMode = 'task';
 let thinkingDisplayEnabled = localStorage.getItem('nullion_show_thinking_enabled') === 'true';
 let chatStreamingEnabled = localStorage.getItem('nullion_chat_streaming_enabled') !== 'false';
 let currentActivityEl = null;
@@ -6338,6 +6385,43 @@ function typingIndicatorHtml(label = 'Thinking') {
   </span>`;
 }
 
+const CHAT_AUTO_SCROLL_THRESHOLD_PX = 96;
+let _chatAutoStickToBottom = true;
+
+function messagesPane() {
+  return document.getElementById('messages');
+}
+
+function isMessagesNearBottom(messages = messagesPane()) {
+  if (!messages) return true;
+  return (messages.scrollHeight - messages.clientHeight - messages.scrollTop) <= CHAT_AUTO_SCROLL_THRESHOLD_PX;
+}
+
+function updateChatAutoStickState() {
+  const messages = messagesPane();
+  if (!messages) return;
+  _chatAutoStickToBottom = isMessagesNearBottom(messages);
+}
+
+function installMessagesScrollObserver() {
+  const messages = messagesPane();
+  if (!messages || messages.dataset.scrollObserverInstalled === 'true') return;
+  messages.dataset.scrollObserverInstalled = 'true';
+  messages.addEventListener('scroll', updateChatAutoStickState, { passive: true });
+}
+
+function scrollMessagesToBottom({ force = false } = {}) {
+  const messages = messagesPane();
+  if (!messages) return;
+  installMessagesScrollObserver();
+  if (force || _chatAutoStickToBottom || isMessagesNearBottom(messages)) {
+    messages.scrollTop = messages.scrollHeight;
+    _chatAutoStickToBottom = true;
+  }
+}
+
+queueMicrotask(installMessagesScrollObserver);
+
 function createBotBubble() {
   const messages = document.getElementById('messages');
   const div = document.createElement('div');
@@ -6347,7 +6431,7 @@ function createBotBubble() {
   botMsgEl = div.querySelector('.bubble');
   botMsgEl.dataset.rawText = '';
   botMsgEl.dataset.createdAt = messageTimestampIso();
-  document.getElementById('messages').scrollTop = 999999;
+  scrollMessagesToBottom();
   return botMsgEl;
 }
 
@@ -6775,7 +6859,7 @@ function updateTaskStatusCard(data) {
   ensureBubbleTimestamp(bubble);
   _taskStatusBubbles.set(groupId, bubble);
   if (turnId) _botTurnBubbles.set(turnId, bubble);
-  document.getElementById('messages').scrollTop = 999999;
+  scrollMessagesToBottom();
 }
 
 function activityEnabledForTurn(turnId = null) {
@@ -6842,7 +6926,7 @@ function addThinkingBlock(text, turnId = null) {
   const bodyEl = wrap.querySelector('.thinking-block-body');
   bodyEl.textContent = body;
   ensureBubbleTimestamp(bubble);
-  document.getElementById('messages').scrollTop = 999999;
+  scrollMessagesToBottom();
 }
 
 function activityIcon(status, isGroup = false) {
@@ -7133,7 +7217,7 @@ function updateRunActivityInWrap(wrap, event, fallbackItems = currentActivityIte
   detailEl.textContent = detail;
   detailEl.style.display = detail ? 'block' : 'none';
   reorderRunActivityBody(body);
-  document.getElementById('messages').scrollTop = 999999;
+  scrollMessagesToBottom();
 }
 
 function updateApprovalRunActivity(approvalId, event) {
@@ -7181,7 +7265,7 @@ function addSystemNotice(text) {
   div.className = 'session-marker';
   div.textContent = `— ${text}`;
   messages.appendChild(div);
-  messages.scrollTop = 999999;
+  scrollMessagesToBottom();
 }
 
 const shownGatewayEventIds = new Set();
@@ -7211,7 +7295,7 @@ function addAssistantNotice(title, body) {
   div.innerHTML = `<div class="avatar logo-avatar" aria-hidden="true"></div><div class="bubble"><strong>${escHtml(title)}</strong><br>${escHtml(body || '')}</div>`;
   messages.appendChild(div);
   ensureBubbleTimestamp(div.querySelector('.bubble'));
-  messages.scrollTop = 999999;
+  scrollMessagesToBottom();
   return div;
 }
 
@@ -7258,7 +7342,7 @@ function addDefaultBotGreeting() {
       <div class="bubble">Hi. I’m Nullion. Give me a mission and I’ll keep the plan, approvals, tools, and memory visible as I work.</div>
     </div>`;
   ensureBubbleTimestamp(messages.querySelector('.msg.bot .bubble'));
-  messages.scrollTop = 999999;
+  scrollMessagesToBottom({ force: true });
 }
 
 function showBotTyping(label = 'Thinking', turnId = null) {
@@ -7269,7 +7353,7 @@ function showBotTyping(label = 'Thinking', turnId = null) {
   if (turnId) bubble.dataset.turnId = turnId;
   ensureBubbleTimestamp(bubble);
   botMsgRaw = '';
-  document.getElementById('messages').scrollTop = 999999;
+  scrollMessagesToBottom();
   return bubble;
 }
 
@@ -7285,7 +7369,7 @@ function setBotStatus(text, turnId = null) {
   if (turnId) bubble.dataset.turnId = turnId;
   ensureBubbleTimestamp(bubble);
   botMsgRaw = '';
-  document.getElementById('messages').scrollTop = 999999;
+  scrollMessagesToBottom();
   return bubble;
 }
 
@@ -7370,7 +7454,6 @@ async function connect() {
         refreshDashboard();
       } else if (data.type === 'done') {
         const doneTurnId = data.turn_id || '__current__';
-        pruneTrivialRunActivity(data.turn_id || null);
         _messageMetadataByTurn.set(doneTurnId, {
           artifacts: data.artifacts || [],
           activity: _activityEventsByTurn.get(doneTurnId) || [],
@@ -7772,7 +7855,7 @@ function addMessage(role, text, isError = false, metadata = null) {
   }
   ensureBubbleTimestamp(bubble);
   messages.appendChild(div);
-  messages.scrollTop = messages.scrollHeight;
+  scrollMessagesToBottom({ force: role === 'user' });
   return bubble;
 }
 
@@ -8039,7 +8122,7 @@ function appendBotChunk(chunk, turnId = null) {
   restoreRunActivity(bubble, activity);
   ensureBubbleTimestamp(bubble);
   if (!turnId) botMsgRaw = raw;
-  document.getElementById('messages').scrollTop = 999999;
+  scrollMessagesToBottom();
 }
 
 function finalizeBotMsg(fallback = null, isError = false, turnId = null) {
@@ -8134,6 +8217,11 @@ function approvalTitleFor(a) {
     if (sideEffect.includes('exec')) return '💻 Run this command?';
   }
   return approvalTitle((a && (a.tool_name || a.action)) || 'Tool');
+}
+
+function approvalIsEmailSend(toolName, detail = '') {
+  const raw = `${toolName || ''} ${detail || ''}`.toLowerCase();
+  return raw.includes('email_send') || raw.includes('send an email') || raw.includes('email draft:');
 }
 
 function approvalDetail(toolName, toolDetail, approvalId) {
@@ -8249,6 +8337,9 @@ function approvalIsWebApproval(a, detail) {
 }
 
 function approvalCopyFor(toolName, detail, forceWeb = false) {
+  if (approvalIsEmailSend(toolName, detail)) {
+    return 'Review the email below. Approve once to send it, or deny to stop.';
+  }
   if (forceWeb || approvalIsWebRequest(toolName, detail)) {
     return 'Nullion may need a few external sites to finish this request. Choose the web access scope to continue.';
   }
@@ -8288,12 +8379,19 @@ function approvalDetailHtml(toolName, detail, forceWeb = false) {
       ${tool ? `<div class="approval-url-tool">Tool: ${escHtml(tool)}</div>` : ''}
     </div>`;
   }
-  return `<div class="approval-detail">${escHtml(detail)}</div>`;
+  const cls = approvalIsEmailSend(toolName, detail) ? 'approval-detail email-review' : 'approval-detail';
+  return `<div class="${cls}">${escHtml(detail)}</div>`;
 }
 
 function approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel = 'for all workspaces', forceWeb = false) {
   const isWeb = forceWeb || approvalIsWebRequest(toolName, detail);
   const host = approvalTargetHost(detail);
+  if (approvalIsEmailSend(toolName, detail)) {
+    return `<div class="approval-actions">
+      <button class="card-btn primary" onclick="approveRequest('${approvalId}', this, 'once')">Send email</button>
+      <button class="card-btn reject" onclick="rejectRequest('${approvalId}', this)">Deny</button>
+    </div>`;
+  }
   if (isWeb) {
     return `<div class="approval-actions web-scope">
       <div class="approval-session-note"><span>All web domains</span><strong>${escHtml(sessionAllowLabel)}</strong></div>
@@ -8327,7 +8425,6 @@ function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel =
             <div class="approval-copy">${escHtml(approvalCopyFor(toolName, detail, isWeb))}</div>
           </div>
         </div>
-        ${approvalTriggerHtml(triggerFlowLabel)}
         ${approvalDetailHtml(toolName, detail, isWeb)}
         ${approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel, isWeb)}
         <div class="approval-state" aria-live="polite"></div>
@@ -8335,7 +8432,7 @@ function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel =
     </div>`;
   messages.appendChild(div);
   ensureBubbleTimestamp(div.querySelector('.bubble'));
-  messages.scrollTop = 999999;
+  scrollMessagesToBottom();
 }
 
 function approvalViews(approvalId) {
@@ -9035,11 +9132,22 @@ function renderMessageBlocks(html) {
   const lines = String(html || '').split('\n');
   const out = [];
   let inList = false;
+  let quoteLines = [];
   const closeList = () => {
     if (inList) {
       out.push('</ul>');
       inList = false;
     }
+  };
+  const flushQuote = () => {
+    if (!quoteLines.length) return;
+    closeList();
+    while (quoteLines.length && !quoteLines[0].trim()) quoteLines.shift();
+    while (quoteLines.length && !quoteLines[quoteLines.length - 1].trim()) quoteLines.pop();
+    if (quoteLines.length) {
+      out.push('<blockquote class="message-quote">' + quoteLines.map(line => line || '<br>').join('<br>') + '</blockquote>');
+    }
+    quoteLines = [];
   };
   const tableCells = (line) => {
     const trimmed = String(line || '').trim();
@@ -9055,6 +9163,12 @@ function renderMessageBlocks(html) {
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const quoteMatch = line.match(/^\s*&gt;\s?(.*)$/);
+    if (quoteMatch) {
+      quoteLines.push(quoteMatch[1] || '');
+      continue;
+    }
+    flushQuote();
     const header = tableCells(line);
     const separator = header && i + 1 < lines.length ? tableCells(lines[i + 1]) : null;
     if (header && separator && header.length === separator.length && isSeparator(separator)) {
@@ -9086,6 +9200,7 @@ function renderMessageBlocks(html) {
     closeList();
     out.push(line ? `${line}<br>` : '<br>');
   }
+  flushQuote();
   closeList();
   return out.join('');
 }
@@ -9162,7 +9277,6 @@ function approvalCardHtml(a) {
   const toolName = a.display_label || a.tool_name || a.action || 'Tool';
   const isWeb = Boolean(a.is_web_request) || approvalIsWebApproval(a, detail);
   const copy = a.display_copy || (isWeb ? 'Nullion may need a few external sites to finish this request. Choose the web access scope to continue.' : approvalCopyFor(toolName, detail));
-  const triggerLabel = approvalTriggerLabelFor(a);
   return `
     <div class="card approval-panel-card" data-approval-id="${escHtml(a.approval_id)}">
       <div class="approval-card">
@@ -9173,7 +9287,6 @@ function approvalCardHtml(a) {
             <div class="approval-copy">${escHtml(copy)}</div>
           </div>
         </div>
-        ${approvalTriggerHtml(triggerLabel)}
         ${approvalDetailHtml(toolName, detail, isWeb)}
         ${approvalActionsHtml(a.approval_id, toolName, detail, 'for all workspaces', isWeb)}
         <div class="approval-state" aria-live="polite"></div>
@@ -9233,8 +9346,6 @@ function decisionDetailParts(a) {
   const ctx = (a && typeof a.context === 'object' && a.context) ? a.context : {};
   const parts = [];
   if (a.requested_by) parts.push(`Requested from ${a.requested_by}`);
-  const triggerLabel = approvalTriggerLabelFor(a);
-  if (triggerLabel) parts.push(`Triggered by ${triggerLabel}`);
   if (a.action) parts.push(`Action ${a.action}`);
   let target = '';
   let targetLabel = approvalKind(a) === 'domain' ? 'URL' : 'Resource';
@@ -12507,11 +12618,9 @@ async function loadConfig(options = {}) {
     document.getElementById('cfg-proactive-reminders').checked = cfg.proactive_reminders !== false;
     document.getElementById('cfg-show-thinking').checked = cfg.show_thinking === true;
     document.getElementById('cfg-web-session-allow-duration').value = cfg.web_session_allow_duration || 'session';
-    activityTraceEnabled = cfg.activity_trace !== false;
-    taskPlannerFeedMode = normalizePlannerFeedMode(cfg.task_planner_feed_mode || 'task');
+    activityTraceEnabled = cfg.activity_trace === true;
     const verboseToggle = document.getElementById('cfg-verbose-enabled');
     if (verboseToggle) verboseToggle.checked = activityTraceEnabled;
-    renderTaskPlannerFeedSetting(taskPlannerFeedMode);
     thinkingDisplayEnabled = cfg.show_thinking === true;
     localStorage.setItem('nullion_show_thinking_enabled', thinkingDisplayEnabled ? 'true' : 'false');
     if (cfg.browser_backend !== undefined) {
@@ -12630,6 +12739,7 @@ async function loadConfig(options = {}) {
     // model-backed helper suggestions may not appear until the next click.
     refreshMediaHelperOptionsFromInventory();
     // Load profile separately
+    window.__nullionProfileLoaded = false;
     try {
       const p = await API('/api/profile');
       document.getElementById('cfg-profile-name').value    = p.name    || '';
@@ -12637,6 +12747,7 @@ async function loadConfig(options = {}) {
       document.getElementById('cfg-profile-phone').value   = p.phone   || '';
       document.getElementById('cfg-profile-address').value = p.address || '';
       document.getElementById('cfg-profile-notes').value   = p.notes   || '';
+      window.__nullionProfileLoaded = true;
     } catch(e) { /* silent */ }
   } catch (e) { /* silent */ }
 }
@@ -12721,8 +12832,7 @@ function renderHeaderConfig(cfg) {
     browserBtn.setAttribute('aria-label', browserBtn.title);
     browserBtn.setAttribute('data-tooltip', browserBtn.title);
   }
-  renderVerboseModeButton(verboseModeFromSettings(cfg.activity_trace !== false));
-  renderTaskPlannerFeedSetting(cfg.task_planner_feed_mode || 'task');
+  renderVerboseModeButton(verboseModeFromSettings(cfg.activity_trace === true));
   renderThinkingDisplayButton(cfg.show_thinking === true);
   renderChatStreamingButton(chatStreamingEnabled);
 }
@@ -12773,16 +12883,9 @@ async function applyHeaderModelSelection(provider, model) {
   }
 }
 
-function normalizePlannerFeedMode(mode) {
-  const normalized = String(mode || '').trim().toLowerCase().replace('_', '-');
-  if (normalized === 'all' || normalized === 'task' || normalized === 'off') return normalized;
-  if (normalized === 'tasks') return 'task';
-  return 'task';
-}
-
 function normalizeVerboseMode(mode) {
   const normalized = String(mode || '').trim().toLowerCase().replace('_', '-');
-  return ['off', 'on'].includes(normalized) ? normalized : 'on';
+  return ['off', 'on'].includes(normalized) ? normalized : 'off';
 }
 
 function verboseModeFromSettings(activityEnabled = activityTraceEnabled) {
@@ -12818,12 +12921,6 @@ function renderVerboseModeButton(mode = verboseModeFromSettings()) {
   }
   if (label) label.textContent = `Verbose: ${text}`;
   if (toggle) toggle.checked = cfg.activity_trace;
-}
-
-function renderTaskPlannerFeedSetting(mode = taskPlannerFeedMode) {
-  taskPlannerFeedMode = normalizePlannerFeedMode(mode);
-  const toggle = document.getElementById('cfg-task-planner-feed-enabled');
-  if (toggle) toggle.checked = taskPlannerFeedMode !== 'off';
 }
 
 function renderThinkingDisplayButton(enabled) {
@@ -12887,29 +12984,6 @@ async function cycleVerboseMode() {
   await setVerboseMode(next);
 }
 
-async function toggleTaskPlannerFeed(force = null) {
-  const currentEnabled = normalizePlannerFeedMode(taskPlannerFeedMode) !== 'off';
-  const nextEnabled = force === null ? !currentEnabled : Boolean(force);
-  const nextMode = nextEnabled ? 'task' : 'off';
-  const previousMode = taskPlannerFeedMode;
-  renderTaskPlannerFeedSetting(nextMode);
-  try {
-    const res = await fetch('/api/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ task_planner_feed_mode: nextMode }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.ok === false) throw new Error(data.error || 'Planner card update failed');
-    await loadHeaderConfig();
-    recordActivity('Planner card updated', nextEnabled ? 'Enabled' : 'Disabled');
-  } catch (e) {
-    renderTaskPlannerFeedSetting(previousMode);
-    await loadHeaderConfig();
-    alert(`Could not update planner card: ${e.message || e}`);
-  }
-}
-
 async function toggleThinkingDisplay(force = null) {
   const next = force === null ? !thinkingDisplayEnabled : Boolean(force);
   thinkingDisplayEnabled = next;
@@ -12962,7 +13036,7 @@ async function launchAgentBrowser() {
     const res = await fetch('/api/browser/open', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ url: 'https://example.com' }),
+      body: JSON.stringify({}),
     });
     const data = await res.json();
     if (!res.ok || data.ok === false) {
@@ -14186,7 +14260,6 @@ async function saveConfig() {
     mini_agent_stale_after_seconds: Number(document.getElementById('cfg-mini-agent-stale-after').value || 600),
     proactive_reminders: document.getElementById('cfg-proactive-reminders').checked,
     activity_trace:   document.getElementById('cfg-verbose-enabled').checked,
-    task_planner_feed_mode: document.getElementById('cfg-task-planner-feed-enabled').checked ? 'task' : 'off',
     show_thinking:    document.getElementById('cfg-show-thinking').checked,
     web_session_allow_duration: document.getElementById('cfg-web-session-allow-duration').value,
     browser_backend: document.getElementById('cfg-browser-backend').value,
@@ -14232,6 +14305,7 @@ async function saveConfig() {
     phone:   document.getElementById('cfg-profile-phone').value.trim(),
     address: document.getElementById('cfg-profile-address').value.trim(),
     notes:   document.getElementById('cfg-profile-notes').value.trim(),
+    _allow_clear: window.__nullionProfileLoaded === true,
   };
   fetch('/api/profile', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(profilePayload) });
 
@@ -15159,6 +15233,12 @@ let _ahCalDays  = {};
 const _MONTH_NAMES = ['January','February','March','April','May','June',
   'July','August','September','October','November','December'];
 
+function _localDateKey(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
 function openAllHistory() {
   document.getElementById('allhist-overlay').style.display = 'flex';
   const now = new Date();
@@ -15241,7 +15321,7 @@ function _paintAhCalendar(ym) {
   grid.innerHTML = '';
   const firstDay    = new Date(_ahCalYear, _ahCalMonth, 1).getDay();
   const daysInMonth = new Date(_ahCalYear, _ahCalMonth + 1, 0).getDate();
-  const todayStr    = new Date().toISOString().slice(0, 10);
+  const todayStr    = _localDateKey(new Date());
   for (let i = 0; i < firstDay; i++) {
     const b = document.createElement('div');
     b.className = 'ahcal-day other-month';
@@ -15305,7 +15385,7 @@ async function _selectAhDate(dateStr) {
       row.innerHTML =
         '<div class="ahconv-title">' + escHtml(c.title || '(untitled)') + '</div>' +
         '<div class="ahconv-meta">' + c.message_count + ' msg' + (time ? ' \u00B7 ' + time : '') + '</div>';
-      row.onclick = () => _loadAhMessages(c.id, row);
+      row.onclick = () => _loadAhMessages(c.id, row, dateStr);
       convList.appendChild(row);
     });
     convList.querySelector('.ahconv-row').click();
@@ -15348,13 +15428,15 @@ async function deleteAhDate(dateStr, btn) {
   }
 }
 
-async function _loadAhMessages(convId, rowEl) {
+async function _loadAhMessages(convId, rowEl, dateStr = '') {
   document.querySelectorAll('.ahconv-row').forEach(r => r.classList.remove('active'));
   if (rowEl) rowEl.classList.add('active');
   const msgPane = document.getElementById('allhist-messages');
   msgPane.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:14px">Loading\u2026</div>';
   try {
-    const data = await fetch('/api/chat/history/' + encodeURIComponent(convId)).then(r => r.json());
+    const url = '/api/chat/history/' + encodeURIComponent(convId)
+      + (dateStr ? '?date=' + encodeURIComponent(dateStr) : '');
+    const data = await fetch(url).then(r => r.json());
     const msgs = data.messages || [];
     if (!msgs.length) {
       msgPane.innerHTML = '<div id="allhist-empty">No messages found.</div>';
@@ -15399,6 +15481,18 @@ function _fmtNextRun(iso) {
     const days = Math.floor(hrs / 24);
     return `in ${days}d ${hrs % 24}h`;
   } catch { return iso; }
+}
+
+function cronScheduleLabel(job) {
+  const label = String((job && job.schedule_description) || '').trim();
+  if (label) return label;
+  return 'Custom schedule';
+}
+
+function cronNextRunLabel(job) {
+  const label = String((job && job.next_run_description) || '').trim();
+  if (label) return label;
+  return _fmtNextRun(job && job.next_run);
 }
 
 async function loadCronsTab() {
@@ -15454,9 +15548,9 @@ function renderCronsTab(jobs) {
       <div class="cron-info">
         <div class="cron-name">${escHtml(j.name)}</div>
         <div class="cron-meta">
-          <code>${escHtml(j.schedule)}</code>
+          ${escHtml(cronScheduleLabel(j))}
           &nbsp;·&nbsp; ${escHtml(j.workspace_id || 'workspace_admin')}
-          &nbsp;·&nbsp; ${j.enabled ? 'next ' + _fmtNextRun(j.next_run) : 'disabled'}
+          &nbsp;·&nbsp; ${j.enabled ? 'next ' + escHtml(cronNextRunLabel(j)) : 'disabled'}
           ${j.last_run ? '&nbsp;·&nbsp; last ' + new Date(j.last_run).toLocaleString() : ''}
           ${j.last_result && j.last_result !== 'ok' ? `${NI.warn()} ${escHtml(j.last_result)}` : ''}
         </div>
@@ -15493,7 +15587,7 @@ function renderCronsDash(jobs) {
     <div class="cron-dash-row">
       <div class="cron-dash-dot ${j.enabled ? 'on' : ''}"></div>
       <div class="cron-dash-name">${escHtml(j.name)}</div>
-      <div class="cron-dash-next">${escHtml(j.workspace_id || 'workspace_admin')} · ${j.enabled ? _fmtNextRun(j.next_run) : 'off'}</div>
+      <div class="cron-dash-next">${escHtml(j.workspace_id || 'workspace_admin')} · ${j.enabled ? escHtml(cronNextRunLabel(j)) : 'off'}</div>
     </div>
   `, { key: 'scheduled', title: `Scheduled tasks · ${jobs.length}`, className: 'control-list' });
 }
@@ -15698,6 +15792,8 @@ def _preferred_singular_artifact_paths_from_tool_results(
     for result in tool_results or ():
         if normalize_tool_status(getattr(result, "status", None)) != "completed":
             continue
+        if str(getattr(result, "tool_name", "") or "") == "browser_screenshot":
+            continue
         output = result.output if isinstance(result.output, dict) else {}
         value = output.get("artifact_path")
         if isinstance(value, str) and value.strip():
@@ -15723,6 +15819,49 @@ def _companion_artifact_paths_from_tool_results(
             continue
         paths.append(value)
     return list(dict.fromkeys(paths))
+
+
+def _web_email_attachment_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> list[str]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "email_send":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        values = output.get("attachment_paths")
+        if isinstance(values, str) and values.strip():
+            paths.append(values.strip())
+        elif isinstance(values, (list, tuple)):
+            paths.extend(str(value).strip() for value in values if isinstance(value, str) and value.strip())
+    return list(dict.fromkeys(paths))
+
+
+def _web_browser_screenshot_artifact_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> list[str]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "browser_screenshot":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for key in ("path", "artifact_path"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.append(value.strip())
+        values = output.get("artifact_paths")
+        if isinstance(values, (list, tuple)):
+            paths.extend(str(value).strip() for value in values if isinstance(value, str) and value.strip())
+    return list(dict.fromkeys(paths))
+
+
+def _web_is_email_confirmation_text_artifact(path_text: object) -> bool:
+    path = Path(str(path_text or "").strip())
+    return path.suffix.lower() == ".txt" and "confirmation" in path.name.casefold()
 
 
 def _filter_web_artifact_paths_for_requested_format(
@@ -15754,7 +15893,13 @@ def _web_delivery_artifact_paths(
     principal_id: str | None = None,
     requested_extension: str | None = None,
 ) -> list[str]:
+    email_attachment_paths = _web_email_attachment_paths_from_tool_results(tool_results)
+    browser_screenshot_paths = _web_browser_screenshot_artifact_paths(tool_results)
     explicit_media_paths = [str(path) for path in media_candidate_paths_from_text(str(reply or ""))]
+    if email_attachment_paths:
+        explicit_media_paths = [
+            path for path in explicit_media_paths if not _web_is_email_confirmation_text_artifact(path)
+        ]
     preferred_tool_artifacts = _preferred_singular_artifact_paths_from_tool_results(tool_results)
     if explicit_media_paths:
         candidates = explicit_media_paths
@@ -15767,11 +15912,21 @@ def _web_delivery_artifact_paths(
     else:
         candidates = [
             *preferred_tool_artifacts,
+            *email_attachment_paths,
             *(artifact_paths or ()),
             *artifact_paths_from_tool_results(tool_results),
             *_web_plain_artifact_paths_from_reply(reply),
         ]
+    non_screenshot_candidates = [
+        path
+        for path in candidates
+        if str(Path(path).expanduser()) not in {str(Path(value).expanduser()) for value in browser_screenshot_paths}
+    ]
+    if browser_screenshot_paths and requested_extension == ".png":
+        candidates = [*candidates, *browser_screenshot_paths]
     candidates = list(dict.fromkeys(str(path) for path in candidates if str(path or "").strip()))
+    if email_attachment_paths:
+        candidates = [path for path in candidates if not _web_is_email_confirmation_text_artifact(path)]
     candidates = _filter_web_artifact_paths_for_requested_format(
         prompt,
         candidates,
@@ -15849,7 +16004,12 @@ def _web_artifact_delivery_notice(
     text: str,
     artifact_paths: list[str] | tuple[str, ...],
     artifact_payloads: list[dict[str, object]],
+    *,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
 ) -> str:
+    email_notice = _web_completed_email_attachment_notice(tool_results, artifact_payloads)
+    if email_notice is not None:
+        return email_notice
     if artifact_paths and not artifact_payloads:
         return (
             f"{text}\n\n"
@@ -15857,6 +16017,86 @@ def _web_artifact_delivery_notice(
             "The source fetch likely failed; try the rendered browser capture path or retry the fetch."
         )
     return text
+
+
+def _web_completed_email_attachment_notice(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    artifact_payloads: list[dict[str, object]],
+) -> str | None:
+    email_results = [
+        result
+        for result in tool_results or ()
+        if str(getattr(result, "tool_name", "") or "") == "email_send"
+        and normalize_tool_status(getattr(result, "status", "")) == "completed"
+        and isinstance(getattr(result, "output", None), dict)
+        and _web_email_attachment_paths_from_tool_results([result])
+    ]
+    if not email_results:
+        return None
+    summary = _web_completed_email_send_summary(email_results[-1])
+    label = _web_artifact_payload_delivery_label(artifact_payloads)
+    return f"{summary}\n\nDone — attached the requested {label}.".strip()
+
+
+def _web_completed_email_send_summary(result: ToolResult) -> str:
+    output = result.output if isinstance(result.output, dict) else {}
+    recipients = output.get("to")
+    if isinstance(recipients, str):
+        recipient_text = recipients.strip()
+    elif isinstance(recipients, (list, tuple)):
+        recipient_text = ", ".join(str(value).strip() for value in recipients if str(value).strip())
+    else:
+        recipient_text = ""
+    subject = str(output.get("subject") or "").strip()
+    summary = f"✉️ Email sent to {recipient_text or 'the requested recipient'}"
+    if subject:
+        summary += f' with subject "{subject}"'
+    return summary + "."
+
+
+def _web_normalize_completed_email_send_reply(
+    text: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str:
+    email_results = [
+        result
+        for result in tool_results or ()
+        if str(getattr(result, "tool_name", "") or "") == "email_send"
+        and normalize_tool_status(getattr(result, "status", "")) == "completed"
+        and isinstance(getattr(result, "output", None), dict)
+    ]
+    if not email_results:
+        return text
+    summary = _web_completed_email_send_summary(email_results[-1])
+    reply_text = str(text or "")
+    if summary in reply_text:
+        return reply_text
+    lowered = reply_text.lower()
+    if (
+        "email sent" in lowered
+        or "email was sent" in lowered
+        or "sent the email" in lowered
+        or "message id" in lowered
+        or "status 200" in lowered
+    ) and "did not send" not in lowered:
+        return summary
+    return "\n\n".join([summary, reply_text]).strip()
+
+
+def _web_artifact_payload_delivery_label(artifact_payloads: list[dict[str, object]]) -> str:
+    if len(artifact_payloads) != 1:
+        return "attachments"
+    payload = artifact_payloads[0]
+    media_type = str(payload.get("media_type") or payload.get("mime_type") or "").lower()
+    name = str(payload.get("name") or payload.get("path") or "").lower()
+    suffix = Path(name).suffix
+    if media_type.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        return "image"
+    if media_type == "application/pdf" or suffix == ".pdf":
+        return "PDF"
+    if suffix == ".txt" or media_type.startswith("text/"):
+        return "text file"
+    return "file"
 
 
 def _enforce_web_response_fulfillment(
@@ -16508,6 +16748,11 @@ def create_app(runtime, orchestrator, registry):
     globals()["WebSocket"] = WebSocket
 
     app = FastAPI(title="Nulliøn Web UI")
+    try:
+        if registry is not None:
+            runtime.active_tool_registry = registry
+    except Exception:
+        pass
     csrf_token = secrets.token_urlsafe(32)
     app.state.nullion_csrf_token = csrf_token
     runtime_store_sync_lock = threading.RLock()
@@ -16736,6 +16981,21 @@ def create_app(runtime, orchestrator, registry):
             return None
         return stat.st_mtime_ns, stat.st_size
 
+    def _orchestrator_has_active_background_tasks() -> bool:
+        if orchestrator is None or not hasattr(orchestrator, "get_status"):
+            return False
+        try:
+            tasks = orchestrator.get_status()
+        except Exception:
+            logger.debug("Could not inspect mini-agent tasks before status sync", exc_info=True)
+            return True
+        for task in tasks or ():
+            status = getattr(task, "status", None)
+            status_value = str(getattr(status, "value", status) or "").strip().lower()
+            if status_value and status_value not in {"complete", "failed", "cancelled", "waiting_input"}:
+                return True
+        return False
+
     def _sync_runtime_store_from_checkpoint() -> bool:
         nonlocal status_checkpoint_file_signature
         checkpoint_path = getattr(runtime, "checkpoint_path", None)
@@ -16748,6 +17008,8 @@ def create_app(runtime, orchestrator, registry):
         with runtime_store_sync_lock:
             if active_runtime_turns > 0:
                 return False
+            if _orchestrator_has_active_background_tasks():
+                return False
             if checkpoint_signature == status_checkpoint_file_signature:
                 return False
         try:
@@ -16756,6 +17018,8 @@ def create_app(runtime, orchestrator, registry):
             loaded_store = load_runtime_store(path)
             with runtime_store_sync_lock:
                 if active_runtime_turns > 0:
+                    return False
+                if _orchestrator_has_active_background_tasks():
                     return False
                 runtime.store = loaded_store
                 # Skip expensive full-store fingerprint serialization here.
@@ -17268,6 +17532,52 @@ def create_app(runtime, orchestrator, registry):
             planner_terminal_sent = False
             pending_activity_detail = ""
 
+            def _planner_status_delivered_by_local_callback() -> bool:
+                return str(conv_id or "").startswith("web:")
+
+            def _planner_group_has_started_runs(group_id: str) -> bool:
+                group_id = str(group_id or "").strip()
+                if not group_id:
+                    return False
+                try:
+                    for run in getattr(runtime.store, "list_mini_agent_runs", lambda: [])():
+                        if str(getattr(run, "capsule_id", "") or "") == group_id:
+                            return True
+                except Exception:
+                    logger.debug("Could not inspect cron planner group runs", exc_info=True)
+                return False
+
+            def _deferred_dispatch_payload(error: BaseException) -> dict[str, object]:
+                error_text = str(error).strip() or error.__class__.__name__
+                logger.warning(
+                    "Cron DeepAgent dispatch raised after planner group started; preserving deferred delivery "
+                    "conversation_id=%s group_id=%s error=%s",
+                    conv_id,
+                    planner_group_id,
+                    error_text,
+                    exc_info=True,
+                )
+                return {
+                    "text": (
+                        "Manual scheduled task run started. The result will be delivered when ready."
+                        if str(label).lower().startswith("manual")
+                        else "Scheduled task run started. The result will be delivered when ready."
+                    ),
+                    "tool_results": [],
+                    "artifacts": [],
+                    "mini_agent_dispatch": True,
+                    "task_group_id": planner_group_id,
+                    "planner_summary": (
+                        str(getattr(display_preview, "summary", "") or "")
+                        if display_preview is not None
+                        else ""
+                    ),
+                    "status_delivered": bool(display_preview is not None)
+                    and _planner_status_delivered_by_local_callback(),
+                    "dispatch_error_recovered": True,
+                    "dispatch_error": error_text,
+                }
+
             def _flush_pending_activity() -> None:
                 nonlocal pending_activity_detail
                 if display_preview is None or not planner_group_id or not pending_activity_detail:
@@ -17295,7 +17605,7 @@ def create_app(runtime, orchestrator, registry):
                 _flush_pending_activity()
 
             _record_agent_preflight("started", planner_status_preview=bool(planner_status_preview))
-            if planner_status_preview and task_planner_feed_enabled():
+            if planner_status_preview:
                 try:
                     preview_registry = CronExecutionToolRegistry(
                         registry,
@@ -17320,6 +17630,25 @@ def create_app(runtime, orchestrator, registry):
                     cache_only=True,
                 )
                 if preview is None:
+                    try:
+                        preview = build_cron_planner_status_preview(
+                            model_client=getattr(orchestrator, "model_client", None),
+                            user_message=planner_preview_prompt,
+                            conversation_id=conv_id,
+                            principal_id=conv_id,
+                            tool_registry=preview_registry,
+                            subject=str(getattr(cron_job, "name", "") or ""),
+                        )
+                    except Exception:
+                        logger.debug("Could not build synchronous web cron planner status preview", exc_info=True)
+                        preview = None
+                    _install_planner_preview(preview)
+                    _record_agent_preflight(
+                        "planner_preview_sync_build",
+                        preview_available=preview is not None,
+                        allowed_tools=len(preview.allowed_tools) if preview is not None else 0,
+                    )
+                if preview is None:
                     fallback_preview = build_cron_planner_status_fallback(
                         user_message=planner_preview_prompt,
                         conversation_id=conv_id,
@@ -17331,6 +17660,9 @@ def create_app(runtime, orchestrator, registry):
                         "planner_preview_metadata_fallback_installed",
                         fallback_group_id=fallback_preview.group_id,
                     )
+
+                    preview_ready = threading.Event()
+                    preview_holder: dict[str, object] = {}
 
                     def _build_planner_preview_background() -> None:
                         try:
@@ -17347,16 +17679,39 @@ def create_app(runtime, orchestrator, registry):
                                 preview_available=candidate is not None,
                                 allowed_tools=len(candidate.allowed_tools) if candidate is not None else 0,
                             )
+                            preview_holder["candidate"] = candidate
                             if candidate is not None and not planner_terminal_sent:
                                 _install_planner_preview(candidate, preserve_group_id=True)
                         except Exception:
                             logger.debug("Could not build async web cron planner status preview", exc_info=True)
+                        finally:
+                            preview_ready.set()
 
-                    threading.Thread(
+                    planner_thread = threading.Thread(
                         target=_build_planner_preview_background,
                         name="nullion-web-cron-planner-preview",
                         daemon=True,
-                    ).start()
+                    )
+                    planner_thread.start()
+                    try:
+                        sync_wait_seconds = max(
+                            0.0,
+                            float(os.environ.get("NULLION_CRON_PLANNER_PREVIEW_SYNC_WAIT_SECONDS", "6")),
+                        )
+                    except ValueError:
+                        sync_wait_seconds = 6.0
+                    if sync_wait_seconds and preview_ready.wait(sync_wait_seconds):
+                        candidate = preview_holder.get("candidate")
+                        if candidate is not None:
+                            _record_agent_preflight(
+                                "planner_preview_sync_wait_ready",
+                                wait_s=sync_wait_seconds,
+                            )
+                    else:
+                        _record_agent_preflight(
+                            "planner_preview_sync_wait_timeout",
+                            wait_s=sync_wait_seconds,
+                        )
             connector_scope = build_cron_connector_scope_decision(
                 model_client=getattr(orchestrator, "model_client", None),
                 user_message=connector_scope_prompt,
@@ -17401,24 +17756,69 @@ def create_app(runtime, orchestrator, registry):
                 allow_connector_tools=connector_scope.allow_connector_tools,
                 connector_provider_ids=connector_scope.provider_ids,
             )
-            _record_agent_preflight("guarded_turn_start")
-            result = _run_guarded_turn_sync(
-                prompt,
-                conv_id,
-                orchestrator,
-                execution_registry,
-                runtime,
-                allow_mini_agents=allow_mini_agents,
-                force_mini_agent_dispatch=allow_mini_agents,
-                memory_owner=memory_owner_for_workspace(getattr(cron_job, "workspace_id", "workspace_admin")),
-                reinforce_memory_context=False,
-                include_structured_result=True,
-                force_model_attachment_planning=True,
-                persist_user_turn=False,
-                builder_learning_enabled=False,
-                activity_callback=_planner_activity_callback if planner_status_preview else None,
-                preferred_task_group_id=planner_group_id or None,
-            )
+            if (
+                allow_mini_agents
+                and _feature_enabled("NULLION_CRON_DEEP_AGENT_EXECUTION_ENABLED", default=True)
+                and hasattr(orchestrator, "dispatch_request_sync")
+            ):
+                _record_agent_preflight("deep_agent_dispatch_start")
+                dag_plan = cron_deep_agent_dispatch_plan(
+                    cron_job,
+                    label=label,
+                    tool_registry=execution_registry,
+                    planner_preview=preview,
+                )
+                try:
+                    dispatch_result = orchestrator.dispatch_request_sync(
+                        conversation_id=conv_id,
+                        principal_id=conv_id,
+                        user_message=prompt,
+                        tool_registry=execution_registry,
+                        policy_store=runtime.store,
+                        approval_store=runtime.store,
+                        available_tools=list(dict.fromkeys(
+                            tool
+                            for task in getattr(dag_plan, "tasks", []) or []
+                            for tool in (getattr(task, "tool_scope", []) or [])
+                        )),
+                        single_task_fast_path=False,
+                        dag_plan=dag_plan,
+                        preferred_group_id=planner_group_id or None,
+                    )
+                    result = {
+                        "text": str(getattr(dispatch_result, "acknowledgment", "") or ""),
+                        "tool_results": [],
+                        "artifacts": [],
+                        "mini_agent_dispatch": True,
+                        "task_group_id": str(getattr(dispatch_result, "group_id", "") or ""),
+                        "planner_summary": str(getattr(dispatch_result, "planner_summary", "") or ""),
+                        "status_delivered": bool(getattr(dispatch_result, "status_delivered", False))
+                        and _planner_status_delivered_by_local_callback(),
+                    }
+                except BaseException as exc:
+                    if planner_group_id and _planner_group_has_started_runs(planner_group_id):
+                        result = _deferred_dispatch_payload(exc)
+                    else:
+                        raise
+            else:
+                _record_agent_preflight("guarded_turn_start")
+                result = _run_guarded_turn_sync(
+                    prompt,
+                    conv_id,
+                    orchestrator,
+                    execution_registry,
+                    runtime,
+                    allow_mini_agents=False,
+                    force_mini_agent_dispatch=False,
+                    memory_owner=memory_owner_for_workspace(getattr(cron_job, "workspace_id", "workspace_admin")),
+                    reinforce_memory_context=False,
+                    include_structured_result=True,
+                    force_model_attachment_planning=True,
+                    persist_user_turn=False,
+                    builder_learning_enabled=False,
+                    activity_callback=_planner_activity_callback if planner_status_preview else None,
+                    preferred_task_group_id=planner_group_id or None,
+                )
             _record_agent_preflight(
                 "guarded_turn_done",
                 tool_results=len(result.get("tool_results") or ()) if isinstance(result, dict) else 0,
@@ -17426,7 +17826,6 @@ def create_app(runtime, orchestrator, registry):
             if (
                 display_preview is None
                 and planner_status_preview
-                and task_planner_feed_enabled()
             ):
                 fallback_preview = build_cron_planner_status_fallback(
                     user_message=planner_preview_prompt,
@@ -17480,7 +17879,7 @@ def create_app(runtime, orchestrator, registry):
     def _cron_fire(job):
         """Fire a cron by sending its task string through a synthetic agent turn."""
         try:
-            result = _run_cron_agent_turn(job, label="Scheduled task", allow_mini_agents=False)
+            result = _run_cron_agent_turn(job, label="Scheduled task", allow_mini_agents=True)
             if isinstance(result, dict) and (result.get("cron_delivery_failed") or result.get("cron_run_failed")):
                 raise RuntimeError("cron delivery failed")
         except Exception as exc:
@@ -17495,25 +17894,73 @@ def create_app(runtime, orchestrator, registry):
 
         if not _tool_registered("run_cron"):
             def _cron_tool_runner(job, invocation=None):
+                manual_channel = ""
                 manual_target = ""
                 principal_id = str(getattr(invocation, "principal_id", "") or "").strip()
                 if principal_id.startswith("web:"):
+                    manual_channel = "web"
                     manual_target = principal_id
+                elif principal_id.startswith("telegram:"):
+                    manual_channel = "telegram"
+                    manual_target = principal_id.split(":", 1)[1].strip()
+                elif principal_id.startswith("slack:"):
+                    manual_channel = "slack"
+                    manual_target = principal_id.split(":", 1)[1].strip()
+                elif principal_id.startswith("discord:"):
+                    manual_channel = "discord"
+                    manual_target = principal_id.split(":", 1)[1].strip()
                 flow_context = getattr(invocation, "flow_context", None)
                 if not manual_target and isinstance(flow_context, dict):
                     for key in ("conversation_id", "chat_id"):
                         candidate = str(flow_context.get(key) or "").strip()
                         if candidate.startswith("web:"):
+                            manual_channel = "web"
                             manual_target = candidate
                             break
-                return _run_cron_agent_turn(
-                    job,
-                    label="Manual scheduled task run",
-                    allow_mini_agents=False,
-                    manual_delivery_channel="web",
-                    manual_delivery_target=manual_target or "web:operator",
-                    planner_status_preview=True,
+                        if candidate.startswith("telegram:"):
+                            manual_channel = "telegram"
+                            manual_target = candidate.split(":", 1)[1].strip()
+                            break
+                        if key == "chat_id" and candidate:
+                            manual_channel = "telegram"
+                            manual_target = candidate
+                            break
+                delivery_channel = manual_channel or "web"
+                delivery_target = manual_target or "web:operator"
+
+                def _background_manual_cron_run() -> None:
+                    try:
+                        result = _run_cron_agent_turn(
+                            job,
+                            label="Manual scheduled task run",
+                            allow_mini_agents=True,
+                            manual_delivery_channel=delivery_channel,
+                            manual_delivery_target=delivery_target,
+                            planner_status_preview=True,
+                        )
+                        if isinstance(result, dict) and (
+                            result.get("cron_delivery_failed") or result.get("cron_run_failed")
+                        ):
+                            logger.warning(
+                                "Manual cron background run failed [%s]: %s",
+                                getattr(job, "id", ""),
+                                result.get("reason") or result,
+                            )
+                    except Exception:
+                        logger.warning("Manual cron background run error [%s]", getattr(job, "id", ""), exc_info=True)
+
+                thread = threading.Thread(
+                    target=_background_manual_cron_run,
+                    name=f"nullion-manual-cron-{getattr(job, 'id', 'run')}",
+                    daemon=True,
                 )
+                thread.start()
+                return {
+                    "cron_delivery_status": "deferred",
+                    "mini_agent_dispatch": True,
+                    "text": "Manual scheduled task run started. The result will be delivered when ready.",
+                    "status_delivered": False,
+                }
 
             register_cron_tools(
                 registry,
@@ -17528,8 +17975,15 @@ def create_app(runtime, orchestrator, registry):
 
     @app.get("/api/crons")
     async def list_crons_endpoint():
-        from nullion.crons import load_crons
-        return JSONResponse([j.to_dict() for j in load_crons()])
+        from nullion.crons import cron_display_fields, cron_display_timezone, load_crons
+
+        rows = []
+        cron_tz = cron_display_timezone()
+        for job in load_crons():
+            item = job.to_dict()
+            item.update(cron_display_fields(job, tz=cron_tz))
+            rows.append(item)
+        return JSONResponse(rows)
 
     @app.post("/api/crons")
     async def create_cron_endpoint(request: Request):
@@ -17593,15 +18047,17 @@ def create_app(runtime, orchestrator, registry):
     from nullion.chat_store import get_chat_store as _get_chat_store
 
     @app.get("/api/chat/history/{conv_id}")
-    async def get_chat_history(conv_id: str):
+    async def get_chat_history(conv_id: str, date: str = ""):
         """Return the last 300 messages for a conversation (creates record if new)."""
         try:
+            if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                return JSONResponse({"ok": False, "error": "date must be YYYY-MM-DD"}, status_code=400)
             store = _get_chat_store()
             _sync_runtime_chat_history_to_store(runtime, store)
             store.ensure_conversation(conv_id)
             msgs = _hydrate_chat_history_media(
                 runtime,
-                store.load_messages(conv_id, limit=300),
+                store.load_messages(conv_id, limit=5000 if date else 300, local_date=date or None),
                 principal_id=conv_id,
             )
             conv = store.get_conversation(conv_id) or {}
@@ -17732,7 +18188,15 @@ def create_app(runtime, orchestrator, registry):
             store = _get_chat_store()
             _sync_runtime_chat_history_to_store(runtime, store)
             if not month:
-                month = _dt.date.today().strftime("%Y-%m")
+                try:
+                    from nullion.preferences import detect_system_timezone, load_preferences, resolve_timezone
+
+                    preferred_tz = str(load_preferences().timezone or "").strip()
+                    if preferred_tz.upper() == "UTC":
+                        preferred_tz = detect_system_timezone(default="UTC")
+                    month = datetime.now(resolve_timezone(preferred_tz)).strftime("%Y-%m")
+                except Exception:
+                    month = _dt.date.today().strftime("%Y-%m")
             days = store.calendar_days(channel, month)
             return JSONResponse({"ok": True, "channel": channel, "month": month, "days": days})
         except ValueError as exc:
@@ -19350,15 +19814,15 @@ def create_app(runtime, orchestrator, registry):
         mini_agent_stale_after = int(mini_agent_stale_after_seconds())
         repeated_tool_failure_limit = int(_repeated_tool_failure_limit())
         proactive_reminders = os.environ.get("NULLION_PROACTIVE_REMINDERS_ENABLED", "true").lower() not in ("0", "false", "no", "off")
-        activity_trace = os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED", "true").lower() not in ("0", "false", "no", "off")
-        planner_feed_mode = task_planner_feed_mode()
+        activity_trace = os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED", "false").lower() not in ("0", "false", "no", "off")
         show_thinking = os.environ.get("NULLION_SHOW_THINKING_ENABLED", "false").lower() not in ("0", "false", "no", "off")
         data_retention_days = _data_retention_days_config_value()
         data_retention_types = _data_retention_types_config_value()
         browser_backend = (creds.get("browser_backend", "") if creds else "") or os.environ.get("NULLION_BROWSER_BACKEND", "")
         browser_preferred = (creds.get("browser_preferred", "") if creds else "") or os.environ.get("NULLION_BROWSER_PREFERRED", "")
-        browser_cdp_url = _normalize_browser_cdp_url(
-            (creds.get("browser_cdp_url", "") if creds else "") or os.environ.get("NULLION_BROWSER_CDP_URL", "")
+        browser_cdp_url = _browser_cdp_url_for_preference(
+            (creds.get("browser_cdp_url", "") if creds else "") or os.environ.get("NULLION_BROWSER_CDP_URL", ""),
+            browser_preferred,
         )
         provider_bindings = os.environ.get("NULLION_PROVIDER_BINDINGS", "")
         search_provider = "builtin_search_provider"
@@ -19585,7 +20049,6 @@ def create_app(runtime, orchestrator, registry):
             "mini_agent_stale_after_seconds": mini_agent_stale_after,
             "proactive_reminders": proactive_reminders,
             "activity_trace":   activity_trace,
-            "task_planner_feed_mode": planner_feed_mode,
             "show_thinking":    show_thinking,
             "data_retention_days": data_retention_days,
             "data_retention_types": data_retention_types,
@@ -20028,14 +20491,18 @@ def create_app(runtime, orchestrator, registry):
             body = await request.json()
         except Exception:
             body = {}
-        url = str(body.get("url") or "https://example.com").strip()
+        url = str(body.get("url") or "").strip()
         session_id = str(body.get("session_id") or "default").strip() or "default"
+        tool_name = "browser_navigate" if url else "browser_open"
+        arguments = {"session_id": session_id}
+        if url:
+            arguments["url"] = url
         result = registry.invoke(
             ToolInvocation(
                 invocation_id=f"browser-open-{int(time.time() * 1000)}",
-                tool_name="browser_navigate",
+                tool_name=tool_name,
                 principal_id="web:operator",
-                arguments={"url": url, "session_id": session_id},
+                arguments=arguments,
             )
         )
         if normalize_tool_status(result.status) != "completed":
@@ -20578,8 +21045,20 @@ def create_app(runtime, orchestrator, registry):
                         creds.pop("browser_preferred", None)
                         os.environ.pop("NULLION_BROWSER_PREFERRED", None)
                         updates["NULLION_BROWSER_PREFERRED"] = ""
+                    if browser_preferred and browser_cdp_url_val is None:
+                        current_cdp_url = creds.get("browser_cdp_url") or os.environ.get("NULLION_BROWSER_CDP_URL")
+                        browser_cdp_url = _browser_cdp_url_for_preference(current_cdp_url, browser_preferred)
+                        if browser_cdp_url != _normalize_browser_cdp_url(current_cdp_url):
+                            creds["browser_cdp_url"] = browser_cdp_url
+                            os.environ["NULLION_BROWSER_CDP_URL"] = browser_cdp_url
+                            updates["NULLION_BROWSER_CDP_URL"] = browser_cdp_url
                 if browser_cdp_url_val is not None:
-                    browser_cdp_url = _normalize_browser_cdp_url(browser_cdp_url_val)
+                    effective_browser_preferred = str(
+                        creds.get("browser_preferred")
+                        or os.environ.get("NULLION_BROWSER_PREFERRED")
+                        or ""
+                    )
+                    browser_cdp_url = _browser_cdp_url_for_preference(browser_cdp_url_val, effective_browser_preferred)
                     creds["browser_cdp_url"] = browser_cdp_url
                     os.environ["NULLION_BROWSER_CDP_URL"] = browser_cdp_url
                     updates["NULLION_BROWSER_CDP_URL"] = browser_cdp_url
@@ -20844,17 +21323,6 @@ def create_app(runtime, orchestrator, registry):
                 val = "true" if body[toggle_key] else "false"
                 updates[env_name] = val
                 os.environ[env_name] = val
-
-        if "task_planner_feed_mode" in body:
-            planner_feed_mode = str(body.get("task_planner_feed_mode") or "").strip().lower().replace("_", "-")
-            if planner_feed_mode == "tasks":
-                planner_feed_mode = "task"
-            if planner_feed_mode not in {"all", "task", "off"}:
-                return JSONResponse({"ok": False, "error": "task_planner_feed_mode must be all, task, or off."}, status_code=400)
-            updates["NULLION_TASK_PLANNER_FEED_MODE"] = planner_feed_mode
-            updates["NULLION_TASK_PLANNER_FEED_ENABLED"] = "false" if planner_feed_mode == "off" else "true"
-            os.environ["NULLION_TASK_PLANNER_FEED_MODE"] = planner_feed_mode
-            os.environ["NULLION_TASK_PLANNER_FEED_ENABLED"] = updates["NULLION_TASK_PLANNER_FEED_ENABLED"]
 
         if "data_retention_days" in body:
             raw_retention = body.get("data_retention_days")
@@ -21207,7 +21675,28 @@ def create_app(runtime, orchestrator, registry):
         """Save user profile to ~/.nullion/profile.json."""
         body = await request.json()
         allowed = {"name", "email", "phone", "address", "notes"}
-        profile = {k: v for k, v in body.items() if k in allowed and isinstance(v, str)}
+        if not isinstance(body, dict):
+            return JSONResponse({"ok": False, "error": "invalid profile payload"}, status_code=400)
+        allow_clear = bool(body.get("_allow_clear"))
+        profile: dict[str, str] = {}
+        try:
+            if _PROFILE_PATH.exists():
+                loaded = json.loads(_PROFILE_PATH.read_text())
+                if isinstance(loaded, dict):
+                    profile = {
+                        k: str(v).strip()
+                        for k, v in loaded.items()
+                        if k in allowed and isinstance(v, str)
+                    }
+        except Exception:
+            profile = {}
+        for key in allowed:
+            value = body.get(key)
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip()
+            if normalized or allow_clear or key not in profile:
+                profile[key] = normalized
         try:
             _PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
             _PROFILE_PATH.write_text(json.dumps(profile, indent=2) + "\n")
@@ -21354,6 +21843,19 @@ def create_app(runtime, orchestrator, registry):
             run_reminder_delivery_loop(runtime, send=_send_web_reminder, settings=app_settings)
         )
 
+    async def _start_chat_startup_warmup() -> None:
+        try:
+            from nullion.startup_warmup import schedule_chat_startup_warmup
+
+            app.state.nullion_startup_warmup_task = schedule_chat_startup_warmup(
+                runtime,
+                registry=registry,
+                settings=app_settings,
+                surface="web",
+            )
+        except Exception:
+            logger.debug("Could not schedule web chat startup warmup", exc_info=True)
+
     async def _stop_reminder_delivery_loop() -> None:
         task = getattr(app.state, "nullion_reminder_task", None)
         if task is None:
@@ -21366,9 +21868,11 @@ def create_app(runtime, orchestrator, registry):
 
     add_event_handler = getattr(app, "add_event_handler", None)
     if add_event_handler is not None:
+        add_event_handler("startup", _start_chat_startup_warmup)
         add_event_handler("startup", _start_reminder_delivery_loop)
         add_event_handler("shutdown", _stop_reminder_delivery_loop)
     else:
+        app.router.on_startup.append(_start_chat_startup_warmup)
         app.router.on_startup.append(_start_reminder_delivery_loop)
         app.router.on_shutdown.append(_stop_reminder_delivery_loop)
 
@@ -21454,11 +21958,8 @@ def create_app(runtime, orchestrator, registry):
                     except Exception:
                         logger.debug("Could not broadcast web mini-agent artifact delivery failure", exc_info=True)
                 return
-            planner_feed_mode = task_planner_feed_mode()
             if kwargs.get("is_status"):
                 status_kind = str(kwargs.get("status_kind") or "")
-                if planner_feed_mode == "off":
-                    return
                 if status_kind != "task_summary" and not activity_trace_enabled():
                     return
                 status_text = text
@@ -21909,7 +22410,7 @@ def create_app(runtime, orchestrator, registry):
             async def send_early_reply_payload(payload: dict[str, object]) -> bool:
                 reply = str(payload.get("text") or "(no reply)")
                 task_group_id = str(payload.get("task_group_id") or "")
-                if payload.get("mini_agent_dispatch") and task_group_id and task_planner_feed_enabled():
+                if payload.get("mini_agent_dispatch") and task_group_id:
                     await send_websocket_event(turn_payload({
                         "type": "task_status",
                         "conversation_id": conv_id,
@@ -22012,7 +22513,6 @@ def create_app(runtime, orchestrator, registry):
                     if (
                         result.get("mini_agent_dispatch")
                         and task_group_id
-                        and task_planner_feed_enabled()
                         and not result.get("reply_already_sent")
                     ):
                         await send_websocket_event(turn_payload({
@@ -22123,7 +22623,6 @@ def create_app(runtime, orchestrator, registry):
                 if (
                     result.get("mini_agent_dispatch")
                     and task_group_id
-                    and task_planner_feed_enabled()
                     and not result.get("reply_already_sent")
                 ):
                     await send_websocket_event(turn_payload({
@@ -23504,7 +24003,8 @@ def _web_ambiguity_classifier(
         has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
         if not has_structured_evidence:
             return None
-        active_turn_text = previous_user_message
+        else:
+            active_turn_text = previous_user_message
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 
@@ -24085,9 +24585,14 @@ def _try_dispatch_web_mini_agents(
     model_client = getattr(orchestrator, "model_client", None)
     if model_client is None:
         return None
+    tool_registry = materialize_mini_agent_tool_scope_registry(
+        tool_registry or ToolRegistry(),
+        model_client=model_client,
+        user_message=user_message,
+    )
     available_tools = [
         str(tool.get("name", ""))
-        for tool in (tool_registry or ToolRegistry()).list_tool_definitions()
+        for tool in tool_registry.list_tool_definitions()
         if tool.get("name")
     ]
     dag_plan = TaskDecomposer(model_client=model_client).plan_dag(
@@ -24123,18 +24628,23 @@ def _try_dispatch_web_mini_agents(
         if isinstance(getattr(task, "title", None), str) and task.title.strip()
     ]
     try:
-        registry = tool_registry or ToolRegistry()
         dispatch_result = orchestrator.dispatch_request_sync(
             conversation_id=conversation_id,
             principal_id=principal_id,
             user_message=user_message,
-            tool_registry=registry,
+            tool_registry=tool_registry,
             policy_store=getattr(runtime, "store", None),
             approval_store=getattr(runtime, "store", None),
             available_tools=available_tools,
             single_task_fast_path=False,
             dag_plan=dag_plan,
             preferred_group_id=preferred_group_id,
+            requires_artifact_delivery=bool(requested_extensions),
+            required_artifact_kind=(
+                str(tuple(requested_extensions or ())[0]).lstrip(".")
+                if requested_extensions
+                else None
+            ),
         )
         try:
             setattr(dispatch_result, "task_titles", planned_task_titles)
@@ -24207,7 +24717,7 @@ def _schedule_web_no_tool_memory_capture(
         owner=owner,
         user_message=user_message,
         tool_results=tool_results,
-        rate_limit_key=f"{id(runtime)}:{owner}",
+        rate_limit_key=f"{_web_runtime_cache_identity(runtime)}:{owner}",
     ):
         return
     model_client = getattr(orchestrator, "model_client", None)
@@ -24216,34 +24726,21 @@ def _schedule_web_no_tool_memory_capture(
 
     def _worker() -> None:
         try:
-            from nullion.builder_memory import capture_turn_memory_claims
+            from nullion.builder_memory import capture_turn_memory_claims_verified
 
-            result = capture_turn_memory_claims(
+            capture_turn_memory_claims_verified(
                 runtime,
                 model_client,
                 owner=str(owner),
                 user_message=user_message,
                 assistant_reply=assistant_reply,
             )
-            if getattr(result, "skipped", None) == "empty":
-                capture_turn_memory_claims(
-                    runtime,
-                    model_client,
-                    owner=str(owner),
-                    user_message=user_message,
-                    assistant_reply=assistant_reply,
-                )
         except Exception:
             logger.debug("Web background memory capture failed (non-fatal)", exc_info=True)
 
-    try:
-        from nullion.builder_background import schedule_builder_background_task
-
-        if schedule_builder_background_task("web-no-tool-memory-capture", _worker):
-            return
-    except Exception:
-        logger.debug("Unable to schedule Web no-tool memory capture", exc_info=True)
-
+    if _feature_enabled("NULLION_MEMORY_NO_TOOL_SYNC_CAPTURE"):
+        _worker()
+        return
     thread = threading.Thread(target=_worker, name="nullion-web-memory-capture", daemon=True)
     thread.start()
 
@@ -24807,7 +25304,12 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         requested_extension=requested_attachment_extension,
     )
     artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=conversation_id)
-    final_text = _web_artifact_delivery_notice(result.final_text or "(no reply)", artifact_paths, artifacts)
+    final_text = _web_artifact_delivery_notice(
+        result.final_text or "(no reply)",
+        artifact_paths,
+        artifacts,
+        tool_results=getattr(result, "tool_results", []),
+    )
     tool_results = list(getattr(result, "tool_results", []) or [])
     final_text, _fulfilled = _enforce_web_response_fulfillment(
         runtime,
@@ -24818,6 +25320,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         artifact_paths=artifact_paths,
         artifact_count=len(artifacts),
     )
+    final_text = _web_normalize_completed_email_send_reply(final_text, tool_results)
     final_text = sanitize_user_visible_reply(
         user_message=user_text,
         reply=final_text,
@@ -25038,7 +25541,6 @@ def _web_turn_fast_profile_candidate(
 def _web_turn_skip_tool_scope_decision(
     *,
     evidence,
-    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -25049,13 +25551,13 @@ def _web_turn_skip_tool_scope_decision(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _web_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        return False
     if (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
-        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        or turn_tool_scope_decision_may_apply(evidence)
     ):
         return False
     return True
@@ -25071,6 +25573,36 @@ def _turn_tool_scope_requires_special_tools(tool_registry: object) -> bool:
         or getattr(decision, "allow_connector_tools", False)
         or getattr(decision, "allow_skill_pack_tools", False)
     )
+
+
+def _registry_contains_scoped_special_tools(tool_registry: object) -> bool:
+    special_tags = {"scheduler", "cron", "connector", "skill_pack"}
+    special_names = {
+        "browser_navigate",
+        "browser_extract_text",
+        "browser_find",
+        "browser_scroll",
+        "browser_screenshot",
+        "browser_wait_for",
+        "web_fetch",
+        "web_search",
+    }
+    try:
+        specs = list(tool_registry.list_specs())
+    except Exception:
+        specs = ()
+    for spec in specs:
+        name = str(getattr(spec, "name", "") or "")
+        if name in special_names:
+            return True
+        tags = {
+            str(tag or "").strip().lower()
+            for tag in (getattr(spec, "capability_tags", ()) or ())
+            if str(tag or "").strip()
+        }
+        if tags.intersection(special_tags):
+            return True
+    return False
 
 
 def _orchestrator_with_interactive_fast_profile(orchestrator, *, enabled: bool, tool_registry: object):
@@ -25285,7 +25817,11 @@ def _run_turn_sync(
     try:
         from nullion.chat_operator import _chat_model_issue_reply
 
-        health_reply = _chat_model_issue_reply(runtime, message=user_text)
+        health_reply = _chat_model_issue_reply(
+            runtime,
+            message=user_text,
+            model_client=getattr(orchestrator, "model_client", None),
+        )
     except Exception:
         health_reply = None
     if health_reply is not None:
@@ -25398,19 +25934,21 @@ def _run_turn_sync(
     _mark_timing("tool_scope_decision_check_start")
     skip_tool_scope_decision = _web_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
-        user_message=user_text,
         config_action=config_action,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=force_mini_agent_dispatch,
         turn_dispatch_decision=turn_dispatch_decision,
     )
     if skip_tool_scope_decision:
-        turn_tool_registry = scoped_turn_tool_registry(
-            registry,
-            evidence=turn_tool_evidence,
-            model_client=None,
-            user_message=user_text,
-        )
+        if _registry_contains_scoped_special_tools(registry):
+            turn_tool_registry = scoped_turn_tool_registry(
+                registry,
+                evidence=turn_tool_evidence,
+                model_client=None,
+                user_message=user_text,
+            )
+        else:
+            turn_tool_registry = registry
         _mark_timing("tool_scope_decision_skipped")
     else:
         _mark_timing("tool_scope_decision_allowed")
@@ -25473,7 +26011,7 @@ def _run_turn_sync(
             logger.debug("Could not build web profile prompt", exc_info=True)
             return ""
 
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="nullion-web-preflight") as _preflight_pool:
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="nullion-web-preflight") as _preflight_pool:
         _stable_context_future = _preflight_pool.submit(_stable_context_job)
         _preferences_future = _preflight_pool.submit(_preferences_prompt_job)
         _profile_future = _preflight_pool.submit(_profile_prompt_job)
@@ -25546,7 +26084,11 @@ def _run_turn_sync(
             "content": [{"type": "text", "text": route_hints}],
         })
     _mark_timing("route_hints")
-    recent_tool_context = _recent_web_tool_context_prompt(runtime, conv_id)
+    recent_tool_context = (
+        _recent_web_tool_context_prompt(runtime, conv_id)
+        if _should_include_web_recent_tool_context(web_conversation_result)
+        else None
+    )
     if recent_tool_context:
         history_prefix.append({
             "role": "system",
@@ -25603,13 +26145,7 @@ def _run_turn_sync(
 
     def _record_live_tool_activity(tool_result: ToolResult) -> None:
         live_tool_results.append(tool_result)
-        _emit_activity(
-            activity_callback,
-            "orchestrate",
-            "Running model and tools",
-            "running",
-            format_tool_activity_detail(live_tool_results),
-        )
+        phase_tracker.emit(PHASE_RUN_TOOLS, "running", format_tool_activity_detail(live_tool_results))
 
     from nullion.reminders import reminder_chat_context
 
@@ -25801,7 +26337,12 @@ def _run_turn_sync(
         f"{len(artifacts)} artifact{'s' if len(artifacts) != 1 else ''}" if artifacts else None,
     )
     phase_tracker.done(PHASE_PREPARE_ARTIFACTS, "artifacts", f"{len(artifacts)} artifact{'s' if len(artifacts) != 1 else ''}" if artifacts else None)
-    final_text = _web_artifact_delivery_notice(result.final_text or "(no reply)", artifact_paths, artifacts)
+    final_text = _web_artifact_delivery_notice(
+        result.final_text or "(no reply)",
+        artifact_paths,
+        artifacts,
+        tool_results=tool_results,
+    )
     attachment_failure = attachment_processing_failure_reply(user_text, normalized_attachments, tool_results)
     if attachment_failure is not None:
         final_text = attachment_failure
@@ -25914,6 +26455,7 @@ def _run_turn_sync(
                 getattr(repair_result, "final_text", None) or final_text,
                 artifact_paths,
                 artifacts,
+                tool_results=tool_results,
             )
             final_text, fulfilled = _enforce_web_response_fulfillment(
                 runtime,
@@ -25925,6 +26467,7 @@ def _run_turn_sync(
                 artifact_count=len(artifacts),
                 required_attachment_extensions=required_attachment_extensions,
             )
+    final_text = _web_normalize_completed_email_send_reply(final_text, tool_results)
     final_text = sanitize_user_visible_reply(
         user_message=user_text,
         reply=final_text,
@@ -26132,14 +26675,19 @@ def _resolve_browser_backend() -> str | None:
     if os.environ.get("NULLION_BROWSER_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
         return None
 
-    try:
-        from nullion.auth import load_stored_credentials
-        creds = load_stored_credentials() or {}
-        be = str(creds.get("browser_backend", "")).strip().lower()
-        if be:
-            return be
-    except Exception:
-        pass
+    for loader in (_read_credentials_json, None):
+        try:
+            if loader is None:
+                from nullion.auth import load_stored_credentials
+
+                creds = load_stored_credentials() or {}
+            else:
+                creds = loader() or {}
+            be = str(creds.get("browser_backend", "")).strip().lower()
+            if be:
+                return be
+        except Exception:
+            pass
 
     be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip().lower()
     if be:
@@ -26174,8 +26722,8 @@ def _build_runtime():
         should_register_search_plugin,
     )
 
-    settings = Settings()
     app_settings = load_app_settings()
+    settings = Settings()
     runtime = build_runtime_from_settings(settings)
     artifact_root = ensure_artifact_root(runtime)
     allowed_roots = messaging_file_allowed_roots(
@@ -26266,7 +26814,7 @@ def _build_runtime():
     model_client = None
     try:
         from nullion.model_clients import ModelClientConfigurationError, build_model_client_from_settings
-        model_client = build_model_client_from_settings(settings)
+        model_client = build_model_client_from_settings(app_settings)
     except ModelClientConfigurationError as _cfg_err:
         _clean_warn = f"Provider warning: {_cfg_err}"
         logger.warning("Model client configuration error — falling back to env-based client: %s", _cfg_err)

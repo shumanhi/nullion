@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import email
 from email import policy
+import html
 import imaplib
 import inspect
 import json
@@ -648,7 +649,10 @@ def _local_image_generate(prompt: str, output_path: str, size: str | None, sourc
         raise RuntimeError("image_generate provider is not configured")
     template = os.environ.get("NULLION_IMAGE_GENERATE_COMMAND", "").strip()
     if template:
-        return _command_image_generate(template, prompt, output_path, size, source_path=source_path)
+        try:
+            return _command_image_generate(template, prompt, output_path, size, source_path=source_path)
+        except Exception as exc:
+            return _fallback_svg_image_generate(prompt, output_path, size, fallback_error=str(exc))
     model_selection = _media_model_selection(
         "NULLION_IMAGE_GENERATE_PROVIDER",
         "NULLION_IMAGE_GENERATE_MODEL",
@@ -656,10 +660,67 @@ def _local_image_generate(prompt: str, output_path: str, size: str | None, sourc
     )
     if model_selection is not None:
         provider, model = model_selection
-        return _model_image_generate(provider, model, prompt, output_path, size, source_path=source_path)
-    raise RuntimeError(
-        "local_media_provider requires NULLION_IMAGE_GENERATE_COMMAND for image_generate"
-    )
+        try:
+            return _model_image_generate(provider, model, prompt, output_path, size, source_path=source_path)
+        except Exception as exc:
+            return _fallback_svg_image_generate(prompt, output_path, size, fallback_error=str(exc))
+    return _fallback_svg_image_generate(prompt, output_path, size)
+
+
+def _fallback_svg_image_generate(
+    prompt: str,
+    output_path: str,
+    size: str | None,
+    *,
+    fallback_error: str | None = None,
+) -> dict[str, object]:
+    requested = Path(output_path).expanduser()
+    resolved_output = requested if requested.suffix.lower() == ".svg" else requested.with_suffix(".svg")
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    cleaned_prompt = " ".join(str(prompt or "").split()).strip() or "Generated image"
+    title = cleaned_prompt[:90]
+    subtitle = "Local SVG fallback - configure an image model for raster generation"
+    safe_title = html.escape(title)
+    safe_subtitle = html.escape(subtitle)
+    safe_prompt = html.escape(cleaned_prompt[:260])
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="{safe_title}">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#12212f"/>
+      <stop offset="0.52" stop-color="#145244"/>
+      <stop offset="1" stop-color="#15233f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="42%" r="55%">
+      <stop offset="0" stop-color="#8be9d4" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#8be9d4" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="64" fill="url(#bg)"/>
+  <circle cx="512" cy="410" r="360" fill="url(#glow)"/>
+  <g fill="none" stroke-linecap="round">
+    <path d="M220 680 C350 510 674 510 804 680" stroke="#f6d56f" stroke-width="28" opacity="0.9"/>
+    <path d="M300 590 C400 410 624 410 724 590" stroke="#5be7c4" stroke-width="22" opacity="0.9"/>
+    <path d="M380 530 C450 360 574 360 644 530" stroke="#61a8ff" stroke-width="18" opacity="0.9"/>
+  </g>
+  <circle cx="512" cy="505" r="96" fill="#0c1723" opacity="0.82"/>
+  <circle cx="480" cy="482" r="11" fill="#f7fbff"/>
+  <circle cx="545" cy="482" r="11" fill="#f7fbff"/>
+  <path d="M470 542 C500 568 532 568 560 542" fill="none" stroke="#f7fbff" stroke-width="10" stroke-linecap="round"/>
+  <text x="512" y="120" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="800" fill="#f7fbff">{safe_title}</text>
+  <text x="512" y="880" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="24" fill="#d6fff4">{safe_subtitle}</text>
+  <foreignObject x="172" y="742" width="680" height="104">
+    <div xmlns="http://www.w3.org/1999/xhtml" style="font-family: Inter, Arial, sans-serif; color: #effffb; font-size: 24px; line-height: 1.35; text-align: center;">{safe_prompt}</div>
+  </foreignObject>
+</svg>
+"""
+    resolved_output.write_text(svg, encoding="utf-8")
+    return {
+        "path": str(resolved_output),
+        "provider": "local_svg_fallback",
+        "size": size,
+        "fallback_used": True,
+        **({"fallback_error": fallback_error} if fallback_error else {}),
+    }
 
 
 def _command_image_generate(
@@ -1501,7 +1562,9 @@ def resolve_plugin_provider_kwargs(*, plugin_name: str, provider_name: str) -> d
             return {
                 "audio_transcriber": _local_audio_transcribe,
                 "image_text_extractor": _local_image_extract_text,
-                "image_generator": _local_image_generate if image_generation_configured() else None,
+                "image_generator": None
+                if _media_capability_disabled("NULLION_IMAGE_GENERATE_ENABLED")
+                else _local_image_generate,
             }
         raise ValueError(f"unknown provider binding for media_plugin: {provider_name}")
     raise ValueError(f"unsupported plugin provider resolution: {plugin_name}")

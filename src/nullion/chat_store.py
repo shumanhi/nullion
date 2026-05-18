@@ -41,6 +41,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterable, Iterator
+from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -201,6 +202,53 @@ def _channel_label_for_conversation(conversation_id: str) -> str:
     if conversation_id.startswith("discord:"):
         return f"Discord · {conversation_id.removeprefix('discord:')}"
     return conversation_id
+
+
+def _channel_for_conversation(conversation_id: str) -> str:
+    if conversation_id == "web" or conversation_id.startswith("web:"):
+        return "web"
+    if conversation_id.startswith(("telegram:", "slack:", "discord:")):
+        return conversation_id
+    return conversation_id
+
+
+def _is_internal_history_conversation(conversation_id: str) -> bool:
+    return conversation_id.startswith("web:live-stage-contract:")
+
+
+def _local_history_timezone() -> timezone | ZoneInfo:
+    try:
+        from nullion.preferences import detect_system_timezone, load_preferences
+
+        configured = str(getattr(load_preferences(), "timezone", "") or "").strip()
+        name = configured or detect_system_timezone(default="UTC")
+        if name.upper() == "UTC":
+            detected = detect_system_timezone(default="UTC")
+            if detected:
+                name = detected
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _local_date_for_timestamp(value: object, tz: timezone | ZoneInfo | None = None) -> str | None:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone(tz or _local_history_timezone()).date().isoformat()
 
 
 def _month_bounds(year_month: str) -> tuple[str, str]:
@@ -436,7 +484,7 @@ class ChatStore:
                     """SELECT c.*, COUNT(m.id) AS message_count, MAX(m.id) AS latest_message_id
                        FROM conversations c
                        LEFT JOIN messages m ON m.conversation_id = c.id
-                       WHERE c.status = ?
+                       WHERE c.status = ? AND c.id NOT LIKE 'web:live-stage-contract:%'
                        GROUP BY c.id
                        ORDER BY COALESCE(MAX(m.id), 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC
                        LIMIT ?""",
@@ -447,11 +495,13 @@ class ChatStore:
                     """SELECT c.*, COUNT(m.id) AS message_count, MAX(m.id) AS latest_message_id
                        FROM conversations c
                        LEFT JOIN messages m ON m.conversation_id = c.id
-                       WHERE c.status = ? AND c.channel = ?
+                       WHERE c.status = ?
+                         AND c.id NOT LIKE 'web:live-stage-contract:%'
+                         AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
                        GROUP BY c.id
                        ORDER BY COALESCE(MAX(m.id), 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC
                        LIMIT ?""",
-                    (status, channel, limit),
+                    (status, channel, channel, limit),
                 ).fetchall()
             results = [self._decrypt_row(r) for r in rows]
             _log_chat_sqlite_timing("list_conversations", started_at, self._path, rows=len(results))
@@ -469,12 +519,14 @@ class ChatStore:
         started_at = perf_counter()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT channel, channel_label,
+                """SELECT CASE WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'web' ELSE channel END AS channel,
+                          CASE WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'Web' ELSE channel_label END AS channel_label,
                           COUNT(DISTINCT c.id) AS conversation_count,
                           MAX(c.last_message_at) AS last_message_at
                    FROM conversations c
                    WHERE c.status != 'cleared'
-                   GROUP BY channel
+                     AND c.id NOT LIKE 'web:live-stage-contract:%'
+                   GROUP BY CASE WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'web' ELSE channel END
                    ORDER BY last_message_at DESC"""
             ).fetchall()
             results = [self._decrypt_row(r) for r in rows]
@@ -492,16 +544,25 @@ class ChatStore:
             raise ValueError(f"year_month must be in YYYY-MM format, got {year_month!r}")
         started_at = perf_counter()
         start_date, end_date = _month_bounds(year_month)
+        expanded_start = (datetime.fromisoformat(start_date) - timedelta(days=1)).date().isoformat()
+        expanded_end = (datetime.fromisoformat(end_date) + timedelta(days=1)).date().isoformat()
+        tz = _local_history_timezone()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT date(m.created_at) AS day, COUNT(m.id) AS msg_count
+                """SELECT m.created_at AS created_at
                    FROM messages m
                    JOIN conversations c ON c.id = m.conversation_id
-                   WHERE c.channel = ? AND m.created_at >= ? AND m.created_at < ?
-                   GROUP BY day""",
-                (channel, start_date, end_date),
+                   WHERE (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
+                     AND c.id NOT LIKE 'web:live-stage-contract:%'
+                     AND m.created_at >= ? AND m.created_at < ?
+                   ORDER BY m.created_at ASC""",
+                (channel, channel, expanded_start, expanded_end),
             ).fetchall()
-            results = {row["day"]: row["msg_count"] for row in rows}
+            results: dict[str, int] = {}
+            for row in rows:
+                day = _local_date_for_timestamp(row["created_at"], tz)
+                if day and start_date <= day < end_date:
+                    results[day] = results.get(day, 0) + 1
             _log_chat_sqlite_timing("calendar_days", started_at, self._path, rows=len(results))
             return results
 
@@ -514,24 +575,33 @@ class ChatStore:
         ``message_count`` field reflecting the number of messages on that day.
         """
         started_at = perf_counter()
-        start_date = date
-        year, month, day = (int(part) for part in date.split("-", 2))
-        # Avoid date(m.created_at) in the WHERE clause so SQLite can use
-        # created_at indexes.
-        end_date_text = (datetime(year, month, day, tzinfo=timezone.utc) + timedelta(days=1)).date().isoformat()
+        # Validate the date shape while keeping local-date grouping in Python.
+        datetime.strptime(date, "%Y-%m-%d")
+        tz = _local_history_timezone()
         with self._connect() as conn:
-            rows = conn.execute(
+            candidate_rows = conn.execute(
                 """SELECT c.id, c.title, c.channel, c.channel_label,
                           c.created_at, c.last_message_at,
-                          COUNT(m.id) AS message_count
+                          m.created_at AS message_created_at
                    FROM conversations c
                    JOIN messages m ON m.conversation_id = c.id
-                   WHERE c.channel = ? AND m.created_at >= ? AND m.created_at < ?
-                   GROUP BY c.id
-                   ORDER BY MIN(m.created_at) ASC""",
-                (channel, start_date, end_date_text),
+                   WHERE c.id NOT LIKE 'web:live-stage-contract:%'
+                     AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
+                   ORDER BY m.created_at ASC""",
+                (channel, channel),
             ).fetchall()
-            results = [self._decrypt_row(r) for r in rows]
+            grouped: dict[str, dict[str, Any]] = {}
+            for row in candidate_rows:
+                if _local_date_for_timestamp(row["message_created_at"], tz) != date:
+                    continue
+                item = grouped.get(row["id"])
+                if item is None:
+                    item = self._decrypt_row(row)
+                    item.pop("message_created_at", None)
+                    item["message_count"] = 0
+                    grouped[row["id"]] = item
+                item["message_count"] = int(item.get("message_count") or 0) + 1
+            results = list(grouped.values())
             _log_chat_sqlite_timing(
                 "list_conversations_for_channel_date",
                 started_at,
@@ -580,10 +650,19 @@ class ChatStore:
                 """SELECT DISTINCT c.id
                    FROM conversations c
                    JOIN messages m ON m.conversation_id = c.id
-                   WHERE c.channel = ? AND date(m.created_at) = ?""",
-                (channel, date),
+                   WHERE c.id NOT LIKE 'web:live-stage-contract:%'
+                     AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))""",
+                (channel, channel),
             ).fetchall()
-            conv_ids = [row["id"] for row in rows]
+            tz = _local_history_timezone()
+            conv_ids = []
+            for row in rows:
+                hit = conn.execute(
+                    "SELECT created_at FROM messages WHERE conversation_id = ?",
+                    (row["id"],),
+                ).fetchall()
+                if any(_local_date_for_timestamp(item["created_at"], tz) == date for item in hit):
+                    conv_ids.append(row["id"])
             for conv_id in conv_ids:
                 conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
                 conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
@@ -713,6 +792,8 @@ class ChatStore:
                 conversation_id = str(turn.get("conversation_id") or "").strip()
                 if not conversation_id.startswith(("web:", "telegram:", "slack:", "discord:")):
                     continue
+                if _is_internal_history_conversation(conversation_id):
+                    continue
                 created_at = str(turn.get("created_at") or "").strip() or _now()
                 user_message = str(turn.get("user_message") or "").strip()
                 if _is_internal_scheduled_task_context(user_message):
@@ -733,12 +814,13 @@ class ChatStore:
                         for row in rows
                     }
 
+                channel = _channel_for_conversation(conversation_id)
                 channel_label = _channel_label_for_conversation(conversation_id)
                 conn.execute(
                     """INSERT OR IGNORE INTO conversations
                        (id, created_at, channel, channel_label)
                        VALUES (?, ?, ?, ?)""",
-                    (conversation_id, created_at, conversation_id, channel_label),
+                    (conversation_id, created_at, channel, channel_label),
                 )
 
                 for role, raw_text in (("user", user_message), ("bot", assistant_reply)):
@@ -775,26 +857,59 @@ class ChatStore:
                     imported += 1
         return imported
 
-    def load_messages(self, conv_id: str, limit: int = 300) -> list[dict]:
-        """Return the last ``limit`` messages in ascending chronological order."""
+    def load_messages(
+        self,
+        conv_id: str,
+        limit: int = 300,
+        *,
+        local_date: str | None = None,
+    ) -> list[dict]:
+        """Return the last ``limit`` messages in ascending chronological order.
+
+        When ``local_date`` is provided, messages are filtered by the user's
+        configured local date rather than by UTC date.
+        """
+        target_date: datetime | None = None
+        if local_date:
+            target_date = datetime.strptime(local_date, "%Y-%m-%d")
         started_at = perf_counter()
         with self._connect() as conn:
-            rows = conn.execute(
-                """SELECT id, role, text, metadata, is_error, created_at
-                   FROM (
-                       SELECT * FROM messages
+            if target_date is not None:
+                expanded_start = (target_date - timedelta(days=1)).date().isoformat()
+                expanded_end = (target_date + timedelta(days=2)).date().isoformat()
+                rows = conn.execute(
+                    """SELECT id, role, text, metadata, is_error, created_at
+                       FROM messages
                        WHERE conversation_id = ?
-                       ORDER BY id DESC
-                       LIMIT ?
-                   ) sub
-                   ORDER BY id ASC""",
-                (conv_id, limit),
-            ).fetchall()
+                         AND created_at >= ? AND created_at < ?
+                       ORDER BY id ASC
+                       LIMIT ?""",
+                    (conv_id, expanded_start, expanded_end, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, role, text, metadata, is_error, created_at
+                       FROM (
+                           SELECT * FROM messages
+                           WHERE conversation_id = ?
+                           ORDER BY id DESC
+                           LIMIT ?
+                       ) sub
+                       ORDER BY id ASC""",
+                    (conv_id, limit),
+                ).fetchall()
             results = [
                 row
                 for row in (self._decrypt_row(r) for r in rows)
                 if not (row.get("role") == "user" and _is_internal_scheduled_task_context(str(row.get("text") or "")))
             ]
+            if local_date:
+                tz = _local_history_timezone()
+                results = [
+                    row
+                    for row in results
+                    if _local_date_for_timestamp(row.get("created_at"), tz) == local_date
+                ]
             results = _collapse_adjacent_duplicate_bot_messages(results)
             _log_chat_sqlite_timing("load_messages", started_at, self._path, rows=len(results))
             return results

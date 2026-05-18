@@ -1,8 +1,9 @@
 """Deterministic Mini-Agent run tracking primitives."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 
 class MiniAgentRunStatus(str, Enum):
@@ -26,6 +27,7 @@ class MiniAgentRun:
     status: MiniAgentRunStatus
     created_at: datetime
     result_summary: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 _ALLOWED_TRANSITIONS: dict[MiniAgentRunStatus, set[MiniAgentRunStatus]] = {
@@ -54,6 +56,7 @@ def create_mini_agent_run(
     capsule_id: str,
     mini_agent_type: str,
     created_at: datetime,
+    metadata: dict[str, Any] | None = None,
 ) -> MiniAgentRun:
     """Create a run record in the pending state."""
 
@@ -64,6 +67,7 @@ def create_mini_agent_run(
         status=MiniAgentRunStatus.PENDING,
         created_at=created_at,
         result_summary=None,
+        metadata=dict(metadata or {}),
     )
 
 

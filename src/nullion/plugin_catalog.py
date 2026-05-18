@@ -79,7 +79,19 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
         category="Automation",
         status="available",
         summary="Open and inspect real browser pages, capture screenshots, and keep an agent browser session.",
-        tools=("browser_open", "browser_navigate", "browser_snapshot", "browser_screenshot"),
+        tools=(
+            "browser_open",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click_element",
+            "browser_click_id",
+            "browser_type_field",
+            "browser_type_id",
+            "browser_select_combobox",
+            "browser_extract_text",
+            "browser_find",
+            "browser_screenshot",
+        ),
         providers=(
             PluginProviderCatalogEntry(
                 provider_id="playwright_browser_provider",
