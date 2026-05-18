@@ -11,10 +11,8 @@ from typing import Any, Iterable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_display import (
     approval_display_from_request,
-    approval_inline_code,
     format_approval_detail_markdown,
 )
 from nullion.approvals import ApprovalRequest, ApprovalStatus
@@ -44,9 +42,6 @@ def approval_notification_text(approval: ApprovalRequest) -> str:
     ]
     if display.detail:
         lines.append(format_approval_detail_markdown(display.detail))
-    trigger_label = approval_trigger_flow_label(approval)
-    if trigger_label:
-        lines.append(f"Triggered by: {approval_inline_code(trigger_label)}")
     lines.append(f"Approval ID: {approval.approval_id}")
     lines.append("Open the web dashboard or use the originating chat approval controls to decide.")
     return "\n".join(lines)

@@ -27,10 +27,15 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, TypedDict
+from urllib.parse import urlparse
 
 from langgraph.graph import END, START, StateGraph
 
-from nullion.deep_agent_profiles import deep_agent_skills_for_task, deep_agent_subagents_for_task
+from nullion.deep_agent_profiles import (
+    deep_agent_skills_for_task,
+    deep_agent_subagents_for_task,
+    deep_agent_task_metadata_for_tools,
+)
 from nullion.task_planner import strip_composer_mode_instruction
 from nullion.task_queue import (
     TaskGroup,
@@ -65,7 +70,8 @@ Output ONLY one JSON object (no markdown fences, no commentary):
       "context_key_in": string or null — context bus key to read from,
       "context_key_out": string or null — context bus key to write result to,
       "required_inputs": array of missing input names,
-      "can_start": boolean
+      "can_start": boolean,
+      "metadata": object or null — structured execution metadata only
     }
   ]
 }
@@ -132,6 +138,7 @@ class DecomposedTask:
     context_key_out: str | None
     required_inputs: list[str] | None = None
     can_start: bool = True
+    metadata: dict[str, object] | None = None
 
 
 @dataclass
@@ -203,6 +210,9 @@ class TaskDecomposer:
         principal_id: str,
         available_tools: list[str],
         dag_plan: DagPlan | None = None,
+        requires_artifact_delivery: bool = False,
+        required_artifact_kind: str | None = None,
+        tool_profile_metadata: dict[str, dict[str, tuple[str, ...]]] | None = None,
     ) -> TaskGroup:
         """Decompose *user_message* into a TaskGroup.
 
@@ -220,6 +230,12 @@ class TaskDecomposer:
             if dag_plan.can_dispatch or (dag_plan.is_valid and len(dag_plan.tasks) == 1)
             else []
         )
+        if raw_tasks and requires_artifact_delivery:
+            raw_tasks = _with_artifact_verification_tasks(
+                list(raw_tasks),
+                available_tools=available_tools,
+                required_artifact_kind=required_artifact_kind,
+            )
 
         if not raw_tasks:
             # Fallback: treat the whole message as one task
@@ -234,7 +250,6 @@ class TaskDecomposer:
                 required_inputs=[],
                 can_start=True,
             )]
-
         # Assign IDs in order so dependency indices can be resolved.
         task_ids = [make_task_id() for _ in raw_tasks]
 
@@ -248,6 +263,10 @@ class TaskDecomposer:
             else:
                 initial_status = TaskStatus.QUEUED
 
+            task_metadata = {
+                **dict(dt.metadata or {}),
+                **deep_agent_task_metadata_for_tools(dt.tool_scope, tool_profile_metadata),
+            }
             record = TaskRecord(
                 task_id=task_ids[i],
                 group_id=gid,
@@ -261,6 +280,7 @@ class TaskDecomposer:
                 dependencies=dep_ids,
                 context_key_in=dt.context_key_in,
                 context_key_out=dt.context_key_out,
+                metadata=task_metadata,
             )
             record.deep_agent_skills = deep_agent_skills_for_task(record)
             record.deep_agent_subagents = deep_agent_subagents_for_task(record)
@@ -271,7 +291,7 @@ class TaskDecomposer:
             conversation_id=conversation_id,
             original_message=normalized_message,
             tasks=records,
-            planner_metadata=_planner_metadata(dag_plan),
+            planner_metadata=_planner_metadata(_planner_plan_with_tasks(dag_plan, raw_tasks)),
         )
         logger.info(
             "TaskDecomposer: group=%s disposition=%s valid=%s dispatchable=%s tasks=%d",
@@ -615,6 +635,7 @@ def _parse_decomposed_task_items(items: object) -> list[DecomposedTask]:
             context_key_out=str(ctx_out) if ctx_out else None,
             required_inputs=required_inputs,
             can_start=bool(can_start),
+            metadata=dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else {},
         ))
     return tasks
 
@@ -649,33 +670,37 @@ def _validate_dag_plan(
     if len(plan.tasks) > 1 and "model_structured_plan" not in routing_evidence:
         errors.append("multi-task plan lacks model_structured_plan routing evidence")
     available = set(available_tools)
+    tasks = [
+        _normalize_task_tool_scope_from_structured_evidence(task, available_tools=available)
+        for task in plan.tasks
+    ]
     context_outputs = {
         task.context_key_out
-        for task in plan.tasks
+        for task in tasks
         if isinstance(task.context_key_out, str) and task.context_key_out
     }
-    for index, task in enumerate(plan.tasks):
+    for index, task in enumerate(tasks):
         unknown_tools = [tool for tool in task.tool_scope if tool not in available]
         if unknown_tools:
             errors.append(f"task {index} uses unknown tools: {', '.join(unknown_tools)}")
         for dep in task.dep_indices:
-            if dep < 0 or dep >= len(plan.tasks):
+            if dep < 0 or dep >= len(tasks):
                 errors.append(f"task {index} has invalid dependency {dep}")
             if dep == index:
                 errors.append(f"task {index} depends on itself")
         if task.context_key_in and task.context_key_in not in context_outputs:
             errors.append(f"task {index} reads missing context key: {task.context_key_in}")
         if task.context_key_in and not any(
-            0 <= dep < len(plan.tasks) and plan.tasks[dep].context_key_out == task.context_key_in
+            0 <= dep < len(tasks) and tasks[dep].context_key_out == task.context_key_in
             for dep in task.dep_indices
         ):
             errors.append(f"task {index} context_key_in is not produced by a dependency")
-    if _has_cycle([task.dep_indices for task in plan.tasks]):
+    if _has_cycle([task.dep_indices for task in tasks]):
         errors.append("plan has a dependency cycle")
     if plan.disposition == "parallel_mission":
         independent = [
             task
-            for task in plan.tasks
+            for task in tasks
             if not task.dep_indices and task.can_start and not task.required_inputs
         ]
         if len(independent) < 2:
@@ -684,12 +709,191 @@ def _validate_dag_plan(
         errors.append("clarification plan lacks clarification_question")
     return DagPlan(
         disposition=plan.disposition,
-        tasks=plan.tasks,
+        tasks=tasks,
         needs_clarification=plan.needs_clarification or plan.disposition == "clarification",
         clarification_question=plan.clarification_question,
         routing_evidence=routing_evidence,
         validation_errors=errors,
     )
+
+
+_PUBLIC_DOMAIN_RE = re.compile(
+    r"(?<![@\w.-])(?:https?://)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)(?::\d+)?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+_PRIVATE_DOMAIN_SUFFIXES = (".local", ".internal", ".corp", ".lan", ".localhost")
+
+
+def _normalize_task_tool_scope_from_structured_evidence(
+    task: DecomposedTask,
+    *,
+    available_tools: set[str],
+) -> DecomposedTask:
+    browser_scope = [
+        tool_name
+        for tool_name in ("browser_navigate", "browser_extract_text")
+        if tool_name in available_tools
+    ]
+    if len(browser_scope) < 2:
+        return task
+    if task.tool_scope and task.tool_scope != ["connector_request"]:
+        return task
+    if not _contains_public_domain_signal(task.description):
+        return task
+    return DecomposedTask(
+        title=task.title,
+        description=task.description,
+        tool_scope=browser_scope,
+        priority=task.priority,
+        dep_indices=list(task.dep_indices),
+        context_key_in=task.context_key_in,
+        context_key_out=task.context_key_out,
+        required_inputs=list(task.required_inputs or []),
+        can_start=task.can_start,
+        metadata=dict(task.metadata or {}),
+    )
+
+
+_ARTIFACT_PRODUCER_TOOLS = frozenset({"file_write", "pdf_create", "pdf_edit", "render", "image_generate"})
+_UNCHANGED = object()
+
+
+def _with_artifact_verification_tasks(
+    tasks: list[DecomposedTask],
+    *,
+    available_tools: list[str],
+    required_artifact_kind: str | None,
+) -> list[DecomposedTask]:
+    """Append explicit artifact verification and receipt tasks after producers.
+
+    This is driven by a structured artifact-delivery requirement from the caller
+    rather than prompt wording. Artifact-producing tasks create the file;
+    dependent verifier tasks validate the file; receipt tasks produce the final
+    user-visible delivery contract.
+    """
+    if not tasks or any(
+        isinstance(task.metadata, dict) and task.metadata.get("artifact_role") in {"verify", "deliver_receipt"}
+        for task in tasks
+    ):
+        return tasks
+    producer_indices = [
+        index
+        for index, task in enumerate(tasks)
+        if set(str(tool).lower() for tool in (task.tool_scope or [])) & _ARTIFACT_PRODUCER_TOOLS
+    ]
+    if not producer_indices:
+        return tasks
+    result = [
+        _copy_decomposed_task(
+            task,
+            metadata={
+                **dict(task.metadata or {}),
+                **(
+                    {
+                        "requires_artifact_delivery": True,
+                        "required_artifact_kind": required_artifact_kind,
+                    }
+                    if index in producer_indices
+                    else {}
+                ),
+            },
+        )
+        for index, task in enumerate(tasks)
+    ]
+    available = {str(tool) for tool in available_tools}
+    verify_tools = [tool for tool in ("file_read", "file_search") if tool in available]
+    for producer_index in producer_indices:
+        producer = result[producer_index]
+        produced_key = producer.context_key_out or f"artifact_{producer_index}"
+        if producer.context_key_out is None:
+            result[producer_index] = _copy_decomposed_task(producer, context_key_out=produced_key)
+        verify_index = len(result)
+        verified_key = f"{produced_key}_verified"
+        result.append(
+            DecomposedTask(
+                title="Verify artifact",
+                description=(
+                    "Verify the generated artifact from context, including path, expected format, "
+                    "and delivery evidence before any user-visible success claim."
+                ),
+                tool_scope=verify_tools,
+                priority=TaskPriority.NORMAL,
+                dep_indices=[producer_index],
+                context_key_in=produced_key,
+                context_key_out=verified_key,
+                required_inputs=[],
+                can_start=True,
+                metadata={
+                    "artifact_role": "verify",
+                    "requires_artifact_delivery": True,
+                    "required_artifact_kind": required_artifact_kind,
+                },
+            )
+        )
+        result.append(
+            DecomposedTask(
+                title="Deliver receipt",
+                description=(
+                    "Prepare the final user-visible artifact receipt from verified_artifact context. "
+                    "Do not claim delivery unless the verifier task confirms the artifact."
+                ),
+                tool_scope=[],
+                priority=TaskPriority.NORMAL,
+                dep_indices=[verify_index],
+                context_key_in=verified_key,
+                context_key_out=None,
+                required_inputs=[],
+                can_start=True,
+                metadata={
+                    "artifact_role": "deliver_receipt",
+                    "requires_artifact_delivery": True,
+                    "required_artifact_kind": required_artifact_kind,
+                },
+            )
+        )
+    return result
+
+
+def _copy_decomposed_task(
+    task: DecomposedTask,
+    *,
+    context_key_out: str | None | object = _UNCHANGED,
+    metadata: dict[str, object] | None = None,
+) -> DecomposedTask:
+    return DecomposedTask(
+        title=task.title,
+        description=task.description,
+        tool_scope=list(task.tool_scope),
+        priority=task.priority,
+        dep_indices=list(task.dep_indices),
+        context_key_in=task.context_key_in,
+        context_key_out=task.context_key_out if context_key_out is _UNCHANGED else context_key_out,
+        required_inputs=list(task.required_inputs or []),
+        can_start=task.can_start,
+        metadata=dict(task.metadata or {}) if metadata is None else metadata,
+    )
+
+
+def _contains_public_domain_signal(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    for match in _PUBLIC_DOMAIN_RE.finditer(text):
+        host = match.group(1).strip(".").lower()
+        if _is_public_domain_signal(host):
+            return True
+    return False
+
+
+def _is_public_domain_signal(host: str) -> bool:
+    if not host or host.endswith(_PRIVATE_DOMAIN_SUFFIXES):
+        return False
+    parsed = urlparse(f"http://{host}")
+    candidate = (parsed.hostname or "").lower()
+    if not candidate or "." not in candidate:
+        return False
+    if candidate in {"localhost", "0.0.0.0"}:
+        return False
+    return True
 
 
 def _planner_metadata(plan: DagPlan) -> dict[str, object]:
@@ -717,6 +921,17 @@ def _planner_metadata(plan: DagPlan) -> dict[str, object]:
             for index, task in enumerate(plan.tasks)
         ],
     }
+
+
+def _planner_plan_with_tasks(plan: DagPlan, tasks: list[DecomposedTask]) -> DagPlan:
+    return DagPlan(
+        disposition=plan.disposition,
+        tasks=tasks,
+        needs_clarification=plan.needs_clarification,
+        clarification_question=plan.clarification_question,
+        routing_evidence=list(plan.routing_evidence or []),
+        validation_errors=list(plan.validation_errors or []),
+    )
 
 
 def _has_cycle(dependencies: list[list[int]]) -> bool:

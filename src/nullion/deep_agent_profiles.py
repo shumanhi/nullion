@@ -1,6 +1,7 @@
 """Built-in Deep Agents profile hints for delegated Nullion tasks."""
 
 from __future__ import annotations
+from functools import lru_cache
 from typing import Any
 
 
@@ -48,24 +49,118 @@ _PROFILE_DEFINITIONS: dict[str, dict[str, str]] = {
 }
 
 _BUILTIN_SKILL_SOURCE = "/skills/nullion/"
+_TAG_PROFILE_RULES: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"scheduler", "cron", "reminder"}), "scheduled_job"),
+    (frozenset({"doctor", "health", "service", "recovery"}), "doctor"),
+    (frozenset({"migration", "refactor", "dependency"}), "migration"),
+    (frozenset({"artifact", "file", "document", "pdf", "spreadsheet", "presentation", "media", "image_generation"}), "artifact"),
+    (frozenset({"browser", "ui", "screenshot"}), "browser"),
+    (frozenset({"public_web", "web", "network", "search", "weather", "forecast"}), "research"),
+    (frozenset({"filesystem", "workspace", "repo"}), "repo_analysis"),
+)
+
+_STRUCTURED_TOOL_PROFILE_HINTS: dict[str, tuple[str, ...]] = {
+    "file_read": ("repo_analysis",),
+    "file_search": ("repo_analysis",),
+    "repo_search": ("repo_analysis",),
+}
+def _dedupe_profiles(profiles: list[str]) -> list[str]:
+    return [profile for profile in dict.fromkeys(profiles) if profile in _PROFILE_DEFINITIONS]
+
+
+def _normalize_tags(tags: Any) -> tuple[str, ...]:
+    return tuple(sorted({str(tag).strip().lower() for tag in (tags or ()) if str(tag).strip()}))
+
+
+def _profiles_for_tags(tags: tuple[str, ...]) -> list[str]:
+    tag_set = set(tags)
+    profiles: list[str] = []
+    for rule_tags, profile in _TAG_PROFILE_RULES:
+        if tag_set.intersection(rule_tags):
+            profiles.append(profile)
+    return profiles
+
+
+def _tool_profile_shape(tool_definitions: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    shape: list[tuple[str, tuple[str, ...]]] = []
+    for definition in tool_definitions or ():
+        if not isinstance(definition, dict):
+            continue
+        name = str(definition.get("name") or "").strip()
+        if not name:
+            continue
+        shape.append((name, _normalize_tags(definition.get("capability_tags"))))
+    return tuple(sorted(shape))
+
+
+@lru_cache(maxsize=128)
+def _cached_tool_profile_metadata(
+    shape: tuple[tuple[str, tuple[str, ...]], ...],
+    ) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]:
+    rows: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+    for name, tags in shape:
+        profiles = _dedupe_profiles(_profiles_for_tags(tags))
+        rows.append((name, tags, tuple(profiles)))
+    return tuple(rows)
+
+
+def deep_agent_tool_profile_metadata(tool_definitions: Any) -> dict[str, dict[str, tuple[str, ...]]]:
+    """Return compact cached profile metadata keyed by tool registry shape."""
+
+    rows = _cached_tool_profile_metadata(_tool_profile_shape(tool_definitions))
+    return {
+        "tool_capability_tags": {name: tags for name, tags, _profiles in rows},
+        "tool_profiles": {name: profiles for name, _tags, profiles in rows},
+    }
+
+
+def deep_agent_task_metadata_for_tools(
+    allowed_tools: Any,
+    tool_profile_metadata: dict[str, dict[str, tuple[str, ...]]] | None,
+) -> dict[str, object]:
+    """Return compact task metadata for Deep Agents profile selection."""
+
+    if not tool_profile_metadata:
+        return {}
+    tool_names = [str(tool).strip() for tool in (allowed_tools or ()) if str(tool).strip()]
+    tags_by_tool = tool_profile_metadata.get("tool_capability_tags", {})
+    profiles_by_tool = tool_profile_metadata.get("tool_profiles", {})
+    tags: list[str] = []
+    profiles: list[str] = []
+    for tool_name in tool_names:
+        tags.extend(tags_by_tool.get(tool_name, ()))
+        profiles.extend(profiles_by_tool.get(tool_name, ()))
+    metadata: dict[str, object] = {}
+    if tags:
+        metadata["tool_capability_tags"] = _normalize_tags(tags)
+    profiles = _dedupe_profiles(profiles)
+    if profiles:
+        metadata["deep_agent_profiles"] = profiles
+    return metadata
+
+
+def clear_deep_agent_profile_caches() -> None:
+    """Clear cached compact tool-profile metadata after registry changes."""
+
+    _cached_tool_profile_metadata.cache_clear()
 
 
 def deep_agent_profile_names_for_task(task: Any) -> list[str]:
     """Infer reusable Deep Agents profiles from structured scoped tools."""
-    tools = {str(tool).lower() for tool in (getattr(task, "allowed_tools", None) or [])}
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
     profiles: list[str] = []
 
-    if tools & {"web_search", "web_fetch"}:
-        profiles.append("research")
-    if tools & {"file_read", "file_search", "workspace_summary"}:
-        profiles.append("repo_analysis")
-    if any(tool.startswith("browser_") for tool in tools):
-        profiles.append("browser")
-    if tools & {"file_write", "pdf_create", "pdf_edit", "render", "image_generate"}:
-        profiles.append("artifact")
+    if metadata.get("artifact_role") == "verify":
         profiles.append("artifact_verifier")
+    elif metadata.get("requires_artifact_delivery"):
+        profiles.append("artifact")
+    profiles.extend(str(profile) for profile in (metadata.get("deep_agent_profiles") or ()))
+    profiles.extend(_profiles_for_tags(_normalize_tags(metadata.get("tool_capability_tags"))))
+    for tool_name in getattr(task, "allowed_tools", None) or ():
+        profiles.extend(_STRUCTURED_TOOL_PROFILE_HINTS.get(str(tool_name).strip(), ()))
 
-    return list(dict.fromkeys(profiles))
+    return _dedupe_profiles(profiles)
 
 
 def deep_agent_skills_for_task(task: Any) -> list[str]:
@@ -100,8 +195,11 @@ def deep_agent_subagents_for_task(task: Any) -> list[dict[str, str]]:
 
 
 __all__ = [
+    "clear_deep_agent_profile_caches",
     "deep_agent_profile_names_for_task",
     "deep_agent_skill_files_for_task",
     "deep_agent_skills_for_task",
     "deep_agent_subagents_for_task",
+    "deep_agent_task_metadata_for_tools",
+    "deep_agent_tool_profile_metadata",
 ]

@@ -382,6 +382,15 @@ def _preview_cache_ttl_seconds() -> int:
     return max(0, parsed)
 
 
+def clear_cron_planner_preview_caches() -> None:
+    """Clear in-memory and shared cron planner-preview caches."""
+
+    global _PERSIST_CACHE_LOADED
+    _PREVIEW_CACHE.clear()
+    _PERSIST_CACHE_LOADED = False
+    runtime_cache.invalidate_prefix(_PREVIEW_CACHE_NAMESPACE)
+
+
 def _preview_model_timeout_seconds() -> float:
     raw = os.environ.get(_PREVIEW_MODEL_TIMEOUT_SECONDS_ENV, "").strip()
     if not raw:
@@ -783,6 +792,12 @@ def _materialize_cached_preview(
         conversation_id=conversation_id,
         original_message="",
         tasks=tasks,
+        planner_metadata={
+            "planner": "model_dag",
+            "disposition": _disposition_from_planner_summary(template.planner_summary),
+            "dispatchable_when_requested": True,
+            "from_cache": True,
+        },
     )
     return CronPlannerStatusPreview(
         group=group,
@@ -791,9 +806,21 @@ def _materialize_cached_preview(
     )
 
 
+def _disposition_from_planner_summary(summary: str) -> str:
+    normalized = str(summary or "").strip().lower()
+    if "parallel mission" in normalized:
+        return "parallel_mission"
+    if "sequential mission" in normalized:
+        return "sequential_mission"
+    if "single turn" in normalized:
+        return "single_turn"
+    return ""
+
+
 __all__ = [
     "CronPlannerStatusPreview",
     "build_cron_planner_status_preview",
     "build_cron_planner_status_fallback",
+    "clear_cron_planner_preview_caches",
     "cron_planner_run_succeeded",
 ]

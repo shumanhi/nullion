@@ -38,10 +38,12 @@ _SHELL_COMMAND_FAMILIES = {
 }
 _HTTP_URL_RE = re.compile(r"https?://[^\s'\"<>()\[\]{}]+", re.I)
 _WEB_SEARCH_TARGET = "https://www.bing.com/*"
+_INTERNAL_LARGE_TOOL_RESULT_RE = re.compile(r"^/large_tool_results/call_[A-Za-z0-9_-]+$")
 
 # Account-scoped tools: maps tool_name → (operation, account_type)
 _ACCOUNT_SCOPED_TOOLS: dict[str, tuple[str, str]] = {
     "email_send":      ("send",  "email"),
+    "email_search":    ("read",  "email"),
     "email_read":      ("read",  "email"),
     "calendar_write":  ("write", "calendar"),
     "calendar_read":   ("read",  "calendar"),
@@ -152,8 +154,23 @@ def _email_send_account_target(invocation: "ToolInvocation") -> str:
     return f"{provider_id}:send" if provider_id else "email:send"
 
 
+def _email_read_account_target(invocation: "ToolInvocation") -> str:
+    provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+    if not provider_id:
+        try:
+            from nullion.connections import default_email_connector_provider_id
+
+            provider_id = default_email_connector_provider_id(invocation.principal_id) or ""
+        except Exception:
+            provider_id = ""
+    return provider_id or "email:read"
+
+
 def _filesystem_boundary_fact(*, tool_name: str, operation: str, raw_path: object) -> BoundaryFact | None:
     if not isinstance(raw_path, str) or not raw_path:
+        return None
+    raw_text = raw_path.strip()
+    if operation == "read" and _INTERNAL_LARGE_TOOL_RESULT_RE.fullmatch(raw_text):
         return None
     path = str(Path(raw_path).expanduser())
     return BoundaryFact(
@@ -303,11 +320,13 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
     # Named account-scoped tools (email, calendar, contacts)
     if invocation.tool_name in _ACCOUNT_SCOPED_TOOLS:
         operation, account_type = _ACCOUNT_SCOPED_TOOLS[invocation.tool_name]
+        target = _email_read_account_target(invocation) if invocation.tool_name in {"email_search", "email_read"} else ""
         return [
             _account_boundary_fact(
                 tool_name=invocation.tool_name,
                 operation=operation,
                 account_type=account_type,
+                target=target,
             )
         ]
 

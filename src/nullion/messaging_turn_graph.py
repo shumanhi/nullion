@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import inspect
+import logging
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -13,6 +14,9 @@ from nullion.approval_markers import split_tool_approval_marker, strip_tool_appr
 from nullion.chat_operator import _chat_model_issue_reply
 from nullion.operator_commands import is_operator_command_text
 from nullion import messaging_adapters as adapters
+
+
+logger = logging.getLogger(__name__)
 
 
 class MessagingTurnState(TypedDict, total=False):
@@ -70,7 +74,11 @@ def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
         and (not message.startswith("/") or not is_operator_command_text(message))
         and chat_enabled
     ):
-        health_reply = _chat_model_issue_reply(runtime, message=message)
+        health_reply = _chat_model_issue_reply(
+            runtime,
+            message=message,
+            model_client=getattr(service, "model_client", None),
+        )
         if health_reply is not None:
             return {"raw_reply": health_reply}
 
@@ -113,6 +121,12 @@ def _finalize_reply_node(state: MessagingTurnState) -> dict[str, object]:
         )
     reply = adapters._append_decision_fallbacks(visible_reply, fallbacks)
     adapters.save_messaging_chat_history(ingress, reply)
+    runtime = getattr(state["service"], "runtime", None)
+    if runtime is not None:
+        try:
+            runtime.checkpoint(force=True)
+        except Exception:
+            logger.debug("Unable to checkpoint messaging turn graph final state", exc_info=True)
     raw_reply_already_sent = bool(state.get("raw_reply_already_sent"))
     reply_already_sent = raw_reply_already_sent and reply == str(raw_reply)
     return {

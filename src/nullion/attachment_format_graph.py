@@ -59,6 +59,22 @@ ATTACHMENT_TOKEN_EXTENSIONS: dict[str, str] = {
 }
 VALID_ATTACHMENT_EXTENSIONS: tuple[str, ...] = tuple(sorted(set(ATTACHMENT_TOKEN_EXTENSIONS.values())))
 _GENERIC_EXTENSION_RE = re.compile(r"^\.[A-Za-z0-9]{1,16}$")
+_DOMAIN_SUFFIX_EXTENSIONS = frozenset(
+    {
+        ".ai",
+        ".app",
+        ".biz",
+        ".co",
+        ".com",
+        ".dev",
+        ".edu",
+        ".gov",
+        ".io",
+        ".net",
+        ".org",
+        ".us",
+    }
+)
 _ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS_ENV = "NULLION_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS"
 _DEFAULT_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS = 3.0
 logger = logging.getLogger(__name__)
@@ -208,6 +224,13 @@ def _attachment_format_model_timeout_seconds() -> float | None:
     return value if value > 0 else None
 
 
+def is_domain_suffix_extension(extension: str | None) -> bool:
+    normalized = str(extension or "").strip().lower()
+    if normalized and not normalized.startswith("."):
+        normalized = f".{normalized}"
+    return normalized in _DOMAIN_SUFFIX_EXTENSIONS
+
+
 def _token_around(text: str, start: int, end: int) -> str:
     left = start
     while left > 0 and not text[left - 1].isspace():
@@ -265,6 +288,8 @@ def _extension_from_match(token: str, raw_extension: str) -> str | None:
         return mapped
     extension = f".{normalized}"
     if _GENERIC_EXTENSION_RE.fullmatch(extension) is None:
+        return None
+    if is_domain_suffix_extension(extension):
         return None
     parts = tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
     has_path_evidence = (
@@ -334,6 +359,8 @@ def plan_attachment_format(text: str, *, model_client: object | None = None) -> 
     if isinstance(plan, AttachmentFormatPlan) and plan.extension is not None:
         return plan
     model_plan = _model_attachment_format_plan(text, model_client)
+    if model_plan is not None and is_domain_suffix_extension(model_plan.extension):
+        return AttachmentFormatPlan()
     if model_plan is not None:
         return model_plan
     return plan if isinstance(plan, AttachmentFormatPlan) else AttachmentFormatPlan()
@@ -344,5 +371,6 @@ __all__ = [
     "AttachmentFormatPlan",
     "AttachmentFormatState",
     "VALID_ATTACHMENT_EXTENSIONS",
+    "is_domain_suffix_extension",
     "plan_attachment_format",
 ]

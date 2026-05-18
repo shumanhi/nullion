@@ -25,6 +25,9 @@ from urllib.request import urlopen
 
 logger = logging.getLogger(__name__)
 _PACK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*$")
+_SKILL_PACK_INDEX_CACHE_NAMESPACE = "skill_pack.compact_index"
+_SKILL_PACK_INDEX_CACHE_VERSION = "v1"
+_SKILL_PACK_INDEX_CACHE_TTL_SECONDS = 24 * 60 * 60
 _SUSPICIOUS_PATTERNS = (
     "curl ",
     "wget ",
@@ -480,6 +483,83 @@ def format_compact_enabled_skill_packs_for_prompt(
     return "\n".join(lines).strip() if len(lines) > 2 else ""
 
 
+def format_cached_enabled_skill_pack_index_for_prompt(
+    enabled_pack_ids: tuple[str, ...] | list[str],
+    *,
+    root: Path | None = None,
+    max_total_chars: int = 900,
+) -> str:
+    """Return a tiny cached index of enabled skills for cheap routing.
+
+    This is safe to include in lightweight turns because it is only a compact
+    index. Full instructions and reference files still require an explicit
+    ``skill_pack_read`` call or a structured scope decision that opts into
+    skill-pack context.
+    """
+
+    try:
+        normalized_pack_ids = tuple(
+            normalize_pack_id(str(pack_id))
+            for pack_id in enabled_pack_ids
+            if str(pack_id or "").strip()
+        )
+    except ValueError:
+        normalized_pack_ids = tuple(
+            pack_id
+            for raw in enabled_pack_ids
+            for pack_id in [str(raw or "").strip().lower()]
+            if pack_id
+        )
+    if not normalized_pack_ids:
+        return ""
+    try:
+        from nullion import runtime_cache
+
+        cache_key = {
+            "enabled": list(normalized_pack_ids),
+            "signature": enabled_skill_pack_signature(normalized_pack_ids, root=root, max_paths=24),
+            "max_total_chars": max_total_chars,
+        }
+        cached = runtime_cache.get_json(
+            _SKILL_PACK_INDEX_CACHE_NAMESPACE,
+            cache_key,
+            version=_SKILL_PACK_INDEX_CACHE_VERSION,
+            ttl_seconds=_SKILL_PACK_INDEX_CACHE_TTL_SECONDS,
+            persistent=True,
+        )
+        if cached.hit and isinstance(cached.value, str):
+            return cached.value
+    except Exception:
+        cache_key = None
+    text = format_compact_enabled_skill_packs_for_prompt(
+        normalized_pack_ids,
+        root=root,
+        max_total_chars=max_total_chars,
+    )
+    if text:
+        text = (
+            "Installed skill index for routing only. Do not treat this as account access; "
+            "load exact docs with skill_pack_read only when the current structured plan needs them.\n"
+            + text
+        )
+    if text and cache_key is not None:
+        try:
+            from nullion import runtime_cache
+
+            runtime_cache.set_json(
+                _SKILL_PACK_INDEX_CACHE_NAMESPACE,
+                cache_key,
+                text,
+                version=_SKILL_PACK_INDEX_CACHE_VERSION,
+                ttl_seconds=_SKILL_PACK_INDEX_CACHE_TTL_SECONDS,
+                persistent=True,
+                max_entries=64,
+            )
+        except Exception:
+            logger.debug("Could not cache compact skill-pack index", exc_info=True)
+    return text
+
+
 def install_skill_pack(
     source: str,
     *,
@@ -703,6 +783,7 @@ __all__ = [
     "default_skill_pack_root",
     "derive_pack_id_from_source",
     "format_compact_enabled_skill_packs_for_prompt",
+    "format_cached_enabled_skill_pack_index_for_prompt",
     "format_enabled_skill_packs_for_prompt",
     "get_installed_skill_pack",
     "enabled_skill_pack_signature",

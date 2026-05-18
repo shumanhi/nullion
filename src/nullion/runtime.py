@@ -139,10 +139,12 @@ from nullion.intent_router import (
 )
 from nullion.runtime_store import RuntimeStore
 from nullion.runtime_persistence import (
+    build_runtime_store_payload,
     list_runtime_store_backups as _list_runtime_store_backups,
     load_runtime_store,
     render_runtime_store_payload_json,
     restore_runtime_store_backup,
+    runtime_store_payload_fingerprint,
     save_runtime_store,
 )
 from nullion.task_frames import (
@@ -298,9 +300,16 @@ class PersistentRuntime:
     def checkpoint(self, *, force: bool = False) -> Path:
         measure_sqlite = os.environ.get("NULLION_SQLITE_MEASURE", "").lower() in {"1", "true", "yes"}
         started_at = perf_counter()
-        fingerprint = None if force else render_runtime_store_payload_json(self.store)
+        payload = None if force else build_runtime_store_payload(self.store)
+        fingerprint = None if payload is None else runtime_store_payload_fingerprint(payload)
         fingerprint_ms = (perf_counter() - started_at) * 1000
-        if not force and fingerprint == self.last_checkpoint_fingerprint and self.checkpoint_path.exists():
+        current_file_signature = _runtime_checkpoint_file_signature(self.checkpoint_path)
+        if (
+            not force
+            and fingerprint == self.last_checkpoint_fingerprint
+            and self.checkpoint_path.exists()
+            and current_file_signature == self.last_checkpoint_file_signature
+        ):
             if measure_sqlite:
                 logger.debug(
                     "runtime checkpoint skipped path=%s fingerprint_ms=%.1f",
@@ -308,13 +317,17 @@ class PersistentRuntime:
                     fingerprint_ms,
                 )
             return self.checkpoint_path
-        current_file_signature = _runtime_checkpoint_file_signature(self.checkpoint_path)
         merge_existing = (
             current_file_signature is not None
             and current_file_signature != self.last_checkpoint_file_signature
         )
         save_started_at = perf_counter()
-        saved_path = checkpoint_runtime_store(self.store, self.checkpoint_path, merge_existing=merge_existing)
+        saved_path = checkpoint_runtime_store(
+            self.store,
+            self.checkpoint_path,
+            merge_existing=merge_existing,
+            payload=payload,
+        )
         save_ms = (perf_counter() - save_started_at) * 1000
         self.last_checkpoint_fingerprint = fingerprint
         self.last_checkpoint_file_signature = _runtime_checkpoint_file_signature(saved_path)
@@ -1026,6 +1039,7 @@ class PersistentRuntime:
         conversation_id: str | None = None,
         turn_id: str | None = None,
         branch_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> MiniAgentRun:
         run = start_mini_agent_run(
             self.store,
@@ -1036,6 +1050,7 @@ class PersistentRuntime:
             conversation_id=conversation_id,
             turn_id=turn_id,
             branch_id=branch_id,
+            metadata=metadata,
         )
         self.checkpoint()
         return run
@@ -1063,6 +1078,8 @@ class PersistentRuntime:
         live_run_ids: Iterable[str] | None = None,
         live_group_ids: Iterable[str] | None = None,
     ) -> list[MiniAgentRun]:
+        event_count = len(getattr(self.store, "events", []) or [])
+        doctor_action_count = len(getattr(self.store, "doctor_actions", []) or [])
         runs = reconcile_stale_mini_agent_runs(
             self.store,
             now=now,
@@ -1070,7 +1087,12 @@ class PersistentRuntime:
             live_run_ids=live_run_ids,
             live_group_ids=live_group_ids,
         )
-        if runs:
+        changed = (
+            runs
+            or len(getattr(self.store, "events", []) or []) != event_count
+            or len(getattr(self.store, "doctor_actions", []) or []) != doctor_action_count
+        )
+        if changed:
             self.checkpoint()
         return runs
 
@@ -1113,12 +1135,14 @@ def start_mini_agent_run(
     conversation_id: str | None = None,
     turn_id: str | None = None,
     branch_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> MiniAgentRun:
     run = create_mini_agent_run(
         run_id=run_id,
         capsule_id=capsule_id,
         mini_agent_type=mini_agent_type,
         created_at=created_at,
+        metadata=metadata,
     )
     store.add_mini_agent_run(run)
 
@@ -1264,16 +1288,18 @@ def reconcile_stale_mini_agent_runs(
     remain ``pending``/``running`` forever and keep the system looking busy.
     This reconciler is deliberately conservative: live dispatcher task IDs are
     protected, fresh rows are left alone, and each row is repaired independently.
+    Scheduled background runs are not auto-failed because they can intentionally
+    outlive the interactive web process; Doctor records an inspection action
+    instead.
     """
 
     observed_at = now or datetime.now(UTC)
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=UTC)
     live_ids = {str(run_id) for run_id in (live_run_ids or []) if str(run_id)}
-    scoped_group_ids = None
+    live_group_id_set: set[str] = set()
     if live_group_ids is not None:
         live_group_id_set = {str(group_id) for group_id in live_group_ids if str(group_id)}
-        scoped_group_ids = live_group_id_set or None
     stale_after = stale_after or mini_agent_stale_after()
     repaired: list[MiniAgentRun] = []
     active_statuses = {
@@ -1285,7 +1311,7 @@ def reconcile_stale_mini_agent_runs(
     for run in list(store.list_mini_agent_runs()):
         if run.status not in active_statuses or run.run_id in live_ids:
             continue
-        if scoped_group_ids is not None and run.capsule_id not in scoped_group_ids:
+        if run.capsule_id in live_group_id_set:
             continue
         created_at = run.created_at
         if created_at.tzinfo is None:
@@ -1293,11 +1319,7 @@ def reconcile_stale_mini_agent_runs(
         age = observed_at - created_at
         if age < stale_after:
             continue
-
-        summary = (
-            "Auto-reconciled as failed: persisted Mini-Agent run was still "
-            f"{run.status.value} after {int(age.total_seconds())}s with no live dispatcher owner."
-        )
+        summary = _stale_mini_agent_repair_summary(run, age=age)
         try:
             repaired.append(fail_mini_agent_run(store, run.run_id, result_summary=summary))
         except Exception as exc:
@@ -1322,6 +1344,53 @@ def reconcile_stale_mini_agent_runs(
                 logger.debug("Unable to record Mini-Agent reconciliation failure", exc_info=True)
 
     return repaired
+
+
+def _stale_mini_agent_repair_summary(run: MiniAgentRun, *, age: timedelta) -> str:
+    scheduled = "scheduled background " if _mini_agent_run_is_scheduled_background(run) else ""
+    return (
+        f"Auto-reconciled as failed: persisted {scheduled}Mini-Agent run was still "
+        f"{run.status.value} after {int(age.total_seconds())}s with no live dispatcher owner."
+    )
+
+
+def _mini_agent_run_is_scheduled_background(run: MiniAgentRun) -> bool:
+    metadata = getattr(run, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return bool(metadata.get("scheduled_task_run"))
+
+
+def _record_stale_scheduled_background_run(
+    store: RuntimeStore,
+    *,
+    run: MiniAgentRun,
+    age: timedelta,
+) -> None:
+    reason = f"scheduled_background_mini_agent_stale:{run.run_id}"
+    summary = "Inspect long-running scheduled background work before cancelling or retrying."
+    action = create_doctor_action(
+        recommendation_code="investigate_stale_background_mini_agent",
+        summary=summary,
+        severity="medium",
+        owner="doctor",
+        route_target="doctor",
+        route_reason=reason,
+    )
+    action_record = _doctor_action_record(action, action_type="investigate")
+    existing_action = _find_open_matching_doctor_action(store, action_record)
+    if existing_action is None:
+        store.add_doctor_action(_uniquify_doctor_action_id(store, action_record))
+        store.add_event(make_event(
+            event_type="mini_agent.background_stale",
+            actor="runtime",
+            payload={
+                "run_id": run.run_id,
+                "capsule_id": run.capsule_id,
+                "status": run.status.value,
+                "age_seconds": str(int(age.total_seconds())),
+                "doctor_reason": reason,
+            },
+        ))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1419,7 +1488,10 @@ def diagnose_runtime_health(
     if repaired_runs:
         recommendations.append("Review /status to confirm the active task list is clear, then retry the original request only if it is still needed.")
     elif stale_runs:
-        recommendations.append("Run Doctor diagnose with repair enabled or restart the dispatcher before retrying the affected request.")
+        if any(_mini_agent_run_is_scheduled_background(run) for run in stale_runs):
+            recommendations.append("Inspect long-running scheduled background work before cancelling or retrying.")
+        else:
+            recommendations.append("Run Doctor diagnose with repair enabled or restart the dispatcher before retrying the affected request.")
     if pending_doctor_actions:
         recommendations.append("Review pending Doctor actions with /doctor and resolve or dismiss items that are no longer relevant.")
     if not recommendations:
@@ -4117,8 +4189,14 @@ def run_due_scheduled_tasks(store: RuntimeStore, now: datetime):
 
 
 
-def checkpoint_runtime_store(store: RuntimeStore, path: str | Path, *, merge_existing: bool = True) -> Path:
-    return save_runtime_store(store, path, merge_existing=merge_existing)
+def checkpoint_runtime_store(
+    store: RuntimeStore,
+    path: str | Path,
+    *,
+    merge_existing: bool = True,
+    payload: dict[str, object] | None = None,
+) -> Path:
+    return save_runtime_store(store, path, merge_existing=merge_existing, payload=payload)
 
 
 

@@ -73,6 +73,14 @@ def _planner_dependency_recovery_attempts() -> int:
     return planner_dependency_recovery_attempts()
 
 
+def _mini_agent_runner_concurrency_limit() -> int:
+    try:
+        value = int(os.environ.get("NULLION_MINI_AGENT_RUNNER_CONCURRENCY", "3"))
+    except ValueError:
+        value = 3
+    return max(1, min(value, 8))
+
+
 def _group_uses_planner_timeout(group: Any, *, single_task_fast_path: bool) -> bool:
     return len(getattr(group, "tasks", ()) or ()) > 1 or not single_task_fast_path
 
@@ -94,6 +102,36 @@ def _apply_planner_timeout_policy(group: Any, *, single_task_fast_path: bool) ->
 def _task_has_artifact_delivery_scope(task: Any) -> bool:
     allowed_tools = {str(tool) for tool in (getattr(task, "allowed_tools", None) or [])}
     return bool(allowed_tools.intersection(_ARTIFACT_RECOVERY_TOOLS))
+
+
+def _task_is_scheduled_background_run(task: Any) -> bool:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return bool(metadata.get("scheduled_task_run"))
+
+
+def _mini_agent_run_metadata_for_task(task: Any) -> dict[str, object]:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    compact: dict[str, object] = {}
+    for key in (
+        "scheduled_task_run",
+        "no_user_input_requests",
+        "authoritative_scheduled_task_context",
+        "cached_cron_dispatch_plan",
+    ):
+        if metadata.get(key):
+            compact[key] = True
+    profiles = metadata.get("deep_agent_profiles")
+    if isinstance(profiles, (list, tuple, set)):
+        compact_profiles = tuple(
+            str(profile).strip()
+            for profile in profiles
+            if str(profile).strip()
+        )
+        if compact_profiles:
+            compact["deep_agent_profiles"] = compact_profiles
+    return compact
 
 
 def _task_dependency_recovery_description(
@@ -417,6 +455,26 @@ def _foreground_suppressed_tool_completion_text(result: ToolResult) -> str | Non
             delivery_text = "The configured delivery completed."
         return " ".join(part for part in (message, delivery_text) if part).strip()
     return message or "Done."
+
+
+def _deferred_background_tool_completion_text(result: ToolResult) -> str | None:
+    if result.status != "completed":
+        return None
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("mini_agent_dispatch") is not True:
+        return None
+    if str(output.get("delivery_status") or output.get("cron_delivery_status") or "").strip() != "deferred":
+        return None
+    nested = output.get("result") if isinstance(output.get("result"), dict) else {}
+    for key in ("result_text", "final_text", "text", "message"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("result_text", "final_text", "text", "message"):
+        value = nested.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "Started. The result will be delivered when ready."
 
 
 def _last_useful_tool_message(tool_results: list[ToolResult]) -> str:
@@ -757,6 +815,27 @@ def _missing_artifact_delivery_nudge(missing_requirements: tuple[str, ...]) -> s
     )
 
 
+def _missing_required_tool_nudge(missing_requirements: tuple[str, ...]) -> str:
+    missing = ", ".join(missing_requirements) or "the required tool completion"
+    return (
+        "The active task is not complete yet. Before giving a final reply, run the registered tool needed for "
+        f"{missing}. If that tool requires approval, invoke it so the approval prompt is created."
+    )
+
+
+def _required_tool_names_from_turn_scope(tool_registry: object | None) -> tuple[str, ...]:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(tool_name or "").strip()
+            for tool_name in (getattr(decision, "requested_tool_names", ()) or ())
+            if str(tool_name or "").strip()
+        )
+    )
+
+
 def _artifact_roots_for_agent_turn(runtime_store: object, principal_id: str) -> tuple[Any, ...]:
     roots: list[Any] = []
     try:
@@ -846,11 +925,214 @@ def _repeated_tool_failure_message(
         return (
             f"The connector request{provider_text} failed {repeated_count} times, so I stopped retrying it. "
             f"{detail}".rstrip()
-            + " I need to use a different available tool path or a correctly configured connector for this request."
+            + "\n\nI can still help with this. Options:\n"
+            "1. Try another available tool path, such as browser or web tools.\n"
+            "2. Use a configured connector for this account.\n"
+            "3. Install or enable the matching skill/connector, then retry."
         )
     return (
         f"I stopped because the same {tool_label} step failed {repeated_count} times in a row. "
         "I did not keep retrying the same action."
+    )
+
+
+def _connector_failure_has_public_url_evidence(tool_results: list[ToolResult]) -> bool:
+    for result in tool_results:
+        if result.tool_name != "connector_request" or result.status == "completed":
+            continue
+        error_text = str(result.error or "")
+        if "Blocked URL for connector_request:" not in error_text:
+            continue
+        if "http://" in error_text or "https://" in error_text:
+            return True
+    return False
+
+
+def _failed_tool_result_count(tool_results: list[ToolResult], *, tool_name: str) -> int:
+    return sum(1 for result in tool_results if result.tool_name == tool_name and result.status != "completed")
+
+
+def _tool_registry_names(tool_registry: object) -> set[str]:
+    try:
+        return {str(definition.get("name") or "") for definition in tool_registry.list_tool_definitions()}
+    except Exception:
+        pass
+    try:
+        return {str(getattr(spec, "name", "") or "") for spec in tool_registry.list_specs()}
+    except Exception:
+        return set()
+
+
+class _BlockedToolRegistry:
+    def __init__(self, delegate: object, blocked_tool_names: set[str]) -> None:
+        self._delegate = delegate
+        self._blocked_tool_names = {str(name) for name in blocked_tool_names if str(name)}
+        self.turn_tool_scope_decision = getattr(delegate, "turn_tool_scope_decision", None)
+
+    def _is_blocked(self, tool_name: object) -> bool:
+        return str(tool_name or "") in self._blocked_tool_names
+
+    def get_spec(self, name: str):
+        if self._is_blocked(name):
+            raise KeyError(name)
+        return self._delegate.get_spec(name)
+
+    def list_specs(self):
+        return [spec for spec in self._delegate.list_specs() if not self._is_blocked(getattr(spec, "name", ""))]
+
+    def list_tool_definitions(self, *args, **kwargs):
+        return [
+            definition
+            for definition in self._delegate.list_tool_definitions(*args, **kwargs)
+            if not self._is_blocked(definition.get("name"))
+        ]
+
+    def invoke(self, invocation: ToolInvocation) -> ToolResult:
+        if self._is_blocked(invocation.tool_name):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"reason": "tool_recovery_blocked"},
+                error=f"{invocation.tool_name} was skipped after repeated failures; use the available fallback tools.",
+            )
+        return self._delegate.invoke(invocation)
+
+    def apply_scope_request(self, invocation: ToolInvocation):
+        apply_scope_request = getattr(self._delegate, "apply_scope_request", None)
+        if not callable(apply_scope_request):
+            raise AttributeError("delegate does not support apply_scope_request")
+        result, widened = apply_scope_request(invocation)
+        return result, _BlockedToolRegistry(widened, self._blocked_tool_names)
+
+
+def _block_tools_for_recovery(tool_registry: object, blocked_tool_names: set[str]):
+    if not blocked_tool_names:
+        return tool_registry
+    existing = getattr(tool_registry, "_blocked_tool_names", None)
+    if isinstance(existing, set):
+        blocked_tool_names = set(blocked_tool_names) | existing
+        delegate = getattr(tool_registry, "_delegate", tool_registry)
+        return _BlockedToolRegistry(delegate, blocked_tool_names)
+    return _BlockedToolRegistry(tool_registry, blocked_tool_names)
+
+
+def _synthetic_recovery_scope_result(
+    state: _AgentTurnGraphState,
+    *,
+    tool_registry: object,
+    skipped_scopes: set[str],
+) -> tuple[ToolRegistry, ToolResult, str] | None:
+    names = _tool_registry_names(tool_registry)
+    recovery_candidates = (
+        (
+            "web",
+            [
+                "web_search",
+                "web_fetch",
+                "browser_navigate",
+                "browser_extract_text",
+                "browser_find",
+                "browser_scroll",
+                "browser_wait_for",
+            ],
+        ),
+        ("local_shell", ["terminal_exec"]),
+    )
+    for recovery_scope, candidate_names in recovery_candidates:
+        if recovery_scope in skipped_scopes:
+            continue
+        available_tools = [name for name in candidate_names if name in names]
+        if not available_tools:
+            continue
+        return (
+            tool_registry,
+            ToolResult(
+                invocation_id=f"orchestrator-{uuid4().hex}",
+                tool_name="request_tool_scope",
+                status="completed",
+                output={
+                    "scope_requested": True,
+                    "capabilities": [recovery_scope],
+                    "available_tools": available_tools,
+                    "message": "Recovery tools are already available. Continue the same user request using them.",
+                    "suppress_activity": True,
+                },
+            ),
+            recovery_scope,
+        )
+    return None
+
+
+def _maybe_widen_scope_after_repeated_tool_failure(
+    state: _AgentTurnGraphState,
+    *,
+    result: ToolResult,
+    tool_registry: ToolRegistry,
+    tool_results: list[ToolResult],
+    tool_recovery_scopes_attempted: list[str],
+) -> tuple[ToolRegistry, ToolResult, str] | None:
+    if result.tool_name != "connector_request":
+        return None
+    skipped_scopes = set(tool_recovery_scopes_attempted)
+    if {"web", "local_shell"}.issubset(skipped_scopes):
+        return None
+    failure_limit = int(state.get("repeated_failure_limit") or _repeated_tool_failure_limit())
+    connector_failure_count = _failed_tool_result_count(tool_results, tool_name="connector_request")
+    if connector_failure_count < failure_limit and not _connector_failure_has_public_url_evidence(tool_results):
+        return None
+    apply_scope_request = getattr(tool_registry, "apply_scope_request", None)
+    if callable(apply_scope_request):
+        for recovery_scope in ("web", "local_shell"):
+            if recovery_scope in skipped_scopes:
+                continue
+            invocation = ToolInvocation(
+                invocation_id=f"orchestrator-{uuid4().hex}",
+                tool_name="request_tool_scope",
+                principal_id=state["principal_id"],
+                arguments={"capabilities": [recovery_scope]},
+                capsule_id=state["cleanup_scope"],
+            )
+            try:
+                scope_result, widened_registry = apply_scope_request(invocation)
+            except Exception:
+                logger.debug("Could not widen tool scope after repeated connector failure", exc_info=True)
+                continue
+            if scope_result.status != "completed":
+                continue
+            available_tools = []
+            output = scope_result.output if isinstance(scope_result.output, dict) else {}
+            raw_tools = output.get("available_tools")
+            if isinstance(raw_tools, list):
+                available_tools = [str(tool).strip() for tool in raw_tools if str(tool).strip()]
+            if not available_tools:
+                continue
+            return widened_registry, scope_result, recovery_scope
+    return _synthetic_recovery_scope_result(state, tool_registry=tool_registry, skipped_scopes=skipped_scopes)
+
+
+def _append_tool_scope_recovery_result(
+    *,
+    tool_result_blocks: list[dict[str, object]],
+    tool_use_id: str,
+    failed_result: ToolResult,
+    scope_result: ToolResult,
+) -> None:
+    tool_result_blocks.append(
+        {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        _tool_result_message_payload(failed_result)
+                        + "\n\n"
+                        + _tool_result_message_payload(scope_result)
+                    ),
+                }
+            ],
+        }
     )
 
 
@@ -967,6 +1249,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     raw_tool_payload_nudge_count: int
     repeated_failure_limit: int
     failure_fingerprints: dict[str, int]
+    tool_recovery_scopes_attempted: list[str]
     thinking_parts: list[str]
     initial_tool_content: list[dict[str, Any]] | None
     enable_repeated_failure_guard: bool
@@ -1212,6 +1495,7 @@ def _execute_agent_turn_tool_uses(
     tool_results = list(state.get("tool_results") or [])
     artifacts = list(state.get("artifacts") or [])
     failure_fingerprints = dict(state.get("failure_fingerprints") or {})
+    tool_recovery_scopes_attempted = list(state.get("tool_recovery_scopes_attempted") or [])
     tool_result_blocks: list[dict[str, object]] = []
 
     for block in content:
@@ -1261,6 +1545,38 @@ def _execute_agent_turn_tool_uses(
             arguments=dict(tool_input),
             capsule_id=cleanup_scope,
         )
+        if tool_name == "request_tool_scope":
+            apply_scope_request = getattr(tool_registry, "apply_scope_request", None)
+            if callable(apply_scope_request):
+                tool_started_at = time.perf_counter()
+                result, widened_registry = apply_scope_request(invocation)
+                tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
+                tool_registry = widened_registry
+                state["tool_registry"] = widened_registry
+                tool_results.append(result)
+                if tool_result_callback is not None:
+                    try:
+                        tool_result_callback(result)
+                    except Exception:
+                        logger.debug("Tool result callback failed", exc_info=True)
+                if runtime_store is not None:
+                    _record_agent_tool_timing(
+                        runtime_store,
+                        conversation_id=conversation_id,
+                        iteration=int(state.get("iterations") or 0),
+                        invocation=invocation,
+                        result=result,
+                        duration_ms=tool_duration_ms,
+                        artifact_count=0,
+                    )
+                tool_result_blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": [{"type": "text", "text": _tool_result_message_payload(result)}],
+                    }
+                )
+                continue
         invocation_signature = _tool_invocation_signature(
             tool_name=tool_name,
             tool_input=dict(tool_input),
@@ -1385,6 +1701,16 @@ def _execute_agent_turn_tool_uses(
                 **_complete_agent_turn(updated_state, final_text=foreground_suppressed_text),
             }
 
+        deferred_background_text = _deferred_background_tool_completion_text(result)
+        if deferred_background_text is not None:
+            updated_state = dict(state)
+            updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
+            return {
+                "tool_results": tool_results,
+                "artifacts": artifacts,
+                **_complete_agent_turn(updated_state, final_text=deferred_background_text),
+            }
+
         if state.get("enable_repeated_failure_guard", False):
             failure_fingerprint = _tool_failure_fingerprint(
                 result=result,
@@ -1393,6 +1719,28 @@ def _execute_agent_turn_tool_uses(
             if failure_fingerprint is not None:
                 failure_fingerprints[failure_fingerprint] = failure_fingerprints.get(failure_fingerprint, 0) + 1
                 repeated_count = failure_fingerprints[failure_fingerprint]
+                recovery_update = _maybe_widen_scope_after_repeated_tool_failure(
+                    state,
+                    result=result,
+                    tool_registry=tool_registry,
+                    tool_results=tool_results,
+                    tool_recovery_scopes_attempted=tool_recovery_scopes_attempted,
+                )
+                if recovery_update is not None:
+                    widened_registry, scope_result, recovery_scope = recovery_update
+                    widened_registry = _block_tools_for_recovery(widened_registry, {result.tool_name})
+                    tool_registry = widened_registry
+                    state["tool_registry"] = widened_registry
+                    tool_results.append(scope_result)
+                    tool_recovery_scopes_attempted.append(recovery_scope)
+                    _append_tool_scope_recovery_result(
+                        tool_result_blocks=tool_result_blocks,
+                        tool_use_id=tool_use_id,
+                        failed_result=result,
+                        scope_result=scope_result,
+                    )
+                    failure_fingerprints = {}
+                    continue
                 if repeated_count >= int(state.get("repeated_failure_limit") or 1):
                     updated_state = dict(state)
                     updated_state.update(
@@ -1400,6 +1748,7 @@ def _execute_agent_turn_tool_uses(
                             "tool_results": tool_results,
                             "artifacts": artifacts,
                             "failure_fingerprints": failure_fingerprints,
+                            "tool_recovery_scopes_attempted": tool_recovery_scopes_attempted,
                         }
                     )
                     return {
@@ -1435,9 +1784,11 @@ def _execute_agent_turn_tool_uses(
     messages.append({"role": "user", "content": tool_result_blocks})
     return {
         "messages": messages,
+        "tool_registry": tool_registry,
         "tool_results": tool_results,
         "artifacts": list(dict.fromkeys(artifacts)),
         "failure_fingerprints": failure_fingerprints,
+        "tool_recovery_scopes_attempted": tool_recovery_scopes_attempted,
     }
 
 
@@ -1627,20 +1978,35 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                 state["runtime_store"],
                 state["principal_id"],
             ),
+            required_tool_names=_required_tool_names_from_turn_scope(state.get("tool_registry")),
         )
-        if not decision.satisfied and any(
-            "attachment" in requirement for requirement in decision.missing_requirements
-        ):
+        if not decision.satisfied:
+            missing_attachment = any(
+                "attachment" in requirement for requirement in decision.missing_requirements
+            )
+            missing_required_tool = any(
+                "required tool completion" in requirement
+                for requirement in decision.missing_requirements
+            )
+        else:
+            missing_attachment = False
+            missing_required_tool = False
+        if not decision.satisfied and (missing_attachment or missing_required_tool):
             messages.append(
                 {
                     "role": "assistant",
                     "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
                 }
             )
+            nudge_text = (
+                _missing_artifact_delivery_nudge(decision.missing_requirements)
+                if missing_attachment
+                else _missing_required_tool_nudge(decision.missing_requirements)
+            )
             messages.append(
                 {
                     "role": "user",
-                    "content": [{"type": "text", "text": _missing_artifact_delivery_nudge(decision.missing_requirements)}],
+                    "content": [{"type": "text", "text": nudge_text}],
                 }
             )
             return {"messages": messages, "post_tool_delivery_nudged": True}
@@ -1963,6 +2329,7 @@ class AgentOrchestrator:
                 "raw_tool_payload_nudge_count": 0,
                 "repeated_failure_limit": _repeated_tool_failure_limit(),
                 "failure_fingerprints": {},
+                "tool_recovery_scopes_attempted": [],
                 "thinking_parts": [],
                 "initial_tool_content": None,
                 "enable_repeated_failure_guard": True,
@@ -2036,6 +2403,7 @@ class AgentOrchestrator:
                 "raw_tool_payload_nudge_count": 0,
                 "repeated_failure_limit": _repeated_tool_failure_limit(),
                 "failure_fingerprints": {},
+                "tool_recovery_scopes_attempted": [],
                 "thinking_parts": [],
                 "initial_tool_content": initial_tool_content,
                 "enable_repeated_failure_guard": False,
@@ -2063,6 +2431,7 @@ class AgentOrchestrator:
     _checkpoint_fn: Any = None
     _supervisor_tasks: set[asyncio.Task] | None = None
     _runner_tasks_by_group: dict[str, set[asyncio.Task]] | None = None
+    _runner_semaphore: asyncio.Semaphore | None = None
     _dispatch_policy_store: Any = None
     _dispatcher_loop: Any = None
     _dispatcher_thread: threading.Thread | None = None
@@ -2131,6 +2500,24 @@ class AgentOrchestrator:
         except Exception:
             logger.debug("Could not checkpoint mini-agent dispatch state", exc_info=True)
 
+    async def _finalize_terminal_dispatch_group(self, group_id: str) -> None:
+        if self._task_registry is None or self._result_aggregator is None:
+            return
+        group = self._task_registry.get_group(group_id)
+        if group is None or not group.all_terminal():
+            return
+        from nullion.result_aggregator import GroupState
+
+        group_state = self._result_aggregator._group_state.setdefault(
+            group_id,
+            GroupState(
+                group_id=group_id,
+                conversation_id=group.conversation_id,
+                original_message=group.original_message,
+            ),
+        )
+        await self._result_aggregator._on_group_complete(group_state, group)
+
     def _ensure_dispatcher_loop(self) -> asyncio.AbstractEventLoop:
         """Return the persistent loop used by sync chat adapters for background dispatch."""
         loop = self._dispatcher_loop
@@ -2181,6 +2568,7 @@ class AgentOrchestrator:
                     capsule_id=task.group_id,
                     mini_agent_type=task.title or "general",
                     created_at=getattr(task, "created_at", None) or datetime.now(UTC),
+                    metadata=_mini_agent_run_metadata_for_task(task),
                 )
             )
         except Exception:
@@ -2201,9 +2589,17 @@ class AgentOrchestrator:
             if existing is None:
                 self._record_dispatch_task_run_pending(store, task)
                 existing = store.get_mini_agent_run(task.task_id)
-            if existing is None or existing.status is status:
+            if existing is None:
                 return
-            if existing.status is MiniAgentRunStatus.PENDING and status in {
+            existing_status = existing.status
+            if not isinstance(existing_status, MiniAgentRunStatus):
+                existing_status = MiniAgentRunStatus(str(existing_status))
+                existing = replace(existing, status=existing_status)
+            if existing_status == status:
+                if result_summary is not None and result_summary != existing.result_summary:
+                    store.add_mini_agent_run(replace(existing, result_summary=result_summary))
+                return
+            if existing_status == MiniAgentRunStatus.PENDING and status in {
                 MiniAgentRunStatus.COMPLETED,
                 MiniAgentRunStatus.FAILED,
             }:
@@ -2212,8 +2608,54 @@ class AgentOrchestrator:
             store.add_mini_agent_run(
                 transition_mini_agent_run_status(existing, status, result_summary=result_summary)
             )
+            persisted = store.get_mini_agent_run(task.task_id)
+            persisted_status = getattr(persisted, "status", None)
+            if persisted is not None and (
+                persisted_status != status
+                or (result_summary is not None and persisted.result_summary != result_summary)
+            ):
+                store.add_mini_agent_run(replace(persisted, status=status, result_summary=result_summary))
         except Exception:
-            logger.debug("Could not transition mini-agent run status", exc_info=True)
+            try:
+                existing = store.get_mini_agent_run(task.task_id)
+                if existing is not None:
+                    existing_status = existing.status
+                    if not isinstance(existing_status, MiniAgentRunStatus):
+                        existing_status = MiniAgentRunStatus(str(existing_status))
+                        existing = replace(existing, status=existing_status)
+                    store.add_mini_agent_run(replace(existing, status=status, result_summary=result_summary))
+                    return
+            except Exception:
+                pass
+            logger.warning("Could not transition mini-agent run status", exc_info=True)
+
+    def _force_persist_dispatch_task_run(
+        self,
+        store: Any,
+        task: Any,
+        status: MiniAgentRunStatus,
+        *,
+        result_summary: str | None = None,
+    ) -> None:
+        if store is None or not hasattr(store, "get_mini_agent_run") or not hasattr(store, "add_mini_agent_run"):
+            return
+        try:
+            existing = store.get_mini_agent_run(task.task_id)
+            if existing is None:
+                self._record_dispatch_task_run_pending(store, task)
+                existing = store.get_mini_agent_run(task.task_id)
+            if existing is None:
+                return
+            existing_status = existing.status
+            if not isinstance(existing_status, MiniAgentRunStatus):
+                existing_status = MiniAgentRunStatus(str(existing_status))
+                existing = replace(existing, status=existing_status)
+            if existing_status != status or (
+                result_summary is not None and existing.result_summary != result_summary
+            ):
+                store.add_mini_agent_run(replace(existing, status=status, result_summary=result_summary))
+        except Exception:
+            logger.warning("Could not force-persist mini-agent run status", exc_info=True)
 
     def _supervision_interval_seconds(self) -> float:
         raw_value = os.environ.get("NULLION_MINI_AGENT_SUPERVISION_INTERVAL_SECONDS", "10").strip()
@@ -2319,6 +2761,9 @@ class AgentOrchestrator:
                 group = self._task_registry.get_group(group_id)
                 if group is None:
                     return
+                if group.all_terminal():
+                    await self._finalize_terminal_dispatch_group(group_id)
+                    return
                 if _group_all_quiescent(group):
                     return
 
@@ -2347,6 +2792,8 @@ class AgentOrchestrator:
                     allowed_seconds = float(getattr(task, "timeout_s", 180.0) or 180.0) + grace
                     age_seconds = (now - started_at).total_seconds()
                     if age_seconds >= allowed_seconds:
+                        if _task_is_scheduled_background_run(task):
+                            continue
                         failures.append((
                             task,
                             f"Timed out after {int(age_seconds)}s without reaching a terminal state.",
@@ -2465,6 +2912,8 @@ class AgentOrchestrator:
         single_task_fast_path: bool = True,
         dag_plan: Any | None = None,
         preferred_group_id: str | None = None,
+        requires_artifact_delivery: bool = False,
+        required_artifact_kind: str | None = None,
     ) -> "DispatchResult":
         """Decompose *user_message* and dispatch tasks to mini-agents.
 
@@ -2472,6 +2921,7 @@ class AgentOrchestrator:
         background asyncio tasks. Single-task requests use run_turn() directly.
         """
         from nullion.context_bus import ContextBus
+        from nullion.deep_agent_profiles import deep_agent_tool_profile_metadata
         from nullion.mini_agent_runner import MiniAgentRunner
         from nullion.result_aggregator import ResultAggregator
         from nullion.task_decomposer import TaskDecomposer
@@ -2483,9 +2933,9 @@ class AgentOrchestrator:
         )
         from nullion.warm_pool import WarmAgentPool
 
-        tools = available_tools or [
-            t.get("name", "") for t in tool_registry.list_tool_definitions()
-        ]
+        tool_definitions = tool_registry.list_tool_definitions()
+        tools = available_tools or [t.get("name", "") for t in tool_definitions]
+        tool_profile_metadata = deep_agent_tool_profile_metadata(tool_definitions)
         self._dispatch_policy_store = policy_store
 
         # Lazy init.
@@ -2512,9 +2962,11 @@ class AgentOrchestrator:
             self._supervisor_tasks = set()
         if self._runner_tasks_by_group is None:
             self._runner_tasks_by_group = {}
+        runner_limit = _mini_agent_runner_concurrency_limit()
+        if self._runner_semaphore is None:
+            self._runner_semaphore = asyncio.Semaphore(runner_limit)
         if self._pool is None:
-            self._pool = WarmAgentPool(min_size=3, max_size=20, shared_client=self._model_client)
-            await self._pool.start()
+            self._pool = WarmAgentPool(min_size=min(2, runner_limit), max_size=max(2, runner_limit), shared_client=self._model_client)
 
         # Decompose.
         decomposer = TaskDecomposer(model_client=self._model_client)
@@ -2524,6 +2976,9 @@ class AgentOrchestrator:
             principal_id=principal_id,
             available_tools=tools,
             dag_plan=dag_plan,
+            requires_artifact_delivery=requires_artifact_delivery,
+            required_artifact_kind=required_artifact_kind,
+            tool_profile_metadata=tool_profile_metadata,
         )
         preferred_group_id = str(preferred_group_id or "").strip()
         if preferred_group_id and preferred_group_id != group.group_id:
@@ -2579,6 +3034,14 @@ class AgentOrchestrator:
         self._checkpoint_dispatch_state()
 
         runner = MiniAgentRunner()
+        status_delivered = await self._emit_supervised_status(
+            group.conversation_id,
+            acknowledgment,
+            is_status=True,
+            group_id=group.group_id,
+            status_kind="task_summary",
+        )
+        await self._pool.start()
         for task in group.tasks:
             if task.status == TaskStatus.QUEUED:
                 self._spawn_runner_task(
@@ -2601,13 +3064,6 @@ class AgentOrchestrator:
             name=f"supervise-{group.group_id}",
         )
         self._supervisor_tasks.add(supervisor_task)
-        status_delivered = await self._emit_supervised_status(
-            group.conversation_id,
-            acknowledgment,
-            is_status=True,
-            group_id=group.group_id,
-            status_kind="task_summary",
-        )
 
         return DispatchResult(
             group_id=group.group_id,
@@ -2622,6 +3078,37 @@ class AgentOrchestrator:
         )
 
     async def _run_task(
+        self,
+        task: Any,
+        *,
+        runner: Any,
+        group: Any,
+        tool_registry: ToolRegistry,
+        policy_store: Any,
+        approval_store: Any,
+    ) -> None:
+        semaphore = self._runner_semaphore
+        if semaphore is None:
+            await self._run_task_inner(
+                task,
+                runner=runner,
+                group=group,
+                tool_registry=tool_registry,
+                policy_store=policy_store,
+                approval_store=approval_store,
+            )
+            return
+        async with semaphore:
+            await self._run_task_inner(
+                task,
+                runner=runner,
+                group=group,
+                tool_registry=tool_registry,
+                policy_store=policy_store,
+                approval_store=approval_store,
+            )
+
+    async def _run_task_inner(
         self,
         task: Any,
         *,
@@ -2646,12 +3133,19 @@ class AgentOrchestrator:
                 return
             agent = await self._pool.acquire(preferred_tools=task.allowed_tools, task_id=task.task_id)
             agent_id = agent.agent_id
+            task_metadata = getattr(task, "metadata", None)
+            task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
+            can_request_user_input = not bool(
+                task_metadata.get("no_user_input_requests")
+                or task_metadata.get("scheduled_task_run")
+            )
             config = MiniAgentConfig(
                 agent_id=agent.agent_id,
                 task=task,
                 context_in=self._context_bus.get(task.context_key_in, group_id=task.group_id)
                            if task.context_key_in else None,
                 timeout_s=float(getattr(task, "timeout_s", 180.0) or 180.0),
+                can_request_user_input=can_request_user_input,
             )
             await self._task_registry.update_task(
                 task.task_id, status=TaskStatus.RUNNING,
@@ -2668,26 +3162,27 @@ class AgentOrchestrator:
                         kind="task_started",
                     )
                 )
-            timeout_seconds = max(0.1, float(config.timeout_s or 180.0))
-            try:
-                result = await asyncio.wait_for(
-                    runner.run(
-                        config,
-                        anthropic_client=get_agent_client(agent),
-                        tool_registry=tool_registry,
-                        policy_store=policy_store,
-                        approval_store=approval_store,
-                        context_bus=self._context_bus,
-                        progress_queue=self._progress_queue,
-                    ),
-                    timeout=timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                result = TaskResult(
-                    task_id=task.task_id,
-                    status="failure",
-                    error=f"Timed out after {timeout_seconds:g}s without reaching a terminal state.",
-                )
+            run_coro = runner.run(
+                config,
+                anthropic_client=get_agent_client(agent),
+                tool_registry=tool_registry,
+                policy_store=policy_store,
+                approval_store=approval_store,
+                context_bus=self._context_bus,
+                progress_queue=self._progress_queue,
+            )
+            if _task_is_scheduled_background_run(task):
+                result = await run_coro
+            else:
+                timeout_seconds = max(0.1, float(config.timeout_s or 180.0))
+                try:
+                    result = await asyncio.wait_for(run_coro, timeout=timeout_seconds)
+                except asyncio.TimeoutError:
+                    result = TaskResult(
+                        task_id=task.task_id,
+                        status="failure",
+                        error=f"Timed out after {timeout_seconds:g}s without reaching a terminal state.",
+                    )
         except asyncio.CancelledError:
             cancelled = True
             result = TaskResult(task_id=task.task_id, status="cancelled", error="Cancelled by user.")
@@ -2701,6 +3196,12 @@ class AgentOrchestrator:
         final_status = TaskStatus.CANCELLED if cancelled else _task_status_for_task_result(result)
         _store_delegated_pause_suspended_turn(policy_store, approval_store, task=task, result=result, agent_id=agent_id)
         self._transition_dispatch_task_run(
+            policy_store,
+            task,
+            _mini_agent_run_status_for_task_result(result),
+            result_summary=result.output or result.error,
+        )
+        self._force_persist_dispatch_task_run(
             policy_store,
             task,
             _mini_agent_run_status_for_task_result(result),
@@ -2738,6 +3239,7 @@ class AgentOrchestrator:
 
         grp = self._task_registry.get_group(task.group_id)
         if grp is not None and grp.all_terminal():
+            await self._finalize_terminal_dispatch_group(task.group_id)
             self._context_bus.clear_group(task.group_id)
 
     async def resume_paused_task(
@@ -2827,7 +3329,7 @@ class AgentOrchestrator:
             return self._task_registry.list_by_group(group_id)
         if conversation_id:
             return self._task_registry.list_by_conversation(conversation_id)
-        return []
+        return list(getattr(self._task_registry, "_tasks", {}).values())
 
     async def cancel_task(self, task_id: str) -> bool:
         if self._task_registry is None:

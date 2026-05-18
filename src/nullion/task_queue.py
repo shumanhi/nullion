@@ -80,6 +80,7 @@ class TaskRecord:
     timeout_s: float = field(default_factory=mini_agent_timeout_seconds)
     deep_agent_skills: list[str] = field(default_factory=list)
     deep_agent_subagents: list[dict[str, str]] = field(default_factory=list)
+    metadata: dict[str, object] = field(default_factory=dict)
 
     def is_terminal(self) -> bool:
         return self.status in {TaskStatus.COMPLETE, TaskStatus.FAILED, TaskStatus.CANCELLED}

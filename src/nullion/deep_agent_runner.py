@@ -19,11 +19,10 @@ from nullion.artifacts import (
 )
 from nullion.deep_agent_profiles import (
     deep_agent_skill_files_for_task,
-    deep_agent_skills_for_task,
     deep_agent_subagents_for_task,
 )
 from nullion.langchain_adapters import nullion_client_as_langchain_chat_model, nullion_tools_as_langchain_tools
-from nullion.response_sanitizer import sanitize_user_visible_reply
+from nullion.response_sanitizer import is_safe_raw_tool_payload_replacement_reply, sanitize_user_visible_reply
 from nullion.response_fulfillment_contract import artifact_paths_from_tool_results
 from nullion.run_activity import format_tool_activity_line, should_suppress_tool_activity
 from nullion.task_queue import TaskResult
@@ -47,7 +46,7 @@ class DeepAgentEvidenceFallbackUnavailable(RuntimeError):
 
 
 _DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS_ENV = "NULLION_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS"
-_DEFAULT_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS = 5.0
+_DEFAULT_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS = 20.0
 
 
 class DeepAgentMiniAgentRunner:
@@ -73,17 +72,18 @@ class DeepAgentMiniAgentRunner:
             message=task.title,
         )
         try:
-            result = await asyncio.wait_for(
-                self._run_inner(
-                    config,
-                    anthropic_client=anthropic_client,
-                    tool_registry=tool_registry,
-                    policy_store=policy_store,
-                    context_bus=context_bus,
-                    progress_queue=progress_queue,
-                ),
-                timeout=config.timeout_s,
+            run_coro = self._run_inner(
+                config,
+                anthropic_client=anthropic_client,
+                tool_registry=tool_registry,
+                policy_store=policy_store,
+                context_bus=context_bus,
+                progress_queue=progress_queue,
             )
+            if _is_scheduled_background_config(config):
+                result = await run_coro
+            else:
+                result = await asyncio.wait_for(run_coro, timeout=config.timeout_s)
         except DeepAgentUserInputRequested as exc:
             await _emit_progress(
                 progress_queue,
@@ -156,7 +156,7 @@ class DeepAgentMiniAgentRunner:
         if context_in is None and task.context_key_in:
             context_in = context_bus.get(task.context_key_in, group_id=task.group_id)
 
-        system_prompt = _system_prompt_for_task(config, context_in=context_in)
+        system_prompt = _system_prompt_for_task(config, context_in=context_in, tool_registry=tool_registry)
         tool_results: list[Any] = []
 
         def record_tool_result(result: Any) -> None:
@@ -178,7 +178,7 @@ class DeepAgentMiniAgentRunner:
             model=model,
             tools=tools,
             system_prompt=system_prompt,
-            skills=_deep_agent_skills_for_task(config),
+            skills=_deep_agent_external_skills_for_task(config),
             subagents=_deep_agent_subagents_for_task(config),
         )
         payload = {"messages": [{"role": "user", "content": task.description}]}
@@ -222,6 +222,20 @@ class DeepAgentMiniAgentRunner:
             tool_results=tool_results,
             source="deep-agent",
         ) or output_text
+        if is_safe_raw_tool_payload_replacement_reply(reply=output_text, tool_results=tool_results):
+            try:
+                output_text = await _fallback_answer_from_tool_evidence(
+                    config,
+                    tool_results=tool_results,
+                    model_client=anthropic_client,
+                )
+            except DeepAgentEvidenceFallbackUnavailable as exc:
+                return TaskResult(
+                    task_id=task.task_id,
+                    status="failure",
+                    error=str(exc) or output_text,
+                    context_out=output_text,
+                )
         artifacts = artifact_paths_from_tool_results(tool_results)
         artifacts = _relocate_external_artifact_paths_for_task(config, artifacts)
         deliverable_artifacts = _deliverable_artifact_paths_for_task(config, artifacts)
@@ -251,7 +265,11 @@ class DeepAgentMiniAgentRunner:
                     payload={"approval_id": pending_approval.get("approval_id")},
                 ),
             )
-        artifact_failure = _artifact_delivery_failure_for_task(config, artifacts, deliverable_artifacts)
+        artifact_failure = (
+            _artifact_delivery_failure_for_task(config, artifacts, deliverable_artifacts)
+            if _task_requires_user_file_delivery(task)
+            else None
+        )
         if artifact_failure:
             return TaskResult(
                 task_id=task.task_id,
@@ -265,17 +283,39 @@ class DeepAgentMiniAgentRunner:
             output=output_text,
             artifacts=deliverable_artifacts,
             context_out=output_text,
-        )
+            )
 
 
-def _system_prompt_for_task(config, *, context_in: Any) -> str:
+def _is_scheduled_background_config(config: Any) -> bool:
+    task = getattr(config, "task", None)
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return bool(metadata.get("scheduled_task_run"))
+
+
+def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = None) -> str:
     task = config.task
     artifact_root = _artifact_root_for_prompt(task)
+    tool_inventory = _scoped_tool_inventory_for_prompt(task, tool_registry=tool_registry)
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    scheduled_task_guidance = ""
+    if metadata.get("scheduled_task_run"):
+        scheduled_task_guidance = (
+            "Scheduled task rules:\n"
+            "- This is a scheduled/background task execution, not an interactive chat turn.\n"
+            "- The task description contains the authoritative stored scheduled-job context.\n"
+            "- Do not ask the user for missing details or clarification during this run.\n"
+            "- If a step cannot be completed from the stored context and scoped tools, return concise "
+            "blocked evidence instead of pausing for input.\n\n"
+        )
     prompt = (
         "You are a scoped Deep Agent running inside Nullion. Complete only the assigned task. "
         "Use the provided Nullion tools for side effects so Sentinel policy remains authoritative. "
         "Do not claim a file, message, approval, or external change succeeded unless a tool result confirms it. "
         "Return a concise final answer for the user.\n\n"
+        f"{scheduled_task_guidance}"
+        f"{tool_inventory}"
         "File delivery rules:\n"
         f"- Save final user-facing files under the workspace artifact directory: {artifact_root}\n"
         "- Do not use /tmp, /var/tmp, or arbitrary absolute paths for final files the user asked to receive.\n"
@@ -290,6 +330,43 @@ def _system_prompt_for_task(config, *, context_in: Any) -> str:
     if context_in is not None:
         prompt += f"\n\nContext input ({task.context_key_in}):\n{context_in}"
     return prompt
+
+
+def _scoped_tool_inventory_for_prompt(task: Any, *, tool_registry: Any) -> str:
+    allowed_tools = [
+        str(tool_name).strip()
+        for tool_name in (getattr(task, "allowed_tools", ()) or ())
+        if str(tool_name).strip()
+    ]
+    if not allowed_tools:
+        return "Scoped tools available to this task: none.\n\n"
+    definitions: list[dict[str, Any]] = []
+    if tool_registry is not None:
+        try:
+            definitions = list(tool_registry.list_tool_definitions())
+        except Exception:
+            definitions = []
+    definitions_by_name = {
+        str(definition.get("name") or ""): definition
+        for definition in definitions
+        if isinstance(definition, dict)
+    }
+    lines = ["Scoped tools available to this task:"]
+    for tool_name in allowed_tools:
+        definition = definitions_by_name.get(tool_name, {})
+        description = str(definition.get("description") or "").strip()
+        if description:
+            lines.append(f"- {tool_name}: {description}")
+        else:
+            lines.append(f"- {tool_name}")
+    if "web_fetch" not in allowed_tools and "browser_navigate" in allowed_tools:
+        extract_text = "browser_extract_text" in allowed_tools
+        lines.append(
+            "- Direct web_fetch is not scoped for this task; use browser_navigate"
+            + (" and browser_extract_text" if extract_text else "")
+            + " for public web evidence when a URL or domain is part of the task."
+        )
+    return "\n".join(lines) + "\n\n"
 
 
 def _artifact_root_for_prompt(task) -> str:
@@ -420,14 +497,23 @@ def _completion_progress_kind(result: TaskResult) -> str:
     return "task_failed"
 
 
-def _deep_agent_skills_for_task(config) -> list[str] | None:
+def _deep_agent_external_skills_for_task(config) -> list[str] | None:
     task = config.task
     raw = getattr(task, "deep_agent_skills", None)
     if raw is None:
         raw = os.environ.get("NULLION_DEEP_AGENTS_SKILLS", "")
-    inferred = deep_agent_skills_for_task(task)
     raw_values = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
-    skills = [str(skill).strip() for skill in [*raw_values, *inferred]]
+    skills = [
+        str(skill).strip()
+        for skill in raw_values
+        if str(skill).strip() and not str(skill).strip().startswith("/skills/nullion/")
+    ]
+    env_skills = [
+        str(skill).strip()
+        for skill in str(os.environ.get("NULLION_DEEP_AGENTS_SKILLS", "") or "").split(",")
+        if str(skill).strip()
+    ]
+    skills.extend(env_skills)
     skills = [skill for skill in skills if skill]
     return list(dict.fromkeys(skills)) or None
 
@@ -496,18 +582,22 @@ def _deep_agent_meta_tools(config, *, progress_queue: asyncio.Queue) -> list[Any
             raise DeepAgentUserInputRequested(str(question), [str(option) for option in (options or [])])
         return "User input is not available in this context."
 
-    return [
+    tools = [
         StructuredTool.from_function(
             coroutine=report_progress,
             name="report_progress",
             description="Report a short progress update to the user.",
         ),
-        StructuredTool.from_function(
-            coroutine=request_user_input,
-            name="request_user_input",
-            description="Ask the user a question and pause the task.",
-        ),
     ]
+    if config.can_request_user_input:
+        tools.append(
+            StructuredTool.from_function(
+                coroutine=request_user_input,
+                name="request_user_input",
+                description="Ask the user a question and pause the task.",
+            )
+        )
+    return tools
 
 
 def _deep_agent_graph_config(config) -> dict[str, Any]:
@@ -565,9 +655,16 @@ async def _fallback_answer_from_tool_evidence(
     ]
     if not completed_results:
         raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence was unavailable for recovery.")
+    deterministic_answer = _deterministic_scheduled_tool_evidence_answer(config, completed_results)
     create = getattr(model_client, "create", None)
     if create is None:
+        if deterministic_answer:
+            return deterministic_answer
         raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence could not be summarized.")
+    if not _model_client_can_make_evidence_fallback_decision(model_client):
+        if deterministic_answer:
+            return deterministic_answer
+        return _generic_tool_evidence_answer(config, completed_results)
     evidence = _tool_evidence_payload(completed_results)
     system_prompt = (
         "You are completing a delegated Nullion task after the stateful agent graph hit a runtime step limit. "
@@ -598,6 +695,15 @@ async def _fallback_answer_from_tool_evidence(
             timeout=_evidence_fallback_timeout_seconds(),
         )
     except TimeoutError as exc:
+        if deterministic_answer:
+            logger.warning(
+                "DeepAgent scheduled evidence fallback model timed out; using deterministic tool evidence summary "
+                "agent_id=%s task_id=%s completed_tools=%d",
+                getattr(config, "agent_id", ""),
+                getattr(getattr(config, "task", None), "task_id", ""),
+                len(completed_results),
+            )
+            return deterministic_answer
         raise DeepAgentEvidenceFallbackUnavailable(
             "Verified tool evidence recovery timed out."
         ) from exc
@@ -606,11 +712,66 @@ async def _fallback_answer_from_tool_evidence(
         raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence recovery returned no valid structured decision.")
     if decision.get("status") != "success":
         reason = str(decision.get("answer") or "Verified tool evidence was insufficient to finish the task.").strip()
+        metadata = getattr(config.task, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get("scheduled_task_run") and reason:
+            return reason
         raise DeepAgentEvidenceFallbackUnavailable(reason)
     answer = str(decision.get("answer") or "").strip()
     if not answer:
         raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence recovery returned an empty answer.")
     return answer
+
+
+def _model_client_can_make_evidence_fallback_decision(model_client: Any) -> bool:
+    provider = str(getattr(model_client, "provider", "") or "").strip()
+    model = str(getattr(model_client, "model", "") or "").strip()
+    if provider or model:
+        return True
+    module = str(getattr(type(model_client), "__module__", "") or "")
+    return module.startswith("nullion.")
+
+
+def _generic_tool_evidence_answer(config, tool_results: list[Any]) -> str:
+    task = getattr(config, "task", None)
+    title = str(getattr(task, "title", "") or getattr(task, "description", "") or "Task").strip()
+    names = [
+        str(getattr(result, "tool_name", "") or "").strip()
+        for result in tool_results
+        if str(getattr(result, "tool_name", "") or "").strip()
+    ]
+    tool_summary = ", ".join(dict.fromkeys(names))
+    if tool_summary:
+        return f"{title} completed using verified runtime evidence from {tool_summary}."
+    return f"{title} completed using verified runtime evidence."
+
+
+def _deterministic_scheduled_tool_evidence_answer(config, tool_results: list[Any]) -> str:
+    task = getattr(config, "task", None)
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if not metadata.get("scheduled_task_run"):
+        return ""
+    evidence = _tool_evidence_payload(tool_results, max_results=8, max_chars=700)
+    if not evidence:
+        return ""
+    title = str(getattr(task, "title", "") or "Scheduled subtask").strip()
+    lines = [f"{title} completed with verified runtime evidence."]
+    for item in evidence:
+        tool_name = str(item.get("tool_name") or "tool").strip() or "tool"
+        status = str(item.get("status") or "completed").strip() or "completed"
+        output = str(item.get("output") or "").strip()
+        error = str(item.get("error") or "").strip()
+        if tool_name == "connector_request":
+            output = "[connector response captured by runtime]"
+        elif len(output) > 700:
+            output = output[:700].rstrip() + "...[truncated]"
+        detail = output or error
+        if detail:
+            lines.append(f"- {tool_name} ({status}): {detail}")
+        else:
+            lines.append(f"- {tool_name} ({status})")
+    return "\n".join(lines)
 
 
 def _tool_evidence_payload(tool_results: list[Any], *, max_results: int = 12, max_chars: int = 1200) -> list[dict[str, Any]]:

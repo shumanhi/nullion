@@ -369,8 +369,28 @@ def build_cron_connector_scope_decision(
     provider_summaries = _connected_connector_provider_summaries(principal_id)
     if not provider_summaries:
         return CronConnectorScopeDecision()
+    connected_provider_ids = {
+        str(provider.get("provider_id") or "").strip()
+        for provider in provider_summaries
+        if str(provider.get("provider_id") or "").strip()
+    }
+    explicit_provider_ids = tuple(
+        provider_id for provider_id in sorted(connected_provider_ids) if provider_id and provider_id in user_message
+    )
+    if explicit_provider_ids:
+        logger.info(
+            "cron connector scope allowed principal_id=%s providers=%d reason=stored_provider_id",
+            principal_id,
+            len(explicit_provider_ids),
+        )
+        return CronConnectorScopeDecision(
+            allow_connector_tools=True,
+            provider_ids=explicit_provider_ids,
+            confidence=1.0,
+            valid=True,
+        )
     planned_tool_names_tuple = tuple(planned_tool_names or ())
-    if planned_tool_names_tuple and not _has_structured_connector_scope_evidence(
+    if not _has_structured_connector_scope_evidence(
         planned_tool_names=planned_tool_names_tuple,
     ):
         logger.info(
@@ -379,11 +399,6 @@ def build_cron_connector_scope_decision(
             len(provider_summaries),
         )
         return CronConnectorScopeDecision()
-    connected_provider_ids = {
-        str(provider.get("provider_id") or "").strip()
-        for provider in provider_summaries
-        if str(provider.get("provider_id") or "").strip()
-    }
     prompt = {
         "surface": "scheduled_task_execution",
         "available_connector_providers": list(provider_summaries),

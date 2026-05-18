@@ -286,6 +286,10 @@ def build_preferences_prompt(prefs: Preferences, *, now: datetime | None = None)
     lines.append(_TONE_LINES.get(prefs.tone, _TONE_LINES["friendly"]))
     lines.append(_COMPLEXITY_LINES.get(prefs.language_complexity, _COMPLEXITY_LINES["standard"]))
     lines.append(_CODE_LINES.get(prefs.code_examples, _CODE_LINES["relevant"]))
+    lines.append(
+        "When asking the user to choose from options or provide one of several inputs, "
+        "present numbered options and accept a numeric reply."
+    )
 
     if prefs.proactive_suggestions:
         lines.append("When relevant, proactively suggest related ideas, follow-ups, or improvements the user hasn't asked for.")
@@ -331,4 +335,11 @@ def build_profile_prompt(profile: dict[str, str] | None = None) -> str | None:
     parts = [f"{key.title()}: {value}" for key, value in data.items() if isinstance(value, str) and value.strip()]
     if not parts:
         return None
+    address = str(data.get("address") or "").strip()
+    if address:
+        parts.append(
+            "Default location: Use the Address above as the user's default location for local context, "
+            "including weather, nearby places, showtimes, travel origin, and timezone-sensitive lookups "
+            "when the user does not provide another location."
+        )
     return "User profile:\n" + "\n".join(parts)

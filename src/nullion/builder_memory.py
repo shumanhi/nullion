@@ -339,6 +339,42 @@ def capture_turn_memory_claims(
         return BuilderMemoryResult(skipped="failed")
 
 
+def capture_turn_memory_claims_verified(
+    runtime,
+    model_client,
+    *,
+    owner: str,
+    user_message: str,
+    assistant_reply: str | None,
+) -> BuilderMemoryResult:
+    """Capture durable turn memory, then fall back to the full memory graph if empty.
+
+    The first pass is a narrow structured extraction. If that pass returns no
+    durable entry, the full Builder memory graph gets one off-path chance to
+    reconcile the turn against existing memory before we give up.
+    """
+    result = capture_turn_memory_claims(
+        runtime,
+        model_client,
+        owner=owner,
+        user_message=user_message,
+        assistant_reply=assistant_reply,
+    )
+    if result.written or result.skipped != "empty":
+        return result
+    managed = manage_turn_memory(
+        runtime,
+        model_client,
+        owner=owner,
+        user_message=user_message,
+        assistant_reply=assistant_reply,
+        tool_results=[],
+    )
+    if managed.written or managed.skipped is None:
+        return managed
+    return result
+
+
 def _memory_precheck_node(state: _BuilderMemoryState) -> dict[str, object]:
     runtime = state.get("runtime")
     store = getattr(runtime, "store", None)

@@ -122,6 +122,30 @@ def _refresh_codex_access_token(refresh_token: str) -> str:
     return access_token.strip()
 
 
+def _codex_token_expired_response(detail: str) -> bool:
+    lowered = str(detail or "").lower()
+    return "token_expired" in lowered or "authentication token is expired" in lowered
+
+
+def _persist_codex_access_token(access_token: str) -> None:
+    """Best-effort persistence for a refreshed Codex access token."""
+    try:
+        from nullion.credential_store import load_encrypted_credentials, save_encrypted_credentials
+
+        creds = load_encrypted_credentials() or {}
+        if creds.get("provider") != "codex":
+            return
+        creds["api_key"] = access_token
+        keys = creds.get("keys")
+        if not isinstance(keys, dict):
+            keys = {}
+        keys["codex"] = access_token
+        creds["keys"] = keys
+        save_encrypted_credentials(creds)
+    except Exception:
+        logger.debug("Could not persist refreshed Codex OAuth access token", exc_info=True)
+
+
 class ModelClientConfigurationError(RuntimeError):
     """Raised when model client configuration cannot be resolved."""
 
@@ -659,6 +683,31 @@ class CodexResponsesModelClient:
     _ENDPOINT: str = "https://chatgpt.com/backend-api/codex/responses"
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    refresh_token: str | None = None
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "ChatGPT-Account-Id": self.account_id,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        }
+
+    def _refresh_access_token_after_401(self) -> bool:
+        refresh_token = self.refresh_token.strip() if isinstance(self.refresh_token, str) else ""
+        if not refresh_token:
+            return False
+        refreshed = _refresh_codex_access_token(refresh_token)
+        account_id = _extract_chatgpt_account_id(refreshed)
+        if not account_id:
+            raise ModelClientConfigurationError(
+                "Codex OAuth refresh returned an access token without a ChatGPT account claim. "
+                "Re-run `nullion-auth` to sign in again."
+            )
+        self.api_key = refreshed
+        self.account_id = account_id
+        _persist_codex_access_token(refreshed)
+        return True
 
     @staticmethod
     def _to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -869,99 +918,102 @@ class CodexResponsesModelClient:
         if converted_tools:
             body["tools"] = converted_tools
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "ChatGPT-Account-Id": self.account_id,
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0",
-        }
-
         def _invoke(payload: dict[str, Any]) -> dict[str, Any]:
-            text_parts: list[str] = []
-            thinking_parts: list[str] = []
-            tool_blocks: list[dict[str, Any]] = []
-            # track in-progress function call by item index
-            fn_calls: dict[int, dict[str, Any]] = {}
-            deadline = (_time.monotonic() + float(timeout)) if timeout and timeout > 0 else None
+            for attempt in range(2):
+                text_parts: list[str] = []
+                thinking_parts: list[str] = []
+                tool_blocks: list[dict[str, Any]] = []
+                # track in-progress function call by item index
+                fn_calls: dict[int, dict[str, Any]] = {}
+                deadline = (_time.monotonic() + float(timeout)) if timeout and timeout > 0 else None
 
-            with _httpx.Client(timeout=float(timeout or 120.0)) as client:
-                with client.stream("POST", self._ENDPOINT, json=payload, headers=headers) as resp:
-                    if resp.status_code >= 400:
-                        detail = resp.read().decode("utf-8", errors="replace")
-                        detail = " ".join(detail.split())
-                        if len(detail) > 500:
-                            detail = detail[:497].rstrip() + "..."
-                        raise ModelClientConfigurationError(
-                            f"Codex Responses request failed with HTTP {resp.status_code}: {detail or resp.reason_phrase}"
-                        )
-                    resp.raise_for_status()
-                    for raw_line in resp.iter_lines():
-                        if deadline is not None and _time.monotonic() >= deadline:
+                with _httpx.Client(timeout=float(timeout or 120.0)) as client:
+                    with client.stream("POST", self._ENDPOINT, json=payload, headers=self._headers()) as resp:
+                        if resp.status_code >= 400:
+                            detail = resp.read().decode("utf-8", errors="replace")
+                            detail = " ".join(detail.split())
+                            if (
+                                resp.status_code == 401
+                                and attempt == 0
+                                and _codex_token_expired_response(detail)
+                                and self._refresh_access_token_after_401()
+                            ):
+                                logger.info("Refreshed Codex OAuth access token after token_expired response; retrying request once")
+                                continue
+                            if len(detail) > 500:
+                                detail = detail[:497].rstrip() + "..."
                             raise ModelClientConfigurationError(
-                                "Codex Responses request exceeded timeout budget while streaming."
+                                f"Codex Responses request failed with HTTP {resp.status_code}: {detail or resp.reason_phrase}"
                             )
-                        line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            ev = json.loads(data_str)
-                        except Exception:
-                            continue
+                        resp.raise_for_status()
+                        for raw_line in resp.iter_lines():
+                            if deadline is not None and _time.monotonic() >= deadline:
+                                raise ModelClientConfigurationError(
+                                    "Codex Responses request exceeded timeout budget while streaming."
+                                )
+                            line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                ev = json.loads(data_str)
+                            except Exception:
+                                continue
 
-                        etype = ev.get("type", "")
-                        if etype == "response.completed":
-                            break
+                            etype = ev.get("type", "")
+                            if etype == "response.completed":
+                                break
 
-                        if etype == "response.output_text.delta":
-                            delta = ev.get("delta", "")
-                            text_parts.append(delta)
-                            if text_delta_callback is not None and delta:
-                                try:
-                                    text_delta_callback(delta)
-                                except Exception:
-                                    logger.debug("Codex Responses text delta callback failed", exc_info=True)
-                        elif etype in {
-                            "response.reasoning_summary_text.delta",
-                            "response.reasoning_text.delta",
-                        }:
-                            thinking_parts.append(ev.get("delta", ""))
+                            if etype == "response.output_text.delta":
+                                delta = ev.get("delta", "")
+                                text_parts.append(delta)
+                                if text_delta_callback is not None and delta:
+                                    try:
+                                        text_delta_callback(delta)
+                                    except Exception:
+                                        logger.debug("Codex Responses text delta callback failed", exc_info=True)
+                            elif etype in {
+                                "response.reasoning_summary_text.delta",
+                                "response.reasoning_text.delta",
+                            }:
+                                thinking_parts.append(ev.get("delta", ""))
 
-                        elif etype == "response.output_item.added":
-                            item = ev.get("item", {})
-                            if item.get("type") == "function_call":
-                                idx = ev.get("output_index", len(fn_calls))
-                                fn_calls[idx] = {
-                                    "id": item.get("call_id") or item.get("id", ""),
-                                    "name": item.get("name", ""),
-                                    "arguments": item.get("arguments", ""),
-                                }
-                            elif item.get("type") in {"reasoning", "thinking"}:
-                                for block in item.get("summary", []) or item.get("content", []):
-                                    if isinstance(block, dict) and isinstance(block.get("text"), str):
-                                        thinking_parts.append(block["text"])
+                            elif etype == "response.output_item.added":
+                                item = ev.get("item", {})
+                                if item.get("type") == "function_call":
+                                    idx = ev.get("output_index", len(fn_calls))
+                                    fn_calls[idx] = {
+                                        "id": item.get("call_id") or item.get("id", ""),
+                                        "name": item.get("name", ""),
+                                        "arguments": item.get("arguments", ""),
+                                    }
+                                elif item.get("type") in {"reasoning", "thinking"}:
+                                    for block in item.get("summary", []) or item.get("content", []):
+                                        if isinstance(block, dict) and isinstance(block.get("text"), str):
+                                            thinking_parts.append(block["text"])
 
-                        elif etype == "response.function_call_arguments.delta":
-                            idx = ev.get("output_index", -1)
-                            if idx in fn_calls:
-                                fn_calls[idx]["arguments"] += ev.get("delta", "")
+                            elif etype == "response.function_call_arguments.delta":
+                                idx = ev.get("output_index", -1)
+                                if idx in fn_calls:
+                                    fn_calls[idx]["arguments"] += ev.get("delta", "")
 
-                        elif etype == "response.output_item.done":
-                            item = ev.get("item", {})
-                            if item.get("type") == "function_call":
-                                call_id = item.get("call_id") or item.get("id", "")
-                                args_str = item.get("arguments", "{}")
-                                parsed_input = _parse_tool_arguments(args_str)
-                                tool_blocks.append({
-                                    "type": "tool_use",
-                                    "id": call_id,
-                                    "name": item.get("name", ""),
-                                    "input": parsed_input,
-                                })
+                            elif etype == "response.output_item.done":
+                                item = ev.get("item", {})
+                                if item.get("type") == "function_call":
+                                    call_id = item.get("call_id") or item.get("id", "")
+                                    args_str = item.get("arguments", "{}")
+                                    parsed_input = _parse_tool_arguments(args_str)
+                                    tool_blocks.append({
+                                        "type": "tool_use",
+                                        "id": call_id,
+                                        "name": item.get("name", ""),
+                                        "input": parsed_input,
+                                    })
+                break
 
-        # Also flush any fn_calls that didn't get an output_item.done
+            # Also flush any fn_calls that didn't get an output_item.done
             seen_ids = {b["id"] for b in tool_blocks}
             for fc in fn_calls.values():
                 if fc["id"] not in seen_ids:
@@ -1097,6 +1149,7 @@ def build_model_client_from_settings(
             account_id=account_id,
             model=model_name,
             reasoning_effort=getattr(model_cfg, "reasoning_effort", None),
+            refresh_token=refresh_token,
         )
 
     if provider == "anthropic":

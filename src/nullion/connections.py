@@ -36,7 +36,7 @@ def _provider_id_looks_external_connector(provider_id: object) -> bool:
 def _structured_tools_for_connection(connection: "ProviderConnection") -> tuple[str, ...]:
     if not _provider_id_looks_external_connector(connection.provider_id):
         return ()
-    tools = ["connector_request"]
+    tools = ["connector_request", "email_search", "email_read", "calendar_list"]
     if connection.permission_mode == "write":
         tools.append("email_send")
     return tuple(tools)

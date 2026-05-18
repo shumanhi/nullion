@@ -32,7 +32,7 @@ def classify_run_activity_phase(*, reply: str | None) -> RunActivityPhase:
     return RunActivityPhase.ACTIVE
 
 
-def activity_trace_enabled(*, default: bool = True) -> bool:
+def activity_trace_enabled(*, default: bool = False) -> bool:
     raw = os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED")
     if raw is None or raw.strip() == "":
         return default
@@ -48,24 +48,18 @@ def activity_trace_status_text() -> str:
 
 
 def task_planner_feed_enabled(*, default: bool = True) -> bool:
-    mode = task_planner_feed_mode(default="task" if default else "off")
-    return mode != "off"
+    _ = default
+    return True
 
 
 def task_planner_feed_mode(*, default: str = "task") -> str:
-    raw_mode = os.environ.get("NULLION_TASK_PLANNER_FEED_MODE")
-    if raw_mode is not None and raw_mode.strip():
-        normalized = raw_mode.strip().lower().replace("_", "-")
-        if normalized in {"all", "task", "tasks", "off"}:
-            return "task" if normalized == "tasks" else normalized
-    raw = os.environ.get("NULLION_TASK_PLANNER_FEED_ENABLED")
-    if raw is None or raw.strip() == "":
-        return default if default in {"all", "task", "off"} else "task"
-    return "off" if raw.strip().lower() in {"0", "false", "no", "off"} else "task"
+    _ = default
+    return "task"
 
 
 def set_task_planner_feed_enabled(enabled: bool) -> None:
-    set_task_planner_feed_mode("task" if enabled else "off")
+    _ = enabled
+    set_task_planner_feed_mode("task")
 
 
 def set_task_planner_feed_mode(mode: str) -> None:
@@ -74,8 +68,6 @@ def set_task_planner_feed_mode(mode: str) -> None:
         normalized = "task"
     if normalized not in {"all", "task", "off"}:
         raise ValueError("task planner feed mode must be all, task, or off")
-    os.environ["NULLION_TASK_PLANNER_FEED_MODE"] = normalized
-    os.environ["NULLION_TASK_PLANNER_FEED_ENABLED"] = "false" if normalized == "off" else "true"
 
 
 def task_planner_feed_status_text() -> str:
@@ -94,7 +86,7 @@ def normalize_verbose_mode(mode: str) -> str:
     return normalized
 
 
-def verbose_mode(*, default_activity_trace: bool = True, default_planner_feed: str = "task") -> str:
+def verbose_mode(*, default_activity_trace: bool = False, default_planner_feed: str = "task") -> str:
     _ = default_planner_feed
     activity_enabled = activity_trace_enabled(default=default_activity_trace)
     return "on" if activity_enabled else "off"
@@ -247,13 +239,31 @@ def _tool_activity_should_hide_detail(tool_name: str) -> bool:
 
 
 def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
+    normalized_tool = str(tool_name or "").strip().lower()
     if not isinstance(output, dict):
         return ""
+    if normalized_tool == "email_search":
+        results = output.get("results")
+        count = len(results) if isinstance(results, list) else output.get("resultSizeEstimate")
+        if isinstance(count, int):
+            return f"✉️ {count} message{'s' if count != 1 else ''}"
+        return "✉️ messages searched"
+    if normalized_tool == "email_read":
+        return "✉️ message read"
+    if normalized_tool == "email_send":
+        return "✉️ sent"
+    if normalized_tool == "calendar_list":
+        results = output.get("results")
+        count = len(results) if isinstance(results, list) else output.get("result_count")
+        if isinstance(count, int):
+            return f"📅 {count} event{'s' if count != 1 else ''}"
+        return "📅 calendar checked"
+    if normalized_tool == "skill_pack_read":
+        return "reference loaded"
     crons = output.get("crons")
     if isinstance(crons, list):
         count = len(crons)
         return f"{count} scheduled task{'s' if count != 1 else ''}"
-    normalized_tool = str(tool_name or "").strip().lower()
     if normalized_tool == "run_cron":
         delivery_status = output.get("delivery_status")
         if isinstance(delivery_status, str) and delivery_status.strip():

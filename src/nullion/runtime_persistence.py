@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import threading
+import hashlib
 from time import perf_counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -176,6 +177,45 @@ def _revocable_record_merge_value(current, previous):
     return current
 
 
+_MINI_AGENT_STATUS_RANK = {
+    MiniAgentRunStatus.PENDING: 0,
+    MiniAgentRunStatus.RUNNING: 1,
+    MiniAgentRunStatus.WAITING_INPUT: 2,
+    MiniAgentRunStatus.CANCELLED: 3,
+    MiniAgentRunStatus.FAILED: 3,
+    MiniAgentRunStatus.COMPLETED: 3,
+}
+
+
+def _mini_agent_status(value: object) -> MiniAgentRunStatus | None:
+    if isinstance(value, MiniAgentRunStatus):
+        return value
+    try:
+        return MiniAgentRunStatus(str(value))
+    except Exception:
+        return None
+
+
+def _mini_agent_run_merge_value(current: MiniAgentRun, previous: MiniAgentRun) -> MiniAgentRun:
+    current_status = _mini_agent_status(getattr(current, "status", None))
+    previous_status = _mini_agent_status(getattr(previous, "status", None))
+    if previous_status is None:
+        return current
+    if current_status is None:
+        return previous
+    current_rank = _MINI_AGENT_STATUS_RANK.get(current_status, 0)
+    previous_rank = _MINI_AGENT_STATUS_RANK.get(previous_status, 0)
+    if previous_rank > current_rank:
+        return previous
+    if previous_rank < current_rank:
+        return current
+    if current.result_summary:
+        return current
+    if previous.result_summary:
+        return previous
+    return current
+
+
 def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeStore) -> None:
     dict_attrs = (
         "suspended_turns",
@@ -198,6 +238,12 @@ def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeSto
                 current[key] = _approval_merge_value(current[key], value)
             elif attr in {"permission_grants", "boundary_permits", "boundary_policy_rules"}:
                 current[key] = _revocable_record_merge_value(current[key], value)
+    for key, previous_run in getattr(previous, "mini_agent_runs", {}).items():
+        current_run = store.mini_agent_runs.get(key)
+        if current_run is None:
+            store.mini_agent_runs[key] = previous_run
+        else:
+            store.mini_agent_runs[key] = _mini_agent_run_merge_value(current_run, previous_run)
     for attr in ("events", "audit_records"):
         _merge_list_records(getattr(store, attr), getattr(previous, attr))
     if getattr(previous, "builder_route_observations", None):
@@ -440,7 +486,7 @@ def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object
         return result
 
     result["attempted"] = True
-    updates: list[tuple[int, str]] = []
+    updates: list[tuple[int, str, str, bool]] = []
     quarantines: list[tuple[int, str, str, str, str]] = []
     failures: list[dict[str, str]] = []
     for row in rows:
@@ -450,12 +496,22 @@ def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object
         payload = str(row["payload"])
         if payload.startswith(_ENCRYPTED_RUNTIME_MEMORY_PREFIX):
             result["already_encrypted_rows"] = int(result["already_encrypted_rows"]) + 1
+            try:
+                decoded = _decode_sqlite_runtime_payload(collection, checkpoint_path, payload)
+                if not isinstance(decoded, dict):
+                    raise ValueError("memory payload is not a JSON object")
+                if not item_key.startswith("encrypted:"):
+                    updates.append((rowid, f"encrypted:{rowid}", payload, False))
+            except Exception as exc:
+                reason = str(exc) or exc.__class__.__name__
+                failures.append({"collection": collection, "row": str(rowid), "reason": reason})
+                quarantines.append((rowid, collection, item_key, payload, reason))
             continue
         try:
             decoded = json.loads(payload)
             if not isinstance(decoded, dict):
                 raise ValueError("memory payload is not a JSON object")
-            updates.append((rowid, _encode_sqlite_runtime_payload(collection, checkpoint_path, decoded)))
+            updates.append((rowid, f"encrypted:{rowid}", _encode_sqlite_runtime_payload(collection, checkpoint_path, decoded), True))
         except Exception as exc:
             reason = str(exc) or exc.__class__.__name__
             failures.append({"collection": collection, "row": str(rowid), "reason": reason})
@@ -478,10 +534,10 @@ def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object
         conn.execute("PRAGMA secure_delete=ON")
         conn.executescript(_sqlite_runtime_ddl())
         conn.executescript(_sqlite_memory_migration_failure_ddl())
-        for rowid, encrypted_payload in updates:
+        for rowid, item_key, encrypted_payload, _count_encrypted in updates:
             conn.execute(
                 "UPDATE memory SET item_key = ?, payload = ?, updated_at = ? WHERE rowid = ?",
-                (f"encrypted:{rowid}", encrypted_payload, now, rowid),
+                (item_key, encrypted_payload, now, rowid),
             )
         for rowid, collection, item_key, encrypted_payload, reason in quarantines:
             _quarantine_sqlite_runtime_row(
@@ -497,7 +553,7 @@ def migrate_sqlite_runtime_memory_payloads(path: str | Path) -> dict[str, object
     with sqlite3.connect(str(checkpoint_path), timeout=10) as conn:
         conn.execute("VACUUM")
 
-    result["encrypted_rows"] = len(updates)
+    result["encrypted_rows"] = sum(1 for update in updates if update[3])
     result["quarantined_rows"] = len(quarantines)
     result["failures"] = failures
     return result
@@ -891,7 +947,7 @@ def _deserialize_boundary_policy_rule(payload: dict[str, object]) -> BoundaryPol
 
 
 def _serialize_mini_agent_run(run: MiniAgentRun) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "run_id": run.run_id,
         "capsule_id": run.capsule_id,
         "mini_agent_type": run.mini_agent_type,
@@ -899,6 +955,10 @@ def _serialize_mini_agent_run(run: MiniAgentRun) -> dict[str, object]:
         "created_at": run.created_at.isoformat(),
         "result_summary": run.result_summary,
     }
+    metadata = dict(getattr(run, "metadata", {}) or {})
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
 
 
 
@@ -910,6 +970,7 @@ def _deserialize_mini_agent_run(payload: dict[str, object]) -> MiniAgentRun:
         status=MiniAgentRunStatus(str(payload["status"])),
         created_at=_parse_dt(str(payload["created_at"])),
         result_summary=payload.get("result_summary"),
+        metadata=dict(payload.get("metadata") or {}),
     )
 
 
@@ -1550,9 +1611,15 @@ def _rotate_runtime_store_backups(target: Path) -> None:
         if not source.exists():
             continue
         if generation == RUNTIME_STORE_BACKUP_DEPTH - 1:
-            source.unlink()
+            try:
+                source.unlink()
+            except FileNotFoundError:
+                pass
             continue
-        source.replace(_backup_path_for(target, generation + 1))
+        try:
+            source.replace(_backup_path_for(target, generation + 1))
+        except FileNotFoundError:
+            continue
 
 
 def _sqlite_runtime_ddl() -> str:
@@ -1684,10 +1751,17 @@ def _validate_sqlite_runtime_row(collection: str, decoded: dict[str, object]) ->
     _runtime_store_from_payload(payload)
 
 
-def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path, *, merge_existing: bool = True) -> Path:
+def _save_runtime_store_sqlite(
+    store: RuntimeStore,
+    path: str | Path,
+    *,
+    merge_existing: bool = True,
+    payload: dict[str, object] | None = None,
+) -> Path:
     target = Path(path)
     started_at = perf_counter()
     merge_ms = 0.0
+    merged_previous = False
     if merge_existing and target.exists():
         merge_started_at = perf_counter()
         try:
@@ -1699,17 +1773,19 @@ def _save_runtime_store_sqlite(store: RuntimeStore, path: str | Path, *, merge_e
                     "permission_grants",
                     "boundary_permits",
                     "boundary_policy_rules",
+                    "mini_agent_runs",
                     "events",
                     "audit_records",
                     "builder_route_observations",
                 ),
             )
             _merge_previous_checkpoint_records(store, previous_store)
+            merged_previous = True
         except Exception:
             pass
         merge_ms = (perf_counter() - merge_started_at) * 1000
     payload_started_at = perf_counter()
-    payload = build_runtime_store_payload(store)
+    payload = payload if payload is not None and not merged_previous else build_runtime_store_payload(store)
     payload_ms = (perf_counter() - payload_started_at) * 1000
     target.parent.mkdir(parents=True, exist_ok=True)
     backup_ms = 0.0
@@ -1931,21 +2007,37 @@ def render_runtime_store_payload_json(store: RuntimeStore) -> str:
     return json.dumps(build_runtime_store_payload(store), indent=2, sort_keys=True)
 
 
+def runtime_store_payload_fingerprint(payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-def save_runtime_store(store: RuntimeStore, path: str | Path, *, merge_existing: bool = True) -> Path:
+
+def save_runtime_store(
+    store: RuntimeStore,
+    path: str | Path,
+    *,
+    merge_existing: bool = True,
+    payload: dict[str, object] | None = None,
+) -> Path:
     target = Path(path)
     if _is_sqlite_runtime_path(target):
         with _runtime_store_file_lock(target):
-            return _save_runtime_store_sqlite(store, target, merge_existing=merge_existing)
+            return _save_runtime_store_sqlite(store, target, merge_existing=merge_existing, payload=payload)
     with _runtime_store_file_lock(target):
         previous_payload = target.read_text(encoding="utf-8") if target.exists() else None
+        merged_previous = False
         if merge_existing and previous_payload is not None:
             try:
                 previous_store = _runtime_store_from_payload(json.loads(previous_payload))
                 _merge_previous_checkpoint_records(store, previous_store)
+                merged_previous = True
             except Exception:
                 pass
-        payload_json = render_runtime_store_payload_json(store)
+        payload_json = json.dumps(
+            payload if payload is not None and not merged_previous else build_runtime_store_payload(store),
+            indent=2,
+            sort_keys=True,
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         temp_target = target.with_name(
             f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"

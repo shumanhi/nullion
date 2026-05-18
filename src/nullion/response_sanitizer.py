@@ -68,15 +68,415 @@ def sanitize_user_visible_reply(
     if reply is None or user_requested_raw_output(user_message):
         return reply
     raw = str(reply)
+    results = list(tool_results or ())
+    if _has_completed_tool_result(results, "email_send"):
+        raw = _sanitize_email_send_transport_details(raw)
+    raw = _sanitize_account_tool_transport_details(raw, results)
+    raw = _sanitize_internal_tool_state_phrasing(raw, results)
+    raw = _sanitize_account_tool_family_drift(raw, results)
+    raw = _prefix_account_tool_reply(raw, results)
+    if numbered_reply := _structured_numbered_choice_reply(results):
+        return numbered_reply
+    if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
+        return cron_list_reply
     if _looks_like_raw_function_markup(raw):
-        return safe_raw_tool_payload_replacement(tool_results=list(tool_results or ()), source=source)
+        return safe_raw_tool_payload_replacement(tool_results=results, source=source)
     parsed = _parse_bare_structured_payload(raw)
     if parsed is None:
         return _sanitize_local_paths(raw)
-    results = list(tool_results or ())
     if not _looks_like_raw_tool_payload(parsed, results):
         return _sanitize_local_paths(raw)
     return safe_raw_tool_payload_replacement(tool_results=results, source=source, parsed_payload=parsed)
+
+
+def _has_completed_tool_result(results: Iterable[ToolResult], tool_name: str) -> bool:
+    for result in results:
+        if getattr(result, "tool_name", None) == tool_name and str(getattr(result, "status", None)) == "completed":
+            return True
+    return False
+
+
+def _cron_list_reply_over_empty_reminder_drift(text: str, results: list[ToolResult]) -> str | None:
+    cron_result: ToolResult | None = None
+    reminder_result_seen_after_crons = False
+    for result in results:
+        if result.status != "completed" or not isinstance(result.output, dict):
+            continue
+        if result.tool_name == "list_crons" and isinstance(result.output.get("crons"), list):
+            cron_result = result
+            reminder_result_seen_after_crons = False
+            continue
+        if cron_result is not None and result.tool_name == "list_reminders":
+            reminders = result.output.get("reminders")
+            count = result.output.get("count")
+            if reminders == [] or count == 0:
+                reminder_result_seen_after_crons = True
+    if cron_result is None or not reminder_result_seen_after_crons:
+        return None
+    cron_output = cron_result.output if isinstance(cron_result.output, dict) else {}
+    crons = cron_output.get("crons")
+    if not isinstance(crons, list) or not crons:
+        return None
+    normalized_reply = _normalized_reply_text(text)
+    for cron in crons:
+        if not isinstance(cron, dict):
+            continue
+        for key in ("name", "display_name"):
+            value = cron.get(key)
+            if isinstance(value, str) and value.strip() and _normalized_reply_text(value) in normalized_reply:
+                return None
+    message = cron_output.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return None
+
+
+_EMAIL_TRANSPORT_PAREN_RE = re.compile(
+    r"\s*\((?:\s*(?:status\s+\d{3}|message\s+id\s+[A-Za-z0-9_.:-]+)\s*,?)+\)",
+    flags=re.IGNORECASE,
+)
+_EMAIL_TRANSPORT_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?(?:message\s+id|status)\s*(?::|\*\*:|[:#])?\s*(?:\*\*)?\s*`?[A-Za-z0-9_.:-]+`?\s*\.?\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _sanitize_email_send_transport_details(text: str) -> str:
+    cleaned = _EMAIL_TRANSPORT_PAREN_RE.sub("", text)
+    lines = [
+        line
+        for line in cleaned.splitlines()
+        if not _EMAIL_TRANSPORT_LINE_RE.match(line)
+    ]
+    return "\n".join(lines).strip()
+
+
+_ACCOUNT_TRANSPORT_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?(?:message\s+id|response\s+code|status\s+code)\s*(?::|\*\*:|[:#])?\s*(?:\*\*)?\s*`?[A-Za-z0-9_.:-]+`?\s*\.?\s*$",
+    flags=re.IGNORECASE,
+)
+_ACCOUNT_CONNECTOR_DIAGNOSTIC_SENTENCE_RE = re.compile(
+    r"(?:(?:^|(?<=[.!?])\s+))"
+    r"[^.!?]*(?:lower-level\s+connector\s+route|connector\s+URL\s+policy|connector\s+request|api\.maton\.ai|HTTP\s+Error\s+\d{3})"
+    r"[^.!?]*[.!?]?",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_TOOL_STATE_START_RE = re.compile(
+    r"^\s*(?:"
+    r"Completed\s+the\s+required\s+tool\s+step\.\s*|"
+    r"I\s+completed\s+the\s+required[^.\n]*tool[^.\n]*\.\s*|"
+    r"I\s+(?:have\s+)?already\s+completed\s+the\s+required[^.\n]*tool[^.\n]*\.\s*|"
+    r"I\s+(?:have\s+)?already\s+completed\s+the\s+[^.\n]*(?:check|lookup|request)[^.\n]*\.\s*|"
+    r"I\s+(?:have\s+)?already\s+(?:run|ran)\s+the\s+required[^.\n]*tool[^.\n]*\.\s*|"
+    r"I\s+already\s+completed\s+the\s+required[^.\n]*tool[^.\n]*\.\s*|"
+    r"I\s+ran\s+the\s+required\s+follow-up\s+tool\.\s*|"
+    r"Your\s+[^.\n]*(?:calendar|email)[^.\n]*has\s+been\s+checked[^.\n]*\.\s*|"
+    r"The\s+[^.\n]*(?:check|lookup|request)\s+is\s+already\s+complete[^.\n]*tool[^.\n]*\.\s*"
+    r"(?:No\s+additional\s+[^.\n]*tool[^.\n]*\.\s*)?|"
+    r"The\s+[^.\n]*check\s+is\s+already\s+complete,\s+and\s+no\s+additional\s+registered\s+tool\s+is\s+required[^.\n]*\.\s*"
+    r")",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_TOOL_NAME_RE = re.compile(
+    r"\b(?:"
+    r"calendar_list|connector_request|email_read|email_search|email_send|skill_pack_read|"
+    r"browser_extract_text|browser_navigate|browser_screenshot|terminal_exec|file_read|file_write"
+    r")\b"
+)
+_INTERNAL_TOOL_NAME_SENTENCE_RE = re.compile(
+    r"(?:(?:^|(?<=[.!?])\s+))"
+    r"[^.!?\n]*"
+    r"(?:calendar_list|connector_request|email_read|email_search|email_send|skill_pack_read|"
+    r"browser_extract_text|browser_navigate|browser_screenshot|terminal_exec|file_read|file_write)"
+    r"[^.!?\n]*[.!?]?",
+    flags=re.IGNORECASE,
+)
+_EMAIL_FOLLOWUP_PREFIX_RE = re.compile(
+    r"^\s*I\s+checked\s+one\s+of\s+the\s+unread\s+emails\s+as\s+a\s+follow-up\.",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_TOOL_AND_PREFIX_RE = re.compile(
+    r"^\s*I\s+ran\s+the\s+required\s+follow-up\s+tool\s+and\s+",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_TOOL_COMPLETION_PREFIX_RE = re.compile(
+    r"^\s*I\s+ran\s+the\s+required\s+tool\s+completion\s+step\.\s*",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_REQUIRED_TOOL_SENTENCE_RE = re.compile(
+    r"^\s*(?:Done\s+[—-]\s+)?I\s+ran\s+the\s+required[^.\n]*\.\s*",
+    flags=re.IGNORECASE,
+)
+_INTERNAL_COMPLETION_CLAUSE_RE = re.compile(
+    r"^\s*The\s+calendar\s+check\s+is\s+complete,\s+and\s+",
+    flags=re.IGNORECASE,
+)
+
+
+def _sanitize_account_tool_transport_details(text: str, results: list[ToolResult]) -> str:
+    if not any(result.tool_name in {"email_search", "email_read", "calendar_list", "connector_request"} for result in results):
+        return text
+    lines = [
+        line
+        for line in str(text).splitlines()
+        if not _ACCOUNT_TRANSPORT_LINE_RE.match(line)
+    ]
+    cleaned = "\n".join(lines).strip()
+    cleaned = _ACCOUNT_CONNECTOR_DIAGNOSTIC_SENTENCE_RE.sub("", cleaned).strip()
+    if not cleaned or cleaned.lower().startswith("if you want"):
+        return _account_tool_summary(results) or cleaned
+    return cleaned
+
+
+def _sanitize_account_tool_family_drift(text: str, results: list[ToolResult]) -> str:
+    primary_family = _primary_account_tool_family(results)
+    if primary_family is None:
+        return text
+    families = {
+        family
+        for result in results
+        if (family := _account_tool_family(result.tool_name)) is not None
+        and result.status == "completed"
+        and isinstance(result.output, dict)
+    }
+    if len(families) < 2:
+        return text
+    if _reply_mentions_account_family_evidence(text, results, primary_family):
+        return text
+    for family in families:
+        if family == primary_family:
+            continue
+        if _reply_mentions_account_family_evidence(text, results, family):
+            return _account_tool_summary(results) or text
+    return text
+
+
+def _primary_account_tool_family(results: list[ToolResult]) -> str | None:
+    for result in results:
+        if result.status != "completed" or not isinstance(result.output, dict):
+            continue
+        family = _account_tool_family(result.tool_name)
+        if family is not None:
+            return family
+    return None
+
+
+def _account_tool_family(tool_name: str) -> str | None:
+    if tool_name in {"email_search", "email_read", "email_send"}:
+        return "email"
+    if tool_name == "calendar_list":
+        return "calendar"
+    return None
+
+
+def _prefix_account_tool_reply(text: str, results: list[ToolResult]) -> str:
+    family = _primary_account_tool_family(results)
+    if family is None:
+        return text
+    stripped = str(text or "").lstrip()
+    if not stripped:
+        return text
+    prefix = "✉️" if family == "email" else "📅" if family == "calendar" else ""
+    if not prefix or stripped.startswith(prefix):
+        return text
+    leading = str(text or "")[: len(str(text or "")) - len(stripped)]
+    return f"{leading}{prefix} {stripped}"
+
+
+def _reply_mentions_account_family_evidence(text: str, results: list[ToolResult], family: str) -> bool:
+    normalized_text = str(text or "").casefold()
+    if not normalized_text:
+        return False
+    for result in results:
+        if result.status != "completed" or not isinstance(result.output, dict):
+            continue
+        if _account_tool_family(result.tool_name) != family:
+            continue
+        for evidence in _account_tool_evidence_strings(result):
+            if evidence.casefold() in normalized_text:
+                return True
+    return False
+
+
+def _account_tool_evidence_strings(result: ToolResult) -> list[str]:
+    output = result.output if isinstance(result.output, dict) else {}
+    values: list[str] = []
+    if result.tool_name == "calendar_list":
+        records = output.get("results")
+        for item in records if isinstance(records, list) else []:
+            if isinstance(item, Mapping):
+                values.extend([
+                    str(item.get("summary") or ""),
+                    str(item.get("description") or ""),
+                    str(item.get("location") or ""),
+                ])
+    elif result.tool_name == "email_search":
+        records = output.get("results")
+        for item in records if isinstance(records, list) else []:
+            if isinstance(item, Mapping):
+                values.extend([
+                    str(item.get("subject") or ""),
+                    str(item.get("from") or ""),
+                    str(item.get("snippet") or ""),
+                ])
+    elif result.tool_name == "email_read":
+        message = output.get("message")
+        if isinstance(message, Mapping):
+            values.extend([
+                str(message.get("subject") or ""),
+                str(message.get("from") or ""),
+                str(message.get("snippet") or ""),
+            ])
+    return [
+        value.strip()
+        for value in values
+        if isinstance(value, str) and len(value.strip()) >= 6
+    ]
+
+
+def _sanitize_internal_tool_state_phrasing(text: str, results: list[ToolResult]) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return raw
+    raw = _EMAIL_FOLLOWUP_PREFIX_RE.sub("I checked one of the unread emails.", raw, count=1).strip()
+    raw = _INTERNAL_TOOL_AND_PREFIX_RE.sub("I checked and ", raw, count=1).strip()
+    raw = _INTERNAL_TOOL_COMPLETION_PREFIX_RE.sub("", raw, count=1).strip()
+    raw = _INTERNAL_REQUIRED_TOOL_SENTENCE_RE.sub("", raw, count=1).strip()
+    raw = _INTERNAL_COMPLETION_CLAUSE_RE.sub("", raw, count=1).strip()
+    if _INTERNAL_TOOL_NAME_RE.search(raw):
+        cleaned = _INTERNAL_TOOL_NAME_SENTENCE_RE.sub("", raw).strip()
+        if cleaned:
+            if cleaned.lower().startswith("if you want"):
+                summary = _account_tool_summary(results)
+                return summary or cleaned
+            raw = cleaned
+        else:
+            summary = _account_tool_summary(results)
+            return summary or raw
+    if not raw:
+        summary = _account_tool_summary(results)
+        return summary or raw
+    if not _INTERNAL_TOOL_STATE_START_RE.search(raw):
+        return raw
+    cleaned = _INTERNAL_TOOL_STATE_START_RE.sub("", raw, count=1).strip()
+    summary = _account_tool_summary(results)
+    if summary:
+        return summary
+    if cleaned and not cleaned.lower().startswith("if you want") and not _INTERNAL_TOOL_NAME_RE.search(cleaned):
+        return cleaned
+    return summary or cleaned or raw
+
+
+def _account_tool_summary(results: list[ToolResult]) -> str | None:
+    primary_family: str | None = None
+    for result in results:
+        if result.status != "completed" or not isinstance(result.output, dict):
+            continue
+        if result.tool_name in {"email_read", "email_search"}:
+            primary_family = "email"
+            break
+        if result.tool_name == "calendar_list":
+            primary_family = "calendar"
+            break
+    if primary_family == "email":
+        for result in reversed(results):
+            if result.status == "completed" and isinstance(result.output, dict) and result.tool_name == "email_read":
+                return _email_read_summary(result.output)
+        for result in reversed(results):
+            if result.status == "completed" and isinstance(result.output, dict) and result.tool_name == "email_search":
+                return _email_search_summary(result.output)
+    if primary_family == "calendar":
+        for result in reversed(results):
+            if result.status == "completed" and isinstance(result.output, dict) and result.tool_name == "calendar_list":
+                return _calendar_list_summary(result.output)
+    for result in reversed(results):
+        if result.status != "completed" or not isinstance(result.output, dict):
+            continue
+        if result.tool_name == "calendar_list":
+            return _calendar_list_summary(result.output)
+        if result.tool_name == "email_read":
+            return _email_read_summary(result.output)
+        if result.tool_name == "email_search":
+            return _email_search_summary(result.output)
+    return None
+
+
+def _calendar_list_summary(output: Mapping[str, Any]) -> str:
+    records = output.get("results")
+    items = records if isinstance(records, list) else []
+    if not items:
+        return "I checked your calendar. No events found for that window."
+    noun = "event" if len(items) == 1 else "events"
+    lines = [f"I checked your calendar. Found {len(items)} {noun}:"]
+    for item in items[:6]:
+        if not isinstance(item, Mapping):
+            continue
+        title = str(item.get("summary") or "Untitled event").strip()
+        start = _calendar_time_label(item.get("start"))
+        end = _calendar_time_label(item.get("end"))
+        when = f"{start} - {end}" if start and end else start or end
+        location = str(item.get("location") or "").strip()
+        detail = title
+        if when:
+            detail = f"{when}: {detail}"
+        if location:
+            detail = f"{detail} ({location})"
+        lines.append(f"- {detail}")
+    return "\n".join(lines)
+
+
+def _calendar_time_label(value: object) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    raw = str(value.get("dateTime") or value.get("date") or "").strip()
+    if not raw:
+        return ""
+    return raw.replace("T", " ")[:16]
+
+
+def _email_search_summary(output: Mapping[str, Any]) -> str:
+    records = output.get("results")
+    items = records if isinstance(records, list) else []
+    if not items:
+        return "I checked your email. No matching messages found."
+    noun = "message" if len(items) == 1 else "messages"
+    lines = [f"I checked your email. Found {len(items)} matching {noun}:"]
+    for item in items[:5]:
+        if not isinstance(item, Mapping):
+            continue
+        lines.append(f"- {_email_message_line(item)}")
+    return "\n".join(lines)
+
+
+def _email_read_summary(output: Mapping[str, Any]) -> str:
+    message = output.get("message")
+    if not isinstance(message, Mapping):
+        return "I checked your email."
+    subject = str(message.get("subject") or "Email").strip()
+    sender = str(message.get("from") or "").strip()
+    date = str(message.get("date") or "").strip()
+    snippet = str(message.get("body") or message.get("snippet") or "").strip()
+    lines = [f"I checked your email.\n\n**{subject}**"]
+    if sender:
+        lines.append(f"From: {sender}")
+    if date:
+        lines.append(f"Date: {date}")
+    if snippet:
+        lines.append("")
+        lines.append(snippet[:1000])
+    return "\n".join(lines).strip()
+
+
+def _email_message_line(message: Mapping[str, Any]) -> str:
+    subject = str(message.get("subject") or "Email").strip()
+    sender = str(message.get("from") or "").strip()
+    date = str(message.get("date") or "").strip()
+    parts = [subject]
+    if sender:
+        parts.append(f"from {sender}")
+    if date:
+        parts.append(date)
+    return " - ".join(parts)
 
 
 def is_raw_tool_payload_reply(
@@ -116,7 +516,7 @@ def is_safe_raw_tool_payload_replacement_reply(
     if not actual:
         return False
     candidates: list[str] = []
-    for source in ("agent", "tool"):
+    for source in ("agent", "tool", "deep-agent"):
         candidates.append(safe_raw_tool_payload_replacement(tool_results=results, source=source))
         for result in results:
             candidates.append(safe_raw_tool_payload_replacement(tool_results=[result], source=source))
@@ -260,6 +660,40 @@ def safe_raw_tool_payload_replacement(
         f"{tool_sentence}{detail} Please ask me to summarize the result or rerun a focused check, "
         "and I’ll return a human-readable answer instead of the raw data."
     )
+
+
+def _structured_numbered_choice_reply(results: list[ToolResult]) -> str | None:
+    for result in reversed(results):
+        if result.status != "failed" or not isinstance(result.output, dict):
+            continue
+        matches = result.output.get("matches")
+        if not isinstance(matches, list) or len(matches) < 2:
+            continue
+        rows: list[tuple[int, str]] = []
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("selection_index"))
+            except (TypeError, ValueError):
+                continue
+            label = str(item.get("name") or item.get("title") or item.get("label") or "").strip()
+            if not label:
+                continue
+            rows.append((index, label))
+        if len(rows) < 2:
+            continue
+        rows = sorted(rows, key=lambda row: row[0])
+        item_label = "matching options"
+        if result.tool_name == "run_cron":
+            item_label = "matching cron jobs"
+        choices = "\n".join(f"{index}. {label}" for index, label in rows)
+        return (
+            f"I found multiple {item_label}. Which one should I use?\n\n"
+            f"{choices}\n\n"
+            "Reply with the number."
+        )
+    return None
 
 
 def _connector_request_payload_summary(

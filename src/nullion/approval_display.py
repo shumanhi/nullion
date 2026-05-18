@@ -26,14 +26,21 @@ _TOOL_LABELS = {
     "file_read": "read a file",
     "file_delete": "delete a file",
     "send_email": "send an email",
+    "email_send": "send an email",
     "send_message": "send a message",
     "browser_open": "open a browser page",
     "browser_navigate": "navigate a browser page",
     "browser_click": "click on a webpage",
+    "browser_click_element": "click on a webpage",
+    "browser_click_id": "click on a webpage",
     "browser_type": "type into a webpage",
+    "browser_type_field": "type into a webpage",
+    "browser_type_id": "type into a webpage",
+    "browser_select_combobox": "select an option on a webpage",
     "browser_fill": "fill in a form",
     "browser_run_js": "run JavaScript in the browser",
     "browser_screenshot": "capture a browser screenshot",
+    "browser_snapshot": "inspect browser page elements",
     "browser_extract_text": "read browser page text",
     "doctor_check": "run a health check",
     "create_task": "create a task",
@@ -157,6 +164,8 @@ def format_approval_detail_markdown(detail: str) -> str:
     text = _string(detail)
     if not text:
         return "Request details were not provided."
+    if text.startswith("Email draft:"):
+        return text
     for key in ("URL", "Path", "Target", "Command", "Query", "Resource", "Operation"):
         match = re.search(rf"(?P<prefix>.*?)(?: · )?{key}:\s*(?P<value>.+)$", text, flags=re.IGNORECASE)
         if match:
@@ -183,6 +192,37 @@ def _metadata_detail(context: dict[str, object]) -> str:
     if description and meta:
         return f"{description} {' · '.join(meta)}."
     return description
+
+
+def _email_send_review_detail(context: dict[str, object]) -> str | None:
+    arguments = context.get("tool_arguments")
+    if not isinstance(arguments, dict):
+        return None
+    recipients = arguments.get("to") or arguments.get("recipients")
+    if isinstance(recipients, (list, tuple)):
+        to_text = ", ".join(_string(value) for value in recipients if _string(value))
+    else:
+        to_text = _string(recipients)
+    subject = _string(arguments.get("subject"))
+    body = _string(arguments.get("body"))
+    attachments = arguments.get("attachment_paths") or arguments.get("attachments")
+    if isinstance(attachments, (list, tuple)):
+        attachment_lines = [_string(value) for value in attachments if _string(value)]
+    else:
+        attachment_text = _string(attachments)
+        attachment_lines = [attachment_text] if attachment_text else []
+    lines = ["Email draft:"]
+    if to_text:
+        lines.append(f"> To: {to_text}")
+    if subject:
+        lines.append(f"> Subject: {subject}")
+    if body:
+        lines.extend(["", "> Body:"])
+        lines.extend(f"> {line}" if line else ">" for line in body.splitlines())
+    if attachment_lines:
+        lines.extend(["", "Attachments:"])
+        lines.extend(f"- {path}" for path in attachment_lines)
+    return "\n".join(lines)
 
 
 def _approval_placeholder(value: str) -> bool:
@@ -241,6 +281,15 @@ def approval_display_from_request(approval: Any) -> ApprovalDisplay:
     side_effect = _string(context.get("tool_side_effect_class"))
     tool_name = _tool_name_for(approval, context)
     label = approval_label_for_tool(tool_name)
+    if tool_name == "email_send":
+        detail = _email_send_review_detail(context) or _metadata_detail(context) or "Email draft details were not provided."
+        return ApprovalDisplay(
+            label=label,
+            detail=detail,
+            title="✉️ Review email before sending",
+            copy="Review the email below. Approve once to send it, or deny to stop.",
+            is_web_request=False,
+        )
 
     is_boundary = request_kind == "boundary_policy" or action == "allow_boundary"
     is_web = is_boundary and boundary_kind == "outbound_network"

@@ -17,6 +17,7 @@ import base64
 import fnmatch
 import json
 import os
+import re
 from types import SimpleNamespace
 from typing import Any
 from urllib.request import Request, urlopen
@@ -35,6 +36,9 @@ except ImportError:
 
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+_BLANK_PAGE_URLS = frozenset({"", "about:blank", "chrome://newtab/", "brave://newtab/"})
+_TYPE_TEXT_TIMEOUT_MS = 10_000
+_CLICK_TIMEOUT_MS = 5_000
 
 
 def _require_playwright() -> None:
@@ -55,6 +59,44 @@ def normalized_cdp_url(raw_url: str | None = None) -> str:
         netloc = f"127.0.0.1:{port}"
         return urlunparse(parsed._replace(netloc=netloc))
     return url
+
+
+def _page_url(page: object) -> str:
+    try:
+        return str(getattr(page, "url", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _page_is_blank(page: object) -> bool:
+    return _page_url(page).lower() in _BLANK_PAGE_URLS
+
+
+async def _close_page_quietly(page: object) -> None:
+    close = getattr(page, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        pass
+
+
+async def _prune_extra_blank_pages(pages: list[object]) -> list[object]:
+    open_pages = [page for page in pages if not page.is_closed()]
+    if len(open_pages) <= 1:
+        return open_pages
+    nonblank_pages = [page for page in open_pages if not _page_is_blank(page)]
+    blank_pages = [page for page in open_pages if _page_is_blank(page)]
+    keep_blank = [] if nonblank_pages else blank_pages[-1:]
+    keep = [*nonblank_pages, *keep_blank]
+    for page in blank_pages:
+        if page in keep_blank:
+            continue
+        await _close_page_quietly(page)
+    return keep
 
 
 def _json_url(cdp_url: str, path: str) -> str:
@@ -87,6 +129,564 @@ async def _async_new_cdp_target(cdp_url: str) -> dict[str, object] | None:
         return payload if isinstance(payload, dict) else None
 
     return await asyncio.to_thread(create)
+
+
+async def _async_page_targets_or_new(cdp_url: str) -> list[dict[str, object]]:
+    targets = [
+        target
+        for target in await _async_cdp_targets(cdp_url)
+        if str(target.get("type") or "") == "page"
+    ]
+    if targets:
+        return targets
+    target = await _async_new_cdp_target(cdp_url)
+    if target and str(target.get("type") or "") == "page":
+        return [target]
+    return []
+
+
+def _dom_type_script(selector: str, text: str) -> str:
+    return (
+        "(() => {"
+        f" const el = document.querySelector({json.dumps(selector)});"
+        f" const text = {json.dumps(text)};"
+        " if (!el) throw new Error(`selector not found: ${selector}`);"
+        " if (typeof el.focus === 'function') el.focus();"
+        " const proto = el instanceof HTMLTextAreaElement"
+        "   ? HTMLTextAreaElement.prototype"
+        "   : el instanceof HTMLInputElement ? HTMLInputElement.prototype : null;"
+        " const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value')?.set;"
+        " if (setter) setter.call(el, text);"
+        " else if (el.isContentEditable) el.textContent = text;"
+        " else el.value = text;"
+        " el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));"
+        " el.dispatchEvent(new Event('change', { bubbles: true }));"
+        "})()"
+    )
+
+
+def _dom_type_element_function() -> str:
+    return (
+        "(el, text) => {"
+        " if (!el) throw new Error('element not found');"
+        " if (typeof el.scrollIntoView === 'function') el.scrollIntoView({block:'center', inline:'center'});"
+        " if (typeof el.focus === 'function') el.focus({preventScroll: true});"
+        " const tag = (el.tagName || '').toLowerCase();"
+        " const editable = el.isContentEditable || tag === 'textarea' || tag === 'input' || tag === 'select' || el.getAttribute('role') === 'combobox' || el.getAttribute('contenteditable') === 'true';"
+        " if (!editable) {"
+        "   const opts = {bubbles: true, cancelable: true, view: window};"
+        "   for (const type of ['pointerdown','mousedown','pointerup','mouseup']) el.dispatchEvent(new MouseEvent(type, opts));"
+        "   if (typeof el.click === 'function') el.click();"
+        "   else el.dispatchEvent(new MouseEvent('click', opts));"
+        "   return {ok: true, clicked: true, editable: false};"
+        " }"
+        " const before = 'value' in el ? String(el.value || '') : String(el.textContent || '');"
+        " const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLInputElement ? HTMLInputElement.prototype : null;"
+        " const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value')?.set;"
+        " if (setter) setter.call(el, text);"
+        " else if ('value' in el) el.value = text;"
+        " else el.textContent = text;"
+        " el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));"
+        " el.dispatchEvent(new Event('change', {bubbles: true}));"
+        " const after = 'value' in el ? String(el.value || '') : String(el.textContent || '');"
+        " return {ok: true, clicked: false, editable: true, before, after};"
+        "}"
+    )
+
+
+def _dom_click_script(selector: str) -> str:
+    return (
+        "(() => {"
+        f" const el = document.querySelector({json.dumps(selector)});"
+        " if (!el) throw new Error(`selector not found: ${selector}`);"
+        " if (typeof el.scrollIntoView === 'function') el.scrollIntoView({block:'center', inline:'center'});"
+        " if (typeof el.focus === 'function') el.focus();"
+        " const opts = { bubbles: true, cancelable: true, view: window };"
+        " for (const type of ['pointerdown','mousedown','pointerup','mouseup']) el.dispatchEvent(new MouseEvent(type, opts));"
+        " if (typeof el.click === 'function') el.click();"
+        " else el.dispatchEvent(new MouseEvent('click', opts));"
+        "})()"
+    )
+
+
+def _active_combobox_option_click_script(text: str) -> str:
+    return (
+        "(() => {"
+        f" const needle = {json.dumps(text)}.trim().toLowerCase();"
+        " if (!needle) return false;"
+        " const normalize = (value) => (value || '').toLowerCase().replace(/\\b(west)\\b/g, 'w').replace(/\\b(east)\\b/g, 'e').replace(/\\b(north)\\b/g, 'n').replace(/\\b(south)\\b/g, 's').replace(/[^a-z0-9]+/g, ' ').trim();"
+        " const needleNorm = normalize(needle);"
+        " const needleTokens = needleNorm.split(' ').filter(Boolean);"
+        " const needleNums = needleTokens.filter((token) => /\\d/.test(token));"
+        " const needleWords = needleTokens.filter((token) => !/\\d/.test(token) && token.length >= 3);"
+        " const compatible = (text) => {"
+        "   const textNorm = normalize(text);"
+        "   if (!textNorm) return false;"
+        "   const textTokens = textNorm.split(' ').filter(Boolean);"
+        "   if (needleNums.length > 0) return needleNums.every((token) => textTokens.includes(token)) && (!needleWords.length || needleWords.some((token) => textTokens.includes(token)));"
+        "   if (needleWords.length > 1) return needleWords.every((token) => textTokens.includes(token));"
+        "   if (needleWords.length === 1) return textTokens.includes(needleWords[0]);"
+        "   return textNorm.includes(needleNorm);"
+        " };"
+        " const active = document.activeElement;"
+        " const controlled = active && (active.getAttribute('aria-controls') || active.getAttribute('aria-owns'));"
+        " if (!controlled) return false;"
+        " const root = document.getElementById(controlled);"
+        " if (!root) return false;"
+        " const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);"
+        " const directText = (el) => Array.from(el.childNodes || []).filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent || '').join(' ').trim();"
+        " const optionLike = Array.from(root.querySelectorAll('[role=\"option\"],button,[role=\"button\"],li,[data-testid*=\"option\" i],[data-baseweb*=\"menu\" i] div')).filter(visible);"
+        " const leafLike = Array.from(root.querySelectorAll('*')).filter((el) => visible(el) && !Array.from(el.children || []).some(visible));"
+        " const candidates = [...optionLike, ...leafLike];"
+        " const seen = new Set();"
+        " const match = candidates.find((el) => {"
+        "   if (seen.has(el)) return false;"
+        "   seen.add(el);"
+        "   const text = (directText(el) || el.getAttribute('aria-label') || el.innerText || el.textContent || '').trim();"
+        "   return text && compatible(text);"
+        " });"
+        " if (!match) return false;"
+        " const clickable = match.closest('button,[role=\"option\"],[role=\"button\"],li,div') || match;"
+        " if (typeof clickable.scrollIntoView === 'function') clickable.scrollIntoView({block:'center', inline:'center'});"
+        " if (typeof clickable.focus === 'function') clickable.focus();"
+        " const opts = { bubbles: true, cancelable: true, view: window };"
+        " for (const type of ['pointerdown','mousedown','pointerup','mouseup']) clickable.dispatchEvent(new MouseEvent(type, opts));"
+        " if (typeof clickable.click === 'function') clickable.click();"
+        " else clickable.dispatchEvent(new MouseEvent('click', opts));"
+        " return true;"
+        "})()"
+    )
+
+
+def _semantic_selector_for_target(target: dict[str, object]) -> str:
+    value = str(
+        target.get("selector")
+        or target.get("label")
+        or target.get("placeholder")
+        or target.get("text")
+        or target.get("name")
+        or ""
+    ).strip()
+    if not value:
+        raise ValueError("Provide selector, label, placeholder, text, or role/name.")
+    return value
+
+
+def _first_locator(locator: Any) -> Any:
+    first = getattr(locator, "first", None)
+    if callable(first):
+        return first()
+    return first or locator
+
+
+async def _maybe_await(value: Any) -> Any:
+    if asyncio.iscoroutine(value):
+        return await value
+    return value
+
+
+def _base_locator_for_target(page: object, target: dict[str, object]):
+    selector = str(target.get("selector") or "").strip()
+    if selector and hasattr(page, "locator"):
+        return page.locator(selector)
+    label = str(target.get("label") or "").strip()
+    if label and hasattr(page, "get_by_label"):
+        return page.get_by_label(label)
+    placeholder = str(target.get("placeholder") or "").strip()
+    if placeholder and hasattr(page, "get_by_placeholder"):
+        return page.get_by_placeholder(placeholder)
+    role = str(target.get("role") or "").strip()
+    name = str(target.get("name") or "").strip()
+    if role and hasattr(page, "get_by_role"):
+        kwargs = {"name": name} if name else {}
+        return page.get_by_role(role, **kwargs)
+    text = str(target.get("text") or "").strip()
+    if text and hasattr(page, "get_by_text"):
+        return page.get_by_text(text)
+    if name and hasattr(page, "get_by_text"):
+        return page.get_by_text(name)
+    if hasattr(page, "locator"):
+        return page.locator(_semantic_selector_for_target(target))
+    return None
+
+
+def _locator_for_target(page: object, target: dict[str, object]):
+    locator = _base_locator_for_target(page, target)
+    return _first_locator(locator) if locator is not None else None
+
+
+async def _is_visible_locator(locator: Any) -> bool:
+    is_visible = getattr(locator, "is_visible", None)
+    if not callable(is_visible):
+        return True
+    try:
+        return bool(await _maybe_await(is_visible(timeout=300)))
+    except TypeError:
+        try:
+            return bool(await _maybe_await(is_visible()))
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+async def _is_enabled_locator(locator: Any) -> bool:
+    is_enabled = getattr(locator, "is_enabled", None)
+    if not callable(is_enabled):
+        try:
+            disabled = await _maybe_await(locator.get_attribute("disabled", timeout=300))
+            return disabled is None
+        except Exception:
+            return True
+    try:
+        return bool(await _maybe_await(is_enabled(timeout=300)))
+    except TypeError:
+        try:
+            return bool(await _maybe_await(is_enabled()))
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+async def _candidate_locators_for_target(page: object, target: dict[str, object]) -> list[Any]:
+    base = _base_locator_for_target(page, target)
+    if base is None:
+        return []
+    count_fn = getattr(base, "count", None)
+    nth_fn = getattr(base, "nth", None)
+    if not callable(count_fn) or not callable(nth_fn):
+        return [_first_locator(base)]
+    try:
+        count = int(await _maybe_await(count_fn()))
+    except Exception:
+        return [_first_locator(base)]
+    if count <= 1:
+        return [_first_locator(base)]
+    candidates = [nth_fn(index) for index in range(min(count, 8))]
+    visible: list[Any] = []
+    hidden: list[Any] = []
+    for candidate in candidates:
+        if not await _is_enabled_locator(candidate):
+            continue
+        if await _is_visible_locator(candidate):
+            visible.append(candidate)
+        else:
+            hidden.append(candidate)
+    return visible + hidden
+
+
+async def _click_with_dom_fallback(page: object, selector: str) -> None:
+    original_error: BaseException | None = None
+    click = getattr(page, "click", None)
+    if callable(click):
+        try:
+            result = click(selector, timeout=_CLICK_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        except TypeError:
+            try:
+                result = click(selector)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception as exc:
+                original_error = exc
+        except Exception as exc:
+            original_error = exc
+    else:
+        original_error = RuntimeError("page does not support click")
+    locator = getattr(page, "locator", None)
+    if callable(locator):
+        try:
+            target = locator(selector)
+            result = target.click(force=True, timeout=_CLICK_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        except Exception as exc:
+            original_error = original_error or exc
+        try:
+            target = locator(selector)
+            dispatch = getattr(target, "dispatch_event", None)
+            if callable(dispatch):
+                result = dispatch("click", timeout=_CLICK_TIMEOUT_MS)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+        except Exception as exc:
+            original_error = original_error or exc
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        raise original_error
+    try:
+        result = evaluate(_dom_click_script(selector))
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        if original_error is not None:
+            raise original_error
+        raise
+
+
+async def _click_target_with_fallback(page: object, target: dict[str, object]) -> None:
+    selector = _semantic_selector_for_target(target)
+    if await _click_active_combobox_option(page, target):
+        return
+    original_error: BaseException | None = None
+    for locator in await _candidate_locators_for_target(page, target):
+        try:
+            result = locator.click(timeout=_CLICK_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        except Exception as exc:
+            original_error = exc
+        try:
+            result = locator.click(force=True, timeout=_CLICK_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        except Exception as exc:
+            original_error = original_error or exc
+        dispatch = getattr(locator, "dispatch_event", None)
+        if callable(dispatch):
+            try:
+                result = dispatch("click", timeout=_CLICK_TIMEOUT_MS)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception as exc:
+                original_error = original_error or exc
+    try:
+        await _click_with_dom_fallback(page, selector)
+    except Exception:
+        if original_error is not None:
+            raise original_error
+        raise
+
+
+async def _click_active_combobox_option(page: object, target: dict[str, object]) -> bool:
+    text = str(target.get("text") or target.get("name") or "").strip()
+    if not text:
+        return False
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return False
+    try:
+        result = evaluate(_active_combobox_option_click_script(text))
+        if asyncio.iscoroutine(result):
+            result = await result
+        return bool(result)
+    except Exception:
+        return False
+
+
+async def _active_combobox_has_options(page: object) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return False
+    try:
+        result = evaluate(
+            """(() => {
+                const active = document.activeElement;
+                const controlled = active && (active.getAttribute('aria-controls') || active.getAttribute('aria-owns'));
+                const root = controlled && document.getElementById(controlled);
+                if (!root) return false;
+                return [...root.querySelectorAll('*')].some((el) => {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    return text && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                });
+            })()"""
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+        return bool(result)
+    except Exception:
+        return False
+
+
+async def _type_text_with_dom_fallback(page: object, selector: str, text: str) -> None:
+    original_error: BaseException | None = None
+    fill = getattr(page, "fill", None)
+    if callable(fill):
+        try:
+            result = fill(selector, text, timeout=_TYPE_TEXT_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        except TypeError:
+            try:
+                result = fill(selector, text)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception as exc:
+                original_error = exc
+        except Exception as exc:
+            original_error = exc
+    else:
+        original_error = RuntimeError("page does not support fill")
+    locator = getattr(page, "locator", None)
+    if callable(locator):
+        try:
+            target = locator(selector)
+            result = target.fill(text, force=True, timeout=_TYPE_TEXT_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        except Exception as exc:
+            original_error = original_error or exc
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        raise original_error
+    try:
+        result = evaluate(_dom_type_script(selector, text))
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        if original_error is not None:
+            raise original_error
+        raise
+
+
+async def _type_target_with_fallback(page: object, target: dict[str, object], text: str) -> None:
+    selector = _semantic_selector_for_target(target)
+    original_error: BaseException | None = None
+    unverified_success = False
+    for locator in await _candidate_locators_for_target(page, target):
+        try:
+            result = locator.fill(text, timeout=_TYPE_TEXT_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            had_options = await _active_combobox_has_options(page)
+            committed = await _click_active_combobox_option(page, {"text": text})
+            if had_options and not committed:
+                raise RuntimeError("No compatible active combobox suggestion matched the typed text.")
+            matches = await _locator_value_matches(locator, text)
+            if matches is True:
+                return
+            if matches is None:
+                unverified_success = True
+            continue
+        except Exception as exc:
+            original_error = exc
+        try:
+            result = locator.fill(text, force=True, timeout=_TYPE_TEXT_TIMEOUT_MS)
+            if asyncio.iscoroutine(result):
+                await result
+            had_options = await _active_combobox_has_options(page)
+            committed = await _click_active_combobox_option(page, {"text": text})
+            if had_options and not committed:
+                raise RuntimeError("No compatible active combobox suggestion matched the typed text.")
+            matches = await _locator_value_matches(locator, text)
+            if matches is True:
+                return
+            if matches is None:
+                unverified_success = True
+            continue
+        except Exception as exc:
+            original_error = original_error or exc
+        press = getattr(locator, "press_sequentially", None)
+        if callable(press):
+            try:
+                result = press(text, timeout=_TYPE_TEXT_TIMEOUT_MS)
+                if asyncio.iscoroutine(result):
+                    await result
+                had_options = await _active_combobox_has_options(page)
+                committed = await _click_active_combobox_option(page, {"text": text})
+                if had_options and not committed:
+                    raise RuntimeError("No compatible active combobox suggestion matched the typed text.")
+                matches = await _locator_value_matches(locator, text)
+                if matches is True:
+                    return
+                if matches is None:
+                    unverified_success = True
+            except Exception as exc:
+                original_error = original_error or exc
+        evaluate = getattr(locator, "evaluate", None)
+        if callable(evaluate):
+            try:
+                result = evaluate(_dom_type_element_function(), text, timeout=_TYPE_TEXT_TIMEOUT_MS)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except TypeError:
+                try:
+                    result = evaluate(_dom_type_element_function(), text)
+                    if asyncio.iscoroutine(result):
+                        await result
+                    return
+                except Exception as exc:
+                    original_error = original_error or exc
+            except Exception as exc:
+                original_error = original_error or exc
+    if unverified_success:
+        return
+    try:
+        await _type_text_with_dom_fallback(page, selector, text)
+    except Exception:
+        if original_error is not None:
+            raise original_error
+        raise
+
+
+async def _locator_value_matches(locator: Any, text: str) -> bool | None:
+    expected = text.strip()
+    if not expected:
+        return True
+    value: str | None = None
+    input_value = getattr(locator, "input_value", None)
+    if callable(input_value):
+        try:
+            raw_value = await _maybe_await(input_value(timeout=500))
+            value = str(raw_value) if raw_value is not None else None
+        except TypeError:
+            try:
+                raw_value = await _maybe_await(input_value())
+                value = str(raw_value) if raw_value is not None else None
+            except Exception:
+                value = None
+        except Exception:
+            value = None
+    if value is None:
+        get_attribute = getattr(locator, "get_attribute", None)
+        if callable(get_attribute):
+            for attr in ("value", "title"):
+                try:
+                    attr_value = await _maybe_await(get_attribute(attr, timeout=500))
+                except TypeError:
+                    try:
+                        attr_value = await _maybe_await(get_attribute(attr))
+                    except Exception:
+                        attr_value = None
+                except Exception:
+                    attr_value = None
+                if attr_value:
+                    value = str(attr_value)
+                    break
+    if value is None:
+        return None
+    actual = value.strip()
+    if not actual:
+        return False
+    if expected in actual or actual in expected:
+        return True
+    def normalize(raw: str) -> str:
+        lowered = raw.lower()
+        for word, abbreviation in (("west", "w"), ("east", "e"), ("north", "n"), ("south", "s")):
+            lowered = re.sub(rf"\b{word}\b", abbreviation, lowered)
+        return lowered
+    expected_tokens = [token for token in re.split(r"[^a-z0-9]+", normalize(expected)) if token]
+    actual_tokens = [token for token in re.split(r"[^a-z0-9]+", normalize(actual)) if token]
+    expected_numbers = [token for token in expected_tokens if any(char.isdigit() for char in token)]
+    if expected_numbers:
+        actual_set = set(actual_tokens)
+        return all(token in actual_set for token in expected_numbers) and any(
+            token in actual_set for token in expected_tokens if not any(char.isdigit() for char in token)
+        )
+    return False
 
 
 class _RawCDPClient:
@@ -349,11 +949,7 @@ class _RawCDPBrowser:
         return True
 
     async def refresh(self) -> "_RawCDPBrowser":
-        targets = [
-            target
-            for target in await _async_cdp_targets(self.cdp_url)
-            if str(target.get("type") or "") == "page"
-        ]
+        targets = await _async_page_targets_or_new(self.cdp_url)
         self.contexts = [_RawCDPContext(self.cdp_url, targets)]
         return self
 
@@ -383,14 +979,20 @@ class CDPBackend:
 
     async def _ensure_browser(self) -> "Browser | _RawCDPBrowser":
         if self._browser is None or not self._browser.is_connected():
+            targets = await _async_page_targets_or_new(self._cdp_url)
+            if not targets:
+                raise RuntimeError(
+                    "Connected to CDP, but no browser page target was available and a new tab could not be created. "
+                    "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
+                )
             pw = await async_playwright().__aenter__()
             self._playwright = pw
             try:
-                self._browser = await pw.chromium.connect_over_cdp(self._cdp_url)
+                self._browser = await asyncio.wait_for(
+                    pw.chromium.connect_over_cdp(self._cdp_url),
+                    timeout=5,
+                )
             except Exception as exc:
-                message = str(exc)
-                if "Browser.setDownloadBehavior" not in message and "Browser context management is not supported" not in message:
-                    raise
                 try:
                     await pw.__aexit__(None, None, None)
                 except Exception:
@@ -401,6 +1003,9 @@ class CDPBackend:
 
     async def _get_page(self, session_id: str) -> "Page | _RawCDPPage":
         async with self._lock:
+            cached = self._pages.get(session_id)
+            if cached is not None and cached.is_closed():
+                self._pages.pop(session_id, None)
             if session_id not in self._pages:
                 browser = await self._ensure_browser()
                 # Use the first existing context (the user's real browser session)
@@ -412,7 +1017,7 @@ class CDPBackend:
                         "Connected to CDP, but no visible browser context was available. "
                         "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
                     )
-                pages = [page for page in ctx.pages if not page.is_closed()]
+                pages = await _prune_extra_blank_pages(list(ctx.pages))
                 if pages:
                     self._pages[session_id] = pages[-1]
                 else:
@@ -430,6 +1035,14 @@ class CDPBackend:
 
     # ── BrowserBackend protocol ───────────────────────────────────────────────
 
+    async def open(self, session_id: str) -> str:
+        page = await self._get_page(session_id)
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        return f"Opened browser session {session_id} — visible in your browser"
+
     async def navigate(self, session_id: str, url: str) -> str:
         page = await self._get_page(session_id)
         response = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -438,11 +1051,19 @@ class CDPBackend:
 
     async def click(self, session_id: str, selector: str) -> None:
         page = await self._get_page(session_id)
-        await page.click(selector, timeout=10_000)
+        await _click_with_dom_fallback(page, selector)
+
+    async def click_element(self, session_id: str, target: dict[str, object]) -> None:
+        page = await self._get_page(session_id)
+        await _click_target_with_fallback(page, target)
 
     async def type_text(self, session_id: str, selector: str, text: str) -> None:
         page = await self._get_page(session_id)
-        await page.fill(selector, text)
+        await _type_text_with_dom_fallback(page, selector, text)
+
+    async def type_field(self, session_id: str, target: dict[str, object], text: str) -> None:
+        page = await self._get_page(session_id)
+        await _type_target_with_fallback(page, target, text)
 
     async def extract_text(self, session_id: str, selector: str | None) -> str:
         page = await self._get_page(session_id)
@@ -548,16 +1169,50 @@ class CDPBackend:
         session_id: str,
         selector: str | None,
         url_pattern: str | None,
+        text: str | None,
         timeout: float,
     ) -> None:
         page = await self._get_page(session_id)
         timeout_ms = int(timeout * 1000)
-        if selector:
+        if selector and not url_pattern and not text:
             await page.wait_for_selector(selector, timeout=timeout_ms)
-        elif url_pattern:
+            return
+        if url_pattern and not selector and not text:
             await page.wait_for_url(url_pattern, timeout=timeout_ms)
-        else:
+            return
+        if not selector and not url_pattern and not text:
             await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            return
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            if selector:
+                try:
+                    exists = await page.evaluate(f"Boolean(document.querySelector({json.dumps(selector)}))")
+                    if exists:
+                        return
+                except Exception:
+                    pass
+            if url_pattern:
+                try:
+                    current = str(await page.evaluate("location.href") or "")
+                    if fnmatch.fnmatch(current, url_pattern):
+                        return
+                except Exception:
+                    pass
+            if text:
+                try:
+                    found = await page.evaluate(
+                        "(() => (document.body?.innerText || '').toLowerCase().includes("
+                        f"{json.dumps(text.lower())}"
+                        "))()"
+                    )
+                    if found:
+                        return
+                except Exception:
+                    pass
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("Timed out waiting for any browser condition.")
+            await asyncio.sleep(0.1)
 
     async def find(self, session_id: str, selector: str) -> list[dict[str, str]]:
         page = await self._get_page(session_id)
