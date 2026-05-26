@@ -77,6 +77,8 @@ class _TurnDispositionState(TypedDict, total=False):
 
 
 _URL_TERMS = ("http://", "https://", "www.")
+_NUMERIC_REPLY_RE = re.compile(r"^\s*(\d{1,2})\s*$")
+_NUMBERED_OPTION_RE = re.compile(r"^\s*(\d{1,2})[\.)]\s*(.*\S)?\s*$")
 
 
 def _normalize(text: str) -> str:
@@ -88,6 +90,60 @@ def _normalize(text: str) -> str:
 
 def _words(normalized_text: str) -> list[str]:
     return normalized_text.split()
+
+
+def _selected_numbered_option_context_from_message(
+    user_text: object,
+    previous_assistant_message: object,
+) -> str | None:
+    match = _NUMERIC_REPLY_RE.fullmatch(str(user_text or ""))
+    if not match:
+        return None
+    selected = match.group(1)
+    lines = str(previous_assistant_message or "").splitlines()
+    selected_lines: list[str] = []
+    collecting = False
+    for line in lines:
+        option_match = _NUMBERED_OPTION_RE.match(line)
+        if option_match:
+            if collecting:
+                break
+            collecting = option_match.group(1) == selected
+            if collecting:
+                first = (option_match.group(2) or "").strip()
+                if first:
+                    selected_lines.append(first)
+            continue
+        if collecting and line.strip():
+            selected_lines.append(line.strip())
+    if not selected_lines:
+        return None
+    body = "\n".join(selected_lines)
+    return (
+        f"Structured numbered-option selection: the user replied with option {selected} "
+        f"from the immediately previous assistant response.\nSelected option {selected}:\n{body}"
+    )
+
+
+def selected_numbered_option_context(
+    user_text: object,
+    previous_assistant_message: object,
+) -> str | None:
+    """Return selected numbered-option text from prior assistant choices.
+
+    This treats a bare numeric user reply as a structured option selection,
+    not as natural-language intent. When multiple recent assistant messages
+    are supplied, the newest message containing the selected option wins so a
+    background delivery cannot steal the reply from a numbered prompt.
+    """
+
+    if isinstance(previous_assistant_message, (list, tuple)):
+        for candidate in reversed(previous_assistant_message):
+            context = _selected_numbered_option_context_from_message(user_text, candidate)
+            if context:
+                return context
+        return None
+    return _selected_numbered_option_context_from_message(user_text, previous_assistant_message)
 
 
 def _intent_signals(normalized_text: str) -> IntentSignals:
@@ -224,6 +280,14 @@ def _turn_disposition_marker_node(state: _TurnDispositionState) -> dict[str, obj
         )}
 
     active_branch_exists = bool(state.get("active_branch_exists"))
+    if selected_numbered_option_context(
+        state.get("text") or "",
+        state.get("previous_assistant_message") or "",
+    ):
+        return {"decision": ConversationTurnDispositionDecision(
+            disposition=ConversationTurnDisposition.CONTINUE,
+            reason="numbered_option_reply",
+        )}
     if active_branch_exists and _matches_interrupt_or_revise_prefix(normalized):
         return {"decision": ConversationTurnDispositionDecision(
             disposition=ConversationTurnDisposition.INTERRUPT,
@@ -403,5 +467,6 @@ __all__ = [
     "classify_intent",
     "classify_turn_disposition",
     "classify_turn_disposition_with_reason",
+    "selected_numbered_option_context",
     "split_compound_intent",
 ]

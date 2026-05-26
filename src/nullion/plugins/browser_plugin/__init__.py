@@ -428,7 +428,7 @@ def register_browser_tools(
             "Execute JavaScript on the current page and return the result.",
             risk=ToolRiskLevel.HIGH,
             side_effect=ToolSideEffectClass.WRITE,
-            requires_approval=True,
+            requires_approval=False,
             timeout=15,
             input_schema=_object_schema(
                 {

@@ -155,6 +155,10 @@ _ATTACHMENT_UPLOAD_FAILED_REPLY = (
     "I couldn't upload the requested attachment to this platform. "
     "I won't mark it delivered."
 )
+_PRIMARY_RENDERED_ATTACHMENT_SUFFIXES = frozenset(
+    {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm"}
+)
+_TEXT_SIDECAR_ATTACHMENT_SUFFIXES = frozenset({".txt", ".md"})
 _MESSAGING_ATTACHMENT_UPLOAD_ATTEMPTS = 3
 _MESSAGING_ATTACHMENT_UPLOAD_RETRY_DELAY_SECONDS = 0.5
 _EXTERNAL_INLINE_TAG_PATTERN = re.compile(
@@ -568,8 +572,7 @@ def _new_doctor_action_text_fallbacks(runtime, before_ids: frozenset[str]) -> tu
         lines.extend([
             "",
             "Inspect: /doctor latest",
-            "Mark resolved: /doctor complete latest",
-            "Dismiss: /doctor dismiss latest",
+            "Hide: /doctor dismiss latest",
         ])
         fallbacks.append("\n".join(lines))
     return tuple(fallbacks)
@@ -862,12 +865,6 @@ def delivery_contract_for_turn(
             allow_plain_paths=False,
             required_attachment_extensions=required_extensions,
         )
-    if _reply_mentions_structured_attachment_path(reply, required_extensions=required_extensions):
-        return DeliveryContract.attachment_required(
-            source="reply_structured_path",
-            allow_plain_paths=True,
-            required_attachment_extensions=required_extensions,
-        )
     return DeliveryContract.message_only()
 
 
@@ -967,7 +964,25 @@ def _required_attachment_extensions_from_contract(
     planned_extension = plan_attachment_format(text or "").extension
     if planned_extension:
         extensions.append(planned_extension.lower())
+    filename_extension = _contract_filename_extension(text)
+    if filename_extension:
+        extensions.append(filename_extension)
     return tuple(dict.fromkeys(extensions))
+
+
+def _contract_filename_extension(text: str | None) -> str | None:
+    for match in re.finditer(r"(?<![\w./\\-])([A-Za-z0-9][\w .()@+-]{0,180}\.([A-Za-z0-9]{1,16}))(?![\w./\\-])", str(text or "")):
+        token = match.group(1).strip()
+        if "/" in token or "\\" in token or "=" in token:
+            continue
+        extension = f".{match.group(2).lower()}"
+        if extension in {".ai", ".app", ".co", ".com", ".dev", ".edu", ".gov", ".io", ".net", ".org", ".us"}:
+            continue
+        # This helper is only used after structured delivery evidence exists
+        # (MEDIA, artifact result, or task contract). A bare filename here is a
+        # format filter for an already-produced attachment, not task routing.
+        return extension
+    return None
 
 
 def _attachments_matching_contract(
@@ -982,6 +997,35 @@ def _attachments_matching_contract(
     return tuple(path for path in attachments if path.suffix.lower() in required_extensions)
 
 
+def _drop_primary_artifact_text_sidecars(attachments: tuple[Path, ...]) -> tuple[Path, ...]:
+    # Generated artifacts often have status/summary sidecars for internal QA.
+    # Chat delivery should send the primary artifact unless the sidecar was
+    # explicitly requested, otherwise users receive duplicate/confusing files.
+    primary_stems: set[str] = set()
+    for path in attachments:
+        if path.suffix.lower() in _PRIMARY_RENDERED_ATTACHMENT_SUFFIXES:
+            primary_stems.add(path.stem)
+    if not primary_stems:
+        return attachments
+
+    def is_summary_sidecar(path: Path) -> bool:
+        if path.suffix.lower() not in _TEXT_SIDECAR_ATTACHMENT_SUFFIXES:
+            return False
+        stem = path.stem.lower()
+        return any(
+            stem.startswith(f"{primary_stem.lower()}{separator}{sidecar_kind}")
+            for primary_stem in primary_stems
+            for separator in ("_", "-", ".")
+            for sidecar_kind in ("summary", "completion", "status", "request", "note", "notes")
+        )
+
+    return tuple(
+        path
+        for path in attachments
+        if not is_summary_sidecar(path)
+    )
+
+
 def _plain_candidate_paths_from_text(text: str) -> list[Path]:
     paths: list[Path] = []
     for match in _PLAIN_ABSOLUTE_PATH_RE.finditer(str(text or "")):
@@ -993,31 +1037,6 @@ def _plain_candidate_paths_from_text(text: str) -> list[Path]:
         if raw:
             paths.append(Path(raw))
     return list(dict.fromkeys(paths))
-
-
-def _structured_relative_output_candidates(paths: list[Path]) -> tuple[Path, ...]:
-    structured: list[Path] = []
-    for path in paths:
-        if path.is_absolute():
-            continue
-        parts = path.parts
-        if not parts or parts[0] not in {"artifacts", "files", "media"}:
-            continue
-        structured.append(path)
-    return tuple(dict.fromkeys(structured))
-
-
-def _reply_mentions_structured_attachment_path(
-    reply: str | None,
-    *,
-    required_extensions: tuple[str, ...],
-) -> bool:
-    if not isinstance(reply, str) or not reply.strip() or not required_extensions:
-        return False
-    allowed_extensions = {extension.lower() for extension in required_extensions if extension}
-    if not allowed_extensions:
-        return False
-    return any(path.suffix.lower() in allowed_extensions for path in _plain_candidate_paths_from_text(reply))
 
 
 def _caption_without_attached_paths(
@@ -1097,36 +1116,17 @@ def prepare_reply_for_platform_delivery(
             )
         else:
             delivery_contract = delivery_contract_for_turn(None, reply=text)
-    media_candidates = media_candidate_paths_from_text(text)
+    media_candidates = list(
+        _drop_primary_artifact_text_sidecars(tuple(media_candidate_paths_from_text(text)))
+    )
     caption, attachments = split_reply_for_platform_delivery(text, principal_id=principal_id)
     plain_candidates = _plain_candidate_paths_from_text(text)
-    structured_plain_candidates = _structured_relative_output_candidates(plain_candidates)
     if media_candidates and not delivery_contract.allow_attachment_delivery:
         return PlatformDelivery(
             text=_sanitize_platform_visible_text(caption if caption else None),
             attachments=(),
             media_directive_count=0,
         )
-    if not media_candidates and structured_plain_candidates:
-        opportunistic_attachments = tuple(
-            resolved_path
-            for path in structured_plain_candidates
-            for resolved_path in (_resolve_messaging_attachment_path(path, principal_id=principal_id),)
-            if _is_deliverable_messaging_attachment(resolved_path, principal_id=principal_id)
-        )
-        opportunistic_attachments = _attachments_matching_contract(opportunistic_attachments, delivery_contract)
-        opportunistic_attachments = tuple(dict.fromkeys(opportunistic_attachments))
-        if opportunistic_attachments:
-            visible_text = _caption_without_attached_paths(
-                text,
-                opportunistic_attachments,
-                candidate_path_texts=tuple(str(path) for path in structured_plain_candidates),
-            )
-            return PlatformDelivery(
-                text=_sanitize_platform_visible_text(visible_text),
-                attachments=opportunistic_attachments,
-                media_directive_count=len(opportunistic_attachments),
-            )
     if (
         not media_candidates
         and delivery_contract.allow_attachment_delivery
@@ -1160,7 +1160,9 @@ def prepare_reply_for_platform_delivery(
                 unavailable_attachment_count=1,
             )
         return PlatformDelivery(text=_sanitize_platform_visible_text(text if text else None), attachments=())
-    attachments = _attachments_matching_contract(attachments, delivery_contract)
+    attachments = _drop_primary_artifact_text_sidecars(
+        _attachments_matching_contract(attachments, delivery_contract)
+    )
     unavailable_count = max(0, len(media_candidates) - len(attachments))
     if not attachments:
         return PlatformDelivery(

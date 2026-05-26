@@ -164,6 +164,28 @@ SKILL_PACK_CATALOG: tuple[SkillPackCatalogEntry, ...] = (
         setup_hint="Enable memory, reminders, and scheduled tasks according to the access level you want.",
     ),
     SkillPackCatalogEntry(
+        pack_id="maton-ai/api-gateway-skill",
+        name="Maton API Gateway",
+        source_url="built-in",
+        status="built-in",
+        summary="Optional connector gateway reference for supported account/API workflows.",
+        coverage=(
+            "Gateway-backed account/API workflows",
+            "Read-only connector checks before write actions",
+            "Fallback to other typed tools or numbered setup options when the gateway is unavailable",
+        ),
+        setup_hint="Add a Maton connector provider credential when using this gateway for account access.",
+        required_tools=("connector_request",),
+        auth_providers=(
+            SkillPackAuthProvider(
+                provider_id="skill_pack_connector_maton_ai_api_gateway_skill",
+                name="Maton API Gateway",
+                credential_policy="admin_decides",
+                notes="Optional connector gateway when configured; other installed connector skills remain supported.",
+            ),
+        ),
+    ),
+    SkillPackCatalogEntry(
         pack_id="nullion/connector-skills",
         name="Connector/API Skills",
         source_url="built-in",
@@ -211,6 +233,7 @@ _AUTH_PATTERN = re.compile(
     r"\b(api[-_\s]?key|auth(?:entication|orization)?|oauth|token|secret|credential|bearer|login)\b",
     re.IGNORECASE,
 )
+_RECOMMENDED_AUTH_PROVIDER_ORDER: dict[str, int] = {}
 
 
 def _provider_id_looks_external_connector(provider_id: object) -> bool:
@@ -260,9 +283,32 @@ def builtin_nullion_skill_pack_ids() -> tuple[str, ...]:
     return tuple(entry.pack_id for entry in SKILL_PACK_CATALOG if entry.source_url == "built-in")
 
 
+def is_builtin_nullion_skill_pack_id(pack_id: str) -> bool:
+    normalized = str(pack_id or "").strip().lower()
+    return normalized in set(builtin_nullion_skill_pack_ids())
+
+
 def default_enabled_skill_pack_ids() -> tuple[str, ...]:
-    """Skill packs enabled by default; users can disable any of them in setup or Settings."""
+    """Skill packs that are always present in every Nullion install."""
     return builtin_nullion_skill_pack_ids()
+
+
+def normalize_enabled_skill_pack_ids(enabled_pack_ids: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Return enabled pack ids with core built-ins preserved.
+
+    Built-in Nullion packs are not optional add-ons. They are part of the
+    shipped runtime and must survive empty env files, older saved settings, and
+    direct config API writes.
+    """
+    ordered: list[str] = list(default_enabled_skill_pack_ids())
+    seen = set(ordered)
+    for raw in enabled_pack_ids:
+        pack_id = str(raw or "").strip().lower()
+        if not pack_id or pack_id in seen:
+            continue
+        ordered.append(pack_id)
+        seen.add(pack_id)
+    return tuple(ordered)
 
 
 def get_skill_pack_catalog_entry(pack_id: str) -> SkillPackCatalogEntry | None:
@@ -302,12 +348,14 @@ def list_available_skill_packs() -> tuple[SkillPackCatalogEntry, ...]:
 def list_skill_pack_auth_providers() -> tuple[dict[str, object], ...]:
     providers: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
+    seen_provider_ids: set[str] = set()
     for entry in list_available_skill_packs():
         for provider in entry.auth_providers:
             key = (entry.pack_id, provider.provider_id)
-            if key in seen:
+            if key in seen or provider.provider_id in seen_provider_ids:
                 continue
             seen.add(key)
+            seen_provider_ids.add(provider.provider_id)
             providers.append({
                 "skill_pack_id": entry.pack_id,
                 "skill_name": entry.name,
@@ -326,9 +374,10 @@ def list_skill_pack_auth_providers() -> tuple[dict[str, object], ...]:
             if not getattr(connection, "active", True) or not _provider_id_looks_external_connector(provider_id):
                 continue
             key = ("nullion/connector-skills", provider_id)
-            if key in seen:
+            if key in seen or provider_id in seen_provider_ids:
                 continue
             seen.add(key)
+            seen_provider_ids.add(provider_id)
             providers.append({
                 "skill_pack_id": "nullion/connector-skills",
                 "skill_name": "Connector/API Skills",
@@ -341,7 +390,14 @@ def list_skill_pack_auth_providers() -> tuple[dict[str, object], ...]:
             })
     except Exception:
         pass
-    return tuple(providers)
+    ordered = sorted(
+        enumerate(providers),
+        key=lambda item: (
+            _RECOMMENDED_AUTH_PROVIDER_ORDER.get(str(item[1].get("provider_id") or ""), 100),
+            item[0],
+        ),
+    )
+    return tuple(provider for _index, provider in ordered)
 
 
 def skill_pack_access_prompt(
@@ -429,8 +485,10 @@ __all__ = [
     "builtin_nullion_skill_pack_ids",
     "default_enabled_skill_pack_ids",
     "get_skill_pack_catalog_entry",
+    "is_builtin_nullion_skill_pack_id",
     "list_skill_pack_auth_providers",
     "list_available_skill_packs",
     "list_skill_pack_catalog",
+    "normalize_enabled_skill_pack_ids",
     "skill_pack_access_prompt",
 ]

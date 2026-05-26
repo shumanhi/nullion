@@ -296,10 +296,11 @@ def _tool_scope_decision_for_clause(clause: str) -> ToolScopeDecision:
     if _clause_has_url_target(clause):
         scope.append("web_fetch")
         evidence.append("url_target")
-    requested_extension = plan_attachment_format(clause).extension
+    attachment_plan = plan_attachment_format(clause)
+    requested_extension = attachment_plan.extension
     if requested_extension == ".pdf":
         scope.append("pdf_create")
-        evidence.append("literal_extension")
+        evidence.append(attachment_plan.evidence or "literal_extension")
     return ToolScopeDecision(
         tool_scope=tuple(dict.fromkeys(scope)),
         evidence=tuple(dict.fromkeys(evidence)),

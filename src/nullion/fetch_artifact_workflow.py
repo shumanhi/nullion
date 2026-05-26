@@ -42,6 +42,7 @@ class FetchArtifactState(TypedDict, total=False):
     tool_results: list[ToolResult]
     registry: ToolRegistry | None
     principal_id: str | None
+    requested_extension: str | None
     extension: str | None
     content: str | None
     source_url: str | None
@@ -59,6 +60,7 @@ def run_fetch_artifact_workflow(
     tool_results: list[ToolResult] | tuple[ToolResult, ...],
     registry: ToolRegistry | None = None,
     principal_id: str | None = None,
+    requested_extension: str | None = None,
 ) -> FetchArtifactWorkflowResult:
     """Create a requested artifact from completed fetch/tool output."""
 
@@ -70,6 +72,7 @@ def run_fetch_artifact_workflow(
             "tool_results": list(tool_results),
             "registry": registry,
             "principal_id": principal_id,
+            "requested_extension": requested_extension,
             "artifact_paths": [],
             "write_attempts": 0,
         },
@@ -102,10 +105,50 @@ def _compiled_fetch_artifact_workflow():
 
 
 def _plan_node(state: FetchArtifactState) -> dict[str, object]:
-    extension = plan_attachment_format(state.get("prompt") or "").extension
+    requested_extension = _normalize_supported_fetch_extension(state.get("requested_extension"))
+    extension = requested_extension or plan_attachment_format(state.get("prompt") or "").extension
+    if extension not in _SUPPORTED_FETCH_ARTIFACT_EXTENSIONS:
+        extension = _source_fetch_destination_extension(state.get("prompt") or "")
     if extension not in _SUPPORTED_FETCH_ARTIFACT_EXTENSIONS:
         return {"extension": None}
     return {"extension": extension, "error": None}
+
+
+def _normalize_supported_fetch_extension(extension: object) -> str | None:
+    normalized = str(extension or "").strip().lower()
+    if normalized and not normalized.startswith("."):
+        normalized = f".{normalized}"
+    return normalized if normalized in _SUPPORTED_FETCH_ARTIFACT_EXTENSIONS else None
+
+
+def _source_fetch_destination_extension(prompt: str) -> str | None:
+    if re.search(
+        r"(https?://|www\.|[a-z0-9][a-z0-9-]*\.(?:com|org|net|io|co|gov|edu|ai|dev|app)\b)",
+        str(prompt or ""),
+        flags=re.IGNORECASE,
+    ) is None:
+        return None
+    for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(prompt or "")):
+        token = _token_around_fetch_extension(str(prompt or ""), match.start(), match.end())
+        if "/" in token or "\\" in token or "=" in token:
+            continue
+        extension = f".{match.group(1).lower()}"
+        if extension in _SUPPORTED_FETCH_ARTIFACT_EXTENSIONS:
+            # This workflow only materializes completed fetch/tool output, so a
+            # URL plus a bare destination filename is output evidence here. The
+            # shared attachment planner stays stricter for ordinary file paths.
+            return extension
+    return None
+
+
+def _token_around_fetch_extension(text: str, start: int, end: int) -> str:
+    left = start
+    while left > 0 and not text[left - 1].isspace():
+        left -= 1
+    right = end
+    while right < len(text) and not text[right].isspace():
+        right += 1
+    return text[left:right].strip("`'\"<>(),;:")
 
 
 def _extract_content_node(state: FetchArtifactState) -> dict[str, object]:

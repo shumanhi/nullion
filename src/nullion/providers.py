@@ -646,7 +646,12 @@ def _model_image_extract_text(provider: str, model: str, path: str) -> dict[str,
 
 def _local_image_generate(prompt: str, output_path: str, size: str | None, source_path: str | None = None) -> dict[str, object]:
     if _media_capability_disabled("NULLION_IMAGE_GENERATE_ENABLED"):
-        raise RuntimeError("image_generate provider is not configured")
+        return _fallback_svg_image_generate(
+            prompt,
+            output_path,
+            size,
+            fallback_error="image_generate model provider is disabled; configure an image-generation model for raster output.",
+        )
     template = os.environ.get("NULLION_IMAGE_GENERATE_COMMAND", "").strip()
     if template:
         try:
@@ -719,6 +724,7 @@ def _fallback_svg_image_generate(
         "provider": "local_svg_fallback",
         "size": size,
         "fallback_used": True,
+        "setup": "Configure an LLM/image provider that supports image generation for raster output.",
         **({"fallback_error": fallback_error} if fallback_error else {}),
     }
 
@@ -1562,9 +1568,8 @@ def resolve_plugin_provider_kwargs(*, plugin_name: str, provider_name: str) -> d
             return {
                 "audio_transcriber": _local_audio_transcribe,
                 "image_text_extractor": _local_image_extract_text,
-                "image_generator": None
-                if _media_capability_disabled("NULLION_IMAGE_GENERATE_ENABLED")
-                else _local_image_generate,
+                "image_generator": _local_image_generate,
+                "image_generation_enabled": not _media_capability_disabled("NULLION_IMAGE_GENERATE_ENABLED"),
             }
         raise ValueError(f"unknown provider binding for media_plugin: {provider_name}")
     raise ValueError(f"unsupported plugin provider resolution: {plugin_name}")

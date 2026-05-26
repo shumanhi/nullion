@@ -86,8 +86,10 @@ def normalize_verbose_mode(mode: str) -> str:
     return normalized
 
 
-def verbose_mode(*, default_activity_trace: bool = False, default_planner_feed: str = "task") -> str:
-    _ = default_planner_feed
+def verbose_mode(*, default_activity_trace: bool = False) -> str:
+    # /verbose is intentionally activity-only. Planner/task cards are product
+    # status surfaces and must be delivered by task-status state, not hidden
+    # because a user disabled detailed tool chatter.
     activity_enabled = activity_trace_enabled(default=default_activity_trace)
     return "on" if activity_enabled else "off"
 
@@ -186,6 +188,8 @@ def format_tool_inventory_activity_detail(
 def format_tool_results_activity_detail(tool_results: Iterable[Any]) -> str:
     lines: list[str] = []
     for result in tool_results or ():
+        if should_suppress_tool_activity(result):
+            continue
         status = str(_tool_field(result, "status", "unknown") or "unknown")
         tool_name = str(_tool_field(result, "tool_name", "tool") or "tool")
         detail = _short_tool_detail(result)
@@ -265,8 +269,10 @@ def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
         count = len(crons)
         return f"{count} scheduled task{'s' if count != 1 else ''}"
     if normalized_tool == "run_cron":
-        delivery_status = output.get("delivery_status")
+        delivery_status = output.get("delivery_status") or output.get("cron_delivery_status")
         if isinstance(delivery_status, str) and delivery_status.strip():
+            if delivery_status.strip().lower() == "deferred":
+                return "background run started"
             return f"delivery {delivery_status.strip()[:80]}"
         name = output.get("name")
         if isinstance(name, str) and name.strip():

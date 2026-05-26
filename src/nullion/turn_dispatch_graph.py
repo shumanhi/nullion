@@ -17,6 +17,7 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from .conversation_runtime import ConversationTurnDisposition
+from .turn_relationship_evidence import has_structured_turn_relationship_evidence
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class _TurnDispatchState(TypedDict, total=False):
     text: str
     active_turn_ids: tuple[str, ...]
     active_turn_texts: tuple[str, ...]
+    structured_followup_evidence: bool
     model_client: object | None
     disposition: ConversationTurnDisposition
     disposition_reason: str
@@ -207,19 +209,37 @@ def _classify_node(state: _TurnDispatchState) -> dict[str, object]:
         reason = "no_active_turn"
         target_active_turn_index = None
     else:
-        model_decision = _model_turn_disposition(
-            model_client=state.get("model_client"),
-            current_text=str(state.get("text") or ""),
-            active_turn_texts=tuple(state.get("active_turn_texts", ())),
+        has_structured_evidence = (
+            bool(state.get("structured_followup_evidence"))
+            or
+            has_structured_turn_relationship_evidence(str(state.get("text") or ""))
+            or any(has_structured_turn_relationship_evidence(text) for text in tuple(state.get("active_turn_texts", ())))
         )
-        if model_decision is None:
+        model_create = getattr(state.get("model_client"), "create", None)
+        has_structured_model_route = callable(model_create) and len(active_turn_ids) > 1
+        if not has_structured_evidence and not has_structured_model_route:
+            # Concurrent-turn dispatch must fail open unless either the new turn
+            # or active runtime task has typed evidence, or a structured model
+            # route is available to classify against the active task state. This
+            # preserves the no-active-turn fast path while avoiding prose-only
+            # local heuristics for follow-ups.
             disposition = ConversationTurnDisposition.INDEPENDENT
-            reason = "no_structured_dispatch_decision"
+            reason = "no_structured_dispatch_evidence"
             target_active_turn_index = None
         else:
-            disposition = model_decision.disposition
-            reason = model_decision.reason
-            target_active_turn_index = model_decision.target_active_turn_index
+            model_decision = _model_turn_disposition(
+                model_client=state.get("model_client"),
+                current_text=str(state.get("text") or ""),
+                active_turn_texts=tuple(state.get("active_turn_texts", ())),
+            )
+            if model_decision is None:
+                disposition = ConversationTurnDisposition.INDEPENDENT
+                reason = "no_structured_dispatch_decision"
+                target_active_turn_index = None
+            else:
+                disposition = model_decision.disposition
+                reason = model_decision.reason
+                target_active_turn_index = model_decision.target_active_turn_index
     return {
         "disposition": disposition,
         "disposition_reason": reason,
@@ -290,6 +310,7 @@ def route_turn_dispatch_with_context(
     *,
     active_turn_ids: tuple[str, ...] = (),
     active_turn_texts: tuple[str, ...] = (),
+    structured_followup_evidence: bool = False,
     model_client: object | None = None,
 ) -> TurnDispatchDecision:
     final_state = _compiled_turn_dispatch_graph().invoke(
@@ -297,6 +318,7 @@ def route_turn_dispatch_with_context(
             "text": text,
             "active_turn_ids": tuple(active_turn_ids),
             "active_turn_texts": tuple(active_turn_texts),
+            "structured_followup_evidence": bool(structured_followup_evidence),
             "model_client": model_client,
         },
         config={"configurable": {"thread_id": "turn-dispatch"}},

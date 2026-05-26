@@ -39,6 +39,7 @@ ATTACHMENT_TOKEN_EXTENSIONS: dict[str, str] = {
     "mp4": ".mp4",
     "mpeg": ".mpeg",
     "mpg": ".mpg",
+    "numbers": ".numbers",
     "oga": ".oga",
     "ogg": ".ogg",
     "opus": ".opus",
@@ -77,6 +78,17 @@ _DOMAIN_SUFFIX_EXTENSIONS = frozenset(
 )
 _ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS_ENV = "NULLION_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS"
 _DEFAULT_ATTACHMENT_FORMAT_MODEL_TIMEOUT_SECONDS = 3.0
+_STRUCTURED_ARTIFACT_EXTENSION_KEYS = frozenset({
+    "artifact",
+    "artifact_file",
+    "artifact_path",
+    "attachment",
+    "attachment_file",
+    "attachment_path",
+    "output",
+    "output_file",
+    "output_path",
+})
 logger = logging.getLogger(__name__)
 
 
@@ -88,7 +100,10 @@ class AttachmentFormatPlan:
 
 class AttachmentFormatState(TypedDict, total=False):
     text: str
+    include_format_tokens: bool
+    include_filename_suffixes: bool
     extensions: list[str]
+    extension_evidence: str
     plan: AttachmentFormatPlan
 
 
@@ -180,7 +195,8 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                 "Identify whether this user request specifies a required attachment file format. "
                 "Call select_attachment_format with the result. "
                 "extension must be a literal file extension such as .pdf, .html, or .blend, or null. "
-                "Use null when no attachment file format is specified."
+                "Use null when no attachment file format is specified, or when a format is only "
+                "mentioned as excluded, forbidden, unavailable, or an example of what not to create."
             ),
         }
         try:
@@ -238,7 +254,7 @@ def _token_around(text: str, start: int, end: int) -> str:
     right = end
     while right < len(text) and not text[right].isspace():
         right += 1
-    return text[left:right].strip("`'\"<>(),;:")
+    return text[left:right].strip("`'\"<>(),;:?!")
 
 
 def _extension_candidate_priority(token: str) -> int:
@@ -256,8 +272,22 @@ def _is_hidden_path_component_extension(token: str, raw_extension: str) -> bool:
     parts = tuple(part for part in re.split(r"[\\/]+", token) if part)
     if not parts:
         return False
+    if any(part.lower() == f".{raw_extension.lower()}" for part in parts):
+        return True
     basename = parts[-1].split("=", 1)[-1]
     return basename.lower() == f".{raw_extension.lower()}"
+
+
+def _has_structured_attachment_extension_evidence(token: str) -> bool:
+    value = str(token or "").strip()
+    if _GENERIC_EXTENSION_RE.fullmatch(value):
+        return True
+    key, separator, _raw_value = value.partition("=")
+    key = key.strip().lower().replace("-", "_")
+    if separator and key in _STRUCTURED_ARTIFACT_EXTENSION_KEYS:
+        return True
+    parts = tuple(part.lower() for part in re.split(r"[\\/]+", value) if part)
+    return "artifacts" in parts
 
 
 def _extension_from_match(token: str, raw_extension: str) -> str | None:
@@ -284,22 +314,19 @@ def _extension_from_match(token: str, raw_extension: str) -> str | None:
     basename = re.split(r"[\\/]+", token)[-1].lower()
     if basename == f".{normalized}" and ("/" in token or "\\" in token or token.startswith("~")):
         return None
+    has_attachment_evidence = _has_structured_attachment_extension_evidence(token)
     if mapped is not None:
-        return mapped
+        # A bare filename like report.xlsx can be a source-file reference. Only
+        # promote suffixes to artifact requirements when the token itself is an
+        # extension or an artifact/output descriptor; otherwise downstream tool
+        # scoping may create a new file instead of finding the existing one.
+        return mapped if has_attachment_evidence else None
     extension = f".{normalized}"
     if _GENERIC_EXTENSION_RE.fullmatch(extension) is None:
         return None
     if is_domain_suffix_extension(extension):
         return None
-    parts = tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
-    has_path_evidence = (
-        token.startswith(".")
-        or "/" in token
-        or "\\" in token
-        or "artifacts" in parts
-        or "files" in parts
-    )
-    return extension if has_path_evidence else None
+    return extension if has_attachment_evidence else None
 
 
 def _explicit_extensions(text: str) -> list[str]:
@@ -320,14 +347,67 @@ def _explicit_extensions(text: str) -> list[str]:
     return seen
 
 
+def _format_token_extensions(text: str) -> list[str]:
+    candidates: list[str] = []
+    value = str(text or "")
+    for match in re.finditer(r"(?<![\w.])([A-Za-z0-9]{2,12})(?![\w/-])", value):
+        token = match.group(1).lower()
+        extension = ATTACHMENT_TOKEN_EXTENSIONS.get(token)
+        if not extension or is_domain_suffix_extension(extension):
+            continue
+        if extension not in candidates:
+            candidates.append(extension)
+    return candidates
+
+
+def _filename_suffix_extensions(text: str) -> list[str]:
+    candidates: list[str] = []
+    value = str(text or "")
+    for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", value):
+        token = _token_around(value, match.start(), match.end())
+        if (
+            not token
+            or "://" in token
+            or "/" in token
+            or "\\" in token
+            or token.startswith(("~", "."))
+        ):
+            continue
+        stem, _dot, raw_extension = token.rpartition(".")
+        if not stem or not raw_extension:
+            continue
+        extension = ATTACHMENT_TOKEN_EXTENSIONS.get(raw_extension.lower())
+        if not extension or is_domain_suffix_extension(extension):
+            continue
+        if extension not in candidates:
+            candidates.append(extension)
+    return candidates
+
+
 def _normalize_node(state: AttachmentFormatState) -> dict[str, object]:
-    return {"extensions": _explicit_extensions(state.get("text") or "")}
+    explicit = _explicit_extensions(state.get("text") or "")
+    if explicit:
+        return {"extensions": explicit, "extension_evidence": "literal_extension"}
+    if bool(state.get("include_filename_suffixes")):
+        filename_suffixes = _filename_suffix_extensions(state.get("text") or "")
+        if filename_suffixes:
+            return {"extensions": filename_suffixes, "extension_evidence": "filename_suffix"}
+    if not bool(state.get("include_format_tokens")):
+        return {"extensions": []}
+    # File-format tokens are structured artifact descriptors, not task-routing
+    # prose. Keep this limited to the registered extension table so generic
+    # phrases like "spreadsheet deliverable" still need model-structured evidence.
+    format_tokens = _format_token_extensions(state.get("text") or "")
+    if format_tokens:
+        return {"extensions": format_tokens, "extension_evidence": "format_token"}
+    return {"extensions": []}
 
 
 def _extension_token_node(state: AttachmentFormatState) -> dict[str, object]:
     extensions = state.get("extensions") or []
     if extensions:
-        return {"plan": AttachmentFormatPlan(extension=extensions[0], evidence="literal_extension")}
+        evidence = state.get("extension_evidence") or "literal_extension"
+        return {"plan": AttachmentFormatPlan(extension=extensions[0], evidence=evidence)}
     return {}
 
 
@@ -350,9 +430,19 @@ def _compiled_attachment_format_graph():
     return graph.compile()
 
 
-def plan_attachment_format(text: str, *, model_client: object | None = None) -> AttachmentFormatPlan:
+def plan_attachment_format(
+    text: str,
+    *,
+    model_client: object | None = None,
+    include_format_tokens: bool = False,
+    include_filename_suffixes: bool = False,
+) -> AttachmentFormatPlan:
     final_state = _compiled_attachment_format_graph().invoke(
-        {"text": text},
+        {
+            "text": text,
+            "include_format_tokens": include_format_tokens,
+            "include_filename_suffixes": include_filename_suffixes,
+        },
         config={"configurable": {"thread_id": "attachment-format-plan"}},
     )
     plan = final_state.get("plan")

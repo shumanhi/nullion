@@ -268,6 +268,18 @@ def _task_frame_start_or_continue_node(state: _TaskFrameContinuationState) -> di
             execution=None,
             finish=None,
         )}
+    if getattr(active_frame, "status", TaskFrameStatus.RUNNING) is TaskFrameStatus.WAITING_INPUT:
+        # A waiting-input frame means the product explicitly asked a follow-up
+        # question. The next answer must resume that same task instead of being
+        # reclassified as an unrelated chat turn.
+        return {"decision": TaskFrameContinuationDecision(
+            mode=TaskFrameContinuationMode.CONTINUE,
+            operation=active_frame.operation,
+            target=active_frame.target,
+            output=active_frame.output,
+            execution=active_frame.execution,
+            finish=active_frame.finish,
+        )}
     return {}
 
 

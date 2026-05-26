@@ -172,6 +172,12 @@ def format_approval_detail_markdown(detail: str) -> str:
             prefix = match.group("prefix").strip()
             value = match.group("value").strip()
             label = key if key == "URL" else key.capitalize()
+            if key.lower() in {"command", "script", "code"}:
+                language = "bash" if key.lower() == "command" else ""
+                fence_label = f"```{language}\n" if language else "```\n"
+                if prefix:
+                    return f"{prefix} · {label}:\n{fence_label}{value}\n```"
+                return f"{label}:\n{fence_label}{value}\n```"
             if prefix:
                 return f"{prefix} · {label}:\n{approval_inline_code(value)}"
             return f"{label}:\n{approval_inline_code(value)}"
@@ -192,6 +198,30 @@ def _metadata_detail(context: dict[str, object]) -> str:
     if description and meta:
         return f"{description} {' · '.join(meta)}."
     return description
+
+
+def _tool_argument_detail(context: dict[str, object], *, tool_name: str) -> str | None:
+    arguments = context.get("tool_arguments")
+    if not isinstance(arguments, dict):
+        return None
+    ordered_keys = (
+        ("command", "Command"),
+        ("cmd", "Command"),
+        ("script", "Script"),
+        ("code", "Code"),
+        ("url", "URL"),
+        ("path", "Path"),
+        ("target", "Target"),
+        ("query", "Query"),
+        ("operation", "Operation"),
+    )
+    for key, label in ordered_keys:
+        value = _string(arguments.get(key))
+        if value and not _approval_placeholder(value):
+            return f"{label}: {value}"
+    if tool_name in {"terminal_exec", "run_shell", "execute_code"}:
+        return "Command details were not provided by the runtime."
+    return None
 
 
 def _email_send_review_detail(context: dict[str, object]) -> str | None:
@@ -306,7 +336,11 @@ def approval_display_from_request(approval: Any) -> ApprovalDisplay:
         else:
             detail = "Boundary request" + (f" · Target: {target}" if target else "")
     else:
-        detail = _metadata_detail(context) or _string(context.get("resource") or resource or getattr(approval, "reason", ""))
+        detail = (
+            _tool_argument_detail(context, tool_name=tool_name)
+            or _metadata_detail(context)
+            or _string(context.get("resource") or resource or getattr(approval, "reason", ""))
+        )
         is_web = tool_name in _WEB_ACCESS_TOOLS
 
     title = approval_title_for(

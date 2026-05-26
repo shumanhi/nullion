@@ -45,8 +45,40 @@ _LOCAL_WINDOWS_PATH_RE = re.compile(
 )
 _PRESERVE_DIRECTIVE_PREFIXES = ("MEDIA:", "ARTIFACT:")
 _RAW_FUNCTION_CALL_RE = re.compile(
-    r"<\s*function\b[\s\S]*?</\s*function\s*>|#\{\s*<\s*function\b[\s\S]*?</\s*function\s*>\s*\}",
+    r"<\s*function\b[\s\S]*?</\s*function\s*>"
+    r"|#\{\s*<\s*function\b[\s\S]*?</\s*function\s*>\s*\}"
+    r"|(?:^|\n)\s*/[A-Za-z0-9_./-]+(?:\?[^\n]*)?\s*\n\s*\[[a-z][a-z0-9_]{2,}\]\s*=\s*\\?\{[\s\S]*?/function\b",
     flags=re.IGNORECASE,
+)
+_INTERNAL_SLASH_COMMAND_RE = re.compile(r"^/([A-Za-z_][A-Za-z0-9_]*)\b[^\n]*$")
+_INTERNAL_TOOL_CALL_TEXT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|\s+)[^\n]*$")
+_INTERNAL_ARGUMENT_FRAGMENT_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.:@/-]{2,80}\s*;\s*)?"
+    r"[A-Za-z_][A-Za-z0-9_.-]{0,40}\s*=\s*[^;\n]+"
+    r"(?:\s*;\s*[A-Za-z_][A-Za-z0-9_.-]{0,40}\s*=\s*[^;\n]+)*\s*;?$"
+)
+_COMMON_INTERNAL_TOOL_COMMAND_HEADS = frozenset(
+    {
+        "list_crons",
+        "run_cron",
+        "create_cron",
+        "update_cron",
+        "delete_cron",
+        "email_search",
+        "email_read",
+        "email_send",
+        "calendar_list",
+        "file_search",
+        "file_read",
+        "file_write",
+        "terminal_exec",
+        "connector_request",
+        "skill_pack_read",
+        "web_search",
+        "web_fetch",
+        "weather_forecast",
+        "image_generate",
+    }
 )
 
 
@@ -74,12 +106,15 @@ def sanitize_user_visible_reply(
     raw = _sanitize_account_tool_transport_details(raw, results)
     raw = _sanitize_internal_tool_state_phrasing(raw, results)
     raw = _sanitize_account_tool_family_drift(raw, results)
+    raw = _sanitize_read_only_email_result_drift(raw, results)
     raw = _prefix_account_tool_reply(raw, results)
     if numbered_reply := _structured_numbered_choice_reply(results):
         return numbered_reply
     if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
         return cron_list_reply
     if _looks_like_raw_function_markup(raw):
+        return safe_raw_tool_payload_replacement(tool_results=results, source=source)
+    if is_internal_tool_command_fragment_reply(reply=raw):
         return safe_raw_tool_payload_replacement(tool_results=results, source=source)
     parsed = _parse_bare_structured_payload(raw)
     if parsed is None:
@@ -94,6 +129,54 @@ def _has_completed_tool_result(results: Iterable[ToolResult], tool_name: str) ->
         if getattr(result, "tool_name", None) == tool_name and str(getattr(result, "status", None)) == "completed":
             return True
     return False
+
+
+def is_internal_tool_command_fragment_reply(
+    *,
+    reply: str | None,
+    registered_tool_names: Iterable[object] | None = None,
+) -> bool:
+    """Detect internal tool-command fragments that are not user-visible answers.
+
+    This looks only at the model's proposed final answer and optional registered
+    tool names. It is not a user-intent router; it is a delivery boundary that
+    prevents pseudo tool calls like `/list_crons name=...` or `query=...;
+    count=10` from being sent to users instead of a real tool result.
+    """
+
+    if reply is None:
+        return False
+    text = str(reply or "").strip()
+    if not text or len(text) > 300:
+        return False
+    if "\n" in text:
+        return False
+    registered = {
+        str(name or "").strip()
+        for name in (registered_tool_names or ())
+        if str(name or "").strip()
+    }
+    if slash := _INTERNAL_SLASH_COMMAND_RE.fullmatch(text):
+        head = slash.group(1)
+        if _is_public_operator_command(text):
+            return False
+        return head in registered or head in _COMMON_INTERNAL_TOOL_COMMAND_HEADS or "_" in head
+    if call := _INTERNAL_TOOL_CALL_TEXT_RE.fullmatch(text):
+        head = call.group(1)
+        if head in registered or head in _COMMON_INTERNAL_TOOL_COMMAND_HEADS:
+            return True
+    if _INTERNAL_ARGUMENT_FRAGMENT_RE.fullmatch(text):
+        return True
+    return False
+
+
+def _is_public_operator_command(text: str) -> bool:
+    try:
+        from nullion.operator_commands import is_operator_command_text
+
+        return is_operator_command_text(text)
+    except Exception:
+        return False
 
 
 def _cron_list_reply_over_empty_reminder_drift(text: str, results: list[ToolResult]) -> str | None:
@@ -157,10 +240,12 @@ _ACCOUNT_TRANSPORT_LINE_RE = re.compile(
 )
 _ACCOUNT_CONNECTOR_DIAGNOSTIC_SENTENCE_RE = re.compile(
     r"(?:(?:^|(?<=[.!?])\s+))"
-    r"[^.!?]*(?:lower-level\s+connector\s+route|connector\s+URL\s+policy|connector\s+request|api\.maton\.ai|HTTP\s+Error\s+\d{3})"
+    r"[^.!?]*(?:lower-level\s+connector\s+route|connector\s+URL\s+policy|connector\s+request|connector\s+path|"
+    r"connector\s+endpoint|endpoint\s+I\s+tried|api\.maton\.ai|HTTP\s+Error\s+\d{3}|\b\d{3}\s+Not\s+Found\b)"
     r"[^.!?]*[.!?]?",
     flags=re.IGNORECASE,
 )
+_LEADING_CONTRAST_TRANSITION_RE = re.compile(r"^\s*(?:however|but),\s+", flags=re.IGNORECASE)
 _INTERNAL_TOOL_STATE_START_RE = re.compile(
     r"^\s*(?:"
     r"Completed\s+the\s+required\s+tool\s+step\.\s*|"
@@ -223,6 +308,7 @@ def _sanitize_account_tool_transport_details(text: str, results: list[ToolResult
     ]
     cleaned = "\n".join(lines).strip()
     cleaned = _ACCOUNT_CONNECTOR_DIAGNOSTIC_SENTENCE_RE.sub("", cleaned).strip()
+    cleaned = _LEADING_CONTRAST_TRANSITION_RE.sub("", cleaned).strip()
     if not cleaned or cleaned.lower().startswith("if you want"):
         return _account_tool_summary(results) or cleaned
     return cleaned
@@ -249,6 +335,28 @@ def _sanitize_account_tool_family_drift(text: str, results: list[ToolResult]) ->
         if _reply_mentions_account_family_evidence(text, results, family):
             return _account_tool_summary(results) or text
     return text
+
+
+def _sanitize_read_only_email_result_drift(text: str, results: list[ToolResult]) -> str:
+    if _primary_account_tool_family(results) != "email":
+        return text
+    read_results = [
+        result
+        for result in results
+        if result.tool_name in {"email_search", "email_read"}
+        and result.status == "completed"
+        and isinstance(result.output, dict)
+    ]
+    if not read_results or _has_completed_tool_result(results, "email_send"):
+        return text
+    # A successful read-only account tool is the contract for the final answer.
+    # If the model ignores every returned sender/subject/snippet, use the
+    # deterministic tool-result summary instead of letting unrelated email
+    # write/send guidance leak into the visible reply.
+    if _reply_mentions_account_family_evidence(text, read_results, "email"):
+        return text
+    summary = _account_tool_summary(read_results)
+    return summary or text
 
 
 def _primary_account_tool_family(results: list[ToolResult]) -> str | None:
@@ -637,6 +745,11 @@ def safe_raw_tool_payload_replacement(
     parsed_payload: Any | None = None,
 ) -> str:
     results = list(tool_results or ())
+    # If the model falls back to raw/internal payload text, prefer a stable
+    # summary built from typed tool results. This keeps connector/file details
+    # useful without leaking transport dumps or internal state files.
+    if directory_summary := _file_read_directory_payload_summary(results):
+        return directory_summary
     if file_search_summary := _file_search_payload_summary(results):
         return file_search_summary
     if connector_summary := _connector_request_payload_summary(results, parsed_payload=parsed_payload):
@@ -656,9 +769,8 @@ def safe_raw_tool_payload_replacement(
     else:
         detail = ""
     return (
-        f"I blocked a raw structured payload from {source} output before sending it here."
-        f"{tool_sentence}{detail} Please ask me to summarize the result or rerun a focused check, "
-        "and I’ll return a human-readable answer instead of the raw data."
+        "I could not produce a verified user-facing result from the available tool evidence."
+        f"{tool_sentence}{detail} No raw internal payload was sent."
     )
 
 
@@ -861,6 +973,31 @@ def _file_search_payload_summary(results: list[ToolResult]) -> str | None:
         count = len(safe_names)
         noun = "file" if count == 1 else "files"
         return f"I found {count} matching {noun}: {shown}."
+    return None
+
+
+def _file_read_directory_payload_summary(results: list[ToolResult]) -> str | None:
+    for result in reversed(results):
+        if result.tool_name != "file_read" or result.status != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("is_directory") is not True:
+            continue
+        entries = output.get("entries")
+        names = [str(item).strip() for item in entries if isinstance(item, str) and str(item).strip()] if isinstance(entries, list) else []
+        if not names:
+            return "That path is a folder, but I could not list any files inside it."
+        shown = ", ".join(f"`{Path(name).name}`" for name in names[:10])
+        entry_count = output.get("entry_count")
+        try:
+            total = int(entry_count)
+        except (TypeError, ValueError):
+            total = len(names)
+        extra = max(0, total - min(total, 10))
+        if extra:
+            shown += f", and {extra} more"
+        noun = "entry" if total == 1 else "entries"
+        return f"That path is a folder. I found {total} {noun}: {shown}."
     return None
 
 

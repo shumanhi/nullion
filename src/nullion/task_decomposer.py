@@ -263,9 +263,20 @@ class TaskDecomposer:
             else:
                 initial_status = TaskStatus.QUEUED
 
+            explicit_metadata = dict(dt.metadata or {})
+            # Some runtime plans intentionally expose a broad fallback tool set
+            # while a narrower typed context explains what the worker should do.
+            # Do not infer artifact/research profiles from every fallback tool in
+            # that case, or scheduled/text-only work can be pushed into file
+            # creation just because file_write happens to be available.
+            inferred_metadata = (
+                {}
+                if explicit_metadata.get("skip_tool_profile_inference")
+                else deep_agent_task_metadata_for_tools(dt.tool_scope, tool_profile_metadata)
+            )
             task_metadata = {
-                **dict(dt.metadata or {}),
-                **deep_agent_task_metadata_for_tools(dt.tool_scope, tool_profile_metadata),
+                **inferred_metadata,
+                **explicit_metadata,
             }
             record = TaskRecord(
                 task_id=task_ids[i],
@@ -754,7 +765,25 @@ def _normalize_task_tool_scope_from_structured_evidence(
     )
 
 
-_ARTIFACT_PRODUCER_TOOLS = frozenset({"file_write", "pdf_create", "pdf_edit", "render", "image_generate"})
+_ARTIFACT_PRODUCER_TOOLS = frozenset({
+    "file_write",
+    "pdf_create",
+    "pdf_edit",
+    "presentation_create",
+    "spreadsheet_create",
+    "render",
+    "image_generate",
+})
+_GENERIC_ARTIFACT_FALLBACK_TOOLS = frozenset({"file_write", "terminal_exec"})
+_REQUIRED_ARTIFACT_KIND_TOOLS = {
+    "pdf": ("pdf_create", "pdf_edit"),
+    "ppt": ("presentation_create",),
+    "pptx": ("presentation_create",),
+    "xls": ("spreadsheet_create",),
+    "xlsx": ("spreadsheet_create",),
+    "csv": ("spreadsheet_create", "file_write"),
+    "tsv": ("spreadsheet_create", "file_write"),
+}
 _UNCHANGED = object()
 
 
@@ -776,6 +805,12 @@ def _with_artifact_verification_tasks(
         for task in tasks
     ):
         return tasks
+    tasks = _with_required_artifact_tool_scope(
+        tasks,
+        available_tools=available_tools,
+        required_artifact_kind=required_artifact_kind,
+    )
+    normalized_artifact_kind = _normalize_required_artifact_kind(required_artifact_kind)
     producer_indices = [
         index
         for index, task in enumerate(tasks)
@@ -791,7 +826,7 @@ def _with_artifact_verification_tasks(
                 **(
                     {
                         "requires_artifact_delivery": True,
-                        "required_artifact_kind": required_artifact_kind,
+                        "required_artifact_kind": normalized_artifact_kind,
                     }
                     if index in producer_indices
                     else {}
@@ -826,7 +861,7 @@ def _with_artifact_verification_tasks(
                 metadata={
                     "artifact_role": "verify",
                     "requires_artifact_delivery": True,
-                    "required_artifact_kind": required_artifact_kind,
+                    "required_artifact_kind": normalized_artifact_kind,
                 },
             )
         )
@@ -847,23 +882,135 @@ def _with_artifact_verification_tasks(
                 metadata={
                     "artifact_role": "deliver_receipt",
                     "requires_artifact_delivery": True,
-                    "required_artifact_kind": required_artifact_kind,
+                    "required_artifact_kind": normalized_artifact_kind,
                 },
             )
         )
     return result
 
 
+def _with_required_artifact_tool_scope(
+    tasks: list[DecomposedTask],
+    *,
+    available_tools: list[str],
+    required_artifact_kind: str | None,
+) -> list[DecomposedTask]:
+    required_tools = _artifact_tools_for_required_kind(required_artifact_kind, available_tools=available_tools)
+    if not required_tools:
+        return tasks
+    if any(set(task.tool_scope or ()).intersection(required_tools) for task in tasks):
+        return tasks
+
+    leaf_indices = _leaf_task_indices(tasks)
+    candidate_indices = [
+        index
+        for index, task in enumerate(tasks)
+        if index in leaf_indices
+        and set(str(tool).lower() for tool in (task.tool_scope or [])).intersection(
+            _ARTIFACT_PRODUCER_TOOLS | _GENERIC_ARTIFACT_FALLBACK_TOOLS
+        )
+    ]
+    if len(candidate_indices) == 1:
+        index = candidate_indices[0]
+        task = tasks[index]
+        updated = list(tasks)
+        # Structured artifact-kind contracts should expose the dedicated
+        # producer before broad fallbacks so workers do not jump straight to
+        # shell or text-file work for typed deliverables.
+        updated[index] = _copy_decomposed_task(
+            task,
+            tool_scope=_ordered_required_artifact_scope(
+                task.tool_scope,
+                required_tools=required_tools,
+            ),
+        )
+        return updated
+
+    if len(leaf_indices) == 1:
+        index = leaf_indices[0]
+        task = tasks[index]
+        updated = list(tasks)
+        updated[index] = _copy_decomposed_task(
+            task,
+            tool_scope=_ordered_required_artifact_scope(
+                task.tool_scope,
+                required_tools=required_tools,
+            ),
+        )
+        return updated
+
+    return [
+        *tasks,
+        DecomposedTask(
+            title="Create requested artifact",
+            description=(
+                "Create the requested typed artifact from the completed task context and save it "
+                "as a downloadable workspace file."
+            ),
+            tool_scope=list(required_tools),
+            priority=TaskPriority.HIGH,
+            dep_indices=leaf_indices,
+            context_key_in=None,
+            context_key_out=None,
+            required_inputs=[],
+            can_start=True,
+            metadata={
+                "requires_artifact_delivery": True,
+                "required_artifact_kind": _normalize_required_artifact_kind(required_artifact_kind),
+            },
+        ),
+    ]
+
+
+def _artifact_tools_for_required_kind(
+    required_artifact_kind: str | None,
+    *,
+    available_tools: list[str],
+) -> tuple[str, ...]:
+    normalized = _normalize_required_artifact_kind(required_artifact_kind)
+    if not normalized:
+        return ()
+    available = {str(tool).strip() for tool in available_tools if str(tool).strip()}
+    return tuple(
+        tool for tool in _REQUIRED_ARTIFACT_KIND_TOOLS.get(normalized, ()) if tool in available
+    )
+
+
+def _normalize_required_artifact_kind(required_artifact_kind: str | None) -> str | None:
+    normalized = str(required_artifact_kind or "").strip().lower().removeprefix(".")
+    return normalized or None
+
+
+def _leaf_task_indices(tasks: list[DecomposedTask]) -> list[int]:
+    dependency_indices = {
+        dep
+        for task in tasks
+        for dep in task.dep_indices
+        if isinstance(dep, int) and 0 <= dep < len(tasks)
+    }
+    return [index for index in range(len(tasks)) if index not in dependency_indices]
+
+
+def _ordered_required_artifact_scope(
+    existing_scope: list[str],
+    *,
+    required_tools: tuple[str, ...],
+) -> list[str]:
+    existing = [str(tool) for tool in (existing_scope or []) if str(tool).strip()]
+    return list(dict.fromkeys([*required_tools, *existing]))
+
+
 def _copy_decomposed_task(
     task: DecomposedTask,
     *,
     context_key_out: str | None | object = _UNCHANGED,
+    tool_scope: list[str] | tuple[str, ...] | object = _UNCHANGED,
     metadata: dict[str, object] | None = None,
 ) -> DecomposedTask:
     return DecomposedTask(
         title=task.title,
         description=task.description,
-        tool_scope=list(task.tool_scope),
+        tool_scope=list(task.tool_scope if tool_scope is _UNCHANGED else tool_scope),
         priority=task.priority,
         dep_indices=list(task.dep_indices),
         context_key_in=task.context_key_in,

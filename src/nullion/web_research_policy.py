@@ -14,6 +14,11 @@ _API_BACKED_SEARCH_PROVIDERS = {
     "google_search_provider",
     "perplexity_search_provider",
 }
+_KEYLESS_SEARCH_PROVIDERS = {
+    "builtin_search_provider",
+    "duckduckgo_instant_answer_provider",
+    "duckduckgo_search_provider",
+}
 
 
 def _truthy_env(name: str, *, default: bool = False) -> bool:

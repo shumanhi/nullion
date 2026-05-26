@@ -73,6 +73,14 @@ _INTERNAL_SCHEDULED_TASK_PREFIXES = (
     "[Scheduled task: ",
     "[Manual scheduled task run: ",
 )
+_INTERNAL_HISTORY_CONVERSATION_PREFIXES = (
+    "web:live-stage-contract:",
+    "web:prod-",
+    "web:stage-",
+    "web:test-",
+    "web:codex-",
+    "web:latency-",
+)
 
 
 def _is_internal_scheduled_task_context(text: str) -> bool:
@@ -195,6 +203,8 @@ def _collapse_adjacent_duplicate_bot_messages(messages: list[dict]) -> list[dict
 def _channel_label_for_conversation(conversation_id: str) -> str:
     if conversation_id == "web" or conversation_id.startswith("web:"):
         return "Web"
+    if conversation_id == "api" or conversation_id.startswith("api:"):
+        return "API"
     if conversation_id.startswith("telegram:"):
         return f"Telegram · {conversation_id.removeprefix('telegram:')}"
     if conversation_id.startswith("slack:"):
@@ -207,13 +217,24 @@ def _channel_label_for_conversation(conversation_id: str) -> str:
 def _channel_for_conversation(conversation_id: str) -> str:
     if conversation_id == "web" or conversation_id.startswith("web:"):
         return "web"
+    if conversation_id == "api" or conversation_id.startswith("api:"):
+        return "api"
     if conversation_id.startswith(("telegram:", "slack:", "discord:")):
         return conversation_id
     return conversation_id
 
 
 def _is_internal_history_conversation(conversation_id: str) -> bool:
-    return conversation_id.startswith("web:live-stage-contract:")
+    return conversation_id.startswith(_INTERNAL_HISTORY_CONVERSATION_PREFIXES)
+
+
+def _internal_history_sql_filter(alias: str = "c") -> str:
+    column = f"{alias}.id" if alias else "id"
+    return " AND ".join(f"{column} NOT LIKE ?" for _ in _INTERNAL_HISTORY_CONVERSATION_PREFIXES)
+
+
+def _internal_history_sql_args() -> tuple[str, ...]:
+    return tuple(f"{prefix}%" for prefix in _INTERNAL_HISTORY_CONVERSATION_PREFIXES)
 
 
 def _local_history_timezone() -> timezone | ZoneInfo:
@@ -447,10 +468,12 @@ class ChatStore:
         self,
         conv_id: str,
         *,
-        channel: str = "web",
-        channel_label: str = "Web",
+        channel: str | None = None,
+        channel_label: str | None = None,
     ) -> None:
         """Create a conversation record if it doesn't exist yet."""
+        channel = channel or _channel_for_conversation(conv_id)
+        channel_label = channel_label or _channel_label_for_conversation(conv_id)
         with self._connect() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO conversations
@@ -478,30 +501,36 @@ class ChatStore:
         Optionally filter by ``channel`` (e.g. ``'web'`` or ``'telegram:123'``).
         """
         started_at = perf_counter()
+        internal_filter = _internal_history_sql_filter("c")
+        internal_args = _internal_history_sql_args()
         with self._connect() as conn:
             if channel is None:
                 rows = conn.execute(
-                    """SELECT c.*, COUNT(m.id) AS message_count, MAX(m.id) AS latest_message_id
+                    f"""SELECT c.*, COUNT(m.id) AS message_count, MAX(m.id) AS latest_message_id
                        FROM conversations c
                        LEFT JOIN messages m ON m.conversation_id = c.id
-                       WHERE c.status = ? AND c.id NOT LIKE 'web:live-stage-contract:%'
+                       WHERE c.status = ? AND {internal_filter}
                        GROUP BY c.id
                        ORDER BY COALESCE(MAX(m.id), 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC
                        LIMIT ?""",
-                    (status, limit),
+                    (status, *internal_args, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT c.*, COUNT(m.id) AS message_count, MAX(m.id) AS latest_message_id
+                    f"""SELECT c.*, COUNT(m.id) AS message_count, MAX(m.id) AS latest_message_id
                        FROM conversations c
                        LEFT JOIN messages m ON m.conversation_id = c.id
                        WHERE c.status = ?
-                         AND c.id NOT LIKE 'web:live-stage-contract:%'
-                         AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
+                         AND {internal_filter}
+                         AND (
+                            c.channel = ?
+                            OR (? = 'web' AND c.channel LIKE 'web:%')
+                            OR (? = 'api' AND c.channel LIKE 'api:%')
+                         )
                        GROUP BY c.id
                        ORDER BY COALESCE(MAX(m.id), 0) DESC, COALESCE(c.last_message_at, c.created_at) DESC
                        LIMIT ?""",
-                    (status, channel, channel, limit),
+                    (status, *internal_args, channel, channel, channel, limit),
                 ).fetchall()
             results = [self._decrypt_row(r) for r in rows]
             _log_chat_sqlite_timing("list_conversations", started_at, self._path, rows=len(results))
@@ -517,17 +546,32 @@ class ChatStore:
             last_message_at    -- ISO-8601 timestamp of the most recent message
         """
         started_at = perf_counter()
+        internal_filter = _internal_history_sql_filter("c")
+        internal_args = _internal_history_sql_args()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT CASE WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'web' ELSE channel END AS channel,
-                          CASE WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'Web' ELSE channel_label END AS channel_label,
+                f"""SELECT CASE
+                            WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'web'
+                            WHEN channel = 'api' OR channel LIKE 'api:%' THEN 'api'
+                            ELSE channel
+                          END AS channel,
+                          CASE
+                            WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'Web'
+                            WHEN channel = 'api' OR channel LIKE 'api:%' THEN 'API'
+                            ELSE channel_label
+                          END AS channel_label,
                           COUNT(DISTINCT c.id) AS conversation_count,
                           MAX(c.last_message_at) AS last_message_at
                    FROM conversations c
                    WHERE c.status != 'cleared'
-                     AND c.id NOT LIKE 'web:live-stage-contract:%'
-                   GROUP BY CASE WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'web' ELSE channel END
-                   ORDER BY last_message_at DESC"""
+                     AND {internal_filter}
+                   GROUP BY CASE
+                              WHEN channel = 'web' OR channel LIKE 'web:%' THEN 'web'
+                              WHEN channel = 'api' OR channel LIKE 'api:%' THEN 'api'
+                              ELSE channel
+                            END
+                   ORDER BY last_message_at DESC""",
+                internal_args,
             ).fetchall()
             results = [self._decrypt_row(r) for r in rows]
             _log_chat_sqlite_timing("list_channels", started_at, self._path, rows=len(results))
@@ -547,16 +591,22 @@ class ChatStore:
         expanded_start = (datetime.fromisoformat(start_date) - timedelta(days=1)).date().isoformat()
         expanded_end = (datetime.fromisoformat(end_date) + timedelta(days=1)).date().isoformat()
         tz = _local_history_timezone()
+        internal_filter = _internal_history_sql_filter("c")
+        internal_args = _internal_history_sql_args()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT m.created_at AS created_at
+                f"""SELECT m.created_at AS created_at
                    FROM messages m
                    JOIN conversations c ON c.id = m.conversation_id
-                   WHERE (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
-                     AND c.id NOT LIKE 'web:live-stage-contract:%'
+                   WHERE (
+                        c.channel = ?
+                        OR (? = 'web' AND c.channel LIKE 'web:%')
+                        OR (? = 'api' AND c.channel LIKE 'api:%')
+                   )
+                     AND {internal_filter}
                      AND m.created_at >= ? AND m.created_at < ?
                    ORDER BY m.created_at ASC""",
-                (channel, channel, expanded_start, expanded_end),
+                (channel, channel, channel, *internal_args, expanded_start, expanded_end),
             ).fetchall()
             results: dict[str, int] = {}
             for row in rows:
@@ -578,17 +628,26 @@ class ChatStore:
         # Validate the date shape while keeping local-date grouping in Python.
         datetime.strptime(date, "%Y-%m-%d")
         tz = _local_history_timezone()
+        expanded_start = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).date().isoformat()
+        expanded_end = (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=2)).date().isoformat()
+        internal_filter = _internal_history_sql_filter("c")
+        internal_args = _internal_history_sql_args()
         with self._connect() as conn:
             candidate_rows = conn.execute(
-                """SELECT c.id, c.title, c.channel, c.channel_label,
+                f"""SELECT c.id, c.title, c.channel, c.channel_label,
                           c.created_at, c.last_message_at,
                           m.created_at AS message_created_at
                    FROM conversations c
                    JOIN messages m ON m.conversation_id = c.id
-                   WHERE c.id NOT LIKE 'web:live-stage-contract:%'
-                     AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
+                   WHERE {internal_filter}
+                     AND (
+                        c.channel = ?
+                        OR (? = 'web' AND c.channel LIKE 'web:%')
+                        OR (? = 'api' AND c.channel LIKE 'api:%')
+                     )
+                     AND m.created_at >= ? AND m.created_at < ?
                    ORDER BY m.created_at ASC""",
-                (channel, channel),
+                (*internal_args, channel, channel, channel, expanded_start, expanded_end),
             ).fetchall()
             grouped: dict[str, dict[str, Any]] = {}
             for row in candidate_rows:
@@ -645,14 +704,24 @@ class ChatStore:
 
         Returns the number of conversation records removed.
         """
+        datetime.strptime(date, "%Y-%m-%d")
+        expanded_start = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).date().isoformat()
+        expanded_end = (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=2)).date().isoformat()
+        internal_filter = _internal_history_sql_filter("c")
+        internal_args = _internal_history_sql_args()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT DISTINCT c.id
+                f"""SELECT DISTINCT c.id
                    FROM conversations c
                    JOIN messages m ON m.conversation_id = c.id
-                   WHERE c.id NOT LIKE 'web:live-stage-contract:%'
-                     AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))""",
-                (channel, channel),
+                   WHERE {internal_filter}
+                     AND (
+                        c.channel = ?
+                        OR (? = 'web' AND c.channel LIKE 'web:%')
+                        OR (? = 'api' AND c.channel LIKE 'api:%')
+                     )
+                     AND m.created_at >= ? AND m.created_at < ?""",
+                (*internal_args, channel, channel, channel, expanded_start, expanded_end),
             ).fetchall()
             tz = _local_history_timezone()
             conv_ids = []
@@ -678,8 +747,8 @@ class ChatStore:
         *,
         is_error: bool = False,
         metadata: dict[str, Any] | None = None,
-        channel: str = "web",
-        channel_label: str = "Web",
+        channel: str | None = None,
+        channel_label: str | None = None,
     ) -> int:
         """Save a message and return its row id.
 
@@ -690,6 +759,8 @@ class ChatStore:
         """
         if not text or not text.strip():
             return -1
+        channel = channel or _channel_for_conversation(conv_id)
+        channel_label = channel_label or _channel_label_for_conversation(conv_id)
         started_at = perf_counter()
         safe_text = redact_text(text)
         metadata_text = None
@@ -790,7 +861,7 @@ class ChatStore:
         with self._connect() as conn:
             for turn in sorted_turns:
                 conversation_id = str(turn.get("conversation_id") or "").strip()
-                if not conversation_id.startswith(("web:", "telegram:", "slack:", "discord:")):
+                if not conversation_id.startswith(("web:", "api:", "telegram:", "slack:", "discord:")):
                     continue
                 if _is_internal_history_conversation(conversation_id):
                     continue

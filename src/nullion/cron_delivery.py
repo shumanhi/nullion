@@ -88,6 +88,11 @@ def cron_agent_prompt(job: object, *, label: str) -> str:
         "instead of manually repeating totals.\n"
         "- Keep scratch/checkpoint/state files in the workspace unless they are requested deliverables.\n"
         "- If the task says to alert only on new data or meaningful changes, return no output when nothing changed.\n"
+        "- If a preferred connector, gateway, provider, or account API fails during this run, treat that as a "
+        "runtime failure of the primary path, not as proof the whole scheduled task is impossible. Try other "
+        "available typed tools for the same account family, then browser/web/manual setup fallbacks when safe. "
+        "Do not keep retrying the same failing connector route or deliver a final report that only says the "
+        "preferred connector failed.\n"
         f"- If no output behavior is specified and there is nothing specific to report, send: {DEFAULT_CRON_NO_OUTPUT_MESSAGE}"
     )
 
@@ -185,6 +190,7 @@ def cron_deep_agent_dispatch_plan(
                     "no_user_input_requests": True,
                     "authoritative_scheduled_task_context": True,
                     "deep_agent_profiles": ["scheduled_job"],
+                    "skip_tool_profile_inference": True,
                     "tool_capability_tags": ("scheduler", "cron"),
                 },
             )
@@ -337,6 +343,7 @@ def _cron_dispatch_plan_from_cache_payload(
                     "no_user_input_requests": True,
                     "authoritative_scheduled_task_context": True,
                     "deep_agent_profiles": ["scheduled_job"],
+                    "skip_tool_profile_inference": True,
                     "tool_capability_tags": ("scheduler", "cron"),
                     "cached_cron_dispatch_plan": True,
                 },
@@ -407,6 +414,7 @@ def _cron_dispatch_plan_from_preview(
                     "no_user_input_requests": True,
                     "authoritative_scheduled_task_context": True,
                     "deep_agent_profiles": ["scheduled_job"],
+                    "skip_tool_profile_inference": True,
                     "tool_capability_tags": ("scheduler", "cron"),
                 },
             )
@@ -441,6 +449,10 @@ def _scheduled_task_subtask_description(authoritative_context: str, *, title: st
             "Complete this subtask using the scheduled job context above. Do not ask the user to clarify "
             "fields already contained in the scheduled job context. If the subtask is blocked, return a "
             "concise failure or evidence summary instead of requesting user input.",
+            "Provider and connector preferences in the stored job identify the primary path. If runtime tool "
+            "results show that primary path is failing, recover through other available typed account tools "
+            "for the same account family, then safe browser/web/manual setup fallbacks. Do not keep retrying "
+            "the same failed connector route or treat a stale provider preference as a prohibition on recovery.",
         ]
     )
     return "\n".join(lines)
@@ -457,12 +469,59 @@ def _cron_preview_disposition(planner_preview: object | None) -> str:
     return ""
 
 
+def _cron_title_timestamp_suffix(title: str) -> str:
+    timestamp_match = re.search(
+        r"(?:\s+[—-]\s+)?((?:\d{4}-\d{2}-\d{2}|[A-Z][a-z]{2,8}\s+\d{1,2},\s+\d{4}).*?\b\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\s*$",
+        str(title or ""),
+    )
+    return timestamp_match.group(1).strip() if timestamp_match else ""
+
+
+def _cron_title_is_redundant_with_job(title: str, job_name: str) -> bool:
+    title_tokens = {token.casefold() for token in re.findall(r"[A-Za-z0-9]+", str(title or ""))}
+    if not title_tokens:
+        return False
+    job_tokens = {token.casefold() for token in re.findall(r"[A-Za-z0-9]+", str(job_name or ""))}
+    return title_tokens.issubset(job_tokens)
+
+
+def _strip_leading_cron_report_heading(body: str, job_name: str) -> tuple[str, str]:
+    body = str(body or "").strip()
+    if not body.startswith(CRON_DELIVERY_REPLY_PREFIX):
+        return "", body
+    first_line, _, rest = body.partition("\n")
+    title = first_line[len(CRON_DELIVERY_REPLY_PREFIX):].strip()
+    timestamp_suffix = _cron_title_timestamp_suffix(title)
+    if timestamp_suffix:
+        return timestamp_suffix, rest.strip()
+    rest_body = rest.strip()
+    if not rest_body.startswith(CRON_DELIVERY_REPLY_PREFIX):
+        return "", rest_body if _cron_title_is_redundant_with_job(title, job_name) else body
+    second_line, _, second_rest = rest_body.partition("\n")
+    second_title = second_line[len(CRON_DELIVERY_REPLY_PREFIX):].strip()
+    timestamp_suffix = _cron_title_timestamp_suffix(second_title)
+    if not timestamp_suffix:
+        return "", body
+    # Some cron report bodies start with a short account/source line before the
+    # actual dated report heading. When that line is already in the cron name,
+    # collapse both generated headings into the scheduled-task header.
+    if _cron_title_is_redundant_with_job(title, job_name):
+        return timestamp_suffix, second_rest.strip()
+    prefix_body = "\n\n".join(part for part in (title, second_rest.strip()) if part)
+    return timestamp_suffix, prefix_body
+
+
 def scheduled_task_delivery_text(job: object, text: str, *, run_label: str | None = None) -> str:
     """Format a user-visible scheduled task delivery header."""
     name = str(getattr(job, "name", "") or "Scheduled task").strip() or "Scheduled task"
     label = str(run_label or "Scheduled task").strip() or "Scheduled task"
     body = str(text or "").strip()
+    timestamp_suffix, normalized_body = _strip_leading_cron_report_heading(body, name)
+    if timestamp_suffix or normalized_body != body:
+        body = normalized_body
     header = f"⏰ {label}: {name}"
+    if timestamp_suffix:
+        header = f"{header} — {timestamp_suffix}"
     return f"{header}\n\n{body}" if body else header
 
 

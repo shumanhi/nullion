@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -32,7 +33,7 @@ from nullion.artifacts import (
     promote_supporting_asset_artifact_paths,
     split_media_reply_attachments,
 )
-from nullion.attachment_format_graph import plan_attachment_format
+from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
 from nullion.builder_observer import (
     TurnOutcome,
     TurnSignal,
@@ -70,7 +71,7 @@ from nullion.conversation_runtime import (
 from nullion.health import HealthIssueType
 from nullion.artifact_workflow_graph import ArtifactWorkflowResult, run_pre_chat_artifact_workflow
 from nullion.fetch_artifact_workflow import run_fetch_artifact_workflow
-from nullion.intent_router import split_compound_intent
+from nullion.intent_router import selected_numbered_option_context, split_compound_intent
 from nullion.latency_phases import (
     PHASE_BUILD_CONTEXT,
     PHASE_CHECK_ATTACHMENTS,
@@ -136,9 +137,18 @@ from nullion.skill_usage import (
     build_learned_skill_usage_hint,
 )
 from nullion.suspended_turns import SuspendedTurn
-from nullion.task_decomposer import TaskDecomposer
-from nullion.task_frames import TaskFrameStatus, TaskFrameOperation, extract_url_target
+from nullion.task_decomposer import DagPlan, DecomposedTask, TaskDecomposer
+from nullion.task_frames import (
+    TaskFrame,
+    TaskFrameExecutionContract,
+    TaskFrameFinishCriteria,
+    TaskFrameOperation,
+    TaskFrameOutputContract,
+    TaskFrameStatus,
+    extract_url_target,
+)
 from nullion.task_planner import TaskPlanner
+from nullion.task_queue import TaskPriority
 from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
@@ -526,7 +536,7 @@ _TURN_SIGNAL_WINDOW_MAX = 100
 _PATTERN_REFLECTION_CONFIDENCE_THRESHOLD = 0.58
 # Tracks newly auto-accepted skills per runtime so we can show a one-shot
 # "✨ Learned: X" notification in the next reply.
-_NEWLY_LEARNED_SKILLS: WeakKeyDictionary = WeakKeyDictionary()  # runtime → list[title]
+_NEWLY_LEARNED_SKILLS: WeakKeyDictionary = WeakKeyDictionary()  # runtime -> conversation_id -> list[title]
 # Retained for API compatibility; free-form skill matching is disabled.
 _SKILL_INJECT_MIN_SCORE = LEARNED_SKILL_INJECT_MIN_SCORE
 _CHAT_STABLE_CONTEXT_CACHE: dict[tuple[object, ...], str | None] = {}
@@ -552,6 +562,7 @@ _ATTACHMENT_EXTENSION_LABELS: dict[str, str] = {
     ".jpg": "image",
     ".json": "JSON file",
     ".md": "Markdown file",
+    ".numbers": "spreadsheet",
     ".pdf": "PDF",
     ".png": "image",
     ".ppt": "presentation",
@@ -564,6 +575,7 @@ _ATTACHMENT_EXTENSION_LABELS: dict[str, str] = {
     ".yaml": "YAML file",
     ".yml": "YAML file",
 }
+_IMAGE_ATTACHMENT_EXTENSIONS = frozenset({".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"})
 
 
 def _normalize_local_intent_text(prompt: str) -> str:
@@ -603,16 +615,175 @@ def _requested_attachment_extension(
     allow_model_planning: bool = False,
     source_attachment_names: Iterable[str] | None = None,
 ) -> str | None:
-    if is_slash_prefixed_literal_message(prompt):
+    planner_command = parse_planner_command(prompt)
+    if is_slash_prefixed_literal_message(prompt) and not planner_command.requested:
         return None
     planner_model_client = model_client if allow_model_planning else None
-    planning_prompt = str(prompt or "")
+    planning_prompt = planner_command.prompt if planner_command.requested else str(prompt or "")
     for raw_name in source_attachment_names or ():
         name = Path(str(raw_name or "").strip()).name
         if not name:
             continue
         planning_prompt = planning_prompt.replace(name, "attached file")
+    literal_plan = plan_attachment_format(planning_prompt, model_client=None)
+    if literal_plan.extension is not None:
+        return literal_plan.extension
+    if _is_internal_scheduled_delivery_context(planning_prompt):
+        return None
     return plan_attachment_format(planning_prompt, model_client=planner_model_client).extension
+
+
+def _is_internal_scheduled_delivery_context(prompt: object) -> bool:
+    text = str(prompt or "").lstrip()
+    return text.startswith("[Scheduled task:") or text.startswith("[Manual scheduled task run:")
+
+
+def _explicit_planner_fallback_dag_plan(user_message: str, *, available_tools: Iterable[str]) -> DagPlan:
+    """Build the minimum typed plan for an explicit planner invocation.
+
+    `/planner` is a structured product signal. If the model planner times out,
+    asks for clarification prematurely, or collapses a rich request into a direct
+    artifact turn, we still route through the planner-status path so every
+    supported surface gets one planner card and a final result/artifact.
+    """
+
+    prompt = str(user_message or "").strip()
+    return DagPlan(
+        disposition="single_turn",
+        tasks=[
+            DecomposedTask(
+                title="Run requested task",
+                description=prompt,
+                tool_scope=[str(tool) for tool in available_tools if str(tool).strip()],
+                priority=TaskPriority.NORMAL,
+                dep_indices=[],
+                context_key_in=None,
+                context_key_out=None,
+                required_inputs=[],
+                can_start=True,
+                metadata={"planner_origin": "explicit_planner_fallback"},
+            )
+        ],
+        needs_clarification=False,
+        clarification_question=None,
+        routing_evidence=["explicit_planner_command"],
+        validation_errors=[],
+    )
+
+
+def _planner_clarification_reply(question: str | None) -> str:
+    text = str(question or "").strip()
+    prefix = "Waiting for user input:"
+    if text.startswith(prefix):
+        text = text[len(prefix):].strip()
+    if not text:
+        text = "I need one more detail before I can plan this."
+    return f"Question: {text}"
+
+
+def _planner_clarification_frame(
+    *,
+    conversation_id: str,
+    branch_id: str,
+    turn_id: str,
+    original_message: str,
+    question: str,
+    requested_attachment_extensions: Iterable[str],
+) -> TaskFrame:
+    requested_extensions = tuple(
+        extension
+        for extension in (
+            str(extension or "").strip().lower()
+            for extension in requested_attachment_extensions
+        )
+        if extension
+    )
+    artifact_kind = requested_extensions[0].lstrip(".") if requested_extensions else None
+    now = datetime.now(UTC)
+    return TaskFrame(
+        frame_id=f"planner-clarification-{uuid4().hex}",
+        conversation_id=conversation_id,
+        branch_id=branch_id,
+        source_turn_id=turn_id,
+        parent_frame_id=None,
+        status=TaskFrameStatus.WAITING_INPUT,
+        operation=TaskFrameOperation.GENERATE_ARTIFACT if artifact_kind else TaskFrameOperation.ANSWER_WITH_CONTEXT,
+        target=None,
+        execution=TaskFrameExecutionContract(),
+        output=TaskFrameOutputContract(
+            artifact_kind=artifact_kind,
+            delivery_mode="attachment" if artifact_kind else None,
+            response_shape="artifact" if artifact_kind else None,
+        ),
+        finish=TaskFrameFinishCriteria(
+            requires_attempt=True,
+            requires_artifact_delivery=bool(artifact_kind),
+            required_artifact_kind=artifact_kind,
+        ),
+        summary=parse_planner_command(original_message).prompt or str(original_message or "").strip(),
+        created_at=now,
+        updated_at=now,
+        last_activity_turn_id=turn_id,
+        metadata={
+            "planner_requested": True,
+            "planner_waiting_for_clarification": True,
+            "planner_clarification_question": question,
+            "original_planner_message": original_message,
+            "requested_attachment_extensions": list(requested_extensions),
+        },
+    )
+
+
+def _store_planner_clarification_frame(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    conversation_result,
+    original_message: str,
+    question: str,
+    requested_attachment_extensions: Iterable[str],
+) -> None:
+    turn = conversation_result.turn
+    frame = _planner_clarification_frame(
+        conversation_id=conversation_id,
+        branch_id=turn.branch_id,
+        turn_id=turn.turn_id,
+        original_message=original_message,
+        question=question,
+        requested_attachment_extensions=requested_attachment_extensions,
+    )
+    # A clarification is still part of the planned run. Persisting a waiting
+    # task frame keeps the user's answer on the planner/card path instead of
+    # letting the next chat message fall back to ordinary activity delivery.
+    runtime.store.add_task_frame(frame)
+    runtime.store.set_active_task_frame_id(conversation_id, frame.frame_id)
+
+
+def _planner_continuation_prompt_from_frame(
+    runtime: PersistentRuntime,
+    *,
+    conversation_result,
+    prompt: str,
+) -> str | None:
+    active_task_frame_id = getattr(conversation_result, "active_task_frame_id", None)
+    continuation = getattr(conversation_result, "task_frame_continuation", None)
+    if not isinstance(active_task_frame_id, str) or continuation is None:
+        return None
+    if getattr(continuation.mode, "value", None) == "start_new":
+        return None
+    frame = runtime.store.get_task_frame(active_task_frame_id)
+    if frame is None or frame.status is not TaskFrameStatus.WAITING_INPUT:
+        return None
+    metadata = frame.metadata if isinstance(frame.metadata, dict) else {}
+    if metadata.get("planner_requested") is not True:
+        return None
+    original_message = str(metadata.get("original_planner_message") or frame.summary or "").strip()
+    if not original_message:
+        return None
+    clarification = str(prompt or "").strip()
+    if not clarification:
+        return original_message
+    return f"{original_message}\n\nUser clarification:\n{clarification}"
 
 
 def _messaging_feature_enabled(name: str, *, default: bool = True) -> bool:
@@ -727,6 +898,7 @@ def _messaging_turn_fast_profile_candidate(
     *,
     evidence,
     user_message: str = "",
+    memory_context: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -737,19 +909,24 @@ def _messaging_turn_fast_profile_candidate(
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
     if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
-        return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        return not turn_tool_scope_decision_may_apply(
+            evidence,
+            user_message=user_message,
+            memory_context=memory_context,
+        )
     return not (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
-        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message, memory_context=memory_context)
     )
 
 
 def _messaging_turn_skip_tool_scope_decision(
     *,
     evidence,
+    memory_context: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -766,7 +943,7 @@ def _messaging_turn_skip_tool_scope_decision(
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
-        or turn_tool_scope_decision_may_apply(evidence)
+        or turn_tool_scope_decision_may_apply(evidence, memory_context=memory_context)
     ):
         return False
     return True
@@ -1691,7 +1868,18 @@ def _schedule_chat_turn_memory_capture(
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return
     if tool_results:
-        return
+        try:
+            from nullion.builder_memory import should_skip_builder_reflection_for_tool_results
+
+            # Scheduler-only tool turns (for example run_cron/list_crons) still
+            # carry durable user intent such as "track my package". Allow memory
+            # capture for those turns, while keeping non-scheduler tool turns on
+            # the existing no-capture fast path.
+            if not should_skip_builder_reflection_for_tool_results(tool_results=tool_results):
+                return
+        except Exception:
+            logger.debug("Chat scheduler memory-capture guard failed (non-fatal)", exc_info=True)
+            return
     if _is_internal_scheduled_task_context(user_message):
         return
     if len(str(user_message or "").strip()) < _chat_turn_memory_min_user_chars():
@@ -1868,10 +2056,35 @@ def _previous_assistant_message(thread: list[dict[str, str]]) -> str | None:
 
 
 def _assistant_reply_referencable_artifact_reason(reply: str | None) -> str | None:
-    """Assistant prose is not structured evidence for follow-up routing."""
-
-    _ = reply
+    if not isinstance(reply, str):
+        return None
+    for line in reply.splitlines():
+        if parse_media_directive_line(line) is not None:
+            return "assistant_media_directive"
     return None
+
+
+def _conversation_has_recent_structured_artifact_marker(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+) -> bool:
+    store = getattr(runtime, "store", None)
+    list_events = getattr(store, "list_conversation_events", None)
+    if not callable(list_events):
+        return False
+    try:
+        events = list(list_events(conversation_id) or [])
+    except Exception:
+        return False
+    for event in reversed(events[-8:]):
+        for key in ("assistant_reply", "user_message"):
+            value = event.get(key) if isinstance(event, dict) else None
+            if isinstance(value, str) and _assistant_reply_referencable_artifact_reason(value):
+                return True
+            if isinstance(value, str) and "artifacts=" in value:
+                return True
+    return False
 
 
 def _task_frame_referencable_artifact_reason(runtime: PersistentRuntime, *, conversation_id: str) -> str | None:
@@ -1928,12 +2141,21 @@ def _chat_thread_has_structured_relationship_evidence(thread: list[dict[str, str
 def _chat_current_turn_has_structured_followup_evidence(
     runtime: PersistentRuntime,
     *,
+    prompt: object | None = None,
     conversation_id: str,
     attachments: Iterable[object] | None,
+    previous_assistant_message: str | None = None,
     ambiguity_fallback_reason: str | None,
 ) -> bool:
-    _ = (runtime, conversation_id, ambiguity_fallback_reason)
-    return bool(attachments)
+    if attachments:
+        return True
+    if ambiguity_fallback_reason:
+        return True
+    if not _chat_message_is_compact_context_reply(prompt):
+        return False
+    if _assistant_reply_referencable_artifact_reason(previous_assistant_message):
+        return True
+    return _conversation_has_recent_structured_artifact_marker(runtime, conversation_id=conversation_id)
 
 
 def _chat_message_is_compact_context_reply(prompt: object) -> bool:
@@ -1942,7 +2164,26 @@ def _chat_message_is_compact_context_reply(prompt: object) -> bool:
         return False
     if has_structured_turn_relationship_evidence(text):
         return False
-    return len(text) <= 12 and len(text.split()) <= 3
+    return len(text) <= 80 and len(text.split()) <= 4
+
+
+def _chat_message_has_model_routing_payload(prompt: object) -> bool:
+    text = str(prompt or "").strip()
+    if not text:
+        return False
+    return any(ch.isalnum() for ch in text)
+
+
+def _chat_message_is_unanchored_numeric_reply(
+    prompt: object,
+    *,
+    numbered_option_context: str | None,
+    reply_context_prompt: str | None,
+) -> bool:
+    text = str(prompt or "").strip()
+    if numbered_option_context or reply_context_prompt:
+        return False
+    return text.isdecimal() and 1 <= len(text) <= 2
 
 
 def _chat_ambiguity_fallback(runtime: PersistentRuntime, *, chat_id: str | None, prompt: str):
@@ -1977,6 +2218,12 @@ def _chat_ambiguity_classifier(
         has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
         if not has_structured_evidence:
             return None
+        if (
+            not reply_anchor_text
+            and not has_structured_turn_relationship_evidence(text)
+            and not _chat_message_has_model_routing_payload(text)
+        ):
+            return None
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
 
@@ -1984,6 +2231,7 @@ def _chat_ambiguity_classifier(
                 text,
                 active_turn_ids=("active-branch",),
                 active_turn_texts=(active_turn_text,),
+                structured_followup_evidence=structured_followup_evidence,
                 model_client=model_client,
             )
         except Exception:
@@ -2082,6 +2330,48 @@ def _latest_artifact_followup_context(
     return None
 
 
+def _relocate_chat_external_artifacts(
+    runtime: PersistentRuntime,
+    paths: tuple[Path, ...],
+    *,
+    principal_id: str | None,
+) -> tuple[Path, ...]:
+    artifact_roots = (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))
+    destination_root = artifact_root_for_principal(principal_id)
+    relocated: list[Path] = []
+    for path in paths:
+        try:
+            resolved = path.expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if any(artifact_descriptor_for_path(resolved, artifact_root=root) is not None for root in artifact_roots):
+            relocated.append(resolved)
+            continue
+        try:
+            if not resolved.is_file() or resolved.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        if resolved.suffix.lower() not in VALID_ATTACHMENT_EXTENSIONS:
+            continue
+        destination_root.mkdir(parents=True, exist_ok=True)
+        destination = destination_root / resolved.name
+        if destination.exists():
+            try:
+                if destination.resolve() == resolved:
+                    relocated.append(destination)
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                pass
+            destination = destination_root / f"{destination.stem}-{uuid4().hex[:8]}{destination.suffix}"
+        try:
+            shutil.copy2(resolved, destination)
+        except OSError:
+            continue
+        relocated.append(destination.resolve())
+    return tuple(dict.fromkeys(relocated))
+
+
 def _recent_artifact_followup_contexts(
     runtime: PersistentRuntime,
     *,
@@ -2139,6 +2429,46 @@ def _artifact_followup_candidates(contexts: tuple[_ArtifactFollowupContext, ...]
     for context in contexts:
         paths.extend(context.artifact_paths)
     return tuple(dict.fromkeys(paths))[:_MAX_ARTIFACT_FOLLOWUP_CANDIDATES]
+
+
+def _artifact_followup_exact_file_references(current_message: str, candidates: tuple[Path, ...]) -> tuple[Path, ...]:
+    text = str(current_message or "").casefold()
+    selected: list[Path] = []
+    for path in candidates:
+        name = path.name.casefold()
+        if name and name in text:
+            selected.append(path)
+    return tuple(dict.fromkeys(selected))
+
+
+def _artifact_followup_numbered_selection(current_message: str, candidates: tuple[Path, ...]) -> tuple[Path, ...]:
+    raw = str(current_message or "").strip()
+    if not raw.isdecimal():
+        return ()
+    try:
+        index = int(raw)
+    except ValueError:
+        return ()
+    if index < 1 or index > len(candidates):
+        return ()
+    path = candidates[index - 1]
+    return (path,) if path.is_file() else ()
+
+
+def _artifact_followup_disambiguation_reply(candidates: tuple[Path, ...]) -> str | None:
+    if len(candidates) <= 1:
+        return None
+    lines = [
+        "I found multiple matching files. Choose one by number or send the exact filename:",
+    ]
+    for index, path in enumerate(candidates[:_MAX_ARTIFACT_FOLLOWUP_CANDIDATES], start=1):
+        try:
+            size = path.stat().st_size
+            size_text = f" ({size:,} bytes)" if size > 0 else ""
+        except OSError:
+            size_text = ""
+        lines.append(f"{index}. {path.name}{size_text}")
+    return "\n".join(lines)
 
 
 def _extract_model_text(response: object) -> str:
@@ -2287,24 +2617,52 @@ def _maybe_handle_existing_artifact_followup(
     principal_id: str | None,
     model_client: object | None,
 ) -> tuple[str, _ArtifactFollowupContext] | None:
-    if not turn_is_context_linked(conversation_result):
-        return None
+    branch_id = str(getattr(getattr(conversation_result, "turn", None), "branch_id", "") or "") or None
+    context_linked = turn_is_context_linked(conversation_result)
+    if not context_linked:
+        branch_id = None
     contexts = _recent_artifact_followup_contexts(
         runtime,
         conversation_id=conversation_id,
         principal_id=principal_id,
-        branch_id=str(getattr(getattr(conversation_result, "turn", None), "branch_id", "") or "") or None,
+        branch_id=branch_id,
     )
     if not contexts:
         return None
-    selected_paths = _classify_artifact_followup_selection(
-        model_client=model_client,
-        current_message=prompt,
-        contexts=contexts,
-    )
+    candidates = _artifact_followup_candidates(contexts)
+    exact_paths = _artifact_followup_exact_file_references(prompt, candidates)
+    if not context_linked and not exact_paths:
+        # Artifact recovery is allowed to interrupt normal chat only when the
+        # turn is structurally tied to a prior delivery or names a concrete
+        # file. Otherwise old artifacts would steal unrelated calendar, email,
+        # weather, or research requests just because files exist in the chat.
+        return None
+    numbered_paths = _artifact_followup_numbered_selection(prompt, candidates) if context_linked else ()
+    selected_paths: tuple[Path, ...] = numbered_paths
+    if not selected_paths:
+        selected_paths = _classify_artifact_followup_selection(
+            model_client=model_client,
+            current_message=prompt,
+            contexts=contexts,
+        )
+    if len(candidates) > 1 and not exact_paths and not numbered_paths and not selected_paths:
+        # Multiple stored artifacts are ambiguous without a concrete filename
+        # or structured model selection. Ask the user to pick instead of
+        # falling back to latest-file behavior.
+        disambiguation = _artifact_followup_disambiguation_reply(candidates)
+        return (disambiguation, replace(contexts[0], artifact_paths=())) if disambiguation else None
+    if exact_paths:
+        selected_paths = tuple(path for path in selected_paths if path in exact_paths) or exact_paths
     if not selected_paths:
         return None
-    return _artifact_followup_resend_reply(selected_paths), replace(contexts[0], artifact_paths=selected_paths)
+    deliverable_paths = _relocate_chat_external_artifacts(
+        runtime,
+        selected_paths,
+        principal_id=principal_id,
+    )
+    if not deliverable_paths:
+        return None
+    return _artifact_followup_resend_reply(deliverable_paths), replace(contexts[0], artifact_paths=deliverable_paths)
 
 
 
@@ -2431,6 +2789,7 @@ def _maybe_materialize_requested_fetch_attachment(
         tool_results=tool_results,
         registry=runtime.active_tool_registry,
         principal_id=principal_id,
+        requested_extension=extension,
     )
     if not result.completed:
         return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
@@ -2498,6 +2857,7 @@ def _filter_artifact_descriptors_for_requested_format(
     descriptors,
     *,
     requested_extension: str | None = None,
+    allow_image_fallback_svg: bool = False,
 ):
     del prompt
     if requested_extension is None:
@@ -2508,6 +2868,14 @@ def _filter_artifact_descriptors_for_requested_format(
         if Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower()
         == requested_extension
     ]
+    if matching_descriptors:
+        return matching_descriptors
+    if allow_image_fallback_svg and requested_extension in _IMAGE_ATTACHMENT_EXTENSIONS:
+        return [
+            descriptor
+            for descriptor in descriptors
+            if Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower() == ".svg"
+        ]
     return matching_descriptors
 
 
@@ -2538,6 +2906,54 @@ def _filter_text_sidecar_artifact_descriptors(
             continue
         filtered.append(descriptor)
     return filtered
+
+
+def _binary_read_text_summary_result(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    requested_extension: str | None,
+) -> tuple[str | None, set[str]]:
+    if requested_extension is not None:
+        return None, set()
+    saw_binary_read = False
+    suppress_paths: set[str] = set()
+    binary_numbers_paths: list[Path] = []
+    latest_text_path: Path | None = None
+    for result in tool_results or ():
+        output = getattr(result, "output", None)
+        if not isinstance(output, dict):
+            continue
+        if result.tool_name == "file_read" and output.get("binary") is True:
+            for key in ("path", "artifact_path"):
+                value = output.get(key)
+                if isinstance(value, str) and value.strip():
+                    path = Path(value).expanduser()
+                    suppress_paths.add(str(path))
+                    if path.suffix.lower() == ".numbers" and path not in binary_numbers_paths:
+                        binary_numbers_paths.append(path)
+            saw_binary_read = True
+            continue
+        if result.tool_name == "file_write" and saw_binary_read:
+            path_value = output.get("path")
+            if isinstance(path_value, str) and path_value.strip():
+                path = Path(path_value).expanduser()
+                if path.suffix.lower() == ".txt":
+                    suppress_paths.add(str(path))
+                    latest_text_path = path
+    if latest_text_path is None:
+        if binary_numbers_paths:
+            names = ", ".join(path.name for path in binary_numbers_paths)
+            return (
+                f"I found an Apple Numbers binary file ({names}), but the available file reader cannot inspect its table rows. "
+                "I did not create or attach a replacement artifact. Provide an .xlsx/.csv export or a table-aware file reader to inspect the workbook contents.",
+                suppress_paths,
+            )
+        return None, suppress_paths
+    try:
+        text = latest_text_path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None, suppress_paths
+    return (text or None), suppress_paths
 
 
 def _is_unrequested_diagnostic_attachment(path: Path, *, requested_extension: str | None) -> bool:
@@ -2706,9 +3122,12 @@ def _chat_capability_inventory_prompt(
         "tool family needed for the user's request is not yet visible, call request_tool_scope first, then "
         "continue with the newly registered tools. Do not tell the user you cannot use a browser, shell, "
         "scheduler, calendar, email, connector, weather, image, or file capability merely because the exact "
-        "tool is not currently visible; request the matching scope first. If a capability-specific tool is "
-        "unavailable after scope request, fall back to registered core tools when they can still complete "
-        "the task locally. Browser tools may be used when the user can log in or the target is public; "
+        "tool is not currently visible; request the matching scope first. Use the strongest safe ladder for "
+        "the job: configured provider or connector when it has the needed auth, then dedicated local library "
+        "tools, then registered local shell execution when no external auth is required, and only then setup "
+        "guidance. If a capability-specific tool is unavailable or fails after scope request, fall back to "
+        "registered core tools when they can still complete the task locally. Browser tools may be used when "
+        "the user can log in or the target is public; "
         "for live website or browser-app tasks, attempt the browser/web tool path before substituting a "
         "rough estimate or saying live checking is unavailable. "
         "terminal tools may be used for local command-line paths when registered and approved. If every "
@@ -2993,6 +3412,12 @@ def _append_chat_artifacts_to_reply(
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> str:
     requested_extension = (tuple(required_attachment_extensions or ()) or (None,))[0]
+    binary_summary_text, binary_summary_suppress_paths = _binary_read_text_summary_result(
+        tool_results,
+        requested_extension=requested_extension,
+    )
+    if binary_summary_text is not None:
+        return binary_summary_text
     email_attachment_paths = _completed_email_attachment_paths(tool_results)
     browser_screenshot_paths = _browser_screenshot_artifact_paths(tool_results)
     source_paths = {str(Path(path).expanduser()) for path in source_attachment_paths or () if str(path or "").strip()}
@@ -3040,7 +3465,7 @@ def _append_chat_artifacts_to_reply(
     ]
     non_screenshot_candidate_paths = _filter_suppressed_artifact_paths(
         base_candidate_paths,
-        suppress_paths={*browser_screenshot_paths, *source_paths},
+        suppress_paths={*browser_screenshot_paths, *source_paths, *binary_summary_suppress_paths},
     )
     screenshot_is_primary_delivery = bool(browser_screenshot_paths) and requested_extension == ".png"
     suppressed_screenshot_paths = set() if screenshot_is_primary_delivery else browser_screenshot_paths
@@ -3049,13 +3474,13 @@ def _append_chat_artifacts_to_reply(
         candidate_paths = sorted(browser_screenshot_paths)
     candidate_paths = _filter_suppressed_artifact_paths(
         candidate_paths,
-        suppress_paths={*suppressed_screenshot_paths, *source_paths},
+        suppress_paths={*suppressed_screenshot_paths, *source_paths, *binary_summary_suppress_paths},
     )
     promoted_candidate_paths = promote_supporting_asset_artifact_paths(candidate_paths, artifact_roots=artifact_roots)
     supporting_assets_promoted = promoted_candidate_paths != candidate_paths
     candidate_paths = _filter_suppressed_artifact_paths(
         promoted_candidate_paths,
-        suppress_paths={*suppressed_screenshot_paths, *source_paths},
+        suppress_paths={*suppressed_screenshot_paths, *source_paths, *binary_summary_suppress_paths},
     )
     descriptors = []
     seen_ids: set[str] = set()
@@ -3070,6 +3495,7 @@ def _append_chat_artifacts_to_reply(
         descriptors,
         requested_extension=requested_extension
         or (None if reply_media_paths or supporting_assets_promoted else _requested_attachment_extension(prompt)),
+        allow_image_fallback_svg=_image_generation_fallback_used(tool_results),
     )
     descriptors = _filter_text_sidecar_artifact_descriptors(
         descriptors,
@@ -3104,7 +3530,7 @@ def _append_chat_artifacts_to_reply(
         return "\n\n".join([visible_reply, "\n".join(media_lines)])
     attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
     visible_reply = f"Done — attached the requested {attachment_label}."
-    if _image_generation_setup_failed(tool_results):
+    if _image_generation_setup_failed(tool_results) or _image_generation_fallback_used(tool_results):
         visible_reply += (
             "\n\nI created the images with a local fallback because API image generation is not configured.\n\n"
             f"{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}"
@@ -3130,6 +3556,20 @@ def _image_generation_setup_failed(
             or error == "image_generate provider is not configured"
             or "image generation requires an API key" in error
         ):
+            return True
+    return False
+
+
+def _image_generation_fallback_used(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    for result in tool_results or ():
+        if result.tool_name != "image_generate":
+            continue
+        if normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("fallback_used") is True:
             return True
     return False
 
@@ -3237,6 +3677,8 @@ def _required_attachment_repair_prompt(required_attachment_extensions: tuple[str
         f"Your previous response did not create the required {required} attachment. "
         "Continue the same user request now. Use the available tools to create and save the real requested "
         "artifact in the workspace artifact directory, then finish with the artifact attached. "
+        "If the prior artifact used placeholder image panels while image artifacts were generated separately, "
+        "rebuild the deliverable so the generated images are embedded in the final file. "
         "Do not switch models. Do not ask a clarification unless the artifact is impossible without the missing detail."
     )
 
@@ -3608,10 +4050,20 @@ def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id:
                 scopes.append("connector")
             elif tool_name == "skill_pack_read":
                 scopes.append("skill_pack")
-            elif tool_name in {"list_crons", "run_cron", "create_cron", "update_cron", "delete_cron"}:
+            elif tool_name in {"list_crons", "list_reminders", "run_cron", "set_reminder", "create_cron", "update_cron", "delete_cron"}:
                 scopes.append("scheduler")
             elif tool_name.startswith("browser_") or tool_name in {"web_fetch", "web_search"}:
                 scopes.append("web")
+            elif tool_name in {"file_read", "file_search", "file_write"}:
+                # Follow-up turns often refer to "that file" without a path;
+                # carry the typed local-file scope forward so discovery stays
+                # tool-backed instead of becoming an unsupported prose guess.
+                scopes.append("local_files")
+            elif tool_name == "terminal_exec":
+                # Shell is the final no-auth local fallback. Remembering that
+                # scope lets a follow-up continue the same local workflow while
+                # still keeping ordinary new chat turns on the fast path.
+                scopes.append("local_shell")
     return tuple(dict.fromkeys(scopes))
 
 
@@ -3826,9 +4278,44 @@ def _should_show_reply_label(*, local_reply: str | None, prior_user_message: str
 
 
 
-def _pop_learned_skills_notification(runtime: PersistentRuntime) -> str | None:
-    """Return a one-shot '✨ Learned N skills' line and clear the queue."""
-    titles = _NEWLY_LEARNED_SKILLS.pop(runtime, None)
+def _learned_skill_queue_id(conversation_id: str | None) -> str:
+    return str(conversation_id or "__global__")
+
+
+def _queue_learned_skill_notification(
+    runtime: PersistentRuntime,
+    title: str,
+    *,
+    conversation_id: str | None = None,
+) -> None:
+    existing = _NEWLY_LEARNED_SKILLS.get(runtime)
+    if isinstance(existing, list):
+        existing = {"__global__": existing}
+        _NEWLY_LEARNED_SKILLS[runtime] = existing
+    if not isinstance(existing, dict):
+        existing = {}
+        _NEWLY_LEARNED_SKILLS[runtime] = existing
+    queue = existing.setdefault(_learned_skill_queue_id(conversation_id), [])
+    if title not in queue:
+        queue.append(title)
+
+
+def _pop_learned_skills_notification(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str | None = None,
+) -> str | None:
+    """Return a one-shot '✨ Learned N skills' line and clear the scoped queue."""
+    existing = _NEWLY_LEARNED_SKILLS.get(runtime)
+    if isinstance(existing, list):
+        titles = _NEWLY_LEARNED_SKILLS.pop(runtime, None)
+    elif isinstance(existing, dict):
+        key = _learned_skill_queue_id(conversation_id)
+        titles = existing.pop(key, None)
+        if not existing:
+            _NEWLY_LEARNED_SKILLS.pop(runtime, None)
+    else:
+        titles = None
     if not titles:
         return None
     if len(titles) == 1:
@@ -3866,9 +4353,15 @@ def _append_builder_proposal_nudge(runtime: PersistentRuntime, reply: str) -> st
     return nudge
 
 
-def _append_runtime_nudges(runtime: PersistentRuntime, *, prompt: str, reply: str) -> str:
+def _append_runtime_nudges(
+    runtime: PersistentRuntime,
+    *,
+    prompt: str,
+    reply: str,
+    conversation_id: str | None = None,
+) -> str:
     del prompt
-    learned = _pop_learned_skills_notification(runtime)
+    learned = _pop_learned_skills_notification(runtime, conversation_id=conversation_id)
     return f"{reply}\n\n{learned}" if learned and reply else (learned or reply)
 
 
@@ -3976,7 +4469,7 @@ def _try_builder_reflection(
                 pattern=high_confidence_patterns[0],
             )
             if result.should_propose and result.proposal is not None:
-                _auto_accept_proposal(runtime, result.proposal, source="pattern")
+                _auto_accept_proposal(runtime, result.proposal, source="pattern", conversation_id=conversation_id)
             return
 
         # 2. Turn-level: reflect when ≥2 distinct tools were used in a successful turn
@@ -3988,7 +4481,7 @@ def _try_builder_reflection(
                 turn_signal=signal,
             )
             if result.should_propose and result.proposal is not None:
-                _auto_accept_proposal(runtime, result.proposal, source="turn")
+                _auto_accept_proposal(runtime, result.proposal, source="turn", conversation_id=conversation_id)
 
         # 3. Background memory compaction — throttled to every N turns
         global _builder_turn_counter
@@ -4205,7 +4698,13 @@ def _enabled_skill_pack_index_prompt(settings: NullionSettings | None) -> str | 
         return None
 
 
-def _auto_accept_proposal(runtime: PersistentRuntime, proposal, *, source: str) -> None:
+def _auto_accept_proposal(
+    runtime: PersistentRuntime,
+    proposal,
+    *,
+    source: str,
+    conversation_id: str | None = None,
+) -> None:
     """Store a builder proposal and immediately auto-accept it as a skill.
 
     No user approval needed — skills are learned silently and queued for a
@@ -4219,9 +4718,10 @@ def _auto_accept_proposal(runtime: PersistentRuntime, proposal, *, source: str) 
         accept_result = runtime.accept_stored_builder_skill_proposal_result(record.proposal_id, actor="builder_auto")
         skill = accept_result.skill
         if accept_result.created:
-            titles = _NEWLY_LEARNED_SKILLS.setdefault(runtime, [])
-            if skill.title not in titles:
-                titles.append(skill.title)
+            # Skill learning is runtime-wide, but the visible notification
+            # belongs to the conversation that earned it. Otherwise a
+            # background turn can append its nudge to the next unrelated reply.
+            _queue_learned_skill_notification(runtime, skill.title, conversation_id=conversation_id)
         logger.info("Builder: auto-accepted skill %r (%s) from %s", skill.title, skill.skill_id, source)
     except Exception:
         logger.debug("Builder auto-accept failed (non-fatal)", exc_info=True)
@@ -4337,7 +4837,12 @@ def _render_chat_turn(
 
     local_reply = _local_chat_reply_body(prompt)
     if local_reply is not None:
-        reply = _append_runtime_nudges(runtime, prompt=prompt, reply=local_reply)
+        reply = _append_runtime_nudges(
+            runtime,
+            prompt=prompt,
+            reply=local_reply,
+            conversation_id=_conversation_id_for_chat(chat_id),
+        )
         _remember_chat_turn(runtime, chat_id=chat_id, user_message=prompt, assistant_reply=reply)
         _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
         _schedule_chat_turn_memory_capture(
@@ -4361,14 +4866,25 @@ def _render_chat_turn(
         else ""
     )
     previous_assistant_message = reply_context_text or _previous_assistant_message(thread)
+    numbered_option_context = selected_numbered_option_context(prompt, previous_assistant_message)
     ambiguity_fallback, ambiguity_fallback_reason = _chat_ambiguity_fallback(runtime, chat_id=chat_id, prompt=prompt)
     conversation_id = _conversation_id_for_chat(chat_id)
+    unanchored_numeric_reply = _chat_message_is_unanchored_numeric_reply(
+        prompt,
+        numbered_option_context=numbered_option_context,
+        reply_context_prompt=reply_context_prompt,
+    )
+    thread_structured_relationship_evidence = (
+        False if unanchored_numeric_reply else _chat_thread_has_structured_relationship_evidence(thread)
+    )
     structured_followup_evidence = _chat_current_turn_has_structured_followup_evidence(
         runtime,
+        prompt=prompt,
         conversation_id=conversation_id,
         attachments=attachments,
+        previous_assistant_message=previous_assistant_message,
         ambiguity_fallback_reason=ambiguity_fallback_reason,
-    ) or bool(reply_context_prompt) or _chat_thread_has_structured_relationship_evidence(thread)
+    ) or bool(reply_context_prompt) or bool(numbered_option_context) or thread_structured_relationship_evidence
     ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(
         thread,
         model_client=model_client,
@@ -4393,6 +4909,13 @@ def _render_chat_turn(
     _mark_timing("turn_record")
 
     conversation_id = _conversation_id_for_chat(chat_id)
+    planner_continuation_prompt = _planner_continuation_prompt_from_frame(
+        runtime,
+        conversation_result=conversation_result,
+        prompt=prompt,
+    )
+    if planner_continuation_prompt is not None:
+        planner_requested = True
     artifact_followup = _maybe_handle_existing_artifact_followup(
         runtime,
         conversation_result=conversation_result,
@@ -4439,11 +4962,19 @@ def _render_chat_turn(
             artifact_count=len(artifact_context.artifact_paths),
         )
         _finish_latency("artifact_followup", tool_count=1, artifact_count=len(artifact_context.artifact_paths))
-        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply)
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
 
-    conversation_context = _build_conversation_context(thread) if _should_include_conversation_context(conversation_result, thread) else None
+    conversation_context = (
+        None
+        if planner_requested
+        else _build_conversation_context(thread)
+        if _should_include_conversation_context(conversation_result, thread)
+        else None
+    )
     if reply_context_prompt:
         conversation_context = "\n\n".join(part for part in (conversation_context, reply_context_prompt) if part)
+    if numbered_option_context:
+        conversation_context = "\n\n".join(part for part in (conversation_context, numbered_option_context) if part)
     memory_context = _memory_context_for_chat(runtime, chat_id=chat_id, settings=settings)
     prior_user_message = _previous_user_message(thread)
     task_frame_prompt = _effective_prompt_from_task_frame(
@@ -4452,7 +4983,7 @@ def _render_chat_turn(
         conversation_result=conversation_result,
     )
     deferred_prompt = _deferred_runtime_follow_up_source_prompt(thread, prompt)
-    effective_prompt = task_frame_prompt or deferred_prompt or prompt
+    effective_prompt = planner_continuation_prompt or task_frame_prompt or deferred_prompt or numbered_option_context or prompt
     phase_tracker.emit(PHASE_CHECK_ATTACHMENTS, "running")
     normalized_attachments = normalize_chat_attachments(attachments or [])
     phase_tracker.done(PHASE_CHECK_ATTACHMENTS, "attachments", f"{len(normalized_attachments)} attachment{'s' if len(normalized_attachments) != 1 else ''}")
@@ -4461,7 +4992,12 @@ def _render_chat_turn(
             _requested_attachment_extension(
                 effective_prompt,
                 model_client=model_client,
-                allow_model_planning=bool(normalized_attachments) or extract_url_target(effective_prompt) is not None,
+                allow_model_planning=(
+                    planner_requested
+                    or bool(numbered_option_context)
+                    or bool(normalized_attachments)
+                    or extract_url_target(effective_prompt) is not None
+                ),
                 source_attachment_names=(attachment.name for attachment in normalized_attachments),
             ),
         )
@@ -4479,11 +5015,12 @@ def _render_chat_turn(
         conversation_result=conversation_result,
         has_attachments=bool(normalized_attachments),
         requested_extensions=requested_attachment_extensions,
-        prior_tool_scopes=_recent_tool_scopes_for_context(runtime, conversation_id),
+        prior_tool_scopes=() if planner_requested else _recent_tool_scopes_for_context(runtime, conversation_id),
     )
     fast_profile_candidate = _messaging_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
         user_message=effective_prompt,
+        memory_context=memory_context or "",
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -4493,6 +5030,7 @@ def _render_chat_turn(
     _mark_timing("tool_scope_decision_check_start")
     skip_tool_scope_decision = _messaging_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
+        memory_context=memory_context or "",
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -4505,6 +5043,7 @@ def _render_chat_turn(
             evidence=turn_tool_evidence,
             model_client=None,
             user_message=effective_prompt,
+            memory_context=memory_context or "",
         )
         _mark_timing("tool_scope_decision_skipped")
     else:
@@ -4517,6 +5056,7 @@ def _render_chat_turn(
             evidence=turn_tool_evidence,
             model_client=tool_scope_model_client,
             user_message=effective_prompt,
+            memory_context=memory_context or "",
         )
         _mark_timing("tool_scope_registry_done")
     try:
@@ -4557,7 +5097,7 @@ def _render_chat_turn(
             conversation_result_value=conversation_result,
         )
         _finish_latency("screenshot")
-        return _append_runtime_nudges(runtime, prompt=prompt, reply=screenshot_reply)
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=screenshot_reply, conversation_id=conversation_id)
 
     artifact_result = run_pre_chat_artifact_workflow(
         runtime,
@@ -4631,7 +5171,7 @@ def _render_chat_turn(
             tool_count=len(artifact_result.tool_results or []),
             artifact_count=len(artifact_result.artifact_paths or []),
         )
-        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply)
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
     phase_tracker.done(PHASE_CHECK_TASK_STATE, "task_state")
     tool_activity_count = 0
 
@@ -4658,6 +5198,12 @@ def _render_chat_turn(
             if result.tool_name == "list_crons" and isinstance(result.output.get("crons"), list):
                 count = len(result.output.get("crons") or [])
                 detail = f"{count} scheduled task{'s' if count != 1 else ''}"
+            elif result.tool_name == "list_reminders" and isinstance(result.output.get("reminders"), list):
+                count = len(result.output.get("reminders") or [])
+                detail = f"{count} reminder{'s' if count != 1 else ''}"
+            elif result.tool_name == "set_reminder":
+                display = result.output.get("due_at_display")
+                detail = f"reminder set for {display}" if display else "reminder set"
             elif result.tool_name == "run_cron":
                 delivery_status = result.output.get("delivery_status")
                 if isinstance(delivery_status, str) and delivery_status.strip():
@@ -4811,10 +5357,15 @@ def _render_chat_turn(
                 })
             recent_tool_context = (
                 _recent_tool_context_prompt(runtime, conversation_id)
-                if _should_include_recent_tool_context(conversation_result)
+                if planner_requested or _should_include_recent_tool_context(conversation_result)
                 else None
             )
             if recent_tool_context:
+                # Explicit planner runs may delegate to isolated mini-agents.
+                # Give those workers the same compact, verified recent tool
+                # facts the parent turn can see so "this weekend" or "that
+                # file" can resolve from calendar/artifact evidence instead of
+                # becoming a mid-run question.
                 orchestrator_conversation_history.append({
                     "role": "system",
                     "content": [{"type": "text", "text": recent_tool_context}],
@@ -4843,7 +5394,7 @@ def _render_chat_turn(
             # Skill injection: if a stored skill matches the current message well,
             # prepend its steps as a system-level procedure hint so the LLM follows
             # the learned workflow instead of starting from scratch.
-            _skill_hint = _build_skill_hint(runtime, effective_prompt)
+            _skill_hint = None if planner_requested else _build_skill_hint(runtime, effective_prompt)
             skill_uses = list(getattr(_skill_hint, "titles", (_skill_hint.title,))) if _skill_hint is not None else []
             if _skill_hint is not None:
                 orchestrator_conversation_history = [
@@ -4902,6 +5453,7 @@ def _render_chat_turn(
                         active_turn_tool_registry,
                         model_client=model_for_dispatch,
                         user_message=effective_prompt,
+                        evidence=turn_tool_evidence,
                     )
                     dispatch_available_tools = [
                         str(tool.get("name", ""))
@@ -4912,6 +5464,57 @@ def _render_chat_turn(
                         effective_prompt,
                         available_tools=dispatch_available_tools,
                     )
+                    if (
+                        planner_requested
+                        and bool(getattr(dispatch_dag_plan, "needs_clarification", False))
+                        and str(getattr(dispatch_dag_plan, "clarification_question", "") or "").strip()
+                    ):
+                        # Planner mode should ask preflight questions before
+                        # workers start. Do not show a "working" card and then
+                        # have a mini-agent ask for the missing input mid-run.
+                        reply = _planner_clarification_reply(
+                            str(getattr(dispatch_dag_plan, "clarification_question", "") or "")
+                        )
+                        _store_planner_clarification_frame(
+                            runtime,
+                            conversation_id=conversation_id,
+                            conversation_result=conversation_result,
+                            original_message=prompt,
+                            question=str(getattr(dispatch_dag_plan, "clarification_question", "") or ""),
+                            requested_attachment_extensions=requested_attachment_extensions,
+                        )
+                        _remember_chat_turn(
+                            runtime,
+                            chat_id=chat_id,
+                            user_message=prompt,
+                            assistant_reply=reply,
+                            conversation_turn_id=conversation_result.turn.turn_id,
+                        )
+                        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+                        runtime.checkpoint()
+                        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+                        _mark_timing("planner_clarification")
+                        _log_timing_if_slow(
+                            "planner_clarification",
+                            conversation_id_value=conversation_id,
+                            conversation_result_value=conversation_result,
+                        )
+                        _finish_latency("planner_clarification")
+                        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
+                    if planner_requested and not getattr(dispatch_dag_plan, "can_dispatch_when_requested", False):
+                        logger.info(
+                            "Explicit planner command using fallback single-task plan: disposition=%s valid=%s errors=%s",
+                            getattr(dispatch_dag_plan, "disposition", None),
+                            getattr(dispatch_dag_plan, "is_valid", None),
+                            getattr(dispatch_dag_plan, "validation_errors", None),
+                        )
+                        # The slash command is the durable routing signal. Keep
+                        # the card contract even when the model-generated DAG is
+                        # unusable, then let the mini-agent resolve context/tools.
+                        dispatch_dag_plan = _explicit_planner_fallback_dag_plan(
+                            effective_prompt,
+                            available_tools=dispatch_available_tools,
+                        )
             if (
                 dispatch_dag_plan is not None
                 and (
@@ -4961,6 +5564,7 @@ def _render_chat_turn(
                         if requested_attachment_extensions
                         else None
                     ),
+                    parent_context=recent_tool_context,
                 )
                 _mark_timing("mini_agent_dispatch")
                 if getattr(dispatch_result, "dispatched", True):
@@ -5358,7 +5962,7 @@ def _render_chat_turn(
             )
             if suppress_runtime_nudges:
                 return visible_reply
-            nudged_reply = _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply)
+            nudged_reply = _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply, conversation_id=conversation_id)
             if getattr(visible_reply, "reply_already_sent", False) and nudged_reply == str(visible_reply):
                 return visible_reply
             return nudged_reply
@@ -5485,7 +6089,7 @@ def _render_chat_turn(
                 )
                 runtime.checkpoint()
                 _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
-                return _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply)
+                return _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply, conversation_id=conversation_id)
             except ChatBackendUnavailableError as fallback_exc:
                 detail = str(fallback_exc)
                 logger.exception("Fallback chat backend unavailable: %s", fallback_exc)
@@ -5517,7 +6121,7 @@ def _render_chat_turn(
             _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
             runtime.checkpoint()
             _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
-            return _append_runtime_nudges(runtime, prompt=prompt, reply=compound_reply)
+            return _append_runtime_nudges(runtime, prompt=prompt, reply=compound_reply, conversation_id=conversation_id)
         live_tool_results: list[ToolResult] = []
         live_information_resolutions: list[str] = []
         reply = _generate_backend_reply(
@@ -5641,7 +6245,7 @@ def _render_chat_turn(
     )
     runtime.checkpoint()
     _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
-    return _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply)
+    return _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply, conversation_id=conversation_id)
 
 
 

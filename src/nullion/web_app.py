@@ -42,6 +42,7 @@ from typing import Any, AsyncIterator, Callable, Iterable, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from nullion.conversation_runtime import ConversationTurnDisposition
+from nullion.intent_router import selected_numbered_option_context
 from nullion.latency_phases import (
     PHASE_BUILD_CONTEXT,
     PHASE_CHECK_ATTACHMENTS,
@@ -64,6 +65,7 @@ from nullion.artifacts import (
     artifact_root_for_runtime,
     ensure_artifact_root,
     media_candidate_paths_from_text,
+    path_is_within,
 )
 from nullion.chat_attachments import (
     attachment_processing_failure_reply,
@@ -72,7 +74,7 @@ from nullion.chat_attachments import (
     is_supported_video_attachment,
     normalize_chat_attachments,
 )
-from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, plan_attachment_format
+from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
 from nullion.approval_context import approval_trigger_flow_label
 from nullion.approval_display import approval_display_from_request, approval_display_from_tool_result
 from nullion.config import (
@@ -84,6 +86,7 @@ from nullion.config import (
 )
 from nullion.cron_delivery import (
     CronRunDeliveryCallbacks,
+    DEFAULT_CRON_NO_OUTPUT_MESSAGE,
     cron_agent_prompt,
     cron_deep_agent_dispatch_plan,
     cron_delivery_artifact_paths_from_result,
@@ -160,7 +163,13 @@ from nullion.run_activity import (
 from nullion.artifact_workflow_graph import run_pre_chat_artifact_workflow
 from nullion.screenshot_delivery import ScreenshotDeliveryResult
 from nullion.skill_usage import build_learned_skill_usage_hint
-from nullion.skill_pack_catalog import list_available_skill_packs, list_skill_pack_auth_providers, skill_pack_access_prompt
+from nullion.skill_pack_catalog import (
+    is_builtin_nullion_skill_pack_id,
+    list_available_skill_packs,
+    list_skill_pack_auth_providers,
+    normalize_enabled_skill_pack_ids,
+    skill_pack_access_prompt,
+)
 from nullion.skill_pack_installer import (
     install_skill_pack,
     list_installed_skill_packs,
@@ -466,6 +475,29 @@ def _web_enabled_skill_pack_signature(enabled_pack_ids: Iterable[str]) -> object
         )
 
 
+def _should_suppress_active_cron_no_output_delivery(text: str, group_id: str, store: Any) -> bool:
+    if str(text or "").strip() != DEFAULT_CRON_NO_OUTPUT_MESSAGE:
+        return False
+    group_id = str(group_id or "").strip()
+    if not group_id:
+        return False
+    terminal_statuses = {"completed", "failed", "cancelled"}
+    try:
+        runs = getattr(store, "list_mini_agent_runs", lambda: [])()
+    except Exception:
+        logger.debug("Could not inspect cron mini-agent runs before delivery", exc_info=True)
+        return False
+    for run in runs:
+        if str(getattr(run, "capsule_id", "") or "") != group_id:
+            continue
+        status = str(getattr(run, "status", "") or "").strip().lower()
+        if status and "." in status:
+            status = status.rsplit(".", 1)[-1]
+        if status not in terminal_statuses:
+            return True
+    return False
+
+
 def _web_installed_dependency_signature(runtime: object) -> object:
     try:
         from nullion.builder_capabilities import installed_dependency_context_signature
@@ -683,14 +715,65 @@ _NULLION_CHAT_SERVICE_COMMANDS = {
     "slack": "nullion-slack",
     "discord": "nullion-discord",
 }
+
+
+class CronBackgroundDeliveryTracker:
+    """Track in-flight scheduled deliveries without mixing concurrent chats.
+
+    Scheduled jobs can share one Telegram/Slack/Discord conversation and finish
+    in parallel. Keep the task-group mapping authoritative once it exists so a
+    late artifact/summary never inherits another cron's header or delivery
+    contract from the same chat.
+    """
+
+    def __init__(self) -> None:
+        self._by_conversation: dict[str, Any] = {}
+        self._by_group: dict[str, Any] = {}
+
+    def start(self, conversation_id: object, job: Any, *, group_id: object = "") -> None:
+        conversation_key = str(conversation_id or "").strip()
+        group_key = str(group_id or "").strip()
+        if group_key:
+            self._by_group[group_key] = job
+            if conversation_key and self._by_conversation.get(conversation_key) == job:
+                self._by_conversation.pop(conversation_key, None)
+            return
+        if conversation_key:
+            self._by_conversation[conversation_key] = job
+
+    def resolve(self, conversation_id: object, *, group_id: object = "") -> Any | None:
+        group_key = str(group_id or "").strip()
+        if group_key:
+            return self._by_group.get(group_key)
+        conversation_key = str(conversation_id or "").strip()
+        return self._by_conversation.get(conversation_key) if conversation_key else None
+
+    def clear(self, conversation_id: object = "", *, group_id: object = "") -> None:
+        group_key = str(group_id or "").strip()
+        if group_key:
+            self._by_group.pop(group_key, None)
+            return
+        conversation_key = str(conversation_id or "").strip()
+        if conversation_key:
+            self._by_conversation.pop(conversation_key, None)
+
+
 _BROWSER_TOOL_NAMES = (
+    "browser_open",
     "browser_navigate",
     "browser_click",
+    "browser_click_element",
+    "browser_click_id",
     "browser_type",
+    "browser_type_field",
+    "browser_type_id",
+    "browser_select_combobox",
+    "browser_snapshot",
     "browser_extract_text",
     "browser_screenshot",
     "browser_scroll",
     "browser_wait_for",
+    "browser_assert_page_state",
     "browser_find",
     "browser_run_js",
     "browser_close",
@@ -733,6 +816,7 @@ def _open_local_directory(path: Path) -> None:
 
 
 _RUNTIME_HISTORY_SYNC_MTIMES: dict[str, float] = {}
+_RUNTIME_HISTORY_SYNC_CHECKED_AT: dict[str, float] = {}
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 4
 _MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
 
@@ -980,6 +1064,92 @@ def _filter_supported_media_models(
     return filtered
 
 
+def _merge_media_model_maps(
+    *maps: dict[str, list[dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    merged: dict[str, list[dict[str, object]]] = {}
+    for media_models in maps:
+        for provider, records in media_models.items():
+            provider_key = str(provider or "").strip()
+            if not provider_key:
+                continue
+            existing = merged.setdefault(provider_key, [])
+            by_model = {
+                str(record.get("model") or "").strip(): record
+                for record in existing
+                if str(record.get("model") or "").strip()
+            }
+            for record in records:
+                model = str(record.get("model") or "").strip()
+                if not model:
+                    continue
+                raw_caps = record.get("capabilities")
+                caps = {
+                    str(cap).strip()
+                    for cap in (raw_caps if isinstance(raw_caps, list) else [])
+                    if str(cap).strip()
+                }
+                if model in by_model:
+                    current = by_model[model]
+                    current_caps = {
+                        str(cap).strip()
+                        for cap in (current.get("capabilities") if isinstance(current.get("capabilities"), list) else [])
+                        if str(cap).strip()
+                    }
+                    current["capabilities"] = sorted(current_caps | caps)
+                else:
+                    new_record = {"model": model, "capabilities": sorted(caps)}
+                    existing.append(new_record)
+                    by_model[model] = new_record
+    return _filter_supported_media_models(merged)
+
+
+def _explicit_media_model_providers(raw: object) -> set[str]:
+    if not isinstance(raw, dict):
+        return set()
+    return {
+        str(provider or "").strip()
+        for provider, records in raw.items()
+        if str(provider or "").strip() and isinstance(records, list)
+    }
+
+
+def _media_models_from_env_selections(
+    *,
+    clear_media_selections: Iterable[str] | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    cleared = {str(item or "").strip() for item in (clear_media_selections or ()) if str(item or "").strip()}
+    media_models: dict[str, list[dict[str, object]]] = {}
+    for capability, selection_prefix, provider_key, model_key in (
+        ("audio_input", "audio_transcribe", "NULLION_AUDIO_TRANSCRIBE_PROVIDER", "NULLION_AUDIO_TRANSCRIBE_MODEL"),
+        ("image_input", "image_ocr", "NULLION_IMAGE_OCR_PROVIDER", "NULLION_IMAGE_OCR_MODEL"),
+        ("image_output", "image_generate", "NULLION_IMAGE_GENERATE_PROVIDER", "NULLION_IMAGE_GENERATE_MODEL"),
+        ("video_input", "video_input", "NULLION_VIDEO_INPUT_PROVIDER", "NULLION_VIDEO_INPUT_MODEL"),
+    ):
+        if f"{selection_prefix}_provider" in cleared or f"{selection_prefix}_model" in cleared:
+            continue
+        provider = os.environ.get(provider_key, "").strip()
+        model = os.environ.get(model_key, "").strip()
+        if provider and model:
+            media_models.setdefault(provider, []).append({"model": model, "capabilities": [capability]})
+    return _filter_supported_media_models(media_models)
+
+
+def _media_provider_enabled_from_env_selections() -> dict[str, bool]:
+    enabled: dict[str, bool] = {}
+    for provider_key, model_key in (
+        ("NULLION_AUDIO_TRANSCRIBE_PROVIDER", "NULLION_AUDIO_TRANSCRIBE_MODEL"),
+        ("NULLION_IMAGE_OCR_PROVIDER", "NULLION_IMAGE_OCR_MODEL"),
+        ("NULLION_IMAGE_GENERATE_PROVIDER", "NULLION_IMAGE_GENERATE_MODEL"),
+        ("NULLION_VIDEO_INPUT_PROVIDER", "NULLION_VIDEO_INPUT_MODEL"),
+    ):
+        provider = os.environ.get(provider_key, "").strip()
+        model = os.environ.get(model_key, "").strip()
+        if provider and model:
+            enabled[provider] = True
+    return enabled
+
+
 def _media_capability_keys(capability: str) -> set[str]:
     if capability == "audio_transcribe":
         return {"audio", "audio_input", "transcription", "audio_transcription"}
@@ -1055,6 +1225,8 @@ def _install_log_buffer_handler() -> None:
 
 def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
     """Best-effort backfill from runtime conversation events into web history."""
+    if os.environ.get("NULLION_HISTORY_RUNTIME_SYNC_ON_READ", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
     checkpoint_path = Path(
         getattr(runtime, "checkpoint_path", None) or Path.home() / ".nullion" / "runtime.db"
     )
@@ -1065,6 +1237,12 @@ def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
         cache_key = str(checkpoint_path.resolve())
         if _RUNTIME_HISTORY_SYNC_MTIMES.get(cache_key) == mtime:
             return
+        now_monotonic = time.monotonic()
+        last_checked = _RUNTIME_HISTORY_SYNC_CHECKED_AT.get(cache_key, 0.0)
+        sync_interval = float(os.environ.get("NULLION_HISTORY_RUNTIME_SYNC_INTERVAL_S", "60") or 60)
+        if last_checked and now_monotonic - last_checked < max(5.0, sync_interval):
+            return
+        _RUNTIME_HISTORY_SYNC_CHECKED_AT[cache_key] = now_monotonic
         if checkpoint_path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
             events = load_runtime_store(checkpoint_path).list_conversation_events()
         else:
@@ -1348,6 +1526,7 @@ _HTML = r"""<!DOCTYPE html>
   }
   .ahchan-item:hover { background: var(--surface); }
   .ahchan-item.active { background: rgba(99,102,241,.18); color: var(--accent2); }
+  .ahchan-item.loading { opacity: .72; cursor: wait; }
   .ahchan-item .ahchan-name { font-weight: 600; }
   .ahchan-item .ahchan-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
 
@@ -1386,6 +1565,25 @@ _HTML = r"""<!DOCTYPE html>
   .ahcal-day.selected::after { background: #fff; }
   .ahcal-day.today { border: 1px solid var(--accent2); color: var(--accent2); }
   .ahcal-day.other-month { opacity: .3; cursor: default; }
+  .ah-loading {
+    color: var(--muted); font-size: 12px; padding: 14px 18px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .ah-loading::before {
+    content: ""; width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid currentColor; border-right-color: transparent;
+    animation: btn-spin .8s linear infinite;
+  }
+  .ahcal-grid-loading .ahcal-day { opacity: .35; pointer-events: none; }
+  .ahcal-skeleton {
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; padding-top: 8px;
+  }
+  .ahcal-skeleton span {
+    aspect-ratio: 1; border-radius: 50%;
+    background: linear-gradient(90deg, rgba(255,255,255,.05), rgba(255,255,255,.11), rgba(255,255,255,.05));
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
 
   /* Right — conversations + messages */
   #allhist-right {
@@ -1406,6 +1604,7 @@ _HTML = r"""<!DOCTYPE html>
   }
   .ahconv-row:last-child { border-bottom: none; }
   .ahconv-row:hover, .ahconv-row.active { background: var(--surface2); }
+  .ahconv-row.loading { opacity: .72; cursor: wait; }
   .ahconv-title { font-size: 13px; font-weight: 600; color: var(--text); }
   .ahconv-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .ahdate-actions {
@@ -2048,6 +2247,7 @@ _HTML = r"""<!DOCTYPE html>
     display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px;
     align-items: start; min-width: 0; margin: 0;
   }
+  .skill-pack-choice.core { grid-template-columns: minmax(0, 1fr); }
   .skill-pack-option input { margin-top: 2px; accent-color: var(--accent2); }
   .skill-pack-main { min-width: 0; display: grid; gap: 5px; }
   .skill-pack-action { display: flex; justify-content: flex-end; align-items: center; min-height: 32px; }
@@ -3393,6 +3593,26 @@ _HTML = r"""<!DOCTYPE html>
   }
   .card-btn.primary:hover { opacity: 0.85; }
   .card-btn:disabled { opacity: 0.45; cursor: default; }
+  button[aria-busy="true"],
+  button.is-loading {
+    position: relative;
+    opacity: 0.75;
+    cursor: wait !important;
+  }
+  button[aria-busy="true"]::before,
+  button.is-loading::before {
+    content: "";
+    display: inline-block;
+    width: 0.75em;
+    height: 0.75em;
+    margin-right: 0.45em;
+    border-radius: 50%;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    vertical-align: -0.1em;
+    animation: btn-spin 0.8s linear infinite;
+  }
+  @keyframes btn-spin { to { transform: rotate(360deg); } }
   .update-actions {
     display: flex; gap: 10px; justify-content: center; align-items: center;
     flex-wrap: wrap;
@@ -5141,7 +5361,7 @@ _HTML = r"""<!DOCTYPE html>
                   <div class="pref-row-title">Verbose</div>
                   <div class="pref-row-desc">Show activity details during chat runs.</div>
                 </div>
-                <label class="toggle-switch"><input type="checkbox" id="cfg-verbose-enabled" onchange="setVerboseMode(this.checked ? 'on' : 'off')"><span class="toggle-slider"></span></label>
+                <label class="toggle-switch"><input type="checkbox" id="cfg-verbose-enabled"><span class="toggle-slider"></span></label>
               </div>
               <div class="pref-row">
                 <div>
@@ -5262,14 +5482,14 @@ _HTML = r"""<!DOCTYPE html>
               <div class="doctor-storage-alert" id="doctor-cleanup-alert">
                 <span>Auto cleanup is off. Enable auto clean or clean data now for better performance.</span>
                 <span class="doctor-storage-alert-actions">
-                  <button class="mini-btn good" type="button" onclick="enableDoctorAutoClean()">Enable auto clean</button>
-                  <button class="mini-btn" type="button" onclick="runDoctorCleanupNow()">Clean data now</button>
+                  <button class="mini-btn good" type="button" onclick="enableDoctorAutoClean(this)">Enable auto clean</button>
+                  <button class="mini-btn" type="button" onclick="runDoctorCleanupNow(this)">Clean data now</button>
                 </span>
               </div>
               <div class="form-hint" style="margin:12px 0 16px">Safe fixes should report what changed in chat after they run. Pending Doctor items also appear under Attention items.</div>
               <div class="doctor-action-row">
-                <button class="image-artifact-btn" type="button" onclick="runDoctorDiagnose()">Run diagnose</button>
-                <button class="image-artifact-btn" type="button" onclick="runDoctorCleanupNow()">Clean up now</button>
+                <button class="image-artifact-btn" type="button" onclick="runDoctorDiagnose(this)">Run diagnose</button>
+                <button class="image-artifact-btn" type="button" onclick="runDoctorCleanupNow(this)">Clean up now</button>
               </div>
               <div class="settings-command-list">
                 <div class="settings-command"><span>Ask Doctor to inspect the system</span><code>/doctor diagnose</code></div>
@@ -6002,8 +6222,8 @@ _HTML = r"""<!DOCTYPE html>
     <div class="modal-footer">
       <span id="save-feedback"></span>
       <div style="display:flex;gap:8px;">
-        <button class="card-btn" onclick="closeSettings()">Cancel</button>
-        <button class="card-btn primary" onclick="saveConfig()">Save changes</button>
+        <button class="card-btn" id="settings-cancel-btn" onclick="closeSettings()">Cancel</button>
+        <button class="card-btn primary" id="settings-save-btn" onclick="saveConfig()">Save changes</button>
       </div>
     </div>
   </div>
@@ -6060,6 +6280,32 @@ window.fetch = async (input, init = {}) => {
   return response;
 };
 const API = (path) => fetch(path).then(r => r.json());
+let _configFetchPromise = null;
+let _lastConfigPayload = null;
+let _headerConfigFetchPromise = null;
+let _lastHeaderConfigPayload = null;
+async function fetchConfig({force = false} = {}) {
+  if (!force && _lastConfigPayload) return _lastConfigPayload;
+  if (!force && _configFetchPromise) return _configFetchPromise;
+  _configFetchPromise = API('/api/config')
+    .then(cfg => {
+      _lastConfigPayload = cfg || {};
+      return _lastConfigPayload;
+    })
+    .finally(() => { _configFetchPromise = null; });
+  return _configFetchPromise;
+}
+async function fetchHeaderConfig({force = false} = {}) {
+  if (!force && _lastHeaderConfigPayload) return _lastHeaderConfigPayload;
+  if (!force && _headerConfigFetchPromise) return _headerConfigFetchPromise;
+  _headerConfigFetchPromise = API('/api/config/header')
+    .then(cfg => {
+      _lastHeaderConfigPayload = cfg || {};
+      return _lastHeaderConfigPayload;
+    })
+    .finally(() => { _headerConfigFetchPromise = null; });
+  return _headerConfigFetchPromise;
+}
 // ── Nullion SVG icon library ──────────────────────────────────────────────────
 const NI = {
   _svg: (d, extra='') => `<svg class="ni${extra}" viewBox="0 0 72 72" aria-hidden="true">${d}</svg>`,
@@ -6298,6 +6544,33 @@ function chatTurnInFlight() {
 function setSendButtonDisabled(disabled) {
   const sendBtn = document.getElementById('send-btn');
   if (sendBtn) sendBtn.disabled = Boolean(disabled);
+}
+
+function setActionButtonLoading(button, loadingText = 'Working...') {
+  if (!button) return () => {};
+  const originalText = button.dataset.originalText || button.textContent || '';
+  if (!button.dataset.originalText) button.dataset.originalText = originalText;
+  button.disabled = true;
+  button.classList.add('is-loading');
+  button.setAttribute('aria-busy', 'true');
+  button.textContent = loadingText || originalText || 'Working...';
+  let restored = false;
+  return (nextText = null) => {
+    if (restored) return;
+    restored = true;
+    button.disabled = false;
+    button.classList.remove('is-loading');
+    button.removeAttribute('aria-busy');
+    button.textContent = nextText || originalText;
+    delete button.dataset.originalText;
+  };
+}
+
+function finishActionButton(button, text = 'Done') {
+  if (!button) return;
+  button.classList.remove('is-loading');
+  button.setAttribute('aria-busy', 'false');
+  button.textContent = text;
 }
 
 function beginTurnUi(turnId, text) {
@@ -7335,6 +7608,7 @@ function ensureBubbleTimestamp(bubble, value = null) {
 
 function addDefaultBotGreeting() {
   const messages = document.getElementById('messages');
+  if (!messages || messages.children.length) return;
   messages.innerHTML = `
     <div class="timeline-event">Runtime session opened</div>
     <div class="msg bot">
@@ -8673,24 +8947,35 @@ function renderSkillPackOptions(catalog, enabledValue) {
     container.innerHTML = entries.map((entry) => {
       const id = String(entry.pack_id || '').trim();
       if (!id) return '';
-      const checked = enabled.has(id) ? ' checked' : '';
-      const status = entry.status ? `<span>${escHtml(entry.status)}</span>` : '';
+      const isCore = String(entry.status || '').toLowerCase() === 'built-in';
+      const checked = enabled.has(id) || isCore ? ' checked' : '';
+      const statusLabel = isCore ? 'core' : entry.status;
+      const status = statusLabel ? `<span>${escHtml(statusLabel)}</span>` : '';
       const isInstalled = String(entry.status || '').toLowerCase() === 'installed';
-      const canRemove = isInstalled || enabled.has(id);
+      const canRemove = !isCore && (isInstalled || enabled.has(id));
       const removeLabel = isInstalled ? 'Uninstall' : 'Remove';
       const removeAction = canRemove
         ? `<button class="mini-btn danger" type="button" onclick="uninstallSkillPackFromSettings('${escAttr(id)}', this)">${removeLabel}</button>`
         : '';
-      return `
-        <div class="skill-pack-option">
-          <label class="skill-pack-choice">
+      const choiceMarkup = isCore
+        ? `<div class="skill-pack-choice core">
+            <span class="skill-pack-main">
+              <span class="skill-pack-title">${escHtml(entry.name || id)}</span>
+              <span class="skill-pack-summary">${escHtml(entry.summary || 'Reference instructions for repeatable workflows.')}</span>
+              <span class="skill-pack-foot"><code>${escHtml(id)}</code>${status}</span>
+            </span>
+          </div>`
+        : `<label class="skill-pack-choice">
             <input type="checkbox" class="cfg-skill-pack-choice" data-skill-pack-id="${escAttr(id)}" value="${escAttr(id)}"${checked}>
             <span class="skill-pack-main">
               <span class="skill-pack-title">${escHtml(entry.name || id)}</span>
               <span class="skill-pack-summary">${escHtml(entry.summary || 'Reference instructions for repeatable workflows.')}</span>
               <span class="skill-pack-foot"><code>${escHtml(id)}</code>${status}</span>
             </span>
-          </label>
+          </label>`;
+      return `
+        <div class="skill-pack-option" data-skill-pack-id="${escAttr(id)}" data-skill-pack-core="${isCore ? 'true' : 'false'}">
+          ${choiceMarkup}
           <div class="skill-pack-action">${removeAction}</div>
         </div>`;
     }).join('');
@@ -9033,51 +9318,45 @@ async function proposeCustomCapabilityDependency() {
 }
 
 async function acceptBuilderProposal(proposalId, buttonEl = null) {
-  const prevText = buttonEl ? buttonEl.textContent : null;
-  if (buttonEl) buttonEl.disabled = true;
+  const restoreButton = setActionButtonLoading(buttonEl, 'Working...');
   try {
-    if (buttonEl) buttonEl.textContent = 'Working...';
     const r = await fetch(`/api/builder/proposals/${encodeURIComponent(proposalId)}/accept`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Accept failed');
+    finishActionButton(buttonEl, 'Accepted');
     await loadBuilderDoctorSettingsSummary();
     await refreshDashboard();
   } catch (e) {
+    restoreButton();
     alert(`Accept failed: ${e.message || e}`);
-  } finally {
-    if (buttonEl) {
-      buttonEl.disabled = false;
-      buttonEl.textContent = prevText || 'Review & install';
-    }
   }
 }
 
 async function rejectBuilderProposal(proposalId, buttonEl = null) {
-  const prevText = buttonEl ? buttonEl.textContent : null;
-  if (buttonEl) buttonEl.disabled = true;
+  const restoreButton = setActionButtonLoading(buttonEl, 'Skipping...');
   try {
-    if (buttonEl) buttonEl.textContent = 'Working...';
     const r = await fetch(`/api/builder/proposals/${encodeURIComponent(proposalId)}/reject`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Reject failed');
+    finishActionButton(buttonEl, 'Skipped');
     await loadBuilderDoctorSettingsSummary();
     await refreshDashboard();
   } catch (e) {
+    restoreButton();
     alert(`Reject failed: ${e.message || e}`);
-  } finally {
-    if (buttonEl) {
-      buttonEl.disabled = false;
-      buttonEl.textContent = prevText || 'Skip';
-    }
   }
 }
 
 function collectSkillPackConfig() {
+  const core = Array.from(document.querySelectorAll('.skill-pack-option[data-skill-pack-core="true"]'))
+    .map((item) => item.getAttribute('data-skill-pack-id') || '')
+    .map((value) => value.trim())
+    .filter(Boolean);
   const selected = Array.from(document.querySelectorAll('.cfg-skill-pack-choice:checked'))
     .map((input) => input.value.trim())
     .filter(Boolean);
   const custom = document.getElementById('cfg-custom-skill-packs');
-  const ids = Array.from(new Set([...selected, ...parseSkillPackIds(custom ? custom.value : '')]));
+  const ids = Array.from(new Set([...core, ...selected, ...parseSkillPackIds(custom ? custom.value : '')]));
   const value = ids.join(', ');
   const hidden = document.getElementById('cfg-enabled-skill-packs');
   if (hidden) hidden.value = value;
@@ -9410,8 +9689,8 @@ function decisionItemHtml(a) {
       ${decisionDetailHtml(a)}
       ${meta ? `<div class="decision-meta">${escHtml(meta)}</div>` : ''}
       ${(canAllow || canRevoke) ? `<div class="control-actions">
-        ${canAllow ? `<button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','once')">Allow once</button><button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','always')">Always allow</button>` : ''}
-        ${canRevoke ? `<button class="mini-btn danger" onclick="revokeDecision('${escHtml(a.approval_id)}')">Revoke permission</button>` : ''}
+        ${canAllow ? `<button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','once',null,this)">Allow once</button><button class="mini-btn good" onclick="allowDecision('${escHtml(a.approval_id)}','always',null,this)">Always allow</button>` : ''}
+        ${canRevoke ? `<button class="mini-btn danger" onclick="revokeDecision('${escHtml(a.approval_id)}',this)">Revoke permission</button>` : ''}
       </div>` : ''}
     </div>`;
 }
@@ -9662,29 +9941,92 @@ function renderAttentionModal(data = {}) {
     : '<div class="empty"><strong>No attention items</strong>Nothing needs a decision right now.</div>';
 }
 
-async function revokePermission(kind, id) {
+function applyRevokedPermissionToDashboard(kind, id, payload = {}) {
+  const data = _lastDashboardData || {};
+  if (!id) return;
+  if (Array.isArray(data.permission_grants)) {
+    data.permission_grants.forEach(item => {
+      if (kind === 'grant' && item.grant_id === id) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_rules)) {
+    data.boundary_rules.forEach(item => {
+      if ((kind === 'boundary-rule' && item.rule_id === id) || (Array.isArray(payload.revoked_rule_ids) && payload.revoked_rule_ids.includes(item.rule_id))) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_permits)) {
+    data.boundary_permits.forEach(item => {
+      if ((kind === 'boundary-permit' && item.permit_id === id) || (Array.isArray(payload.revoked_permit_ids) && payload.revoked_permit_ids.includes(item.permit_id))) item.active = false;
+    });
+  }
+  renderPermissions(data);
+  renderDecisionHistory(data.approvals || []);
+  if (attentionModalIsOpen()) renderAttentionModal(data);
+}
+
+function applyRevokedDecisionToDashboard(approvalId, payload = {}) {
+  const data = _lastDashboardData || {};
+  const revokedGrantIds = new Set(payload.revoked_grant_ids || []);
+  const revokedRuleIds = new Set(payload.revoked_rule_ids || []);
+  const revokedPermitIds = new Set(payload.revoked_permit_ids || []);
+  if (Array.isArray(data.permission_grants)) {
+    data.permission_grants.forEach(item => {
+      if (item.approval_id === approvalId || revokedGrantIds.has(item.grant_id)) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_rules)) {
+    data.boundary_rules.forEach(item => {
+      if (revokedRuleIds.has(item.rule_id)) item.active = false;
+    });
+  }
+  if (Array.isArray(data.boundary_permits)) {
+    data.boundary_permits.forEach(item => {
+      if (item.approval_id === approvalId || revokedPermitIds.has(item.permit_id)) item.active = false;
+    });
+  }
+  if (Array.isArray(data.approvals)) {
+    data.approvals.forEach(item => {
+      if (item.approval_id !== approvalId) return;
+      item.active_grant_ids = [];
+      item.active_boundary_rule_ids = [];
+      item.active_boundary_permit_ids = [];
+    });
+  }
+  renderPermissions(data);
+  renderDecisionHistory(data.approvals || []);
+  if (attentionModalIsOpen()) renderAttentionModal(data);
+}
+
+async function revokePermission(kind, id, buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Revoking...');
   try {
     const r = await fetch(`/api/permissions/${kind}/${id}/revoke`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Revoke failed');
-    await refreshDashboard();
+    finishActionButton(buttonEl, 'Revoked');
+    applyRevokedPermissionToDashboard(kind, id, data);
   } catch (e) {
+    restoreButton();
     alert(`Revoke failed: ${e.message || e}`);
   }
 }
 
-async function revokeDecision(approvalId) {
+async function revokeDecision(approvalId, buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Revoking...');
   try {
     const r = await fetch(`/api/decisions/${approvalId}/revoke`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Revoke failed');
-    await refreshDashboard();
+    finishActionButton(buttonEl, 'Revoked');
+    applyRevokedDecisionToDashboard(approvalId, data);
   } catch (e) {
+    restoreButton();
     alert(`Revoke failed: ${e.message || e}`);
   }
 }
 
-async function allowDecision(approvalId, mode = 'once', expires = null) {
+async function allowDecision(approvalId, mode = 'once', expires = null, buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, mode === 'always' ? 'Allowing...' : 'Allowing...');
   try {
     const r = await fetch(`/api/decisions/${approvalId}/allow`, {
       method: 'POST',
@@ -9693,8 +10035,10 @@ async function allowDecision(approvalId, mode = 'once', expires = null) {
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Allow failed');
-    await refreshDashboard();
+    finishActionButton(buttonEl, 'Allowed');
+    scheduleDashboardRefresh(5000);
   } catch (e) {
+    restoreButton();
     alert(`Allow failed: ${e.message || e}`);
   }
 }
@@ -9800,7 +10144,7 @@ function renderPermissions(data) {
       <div class="control-meta">${escHtml(meta)}</div>
       ${(isRule || isPermit) ? targetCodeBlockHtml(item.selector, targetLabel, 'control-code-block') : ''}
       ${whenLabel ? `<div class="control-time">${escHtml(whenLabel)}</div>` : ''}
-      <div class="control-actions"><button class="mini-btn danger" onclick="revokePermission('${revokeKind}','${escHtml(id)}')">Revoke</button></div>
+      <div class="control-actions"><button class="mini-btn danger" onclick="revokePermission('${revokeKind}','${escHtml(id)}',this)">Revoke</button></div>
     </div>`;
   };
   renderDynamicList(el, items, permissionItemHtml, { key: 'permissions', title: `Permissions · ${items.length}` });
@@ -9827,7 +10171,7 @@ async function increaseMemoryLimits(btn) {
     icon: 'warn',
   });
   if (!ok) return;
-  if (btn) btn.disabled = true;
+  const restoreButton = setActionButtonLoading(btn, 'Increasing...');
   try {
     const r = await fetch('/api/memory/increase-limits', { method: 'POST' });
     const data = await r.json().catch(() => ({}));
@@ -9838,7 +10182,7 @@ async function increaseMemoryLimits(btn) {
   } catch (e) {
     alert(`Could not increase memory: ${e.message || e}`);
   } finally {
-    if (btn) btn.disabled = false;
+    restoreButton();
   }
 }
 
@@ -9850,7 +10194,7 @@ async function runSmartMemoryCleanup(btn) {
     icon: 'trash',
   });
   if (!ok) return;
-  if (btn) btn.disabled = true;
+  const restoreButton = setActionButtonLoading(btn, 'Cleaning...');
   try {
     const r = await fetch('/api/memory/smart-cleanup', { method: 'POST' });
     const data = await r.json().catch(() => ({}));
@@ -9860,7 +10204,7 @@ async function runSmartMemoryCleanup(btn) {
   } catch (e) {
     alert(`Cleanup failed: ${e.message || e}`);
   } finally {
-    if (btn) btn.disabled = false;
+    restoreButton();
   }
 }
 
@@ -10010,13 +10354,15 @@ function cardHasPendingAction(kind, id) {
 }
 
 function doctorActionButtonHtml(kind, id, action, label, title, className = 'mini-btn') {
-  const disabled = cardHasPendingAction(kind, id) ? ' disabled aria-busy="true"' : '';
-  return `<button class="${escAttr(className)}" title="${escAttr(title)}"${disabled} onclick="updateDoctorItem('${escAttr(kind)}','${escAttr(id)}','${escAttr(action)}')">${escHtml(label)}</button>`;
+  const pending = cardHasPendingAction(kind, id);
+  const disabled = pending ? ' disabled aria-busy="true"' : '';
+  return `<button class="${escAttr(className)}${pending ? ' is-loading' : ''}" title="${escAttr(title)}"${disabled} onclick="updateDoctorItem('${escAttr(kind)}','${escAttr(id)}','${escAttr(action)}')">${escHtml(pending ? 'Working...' : label)}</button>`;
 }
 
 function taskActionButtonHtml(kind, id, title) {
-  const disabled = pendingCardActions.has(pendingActionKey(`task:${kind}`, id, 'kill')) ? ' disabled aria-busy="true"' : '';
-  return `<button class="mini-btn danger" title="Stop this task and clear it from active work."${disabled} data-task-kind="${escAttr(kind)}" data-task-id="${escAttr(id)}" data-task-title="${escAttr(title)}" onclick="killTaskFromButton(this)">Kill</button>`;
+  const pending = pendingCardActions.has(pendingActionKey(`task:${kind}`, id, 'kill'));
+  const disabled = pending ? ' disabled aria-busy="true"' : '';
+  return `<button class="mini-btn danger${pending ? ' is-loading' : ''}" title="Stop this task and clear it from active work."${disabled} data-task-kind="${escAttr(kind)}" data-task-id="${escAttr(id)}" data-task-title="${escAttr(title)}" onclick="killTaskFromButton(this)">${pending ? 'Killing...' : 'Kill'}</button>`;
 }
 
 function askDoctorAboutItem(id) {
@@ -10089,8 +10435,8 @@ function doctorItemHtml(item) {
     doctorActionButtonHtml('doctor', id, actionName, labelText, 'Run this Doctor playbook action.', 'mini-btn good')
   ).join('');
   const actions = isEscalation
-    ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Mark reviewed', 'Mark this Sentinel item as reviewed.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Mark resolved', 'Close this Sentinel item after it has been handled.', 'mini-btn good')}`)
-    : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
+    ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Review details', 'Review this Sentinel item.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Close', 'Close this Sentinel item.', 'mini-btn good')}`)
+    : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Hide', 'Hide this Doctor item.')}`);
   return `<div class="control-card">
     <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
     <div class="doctor-body">
@@ -10132,8 +10478,8 @@ function renderDoctor(data) {
       doctorActionButtonHtml('doctor', id, actionName, labelText, 'Run this Doctor playbook action.', 'mini-btn good')
     ).join('');
     const actions = isEscalation
-      ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Mark reviewed', 'Mark this Sentinel item as reviewed.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Mark resolved', 'Close this Sentinel item after it has been handled.', 'mini-btn good')}`)
-      : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
+      ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Review details', 'Review this Sentinel item.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Close', 'Close this Sentinel item.', 'mini-btn good')}`)
+      : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Hide', 'Hide this Doctor item.')}`);
     return `<div class="control-card">
       <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
       <div class="doctor-body">
@@ -10221,7 +10567,7 @@ async function refreshDashboard() {
   if (dashboardRefreshPromise) return dashboardRefreshPromise;
   dashboardRefreshPromise = (async () => {
     try {
-    const data = await API('/api/status');
+    const data = await API('/api/status?full=1');
     _lastDashboardData = data;
     renderMission(data);
     renderApprovals(data.approvals || []);
@@ -10261,7 +10607,7 @@ function connectDashboardEvents() {
   dashboardEvents.onmessage = (event) => {
     let data = {};
     try { data = JSON.parse(event.data || '{}'); } catch (_) { data = {}; }
-    if (!data.type || data.type === 'status_changed' || data.type === 'connected') {
+    if (data.type === 'status_changed') {
       scheduleDashboardRefresh(0);
     }
   };
@@ -11496,6 +11842,13 @@ function applyMessagingStatus(cfg) {
 let settingsBaselineSnapshot = '';
 let settingsDirtyExplicit = false;
 let settingsSnapshotReady = false;
+let settingsSaveInProgress = false;
+let preferencesLoaded = false;
+let profileSettingsLoaded = false;
+let usersTabLoaded = false;
+let connectionsTabLoaded = false;
+let builderDoctorSummaryLoaded = false;
+let domainPolicyPreviewLoaded = false;
 
 function settingsStateSnapshot() {
   const overlay = document.getElementById('settings-overlay');
@@ -11531,6 +11884,12 @@ function markSettingsClean() {
   settingsSnapshotReady = true;
 }
 
+function markSettingsCleanAfterLazyLoad() {
+  if (document.getElementById('settings-overlay')?.style.display === 'flex' && !settingsDirtyExplicit && !settingsSaveInProgress) {
+    markSettingsClean();
+  }
+}
+
 function markSettingsDirty() {
   if (document.getElementById('settings-overlay')?.style.display === 'flex') {
     settingsDirtyExplicit = true;
@@ -11538,22 +11897,19 @@ function markSettingsDirty() {
 }
 
 function settingsHaveUnsavedChanges() {
-  if (settingsDirtyExplicit) return true;
-  if (!settingsSnapshotReady) return false;
-  return settingsStateSnapshot() !== settingsBaselineSnapshot;
+  return settingsDirtyExplicit;
 }
 
 async function refreshSettingsBaseline({force = false} = {}) {
+  const fb = document.getElementById('save-feedback');
+  if (!settingsDirtyExplicit && !settingsSaveInProgress && fb) { fb.textContent = 'Loading settings...'; fb.className = ''; }
   const loads = [
     loadConfig({skipSettingsApplyIfDirty: !force}),
-    loadBuilderDoctorSettingsSummary(),
-    loadPreferences(),
-    loadUsersTab(),
-    loadConnectionsTab(),
   ];
   await Promise.allSettled(loads);
   if (force || !settingsDirtyExplicit) markSettingsClean();
   else settingsSnapshotReady = true;
+  if (!settingsDirtyExplicit && !settingsSaveInProgress && fb && fb.textContent === 'Loading settings...') fb.textContent = '';
 }
 
 function openSettings() {
@@ -11561,10 +11917,13 @@ function openSettings() {
   overlay.style.display = 'flex';
   settingsSnapshotReady = false;
   settingsDirtyExplicit = false;
+  renderSkillPackOptions(DEFAULT_SKILL_PACK_CATALOG, '');
+  renderCapabilityDependencies([]);
   refreshSettingsBaseline();
 }
 
 async function closeSettings() {
+  if (settingsSaveInProgress) return;
   if (settingsHaveUnsavedChanges()) {
     const discard = await confirmAction({
       title: 'Discard unsaved settings?',
@@ -11594,6 +11953,15 @@ function showTab(name, btn) {
   document.getElementById('tab-' + name).classList.add('active');
   if (btn) btn.classList.add('active');
   if (name === 'builder' || name === 'doctor') loadBuilderDoctorSettingsSummary();
+  if (name === 'preferences') loadPreferences();
+  if (name === 'security') {
+    loadPreferences();
+    loadDomainPolicyPreview();
+  }
+  if (name === 'profile') loadProfileSettings();
+  if (name === 'users') loadUsersTab();
+  if (name === 'setup') loadConnectionsTab();
+  if (name === 'crons') loadCronsTab();
   if (name === 'logs') loadLogs();
 }
 
@@ -11689,22 +12057,21 @@ function applyDataRetentionConfig(value) {
 }
 
 async function loadBuilderDoctorSettingsSummary() {
+  if (builderDoctorSummaryLoaded) return;
   try {
-    const data = await API('/api/status');
-    const proposals = data.builder_proposals || [];
-    const skills = data.skills || [];
-    const doctorActions = data.doctor_actions || [];
-    const recommendations = data.doctor_recommendations || [];
-    const openProposals = proposals.filter(item => !['accepted', 'rejected', 'dismissed', 'completed', 'cancelled'].includes(String(item.status || '').toLowerCase()));
-    const openDoctorActions = doctorActions.filter(item => !['completed', 'cancelled', 'failed', 'dismissed', 'resolved'].includes(String(item.status || '').toLowerCase()));
-    const attention = Number(data.health && data.health.attention_needed || 0);
-    setTextIfPresent('builder-settings-proposals', proposals.length);
-    setTextIfPresent('builder-settings-skills', skills.length);
-    setTextIfPresent('builder-settings-open', openProposals.length);
-    setTextIfPresent('builder-settings-learned', skills.length);
-    setTextIfPresent('doctor-settings-actions', doctorActions.length);
-    setTextIfPresent('doctor-settings-recommendations', recommendations.length);
-    setTextIfPresent('doctor-settings-open', openDoctorActions.length);
+    const data = await API('/api/settings/summary');
+    builderDoctorSummaryLoaded = true;
+    const builder = data.builder || {};
+    const doctor = data.doctor || {};
+    const health = data.health || {};
+    const attention = Number(health.attention_needed || 0);
+    setTextIfPresent('builder-settings-proposals', Number(builder.proposals || 0));
+    setTextIfPresent('builder-settings-skills', Number(builder.skills || 0));
+    setTextIfPresent('builder-settings-open', Number(builder.open_proposals || 0));
+    setTextIfPresent('builder-settings-learned', Number(builder.skills || 0));
+    setTextIfPresent('doctor-settings-actions', Number(doctor.actions || 0));
+    setTextIfPresent('doctor-settings-recommendations', Number(doctor.recommendations || 0));
+    setTextIfPresent('doctor-settings-open', Number(doctor.open_actions || 0));
     setTextIfPresent('doctor-settings-attention', attention);
     const storage = data.storage || {};
     const status = String(storage.status || 'good').toLowerCase();
@@ -11719,7 +12086,8 @@ async function loadBuilderDoctorSettingsSummary() {
   } catch (e) { /* status panel is best-effort */ }
 }
 
-async function runDoctorDiagnose() {
+async function runDoctorDiagnose(buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Diagnosing...');
   try {
     const res = await fetch('/api/doctor/diagnose', { method: 'POST' });
     const data = await res.json().catch(() => ({}));
@@ -11738,10 +12106,13 @@ async function runDoctorDiagnose() {
     recordActivity('Doctor diagnose failed', message);
     const fb = document.getElementById('save-feedback');
     if (fb) { fb.textContent = message; fb.className = 'err'; }
+  } finally {
+    restoreButton();
   }
 }
 
-async function runDoctorCleanupNow() {
+async function runDoctorCleanupNow(buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Cleaning...');
   try {
     const payload = {
       data_retention_days: dataRetentionDaysPayloadValue(),
@@ -11783,14 +12154,21 @@ async function runDoctorCleanupNow() {
     recordActivity('Doctor cleanup failed', message);
     const fb = document.getElementById('save-feedback');
     if (fb) { fb.textContent = message; fb.className = 'err'; }
+  } finally {
+    restoreButton();
   }
 }
 
-async function enableDoctorAutoClean() {
+async function enableDoctorAutoClean(buttonEl = null) {
+  const restoreButton = setActionButtonLoading(buttonEl, 'Enabling...');
   const toggle = document.getElementById('cfg-smart-cleanup-enabled');
-  if (toggle) toggle.checked = true;
-  await saveConfig();
-  await runDoctorCleanupNow();
+  try {
+    if (toggle) toggle.checked = true;
+    await saveConfig();
+    await runDoctorCleanupNow();
+  } finally {
+    restoreButton();
+  }
 }
 
 // Populated from loadConfig — tracks provider credential state
@@ -12519,7 +12897,7 @@ function updateBrowserSettingsVisibility() {
 
 async function loadConfig(options = {}) {
   try {
-    const cfg = await API('/api/config');
+    const cfg = await fetchConfig({force: options.force === true});
     renderHeaderConfig(cfg);
     if (options.skipSettingsApplyIfDirty && settingsDirtyExplicit) {
       return cfg;
@@ -12738,23 +13116,33 @@ async function loadConfig(options = {}) {
     // media refresh after defaults and setup availability are hydrated, or
     // model-backed helper suggestions may not appear until the next click.
     refreshMediaHelperOptionsFromInventory();
-    // Load profile separately
-    window.__nullionProfileLoaded = false;
-    try {
-      const p = await API('/api/profile');
-      document.getElementById('cfg-profile-name').value    = p.name    || '';
-      document.getElementById('cfg-profile-email').value   = p.email   || '';
-      document.getElementById('cfg-profile-phone').value   = p.phone   || '';
-      document.getElementById('cfg-profile-address').value = p.address || '';
-      document.getElementById('cfg-profile-notes').value   = p.notes   || '';
-      window.__nullionProfileLoaded = true;
-    } catch(e) { /* silent */ }
   } catch (e) { /* silent */ }
+}
+
+async function loadProfileSettings(options = {}) {
+  if (profileSettingsLoaded) return;
+  if (options.skipSettingsApplyIfDirty && settingsDirtyExplicit) return;
+  try {
+    const p = await API('/api/profile');
+    if (settingsDirtyExplicit) {
+      window.__nullionProfileLoaded = true;
+      profileSettingsLoaded = true;
+      return;
+    }
+    document.getElementById('cfg-profile-name').value    = p.name    || '';
+    document.getElementById('cfg-profile-email').value   = p.email   || '';
+    document.getElementById('cfg-profile-phone').value   = p.phone   || '';
+    document.getElementById('cfg-profile-address').value = p.address || '';
+    document.getElementById('cfg-profile-notes').value   = p.notes   || '';
+    window.__nullionProfileLoaded = true;
+    profileSettingsLoaded = true;
+    markSettingsCleanAfterLazyLoad();
+  } catch(e) { /* silent */ }
 }
 
 async function loadHeaderConfig() {
   try {
-    renderHeaderConfig(await API('/api/config'));
+    renderHeaderConfig(await fetchHeaderConfig());
   } catch (e) { /* silent */ }
 }
 
@@ -13055,6 +13443,7 @@ async function launchAgentBrowser() {
       icon: 'warn',
     });
   } finally {
+    if (btn) btn.disabled = false;
     await loadHeaderConfig();
   }
 }
@@ -13239,15 +13628,18 @@ function loadMoreDomainPolicyList(mode) {
   renderDomainPolicyList(mode === 'allow' ? 'pref-domain-allow-list' : 'pref-domain-block-list', domainPolicyStatusCache, mode);
 }
 
-async function loadDomainPolicyPreview() {
+async function loadDomainPolicyPreview({force = false} = {}) {
+  if (domainPolicyPreviewLoaded && !force) return;
   try {
-    const data = await API('/api/status');
+    const data = await API('/api/status?full=1');
+    domainPolicyPreviewLoaded = true;
     domainPolicyStatusCache = {
       boundary_rules: data.boundary_rules || [],
       boundary_permits: data.boundary_permits || [],
     };
     renderDomainPolicyList('pref-domain-allow-list', domainPolicyStatusCache, 'allow');
     renderDomainPolicyList('pref-domain-block-list', domainPolicyStatusCache, 'deny');
+    markSettingsCleanAfterLazyLoad();
   } catch (_) {}
 }
 
@@ -13261,7 +13653,7 @@ async function addDomainPolicy(mode, selector) {
   });
   const data = await res.json();
   if (!res.ok || data.ok === false) throw new Error(data.error || 'Could not add domain');
-  await loadDomainPolicyPreview();
+  await loadDomainPolicyPreview({force: true});
 }
 
 async function revokeDomainPolicy(ruleId, permissionKind = 'boundary-rule') {
@@ -13270,7 +13662,7 @@ async function revokeDomainPolicy(ruleId, permissionKind = 'boundary-rule') {
   const res = await fetch(`/api/permissions/${encodeURIComponent(kind)}/${encodeURIComponent(ruleId)}/revoke`, {method:'POST'});
   const data = await res.json();
   if (!res.ok || data.ok === false) throw new Error(data.error || 'Could not remove domain');
-  await loadDomainPolicyPreview();
+  await loadDomainPolicyPreview({force: true});
 }
 
 document.querySelectorAll('.domain-add-form').forEach(form => {
@@ -13280,14 +13672,14 @@ document.querySelectorAll('.domain-add-form').forEach(form => {
     const button = form.querySelector('.domain-add-btn');
     const mode = form.dataset.mode || 'allow';
     if (!input || !button) return;
-    button.disabled = true;
+    const restoreButton = setActionButtonLoading(button, 'Adding...');
     try {
       await addDomainPolicy(mode, input.value);
       input.value = '';
     } catch (err) {
       alert(`Domain update failed: ${err.message || err}`);
     } finally {
-      button.disabled = false;
+      restoreButton();
     }
   });
 });
@@ -13296,11 +13688,11 @@ document.querySelectorAll('.domain-chip-list').forEach(list => {
   list.addEventListener('click', async e => {
     const button = e.target.closest('.domain-remove-btn');
     if (!button) return;
-    button.disabled = true;
+    const restoreButton = setActionButtonLoading(button, 'Removing...');
     try {
       await revokeDomainPolicy(button.dataset.ruleId || '', button.dataset.permissionKind || 'boundary-rule');
     } catch (err) {
-      button.disabled = false;
+      restoreButton();
       alert(`Domain update failed: ${err.message || err}`);
     }
   });
@@ -13315,8 +13707,14 @@ document.querySelectorAll('.domain-search-input').forEach(input => {
 });
 
 async function loadPreferences() {
+  if (preferencesLoaded) return;
   try {
     const p = await API('/api/preferences');
+    if (settingsDirtyExplicit) {
+      preferencesLoaded = true;
+      return;
+    }
+    preferencesLoaded = true;
     const browserTimezone = (() => {
       try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; }
       catch (_) { return ''; }
@@ -13341,8 +13739,8 @@ async function loadPreferences() {
     document.getElementById('pref-timezone').value    = p.timezone || p.system_timezone || browserTimezone || 'UTC';
     document.getElementById('pref-dateformat').value  = p.date_format || 'YYYY-MM-DD';
     document.getElementById('pref-timeformat').value  = p.time_format || '12h';
+    markSettingsCleanAfterLazyLoad();
   } catch(e) { /* silent */ }
-  await loadDomainPolicyPreview();
 }
 
 async function savePreferences() {
@@ -13813,14 +14211,17 @@ function updateNewUserChannelFields() {
 }
 
 async function loadUsersTab() {
+  if (usersTabLoaded) return;
   try {
     const data = await API('/api/users');
+    usersTabLoaded = true;
     usersRegistry = {
       multi_user_enabled: !!data.multi_user_enabled,
       users: Array.isArray(data.users) ? data.users : [],
     };
     updateNewUserChannelFields();
     renderUsersTab();
+    markSettingsCleanAfterLazyLoad();
   } catch (e) {
     const list = document.getElementById('users-list');
     if (list) list.innerHTML = `<div class="empty"><strong>Could not load users</strong>${escHtml(e.message || e)}</div>`;
@@ -13828,12 +14229,15 @@ async function loadUsersTab() {
 }
 
 async function loadConnectionsTab() {
+  if (connectionsTabLoaded) return;
   try {
     const data = await API('/api/connections');
+    connectionsTabLoaded = true;
     connectionRegistry = {
       connections: Array.isArray(data.connections) ? data.connections : [],
     };
     renderConnectionsTab();
+    markSettingsCleanAfterLazyLoad();
   } catch (_) {
     connectionRegistry = { connections: [] };
     renderConnectionsTab();
@@ -14184,6 +14588,12 @@ async function saveConnections() {
   renderConnectionsTab();
 }
 
+async function ensureSettingsStoresLoadedForSave() {
+  // Saving must never pull lazy stores into the hot path after the user has
+  // started editing; late loads can overwrite the values they just typed.
+  await Promise.resolve();
+}
+
 async function checkForUpdates() {
   try {
     const v = await API('/api/version');
@@ -14197,7 +14607,19 @@ async function checkForUpdates() {
 
 async function saveConfig() {
   const fb = document.getElementById('save-feedback');
-  fb.textContent = 'Saving…'; fb.className = '';
+  const saveBtn = document.getElementById('settings-save-btn');
+  const cancelBtn = document.getElementById('settings-cancel-btn');
+  if (settingsSaveInProgress) return;
+  settingsSaveInProgress = true;
+  const previousSaveText = saveBtn ? saveBtn.textContent : '';
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+  }
+  if (cancelBtn) cancelBtn.disabled = true;
+  fb.textContent = 'Saving settings...'; fb.className = '';
+
+  await ensureSettingsStoresLoadedForSave();
 
   const tgToken = document.getElementById('cfg-tg-token').value;
   const slackBotToken = document.getElementById('cfg-slack-bot-token').value;
@@ -14294,9 +14716,9 @@ async function saveConfig() {
   if (payload.search_provider === 'perplexity_search_provider' && perplexitySearchKey && !perplexitySearchKey.startsWith('•')) payload.perplexity_search_key = perplexitySearchKey;
 
   // Save preferences (run in parallel with config save; surface errors)
-  const prefsSave = savePreferences().catch(e => { throw new Error('Prefs: ' + e.message); });
-  const usersSave = saveUsers().catch(e => { throw new Error('Users: ' + e.message); });
-  const connectionsSave = saveConnections().catch(e => { throw new Error('Connections: ' + e.message); });
+  const prefsSave = preferencesLoaded ? savePreferences().catch(e => { throw new Error('Prefs: ' + e.message); }) : Promise.resolve();
+  const usersSave = usersTabLoaded ? saveUsers().catch(e => { throw new Error('Users: ' + e.message); }) : Promise.resolve();
+  const connectionsSave = connectionsTabLoaded ? saveConnections().catch(e => { throw new Error('Connections: ' + e.message); }) : Promise.resolve();
 
   // Save profile
   const profilePayload = {
@@ -14307,7 +14729,15 @@ async function saveConfig() {
     notes:   document.getElementById('cfg-profile-notes').value.trim(),
     _allow_clear: window.__nullionProfileLoaded === true,
   };
-  fetch('/api/profile', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(profilePayload) });
+  const profileSave = fetch('/api/profile', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(profilePayload),
+  }).then(async res => {
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) throw new Error(data.error || 'Profile save failed');
+    return data;
+  });
 
   try {
     const [res] = await Promise.all([
@@ -14319,17 +14749,29 @@ async function saveConfig() {
       prefsSave,
       usersSave,
       connectionsSave,
+      profileSave,
     ]);
     const data = await res.json();
     if (data.ok) {
+      _lastConfigPayload = null;
+      _lastHeaderConfigPayload = null;
       fb.textContent = '✓ Saved'; fb.className = 'ok';
-      setTimeout(() => { fb.textContent = ''; }, 3000);
+      setTimeout(() => {
+        if (fb.textContent === '✓ Saved') fb.textContent = '';
+      }, 8000);
       await refreshSettingsBaseline({force: true}); // refresh to show updated status and reset unsaved-change warning
     } else {
       fb.textContent = '✗ ' + (data.error || 'Save failed'); fb.className = 'err';
     }
   } catch (e) {
     fb.textContent = '✗ ' + (e.message || 'Save failed'); fb.className = 'err';
+  } finally {
+    settingsSaveInProgress = false;
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = previousSaveText || 'Save changes';
+    }
+    if (cancelBtn) cancelBtn.disabled = false;
   }
 }
 
@@ -15230,8 +15672,31 @@ let _ahChannel = null;
 let _ahCalYear  = null;
 let _ahCalMonth = null;
 let _ahCalDays  = {};
+let _ahRequestSeq = 0;
+let _ahMessageRequestSeq = 0;
+const _ahChannelsCache = [];
+const _ahCalendarCache = new Map();
+const _ahConversationCache = new Map();
+const _ahMessageCache = new Map();
 const _MONTH_NAMES = ['January','February','March','April','May','June',
   'July','August','September','October','November','December'];
+
+function _ahCacheKey(...parts) {
+  return parts.map(p => String(p || '')).join('|');
+}
+
+function _ahLoading(text = 'Loading...') {
+  return '<div class="ah-loading">' + escHtml(text) + '</div>';
+}
+
+function _ahCalendarSkeleton() {
+  return '<div class="ahcal-skeleton">' + '<span></span>'.repeat(35) + '</div>';
+}
+
+function _ahSetCalendarLoading(isLoading) {
+  const grid = document.getElementById('allhist-cal-grid');
+  if (grid) grid.classList.toggle('ahcal-grid-loading', Boolean(isLoading));
+}
 
 function _localDateKey(date) {
   const d = date instanceof Date ? date : new Date(date);
@@ -15244,6 +15709,7 @@ function openAllHistory() {
   const now = new Date();
   _ahCalYear  = now.getFullYear();
   _ahCalMonth = now.getMonth();
+  if (_ahChannelsCache.length) _paintAhChannels(_ahChannelsCache);
   _loadAhChannels();
 }
 
@@ -15253,10 +15719,20 @@ function closeAllHistory() {
 
 async function _loadAhChannels() {
   const list = document.getElementById('allhist-chan-list');
-  list.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">Loading\u2026</div>';
+  if (!_ahChannelsCache.length) list.innerHTML = _ahLoading('Loading channels...');
   try {
     const data = await fetch('/api/history/channels').then(r => r.json());
     const channels = data.channels || [];
+    _ahChannelsCache.splice(0, _ahChannelsCache.length, ...channels);
+    _paintAhChannels(channels);
+  } catch (e) {
+    list.innerHTML = '<div style="padding:12px 14px;color:#ef4444;font-size:12px">Failed to load.</div>';
+  }
+}
+
+function _paintAhChannels(channels) {
+  const list = document.getElementById('allhist-chan-list');
+  if (!list) return;
     if (!channels.length) {
       list.innerHTML = '<div style="padding:12px 14px;color:var(--muted);font-size:12px">No history yet.</div>';
       return;
@@ -15270,6 +15746,7 @@ async function _loadAhChannels() {
         ? new Date(ch.last_message_at).toLocaleDateString(undefined, {month:'short', day:'numeric'})
         : '';
       const icon = ch.channel === 'web' ? '\uD83C\uDF10'
+                 : ch.channel === 'api' ? 'API'
                  : ch.channel.startsWith('telegram:') ? '\u2708\uFE0F'
                  : ch.channel.startsWith('slack:') ? '\uD83D\uDCAC'
                  : ch.channel.startsWith('discord:') ? '\uD83C\uDFAE'
@@ -15284,35 +15761,53 @@ async function _loadAhChannels() {
     if (!_ahChannel && channels.length) {
       _selectAhChannel(channels[0].channel, channels[0].channel_label);
     }
-  } catch (e) {
-    list.innerHTML = '<div style="padding:12px 14px;color:#ef4444;font-size:12px">Failed to load.</div>';
-  }
 }
 
 function _selectAhChannel(channel, label) {
   _ahChannel = channel;
+  const requestSeq = ++_ahRequestSeq;
   document.querySelectorAll('.ahchan-item').forEach(el =>
     el.classList.toggle('active', el.dataset.channel === channel));
+  const activeChannel = document.querySelector('.ahchan-item.active');
+  if (activeChannel) activeChannel.classList.add('loading');
   document.getElementById('allhist-right-title').textContent = label || channel;
-  document.getElementById('allhist-conv-list').innerHTML = '';
+  document.getElementById('allhist-conv-list').innerHTML = _ahLoading('Loading calendar...');
   document.getElementById('allhist-messages').innerHTML =
     '<div id="allhist-empty">Pick a day on the calendar to see conversations.</div>';
-  _renderAhCalendar();
+  _renderAhCalendar(requestSeq);
 }
 
-async function _renderAhCalendar() {
+async function _renderAhCalendar(requestSeq = ++_ahRequestSeq) {
   const ym = _ahCalYear + '-' + String(_ahCalMonth + 1).padStart(2, '0');
   document.getElementById('allhist-cal-month').textContent =
     _MONTH_NAMES[_ahCalMonth] + ' ' + _ahCalYear;
   _ahCalDays = {};
   if (_ahChannel) {
+    const cacheKey = _ahCacheKey(_ahChannel, ym);
+    const cached = _ahCalendarCache.get(cacheKey);
+    if (cached) {
+      _ahCalDays = cached;
+      _ahSetCalendarLoading(false);
+      _paintAhCalendar(ym);
+      document.getElementById('allhist-conv-list').innerHTML = '';
+      document.querySelectorAll('.ahchan-item.loading').forEach(el => el.classList.remove('loading'));
+      return;
+    }
+    _ahSetCalendarLoading(true);
+    document.getElementById('allhist-cal-days').innerHTML = _ahCalendarSkeleton();
     try {
       const data = await fetch(
         '/api/history/calendar/' + encodeURIComponent(_ahChannel) + '?month=' + ym
       ).then(r => r.json());
+      if (requestSeq !== _ahRequestSeq) return;
       _ahCalDays = data.days || {};
+      _ahCalendarCache.set(cacheKey, _ahCalDays);
     } catch (_) {}
   }
+  if (requestSeq !== _ahRequestSeq) return;
+  _ahSetCalendarLoading(false);
+  document.querySelectorAll('.ahchan-item.loading').forEach(el => el.classList.remove('loading'));
+  document.getElementById('allhist-conv-list').innerHTML = '';
   _paintAhCalendar(ym);
 }
 
@@ -15341,13 +15836,18 @@ function _paintAhCalendar(ym) {
 }
 
 function ahCalMove(delta) {
+  const requestSeq = ++_ahRequestSeq;
   _ahCalMonth += delta;
   if (_ahCalMonth < 0)  { _ahCalMonth = 11; _ahCalYear--; }
   if (_ahCalMonth > 11) { _ahCalMonth = 0;  _ahCalYear++; }
-  _renderAhCalendar();
+  document.getElementById('allhist-conv-list').innerHTML = _ahLoading('Loading calendar...');
+  document.getElementById('allhist-messages').innerHTML =
+    '<div id="allhist-empty">Pick a day on the calendar to see conversations.</div>';
+  _renderAhCalendar(requestSeq);
 }
 
 async function _selectAhDate(dateStr) {
+  const requestSeq = ++_ahRequestSeq;
   document.querySelectorAll('.ahcal-day.selected').forEach(el => el.classList.remove('selected'));
   document.querySelectorAll('#allhist-cal-days .ahcal-day').forEach(el => {
     if (!el.classList.contains('other-month')) {
@@ -15358,12 +15858,18 @@ async function _selectAhDate(dateStr) {
   });
   const convList = document.getElementById('allhist-conv-list');
   const msgPane  = document.getElementById('allhist-messages');
-  convList.innerHTML = '<div style="padding:10px 18px;color:var(--muted);font-size:12px">Loading\u2026</div>';
-  msgPane.innerHTML  = '';
+  convList.innerHTML = _ahLoading('Loading conversations...');
+  msgPane.innerHTML  = _ahLoading('Loading messages...');
   try {
-    const data = await fetch(
-      '/api/history/conversations/' + encodeURIComponent(_ahChannel) + '/' + dateStr
-    ).then(r => r.json());
+    const cacheKey = _ahCacheKey(_ahChannel, dateStr);
+    let data = _ahConversationCache.get(cacheKey);
+    if (!data) {
+      data = await fetch(
+        '/api/history/conversations/' + encodeURIComponent(_ahChannel) + '/' + dateStr
+      ).then(r => r.json());
+      _ahConversationCache.set(cacheKey, data);
+    }
+    if (requestSeq !== _ahRequestSeq) return;
     const convs = data.conversations || [];
     const totalMessages = convs.reduce((sum, c) => sum + (Number(c.message_count) || 0), 0);
     if (!convs.length) {
@@ -15414,6 +15920,11 @@ async function deleteAhDate(dateStr, btn) {
     );
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Delete failed');
+    _ahCalendarCache.delete(_ahCacheKey(_ahChannel, _ahCalYear + '-' + String(_ahCalMonth + 1).padStart(2, '0')));
+    _ahConversationCache.delete(_ahCacheKey(_ahChannel, dateStr));
+    for (const key of Array.from(_ahMessageCache.keys())) {
+      if (key.endsWith('|' + dateStr)) _ahMessageCache.delete(key);
+    }
     document.getElementById('allhist-conv-list').innerHTML =
       '<div style="padding:10px 18px;color:var(--muted);font-size:12px">Deleted ' +
       (data.deleted || 0) + ' conversation' + (data.deleted === 1 ? '' : 's') + ' for ' + escHtml(dateStr) + '.</div>';
@@ -15429,14 +15940,22 @@ async function deleteAhDate(dateStr, btn) {
 }
 
 async function _loadAhMessages(convId, rowEl, dateStr = '') {
+  const requestSeq = ++_ahMessageRequestSeq;
   document.querySelectorAll('.ahconv-row').forEach(r => r.classList.remove('active'));
-  if (rowEl) rowEl.classList.add('active');
+  if (rowEl) rowEl.classList.add('active', 'loading');
   const msgPane = document.getElementById('allhist-messages');
-  msgPane.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:14px">Loading\u2026</div>';
+  msgPane.innerHTML = _ahLoading('Loading messages...');
   try {
     const url = '/api/chat/history/' + encodeURIComponent(convId)
       + (dateStr ? '?date=' + encodeURIComponent(dateStr) : '');
-    const data = await fetch(url).then(r => r.json());
+    const cacheKey = _ahCacheKey(convId, dateStr);
+    let data = _ahMessageCache.get(cacheKey);
+    if (!data) {
+      data = await fetch(url).then(r => r.json());
+      _ahMessageCache.set(cacheKey, data);
+    }
+    if (requestSeq !== _ahMessageRequestSeq) return;
+    if (rowEl) rowEl.classList.remove('loading');
     const msgs = data.messages || [];
     if (!msgs.length) {
       msgPane.innerHTML = '<div id="allhist-empty">No messages found.</div>';
@@ -15459,6 +15978,7 @@ async function _loadAhMessages(convId, rowEl, dateStr = '') {
     });
     msgPane.scrollTop = msgPane.scrollHeight;
   } catch (e) {
+    if (rowEl) rowEl.classList.remove('loading');
     msgPane.innerHTML = '<div style="color:#ef4444;font-size:12px;padding:14px">Failed.</div>';
   }
 }
@@ -15558,10 +16078,10 @@ function renderCronsTab(jobs) {
         <div class="cron-meta cron-task">${escHtml(j.task.slice(0, 120))}${j.task.length > 120 ? '…' : ''}</div>
       </div>
       <label class="cron-toggle" title="${j.enabled ? 'Enabled — click to disable' : 'Disabled — click to enable'}">
-        <input type="checkbox" ${j.enabled ? 'checked' : ''} onchange="toggleCronItem('${j.id}', this.checked)">
+        <input type="checkbox" ${j.enabled ? 'checked' : ''} onchange="toggleCronItem('${j.id}', this.checked, this)">
         <span class="cron-slider"></span>
       </label>
-      <button class="cron-del" title="Delete cron" onclick="deleteCronItem('${j.id}')">✕</button>
+      <button class="cron-del" title="Delete cron" onclick="deleteCronItem('${j.id}', this)">✕</button>
     </div>
   `).join('');
 }
@@ -15592,7 +16112,8 @@ function renderCronsDash(jobs) {
   `, { key: 'scheduled', title: `Scheduled tasks · ${jobs.length}`, className: 'control-list' });
 }
 
-async function toggleCronItem(id, enabled) {
+async function toggleCronItem(id, enabled, inputEl = null) {
+  if (inputEl) inputEl.disabled = true;
   try {
     const r = await fetch('/api/crons/' + id, {
       method: 'PATCH',
@@ -15600,12 +16121,18 @@ async function toggleCronItem(id, enabled) {
       body: JSON.stringify({enabled}),
     });
     const d = await r.json();
-    if (!d.ok) { alert('Toggle failed: ' + (d.error || 'unknown error')); return; }
+    if (!d.ok) { throw new Error(d.error || 'unknown error'); }
     await loadCronsTab();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) {
+    if (inputEl) {
+      inputEl.checked = !enabled;
+      inputEl.disabled = false;
+    }
+    alert('Toggle failed: ' + e.message);
+  }
 }
 
-async function deleteCronItem(id) {
+async function deleteCronItem(id, buttonEl = null) {
   const ok = await confirmAction({
     title: 'Delete this cron?',
     message: 'The scheduled task will stop running.',
@@ -15613,12 +16140,16 @@ async function deleteCronItem(id) {
     icon: 'trash',
   });
   if (!ok) return;
+  const restoreButton = setActionButtonLoading(buttonEl, 'Deleting...');
   try {
     const r = await fetch('/api/crons/' + id, { method: 'DELETE' });
     const d = await r.json();
-    if (!d.ok) { alert('Delete failed: ' + (d.error || 'unknown error')); return; }
+    if (!d.ok) { throw new Error(d.error || 'unknown error'); }
     await loadCronsTab();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) {
+    restoreButton();
+    alert('Delete failed: ' + e.message);
+  }
 }
 
 function showCronForm() {
@@ -15660,6 +16191,8 @@ async function submitCronForm() {
     errEl.style.display = 'block';
     return;
   }
+  const saveBtn = document.querySelector('#cron-form .btn-sm:not(.btn-ghost)');
+  const restoreButton = setActionButtonLoading(saveBtn, 'Saving...');
   try {
     const r = await fetch('/api/crons', {
       method: 'POST',
@@ -15678,11 +16211,13 @@ async function submitCronForm() {
     if (!d.ok) {
       errEl.textContent = d.error || 'Failed to create cron.';
       errEl.style.display = 'block';
+      restoreButton();
       return;
     }
     hideCronForm();
     await loadCronsTab();
   } catch(e) {
+    restoreButton();
     errEl.textContent = 'Error: ' + e.message;
     errEl.style.display = 'block';
   }
@@ -15692,15 +16227,18 @@ async function submitCronForm() {
 setInterval(() => fetch('/api/crons').then(r => r.json()).then(renderCronsDash).catch(()=>{}), 120000);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+addDefaultBotGreeting();
 connect();
-refreshDashboard();
-connectDashboardEvents();
 loadHeaderConfig();
-setInterval(refreshDashboard, 30000);
+setTimeout(_restoreConversation, 50);
+setTimeout(() => {
+  refreshDashboard();
+  connectDashboardEvents();
+  loadCronsTab();
+}, 1000);
+setInterval(refreshDashboard, 120000);
 setInterval(updateElapsedCounters, 1000);
-checkForUpdates();
-loadCronsTab();
-_restoreConversation();
+setTimeout(checkForUpdates, 1200);
 </script>
 </body>
 </html>
@@ -15774,6 +16312,160 @@ def _inline_artifact_headers(descriptor) -> dict[str, str]:
 
 
 _WEB_PLAIN_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[^\s`'\"<>|]+)")
+
+
+def _web_explicit_existing_file_delivery_payload(
+    runtime,
+    *,
+    prompt: str,
+    principal_id: str | None,
+    requested_extension: str | None = None,
+) -> dict[str, object] | None:
+    requested = str(requested_extension or "").strip().lower()
+    allowed_extensions = set(ATTACHMENT_TOKEN_EXTENSIONS.values())
+    candidate_paths: list[str] = []
+    for match in _WEB_PLAIN_ABSOLUTE_PATH_RE.finditer(str(prompt or "")):
+        raw = match.group(1).rstrip(").,;:")
+        if raw:
+            candidate_paths.append(raw)
+    if not candidate_paths:
+        return None
+
+    try:
+        app_settings = load_settings()
+    except Exception:
+        app_settings = None
+    configured_roots: list[Path] = []
+    if app_settings is not None:
+        workspace_root = getattr(app_settings, "workspace_root", None)
+        if workspace_root:
+            configured_roots.append(Path(workspace_root).expanduser())
+        configured_roots.extend(Path(root).expanduser() for root in (getattr(app_settings, "allowed_roots", ()) or ()))
+
+    workspace_roots = workspace_storage_roots_for_principal(principal_id)
+    safe_roots = messaging_file_allowed_roots(
+        artifact_root_for_runtime(runtime),
+        artifact_root_for_principal(principal_id),
+        messaging_upload_root(),
+        workspace_roots.files,
+        workspace_roots.media,
+        *configured_roots,
+    )
+    deliverable_paths: list[str] = []
+    for raw_path in dict.fromkeys(candidate_paths):
+        path = Path(raw_path).expanduser()
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        suffix = resolved.suffix.lower()
+        if requested and suffix != requested:
+            continue
+        if suffix not in allowed_extensions:
+            continue
+        try:
+            if not resolved.is_file() or resolved.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        if not any(path_is_within(resolved, root) for root in safe_roots):
+            continue
+        deliverable_paths.append(str(resolved))
+
+    if not deliverable_paths:
+        return None
+    artifact_paths = _web_relocate_external_artifact_paths(
+        runtime,
+        list(dict.fromkeys(deliverable_paths)),
+        principal_id=principal_id,
+    )
+    artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=principal_id)
+    if not artifacts:
+        return None
+    label = _web_artifact_payload_delivery_label(artifacts)
+    if len(artifacts) == 1:
+        text = f"Attached the requested {label}: {artifacts[0].get('name') or Path(artifact_paths[0]).name}."
+    else:
+        text = f"Attached the requested {label}."
+    return {"text": text, "artifacts": artifacts, "thinking": ""}
+
+
+def _web_existing_artifact_followup_payload(
+    runtime,
+    *,
+    prompt: str,
+    conversation_id: str,
+    conversation_result: object | None,
+    principal_id: str | None,
+    model_client: object | None,
+) -> dict[str, object] | None:
+    try:
+        from nullion.chat_operator import (
+            _artifact_followup_candidates,
+            _artifact_followup_disambiguation_reply,
+            _artifact_followup_exact_file_references,
+            _artifact_followup_numbered_selection,
+            _classify_artifact_followup_selection,
+            _recent_artifact_followup_contexts,
+            _relocate_chat_external_artifacts,
+        )
+        from nullion.turn_context_policy import turn_is_context_linked
+    except Exception:
+        return None
+
+    branch_id = str(getattr(getattr(conversation_result, "turn", None), "branch_id", "") or "") or None
+    context_linked = turn_is_context_linked(conversation_result)
+    if not context_linked:
+        branch_id = None
+    contexts = _recent_artifact_followup_contexts(
+        runtime,
+        conversation_id=conversation_id,
+        principal_id=principal_id,
+        branch_id=branch_id,
+    )
+    if not contexts:
+        return None
+    candidates = _artifact_followup_candidates(contexts)
+    exact_paths = _artifact_followup_exact_file_references(prompt, candidates)
+    if not context_linked and not exact_paths:
+        # Keep artifact recovery behind structured continuation evidence.
+        # A chat can contain many old files; their existence alone must not
+        # hijack unrelated calendar, email, weather, or research requests.
+        return None
+    numbered_paths = _artifact_followup_numbered_selection(prompt, candidates) if context_linked else ()
+    selected_paths: tuple[Path, ...] = numbered_paths
+    if not selected_paths:
+        selected_paths = _classify_artifact_followup_selection(
+            model_client=model_client,
+            current_message=prompt,
+            contexts=contexts,
+        )
+    if len(candidates) > 1 and not exact_paths and not numbered_paths and not selected_paths:
+        # Web shares the Telegram invariant: ambiguous existing-file requests
+        # must produce choices unless structured selection identifies the
+        # requested artifact.
+        text = _artifact_followup_disambiguation_reply(candidates)
+        return {"text": text, "artifacts": [], "thinking": ""} if text else None
+    if exact_paths:
+        selected_paths = tuple(path for path in selected_paths if path in exact_paths) or exact_paths
+    if not selected_paths:
+        return None
+    deliverable_paths = _relocate_chat_external_artifacts(
+        runtime,
+        selected_paths,
+        principal_id=principal_id,
+    )
+    if not deliverable_paths:
+        return None
+    artifacts = _web_artifact_descriptors(runtime, [str(path) for path in deliverable_paths], principal_id=principal_id)
+    if not artifacts:
+        return None
+    label = _web_artifact_payload_delivery_label(artifacts)
+    if len(artifacts) == 1:
+        text = f"Re-attached the existing {label}: {artifacts[0].get('name') or Path(deliverable_paths[0]).name}."
+    else:
+        text = f"Re-attached the existing {label}."
+    return {"text": text, "artifacts": artifacts, "thinking": ""}
 
 
 def _web_plain_artifact_paths_from_reply(reply: str | None) -> list[str]:
@@ -15859,6 +16551,48 @@ def _web_browser_screenshot_artifact_paths(
     return list(dict.fromkeys(paths))
 
 
+def _web_file_search_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    reply: str | None,
+    requested_extension: str | None = None,
+) -> list[str]:
+    reply_text = str(reply or "")
+    requested = str(requested_extension or "").lower()
+    paths: list[str] = []
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "file_search":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        matches = output.get("matches")
+        if not isinstance(matches, (list, tuple)):
+            continue
+        for match in matches:
+            if isinstance(match, str):
+                candidate = match.strip()
+            elif isinstance(match, dict):
+                candidate = str(match.get("path") or "").strip()
+            else:
+                candidate = ""
+            if not candidate:
+                continue
+            path = Path(candidate).expanduser()
+            if requested:
+                if path.suffix.lower() != requested:
+                    continue
+            elif path.name not in reply_text:
+                continue
+            try:
+                if not path.is_file() or path.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            paths.append(str(path))
+    return list(dict.fromkeys(paths))
+
+
 def _web_is_email_confirmation_text_artifact(path_text: object) -> bool:
     path = Path(str(path_text or "").strip())
     return path.suffix.lower() == ".txt" and "confirmation" in path.name.casefold()
@@ -15869,6 +16603,7 @@ def _filter_web_artifact_paths_for_requested_format(
     paths: list[str],
     *,
     requested_extension: str | None = None,
+    allow_image_fallback_svg: bool = False,
 ) -> list[str]:
     explicit_extensions = {
         f".{match.group(1).lower()}"
@@ -15880,7 +16615,86 @@ def _filter_web_artifact_paths_for_requested_format(
     if not selected_extension:
         return paths
     matching = [path for path in paths if Path(path).suffix.lower() == selected_extension.lower()]
+    if matching and (
+        not allow_image_fallback_svg
+        or any(Path(path).expanduser().is_file() for path in matching)
+    ):
+        return matching
+    if allow_image_fallback_svg and selected_extension.lower() in {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}:
+        return [path for path in paths if Path(path).suffix.lower() == ".svg"]
     return matching
+
+
+def _web_image_generation_fallback_used(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "image_generate":
+            continue
+        if normalize_tool_status(getattr(result, "status", "")) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("fallback_used") is True:
+            return True
+    return False
+
+
+def _web_artifact_roots_for_delivery(runtime, *, principal_id: str | None) -> tuple[Path, ...]:
+    workspace_roots = workspace_storage_roots_for_principal(principal_id)
+    return (
+        artifact_root_for_runtime(runtime),
+        artifact_root_for_principal(principal_id),
+        messaging_upload_root(),
+        workspace_roots.files,
+        workspace_roots.media,
+    )
+
+
+def _web_is_described_artifact_path(path: Path, *, artifact_roots: tuple[Path, ...]) -> bool:
+    return any(artifact_descriptor_for_path(path, artifact_root=root) is not None for root in artifact_roots)
+
+
+def _web_relocate_external_artifact_paths(
+    runtime,
+    paths: list[str],
+    *,
+    principal_id: str | None,
+) -> list[str]:
+    artifact_roots = _web_artifact_roots_for_delivery(runtime, principal_id=principal_id)
+    destination_root = artifact_root_for_principal(principal_id)
+    relocated: list[str] = []
+    for raw_path in paths:
+        path = Path(str(raw_path or "").strip()).expanduser()
+        if not str(path):
+            continue
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if _web_is_described_artifact_path(resolved, artifact_roots=artifact_roots):
+            relocated.append(str(resolved))
+            continue
+        try:
+            if not resolved.is_file() or resolved.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        if resolved.suffix.lower() not in set(ATTACHMENT_TOKEN_EXTENSIONS.values()):
+            continue
+        destination_root.mkdir(parents=True, exist_ok=True)
+        destination = destination_root / resolved.name
+        if destination.exists():
+            try:
+                if destination.resolve() == resolved:
+                    relocated.append(str(destination))
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                pass
+            destination = destination_root / f"{destination.stem}-{uuid4().hex[:8]}{destination.suffix}"
+        try:
+            shutil.copy2(resolved, destination)
+        except OSError:
+            continue
+        relocated.append(str(destination))
+    return list(dict.fromkeys(relocated))
 
 
 def _web_delivery_artifact_paths(
@@ -15901,12 +16715,18 @@ def _web_delivery_artifact_paths(
             path for path in explicit_media_paths if not _web_is_email_confirmation_text_artifact(path)
         ]
     preferred_tool_artifacts = _preferred_singular_artifact_paths_from_tool_results(tool_results)
+    file_search_artifacts = _web_file_search_artifact_paths_from_tool_results(
+        tool_results,
+        reply=reply,
+        requested_extension=requested_extension,
+    )
     if explicit_media_paths:
         candidates = explicit_media_paths
     elif preferred_tool_artifacts and not requested_extension:
         candidates = [
             *preferred_tool_artifacts,
             *_companion_artifact_paths_from_tool_results(tool_results),
+            *file_search_artifacts,
             *_web_plain_artifact_paths_from_reply(reply),
         ]
     else:
@@ -15915,6 +16735,7 @@ def _web_delivery_artifact_paths(
             *email_attachment_paths,
             *(artifact_paths or ()),
             *artifact_paths_from_tool_results(tool_results),
+            *file_search_artifacts,
             *_web_plain_artifact_paths_from_reply(reply),
         ]
     non_screenshot_candidates = [
@@ -15931,7 +16752,9 @@ def _web_delivery_artifact_paths(
         prompt,
         candidates,
         requested_extension=requested_extension,
+        allow_image_fallback_svg=_web_image_generation_fallback_used(tool_results),
     )
+    candidates = _web_relocate_external_artifact_paths(runtime, candidates, principal_id=principal_id)
     descriptor_paths = [
         str(payload.get("path") or "")
         for payload in _web_artifact_descriptors(runtime, candidates, principal_id=principal_id)
@@ -16090,7 +16913,7 @@ def _web_artifact_payload_delivery_label(artifact_payloads: list[dict[str, objec
     media_type = str(payload.get("media_type") or payload.get("mime_type") or "").lower()
     name = str(payload.get("name") or payload.get("path") or "").lower()
     suffix = Path(name).suffix
-    if media_type.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+    if media_type.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}:
         return "image"
     if media_type == "application/pdf" or suffix == ".pdf":
         return "PDF"
@@ -16230,7 +17053,28 @@ def _web_attachment_extension_node(state: _WebAttachmentPlanState) -> dict[str, 
     requested_format = plan_attachment_format(state.get("prompt") or "")
     if requested_format.extension in {".html", ".txt"}:
         return {"extension": requested_format.extension}
+    if bool(state.get("has_source_target")):
+        for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(state.get("prompt") or "")):
+            token = _token_around_web_attachment_format(str(state.get("prompt") or ""), match.start(), match.end())
+            if "/" in token or "\\" in token or "=" in token:
+                continue
+            extension = f".{match.group(1).lower()}"
+            if extension in {".html", ".txt"}:
+                # URL-fetch artifact materialization is the one place where a bare
+                # destination filename is safe: the URL/domain is the source, and
+                # only viewable text/html outputs are handled by this path.
+                return {"extension": extension}
     return {"extension": None}
+
+
+def _token_around_web_attachment_format(text: str, start: int, end: int) -> str:
+    left = start
+    while left > 0 and not text[left - 1].isspace():
+        left -= 1
+    right = end
+    while right < len(text) and not text[right].isspace():
+        right += 1
+    return text[left:right].strip("`'\"<>(),;:")
 
 
 @lru_cache(maxsize=1)
@@ -16344,6 +17188,7 @@ def _materialize_fetch_artifact_for_web(
         tool_results=list(tool_results),
         registry=registry,
         principal_id=principal_id,
+        requested_extension=source_attachment_extension or requested_extension,
     )
     return result.artifact_paths if result.completed else []
 
@@ -17244,7 +18089,7 @@ def create_app(runtime, orchestrator, registry):
             settings = None
         return effective_cron_delivery_channel(job, settings=settings)
 
-    cron_background_deliveries: dict[str, Any] = {}
+    cron_background_deliveries = CronBackgroundDeliveryTracker()
     def _record_cron_delivery_event(event_type: str, job, channel: str, target: str, conv_id: str, **extra: Any) -> None:
         try:
             from .audit import make_audit_record
@@ -17443,6 +18288,7 @@ def create_app(runtime, orchestrator, registry):
         manual_delivery_channel: str | None = None,
         manual_delivery_target: str | None = None,
         planner_status_preview: bool = False,
+        preferred_planner_group_id: str | None = None,
     ) -> dict:
         def _effective_channel_for_run(cron_job) -> str:
             if manual_delivery_channel:
@@ -17528,7 +18374,7 @@ def create_app(runtime, orchestrator, registry):
             )
             preview = None
             display_preview = None
-            planner_group_id = ""
+            planner_group_id = str(preferred_planner_group_id or "").strip()
             planner_terminal_sent = False
             pending_activity_detail = ""
 
@@ -17596,11 +18442,16 @@ def create_app(runtime, orchestrator, registry):
                 nonlocal preview, display_preview, planner_group_id
                 if candidate is None:
                     return
-                if preserve_group_id and planner_group_id:
+                if planner_group_id:
                     candidate = candidate.with_group_id(planner_group_id)
                 preview = candidate
                 display_preview = candidate
-                planner_group_id = candidate.group_id
+                planner_group_id = planner_group_id or candidate.group_id
+                # Multiple cron jobs can deliver to the same Telegram/Slack/Discord
+                # conversation at once. Bind the job to the task group as soon as
+                # we know it so the final mini-agent delivery keeps the right header.
+                if not str(conv_id or "").startswith("web:"):
+                    cron_background_deliveries.start(conv_id, cron_job, group_id=planner_group_id)
                 _broadcast_cron_planner_status(conv_id, planner_group_id, candidate.initial_text())
                 _flush_pending_activity()
 
@@ -17768,6 +18619,12 @@ def create_app(runtime, orchestrator, registry):
                     tool_registry=execution_registry,
                     planner_preview=preview,
                 )
+                if not planner_group_id:
+                    from nullion.task_queue import make_group_id
+
+                    planner_group_id = make_group_id()
+                    if not str(conv_id or "").startswith("web:"):
+                        cron_background_deliveries.start(conv_id, cron_job, group_id=planner_group_id)
                 try:
                     dispatch_result = orchestrator.dispatch_request_sync(
                         conversation_id=conv_id,
@@ -17795,6 +18652,8 @@ def create_app(runtime, orchestrator, registry):
                         "status_delivered": bool(getattr(dispatch_result, "status_delivered", False))
                         and _planner_status_delivered_by_local_callback(),
                     }
+                    if result["task_group_id"] and not str(conv_id or "").startswith("web:"):
+                        cron_background_deliveries.start(conv_id, cron_job, group_id=result["task_group_id"])
                 except BaseException as exc:
                     if planner_group_id and _planner_group_has_started_runs(planner_group_id):
                         result = _deferred_dispatch_payload(exc)
@@ -17871,8 +18730,8 @@ def create_app(runtime, orchestrator, registry):
                     text,
                     run_label=label,
                 ),
-                start_background_delivery=lambda conv_id, cron_job: cron_background_deliveries.__setitem__(conv_id, cron_job),
-                clear_background_delivery=lambda conv_id: cron_background_deliveries.pop(conv_id, None),
+                start_background_delivery=lambda conv_id, cron_job: cron_background_deliveries.start(conv_id, cron_job),
+                clear_background_delivery=lambda conv_id: cron_background_deliveries.clear(conv_id),
             ),
         )
 
@@ -17927,6 +18786,35 @@ def create_app(runtime, orchestrator, registry):
                             break
                 delivery_channel = manual_channel or "web"
                 delivery_target = manual_target or "web:operator"
+                invocation_id = str(getattr(invocation, "invocation_id", "") or "").strip()
+                manual_group_id = f"cron-{getattr(job, 'id', 'run')}-{invocation_id or uuid4().hex[:12]}"
+                foreground_status_delivered = False
+                foreground_status_text = ""
+                if delivery_channel == "web" and delivery_target.startswith("web:"):
+                    try:
+                        planner_prompt = (
+                            f"{str(getattr(job, 'name', '') or '').strip()}\n"
+                            f"{str(getattr(job, 'task', '') or '').strip()}"
+                        ).strip() or str(getattr(job, "task", "") or getattr(job, "name", "") or "")
+                        fallback_preview = build_cron_planner_status_fallback(
+                            user_message=planner_prompt,
+                            conversation_id=delivery_target,
+                            principal_id=delivery_target,
+                            subject=str(getattr(job, "name", "") or ""),
+                        ).with_group_id(manual_group_id)
+                        foreground_status_text = fallback_preview.initial_text()
+                        # The foreground tool call returns before the cron
+                        # finishes. Emit a same-group fallback card now so a
+                        # live WebSocket user is never left with only a
+                        # suppressed receipt while the background runner starts.
+                        _broadcast_cron_planner_status(
+                            delivery_target,
+                            manual_group_id,
+                            foreground_status_text,
+                        )
+                        foreground_status_delivered = True
+                    except Exception:
+                        logger.debug("Could not broadcast foreground web cron planner fallback", exc_info=True)
 
                 def _background_manual_cron_run() -> None:
                     try:
@@ -17937,6 +18825,7 @@ def create_app(runtime, orchestrator, registry):
                             manual_delivery_channel=delivery_channel,
                             manual_delivery_target=delivery_target,
                             planner_status_preview=True,
+                            preferred_planner_group_id=manual_group_id,
                         )
                         if isinstance(result, dict) and (
                             result.get("cron_delivery_failed") or result.get("cron_run_failed")
@@ -17957,9 +18846,19 @@ def create_app(runtime, orchestrator, registry):
                 thread.start()
                 return {
                     "cron_delivery_status": "deferred",
+                    # The background cron run owns execution, but the foreground
+                    # tool result still needs the group id so every surface can
+                    # link the receipt, planner card, and terminal result.
                     "mini_agent_dispatch": True,
+                    "task_group_id": manual_group_id,
+                    # WebSocket, Telegram, and future live surfaces must not
+                    # synthesize a second generic planner/receipt for this
+                    # foreground tool call. The real background cron run is
+                    # already emitting task status for the same group id.
+                    "planner_status_owned_by_background": True,
+                    "planner_status_text": foreground_status_text,
                     "text": "Manual scheduled task run started. The result will be delivered when ready.",
-                    "status_delivered": False,
+                    "status_delivered": foreground_status_delivered,
                 }
 
             register_cron_tools(
@@ -18525,32 +19424,10 @@ def create_app(runtime, orchestrator, registry):
         return None
 
     def _status_cache_fingerprint() -> str | None:
+        # Keep cache validation cheap. Mutating API routes explicitly invalidate
+        # this cache, so a full memory scan here only makes every status poll slow.
         checkpoint_fingerprint = getattr(runtime, "last_checkpoint_fingerprint", None)
-        try:
-            owner = memory_owner_for_web_admin()
-            memory_signature = [
-                (
-                    entry.entry_id,
-                    str(getattr(entry, "kind", "")),
-                    entry.updated_at.isoformat() if getattr(entry, "updated_at", None) else "",
-                    int(getattr(entry, "use_count", 0) or 0),
-                    float(getattr(entry, "use_score", 0.0) or 0.0),
-                )
-                for entry in memory_entries_for_owner(runtime.store, owner)
-            ]
-        except Exception:
-            memory_signature = []
-        try:
-            return json.dumps(
-                {
-                    "checkpoint": checkpoint_fingerprint,
-                    "dashboard_memory": sorted(memory_signature),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        except Exception:
-            return checkpoint_fingerprint
+        return str(checkpoint_fingerprint or "")
 
     @app.middleware("http")
     async def _invalidate_status_cache_after_api_mutation(request: Request, call_next):
@@ -18563,12 +19440,102 @@ def create_app(runtime, orchestrator, registry):
             _invalidate_status_cache()
         return response
 
+    def _lite_status_payload() -> dict[str, object]:
+        try:
+            from nullion.runtime import build_runtime_status_snapshot
+
+            snapshot = build_runtime_status_snapshot(runtime.store)
+            counts = snapshot.get("counts", {})
+        except Exception:
+            counts = {}
+        return {
+            "approvals": [],
+            "permission_grants": [],
+            "boundary_rules": [],
+            "boundary_permits": [],
+            "builder_proposals": [],
+            "builder_route_observations": [],
+            "latency_timings": [],
+            "latency_breakdowns": [],
+            "doctor_actions": [],
+            "doctor_recommendations": [],
+            "sentinel_escalations": [],
+            "task_frames": [],
+            "mini_agent_tasks": [],
+            "skills": [],
+            "memory": [],
+            "health": {"attention_needed": 0, "counts": counts},
+            "storage": {},
+            "tool_count": 0,
+            "status_meta": {"lite": True, "cache_ttl_s": _status_cache_ttl_s(), "limits": {}, "truncated": {}},
+        }
+
+    def _settings_summary_payload() -> dict[str, object]:
+        store = runtime.store
+        builder_records = list(getattr(store, "builder_proposals", {}).values())
+        builder_open = [
+            record
+            for record in builder_records
+            if str(getattr(record, "status", "") or "").lower() in {"pending", "warning", "needs_attention"}
+        ]
+        skills = getattr(store, "skills", {})
+        doctor_actions = list(getattr(store, "list_doctor_actions", lambda: [])())
+        doctor_recommendations = list(getattr(store, "list_doctor_recommendations", lambda: [])())
+        open_doctor_actions = [
+            action
+            for action in doctor_actions
+            if str(action.get("status", "") if isinstance(action, dict) else getattr(action, "status", "")).lower()
+            not in {"completed", "cancelled", "failed", "dismissed", "resolved"}
+        ]
+        try:
+            from nullion.runtime import build_runtime_status_snapshot
+
+            counts = build_runtime_status_snapshot(store).get("counts", {})
+        except Exception:
+            counts = {}
+        attention = (
+            int(counts.get("pending_approval_requests", 0) or 0)
+            + int(counts.get("pending_doctor_actions", 0) or 0)
+            + int(counts.get("open_sentinel_escalations", 0) or 0)
+        )
+        attention += sum(
+            1
+            for record in builder_records
+            if str(getattr(record, "status", "") or "").lower() == "pending"
+            and str(getattr(getattr(record, "proposal", None), "approval_mode", "") or "").lower() == "dependency"
+        )
+        storage = _storage_status_payload(runtime)
+        if storage.get("needs_cleanup") and not storage.get("auto_cleanup_enabled"):
+            attention += 1
+        return {
+            "builder": {
+                "proposals": len(builder_records),
+                "open_proposals": len(builder_open),
+                "skills": len(skills) if isinstance(skills, dict) else 0,
+            },
+            "doctor": {
+                "actions": len(doctor_actions),
+                "open_actions": len(open_doctor_actions),
+                "recommendations": len(doctor_recommendations),
+            },
+            "health": {"attention_needed": attention, "counts": counts},
+            "storage": storage,
+        }
+
+    @app.get("/api/settings/summary")
+    async def settings_summary():
+        return JSONResponse(_settings_summary_payload(), headers={"X-Nullion-Status-Cache": "settings-summary"})
+
     @app.get("/api/status")
-    async def status():
+    async def status(request: Request):
+        full = str(request.query_params.get("full") or "").strip().lower() in {"1", "true", "yes", "full"}
+        if not full:
+            return JSONResponse(_lite_status_payload(), headers={"X-Nullion-Status-Cache": "lite"})
         nonlocal status_cache_payload, status_cache_created_at
         cache_ttl_s = _status_cache_ttl_s()
         async with status_cache_lock:
-            _sync_runtime_store_from_checkpoint()
+            if _sync_runtime_store_from_checkpoint():
+                _invalidate_status_cache()
             current_fingerprint = _status_cache_fingerprint()
             cache_now = time.monotonic()
             cached = _status_cache_response(cache_now, cache_ttl_s, fingerprint=current_fingerprint)
@@ -18907,24 +19874,27 @@ def create_app(runtime, orchestrator, registry):
             })
         builder_route_observations = []
         try:
-            builder_route_observations = store.list_builder_route_observations()[:_status_limit("builder_route_observations", 100)]
+            builder_route_observations = store.list_builder_route_observations()[:_status_limit("builder_route_observations", 25)]
         except Exception:
             logger.debug("web status: failed to list Builder route observations", exc_info=True)
         latency_events: list[dict[str, object]] = []
         latency_timings = []
+        latency_timing_limit = _status_limit("latency_timings", 25)
+        latency_breakdown_limit = _status_limit("latency_breakdowns", 5)
         try:
-            latency_events = [
-                dict(event)
-                for event in store.list_conversation_events()
-                if isinstance(event, dict)
-                and str(event.get("event_type") or "") in {
-                    "conversation.model_timing",
-                    "conversation.latency_timing",
-                    "conversation.tool_timing",
-                }
-            ]
+            timing_event_limit = max(25, latency_timing_limit, latency_breakdown_limit * 8)
+            for event_type in (
+                "conversation.latency_timing",
+                "conversation.model_timing",
+                "conversation.tool_timing",
+            ):
+                latency_events.extend(
+                    dict(event)
+                    for event in store.list_recent_conversation_events(event_type=event_type, limit=timing_event_limit)
+                    if isinstance(event, dict)
+                )
             latency_events.sort(key=lambda event: str(event.get("created_at") or ""), reverse=True)
-            latency_timings = latency_events[:_status_limit("latency_timings", 100)]
+            latency_timings = latency_events[:latency_timing_limit]
         except Exception:
             logger.debug("web status: failed to list latency timing events", exc_info=True)
         memory_pressure = None
@@ -19043,7 +20013,7 @@ def create_app(runtime, orchestrator, registry):
             "latency_timings": latency_timings,
             "latency_breakdowns": _build_latency_breakdowns(
                 latency_events,
-                limit=_status_limit("latency_breakdowns", 50),
+                limit=latency_breakdown_limit,
             ),
             "doctor_actions": doctor_actions,
             "doctor_recommendations": doctor_recommendations,
@@ -19062,11 +20032,11 @@ def create_app(runtime, orchestrator, registry):
             "boundary_rules": _status_limit("boundary_rules", 500),
             "boundary_permits": _status_limit("boundary_permits", 500),
             "builder_proposals": _status_limit("builder_proposals", 250),
-            "builder_route_observations": _status_limit("builder_route_observations", 100),
-            "latency_timings": _status_limit("latency_timings", 100),
-            "latency_breakdowns": _status_limit("latency_breakdowns", 50),
+            "builder_route_observations": _status_limit("builder_route_observations", 25),
+            "latency_timings": latency_timing_limit,
+            "latency_breakdowns": latency_breakdown_limit,
             "doctor_actions": _status_limit("doctor_actions", 250),
-            "doctor_recommendations": _status_limit("doctor_recommendations", 250),
+            "doctor_recommendations": _status_limit("doctor_recommendations", 50),
             "sentinel_escalations": _status_limit("sentinel_escalations", 250),
             "task_frames": _status_limit("task_frames", 500),
             "mini_agent_tasks": _status_limit("mini_agent_tasks", 500),
@@ -19198,7 +20168,7 @@ def create_app(runtime, orchestrator, registry):
             if permission_kind == "grant":
                 runtime.revoke_permission_grant(permission_id, actor="operator", reason="Revoked from web UI")
                 _invalidate_status_cache()
-                return JSONResponse({"ok": True})
+                return JSONResponse({"ok": True, "revoked": 1, "revoked_grant_ids": [permission_id]})
             elif permission_kind in {"boundary-rule", "boundary-permit"}:
                 from nullion.runtime import revoke_related_boundary_permission
 
@@ -19211,7 +20181,7 @@ def create_app(runtime, orchestrator, registry):
                 )
                 runtime.checkpoint()
                 _invalidate_status_cache()
-                return JSONResponse({"ok": True, "revoked": revoked})
+                return JSONResponse({"ok": True, "revoked": revoked, "permission_kind": permission_kind, "permission_id": permission_id})
             else:
                 return JSONResponse({"ok": False, "error": "unknown permission kind"}, status_code=400)
         except KeyError:
@@ -19281,10 +20251,14 @@ def create_app(runtime, orchestrator, registry):
     async def revoke_decision_permissions(approval_id: str):
         try:
             revoked = 0
+            revoked_grant_ids: list[str] = []
+            revoked_rule_ids: list[str] = []
+            revoked_permit_ids: list[str] = []
             for grant in runtime.store.list_permission_grants():
                 if grant.approval_id == approval_id and grant.revoked_at is None:
                     runtime.revoke_permission_grant(grant.grant_id, actor="operator", reason="Revoked from web UI")
                     revoked += 1
+                    revoked_grant_ids.append(grant.grant_id)
             approval = runtime.store.get_approval_request(approval_id)
             from nullion.policy import permission_scope_principal
             ctx = approval.context if approval is not None and isinstance(approval.context, dict) else {}
@@ -19303,13 +20277,21 @@ def create_app(runtime, orchestrator, registry):
                 if matches_approval or matches_selector:
                     runtime.store.add_boundary_policy_rule(replace(rule, revoked_at=datetime.now(UTC)))
                     revoked += 1
+                    revoked_rule_ids.append(rule.rule_id)
             for permit in runtime.store.list_boundary_permits():
                 if permit.approval_id == approval_id and permit.revoked_at is None:
                     runtime.store.add_boundary_permit(replace(permit, revoked_at=datetime.now(UTC)))
                     revoked += 1
+                    revoked_permit_ids.append(permit.permit_id)
             runtime.checkpoint()
             _invalidate_status_cache()
-            return JSONResponse({"ok": True, "revoked": revoked})
+            return JSONResponse({
+                "ok": True,
+                "revoked": revoked,
+                "revoked_grant_ids": revoked_grant_ids,
+                "revoked_rule_ids": revoked_rule_ids,
+                "revoked_permit_ids": revoked_permit_ids,
+            })
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -19633,8 +20615,14 @@ def create_app(runtime, orchestrator, registry):
             or _active_connector_connection_exists()
         ) else "false"
 
+    def _normalized_enabled_skill_pack_value(enabled_value: str) -> str:
+        pack_ids = tuple(item.strip() for item in str(enabled_value or "").split(",") if item.strip())
+        return ", ".join(normalize_enabled_skill_pack_ids(pack_ids))
+
     def _remove_enabled_skill_pack(pack_id: str) -> str:
         normalized = normalize_pack_id(pack_id)
+        if is_builtin_nullion_skill_pack_id(normalized):
+            return _normalized_enabled_skill_pack_value(os.environ.get("NULLION_ENABLED_SKILL_PACKS", ""))
         remaining: list[str] = []
         for raw in os.environ.get("NULLION_ENABLED_SKILL_PACKS", "").split(","):
             value = raw.strip()
@@ -19646,18 +20634,16 @@ def create_app(runtime, orchestrator, registry):
             except ValueError:
                 pass
             remaining.append(value)
-        return ", ".join(dict.fromkeys(remaining))
+        return _normalized_enabled_skill_pack_value(", ".join(dict.fromkeys(remaining)))
 
     def _apply_enabled_skill_packs(enabled_value: str) -> dict[str, str]:
+        enabled_value = _normalized_enabled_skill_pack_value(enabled_value)
         updates = {
             "NULLION_ENABLED_SKILL_PACKS": enabled_value,
-            "NULLION_SKILL_PACK_ACCESS_ENABLED": "true" if enabled_value.strip() else "false",
+            "NULLION_SKILL_PACK_ACCESS_ENABLED": "true",
             "NULLION_CONNECTOR_ACCESS_ENABLED": _connector_access_value_for_skill_packs(enabled_value),
         }
-        if enabled_value.strip():
-            os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_value
-        else:
-            os.environ.pop("NULLION_ENABLED_SKILL_PACKS", None)
+        os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_value
         os.environ["NULLION_SKILL_PACK_ACCESS_ENABLED"] = updates["NULLION_SKILL_PACK_ACCESS_ENABLED"]
         os.environ["NULLION_CONNECTOR_ACCESS_ENABLED"] = updates["NULLION_CONNECTOR_ACCESS_ENABLED"]
         _write_env_updates(_find_env_path(), updates)
@@ -19720,6 +20706,88 @@ def create_app(runtime, orchestrator, registry):
             item["available_to_agent"] = bool(item.get("installed")) and not disabled
             payloads.append(item)
         return payloads
+
+    @app.get("/api/config/header")
+    async def get_header_config():
+        """Return only the lightweight config needed by the always-visible header."""
+        creds = _read_credentials_json()
+        stored_keys_raw = creds.get("keys")
+        stored_keys = stored_keys_raw if isinstance(stored_keys_raw, dict) else {}
+        oai_key = (
+            os.environ.get("OPENAI_API_KEY", "")
+            or (creds.get("api_key", "") if creds.get("provider") == "openai" else "")
+            or str(stored_keys.get("openai") or "")
+        )
+        ant_key = (
+            os.environ.get("ANTHROPIC_API_KEY", "")
+            or (creds.get("api_key", "") if creds.get("provider") == "anthropic" else "")
+            or str(stored_keys.get("anthropic") or "")
+        )
+        raw_provider = (
+            os.environ.get("NULLION_MODEL_PROVIDER")
+            or creds.get("provider")
+            or ("openai" if oai_key else ("anthropic" if ant_key else "openai"))
+        )
+        provider, codex_token = _model_provider_and_codex_token_for_config(
+            raw_provider,
+            oai_key=str(oai_key),
+            creds=creds,
+            stored_keys=stored_keys,
+        )
+        provider_models_raw = creds.get("models")
+        if not isinstance(provider_models_raw, dict):
+            provider_models_raw = {}
+        provider_models: dict[str, str] = {
+            k: str(v or "") for k, v in provider_models_raw.items() if isinstance(k, str)
+        }
+        legacy_model = creds.get("model", "")
+        if legacy_model and provider and not provider_models.get(provider):
+            provider_models[provider] = legacy_model
+        model_name = (
+            _primary_model_entry(os.environ.get("NULLION_MODEL"))
+            or _primary_model_entry(provider_models.get(provider, ""))
+            or _primary_model_entry(legacy_model)
+        )
+        providers_enabled = (
+            {k: bool(v) for k, v in (creds.get("providers_enabled") or {}).items() if isinstance(k, str)}
+            if isinstance(creds.get("providers_enabled"), dict) else {}
+        )
+        providers_configured = {
+            "anthropic": bool(ant_key),
+            "openai": bool(str(oai_key).startswith("sk-")),
+            "openrouter": bool(os.environ.get("OPENROUTER_API_KEY", "") or os.environ.get("NULLION_OPENROUTER_API_KEY", "") or str(stored_keys.get("openrouter") or "")),
+            "openrouter-key": bool(os.environ.get("OPENROUTER_API_KEY", "") or os.environ.get("NULLION_OPENROUTER_API_KEY", "") or str(stored_keys.get("openrouter") or "")),
+            "gemini": bool(os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("NULLION_GEMINI_API_KEY", "") or str(stored_keys.get("gemini") or "")),
+            "ollama": bool(os.environ.get("OLLAMA_API_KEY", "") or os.environ.get("NULLION_OLLAMA_API_KEY", "") or str(stored_keys.get("ollama") or "") or provider == "ollama"),
+            "groq": bool(os.environ.get("GROQ_API_KEY", "") or os.environ.get("NULLION_GROQ_API_KEY", "") or str(stored_keys.get("groq") or "")),
+            "mistral": bool(os.environ.get("MISTRAL_API_KEY", "") or str(stored_keys.get("mistral") or "")),
+            "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY", "") or os.environ.get("NULLION_DEEPSEEK_API_KEY", "") or str(stored_keys.get("deepseek") or "")),
+            "xai": bool(os.environ.get("XAI_API_KEY", "") or os.environ.get("NULLION_XAI_API_KEY", "") or str(stored_keys.get("xai") or "")),
+            "together": bool(os.environ.get("TOGETHER_API_KEY", "") or os.environ.get("NULLION_TOGETHER_API_KEY", "") or str(stored_keys.get("together") or "")),
+            "custom": bool(creds.get("base_url")),
+            "codex": bool(codex_token),
+        }
+        if provider and provider not in providers_configured:
+            providers_configured[provider] = True
+        active_provider_enabled = providers_enabled.get(provider, creds.get("provider_enabled", True))
+        browser_backend = (creds.get("browser_backend", "") if creds else "") or os.environ.get("NULLION_BROWSER_BACKEND", "")
+        return JSONResponse({
+            "model_provider": provider,
+            "model_provider_enabled": (
+                False
+                if (os.environ.get("NULLION_MODEL_PROVIDER_DISABLED", "").strip().lower()
+                    not in ("", "0", "false", "no", "off"))
+                else bool(active_provider_enabled)
+            ),
+            "model_name": model_name,
+            "provider_models": provider_models,
+            "providers_enabled": providers_enabled,
+            "providers_configured": providers_configured,
+            "browser_backend": browser_backend,
+            "browser_tools_available": _tool_registered("browser_navigate"),
+            "activity_trace": os.environ.get("NULLION_ACTIVITY_TRACE_ENABLED", "false").lower() not in ("0", "false", "no", "off"),
+            "show_thinking": os.environ.get("NULLION_SHOW_THINKING_ENABLED", "false").lower() not in ("0", "false", "no", "off"),
+        })
 
     @app.get("/api/config")
     async def get_config():
@@ -20112,7 +21180,9 @@ def create_app(runtime, orchestrator, registry):
             "video_input_provider": video_input_provider,
             "video_input_model": video_input_model,
             "video_input_model_options": video_input_model_options,
-            "enabled_skill_packs": os.environ.get("NULLION_ENABLED_SKILL_PACKS", ""),
+            "enabled_skill_packs": _normalized_enabled_skill_pack_value(
+                os.environ.get("NULLION_ENABLED_SKILL_PACKS", "")
+            ),
             "installed_skill_packs": [
                 {
                     "pack_id": pack.pack_id,
@@ -20222,6 +21292,11 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok": False, "error": "pack_id is required"}, status_code=400)
         try:
             normalized_id = normalize_pack_id(pack_id)
+            if is_builtin_nullion_skill_pack_id(normalized_id):
+                return JSONResponse(
+                    {"ok": False, "error": "Core Nullion skill packs cannot be removed."},
+                    status_code=400,
+                )
             removed_pack = uninstall_skill_pack(normalized_id)
             enabled_value = _remove_enabled_skill_pack(normalized_id)
             updates = _apply_enabled_skill_packs(enabled_value)
@@ -20888,12 +21963,44 @@ def create_app(runtime, orchestrator, registry):
         reasoning_effort = normalize_reasoning_effort(str(body.get("reasoning_effort") or ""))
         media_models_body = body.get("media_models")
         media_providers_enabled_body = body.get("media_providers_enabled")
+        clear_media_selections = {
+            str(item or "").strip()
+            for item in (body.get("clear_media_selections") or ())
+            if str(item or "").strip()
+        }
+        for provider_key, model_key in (
+            ("audio_transcribe_provider", "audio_transcribe_model"),
+            ("image_ocr_provider", "image_ocr_model"),
+            ("image_generate_provider", "image_generate_model"),
+            ("video_input_provider", "video_input_model"),
+        ):
+            if (
+                provider_key in body
+                and model_key in body
+                and not str(body.get(provider_key) or "").strip()
+                and not str(body.get(model_key) or "").strip()
+            ):
+                clear_media_selections.update({provider_key, model_key})
         existing_creds_for_media = _read_credentials_json()
-        effective_media_models = (
-            _normalize_media_models(media_models_body)
-            if media_models_body is not None
-            else _filter_supported_media_models(_normalize_media_models(existing_creds_for_media.get("media_models")))
+        existing_media_models = _filter_supported_media_models(
+            _normalize_media_models(existing_creds_for_media.get("media_models"))
         )
+        env_media_models = _media_models_from_env_selections(clear_media_selections=clear_media_selections)
+        if media_models_body is not None:
+            media_models_from_body = _normalize_media_models(media_models_body)
+            effective_media_models = _merge_media_model_maps(existing_media_models, env_media_models)
+            for provider_key in _explicit_media_model_providers(media_models_body):
+                replacement = _merge_media_model_maps(
+                    {provider_key: env_media_models.get(provider_key, [])},
+                    {provider_key: media_models_from_body.get(provider_key, [])},
+                ).get(provider_key, [])
+                if replacement:
+                    effective_media_models[provider_key] = replacement
+                else:
+                    effective_media_models.pop(provider_key, None)
+            effective_media_models = _filter_supported_media_models(effective_media_models)
+        else:
+            effective_media_models = existing_media_models
         invalid_media_models = _invalid_media_model_capabilities(effective_media_models)
         if invalid_media_models:
             return JSONResponse({"ok": False, "error": "; ".join(invalid_media_models)}, status_code=400)
@@ -21001,10 +22108,26 @@ def create_app(runtime, orchestrator, registry):
                 if media_models_body is not None:
                     creds["media_models"] = effective_media_models
                 if isinstance(media_providers_enabled_body, dict):
+                    existing_media_provider_flags = creds.get("media_providers_enabled")
+                    if not isinstance(existing_media_provider_flags, dict):
+                        existing_media_provider_flags = {}
+                    # Settings saves can arrive with a partial media-provider
+                    # map while model inventories are still hydrating. Merge
+                    # flags so one tab save cannot erase another working media
+                    # setup; env-declared defaults remain enabled until the
+                    # selection itself is explicitly cleared.
                     creds["media_providers_enabled"] = {
-                        str(k): bool(v)
-                        for k, v in media_providers_enabled_body.items()
-                        if isinstance(k, str)
+                        **{
+                            str(k): bool(v)
+                            for k, v in existing_media_provider_flags.items()
+                            if isinstance(k, str)
+                        },
+                        **{
+                            str(k): bool(v)
+                            for k, v in media_providers_enabled_body.items()
+                            if isinstance(k, str)
+                        },
+                        **_media_provider_enabled_from_env_selections(),
                     }
                 if provider_enabled is not None:
                     # Per-provider enabled state. The single `provider_enabled`
@@ -21152,6 +22275,16 @@ def create_app(runtime, orchestrator, registry):
             "video_input_provider",
             "video_input_model",
         }
+        media_selection_env_names = {
+            "audio_transcribe_provider",
+            "audio_transcribe_model",
+            "image_ocr_provider",
+            "image_ocr_model",
+            "image_generate_provider",
+            "image_generate_model",
+            "video_input_provider",
+            "video_input_model",
+        }
         # When the user is disabling a non-active provider via the toggle, we
         # don't want the mapping loop below to overwrite NULLION_MODEL_PROVIDER
         # / NULLION_MODEL / OPENAI_API_KEY with that provider's values — that
@@ -21179,48 +22312,53 @@ def create_app(runtime, orchestrator, registry):
                 updates[env_name] = val
                 os.environ[env_name] = val  # apply live immediately
             elif (key == "model_name" or key in clearable_env_keys) and env_name:
+                if (
+                    key in media_selection_env_names
+                    and os.environ.get(env_name, "").strip()
+                    and key not in clear_media_selections
+                ):
+                    # A full Settings save can submit an empty media selector
+                    # when the browser has not loaded that provider's model
+                    # inventory. Empty UI state must not erase a working media
+                    # default unless the client sends an explicit clear signal.
+                    continue
                 updates[env_name] = ""
                 os.environ.pop(env_name, None)
 
         if "enabled_skill_packs" in body:
-            enabled_skill_packs = str(body.get("enabled_skill_packs") or "")
-            skill_pack_access = "true" if enabled_skill_packs.strip() else "false"
-            has_connector_connection = False
-            try:
-                from nullion.connections import load_connection_registry
+            enabled_skill_packs = _normalized_enabled_skill_pack_value(str(body.get("enabled_skill_packs") or ""))
+            skill_pack_updates = _apply_enabled_skill_packs(enabled_skill_packs)
+            updates.update(skill_pack_updates)
 
-                has_connector_connection = any(
-                    (
-                        str(getattr(connection, "provider_id", "")).strip().lower().startswith("skill_pack_connector_")
-                        or str(getattr(connection, "provider_id", "")).strip().lower().endswith("_connector_provider")
-                    )
-                    for connection in load_connection_registry().connections
-                    if getattr(connection, "active", True)
-                )
-            except Exception:
-                has_connector_connection = False
-            connector_access = "true" if (
-                "connector" in enabled_skill_packs.lower()
-                or "api-gateway" in enabled_skill_packs.lower()
-                or has_connector_connection
-            ) else "false"
-            updates["NULLION_SKILL_PACK_ACCESS_ENABLED"] = skill_pack_access
-            updates["NULLION_CONNECTOR_ACCESS_ENABLED"] = connector_access
-            updates["NULLION_ENABLED_SKILL_PACKS"] = enabled_skill_packs
-            os.environ["NULLION_SKILL_PACK_ACCESS_ENABLED"] = skill_pack_access
-            os.environ["NULLION_CONNECTOR_ACCESS_ENABLED"] = connector_access
-            if enabled_skill_packs.strip():
-                os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_skill_packs
-            else:
-                os.environ.pop("NULLION_ENABLED_SKILL_PACKS", None)
-
-        for key, env_name in [
-            ("audio_transcribe_enabled", "NULLION_AUDIO_TRANSCRIBE_ENABLED"),
-            ("image_ocr_enabled", "NULLION_IMAGE_OCR_ENABLED"),
-            ("image_generate_enabled", "NULLION_IMAGE_GENERATE_ENABLED"),
-            ("video_input_enabled", "NULLION_VIDEO_INPUT_ENABLED"),
-        ]:
+        media_enabled_env_keys = [
+            (
+                "audio_transcribe_enabled",
+                "NULLION_AUDIO_TRANSCRIBE_ENABLED",
+                "NULLION_AUDIO_TRANSCRIBE_PROVIDER",
+                "NULLION_AUDIO_TRANSCRIBE_MODEL",
+            ),
+            ("image_ocr_enabled", "NULLION_IMAGE_OCR_ENABLED", "NULLION_IMAGE_OCR_PROVIDER", "NULLION_IMAGE_OCR_MODEL"),
+            (
+                "image_generate_enabled",
+                "NULLION_IMAGE_GENERATE_ENABLED",
+                "NULLION_IMAGE_GENERATE_PROVIDER",
+                "NULLION_IMAGE_GENERATE_MODEL",
+            ),
+            ("video_input_enabled", "NULLION_VIDEO_INPUT_ENABLED", "NULLION_VIDEO_INPUT_PROVIDER", "NULLION_VIDEO_INPUT_MODEL"),
+        ]
+        for key, env_name, provider_env_name, model_env_name in media_enabled_env_keys:
             if key in body:
+                if (
+                    body.get(key) is False
+                    and os.environ.get(provider_env_name, "").strip()
+                    and os.environ.get(model_env_name, "").strip()
+                    and key.replace("_enabled", "_provider") not in clear_media_selections
+                    and key.replace("_enabled", "_model") not in clear_media_selections
+                ):
+                    # A missing media dropdown can report "disabled" during a
+                    # broad Settings save. Preserve working env-backed helpers
+                    # unless the same request explicitly clears their selection.
+                    continue
                 val = "true" if body.get(key) else "false"
                 updates[env_name] = val
                 os.environ[env_name] = val
@@ -21657,13 +22795,15 @@ def create_app(runtime, orchestrator, registry):
 
     @app.post("/api/preferences")
     async def post_preferences(request: Request):
-        from nullion.preferences import load_preferences, save_preferences, Preferences, _DEFAULTS
+        from nullion.preferences import _DEFAULTS, load_preferences, save_preferences
         body = await request.json()
         current = load_preferences().to_dict()
         # Merge in only known keys
         for k in _DEFAULTS:
             if k in body:
                 current[k] = body[k]
+        if "timezone" in body:
+            current["timezone_source"] = "explicit"
         try:
             save_preferences(current)
         except Exception as exc:
@@ -21883,7 +23023,16 @@ def create_app(runtime, orchestrator, registry):
         def _web_deliver_fn(conversation_id: str, text: str, **kwargs) -> None:
             normalized_conversation_id = str(conversation_id or "")
             if not normalized_conversation_id.startswith("web:"):
-                cron_job = cron_background_deliveries.get(normalized_conversation_id)
+                delivery_group_id = str(kwargs.get("group_id") or "")
+                # Conversation ids are not unique enough for background crons:
+                # several jobs can deliver to the same chat at the same minute.
+                # Require group-specific state whenever the runner provides it
+                # so one cron cannot borrow another cron's title or attachment
+                # expectations.
+                cron_job = cron_background_deliveries.resolve(
+                    normalized_conversation_id,
+                    group_id=delivery_group_id,
+                )
                 channel, _sep, target = normalized_conversation_id.partition(":")
                 if cron_job is None or channel not in {"telegram", "slack", "discord"}:
                     return
@@ -21892,8 +23041,23 @@ def create_app(runtime, orchestrator, registry):
                     return
                 if kwargs.get("is_status"):
                     return
+                if (
+                    _should_suppress_active_cron_no_output_delivery(
+                        text,
+                        str(kwargs.get("group_id") or ""),
+                        runtime.store,
+                    )
+                ):
+                    return
                 delivery_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text
-                _send_cron_platform_delivery(cron_job, channel, target, delivery_text)
+                sent = _send_cron_platform_delivery(cron_job, channel, target, delivery_text)
+                if sent and kwargs.get("is_final") and (
+                    kwargs.get("is_artifact") or not kwargs.get("has_artifacts")
+                ):
+                    cron_background_deliveries.clear(
+                        normalized_conversation_id,
+                        group_id=delivery_group_id,
+                    )
                 return
             text = str(text or "").strip()
             if not text:
@@ -22009,6 +23173,8 @@ def create_app(runtime, orchestrator, registry):
         orchestrator.set_deliver_fn(_web_deliver_fn)
         if hasattr(orchestrator, "set_checkpoint_fn"):
             orchestrator.set_checkpoint_fn(runtime.checkpoint)
+
+    _wire_web_mini_agent_delivery()
 
     def _web_port_from_request(request: Request) -> int:
         request_port = getattr(request.url, "port", None)
@@ -22138,7 +23304,7 @@ def create_app(runtime, orchestrator, registry):
     @app.post("/api/chat")
     async def chat_http(request: Request):
         """HTTP chat fallback for environments where WebSocket upgrades fail."""
-        conv_id = "web:0"
+        conv_id = "api:0"
         try:
             try:
                 payload = await request.json()
@@ -22194,6 +23360,13 @@ def create_app(runtime, orchestrator, registry):
                         "is_web_request": bool(result.get("is_web_request")),
                         "web_session_allow_label": _web_session_allow_duration_label(),
                     })
+                try:
+                    store = _get_chat_store()
+                    store.save_message(conv_id, "user", user_text, is_error=False)
+                    metadata = {"artifacts": result.get("artifacts", [])} if result.get("artifacts") else None
+                    store.save_message(conv_id, "bot", str(result.get("text", "(no reply)")), is_error=False, metadata=metadata)
+                except Exception:
+                    logger.debug("Could not persist HTTP planner chat turn", exc_info=True)
                 return JSONResponse({
                     "type": "message",
                     "text": result.get("text", "(no reply)"),
@@ -22243,6 +23416,13 @@ def create_app(runtime, orchestrator, registry):
                     "is_web_request": bool(result.get("is_web_request")),
                     "web_session_allow_label": _web_session_allow_duration_label(),
                 })
+            try:
+                store = _get_chat_store()
+                store.save_message(conv_id, "user", user_text, is_error=False)
+                metadata = {"artifacts": result.get("artifacts", [])} if result.get("artifacts") else None
+                store.save_message(conv_id, "bot", str(result.get("text", "(no reply)")), is_error=False, metadata=metadata)
+            except Exception:
+                logger.debug("Could not persist HTTP chat turn", exc_info=True)
             return JSONResponse({
                 "type": "message",
                 "text": result.get("text", "(no reply)"),
@@ -22410,6 +23590,19 @@ def create_app(runtime, orchestrator, registry):
             async def send_early_reply_payload(payload: dict[str, object]) -> bool:
                 reply = str(payload.get("text") or "(no reply)")
                 task_group_id = str(payload.get("task_group_id") or "")
+                background_owns_status = payload.get("planner_status_owned_by_background") is True
+                if payload.get("mini_agent_dispatch") and task_group_id and background_owns_status:
+                    planner_status_text = str(payload.get("planner_status_text") or "").strip()
+                    if planner_status_text:
+                        await send_websocket_event(turn_payload({
+                            "type": "task_status",
+                            "conversation_id": conv_id,
+                            "group_id": task_group_id,
+                            "status_kind": "task_summary",
+                            "text": planner_status_text,
+                        }))
+                    await send_thinking_event(str(payload.get("thinking") or ""))
+                    return True
                 if payload.get("mini_agent_dispatch") and task_group_id:
                     await send_websocket_event(turn_payload({
                         "type": "task_status",
@@ -22514,6 +23707,7 @@ def create_app(runtime, orchestrator, registry):
                         result.get("mini_agent_dispatch")
                         and task_group_id
                         and not result.get("reply_already_sent")
+                        and result.get("planner_status_owned_by_background") is not True
                     ):
                         await send_websocket_event(turn_payload({
                             "type": "task_status",
@@ -22522,8 +23716,25 @@ def create_app(runtime, orchestrator, registry):
                             "status_kind": "task_summary",
                             "text": reply,
                         }))
+                    elif (
+                        result.get("mini_agent_dispatch")
+                        and task_group_id
+                        and not result.get("reply_already_sent")
+                        and result.get("planner_status_owned_by_background") is True
+                        and str(result.get("planner_status_text") or "").strip()
+                    ):
+                        await send_websocket_event(turn_payload({
+                            "type": "task_status",
+                            "conversation_id": conv_id,
+                            "group_id": task_group_id,
+                            "status_kind": "task_summary",
+                            "text": str(result.get("planner_status_text") or "").strip(),
+                        }))
                     else:
-                        if not result.get("reply_already_sent"):
+                        if (
+                            not result.get("reply_already_sent")
+                            and result.get("planner_status_owned_by_background") is not True
+                        ):
                             await send_reply_text(reply)
                     if not result.get("reply_already_sent"):
                         await send_thinking_event(result.get("thinking"))
@@ -22624,6 +23835,7 @@ def create_app(runtime, orchestrator, registry):
                     result.get("mini_agent_dispatch")
                     and task_group_id
                     and not result.get("reply_already_sent")
+                    and result.get("planner_status_owned_by_background") is not True
                 ):
                     await send_websocket_event(turn_payload({
                         "type": "task_status",
@@ -22632,8 +23844,25 @@ def create_app(runtime, orchestrator, registry):
                         "status_kind": "task_summary",
                         "text": reply,
                     }))
+                elif (
+                    result.get("mini_agent_dispatch")
+                    and task_group_id
+                    and not result.get("reply_already_sent")
+                    and result.get("planner_status_owned_by_background") is True
+                    and str(result.get("planner_status_text") or "").strip()
+                ):
+                    await send_websocket_event(turn_payload({
+                        "type": "task_status",
+                        "conversation_id": conv_id,
+                        "group_id": task_group_id,
+                        "status_kind": "task_summary",
+                        "text": str(result.get("planner_status_text") or "").strip(),
+                    }))
                 else:
-                    if not result.get("reply_already_sent"):
+                    if (
+                        not result.get("reply_already_sent")
+                        and result.get("planner_status_owned_by_background") is not True
+                    ):
                         await send_reply_text(reply)
                 if not result.get("reply_already_sent"):
                     await send_thinking_event(result.get("thinking"))
@@ -23099,7 +24328,7 @@ def _start_web_task_frame(
 
     active_frame_id = store.get_active_task_frame_id(conversation_id)
     active_frame = store.get_task_frame(active_frame_id) if isinstance(active_frame_id, str) else None
-    if active_frame is not None and active_frame.status in {
+    if active_frame is not None and active_frame.branch_id == branch_id and active_frame.status in {
         TaskFrameStatus.ACTIVE,
         TaskFrameStatus.RUNNING,
         TaskFrameStatus.WAITING_APPROVAL,
@@ -23987,6 +25216,22 @@ def _previous_web_assistant_message(thread: list[dict[str, str]]) -> str | None:
     return assistant_reply if isinstance(assistant_reply, str) and assistant_reply.strip() else None
 
 
+def _web_assistant_messages(thread: list[dict[str, str]]) -> list[str]:
+    messages: list[str] = []
+    for turn in thread:
+        assistant_reply = turn.get("assistant")
+        if isinstance(assistant_reply, str) and assistant_reply.strip():
+            messages.append(assistant_reply)
+    return messages
+
+
+def _web_numbered_option_source_message(user_text: str, thread: list[dict[str, str]]) -> str | None:
+    for assistant_reply in reversed(_web_assistant_messages(thread)):
+        if selected_numbered_option_context(user_text, assistant_reply):
+            return assistant_reply
+    return None
+
+
 def _web_ambiguity_classifier(
     thread: list[dict[str, str]],
     *,
@@ -24003,6 +25248,8 @@ def _web_ambiguity_classifier(
         has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
         if not has_structured_evidence:
             return None
+        if not has_structured_turn_relationship_evidence(text) and not any(ch.isalnum() for ch in str(text or "").strip()):
+            return None
         else:
             active_turn_text = previous_user_message
         try:
@@ -24012,6 +25259,7 @@ def _web_ambiguity_classifier(
                 text,
                 active_turn_ids=("recent-branch",),
                 active_turn_texts=(active_turn_text,),
+                structured_followup_evidence=structured_followup_evidence,
                 model_client=model_client,
             )
         except Exception:
@@ -24244,6 +25492,16 @@ def _recent_web_tool_scopes_for_context(runtime, conversation_id: str) -> tuple[
                 scopes.append("scheduler")
             elif tool_name.startswith("browser_") or tool_name in {"web_fetch", "web_search"}:
                 scopes.append("web")
+            elif tool_name in {"file_read", "file_search", "file_write"}:
+                # Web follows the same product contract as messaging: a
+                # follow-up to local file work should keep the file-discovery
+                # rung available before the model falls back to shell.
+                scopes.append("local_files")
+            elif tool_name == "terminal_exec":
+                # Keep terminal as a remembered continuation scope only after
+                # it was actually used; do not make every ordinary web turn pay
+                # the cost or risk of exposing shell by default.
+                scopes.append("local_shell")
     return tuple(dict.fromkeys(scopes))
 
 
@@ -24572,6 +25830,7 @@ def _try_dispatch_web_mini_agents(
     requested_extensions: tuple[str, ...] | list[str] | None = None,
     force_dispatch: bool = False,
     preferred_group_id: str | None = None,
+    parent_context: str | None = None,
 ) -> Any | None:
     if (
         has_attachments
@@ -24645,6 +25904,7 @@ def _try_dispatch_web_mini_agents(
                 if requested_extensions
                 else None
             ),
+            parent_context=parent_context,
         )
         try:
             setattr(dispatch_result, "task_titles", planned_task_titles)
@@ -24687,8 +25947,20 @@ def _should_schedule_web_no_tool_memory_capture(
     tool_results: list[ToolResult],
     rate_limit_key: str | None = None,
 ) -> bool:
-    if tool_results or not owner or not _feature_enabled("NULLION_MEMORY_ENABLED"):
+    if not owner or not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return False
+    if tool_results:
+        try:
+            from nullion.builder_memory import should_skip_builder_reflection_for_tool_results
+
+            # Keep memory capture narrow for tool-backed web turns: allow it only
+            # for scheduler-control tools so cron intents can persist, while
+            # ordinary tool turns remain no-capture for latency.
+            if not should_skip_builder_reflection_for_tool_results(tool_results=tool_results):
+                return False
+        except Exception:
+            logger.debug("Web scheduler memory-capture guard failed (non-fatal)", exc_info=True)
+            return False
     if _is_internal_scheduled_task_context(user_message):
         return False
     if len(str(user_message or "").strip()) < _web_no_tool_memory_min_user_chars():
@@ -25672,16 +26944,73 @@ def _web_workspace_has_artifact_evidence(conversation_id: str) -> bool:
         return False
 
 
+def _binary_read_text_summary_result(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+    *,
+    requested_extension: str | None,
+) -> tuple[str | None, set[str]]:
+    if requested_extension is not None:
+        return None, set()
+    saw_binary_read = False
+    suppress_paths: set[str] = set()
+    binary_numbers_paths: list[Path] = []
+    latest_text_path: Path | None = None
+    for result in tool_results or ():
+        output = getattr(result, "output", None)
+        if not isinstance(output, dict):
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "")
+        if tool_name == "file_read" and output.get("binary") is True:
+            for key in ("path", "artifact_path"):
+                value = output.get(key)
+                if isinstance(value, str) and value.strip():
+                    path = Path(value).expanduser()
+                    suppress_paths.add(str(path))
+                    if path.suffix.lower() == ".numbers" and path not in binary_numbers_paths:
+                        binary_numbers_paths.append(path)
+            saw_binary_read = True
+            continue
+        if tool_name == "file_write" and saw_binary_read:
+            path_value = output.get("path")
+            if isinstance(path_value, str) and path_value.strip():
+                path = Path(path_value).expanduser()
+                if path.suffix.lower() == ".txt":
+                    suppress_paths.add(str(path))
+                    latest_text_path = path
+    if latest_text_path is None:
+        if binary_numbers_paths:
+            names = ", ".join(path.name for path in binary_numbers_paths)
+            return (
+                f"I found an Apple Numbers binary file ({names}), but the available file reader cannot inspect its table rows. "
+                "I did not create or attach a replacement artifact. Provide an .xlsx/.csv export or a table-aware file reader to inspect the workbook contents.",
+                suppress_paths,
+            )
+        return None, suppress_paths
+    try:
+        text = latest_text_path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None, suppress_paths
+    return (text or None), suppress_paths
+
+
 def _requested_web_turn_attachment_extension(
     user_text: str,
     *,
     model_client: object | None = None,
     allow_model_planning: bool = False,
     require_attachment_token_for_model_planning: bool = True,
+    include_filename_suffixes: bool = False,
 ) -> str | None:
     if is_slash_prefixed_literal_message(user_text):
         return None
-    literal_extension = plan_attachment_format(user_text, model_client=None).extension
+    if include_filename_suffixes:
+        literal_extension = plan_attachment_format(
+            user_text,
+            model_client=None,
+            include_filename_suffixes=True,
+        ).extension
+    else:
+        literal_extension = plan_attachment_format(user_text, model_client=None).extension
     if literal_extension:
         return literal_extension
     if not allow_model_planning:
@@ -25814,6 +27143,21 @@ def _run_turn_sync(
         _log_timing_if_slow("config_shortcut")
         _finish_latency("config_shortcut")
         return {"text": config_shortcut, "artifacts": []}
+    early_existing_file_payload = _web_explicit_existing_file_delivery_payload(
+        runtime,
+        prompt=user_text,
+        principal_id=conv_id,
+        requested_extension=_requested_web_turn_attachment_extension(user_text, allow_model_planning=False),
+    )
+    if early_existing_file_payload is not None:
+        artifact_count = len(early_existing_file_payload.get("artifacts", []) or [])
+        _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Resolved existing file")
+        _emit_activity(activity_callback, "artifacts", "Preparing artifacts", "done", f"{artifact_count} artifact{'s' if artifact_count != 1 else ''}")
+        _emit_activity(activity_callback, "respond", "Writing response", "done")
+        _mark_timing("existing_file_delivery")
+        _log_timing_if_slow("existing_file_delivery", artifact_count=artifact_count)
+        _finish_latency("existing_file_delivery", artifact_count=artifact_count)
+        return early_existing_file_payload
     try:
         from nullion.chat_operator import _chat_model_issue_reply
 
@@ -25866,11 +27210,22 @@ def _run_turn_sync(
     turn_orchestrator = _orchestrator_for_video_attachments(turn_orchestrator, normalized_attachments)
     turn_memory_owner = memory_owner or memory_owner_for_web_admin()
     web_chat_thread = _web_chat_thread_from_store(runtime, conv_id)
+    previous_web_assistant_message = _previous_web_assistant_message(web_chat_thread)
+    numbered_option_source_message = _web_numbered_option_source_message(user_text, web_chat_thread)
+    numbered_option_context = selected_numbered_option_context(
+        user_text,
+        numbered_option_source_message or _web_assistant_messages(web_chat_thread),
+    )
+    # A numeric reply is structured follow-up context, not a replacement for the
+    # user's message. Keep routing/tool evidence tied to the actual turn text so
+    # prior assistant prose cannot hijack unrelated file, email, or artifact work.
+    effective_user_text = user_text
     _mark_timing("history_thread")
     structured_followup_evidence = (
         bool(normalized_attachments)
         or _web_has_open_task_frame(runtime, conv_id)
         or _web_dispatch_requires_existing_turn_context(turn_dispatch_decision)
+        or bool(numbered_option_context)
     )
     _mark_timing("history_evidence")
     web_ambiguity_classifier, web_ambiguity_classifier_reason = _web_ambiguity_classifier(
@@ -25887,7 +27242,7 @@ def _run_turn_sync(
             user_text=user_text,
             turn_id=turn_id,
             turn_dispatch_decision=turn_dispatch_decision,
-            previous_assistant_message=_previous_web_assistant_message(web_chat_thread),
+            previous_assistant_message=numbered_option_source_message or previous_web_assistant_message,
             ambiguity_classifier=web_ambiguity_classifier,
             ambiguity_classifier_reason=web_ambiguity_classifier_reason,
         )
@@ -25898,24 +27253,59 @@ def _run_turn_sync(
         web_conversation_result = None
         _mark_timing("task_frame_not_recorded")
     phase_tracker.done(PHASE_CHECK_TASK_STATE, "task_state")
+    existing_artifact_followup_payload = _web_existing_artifact_followup_payload(
+        runtime,
+        prompt=effective_user_text,
+        conversation_id=conv_id,
+        conversation_result=web_conversation_result,
+        principal_id=conv_id,
+        model_client=getattr(turn_orchestrator, "model_client", None),
+    )
+    if existing_artifact_followup_payload is not None:
+        artifact_count = len(existing_artifact_followup_payload.get("artifacts", []) or [])
+        _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Resolved existing artifact")
+        _emit_activity(activity_callback, "artifacts", "Preparing artifacts", "done", f"{artifact_count} artifact{'s' if artifact_count != 1 else ''}")
+        _emit_activity(activity_callback, "respond", "Writing response", "done")
+        _mark_timing("artifact_followup")
+        _log_timing_if_slow("artifact_followup", artifact_count=artifact_count)
+        _finish_latency("artifact_followup", artifact_count=artifact_count)
+        return existing_artifact_followup_payload
     workspace_has_artifact_evidence = _web_conversation_has_artifact_evidence(runtime, conv_id)
     requested_attachment_extension = _requested_web_turn_attachment_extension(
-        user_text,
+        effective_user_text,
         model_client=getattr(turn_orchestrator, "model_client", None),
         allow_model_planning=(
             force_model_attachment_planning
             or workspace_has_artifact_evidence
+            or bool(numbered_option_context)
         ),
         require_attachment_token_for_model_planning=not (
             force_model_attachment_planning
             or workspace_has_artifact_evidence
+            or bool(numbered_option_context)
         ),
+        include_filename_suffixes=True,
     )
     required_attachment_extensions = (
         (requested_attachment_extension,) if requested_attachment_extension else ()
     )
+    existing_file_payload = _web_explicit_existing_file_delivery_payload(
+        runtime,
+        prompt=effective_user_text,
+        principal_id=conv_id,
+        requested_extension=requested_attachment_extension,
+    )
+    if existing_file_payload is not None:
+        artifact_count = len(existing_file_payload.get("artifacts", []) or [])
+        _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Resolved existing file")
+        _emit_activity(activity_callback, "artifacts", "Preparing artifacts", "done", f"{artifact_count} artifact{'s' if artifact_count != 1 else ''}")
+        _emit_activity(activity_callback, "respond", "Writing response", "done")
+        _mark_timing("existing_file_delivery")
+        _log_timing_if_slow("existing_file_delivery", artifact_count=artifact_count)
+        _finish_latency("existing_file_delivery", artifact_count=artifact_count)
+        return existing_file_payload
     turn_tool_evidence = build_turn_tool_evidence(
-        user_message=user_text,
+        user_message=effective_user_text,
         conversation_result=web_conversation_result,
         has_attachments=bool(normalized_attachments),
         requested_extensions=required_attachment_extensions,
@@ -25924,7 +27314,7 @@ def _run_turn_sync(
     _mark_timing("tool_evidence")
     fast_profile_candidate = _web_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
-        user_message=user_text,
+        user_message=effective_user_text,
         config_action=config_action,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=force_mini_agent_dispatch,
@@ -25945,7 +27335,7 @@ def _run_turn_sync(
                 registry,
                 evidence=turn_tool_evidence,
                 model_client=None,
-                user_message=user_text,
+                user_message=effective_user_text,
             )
         else:
             turn_tool_registry = registry
@@ -25960,7 +27350,7 @@ def _run_turn_sync(
             registry,
             evidence=turn_tool_evidence,
             model_client=tool_scope_model_client,
-            user_message=user_text,
+            user_message=effective_user_text,
         )
         _mark_timing("tool_scope_registry_done")
     try:
@@ -26056,6 +27446,7 @@ def _run_turn_sync(
                 "reasonable neutral default and continue; ask a clarification only when the artifact cannot be "
                 "created without that missing detail.\n\n"
                 f"{workspace_storage_text}\n\n"
+                +
                 "Do not say a file was saved, attached, or sent "
                 "unless file_write completed successfully. Do not create helper scripts, diagnostic scripts, or "
                 "source-code files unless the user explicitly asks you to create code. For read-only diagnostics, "
@@ -26100,7 +27491,12 @@ def _run_turn_sync(
             "role": "system",
             "content": [{"type": "text", "text": context_boundary}],
         })
-    skill_hint = _build_web_skill_hint(runtime, user_text)
+    if numbered_option_context:
+        history_prefix.append({
+            "role": "system",
+            "content": [{"type": "text", "text": numbered_option_context}],
+        })
+    skill_hint = _build_web_skill_hint(runtime, effective_user_text)
     if skill_hint is not None:
         history_prefix.insert(0, {
             "role": "system",
@@ -26127,7 +27523,7 @@ def _run_turn_sync(
     phase_tracker.done(PHASE_START_MODEL, "model_start")
     phase_tracker.emit(PHASE_RUN_TOOLS, "running")
     user_content_blocks = (
-        chat_attachment_content_blocks(user_text, normalized_attachments)
+        chat_attachment_content_blocks(effective_user_text, normalized_attachments)
         if normalized_attachments
         else None
     )
@@ -26154,13 +27550,14 @@ def _run_turn_sync(
             orchestrator=turn_orchestrator,
             conversation_id=conv_id,
             principal_id=conv_id,
-            user_message=user_text,
+            user_message=effective_user_text,
             tool_registry=turn_tool_registry,
             runtime=runtime,
             has_attachments=bool(user_content_blocks),
             requested_extensions=required_attachment_extensions,
             force_dispatch=force_mini_agent_dispatch,
             preferred_group_id=preferred_task_group_id,
+            parent_context=recent_tool_context,
         ) if allow_mini_agents else None
 
     if dispatch_result is not None and getattr(dispatch_result, "dispatched", True):
@@ -26218,7 +27615,7 @@ def _run_turn_sync(
             result = turn_orchestrator.run_turn(
                 conversation_id=conv_id,
                 principal_id=conv_id,
-                user_message=user_text,
+                user_message=effective_user_text,
                 user_content_blocks=user_content_blocks,
                 conversation_history=history_prefix,
                 tool_registry=turn_tool_registry,
@@ -26276,7 +27673,7 @@ def _run_turn_sync(
     tool_count = len(tool_results)
     _mark_timing("model_tools")
     phase_tracker.done(PHASE_RUN_TOOLS, "model_tools", format_tool_activity_detail(tool_results))
-    deferred_cron_dispatch: dict[str, str] | None = None
+    deferred_cron_dispatch: dict[str, object] | None = None
     for tool_result in tool_results:
         if getattr(tool_result, "tool_name", "") != "run_cron":
             continue
@@ -26300,6 +27697,15 @@ def _run_turn_sync(
             "task_group_id": task_group_id,
             "planner_summary": planner_summary,
             "text": deferred_text,
+            "planner_status_text": str(
+                output.get("planner_status_text")
+                or nested.get("planner_status_text")
+                or ""
+            ).strip(),
+            "planner_status_owned_by_background": bool(
+                output.get("planner_status_owned_by_background")
+                or nested.get("planner_status_owned_by_background")
+            ),
         }
         break
     _emit_activity(
@@ -26311,9 +27717,13 @@ def _run_turn_sync(
     )
     _emit_activity(activity_callback, "artifacts", "Preparing artifacts", "running")
     phase_tracker.emit(PHASE_PREPARE_ARTIFACTS, "running")
+    binary_summary_text, binary_summary_suppress_paths = _binary_read_text_summary_result(
+        tool_results,
+        requested_extension=requested_attachment_extension,
+    )
     artifact_paths = _materialize_fetch_artifact_for_web(
         runtime,
-        prompt=user_text,
+        prompt=effective_user_text,
         tool_results=tool_results,
         principal_id=conv_id,
         registry=registry,
@@ -26321,13 +27731,19 @@ def _run_turn_sync(
     ) or list(getattr(result, "artifacts", []) or [])
     artifact_paths = _web_delivery_artifact_paths(
         runtime,
-        prompt=user_text,
+        prompt=effective_user_text,
         reply=getattr(result, "final_text", None) or "",
         tool_results=tool_results,
         artifact_paths=artifact_paths,
         principal_id=conv_id,
         requested_extension=requested_attachment_extension,
     )
+    if binary_summary_suppress_paths:
+        artifact_paths = [
+            path
+            for path in artifact_paths
+            if str(Path(str(path)).expanduser()) not in binary_summary_suppress_paths
+        ]
     artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=conv_id)
     _emit_activity(
         activity_callback,
@@ -26343,7 +27759,11 @@ def _run_turn_sync(
         artifacts,
         tool_results=tool_results,
     )
-    attachment_failure = attachment_processing_failure_reply(user_text, normalized_attachments, tool_results)
+    if binary_summary_text is not None:
+        final_text = binary_summary_text
+        artifact_paths = []
+        artifacts = []
+    attachment_failure = attachment_processing_failure_reply(effective_user_text, normalized_attachments, tool_results)
     if attachment_failure is not None:
         final_text = attachment_failure
         artifact_paths = []
@@ -26351,7 +27771,7 @@ def _run_turn_sync(
     final_text, fulfilled = _enforce_web_response_fulfillment(
         runtime,
         conversation_id=conv_id,
-        user_message=user_text,
+        user_message=effective_user_text,
         reply=final_text,
         tool_results=tool_results,
         artifact_paths=artifact_paths,
@@ -26363,7 +27783,7 @@ def _run_turn_sync(
     if attachment_failure is None and required_attachment_extensions and not fulfilled:
         repair_history = [
             *history_prefix,
-            {"role": "user", "content": user_content_blocks or [{"type": "text", "text": user_text}]},
+            {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_user_text}]},
             {"role": "assistant", "content": [{"type": "text", "text": final_text}]},
         ]
         _emit_activity(
@@ -26434,7 +27854,7 @@ def _run_turn_sync(
             phase_tracker.done(PHASE_RUN_TOOLS, "repair_model_tools", format_tool_activity_detail(repair_tool_results))
             repair_artifact_paths = _materialize_fetch_artifact_for_web(
                 runtime,
-                prompt=user_text,
+                prompt=effective_user_text,
                 tool_results=repair_tool_results,
                 principal_id=conv_id,
                 registry=registry,
@@ -26443,7 +27863,7 @@ def _run_turn_sync(
             artifact_paths = list(dict.fromkeys([*artifact_paths, *repair_artifact_paths]))
             artifact_paths = _web_delivery_artifact_paths(
                 runtime,
-                prompt=user_text,
+                prompt=effective_user_text,
                 reply=getattr(repair_result, "final_text", None) or final_text,
                 tool_results=tool_results,
                 artifact_paths=artifact_paths,
@@ -26460,7 +27880,7 @@ def _run_turn_sync(
             final_text, fulfilled = _enforce_web_response_fulfillment(
                 runtime,
                 conversation_id=conv_id,
-                user_message=user_text,
+                user_message=effective_user_text,
                 reply=final_text,
                 tool_results=tool_results,
                 artifact_paths=artifact_paths,
@@ -26469,7 +27889,7 @@ def _run_turn_sync(
             )
     final_text = _web_normalize_completed_email_send_reply(final_text, tool_results)
     final_text = sanitize_user_visible_reply(
-        user_message=user_text,
+        user_message=effective_user_text,
         reply=final_text,
         tool_results=tool_results,
         source="agent",
@@ -26494,6 +27914,10 @@ def _run_turn_sync(
                 early_payload["planner_summary"] = deferred_cron_dispatch["planner_summary"]
             if deferred_cron_dispatch.get("text"):
                 early_payload["text"] = deferred_cron_dispatch["text"]
+            if deferred_cron_dispatch.get("planner_status_text"):
+                early_payload["planner_status_text"] = deferred_cron_dispatch["planner_status_text"]
+            if deferred_cron_dispatch.get("planner_status_owned_by_background"):
+                early_payload["planner_status_owned_by_background"] = True
         if not early_reply_sent:
             _emit_activity(activity_callback, "respond", "Writing response", "running")
             try:
@@ -26574,6 +27998,10 @@ def _run_turn_sync(
             payload["planner_summary"] = deferred_cron_dispatch["planner_summary"]
         if deferred_cron_dispatch.get("text"):
             payload["text"] = deferred_cron_dispatch["text"]
+        if deferred_cron_dispatch.get("planner_status_text"):
+            payload["planner_status_text"] = deferred_cron_dispatch["planner_status_text"]
+        if deferred_cron_dispatch.get("planner_status_owned_by_background"):
+            payload["planner_status_owned_by_background"] = True
     if include_structured_result:
         payload["tool_results"] = _compact_web_tool_results_for_context(tool_results)
         payload["response_fulfilled"] = bool(fulfilled)
@@ -26615,6 +28043,12 @@ def _cli_impl() -> None:
         checkpoint_path = Path(args.checkpoint).expanduser()
         os.environ["NULLION_CHECKPOINT_PATH"] = str(checkpoint_path)
         os.environ.setdefault("NULLION_HOME", str(checkpoint_path.parent))
+    try:
+        from nullion.preferences import ensure_preferences_timezone
+
+        ensure_preferences_timezone()
+    except Exception:
+        logger.debug("Could not initialize timezone preference", exc_info=True)
 
     return run_single_instance_entrypoint(
         "web",

@@ -108,10 +108,12 @@ def platform_activity_capabilities(platform: str) -> PlatformActivityCapabilitie
 def should_deliver_task_status(
     *,
     status_kind: str,
-    planner_feed_enabled: bool,
+    planner_feed_enabled: bool | None = None,
     include_activity: bool,
 ) -> bool:
     _ = planner_feed_enabled
+    # Planned work always gets a task card. Only tool/activity rows are gated by
+    # verbose so users never lose the planner card when activity details are off.
     kind = str(status_kind or "task_summary").strip()
     if kind == "task_summary":
         return True

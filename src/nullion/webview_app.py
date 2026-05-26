@@ -245,6 +245,13 @@ def _restart_all_services_for_loading_screen() -> dict[str, object]:
             for result in results
         ]
         ok_count = sum(1 for result in results if result.ok)
+        web_result = next((result for result in results if result.service == "web"), None)
+        if web_result is not None and not web_result.ok:
+            return {
+                "ok": False,
+                "message": web_result.message,
+                "results": payload,
+            }
         if ok_count:
             return {
                 "ok": True,

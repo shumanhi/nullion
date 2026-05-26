@@ -26,6 +26,7 @@ from nullion.response_sanitizer import is_safe_raw_tool_payload_replacement_repl
 from nullion.response_fulfillment_contract import artifact_paths_from_tool_results
 from nullion.run_activity import format_tool_activity_line, should_suppress_tool_activity
 from nullion.task_queue import TaskResult
+from nullion.tools import normalize_tool_status
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,8 @@ class DeepAgentEvidenceFallbackUnavailable(RuntimeError):
 
 _DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS_ENV = "NULLION_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS"
 _DEFAULT_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS = 20.0
+_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS_ENV = "NULLION_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS"
+_DEFAULT_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS = 15.0
 
 
 class DeepAgentMiniAgentRunner:
@@ -80,28 +83,38 @@ class DeepAgentMiniAgentRunner:
                 context_bus=context_bus,
                 progress_queue=progress_queue,
             )
+            # Scheduled cron runs are intentionally allowed to outlive the
+            # interactive mini-agent timeout. The persisted run/Doctor layer
+            # owns stale-run detection and repair for these background jobs.
             if _is_scheduled_background_config(config):
                 result = await run_coro
             else:
                 result = await asyncio.wait_for(run_coro, timeout=config.timeout_s)
         except DeepAgentUserInputRequested as exc:
-            await _emit_progress(
-                progress_queue,
-                config=config,
-                kind="input_needed",
-                message=exc.question,
-                data={"options": exc.options},
-            )
-            result = TaskResult(
-                task_id=task.task_id,
-                status="partial",
-                output=f"Waiting for user input: {exc.question}",
-                resume_token=_resume_token_for_pause(
-                    config,
-                    reason="user_input",
-                    payload={"question": exc.question, "options": exc.options},
-                ),
-            )
+            if not bool(getattr(config, "can_request_user_input", True)):
+                result = TaskResult(
+                    task_id=task.task_id,
+                    status="failure",
+                    error=_non_interactive_user_input_error(exc.question),
+                )
+            else:
+                await _emit_progress(
+                    progress_queue,
+                    config=config,
+                    kind="input_needed",
+                    message=exc.question,
+                    data={"options": exc.options},
+                )
+                result = TaskResult(
+                    task_id=task.task_id,
+                    status="partial",
+                    output=f"Waiting for user input: {exc.question}",
+                    resume_token=_resume_token_for_pause(
+                        config,
+                        reason="user_input",
+                        payload={"question": exc.question, "options": exc.options},
+                    ),
+                )
         except asyncio.TimeoutError:
             logger.warning("DeepAgent mini-agent %s timed out after %.0fs", config.agent_id, config.timeout_s)
             result = TaskResult(
@@ -179,7 +192,8 @@ class DeepAgentMiniAgentRunner:
             tools=tools,
             system_prompt=system_prompt,
             skills=_deep_agent_external_skills_for_task(config),
-            subagents=_deep_agent_subagents_for_task(config),
+            middleware=_scheduled_task_deep_agent_middleware(config),
+            subagents=_scheduled_task_subagents(config),
         )
         payload = {"messages": [{"role": "user", "content": task.description}]}
         skill_files = _deep_agent_skill_files_for_task(config)
@@ -216,6 +230,12 @@ class DeepAgentMiniAgentRunner:
                 status="failure",
                 error="Deep Agent finished without a final answer.",
             )
+        if _is_internal_deep_agent_todo_error(output_text):
+            return TaskResult(
+                task_id=task.task_id,
+                status="failure",
+                error="Deep Agent hit an internal todo-list conflict before completing the task.",
+            )
         output_text = sanitize_user_visible_reply(
             user_message=task.description,
             reply=output_text,
@@ -236,13 +256,30 @@ class DeepAgentMiniAgentRunner:
                     error=str(exc) or output_text,
                     context_out=output_text,
                 )
-        artifacts = artifact_paths_from_tool_results(tool_results)
+        artifacts = _artifact_paths_from_deep_agent_tool_results(tool_results)
         artifacts = _relocate_external_artifact_paths_for_task(config, artifacts)
         deliverable_artifacts = _deliverable_artifact_paths_for_task(config, artifacts)
-        if deliverable_artifacts and _task_requires_user_file_delivery(task):
+        artifact_delivery_satisfied = bool(deliverable_artifacts) and _task_requires_user_file_delivery(task)
+        if artifact_delivery_satisfied:
             output_text = _artifact_delivery_success_output_text(deliverable_artifacts)
         pending_approval = _pending_approval_from_tool_results(tool_results)
         if pending_approval is not None:
+            if not bool(getattr(config, "can_request_user_input", True)):
+                if _non_interactive_approval_has_fallback_evidence(tool_results, pending_approval):
+                    return TaskResult(
+                        task_id=task.task_id,
+                        status="success",
+                        output=output_text,
+                        artifacts=deliverable_artifacts,
+                        context_out=output_text,
+                    )
+                return TaskResult(
+                    task_id=task.task_id,
+                    status="failure",
+                    error=_non_interactive_approval_error(pending_approval),
+                    artifacts=deliverable_artifacts,
+                    context_out=output_text,
+                )
             await _emit_progress(
                 progress_queue,
                 config=config,
@@ -253,7 +290,7 @@ class DeepAgentMiniAgentRunner:
                     "resume_supported": True,
                 },
             )
-            return TaskResult(
+            result = TaskResult(
                 task_id=task.task_id,
                 status="partial",
                 output=pending_approval["message"],
@@ -265,6 +302,7 @@ class DeepAgentMiniAgentRunner:
                     payload={"approval_id": pending_approval.get("approval_id")},
                 ),
             )
+            return result
         artifact_failure = (
             _artifact_delivery_failure_for_task(config, artifacts, deliverable_artifacts)
             if _task_requires_user_file_delivery(task)
@@ -277,6 +315,34 @@ class DeepAgentMiniAgentRunner:
                 error=artifact_failure,
                 context_out=output_text,
             )
+        if artifact_delivery_satisfied:
+            return TaskResult(
+                task_id=task.task_id,
+                status="success",
+                output=output_text,
+                artifacts=deliverable_artifacts,
+                context_out=output_text,
+            )
+        completion_decision = await _scheduled_task_completion_decision(
+            config,
+            output_text=output_text,
+            tool_results=tool_results,
+            model_client=anthropic_client,
+        )
+        if completion_decision is not None and completion_decision.get("status") != "success":
+            reason = str(
+                completion_decision.get("answer")
+                or "The scheduled task could not verify enough evidence to complete this step."
+            ).strip()
+            return TaskResult(
+                task_id=task.task_id,
+                status="failure",
+                error=reason,
+            )
+        if completion_decision is not None:
+            answer = str(completion_decision.get("answer") or "").strip()
+            if answer:
+                output_text = answer
         return TaskResult(
             task_id=task.task_id,
             status="success",
@@ -291,6 +357,96 @@ def _is_scheduled_background_config(config: Any) -> bool:
     metadata = getattr(task, "metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
     return bool(metadata.get("scheduled_task_run"))
+
+
+def _non_interactive_user_input_error(question: str) -> str:
+    detail = str(question or "").strip()
+    if detail:
+        return f"Scheduled task could not continue because it requested user input: {detail}"
+    return "Scheduled task could not continue because it requested user input."
+
+
+def _non_interactive_approval_error(pending_approval: dict[str, Any]) -> str:
+    approval_id = str(pending_approval.get("approval_id") or "").strip()
+    message = str(pending_approval.get("message") or "approval was required").strip()
+    if approval_id:
+        return (
+            "Scheduled task could not continue because a tool approval was required "
+            f"({approval_id}): {message}"
+        )
+    return f"Scheduled task could not continue because a tool approval was required: {message}"
+
+
+def _non_interactive_approval_has_fallback_evidence(
+    tool_results: list[Any],
+    pending_approval: dict[str, Any],
+) -> bool:
+    approval_id = str(pending_approval.get("approval_id") or "").strip()
+    saw_approval = False
+    for result in tool_results:
+        output = getattr(result, "output", None)
+        output = output if isinstance(output, dict) else {}
+        is_approval = (
+            output.get("reason") == "approval_required"
+            or bool(output.get("requires_approval"))
+            or (approval_id and str(output.get("approval_id") or "") == approval_id)
+        )
+        if is_approval:
+            saw_approval = True
+            continue
+        if not saw_approval:
+            continue
+        if str(getattr(result, "status", "") or "").strip().lower() == "completed":
+            return True
+    return False
+
+
+def _deep_agent_tool_exclusion_middleware(tool_names: set[str]) -> list[Any]:
+    if not tool_names:
+        return []
+    try:
+        from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
+    except Exception:  # pragma: no cover - depends on optional deepagents internals
+        logger.debug("Deep Agents tool exclusion middleware is unavailable", exc_info=True)
+        return []
+    return [_ToolExclusionMiddleware(excluded=frozenset(tool_names))]
+
+
+def _scheduled_task_deep_agent_middleware(config: Any) -> list[Any]:
+    if not _is_scheduled_background_config(config):
+        return []
+    # Cron planner cards are the user-visible task tracker. Hide DeepAgents'
+    # internal todo tool for scheduled runs so duplicate todo calls cannot turn
+    # a background job into a user-facing framework error.
+    return _deep_agent_tool_exclusion_middleware({"write_todos"})
+
+
+def _scheduled_task_subagents(config: Any) -> list[dict[str, Any]]:
+    subagents = [dict(spec) for spec in (_deep_agent_subagents_for_task(config) or [])]
+    if not _is_scheduled_background_config(config):
+        return subagents
+
+    def guarded(spec: dict[str, Any]) -> dict[str, Any]:
+        existing = list(spec.get("middleware") or [])
+        spec["middleware"] = [*existing, *_scheduled_task_deep_agent_middleware(config)]
+        return spec
+
+    subagents = [guarded(spec) for spec in subagents]
+    try:
+        from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+    except Exception:  # pragma: no cover - depends on optional deepagents internals
+        GENERAL_PURPOSE_SUBAGENT = None
+    if GENERAL_PURPOSE_SUBAGENT is not None and not any(
+        str(spec.get("name") or "") == str(GENERAL_PURPOSE_SUBAGENT.get("name") or "")
+        for spec in subagents
+    ):
+        subagents.insert(0, guarded(dict(GENERAL_PURPOSE_SUBAGENT)))
+    return subagents
+
+
+def _is_internal_deep_agent_todo_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return "write_todos" in lowered and "multiple times in parallel" in lowered
 
 
 def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = None) -> str:
@@ -321,8 +477,9 @@ def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = Non
         "- Do not use /tmp, /var/tmp, or arbitrary absolute paths for final files the user asked to receive.\n"
         "- Temporary scratch files must also stay inside the workspace storage area unless a tool explicitly returns "
         "a workspace-safe generated path.\n"
-        "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, links, and existing "
-        "image artifact paths instead of terminal_exec.\n"
+        "- For typed artifact requirements, use the scoped dedicated producer first "
+        "(for example pdf_create/pdf_edit, spreadsheet_create, or presentation_create); "
+        "request/use terminal_exec only as the local fallback if the dedicated tool cannot complete.\n"
         "- Mention a saved or attached file only after file_write, pdf_create, or another file-producing tool "
         "returns a path in the workspace artifact directory.\n\n"
         f"Task: {task.description}"
@@ -395,6 +552,22 @@ def _deliverable_artifact_paths_for_task(config, artifact_paths: list[str]) -> l
         if descriptor is not None:
             deliverable.append(descriptor.path)
     return list(dict.fromkeys(deliverable))
+
+
+def _artifact_paths_from_deep_agent_tool_results(tool_results: list[Any]) -> list[str]:
+    paths = list(artifact_paths_from_tool_results(tool_results))
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = getattr(result, "output", None)
+        output = output if isinstance(output, dict) else {}
+        value = output.get("artifact_path")
+        if isinstance(value, str) and value.strip():
+            paths.append(value)
+        values = output.get("artifact_paths")
+        if isinstance(values, (list, tuple)):
+            paths.extend(path for path in values if isinstance(path, str) and path.strip())
+    return list(dict.fromkeys(paths))
 
 
 def _relocate_external_artifact_paths_for_task(config, artifact_paths: list[str]) -> list[str]:
@@ -642,6 +815,82 @@ def _evidence_fallback_timeout_seconds() -> float:
     )
 
 
+def _completion_decision_timeout_seconds() -> float:
+    return _float_env(
+        _DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS_ENV,
+        _DEFAULT_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS,
+        minimum=0.1,
+    )
+
+
+async def _scheduled_task_completion_decision(
+    config,
+    *,
+    output_text: str,
+    tool_results: list[Any],
+    model_client: Any,
+) -> dict[str, str] | None:
+    """Validate scheduled mini-agent completion before publishing dependency context.
+
+    Cron/planner tasks often feed one mini-agent's result into downstream
+    report/artifact tasks. A polished final paragraph is not enough evidence
+    that the step succeeded, so scheduled runs get a schema-bound completion
+    decision before their output can unblock dependents.
+    """
+    if not _is_scheduled_background_config(config):
+        return None
+    create = getattr(model_client, "create", None)
+    if create is None or not _model_client_can_make_evidence_fallback_decision(model_client):
+        return None
+    task = getattr(config, "task", None)
+    evidence = _tool_evidence_payload(tool_results)
+    system_prompt = (
+        "You validate one completed Nullion scheduled-task step. "
+        "Use only the assigned task, dependency context, final answer, and verified tool-result evidence. "
+        "Output only JSON with this schema: "
+        '{"status":"success"|"failure","answer":"string"}. '
+        "Set status=failure when required evidence, data, side effects, or verification are insufficient. "
+        "External platform delivery is performed by Nullion after this step; do not require proof that a "
+        "message, report, or artifact was already sent unless the assigned task had an available side-effect "
+        "tool and the final answer claims that tool-side effect already happened. "
+        "For success, keep answer as the concise user-facing task result. "
+        "Do not mention internal validation, tools, or orchestration."
+    )
+    user_payload = {
+        "task": str(getattr(task, "description", "") or getattr(task, "title", "") or ""),
+        "allowed_tools": list(getattr(task, "allowed_tools", ()) or ()),
+        "dependency_context": getattr(config, "context_in", None),
+        "final_answer": str(output_text or ""),
+        "tool_evidence": evidence,
+    }
+    create_kwargs = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": json.dumps(user_payload, ensure_ascii=False, default=str)}],
+            }
+        ],
+        "tools": [],
+        "max_tokens": 700,
+        "system": system_prompt,
+    }
+    try:
+        response = await asyncio.wait_for(
+            _call_model_create(create, create_kwargs),
+            timeout=_completion_decision_timeout_seconds(),
+        )
+    except Exception:
+        logger.warning(
+            "DeepAgent scheduled completion validation failed; preserving original result "
+            "agent_id=%s task_id=%s",
+            getattr(config, "agent_id", ""),
+            str(getattr(task, "task_id", "") or ""),
+            exc_info=True,
+        )
+        return None
+    return _parse_evidence_fallback_decision(_extract_response_text(response))
+
+
 async def _fallback_answer_from_tool_evidence(
     config,
     *,
@@ -724,6 +973,12 @@ async def _fallback_answer_from_tool_evidence(
 
 
 def _model_client_can_make_evidence_fallback_decision(model_client: Any) -> bool:
+    # Evidence recovery is already behind a failed/raw final-answer boundary.
+    # Do not require provider metadata here; wrappers, test harnesses, and
+    # installed model adapters may expose only `create()` even though they are
+    # still the configured model path for this turn.
+    if callable(getattr(model_client, "create", None)):
+        return True
     provider = str(getattr(model_client, "provider", "") or "").strip()
     model = str(getattr(model_client, "model", "") or "").strip()
     if provider or model:

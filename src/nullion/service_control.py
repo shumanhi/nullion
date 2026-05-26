@@ -261,12 +261,69 @@ def _restart_windows_service(service: ManagedService) -> str | None:
         if query.returncode != 0:
             continue
         _run(["schtasks", "/End", "/TN", task], timeout=10)
+        if not _wait_for_windows_task_stopped(task, timeout=15):
+            _force_stop_windows_service_processes(service)
+        if not _wait_for_windows_task_stopped(task, timeout=10):
+            raise RuntimeError(f"{service.display_name} Windows task did not stop before restart ({task}).")
         started = _run(["schtasks", "/Run", "/TN", task], timeout=10)
-        if started.returncode == 0:
+        if started.returncode == 0 and _wait_for_windows_task_running(task, timeout=20):
             return f"Restarted the {service.display_name} service ({task})."
         error = (started.stderr or started.stdout or "schtasks /Run failed").strip()
+        if started.returncode == 0:
+            status = _windows_task_status(task) or "unknown"
+            error = f"task did not stay running after start; status={status}"
         raise RuntimeError(f"{service.display_name} Windows task restart failed for {task}: {error}")
     return None
+
+
+def _windows_task_query(task: str) -> subprocess.CompletedProcess[str]:
+    return _run(["schtasks", "/Query", "/TN", task, "/FO", "LIST", "/V"], timeout=10)
+
+
+def _windows_task_status(task: str) -> str | None:
+    query = _windows_task_query(task)
+    if query.returncode != 0:
+        return None
+    for line in (query.stdout or "").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() == "status":
+            return value.strip()
+    return None
+
+
+def _windows_task_is_running(task: str) -> bool:
+    return (_windows_task_status(task) or "").strip().lower() == "running"
+
+
+def _wait_for_windows_task_stopped(task: str, *, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _windows_task_is_running(task):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _wait_for_windows_task_running(task: str, *, timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    running_since: float | None = None
+    while time.monotonic() < deadline:
+        if _windows_task_is_running(task):
+            if running_since is None:
+                running_since = time.monotonic()
+            if time.monotonic() - running_since >= 1.0:
+                return True
+        else:
+            running_since = None
+        time.sleep(0.3)
+    return False
+
+
+def _force_stop_windows_service_processes(service: ManagedService) -> None:
+    if not service.command_hint:
+        return
+    image = f"{service.command_hint}.exe"
+    _run(["taskkill", "/F", "/T", "/IM", image], timeout=10)
 
 
 def restart_managed_service(name: str, *, manager: ServiceManager = "auto") -> str:

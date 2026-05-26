@@ -34,6 +34,7 @@ from nullion.artifacts import (
 )
 from nullion.attachment_format_graph import is_domain_suffix_extension, plan_attachment_format
 from nullion.delegated_artifact_workflow import finalize_delegated_artifacts
+from nullion.response_fulfillment_contract import pdf_has_unfulfilled_image_placeholders
 from nullion.mini_agent_runner import ProgressUpdate
 from nullion.task_queue import TaskGroup, TaskRecord, TaskRegistry, TaskStatus
 from nullion.task_status_format import format_task_status_line, format_task_status_summary
@@ -55,7 +56,17 @@ MIN_PROGRESS_INTERVAL_S: float = 3.0
 DEFAULT_FINAL_SUMMARY_TIMEOUT_S: float = 12.0
 _FILENAME_TOKEN_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w .()@+-]{0,180}\.[A-Za-z0-9]{1,16})(?![\w./-])")
 _ARTIFACT_DELIVERY_ROLES = frozenset({"deliverable", "deliver_receipt", "verify"})
-_ARTIFACT_PRODUCER_TOOLS = frozenset({"file_write", "document_create", "spreadsheet_create", "presentation_create"})
+# Any task that used a typed artifact producer can be the source of the final
+# attachment, even when later verifier/receipt tasks are the DAG leaves.
+_ARTIFACT_PRODUCER_TOOLS = frozenset({
+    "file_write",
+    "document_create",
+    "pdf_create",
+    "pdf_edit",
+    "spreadsheet_create",
+    "presentation_create",
+    "image_generate",
+})
 _INTERNAL_ARTIFACT_SUFFIXES = frozenset({".json", ".jsonl", ".db", ".sqlite", ".sqlite3"})
 
 
@@ -67,6 +78,7 @@ class GroupState:
     last_progress_time: float = field(default_factory=time.monotonic)
     status_lines: dict[str, str] = field(default_factory=dict)  # task_id → one-line status
     task_summary_visible: bool = False
+    input_needed_task_ids: set[str] = field(default_factory=set)
 
 
 # Delivery callback type: (conversation_id, text, *, is_status) -> Awaitable[None] | None
@@ -178,41 +190,65 @@ class ResultAggregator:
         if group.group_id in self._completed_groups:
             return
         self._completed_groups.add(group.group_id)
-        recovered_artifacts = finalize_delegated_artifacts(group)
-        preverified_artifacts = _artifact_paths_for_group_delivery(
-            group,
-            recovered_artifacts,
-            summary=None,
-        )
-        summary = (
-            _artifact_recovery_summary(group, recovered_artifacts)
-            if recovered_artifacts
-            else await self._generate_summary(group, deliverable_artifacts=preverified_artifacts)
-        )
-        requested_extension = _requested_attachment_extension_for_group(group, model_client=self._model_client)
-        deliverable_artifacts = _artifact_paths_for_group_delivery(
-            group,
-            recovered_artifacts,
-            summary=summary,
-            requested_extension=requested_extension,
-        )
-        if requested_extension and not deliverable_artifacts:
-            summary = _missing_requested_artifact_summary(group, requested_extension)
-        summary = _strip_attached_artifact_references(summary, deliverable_artifacts)
-        if not deliverable_artifacts:
-            summary = _strip_unverified_attachment_claims(summary)
-        await self._deliver(
-            gs.conversation_id,
-            _summary_with_original_request_context(group, summary),
-            group_id=gs.group_id,
-        )
+        try:
+            await self._deliver_status(gs, group)
+            recovered_artifacts = finalize_delegated_artifacts(group)
+            preverified_artifacts = _artifact_paths_for_group_delivery(
+                group,
+                recovered_artifacts,
+                summary=None,
+            )
+            summary = (
+                _artifact_recovery_summary(group, recovered_artifacts)
+                if recovered_artifacts
+                else _scheduled_single_text_summary(group, preverified_artifacts)
+                or await self._generate_summary(group, deliverable_artifacts=preverified_artifacts)
+            )
+            requested_extension = _requested_attachment_extension_for_group(group, model_client=self._model_client)
+            deliverable_artifacts = _artifact_paths_for_group_delivery(
+                group,
+                recovered_artifacts,
+                summary=summary,
+                requested_extension=requested_extension,
+            )
+            if requested_extension and not deliverable_artifacts:
+                summary = _missing_requested_artifact_summary(group, requested_extension)
+            summary = _strip_attached_artifact_references(summary, deliverable_artifacts)
+            if not deliverable_artifacts:
+                summary = _strip_unverified_attachment_claims(summary)
+            delivered = await self._deliver(
+                gs.conversation_id,
+                _summary_with_original_request_context(group, summary),
+                group_id=gs.group_id,
+                # Messaging adapters use this boundary to clear cron delivery
+                # state only after they know whether artifact messages still
+                # follow the summary.
+                is_final=True,
+                has_artifacts=bool(deliverable_artifacts),
+            )
+            if not delivered:
+                self._completed_groups.discard(group.group_id)
+                return
 
-        # Deliver any artifacts.
-        for artifact in deliverable_artifacts:
-            await self._deliver(gs.conversation_id, artifact, is_artifact=True, group_id=gs.group_id)
+            # Deliver any artifacts.
+            for artifact_index, artifact in enumerate(deliverable_artifacts):
+                artifact_delivered = await self._deliver(
+                    gs.conversation_id,
+                    artifact,
+                    is_artifact=True,
+                    group_id=gs.group_id,
+                    is_final=artifact_index == len(deliverable_artifacts) - 1,
+                )
+                if not artifact_delivered:
+                    self._completed_groups.discard(group.group_id)
+                    return
 
-        # Clean up group state.
-        self._group_state.pop(gs.group_id, None)
+            # Clean up group state.
+            self._group_state.pop(gs.group_id, None)
+        except Exception:
+            self._completed_groups.discard(group.group_id)
+            logger.warning("ResultAggregator: final group delivery failed for %s", group.group_id, exc_info=True)
+            raise
 
     async def _generate_summary(self, group: TaskGroup, *, deliverable_artifacts: list[str] | None = None) -> str:
         """One-shot LLM call to synthesize a coherent final reply."""
@@ -408,6 +444,34 @@ def _strip_unverified_attachment_claims(summary: str) -> str:
     return " ".join(sentence for sentence in kept if sentence).strip() or text
 
 
+def _scheduled_single_text_summary(group: TaskGroup, deliverable_artifacts: list[str] | None) -> str | None:
+    if not _is_scheduled_task_request(group.original_message):
+        return None
+    if deliverable_artifacts:
+        return None
+    tasks = list(getattr(group, "tasks", ()) or ())
+    if len(tasks) != 1:
+        return None
+    task = tasks[0]
+    result = getattr(task, "result", None)
+    if result is None or getattr(result, "status", "") != "success":
+        return None
+    result_artifacts = [
+        str(path)
+        for path in (getattr(result, "artifacts", None) or ())
+        if isinstance(path, str) and path.strip()
+    ]
+    if _filter_internal_artifact_paths(result_artifacts):
+        return None
+    output = str(getattr(result, "output", "") or "").strip()
+    if not output:
+        return None
+    roots = _artifact_roots_for_group(group)
+    if _existing_media_artifacts_referenced_by_text(output, artifact_roots=roots):
+        return None
+    return output[:8000]
+
+
 def _artifact_recovery_summary(group: TaskGroup, artifact_paths: list[str]) -> str:
     if len(artifact_paths) == 1:
         return "I created the requested file from the completed task output and attached it."
@@ -424,6 +488,7 @@ def _artifact_paths_for_group_delivery(
     explicit_paths: list[str] = []
     artifact_task_paths: list[str] = []
     scheduled_fallback_paths: list[str] = []
+    scheduled_requested_media_paths: list[str] = []
     all_text_paths: list[str] = []
     scheduled_group = _is_scheduled_task_request(group.original_message)
     leaf_task_ids = _leaf_task_ids(group)
@@ -455,8 +520,10 @@ def _artifact_paths_for_group_delivery(
                 or task_produces_artifacts
             ):
                 artifact_task_paths.extend(media_found)
-            elif scheduled_group and task.task_id not in leaf_task_ids:
-                scheduled_fallback_paths.extend(media_found)
+            elif scheduled_group:
+                scheduled_requested_media_paths.extend(media_found)
+                if task.task_id not in leaf_task_ids:
+                    scheduled_fallback_paths.extend(media_found)
             found = _existing_artifacts_referenced_by_text(text, artifact_roots=roots)
             all_text_paths.extend(found)
             if (
@@ -471,12 +538,23 @@ def _artifact_paths_for_group_delivery(
     requested_extension = _normalize_requested_extension(requested_extension)
     if requested_extension:
         candidate_groups = (
-            (artifact_task_paths, summary_paths, scheduled_fallback_paths, explicit_paths, all_text_paths)
+            (
+                scheduled_requested_media_paths,
+                artifact_task_paths,
+                summary_paths,
+                scheduled_fallback_paths,
+                explicit_paths,
+                all_text_paths,
+            )
             if scheduled_group
             else (artifact_task_paths, explicit_paths, summary_paths, all_text_paths)
         )
         for candidates in candidate_groups:
-            matching = _filter_artifact_paths_by_extension(candidates, requested_extension)
+            matching = _filter_artifact_paths_by_extension(
+                candidates,
+                requested_extension,
+                requires_embedded_images=_group_has_pdf_image_contract(group),
+            )
             if matching:
                 if scheduled_group and not _group_has_explicit_artifact_delivery(group):
                     return _collapse_same_format_scheduled_artifacts(matching)
@@ -504,10 +582,31 @@ def _artifact_paths_for_group_delivery(
 def _requested_attachment_extension_for_group(group: TaskGroup, *, model_client: Any | None) -> str | None:
     del model_client
     try:
-        return plan_attachment_format(group.original_message, model_client=None).extension
+        return plan_attachment_format(
+            _attachment_request_text_for_group(group),
+            model_client=None,
+        ).extension
     except Exception:
         logger.debug("Could not plan requested attachment extension for group %s", group.group_id, exc_info=True)
         return None
+
+
+def _attachment_request_text_for_group(group: TaskGroup) -> str:
+    message = str(getattr(group, "original_message", "") or "")
+    if not _is_scheduled_task_request(message):
+        return message
+    separators = (
+        "\n\nScheduled task execution context:",
+        "\nScheduled task execution context:",
+        "\n\nScheduled task delivery contract:",
+        "\nScheduled task delivery contract:",
+    )
+    end = len(message)
+    for separator in separators:
+        index = message.find(separator)
+        if index >= 0:
+            end = min(end, index)
+    return message[:end].strip() or message
 
 
 def _normalize_requested_extension(extension: str | None) -> str | None:
@@ -518,14 +617,35 @@ def _normalize_requested_extension(extension: str | None) -> str | None:
     return None if is_domain_suffix_extension(normalized) else normalized
 
 
-def _filter_artifact_paths_by_extension(paths: list[str] | tuple[str, ...], extension: str) -> list[str]:
+def _filter_artifact_paths_by_extension(
+    paths: list[str] | tuple[str, ...],
+    extension: str,
+    *,
+    requires_embedded_images: bool = False,
+) -> list[str]:
     normalized = _normalize_requested_extension(extension)
     if normalized is None:
         return _filter_internal_artifact_paths(paths)
-    return list(
+    matching = list(
         dict.fromkeys(
             path for path in paths if Path(str(path)).suffix.lower() == normalized
         )
+    )
+    if normalized == ".pdf" and requires_embedded_images:
+        # Image checks are request-scoped: only a PDF plan that exposed image
+        # generation as a structured tool contract should reject placeholder
+        # panels. Plain PDFs are allowed to be text-only.
+        matching = [
+            path for path in matching
+            if not pdf_has_unfulfilled_image_placeholders(path)
+        ]
+    return matching
+
+
+def _group_has_pdf_image_contract(group: TaskGroup) -> bool:
+    return any(
+        "image_generate" in {str(tool).lower() for tool in (getattr(task, "allowed_tools", None) or ())}
+        for task in getattr(group, "tasks", ()) or ()
     )
 
 
@@ -852,9 +972,18 @@ async def _result_aggregation_task_cancelled_node(state: _ResultAggregationState
 async def _result_aggregation_input_needed_node(state: _ResultAggregationState) -> dict[str, object]:
     update = state["update"]
     gs = state["group_state"]
+    task = state.get("task")
+    if update.task_id in gs.input_needed_task_ids:
+        return {}
+    gs.input_needed_task_ids.add(update.task_id)
+    if task:
+        gs.status_lines[update.task_id] = format_task_status_line(task, status=TaskStatus.WAITING_INPUT)
+        group = state.get("group")
+        if group is not None:
+            await state["aggregator"]._deliver_status(gs, group)
     await state["aggregator"]._deliver(
         gs.conversation_id,
-        f"? {update.message or 'Input needed'}",
+        _input_needed_message(update.message),
         is_question=True,
     )
     return {}
@@ -915,6 +1044,16 @@ def _compiled_result_aggregation_graph():
     ):
         graph.add_edge(node, END)
     return graph.compile()
+
+
+def _input_needed_message(message: str | None) -> str:
+    text = str(message or "").strip()
+    prefix = "Waiting for user input:"
+    if text.startswith(prefix):
+        text = text[len(prefix):].strip()
+    if not text:
+        text = "I need one more detail before this can continue."
+    return f"Question: {text}"
 
 
 def _planner_summary_from_group(group: TaskGroup) -> str:

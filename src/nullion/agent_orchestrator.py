@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -27,17 +28,19 @@ from nullion.prompt_injection import (
     safe_untrusted_tool_metadata,
 )
 from nullion.response_sanitizer import (
+    is_internal_tool_command_fragment_reply,
     is_raw_tool_payload_reply,
     is_safe_raw_tool_payload_replacement_reply,
     safe_raw_tool_payload_replacement,
     sanitize_user_visible_reply,
 )
-from nullion.response_fulfillment_contract import evaluate_response_fulfillment
+from nullion.response_fulfillment_contract import evaluate_response_fulfillment, file_evidence_paths_from_tool_results
 from nullion.runtime import (
     mark_mission_completed,
     mark_mission_failed,
     mark_mission_running,
     mark_mission_waiting_approval,
+    transition_mini_agent_run,
 )
 from nullion.suspended_turns import SuspendedTurn
 from nullion.thinking_display import extract_thinking_text
@@ -47,6 +50,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL_TOOL_RESULT_MAX_CHARS = 87_420
 _ALWAYS_COMPACT_MODEL_TOOL_OUTPUTS = frozenset({"terminal_exec", "workspace_summary"})
+_DEFAULT_MODEL_CALL_TIMEOUT_SECONDS = 90.0
+_BINARY_FILE_READ_TERMINAL_FALLBACK_EXTENSIONS = frozenset(
+    {".numbers", ".xls", ".xlsx", ".doc", ".docx", ".ppt", ".pptx"}
+)
 
 
 _ARTIFACT_RECOVERY_TOOLS = frozenset(
@@ -71,6 +78,47 @@ def _planner_dependency_recovery_attempts() -> int:
     from nullion.mini_agent_config import planner_dependency_recovery_attempts
 
     return planner_dependency_recovery_attempts()
+
+
+def _agent_model_call_timeout_seconds() -> float | None:
+    raw = os.environ.get("NULLION_AGENT_MODEL_CALL_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_MODEL_CALL_TIMEOUT_SECONDS
+    if value <= 0:
+        return None
+    return max(1.0, value)
+
+
+def _model_create_accepts_timeout(model_client: object) -> bool:
+    create = getattr(model_client, "create", None)
+    if create is None:
+        return False
+    try:
+        signature = inspect.signature(create)
+    except (TypeError, ValueError):
+        return True
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == "timeout":
+            return True
+    return False
+
+
+def _model_failure_after_tools_message(tool_results: list[ToolResult], exc: BaseException) -> str:
+    tool_names = ", ".join(dict.fromkeys(result.tool_name for result in tool_results if result.tool_name)) or "tools"
+    detail = str(exc).strip() or exc.__class__.__name__
+    if len(detail) > 240:
+        detail = detail[:237].rstrip() + "..."
+    return (
+        "I completed the available tool work, but the final model response did not finish before the timeout. "
+        f"Tools completed: {tool_names}. "
+        f"Model error: {detail}"
+    )
 
 
 def _mini_agent_runner_concurrency_limit() -> int:
@@ -224,6 +272,50 @@ def _artifact_paths_from_tool_result(result: ToolResult, *, runtime_store=None) 
     return []
 
 
+def _binary_file_read_boundary_result(
+    invocation: ToolInvocation,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+) -> ToolResult | None:
+    if invocation.tool_name not in {"terminal_exec", "file_write"}:
+        return None
+    if invocation.tool_name == "file_write":
+        write_path = Path(str(invocation.arguments.get("path") or "").strip())
+        if write_path.suffix.lower() not in {".txt", ".md"}:
+            return None
+    for result in reversed(tuple(tool_results or ())):
+        if result.tool_name != "file_read" or result.status != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        path_text = str(output.get("path") or output.get("artifact_path") or "").strip()
+        message = str(output.get("message") or result.error or "")
+        binary_read = output.get("binary") is True or "binary file exists" in message.lower()
+        if not binary_read:
+            continue
+        suffix = Path(path_text).suffix.lower()
+        if suffix and suffix not in _BINARY_FILE_READ_TERMINAL_FALLBACK_EXTENSIONS:
+            continue
+        tool_instruction = (
+            "Do not use terminal_exec to unpack or inspect it in this turn"
+            if invocation.tool_name == "terminal_exec"
+            else "Do not create a text or markdown status artifact from it in this turn"
+        )
+        return ToolResult(
+            invocation.invocation_id,
+            invocation.tool_name,
+            "blocked",
+            {
+                "reason": "binary_file_read_boundary",
+                "path": path_text,
+                "message": (
+                    f"The registered file reader reported a binary document. {tool_instruction}; "
+                    "report the exact reader limitation in chat or use a table-aware/document-aware tool."
+                ),
+            },
+            error=f"{invocation.tool_name} blocked after binary file_read",
+        )
+    return None
+
+
 def _artifact_root_snapshot(runtime_store, *, principal_id: str | None = None) -> dict[str, tuple[int, int]]:
     if runtime_store is None and not principal_id:
         return {}
@@ -374,15 +466,22 @@ def _compact_tool_output_for_model_context(tool_name: str, output: object) -> ob
 
 
 def _tool_result_message_payload(result: ToolResult) -> str:
+    output = result.output
+    if result.tool_name == "request_tool_scope" and isinstance(output, dict):
+        output = dict(output)
+        # Scope-change text is orchestration bookkeeping, not answer evidence.
+        # Keeping it out of the model-facing payload prevents "Tool scope
+        # updated" from becoming the final user-visible response.
+        output.pop("message", None)
     payload: dict[str, Any] = {
         "status": result.status,
         "output": (
-            _compact_tool_output_for_model_context(result.tool_name, result.output)
+            _compact_tool_output_for_model_context(result.tool_name, output)
             if result.tool_name in _ALWAYS_COMPACT_MODEL_TOOL_OUTPUTS
-            else _json_safe_tool_value(result.output)
+            else _json_safe_tool_value(output)
         ),
     }
-    security = model_security_envelope(result.tool_name, result.output)
+    security = model_security_envelope(result.tool_name, output)
     if security is not None:
         payload["security"] = security
         payload["untrusted_output_boundary"] = {
@@ -396,7 +495,7 @@ def _tool_result_message_payload(result: ToolResult) -> str:
     if len(text) <= max_chars:
         return text
     original_chars = len(text)
-    payload["output"] = _compact_tool_output_for_model_context(result.tool_name, result.output)
+    payload["output"] = _compact_tool_output_for_model_context(result.tool_name, output)
     payload["model_context_compaction"] = {
         "original_json_chars": original_chars,
         "max_json_chars": max_chars,
@@ -424,6 +523,25 @@ def _malformed_tool_call_result(*, principal_id: str, reason: str, block: object
 def _terminal_tool_failure_text(result: ToolResult) -> str | None:
     output = result.output if isinstance(result.output, dict) else {}
     reason = output.get("reason")
+    if result.tool_name == "run_cron" and result.status == "failed":
+        matches = output.get("matches")
+        if isinstance(matches, list) and matches:
+            lines = []
+            for item in matches:
+                if not isinstance(item, dict):
+                    continue
+                index = str(item.get("selection_index") or item.get("reply_with") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if index and name:
+                    lines.append(f"{index}. {name}")
+            if lines:
+                return "I found multiple matching cron jobs. Which one should I use?\n\n" + "\n".join(
+                    lines
+                ) + "\n\nReply with the number."
+        if result.error and str(result.error).startswith("No cron found"):
+            lookup = str(output.get("name") or output.get("id") or "").strip()
+            target = f" for `{lookup}`" if lookup else ""
+            return f"I couldn't find a scheduled cron job{target}."
     if (
         result.tool_name == "run_cron"
         and result.status == "failed"
@@ -475,6 +593,19 @@ def _deferred_background_tool_completion_text(result: ToolResult) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return "Started. The result will be delivered when ready."
+
+
+def _terminal_user_action_tool_completion_text(result: ToolResult) -> str | None:
+    if result.status != "completed":
+        return None
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("terminal_user_action_required") is not True:
+        return None
+    for key in ("result_text", "final_text", "message", "next_step"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:8000]
+    return "I need you to complete setup before I can continue."
 
 
 def _last_useful_tool_message(tool_results: list[ToolResult]) -> str:
@@ -605,8 +736,27 @@ def _post_tool_delivery_nudge() -> str:
 def _raw_tool_payload_delivery_nudge() -> str:
     return (
         "Your draft final response was a raw structured tool payload. Convert the completed tool results "
-        "into a concise human-readable answer for the user. Do not paste JSON, connector payloads, "
-        "internal paths, or full raw tool output."
+        "into a concise human-readable answer for the user. If you wrote pseudo function/tool syntax without "
+        "actually calling a tool, call the registered tool instead of describing the call. Do not paste JSON, "
+        "connector payloads, internal paths, or full raw tool output."
+    )
+
+
+def _internal_tool_command_delivery_nudge() -> str:
+    return (
+        "Your draft final response was internal tool-command syntax or loose tool arguments, not a "
+        "user-visible answer. Continue the same request by calling the registered tools. If the needed "
+        "tool is hidden, call request_tool_scope with the matching capability first, then call the "
+        "newly exposed tool. Do not output slash commands, tool names, query fragments, or key=value "
+        "arguments as the final reply."
+    )
+
+
+def _internal_scope_update_delivery_nudge() -> str:
+    return (
+        "Your draft final response was the internal result of request_tool_scope. "
+        "Continue the same user request with the newly available tools and give the user the actual result. "
+        "Do not mention tool scope updates or internal capability bookkeeping."
     )
 
 
@@ -804,6 +954,60 @@ def _repair_raw_tool_payload_final_text(state: "_AgentTurnGraphState", final_tex
     if is_safe_raw_tool_payload_replacement_reply(reply=repaired, tool_results=tool_results):
         return None
     return repaired
+
+
+def _is_internal_scope_update_reply(final_text: str | None, tool_results: list[ToolResult]) -> bool:
+    text = str(final_text or "").strip()
+    if not text or not any(result.tool_name == "request_tool_scope" for result in tool_results):
+        return False
+    normalized = " ".join(text.split())
+    for result in tool_results:
+        if result.tool_name != "request_tool_scope":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        message = str(output.get("message") or "").strip()
+        if message and normalized == " ".join(message.split()):
+            return True
+    return normalized.startswith("Tool scope updated.") or normalized.startswith(
+        "No registered tools matched the requested capability scope."
+    )
+
+
+def _registered_or_recoverable_tool_names(tool_registry: object | None) -> tuple[str, ...]:
+    names: list[str] = []
+    registries = [tool_registry]
+    delegate = getattr(tool_registry, "_delegate", None)
+    if delegate is not None:
+        registries.append(delegate)
+    for registry in registries:
+        if registry is None:
+            continue
+        try:
+            specs = registry.list_specs()
+        except Exception:
+            specs = ()
+        for spec in specs or ():
+            name = str(getattr(spec, "name", "") or "").strip()
+            if name:
+                names.append(name)
+        try:
+            definitions = registry.list_tool_definitions()
+        except Exception:
+            definitions = ()
+        for definition in definitions or ():
+            if not isinstance(definition, dict):
+                continue
+            name = str(definition.get("name") or "").strip()
+            if name:
+                names.append(name)
+    return tuple(dict.fromkeys(names))
+
+
+def _is_internal_tool_command_reply(final_text: str | None, state: "_AgentTurnGraphState") -> bool:
+    return is_internal_tool_command_fragment_reply(
+        reply=final_text,
+        registered_tool_names=_registered_or_recoverable_tool_names(state.get("tool_registry")),
+    )
 
 
 def _missing_artifact_delivery_nudge(missing_requirements: tuple[str, ...]) -> str:
@@ -1111,6 +1315,276 @@ def _maybe_widen_scope_after_repeated_tool_failure(
     return _synthetic_recovery_scope_result(state, tool_registry=tool_registry, skipped_scopes=skipped_scopes)
 
 
+def _capability_for_unavailable_tool(tool_name: str) -> str | None:
+    if tool_name in {"file_search", "file_read", "file_write"}:
+        return "local_files"
+    if tool_name == "terminal_exec":
+        return "local_shell"
+    if tool_name in {"web_search", "web_fetch"} or tool_name.startswith("browser_"):
+        return "web"
+    if tool_name in {"list_crons", "list_reminders"}:
+        return "scheduler_read"
+    if tool_name == "run_cron":
+        return "scheduler_run"
+    if tool_name in {"set_reminder", "create_cron", "update_cron", "delete_cron", "enable_cron", "disable_cron"}:
+        return "scheduler_mutate"
+    if tool_name in {"connector_request", "email_send", "email_search", "email_read", "calendar_list"}:
+        return "connector"
+    if tool_name == "skill_pack_read":
+        return "skill_pack"
+    if tool_name == "weather_forecast":
+        return "weather"
+    if tool_name == "image_generate":
+        return "image_generation"
+    return None
+
+
+def _maybe_widen_scope_after_unavailable_tool(
+    state: _AgentTurnGraphState,
+    *,
+    result: ToolResult,
+    tool_registry: ToolRegistry,
+    tool_recovery_scopes_attempted: list[str],
+) -> tuple[ToolRegistry, ToolResult, str] | None:
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("reason") not in {"tool_not_available", "tool_requires_structured_turn_scope"}:
+        return None
+    recovery_scope = _capability_for_unavailable_tool(result.tool_name)
+    if recovery_scope is None or recovery_scope in set(tool_recovery_scopes_attempted):
+        return None
+    apply_scope_request = getattr(tool_registry, "apply_scope_request", None)
+    if not callable(apply_scope_request):
+        return None
+    invocation = ToolInvocation(
+        invocation_id=f"orchestrator-{uuid4().hex}",
+        tool_name="request_tool_scope",
+        principal_id=state["principal_id"],
+        arguments={
+            "capabilities": [recovery_scope],
+            "tool_names": [result.tool_name],
+            "reason": "retry unavailable tool selected by the model",
+        },
+        capsule_id=state["cleanup_scope"],
+    )
+    try:
+        scope_result, widened_registry = apply_scope_request(invocation)
+    except Exception:
+        logger.debug("Could not widen scope after unavailable tool call", exc_info=True)
+        return None
+    output = scope_result.output if isinstance(scope_result.output, dict) else {}
+    available_tools = output.get("available_tools")
+    if scope_result.status != "completed" or not isinstance(available_tools, list) or not available_tools:
+        return None
+    return widened_registry, scope_result, recovery_scope
+
+
+def _file_search_result_has_no_matches(result: ToolResult) -> bool:
+    if result.tool_name != "file_search" or result.status != "completed":
+        return False
+    output = result.output if isinstance(result.output, dict) else {}
+    for key in ("matches", "files"):
+        value = output.get(key)
+        if isinstance(value, list):
+            return len(value) == 0
+    return False
+
+
+def _empty_file_search_has_untried_terminal_fallback(tool_results: list[ToolResult]) -> bool:
+    if not any(_file_search_result_has_no_matches(result) for result in tool_results):
+        return False
+    if any(result.tool_name == "terminal_exec" for result in tool_results):
+        return False
+    for result in tool_results:
+        if result.tool_name != "request_tool_scope" or result.status != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        capabilities = {str(value) for value in output.get("capabilities", []) if str(value)}
+        available_tools = {str(value) for value in output.get("available_tools", []) if str(value)}
+        if "local_shell" in capabilities and "terminal_exec" in available_tools:
+            return True
+    return False
+
+
+def _empty_file_search_terminal_fallback_nudge() -> str:
+    return (
+        "A completed file_search returned no matches, and terminal_exec is now available as the final local fallback. "
+        "Continue the same user request by using terminal_exec for a bounded local search in the allowed roots, "
+        "or ask the user a numbered question for the folder/search boundary if shell search is not permitted. "
+        "Do not finalize with only 'unable to locate' while the fallback remains untried."
+    )
+
+
+def _retryable_terminal_failure_after_file_search(tool_results: list[ToolResult]) -> ToolResult | None:
+    if not any(_file_search_result_has_no_matches(result) for result in tool_results):
+        return None
+    for result in reversed(tool_results):
+        if result.tool_name != "terminal_exec":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        exit_code = output.get("exit_code")
+        stderr = str(output.get("stderr") or "")
+        stdout = str(output.get("stdout") or "")
+        stderr_command_not_found = "command not found" in stderr.lower()
+        if result.status == "failed" and (exit_code == 127 or stderr_command_not_found):
+            return result
+        if result.status == "completed" and stderr_command_not_found and not stdout.strip():
+            # Some shell snippets mask a bad command with `|| true`, so the
+            # terminal tool can report success even though no search ran.
+            # Treat that as an exhausted fallback rung, not a valid answer.
+            return result
+        return None
+    return None
+
+
+def _terminal_failure_retry_nudge(result: ToolResult) -> str:
+    output = result.output if isinstance(result.output, dict) else {}
+    stderr = str(output.get("stderr") or result.error or "").strip()
+    stderr_text = f" The shell stderr was: {stderr[:500]}" if stderr else ""
+    return (
+        "The local shell fallback failed because the command itself was invalid or unavailable, not because the "
+        f"user request was complete.{stderr_text}\n"
+        "Continue the same request by retrying terminal_exec once with corrected, portable shell syntax and a bounded "
+        "search path. For file discovery, prefer commands such as `find . -maxdepth 5 ...` with a space after `find`. "
+        "If a safe search boundary is still unclear, ask a numbered question for the folder to search. Do not finalize "
+        "with only the terminal_exec failure."
+    )
+
+
+def _terminal_failure_boundary_message(tool_results: list[ToolResult]) -> str | None:
+    failed = _retryable_terminal_failure_after_file_search(tool_results)
+    if failed is None:
+        return None
+    output = failed.output if isinstance(failed.output, dict) else {}
+    stderr = str(output.get("stderr") or failed.error or "").strip()
+    detail = f" The shell error was: `{stderr[:180]}`." if stderr else ""
+    return (
+        "I searched the currently allowed file scope and then tried the local shell fallback, but the shell command "
+        f"failed before it could search.{detail}\n\n"
+        "Please reply with one option:\n"
+        "1. Search my home folder\n"
+        "2. Search Documents and Downloads\n"
+        "3. I will send the exact folder path"
+    )
+
+
+def _scheduler_failure_boundary_message(tool_results: list[ToolResult]) -> str | None:
+    run_failure: ToolResult | None = None
+    for result in reversed(tool_results):
+        if result.tool_name == "run_cron" and result.status != "completed":
+            run_failure = result
+            break
+    if run_failure is None:
+        return None
+    output = run_failure.output if isinstance(run_failure.output, dict) else {}
+    error = str(run_failure.error or "").strip()
+    lookup = str(output.get("name") or output.get("id") or "").strip()
+    if error.startswith("Multiple crons matched"):
+        message = str(output.get("message") or "").strip()
+        if message:
+            return (
+                "I found more than one matching scheduled task. Please reply with the number to run:\n"
+                f"{message}"
+            )
+        return "I found more than one matching scheduled task. Please reply with the number to run."
+    if error.startswith("No cron found"):
+        empty_listing = False
+        for result in tool_results:
+            if result.tool_name != "list_crons" or result.status != "completed":
+                continue
+            list_output = result.output if isinstance(result.output, dict) else {}
+            crons = list_output.get("crons")
+            if isinstance(crons, list) and not crons:
+                empty_listing = True
+                break
+        lookup_text = f" matching `{lookup}`" if lookup else ""
+        if empty_listing:
+            return f"I could not find a scheduled task{lookup_text} in this workspace. No crons are scheduled here."
+        return f"I could not find a scheduled task{lookup_text} in this workspace."
+    return None
+
+
+def _final_text_mentions_file_evidence(final_text: str | None, evidence_paths: set[str]) -> bool:
+    text = str(final_text or "").lower()
+    if not text or not evidence_paths:
+        return False
+    for raw_path in evidence_paths:
+        candidate = str(raw_path or "").strip().strip("`'\"")
+        if not candidate:
+            continue
+        name = Path(candidate).name
+        for token in {candidate, name}:
+            normalized = token.lower().strip()
+            if len(normalized) >= 3 and normalized in text:
+                return True
+    return False
+
+
+def _terminal_search_boundary_message(tool_results: list[ToolResult], final_text: str | None) -> str | None:
+    if not any(_file_search_result_has_no_matches(result) for result in tool_results):
+        return None
+    terminal_results = [result for result in tool_results if result.tool_name == "terminal_exec"]
+    if not terminal_results or _retryable_terminal_failure_after_file_search(tool_results) is not None:
+        return None
+    terminal_evidence = file_evidence_paths_from_tool_results(terminal_results)
+    if _final_text_mentions_file_evidence(final_text, terminal_evidence):
+        return None
+    return (
+        "I searched the currently allowed file scope and tried the local shell fallback, but I still do not have "
+        "a verified matching file to report.\n\n"
+        "Please reply with one option:\n"
+        "1. Search my home folder\n"
+        "2. Search Documents and Downloads\n"
+        "3. I will send the exact folder path"
+    )
+
+
+def _scope_update_leak_fallback(tool_results: list[ToolResult]) -> str:
+    if any(_file_search_result_has_no_matches(result) for result in tool_results):
+        return (
+            "I searched the currently available file scope and did not find a match, but I did not complete the "
+            "broader fallback search. Please provide a folder to search, or allow a local shell search so I can keep looking."
+        )
+    return (
+        "I widened the available tools, but I did not complete the requested work. "
+        "Please retry the request so I can continue with the newly available tools."
+    )
+
+
+def _maybe_widen_scope_after_empty_local_file_search(
+    state: _AgentTurnGraphState,
+    *,
+    result: ToolResult,
+    tool_registry: ToolRegistry,
+    tool_recovery_scopes_attempted: list[str],
+) -> tuple[ToolRegistry, ToolResult, str] | None:
+    if not _file_search_result_has_no_matches(result):
+        return None
+    skipped_scopes = set(tool_recovery_scopes_attempted)
+    if "local_shell" in skipped_scopes:
+        return None
+    apply_scope_request = getattr(tool_registry, "apply_scope_request", None)
+    if callable(apply_scope_request):
+        invocation = ToolInvocation(
+            invocation_id=f"orchestrator-{uuid4().hex}",
+            tool_name="request_tool_scope",
+            principal_id=state["principal_id"],
+            arguments={"capabilities": ["local_shell"]},
+            capsule_id=state["cleanup_scope"],
+        )
+        try:
+            scope_result, widened_registry = apply_scope_request(invocation)
+        except Exception:
+            logger.debug("Could not widen local file scope after empty search", exc_info=True)
+        else:
+            output = scope_result.output if isinstance(scope_result.output, dict) else {}
+            available_tools = output.get("available_tools")
+            if scope_result.status == "completed" and isinstance(available_tools, list) and available_tools:
+                return widened_registry, scope_result, "local_shell"
+    # Empty local search is exhausted evidence, not success. Surface shell as
+    # the final no-auth local fallback when it is already registered.
+    return _synthetic_recovery_scope_result(state, tool_registry=tool_registry, skipped_scopes=skipped_scopes | {"web"})
+
+
 def _append_tool_scope_recovery_result(
     *,
     tool_result_blocks: list[dict[str, object]],
@@ -1247,6 +1721,8 @@ class _AgentTurnGraphState(TypedDict, total=False):
     next_doctor_notice_at: int
     post_tool_delivery_nudged: bool
     raw_tool_payload_nudge_count: int
+    scope_fallback_nudge_count: int
+    terminal_failure_nudge_count: int
     repeated_failure_limit: int
     failure_fingerprints: dict[str, int]
     tool_recovery_scopes_attempted: list[str]
@@ -1581,19 +2057,23 @@ def _execute_agent_turn_tool_uses(
             tool_name=tool_name,
             tool_input=dict(tool_input),
         )
+        result = _binary_file_read_boundary_result(invocation, tool_results)
         artifact_snapshot = (
             _artifact_root_snapshot(runtime_store, principal_id=principal_id)
-            if tool_name == "terminal_exec" and runtime_store is not None
+            if result is None and tool_name == "terminal_exec" and runtime_store is not None
             else None
         )
-        tool_started_at = time.perf_counter()
-        if runtime_store is not None:
-            from nullion.runtime import invoke_tool_with_boundary_policy
+        if result is None:
+            tool_started_at = time.perf_counter()
+            if runtime_store is not None:
+                from nullion.runtime import invoke_tool_with_boundary_policy
 
-            result = invoke_tool_with_boundary_policy(runtime_store, invocation, registry=tool_registry)
+                result = invoke_tool_with_boundary_policy(runtime_store, invocation, registry=tool_registry)
+            else:
+                result = tool_registry.invoke(invocation)
+            tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
         else:
-            result = tool_registry.invoke(invocation)
-        tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
+            tool_duration_ms = 0.0
         tool_results.append(result)
         if tool_result_callback is not None:
             try:
@@ -1645,6 +2125,30 @@ def _execute_agent_turn_tool_uses(
                 )
             )
             artifacts = list(dict.fromkeys(artifacts))
+
+        unavailable_tool_recovery = _maybe_widen_scope_after_unavailable_tool(
+            state,
+            result=result,
+            tool_registry=tool_registry,
+            tool_recovery_scopes_attempted=tool_recovery_scopes_attempted,
+        )
+        if unavailable_tool_recovery is not None:
+            widened_registry, scope_result, recovery_scope = unavailable_tool_recovery
+            tool_registry = widened_registry
+            state["tool_registry"] = widened_registry
+            tool_results.append(scope_result)
+            tool_recovery_scopes_attempted.append(recovery_scope)
+            # A scoped-out tool call is structured evidence that the model
+            # selected a registered capability before the turn registry widened.
+            # Retry through request_tool_scope instead of leaking the internal
+            # availability failure as the user-visible answer.
+            _append_tool_scope_recovery_result(
+                tool_result_blocks=tool_result_blocks,
+                tool_use_id=tool_use_id,
+                failed_result=result,
+                scope_result=scope_result,
+            )
+            continue
 
         output = result.output if isinstance(result.output, dict) else {}
         approval_id = output.get("approval_id") if isinstance(output.get("approval_id"), str) else None
@@ -1711,6 +2215,36 @@ def _execute_agent_turn_tool_uses(
                 **_complete_agent_turn(updated_state, final_text=deferred_background_text),
             }
 
+        terminal_user_action_text = _terminal_user_action_tool_completion_text(result)
+        if terminal_user_action_text is not None:
+            updated_state = dict(state)
+            updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
+            return {
+                "tool_results": tool_results,
+                "artifacts": artifacts,
+                **_complete_agent_turn(updated_state, final_text=terminal_user_action_text),
+            }
+
+        local_file_recovery = _maybe_widen_scope_after_empty_local_file_search(
+            state,
+            result=result,
+            tool_registry=tool_registry,
+            tool_recovery_scopes_attempted=tool_recovery_scopes_attempted,
+        )
+        if local_file_recovery is not None:
+            widened_registry, scope_result, recovery_scope = local_file_recovery
+            tool_registry = widened_registry
+            state["tool_registry"] = widened_registry
+            tool_results.append(scope_result)
+            tool_recovery_scopes_attempted.append(recovery_scope)
+            _append_tool_scope_recovery_result(
+                tool_result_blocks=tool_result_blocks,
+                tool_use_id=tool_use_id,
+                failed_result=result,
+                scope_result=scope_result,
+            )
+            continue
+
         if state.get("enable_repeated_failure_guard", False):
             failure_fingerprint = _tool_failure_fingerprint(
                 result=result,
@@ -1751,16 +2285,24 @@ def _execute_agent_turn_tool_uses(
                             "tool_recovery_scopes_attempted": tool_recovery_scopes_attempted,
                         }
                     )
+                    # Repeated tool guards are an internal safety rail. When a
+                    # typed tool result already proves the user-visible outcome,
+                    # prefer that concrete boundary over exposing retry mechanics.
+                    repeated_failure_text = _scheduler_failure_boundary_message(tool_results)
+                    if repeated_failure_text is None:
+                        repeated_failure_text = _terminal_failure_boundary_message(tool_results)
+                    if repeated_failure_text is None:
+                        repeated_failure_text = _repeated_tool_failure_message(
+                            result=result,
+                            repeated_count=repeated_count,
+                        )
                     return {
                         "tool_results": tool_results,
                         "artifacts": artifacts,
                         "failure_fingerprints": failure_fingerprints,
                         **_complete_agent_turn(
                             updated_state,
-                            final_text=_repeated_tool_failure_message(
-                                result=result,
-                                repeated_count=repeated_count,
-                            ),
+                            final_text=repeated_failure_text,
                         ),
                     }
 
@@ -1825,8 +2367,30 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
     text_delta_callback = state.get("text_delta_callback")
     if text_delta_callback is not None:
         create_kwargs["text_delta_callback"] = text_delta_callback
+    model_timeout = _agent_model_call_timeout_seconds()
+    if model_timeout is not None and _model_create_accepts_timeout(state["orchestrator"].model_client):
+        create_kwargs["timeout"] = model_timeout
     model_started_at = time.perf_counter()
-    response = state["orchestrator"].model_client.create(**create_kwargs)
+    try:
+        response = state["orchestrator"].model_client.create(**create_kwargs)
+    except Exception as exc:
+        tool_results = list(state.get("tool_results") or [])
+        if tool_results:
+            logger.warning(
+                "agent model failed after tools conversation_id=%s iteration=%s tool_results=%s error=%s",
+                state.get("conversation_id"),
+                iterations,
+                len(tool_results),
+                exc,
+                exc_info=True,
+            )
+            updated_state = dict(state)
+            updated_state.update({"tool_results": tool_results, "iterations": iterations})
+            return _complete_agent_turn(
+                updated_state,
+                final_text=_model_failure_after_tools_message(tool_results, exc),
+            )
+        raise
     model_duration_ms = (time.perf_counter() - model_started_at) * 1000
     logger.info(
         "agent model timing conversation_id=%s iteration=%s tools=%s duration_ms=%.1f stop_reason=%s",
@@ -1963,6 +2527,46 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         else:
             final_text = _bare_completion_without_work_text(final_text)
     if (
+        _empty_file_search_has_untried_terminal_fallback(tool_results)
+        and int(state.get("scope_fallback_nudge_count") or 0) < 1
+    ):
+        # Empty local-file search is exhausted evidence for that rung only. A
+        # final reply cannot stop there when the shell fallback has been exposed.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _empty_file_search_terminal_fallback_nudge()}],
+            }
+        )
+        return {"messages": messages, "scope_fallback_nudge_count": int(state.get("scope_fallback_nudge_count") or 0) + 1}
+    retryable_terminal_failure = _retryable_terminal_failure_after_file_search(tool_results)
+    if retryable_terminal_failure is not None and int(state.get("terminal_failure_nudge_count") or 0) < 1:
+        # A malformed shell command is a failed fallback attempt, not a product
+        # answer. Give the model one chance to correct syntax before surfacing a
+        # folder-boundary question to the user.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _terminal_failure_retry_nudge(retryable_terminal_failure)}],
+            }
+        )
+        return {
+            "messages": messages,
+            "terminal_failure_nudge_count": int(state.get("terminal_failure_nudge_count") or 0) + 1,
+        }
+    if (
         tool_results
         and not state.get("post_tool_delivery_nudged", False)
         and state.get("runtime_store") is not None
@@ -2010,14 +2614,45 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                 }
             )
             return {"messages": messages, "post_tool_delivery_nudged": True}
-    if (
-        tool_results
-        and int(state.get("raw_tool_payload_nudge_count") or 0) < 1
-        and (
-            is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
-            or is_safe_raw_tool_payload_replacement_reply(reply=final_text, tool_results=tool_results)
+    internal_scope_like = _is_internal_scope_update_reply(final_text, tool_results)
+    if internal_scope_like and int(state.get("raw_tool_payload_nudge_count") or 0) < 1:
+        nudge_count = int(state.get("raw_tool_payload_nudge_count") or 0) + 1
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
+            }
         )
-    ):
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _internal_scope_update_delivery_nudge()}],
+            }
+        )
+        return {"messages": messages, "raw_tool_payload_nudge_count": nudge_count}
+    internal_tool_command_like = _is_internal_tool_command_reply(final_text, state)
+    if internal_tool_command_like and int(state.get("raw_tool_payload_nudge_count") or 0) < 1:
+        nudge_count = int(state.get("raw_tool_payload_nudge_count") or 0) + 1
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
+            }
+        )
+        # Model-emitted slash/tool fragments are structured output from the
+        # assistant, not a user-routing signal. Retry through real registered
+        # tools so hidden scopes are requested and platform chat never receives
+        # pseudo commands as final answers.
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _internal_tool_command_delivery_nudge()}],
+            }
+        )
+        return {"messages": messages, "raw_tool_payload_nudge_count": nudge_count}
+    raw_reply_like = is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
+    safe_raw_reply_like = is_safe_raw_tool_payload_replacement_reply(reply=final_text, tool_results=tool_results)
+    if int(state.get("raw_tool_payload_nudge_count") or 0) < 1 and (raw_reply_like or safe_raw_reply_like):
         nudge_count = int(state.get("raw_tool_payload_nudge_count") or 0) + 1
         messages.append(
             {
@@ -2032,19 +2667,18 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
             }
         )
         return {"messages": messages, "raw_tool_payload_nudge_count": nudge_count}
-    raw_payload_like = bool(
-        tool_results
-        and (
-            is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
-            or is_safe_raw_tool_payload_replacement_reply(reply=final_text, tool_results=tool_results)
-        )
-    )
+    # Some providers emit faux function syntax as final text instead of making
+    # the registered tool call. Treat that as a raw payload even when no tool
+    # result exists, then sanitize rather than delivering internal syntax.
+    raw_payload_like = bool(internal_scope_like or internal_tool_command_like or raw_reply_like or safe_raw_reply_like)
     if raw_payload_like:
         repaired_final_text = _repair_raw_tool_payload_final_text(state, final_text)
         if repaired_final_text is not None:
             final_text = repaired_final_text
             raw_payload_like = bool(
-                is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
+                _is_internal_scope_update_reply(final_text, tool_results)
+                or _is_internal_tool_command_reply(final_text, state)
+                or is_raw_tool_payload_reply(reply=final_text, tool_results=tool_results)
                 or is_safe_raw_tool_payload_replacement_reply(reply=final_text, tool_results=tool_results)
             )
     final_text = sanitize_user_visible_reply(
@@ -2053,6 +2687,27 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         tool_results=tool_results,
         source="agent",
     )
+    if _empty_file_search_has_untried_terminal_fallback(tool_results):
+        final_text = _scope_update_leak_fallback(tool_results)
+    if (terminal_boundary := _terminal_failure_boundary_message(tool_results)) is not None:
+        final_text = terminal_boundary
+    if (terminal_boundary := _terminal_search_boundary_message(tool_results, final_text)) is not None:
+        # After the shell fallback runs, the final answer must either cite
+        # concrete file evidence from a tool result or ask for a tighter search
+        # boundary. It must never delegate terminal work back to the user.
+        final_text = terminal_boundary
+    if _is_internal_scope_update_reply(final_text, tool_results):
+        # Internal scope bookkeeping is never a deliverable answer. If the model
+        # repeats it after the repair/nudge path, replace it with a deterministic
+        # failure boundary instead of leaking orchestration state to chat.
+        final_text = _scope_update_leak_fallback(tool_results)
+        raw_payload_like = True
+    if _is_internal_tool_command_reply(final_text, state):
+        # A repeated pseudo tool command after the retry is still not a result.
+        # Surface the generic raw-payload boundary instead of teaching users or
+        # platform adapters to execute model-authored internal syntax.
+        final_text = safe_raw_tool_payload_replacement(tool_results=tool_results, source="agent")
+        raw_payload_like = True
     return _complete_agent_turn(
         state,
         final_text=final_text,
@@ -2327,6 +2982,8 @@ class AgentOrchestrator:
                 "next_doctor_notice_at": doctor_threshold,
                 "post_tool_delivery_nudged": False,
                 "raw_tool_payload_nudge_count": 0,
+                "scope_fallback_nudge_count": 0,
+                "terminal_failure_nudge_count": 0,
                 "repeated_failure_limit": _repeated_tool_failure_limit(),
                 "failure_fingerprints": {},
                 "tool_recovery_scopes_attempted": [],
@@ -2435,6 +3092,7 @@ class AgentOrchestrator:
     _dispatch_policy_store: Any = None
     _dispatcher_loop: Any = None
     _dispatcher_thread: threading.Thread | None = None
+    _parent_context_by_group: dict[str, str] | None = None
 
     def set_deliver_fn(self, fn: Any) -> None:
         """Set the callback used by the result aggregator to deliver text."""
@@ -2517,6 +3175,8 @@ class AgentOrchestrator:
             ),
         )
         await self._result_aggregator._on_group_complete(group_state, group)
+        if self._parent_context_by_group is not None:
+            self._parent_context_by_group.pop(group_id, None)
 
     def _ensure_dispatcher_loop(self) -> asyncio.AbstractEventLoop:
         """Return the persistent loop used by sync chat adapters for background dispatch."""
@@ -2603,10 +3263,16 @@ class AgentOrchestrator:
                 MiniAgentRunStatus.COMPLETED,
                 MiniAgentRunStatus.FAILED,
             }:
-                existing = transition_mini_agent_run_status(existing, MiniAgentRunStatus.RUNNING)
-                store.add_mini_agent_run(existing)
-            store.add_mini_agent_run(
-                transition_mini_agent_run_status(existing, status, result_summary=result_summary)
+                transition_mini_agent_run(
+                    store,
+                    task.task_id,
+                    new_status=MiniAgentRunStatus.RUNNING,
+                )
+            transition_mini_agent_run(
+                store,
+                task.task_id,
+                new_status=status,
+                result_summary=result_summary,
             )
             persisted = store.get_mini_agent_run(task.task_id)
             persisted_status = getattr(persisted, "status", None)
@@ -2686,6 +3352,8 @@ class AgentOrchestrator:
 
     def _can_recover_blocked_artifact_task(self, task: Any, failed_dependency_ids: list[str]) -> bool:
         if not failed_dependency_ids:
+            return False
+        if _task_is_scheduled_background_run(task):
             return False
         if not _task_has_artifact_delivery_scope(task):
             return False
@@ -2792,6 +3460,10 @@ class AgentOrchestrator:
                     allowed_seconds = float(getattr(task, "timeout_s", 180.0) or 180.0) + grace
                     age_seconds = (now - started_at).total_seconds()
                     if age_seconds >= allowed_seconds:
+                        # Cron/background tasks can legitimately run longer
+                        # than ordinary interactive helper work. Do not fail
+                        # them from the in-memory supervisor; persisted
+                        # run/Doctor reconciliation owns orphan detection.
                         if _task_is_scheduled_background_run(task):
                             continue
                         failures.append((
@@ -2858,6 +3530,12 @@ class AgentOrchestrator:
                         )
 
                 group = self._task_registry.get_group(group_id)
+                if group is not None and group.all_terminal():
+                    # Supervisor-created terminal transitions do not pass
+                    # through a runner task, so finalize them here before
+                    # treating the group as quiet.
+                    await self._finalize_terminal_dispatch_group(group_id)
+                    return
                 if group is None or _group_all_quiescent(group):
                     return
                 monotonic_now = time.monotonic()
@@ -2914,6 +3592,7 @@ class AgentOrchestrator:
         preferred_group_id: str | None = None,
         requires_artifact_delivery: bool = False,
         required_artifact_kind: str | None = None,
+        parent_context: str | None = None,
     ) -> "DispatchResult":
         """Decompose *user_message* and dispatch tasks to mini-agents.
 
@@ -2962,6 +3641,8 @@ class AgentOrchestrator:
             self._supervisor_tasks = set()
         if self._runner_tasks_by_group is None:
             self._runner_tasks_by_group = {}
+        if self._parent_context_by_group is None:
+            self._parent_context_by_group = {}
         runner_limit = _mini_agent_runner_concurrency_limit()
         if self._runner_semaphore is None:
             self._runner_semaphore = asyncio.Semaphore(runner_limit)
@@ -2988,6 +3669,13 @@ class AgentOrchestrator:
                 tasks=[replace(task, group_id=preferred_group_id) for task in group.tasks],
             )
         group = _apply_planner_timeout_policy(group, single_task_fast_path=single_task_fast_path)
+        parent_context_text = _compact_parent_context(parent_context)
+        if parent_context_text:
+            # Mini-agents are isolated workers; they do not automatically see the
+            # parent turn's recent connector/tool evidence. Keep this bounded and
+            # factual so helpers can use verified calendar, file, or artifact
+            # context without guessing or asking the user to repeat themselves.
+            self._parent_context_by_group[group.group_id] = parent_context_text
         await self._task_registry.add_group(group)
         self._checkpoint_dispatch_state()
 
@@ -3142,8 +3830,15 @@ class AgentOrchestrator:
             config = MiniAgentConfig(
                 agent_id=agent.agent_id,
                 task=task,
-                context_in=self._context_bus.get(task.context_key_in, group_id=task.group_id)
-                           if task.context_key_in else None,
+                context_in=_context_input_for_task(
+                    self._context_bus,
+                    task,
+                    parent_context=(
+                        self._parent_context_by_group.get(task.group_id)
+                        if self._parent_context_by_group is not None
+                        else None
+                    ),
+                ),
                 timeout_s=float(getattr(task, "timeout_s", 180.0) or 180.0),
                 can_request_user_input=can_request_user_input,
             )
@@ -3171,6 +3866,9 @@ class AgentOrchestrator:
                 context_bus=self._context_bus,
                 progress_queue=self._progress_queue,
             )
+            # Manual/scheduled cron runs are background jobs. They must keep
+            # running after the chat turn returns; stale/orphaned detection is
+            # handled by persisted mini_agent_runs plus Doctor, not this await.
             if _task_is_scheduled_background_run(task):
                 result = await run_coro
             else:
@@ -3364,6 +4062,8 @@ class AgentOrchestrator:
                     supervisor_task.cancel()
         if self._context_bus is not None:
             self._context_bus.clear_group(group_id)
+        if self._parent_context_by_group is not None:
+            self._parent_context_by_group.pop(group_id, None)
         self._checkpoint_dispatch_state()
         if self._progress_queue is not None:
             from nullion.mini_agent_runner import ProgressUpdate
@@ -3431,6 +4131,8 @@ class AgentOrchestrator:
                 pass
         if self._pool is not None:
             await self._pool.stop()
+        if self._parent_context_by_group is not None:
+            self._parent_context_by_group.clear()
 
 
 def _step_user_message(step: MissionStep) -> str:
@@ -3438,6 +4140,40 @@ def _step_user_message(step: MissionStep) -> str:
     if isinstance(source_clause, str) and source_clause.strip():
         return source_clause.strip()
     return step.title
+
+
+def _compact_parent_context(parent_context: str | None, *, limit: int = 12000) -> str | None:
+    text = str(parent_context or "").strip()
+    if not text:
+        return None
+    text = "\n".join(line.rstrip() for line in text.splitlines()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 80)].rstrip() + "\n...[parent context truncated]"
+
+
+def _context_input_for_task(context_bus: Any, task: Any, *, parent_context: str | None) -> Any | None:
+    dependency_context = None
+    context_key = getattr(task, "context_key_in", None)
+    if context_key:
+        try:
+            dependency_context = context_bus.get(context_key, group_id=task.group_id)
+        except Exception:
+            dependency_context = None
+    parent_text = _compact_parent_context(parent_context)
+    if parent_text and dependency_context is not None:
+        # Parent context is conversation/tool evidence shared by the main turn.
+        # Dependency context is produced inside this task graph. Keep both
+        # labeled so helpers do not confuse prior evidence with a DAG output.
+        return (
+            "Parent turn context:\n"
+            f"{parent_text}\n\n"
+            f"Task dependency context ({context_key}):\n"
+            f"{dependency_context}"
+        )
+    if parent_text:
+        return f"Parent turn context:\n{parent_text}"
+    return dependency_context
 
 
 def _messaging_target_from_conversation_id(conversation_id: str) -> str | None:

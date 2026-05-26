@@ -147,10 +147,32 @@ _APIKEY_PROVIDERS = [
 
 # ── UI helpers ─────────────────────────────────────────────────────────────────
 
+def _stdout_supports(text: str) -> bool:
+    stream = getattr(sys, "stdout", None)
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+        return True
+    except Exception:
+        return False
+
+
+def _section_line(length: int = 29) -> str:
+    return "─" * length if _stdout_supports("─") else "-" * length
+
+
+def _section_header(title: str, total_len: int = 47) -> str:
+    if _stdout_supports("─"):
+        fill = max(total_len - len(title), 4)
+        return f"  ── {title}  {'─' * fill}"
+    fill = max(total_len - len(title), 4)
+    return f"  -- {title}  {'-' * fill}"
+
+
 def _banner() -> None:
     print()
     print("  Nullion — LLM provider setup")
-    print("  ─────────────────────────────")
+    print(f"  {_section_line()}")
     print()
 
 
@@ -167,12 +189,12 @@ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str
 
 
 def _pick_provider() -> dict[str, Any]:
-    print("  ── Browser login (no API key needed)  ────────────────")
+    print(_section_header("Browser login (no API key needed)"))
     for i, p in enumerate(_OAUTH_PROVIDERS, 1):
         print(f"    {i}. {p['label']}")
     print()
     offset = len(_OAUTH_PROVIDERS)
-    print("  ── API key  ──────────────────────────────────────────")
+    print(_section_header("API key"))
     for i, p in enumerate(_APIKEY_PROVIDERS, offset + 1):
         print(f"    {i}. {p['label']}")
     print()

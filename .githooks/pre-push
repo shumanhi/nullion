@@ -16,6 +16,27 @@ else
 fi
 
 TEST_REPO="${NULLION_TEST_REPO:-"$(dirname "$ROOT")/nullion-test"}"
+if [[ -z "${NULLION_TEST_REPO:-}" ]]; then
+  PINNED_TEST_REPO="$("$PYTHON_CMD" - <<'PY'
+import json
+from pathlib import Path
+
+pin = Path.home() / ".nullion-ops" / "pinned-branches.json"
+try:
+    data = json.loads(pin.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+repo = ((data.get("test") or {}).get("repo") or "").strip()
+ref = ((data.get("test") or {}).get("ref") or "").strip()
+if repo and ref:
+    candidate = Path.home().parent / Path.home().name / "Projects" / "nullion-test-worktrees" / ref.split("/", 1)[-1]
+    print(candidate if candidate.exists() else repo)
+PY
+)"
+  if [[ -n "$PINNED_TEST_REPO" ]]; then
+    TEST_REPO="$PINNED_TEST_REPO"
+  fi
+fi
 TEST_PATH="$TEST_REPO/tests"
 
 if [[ "${NULLION_SKIP_PRIVATE_TESTS:-0}" == "1" ]]; then
@@ -59,7 +80,7 @@ PY
     "$PYTHON_CMD" -m pip install $missing_test_deps
   fi
   "$PYTHON_CMD" -m coverage erase
-  "$PYTHON_CMD" -m coverage run --source=src/nullion -m pytest -q "$TEST_PATH"
+  NULLION_LIVE_STAGE_E2E=0 "$PYTHON_CMD" -m coverage run --source=src/nullion -m pytest -q "$TEST_PATH"
   "$PYTHON_CMD" -m coverage report --fail-under=70
 fi
 
@@ -72,4 +93,31 @@ elif [[ -x "$IMPORTANT_CHECK" ]]; then
   echo "pre-push: Nullion important/e2e checks passed."
 else
   echo "pre-push: local important/e2e check harness not found; skipping $IMPORTANT_CHECK"
+fi
+
+LIVE_QA_SCRIPT="$TEST_REPO/scripts/live_stage_full_qa.py"
+if [[ ! -f "$LIVE_QA_SCRIPT" ]]; then
+  LIVE_QA_SCRIPT="$TEST_REPO/scripts/live_stage_full_qa_probe.py"
+fi
+
+if [[ "${NULLION_SKIP_LIVE_STAGE_QA:-0}" == "1" ]]; then
+  echo "pre-push: skipping live stage QA gate because NULLION_SKIP_LIVE_STAGE_QA=1"
+elif [[ ! -f "$LIVE_QA_SCRIPT" ]]; then
+  echo "pre-push: live stage QA script not found in private test repo: $TEST_REPO" >&2
+  exit 1
+elif [[ "${NULLION_LIVE_STAGE_E2E:-}" != "1" ]]; then
+  echo "pre-push: live stage QA not run; set NULLION_LIVE_STAGE_E2E=1 after stage is ready."
+else
+  REPORT_DIR="${NULLION_LIVE_QA_REPORT_DIR:-${HOME}/Projects/agents-worksapce/nullion-ops}"
+  REPORT_PATH="${NULLION_LIVE_QA_REPORT:-${REPORT_DIR}/live-stage-full-qa-pre-push-report.json}"
+  REPORT_MD_PATH="${NULLION_LIVE_QA_REPORT_MD:-${REPORT_DIR}/live-stage-full-qa-pre-push-report.md}"
+  mkdir -p "$REPORT_DIR"
+  echo "pre-push: running live stage full QA gate..."
+  NULLION_APP_REPO="$ROOT" NULLION_LIVE_STAGE_E2E=1 "$PYTHON_CMD" "$LIVE_QA_SCRIPT" \
+    --base-url "${NULLION_STAGE_BASE_URL:-http://127.0.0.1:8753}" \
+    --runtime-db "${NULLION_STAGE_RUNTIME_DB:-${HOME}/.nullion-stage/runtime.db}" \
+    --report "$REPORT_PATH" \
+    --qa-report-md "$REPORT_MD_PATH" \
+    --require-qa-tracker
+  echo "pre-push: live stage full QA gate passed."
 fi

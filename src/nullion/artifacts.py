@@ -40,6 +40,7 @@ _ATTACHMENT_DIRECTIVE_WORDS = ("MEDIA", "ARTIFACT")
 _MEDIA_DIRECTIVE_STRIP_CHARS = "\ufeff\u200b\u200c\u200d"
 _ARTIFACT_MEDIA_TYPES_BY_SUFFIX = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".numbers": "application/vnd.apple.numbers",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }

@@ -1949,12 +1949,12 @@ if [[ "$EMAIL_CALENDAR_ENABLED" == "false" && "$CUSTOM_EMAIL_API_ENABLED" == "fa
                     fi
                 else
                     print_info "Install Himalaya later from https://github.com/pimalaya/himalaya"
-                    print_info "Then configure a Gmail account profile and add it in Settings → Users → Workspace connections."
+                    print_info "Then configure a Gmail account profile and add it in Settings -> Users -> Workspace connections."
                 fi
             fi
             echo
             echo "  After Himalaya has a Gmail account profile, open:"
-            echo "    Settings → Users → Workspace connections"
+            echo "    Settings -> Users -> Workspace connections"
             echo "  Then add a Gmail / Google Workspace connection using that profile name."
             print_ok "Email/calendar plugins will be enabled."
             ;;
@@ -2529,11 +2529,12 @@ print_ok "Media setup checkpoint saved to $NULLION_ENV_FILE"
 
 # ── Skill pack setup ───────────────────────────────────────────────────────
 echo
-print_bold "  Choose skill packs to enable:"
-echo "  All built-in skill packs ship with Nullion and are selected by default."
+print_bold "  Skill packs:"
+echo "  Core skill packs ship with Nullion and are always installed."
 echo "  Skill packs add workflow guidance only; account access still requires"
 echo "  workspace-scoped provider connections and enabled tools."
 echo
+CORE_SKILL_PACKS="nullion/web-research,nullion/browser-automation,nullion/files-and-docs,nullion/pdf-documents,nullion/email-calendar,nullion/github-code,nullion/media-local,nullion/productivity-memory,nullion/connector-skills"
 ENABLED_SKILL_PACKS=""
 trim_skill_pack_id() {
     local value="$1"
@@ -2566,6 +2567,7 @@ add_skill_pack_list() {
 
 normalize_skill_pack_list() {
     ENABLED_SKILL_PACKS=""
+    add_skill_pack_list "$CORE_SKILL_PACKS"
     add_skill_pack_list "$1"
     printf '%s' "$ENABLED_SKILL_PACKS"
     ENABLED_SKILL_PACKS=""
@@ -2608,40 +2610,19 @@ print(pack.pack_id)
 request_skill_pack_choices() {
     SKILL_CHOICES=""
     if [[ ! -t 0 ]]; then
-        SKILL_CHOICES="1,2,3,4,5,6,7,8,9"
-        print_info "No interactive terminal detected; using all default skill packs."
+        print_info "No interactive terminal detected; using core skill packs."
         return 0
     fi
 
     local titles=(
-        "Web research"
-        "Browser automation"
-        "Files and documents"
-        "PDF documents"
-        "Email and calendar"
-        "GitHub and code review"
-        "Local media"
-        "Productivity and memory"
-        "Connector/API skills"
         "Install custom skill pack"
-        "No default skill packs"
     )
     local details=(
-        "Search, fetch, source-backed answers"
-        "Web navigation, forms, screenshots"
-        "Local files, docs, sheets, decks"
-        "PDF generation, conversion, verification, delivery"
-        "Inbox triage, replies, scheduling"
-        "Repos, PRs, issues, release notes"
-        "Audio transcription, OCR, image workflows"
-        "Tasks, routines, preferences, reminders"
-        "Maton, Composio, Nango, Activepieces, n8n, custom APIs"
         "Git URL, GitHub folder, or local folder with SKILL.md"
-        "Start with no enabled reference packs"
     )
-    local choice_values=(1 2 3 4 5 6 7 8 9 10 11)
-    local badges=("" "" "" "" "" "" "" "" "" "" "")
-    local selected=(true true true true true true true true true false false)
+    local choice_values=(1)
+    local badges=("")
+    local selected=(false)
     local current=0
     local total=${#titles[@]}
     local key
@@ -2649,22 +2630,16 @@ request_skill_pack_choices() {
     local alt_screen=false
 
     toggle_current_item() {
-        if [[ "${choice_values[$current]}" == "11" ]]; then
-            for ((i = 0; i < total - 1; i++)); do selected[$i]=false; done
-            selected[$current]=true
+        if [[ "${selected[$current]}" == "true" ]]; then
+            selected[$current]=false
         else
-            if [[ "${selected[$current]}" == "true" ]]; then
-                selected[$current]=false
-            else
-                selected[$current]=true
-            fi
-            selected[$((total - 1))]=false
+            selected[$current]=true
         fi
     }
     draw_menu() {
         printf '\033[H\033[J'
-        echo "  Use ↑/↓ to move, Space to select/deselect, Enter to continue."
-        echo "  You can also press the visible number for single-digit items."
+        echo "  Core skill packs are already installed and cannot be deselected."
+        echo "  Use Space to add an optional custom skill pack, Enter to continue."
         echo
         for ((i = 0; i < total; i++)); do
             print_check_item "${selected[$i]}" "$([[ $i -eq $current ]] && echo true || echo false)" "$((i + 1)). ${titles[$i]}" "${details[$i]}" "${badges[$i]}"
@@ -2707,16 +2682,15 @@ request_skill_pack_choices() {
     for ((i = 0; i < total; i++)); do
         [[ "${selected[$i]}" == "true" ]] && choices+=("${choice_values[$i]}")
     done
-    if ((${#choices[@]} == 0)); then
-        choices=(11)
-    fi
-    SKILL_CHOICES="$(IFS=,; echo "${choices[*]}")"
+    SKILL_CHOICES="$(IFS=,; echo "${choices[*]-}")"
 }
 
-EXISTING_SKILL_PACKS="$(normalize_skill_pack_list "$(env_value NULLION_ENABLED_SKILL_PACKS)")"
+ENABLED_SKILL_PACKS="$(normalize_skill_pack_list "")"
+EXISTING_SKILL_PACKS_RAW="$(env_value NULLION_ENABLED_SKILL_PACKS)"
+EXISTING_SKILL_PACKS="$(normalize_skill_pack_list "$EXISTING_SKILL_PACKS_RAW")"
 EXISTING_SKILLS_DONE="$(env_value NULLION_SETUP_SKILLS_DONE)"
 SKIP_SKILL_SETUP=false
-if [[ "$EXISTING_SKILLS_DONE" == "true" || -n "$EXISTING_SKILL_PACKS" ]]; then
+if [[ "$EXISTING_SKILLS_DONE" == "true" || -n "$EXISTING_SKILL_PACKS_RAW" ]]; then
     print_skill_pack_list "Found existing skill packs" "$EXISTING_SKILL_PACKS"
     if confirm_yes "Use existing skill packs instead of choosing them again?"; then
         add_skill_pack_list "$EXISTING_SKILL_PACKS"
@@ -2728,44 +2702,29 @@ fi
 if [[ "$SKIP_SKILL_SETUP" == "false" ]]; then
 request_skill_pack_choices
 
-if [[ ",${SKILL_CHOICES// /}," == *",11,"* ]]; then
-    print_info "Skipped default skill packs. You can enable them later in Settings."
-else
-    IFS=',' read -ra _SKILL_PARTS <<< "$SKILL_CHOICES"
-    for choice in "${_SKILL_PARTS[@]}"; do
-        choice="$(echo "$choice" | tr -d '[:space:]')"
-        case "$choice" in
-            1) add_skill_pack "nullion/web-research" ;;
-            2) add_skill_pack "nullion/browser-automation" ;;
-            3) add_skill_pack "nullion/files-and-docs" ;;
-            4) add_skill_pack "nullion/pdf-documents" ;;
-            5) add_skill_pack "nullion/email-calendar" ;;
-            6) add_skill_pack "nullion/github-code" ;;
-            7) add_skill_pack "nullion/media-local" ;;
-            8) add_skill_pack "nullion/productivity-memory" ;;
-            9) add_skill_pack "nullion/connector-skills" ;;
-            10)
-                prompt_read -rp "  Skill pack source URL/path: " CUSTOM_SKILL_PACK_SOURCE
-                prompt_read -rp "  Pack id [auto]: " CUSTOM_SKILL_PACK_ID
-                if [[ -n "$CUSTOM_SKILL_PACK_SOURCE" ]]; then
-                    if CUSTOM_INSTALLED_PACK_ID="$(install_custom_skill_pack_now "$CUSTOM_SKILL_PACK_SOURCE" "$CUSTOM_SKILL_PACK_ID" "true")"; then
-                        add_skill_pack "$CUSTOM_INSTALLED_PACK_ID"
-                        print_ok "Installed skill pack: $CUSTOM_INSTALLED_PACK_ID"
-                    else
-                        print_err "Could not install custom skill pack. You can add it later in Settings."
+    if [[ -n "${SKILL_CHOICES:-}" ]]; then
+        IFS=',' read -ra _SKILL_PARTS <<< "$SKILL_CHOICES"
+        for choice in "${_SKILL_PARTS[@]}"; do
+            choice="$(echo "$choice" | tr -d '[:space:]')"
+            case "$choice" in
+                1)
+                    prompt_read -rp "  Skill pack source URL/path: " CUSTOM_SKILL_PACK_SOURCE
+                    prompt_read -rp "  Pack id [auto]: " CUSTOM_SKILL_PACK_ID
+                    if [[ -n "$CUSTOM_SKILL_PACK_SOURCE" ]]; then
+                        if CUSTOM_INSTALLED_PACK_ID="$(install_custom_skill_pack_now "$CUSTOM_SKILL_PACK_SOURCE" "$CUSTOM_SKILL_PACK_ID" "true")"; then
+                            add_skill_pack "$CUSTOM_INSTALLED_PACK_ID"
+                            print_ok "Installed skill pack: $CUSTOM_INSTALLED_PACK_ID"
+                        else
+                            print_err "Could not install custom skill pack. You can add it later in Settings."
+                        fi
                     fi
-                fi
-                ;;
-            "") ;;
-            *) print_info "Ignoring unknown skill choice: $choice" ;;
-        esac
-    done
-    if [[ -n "$ENABLED_SKILL_PACKS" ]]; then
-        print_skill_pack_list "Skill packs enabled" "$ENABLED_SKILL_PACKS"
-    else
-        print_info "No skill packs selected."
+                    ;;
+                "") ;;
+                *) print_info "Ignoring unknown skill choice: $choice" ;;
+            esac
+        done
     fi
-fi
+    print_skill_pack_list "Skill packs enabled" "$ENABLED_SKILL_PACKS"
 fi
 ENABLED_SKILL_PACKS="$(normalize_skill_pack_list "$ENABLED_SKILL_PACKS")"
 
@@ -2820,7 +2779,6 @@ fi
     echo "NULLION_SETUP_PROVIDER_DONE=true"
     echo "NULLION_SETUP_BROWSER_DONE=true"
     echo "NULLION_SETUP_SEARCH_DONE=true"
-    echo "NULLION_SETUP_ACCOUNT_DONE=true"
     echo "NULLION_SETUP_MEDIA_DONE=true"
     echo "NULLION_SETUP_SKILLS_DONE=true"
     if [[ "$TELEGRAM_ENABLED" == "true" ]]; then
@@ -2857,15 +2815,6 @@ fi
     [[ -n "$GOOGLE_SEARCH_KEY" ]] && echo "NULLION_GOOGLE_SEARCH_API_KEY=\"$GOOGLE_SEARCH_KEY\""
     [[ -n "$GOOGLE_SEARCH_CX" ]] && echo "NULLION_GOOGLE_SEARCH_CX=\"$GOOGLE_SEARCH_CX\""
     [[ -n "$PERPLEXITY_SEARCH_KEY" ]] && echo "NULLION_PERPLEXITY_API_KEY=\"$PERPLEXITY_SEARCH_KEY\""
-    [[ -n "$MATON_API_KEY" ]] && echo "MATON_API_KEY=\"$MATON_API_KEY\""
-    [[ -n "$COMPOSIO_API_KEY" ]] && echo "COMPOSIO_API_KEY=\"$COMPOSIO_API_KEY\""
-    [[ -n "$NANGO_SECRET_KEY" ]] && echo "NANGO_SECRET_KEY=\"$NANGO_SECRET_KEY\""
-    [[ -n "$ACTIVEPIECES_API_KEY" ]] && echo "ACTIVEPIECES_API_KEY=\"$ACTIVEPIECES_API_KEY\""
-    [[ -n "$N8N_BASE_URL" ]] && echo "N8N_BASE_URL=\"$N8N_BASE_URL\""
-    [[ -n "$N8N_API_KEY" ]] && echo "N8N_API_KEY=\"$N8N_API_KEY\""
-    [[ "$MATON_CONNECTOR_ENABLED" == "true" ]] && echo "NULLION_CONNECTOR_GATEWAY=\"maton\""
-    [[ -n "$CUSTOM_API_BASE_URL" ]] && echo "NULLION_CUSTOM_API_BASE_URL=\"$CUSTOM_API_BASE_URL\""
-    [[ -n "$CUSTOM_API_TOKEN" ]] && echo "NULLION_CUSTOM_API_TOKEN=\"$CUSTOM_API_TOKEN\""
     echo "NULLION_ENABLED_PLUGINS=\"${ENABLED_PLUGINS}\""
     echo "NULLION_PROVIDER_BINDINGS=\"${PROVIDER_BINDINGS}\""
     echo "NULLION_ACTIVITY_TRACE_ENABLED=false"

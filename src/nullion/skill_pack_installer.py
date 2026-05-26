@@ -93,6 +93,13 @@ BUILTIN_SKILL_PACK_PROMPTS: dict[str, str] = {
         "Use for task planning, daily summaries, recurring workflows, durable preferences, and follow-up organization. "
         "Distinguish reminders, memory, and scheduled tasks. Only claim something was saved or scheduled after the tool or config confirms it."
     ),
+    "maton-ai/api-gateway-skill": (
+        "Skill pack: maton-ai/api-gateway-skill\n"
+        "Use as an optional connector gateway reference for supported account/API workflows when its provider connection is configured. "
+        "This pack is workflow guidance only; account access still requires connector_request plus an active provider credential. "
+        "Prefer read-only checks before write actions, and if the gateway fails or is unavailable, recover through other typed tools for the same account family "
+        "or provide numbered setup, browser, or manual fallback options instead of stopping at this connector."
+    ),
     "nullion/connector-skills": (
         "Skill pack: nullion/connector-skills\n"
         "Use for workflows that call external SaaS/API connector gateways, MCP servers, or custom HTTP bridges. "
@@ -287,7 +294,14 @@ def read_skill_pack_reference(
     builtin_prompt = BUILTIN_SKILL_PACK_PROMPTS.get(normalized_pack_id)
     if builtin_prompt is not None:
         if relative.as_posix() not in _BUILTIN_REFERENCE_ALIASES:
-            raise FileNotFoundError(f"skill reference not found: {relative.as_posix()}")
+            fallback = (
+                builtin_prompt
+                + "\n\nReference path note: this built-in skill pack is prompt-backed and does not ship separate "
+                + f"{relative.as_posix()} reference text. Use SKILL.md, README.md, or README.txt for the built-in guidance."
+            )
+            if len(fallback) <= max_chars:
+                return fallback
+            return fallback[:max_chars].rstrip() + "\n[truncated]"
         if len(builtin_prompt) <= max_chars:
             return builtin_prompt
         return builtin_prompt[:max_chars].rstrip() + "\n[truncated]"

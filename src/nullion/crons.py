@@ -579,7 +579,9 @@ def load_crons(*, refresh_next_runs: bool = True) -> list[CronJob]:
     if legacy_snapshot is not None:
         legacy_jobs, legacy_updated_at = legacy_snapshot
         db_jobs, db_updated_at = db_snapshot
-        json_updated_at = _crons_json_mtime()
+        # Existing installs may still have their scheduled jobs only in the old
+        # JSON mirror. Never let a newly empty DB make those user schedules
+        # disappear from settings or runtime execution.
         if not db_jobs and _has_crons_json_rows():
             legacy_jobs = _load_crons_json()
             save_crons(legacy_jobs)
@@ -588,24 +590,11 @@ def load_crons(*, refresh_next_runs: bool = True) -> list[CronJob]:
                 len(legacy_jobs),
             )
             return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
-        if json_updated_at is not None and (
-            db_updated_at is None or json_updated_at > db_updated_at + _STORE_FRESHNESS_SKEW
-        ):
-            legacy_jobs = _load_crons_json()
-            if not legacy_jobs and db_jobs:
-                log.warning(
-                    "Ignoring newer empty cron JSON mirror because runtime DB still has %d cron(s).",
-                    len(db_jobs),
-                )
-                return _return_crons(db_jobs, persist_refreshed=refresh_next_runs)
+        if legacy_jobs and db_updated_at is None:
             save_crons(legacy_jobs)
-            log.info(
-                "Imported %d cron(s) from newer legacy JSON mirror into runtime DB.",
-                len(legacy_jobs),
-            )
             return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
-        if legacy_updated_at and db_updated_at is None and legacy_jobs and not db_jobs:
-            _save_crons_db(legacy_jobs)
+        if legacy_jobs and db_updated_at is not None and legacy_updated_at > db_updated_at:
+            save_crons(legacy_jobs)
             return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
     return _return_crons(db_snapshot[0], persist_refreshed=refresh_next_runs)
 
@@ -642,8 +631,10 @@ def _save_crons_db(jobs: list[CronJob]) -> bool:
 def _persisted_cron_count() -> int:
     snapshot = _load_crons_db_snapshot()
     db_count = 0 if snapshot is None else len(snapshot[0])
-    json_count = len(_load_crons_json())
-    return max(db_count, json_count)
+    if db_count:
+        return db_count
+    legacy = _load_legacy_crons_json()
+    return 0 if legacy is None else len(legacy[0])
 
 
 def save_crons(jobs: list[CronJob], *, allow_empty: bool = False) -> None:

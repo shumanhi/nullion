@@ -100,6 +100,7 @@ _DEFAULTS: dict = {
     "outbound_request_mode": "risk_based", # allow_all | risk_based | ask_all
     # Time & locale
     "timezone":    detect_system_timezone(),
+    "timezone_source": "auto",
     "date_format": "YYYY-MM-DD",         # MM/DD/YYYY | DD/MM/YYYY | YYYY-MM-DD
     "time_format": "12h",                # 12h | 24h
 }
@@ -124,6 +125,7 @@ class Preferences:
     sentinel_risk_level:   int  = 4
     outbound_request_mode: str  = "risk_based"
     timezone:              str  = field(default_factory=detect_system_timezone)
+    timezone_source:       str  = "auto"
     date_format:           str  = "YYYY-MM-DD"
     time_format:           str  = "12h"
 
@@ -146,6 +148,7 @@ class Preferences:
             "sentinel_risk_level":   self.sentinel_risk_level,
             "outbound_request_mode": self.outbound_request_mode,
             "timezone":              self.timezone,
+            "timezone_source":       self.timezone_source,
             "date_format":           self.date_format,
             "time_format":           self.time_format,
         }
@@ -176,6 +179,13 @@ def load_preferences() -> Preferences:
     approval_strictness = str(data.get("approval_strictness", _DEFAULTS["approval_strictness"]))
     if approval_strictness not in {"strict", "balanced", "relaxed"}:
         approval_strictness = str(_DEFAULTS["approval_strictness"])
+    timezone_source = str(data.get("timezone_source") or "auto")
+    if timezone_source not in {"auto", "explicit"}:
+        timezone_source = "auto"
+    timezone_name = effective_preference_timezone(
+        str(data.get("timezone", _DEFAULTS["timezone"])),
+        source=timezone_source,
+    )
 
     return Preferences(
         persona               = raw_persona[:_MAX_PERSONA_LEN],
@@ -194,7 +204,8 @@ def load_preferences() -> Preferences:
         sentinel_mode         = sentinel_mode,
         sentinel_risk_level   = sentinel_risk_level,
         outbound_request_mode = outbound_request_mode,
-        timezone              = str(data.get("timezone",              _DEFAULTS["timezone"])),
+        timezone              = timezone_name,
+        timezone_source       = timezone_source,
         date_format           = str(data.get("date_format",           _DEFAULTS["date_format"])),
         time_format           = str(data.get("time_format",           _DEFAULTS["time_format"])),
     )
@@ -204,6 +215,36 @@ def save_preferences(prefs: Preferences | dict) -> None:
     _PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
     data = prefs.to_dict() if isinstance(prefs, Preferences) else prefs
     _PREFS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def effective_preference_timezone(timezone_name: str | None, *, source: str = "auto") -> str:
+    """Return the timezone Nullion should use for prompts and time tools."""
+    validated = _validated_timezone_name(timezone_name) or "UTC"
+    if source != "explicit" and validated == "UTC":
+        detected = detect_system_timezone(default="UTC")
+        if detected != "UTC":
+            return detected
+    return validated
+
+
+def ensure_preferences_timezone() -> Preferences:
+    """Initialize or repair the saved timezone preference from the local system."""
+    prefs = load_preferences()
+    try:
+        raw = json.loads(_PREFS_PATH.read_text(encoding="utf-8")) if _PREFS_PATH.exists() else {}
+    except Exception:
+        raw = {}
+    raw_source = str(raw.get("timezone_source") or "auto")
+    if raw_source not in {"auto", "explicit"}:
+        raw_source = "auto"
+    desired = effective_preference_timezone(raw.get("timezone") or prefs.timezone, source=raw_source)
+    if raw.get("timezone") != desired or raw.get("timezone_source") != raw_source:
+        data = prefs.to_dict()
+        data["timezone"] = desired
+        data["timezone_source"] = raw_source
+        save_preferences(data)
+        prefs = load_preferences()
+    return prefs
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────

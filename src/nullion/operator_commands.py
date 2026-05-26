@@ -168,8 +168,6 @@ def telegram_bot_command_menu(*, include_private_aliases: bool = True) -> tuple[
     for spec in _OPERATOR_COMMAND_SPECS:
         if not spec.telegram_command or spec.telegram_command in seen:
             continue
-        if not include_private_aliases and spec.telegram_command == "planner_feed":
-            continue
         seen.add(spec.telegram_command)
         commands.append((spec.telegram_command, spec.description))
     return tuple(commands)

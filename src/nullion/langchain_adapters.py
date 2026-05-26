@@ -177,7 +177,39 @@ def _make_langchain_tool_coroutine(
     policy_store: Any,
     tool_result_callback: Any,
 ):
+    failed_call_signatures: set[str] = set()
+    failed_account_tools: set[str] = set()
+
     async def _run_nullion_tool(**kwargs: Any) -> str:
+        if name in failed_account_tools:
+            result = ToolResult(
+                invocation_id=f"lc-{uuid4().hex[:12]}",
+                tool_name=name,
+                status="failed",
+                output={"reason": "account_tool_already_failed", "arguments": dict(kwargs)},
+                error=(
+                    f"{name} already failed in this turn. Do not keep probing the same account provider; "
+                    "use a different typed tool/connector path or provide numbered setup, browser, or manual fallback options."
+                ),
+            )
+            if tool_result_callback is not None:
+                tool_result_callback(result)
+            return _tool_result_text(result)
+        signature = _repeat_guard_signature(name, kwargs)
+        if signature and signature in failed_call_signatures:
+            result = ToolResult(
+                invocation_id=f"lc-{uuid4().hex[:12]}",
+                tool_name=name,
+                status="failed",
+                output={"reason": "repeated_failed_tool_call", "arguments": dict(kwargs)},
+                error=(
+                    f"{name} already failed with these arguments in this turn. "
+                    "Do not retry it; use a different typed tool/connector path or provide numbered setup, browser, or manual fallback options."
+                ),
+            )
+            if tool_result_callback is not None:
+                tool_result_callback(result)
+            return _tool_result_text(result)
         invocation = ToolInvocation(
             invocation_id=f"lc-{uuid4().hex[:12]}",
             tool_name=name,
@@ -191,6 +223,10 @@ def _make_langchain_tool_coroutine(
             policy_store=policy_store,
         )
         emitted_results = [result]
+        if signature and _result_allows_fallback(result):
+            failed_call_signatures.add(signature)
+        if _account_tool_name(name) and _result_allows_fallback(result):
+            failed_account_tools.add(name)
         if _result_allows_fallback(result):
             for fallback_name in fallback_tools:
                 fallback_invocation = ToolInvocation(
@@ -206,6 +242,11 @@ def _make_langchain_tool_coroutine(
                     policy_store=policy_store,
                 )
                 emitted_results.append(fallback_result)
+                fallback_signature = _repeat_guard_signature(fallback_name, kwargs)
+                if fallback_signature and _result_allows_fallback(fallback_result):
+                    failed_call_signatures.add(fallback_signature)
+                if _account_tool_name(fallback_name) and _result_allows_fallback(fallback_result):
+                    failed_account_tools.add(fallback_name)
                 if not _result_allows_fallback(fallback_result):
                     result = fallback_result
                     break
@@ -217,6 +258,20 @@ def _make_langchain_tool_coroutine(
     _run_nullion_tool.__name__ = f"nullion_{name}"
     _run_nullion_tool.__doc__ = f"Run the Nullion {name} tool through Sentinel policy."
     return _run_nullion_tool
+
+
+def _repeat_guard_signature(name: str, arguments: dict[str, Any]) -> str | None:
+    if name not in {"email_search", "email_read", "calendar_list", "connector_request", "skill_pack_read"}:
+        return None
+    try:
+        encoded = json.dumps(arguments, sort_keys=True, ensure_ascii=True, default=str)
+    except Exception:
+        encoded = str(sorted((str(key), str(value)) for key, value in arguments.items()))
+    return f"{name}:{encoded}"
+
+
+def _account_tool_name(name: str) -> bool:
+    return name in {"email_search", "email_read", "calendar_list"}
 
 
 def _invoke_nullion_tool(
@@ -264,6 +319,10 @@ def _result_allows_fallback(result: ToolResult) -> bool:
 
 
 def _tool_result_text(result: ToolResult) -> str:
+    if _connector_request_failed(result):
+        return _connector_failure_recovery_text(result)
+    if _account_tool_failed_with_recovery(result):
+        return _account_tool_failure_recovery_text(result)
     if result.error:
         return result.error
     output = result.output
@@ -273,6 +332,51 @@ def _tool_result_text(result: ToolResult) -> str:
         return json.dumps(output, ensure_ascii=True)
     except TypeError:
         return str(output)
+
+
+def _connector_request_failed(result: ToolResult) -> bool:
+    if str(getattr(result, "tool_name", "") or "") != "connector_request":
+        return False
+    return str(getattr(result, "status", "") or "").lower() in {"failed", "failure", "error"} or bool(result.error)
+
+
+def _account_tool_failed_with_recovery(result: ToolResult) -> bool:
+    if str(getattr(result, "tool_name", "") or "") not in {"email_search", "email_read", "calendar_list"}:
+        return False
+    output = result.output if isinstance(result.output, dict) else {}
+    if not output.get("next_step") and not output.get("available_connector_providers"):
+        return False
+    return str(getattr(result, "status", "") or "").lower() in {"failed", "failure", "error"} or bool(result.error)
+
+
+def _account_tool_failure_recovery_text(result: ToolResult) -> str:
+    output = result.output if isinstance(result.output, dict) else {}
+    error = str(getattr(result, "error", "") or output.get("error") or "account tool failed").strip()
+    providers = output.get("available_connector_providers")
+    query = output.get("query")
+    details: dict[str, object] = {}
+    if query:
+        details["query"] = query
+    if providers:
+        details["available_connector_providers"] = providers
+    return (
+        f"{result.tool_name} failed: {error}. Do not retry the same failing account tool with the same arguments in this turn. "
+        "Use one different typed account path or connector path if available; otherwise provide numbered setup, browser, or manual fallback options. "
+        + (f"Recovery details: {json.dumps(details, ensure_ascii=True)}" if details else "")
+    ).strip()
+
+
+def _connector_failure_recovery_text(result: ToolResult) -> str:
+    output = result.output if isinstance(result.output, dict) else {}
+    provider_id = str(output.get("provider_id") or "").strip()
+    error = str(getattr(result, "error", "") or output.get("error") or "connector request failed").strip()
+    provider_line = f" for {provider_id}" if provider_id else ""
+    return (
+        f"Connector request{provider_line} failed: {error}. "
+        "Treat this as a primary connector path failure. If other typed account tools are available "
+        "for the same account family, try them before concluding the task cannot be completed. "
+        "If no account tool can complete it, provide numbered setup, browser, or manual fallback options."
+    )
 
 
 async def _call_nullion_model(

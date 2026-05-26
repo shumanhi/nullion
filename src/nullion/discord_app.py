@@ -259,9 +259,10 @@ async def _deliver_discord_task_status(
     task_card_store: PlatformTaskCardStore,
     status_messages: dict[tuple[str, str], object],
     status_locks: dict[tuple[str, str], asyncio.Lock],
-    planner_feed_enabled: bool,
+    planner_feed_enabled: bool = True,
     include_activity: bool,
 ) -> bool:
+    _ = planner_feed_enabled
     target = str(channel_id or "").strip()
     group = str(group_id or "").strip()
     if (
@@ -270,7 +271,7 @@ async def _deliver_discord_task_status(
         or not group
         or not should_deliver_task_status(
             status_kind=status_kind,
-            planner_feed_enabled=planner_feed_enabled,
+            planner_feed_enabled=True,
             include_activity=include_activity,
         )
     ):
@@ -767,7 +768,6 @@ async def run_discord_app(
                 task_card_store=_task_card_store,
                 status_messages=_status_messages,
                 status_locks=_status_locks,
-                planner_feed_enabled=True,
                 include_activity=activity_trace_enabled(),
             )
         if kwargs.get("is_artifact"):

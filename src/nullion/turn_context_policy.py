@@ -68,6 +68,18 @@ _BROWSER_INTERACTION_SCOPE_TOOLS = (
 _PDF_EXTENSIONS = frozenset({".pdf"})
 _PRESENTATION_EXTENSIONS = frozenset({".ppt", ".pptx"})
 _SPREADSHEET_EXTENSIONS = frozenset({".csv", ".tsv", ".xls", ".xlsx"})
+_DEDICATED_ARTIFACT_TOOL_BY_EXTENSION = {
+    ".pdf": "pdf_create",
+    ".ppt": "presentation_create",
+    ".pptx": "presentation_create",
+    ".xls": "spreadsheet_create",
+    ".xlsx": "spreadsheet_create",
+    ".gif": "image_generate",
+    ".jpeg": "image_generate",
+    ".jpg": "image_generate",
+    ".png": "image_generate",
+    ".webp": "image_generate",
+}
 _TEXT_WRITE_EXTENSIONS = frozenset({"", ".csv", ".htm", ".html", ".json", ".md", ".svg", ".tsv", ".txt", ".yaml", ".yml"})
 _CONNECTOR_TOOLS = frozenset({"connector_request"})
 _CONNECTOR_CAPABILITY_TAGS = frozenset({"connector"})
@@ -78,9 +90,16 @@ _CONNECTOR_TYPED_TOOLS = frozenset({
     "email_read",
     "calendar_list",
 })
+_ACCOUNT_APP_TYPED_TOOLS = {
+    "google-mail": frozenset({"email_search", "email_read", "email_send"}),
+    "gmail": frozenset({"email_search", "email_read", "email_send"}),
+    "google-calendar": frozenset({"calendar_list"}),
+}
+_DIRECT_ACCOUNT_TOOL_ONLY_SCOPE = frozenset({"connector_request", "skill_pack_read"})
 _SCHEDULER_READ_TOOLS = frozenset({"list_crons", "list_reminders"})
 _SCHEDULER_RUN_TOOLS = frozenset({"run_cron"})
 _SCHEDULER_MUTATE_TOOLS = frozenset({
+    "set_reminder",
     "create_cron",
     "update_cron",
     "delete_cron",
@@ -117,7 +136,8 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "account/API tools; scheduler_read/run/mutate exposes Nullion cron/reminder "
                     "tools only; web exposes public web/browser tools; skill_pack exposes exact "
                     "installed skill-pack docs; weather and image_generation expose their direct tools; "
-                    "local_shell exposes local terminal execution when registered."
+                    "local_files exposes file discovery/read/write tools; local_shell exposes local terminal "
+                    "execution when registered."
                 ),
                 "items": {
                     "type": "string",
@@ -154,6 +174,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "list_crons",
                         "list_reminders",
                         "run_cron",
+                        "set_reminder",
                         "create_cron",
                         "update_cron",
                         "delete_cron",
@@ -167,6 +188,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "browser_screenshot",
                         "weather_forecast",
                         "image_generate",
+                        "file_search",
                         "file_read",
                         "file_write",
                         "terminal_exec",
@@ -180,15 +202,33 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
     },
     capability_tags=("scope_request",),
 )
-_KNOWN_PRIOR_TOOL_SCOPES = frozenset({"connector", "scheduler", "skill_pack", "web"})
+_KNOWN_PRIOR_TOOL_SCOPES = frozenset({"connector", "local_files", "local_shell", "scheduler", "skill_pack", "web"})
 _WEB_ACTIONS = frozenset({"none", "open_url", "live_research", "browser_interaction"})
 _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
 _SKILL_PACK_ACTIONS = frozenset({"none", "reference", "connector"})
 _TOOL_SCOPE_DECISION_CACHE_NAMESPACE = "tool_scope.decision"
-_TOOL_SCOPE_DECISION_CACHE_VERSION = "v7"
+_TOOL_SCOPE_DECISION_CACHE_VERSION = "v10"
 _TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS = 24 * 60 * 60
 def _normalize_connector_app_id(value: object) -> str:
     return str(value or "").strip().lower()
+
+
+def _normalize_scope_capability(value: object) -> str:
+    capability = str(value or "").strip().lower()
+    aliases = {
+        "file": "local_files",
+        "files": "local_files",
+        "local_file": "local_files",
+        "local_file_search": "local_files",
+        "shell": "local_shell",
+        "exec": "local_shell",
+        "terminal": "local_shell",
+        "terminal_exec": "local_shell",
+    }
+    # Scope requests are structured tool arguments, not product routing from
+    # user prose. Normalize common tool-family aliases so a slightly off-schema
+    # model call still widens to the intended registered fallback ladder.
+    return aliases.get(capability, capability)
 
 
 def _unique_connector_app_ids(values: Iterable[object]) -> tuple[str, ...]:
@@ -221,7 +261,7 @@ def _exact_scope_tools_for_capability(capability: str, tool_names: Iterable[str]
     elif capability == "image_generation":
         capability_tools = frozenset({"image_generate"})
     elif capability == "local_files":
-        capability_tools = frozenset({"file_read", "file_write"})
+        capability_tools = frozenset({"file_read", "file_search", "file_write", *_LOCAL_SHELL_TOOLS})
     elif capability == "local_shell":
         capability_tools = _LOCAL_SHELL_TOOLS
     else:
@@ -359,6 +399,24 @@ class ScopedTurnToolRegistry:
         requested = frozenset(str(name or "") for name in self.turn_tool_scope_decision.requested_tool_names)
         return requested.intersection(names)
 
+    def _has_delegate_tool(self, tool_name: str) -> bool:
+        if not tool_name:
+            return False
+        try:
+            self._delegate.get_spec(tool_name)
+            return True
+        except KeyError:
+            return False
+        except Exception:
+            return tool_name in self._delegate_tool_names()
+
+    def _requested_extension_has_dedicated_artifact_tool(self) -> bool:
+        for extension in self._evidence.requested_extensions:
+            tool_name = _DEDICATED_ARTIFACT_TOOL_BY_EXTENSION.get(extension)
+            if tool_name and self._has_delegate_tool(tool_name):
+                return True
+        return False
+
     def _is_allowed_tool_name(self, tool_name: str) -> bool:
         if tool_name == _SCOPE_REQUEST_TOOL_NAME:
             return True
@@ -462,9 +520,9 @@ class ScopedTurnToolRegistry:
         raw_capabilities = arguments.get("capabilities")
         capabilities = tuple(
             dict.fromkeys(
-                str(value or "").strip().lower()
+                _normalize_scope_capability(value)
                 for value in (raw_capabilities if isinstance(raw_capabilities, list) else ())
-                if str(value or "").strip()
+                if _normalize_scope_capability(value)
             )
         )
         raw_tool_names = arguments.get("tool_names")
@@ -498,6 +556,7 @@ class ScopedTurnToolRegistry:
                     [
                         "list_crons",
                         "list_reminders",
+                        "set_reminder",
                         "create_cron",
                         "update_cron",
                         "delete_cron",
@@ -515,8 +574,15 @@ class ScopedTurnToolRegistry:
             elif capability == "image_generation":
                 requested.append("image_generate")
             elif capability == "local_files":
-                requested.extend(["file_read", "file_write"])
+                # File discovery must expose search before read/write; shell is
+                # included as the last local rung so no-auth file tasks can
+                # still complete when a dedicated file helper is too narrow.
+                requested.extend(["file_search", "file_read", "file_write", *sorted(_LOCAL_SHELL_TOOLS)])
             elif capability == "local_shell":
+                # Core artifact tools are the first rung, but shell execution
+                # remains the generic last resort for local work that needs no
+                # external auth. Do not hide it merely because a dedicated tool
+                # exists; the model can request it after the safer rung fails.
                 requested.extend(sorted(_LOCAL_SHELL_TOOLS))
         available = self._delegate_tool_names()
         return tuple(dict.fromkeys(tool_name for tool_name in requested if tool_name in available))
@@ -525,9 +591,9 @@ class ScopedTurnToolRegistry:
         tool_names = self._tool_names_for_scope_request(invocation.arguments)
         raw_capabilities = invocation.arguments.get("capabilities")
         capabilities = {
-            str(value or "").strip().lower()
+            _normalize_scope_capability(value)
             for value in (raw_capabilities if isinstance(raw_capabilities, list) else ())
-            if str(value or "").strip()
+            if _normalize_scope_capability(value)
         }
         raw_connector_app_ids = invocation.arguments.get("connector_app_ids")
         connector_app_ids = _unique_connector_app_ids(raw_connector_app_ids if isinstance(raw_connector_app_ids, list) else ())
@@ -548,6 +614,22 @@ class ScopedTurnToolRegistry:
             )
         if "connector" in capabilities:
             connector_app_ids = tuple(app_id for app_id in connector_app_ids if app_id in set(active_app_ids)) or active_app_ids
+            direct_account_tools = _direct_account_tools_for_connector_apps(connector_app_ids)
+            if direct_account_tools and "connector_request" not in explicitly_requested_tools:
+                available = set(self._delegate_tool_names())
+                typed_account_tools = [tool_name for tool_name in sorted(direct_account_tools) if tool_name in available]
+                tool_names = tuple(
+                    dict.fromkeys(
+                        [
+                            *typed_account_tools,
+                            *(
+                                tool_name
+                                for tool_name in tool_names
+                                if tool_name not in _DIRECT_ACCOUNT_TOOL_ONLY_SCOPE
+                            ),
+                        ]
+                    )
+                )
         existing = self.turn_tool_scope_decision
         scheduler_action = existing.scheduler_action
         if "scheduler_mutate" in capabilities:
@@ -988,6 +1070,19 @@ def _active_connector_app_ids_from_context(providers: Iterable[object]) -> tuple
     return _unique_connector_app_ids(app_ids)
 
 
+def _direct_account_tools_for_connector_apps(app_ids: Iterable[object]) -> frozenset[str]:
+    requested: set[str] = set()
+    normalized_app_ids = _unique_connector_app_ids(app_ids)
+    if not normalized_app_ids:
+        return frozenset()
+    for app_id in normalized_app_ids:
+        tools = _ACCOUNT_APP_TYPED_TOOLS.get(app_id)
+        if not tools:
+            return frozenset()
+        requested.update(tools)
+    return frozenset(requested)
+
+
 def _validated_turn_tool_scope_decision(
     decision: TurnToolScopeDecision,
     *,
@@ -1031,6 +1126,33 @@ def _validated_turn_tool_scope_decision(
             requested_tool_names=(),
             confidence=decision.confidence,
             valid=decision.valid,
+        )
+    direct_account_tools = _direct_account_tools_for_connector_apps(selected_app_ids)
+    explicitly_requested = {
+        str(tool_name or "").strip()
+        for tool_name in decision.requested_tool_names
+        if str(tool_name or "").strip()
+    }
+    if direct_account_tools and "connector_request" not in explicitly_requested:
+        try:
+            available_names = {str(getattr(spec, "name", "") or "") for spec in registry.list_specs()}
+        except Exception:
+            try:
+                available_names = {str(definition.get("name") or "") for definition in registry.list_tool_definitions()}
+            except Exception:
+                available_names = set()
+        typed_account_tools = [tool_name for tool_name in sorted(direct_account_tools) if tool_name in available_names]
+        requested_tool_names = tuple(
+            dict.fromkeys(
+                [
+                    *typed_account_tools,
+                    *(
+                        tool_name
+                        for tool_name in requested_tool_names
+                        if tool_name not in _DIRECT_ACCOUNT_TOOL_ONLY_SCOPE
+                    ),
+                ]
+            )
         )
     return TurnToolScopeDecision(
         web_action=decision.web_action,
@@ -1091,6 +1213,7 @@ def _tool_scope_model_signature(model_client: object | None) -> object:
 def _tool_scope_cache_key(
     *,
     user_message: str,
+    memory_context: str = "",
     evidence: TurnToolEvidence,
     registry: object,
     model_client: object | None,
@@ -1099,6 +1222,7 @@ def _tool_scope_cache_key(
 ) -> dict[str, object]:
     return {
         "user_turn": str(user_message or ""),
+        "memory_context": str(memory_context or "")[:1200],
         "evidence": {
             "context_linked": evidence.context_linked,
             "has_url_target": evidence.has_url_target,
@@ -1118,14 +1242,20 @@ def build_turn_tool_scope_decision(
     *,
     model_client: object | None,
     user_message: str,
+    memory_context: str = "",
     evidence: TurnToolEvidence,
     registry,
     force_model_decision: bool = False,
 ) -> TurnToolScopeDecision:
+    has_memory_context = bool(str(memory_context or "").strip())
     if (
         model_client is None
         or not _registry_has_scoped_special_tools(registry)
-        or (not force_model_decision and not turn_tool_evidence_needs_model_scope_decision(evidence))
+        or (
+            not force_model_decision
+            and not has_memory_context
+            and not turn_tool_evidence_needs_model_scope_decision(evidence)
+        )
     ):
         return TurnToolScopeDecision()
     active_connector_providers = _active_connector_provider_context()
@@ -1142,6 +1272,7 @@ def build_turn_tool_scope_decision(
         skill_pack_index = ""
     cache_key = _tool_scope_cache_key(
         user_message=user_message,
+        memory_context=memory_context,
         evidence=evidence,
         registry=registry,
         model_client=model_client,
@@ -1167,11 +1298,15 @@ def build_turn_tool_scope_decision(
         "prior_tool_scopes": list(evidence.prior_tool_scopes),
         "active_connector_providers": active_connector_providers,
         "installed_skill_pack_index": skill_pack_index,
+        "known_user_memory": str(memory_context or "")[:1200],
         "available_special_tool_scopes": [
             "web_or_browser",
             "scheduler",
             "skill_pack_reference",
             "connector_gateway",
+            "weather",
+            "image_generation",
+            "local_files",
             "local_shell",
         ],
         "user_turn": user_message,
@@ -1187,12 +1322,16 @@ def build_turn_tool_scope_decision(
         "For browser workflows that must prove visible page state, include browser_assert_page_state in requested_tool_names when registered. "
         "For screenshot capture of a current or prior browser page, include browser_screenshot in requested_tool_names when registered. "
         "Use web_action=none when the request can be answered without web/browser tools. "
+        "Use known_user_memory only as durable user preference context for this same turn; do not treat it as a separate task. "
         "Use scheduler actions only for scheduled-task or reminder control. "
+        "For one-off reminder creation, request/use set_reminder; use create_cron only for recurring scheduled jobs. "
         "Do not choose scheduler just because a saved task could answer the domain. "
         "Use connector only when the request needs a connected external API/account and active_connector_providers lists an active_app_ids value that can satisfy it. "
         "When using connector, include exact app IDs from active_app_ids in connector_app_ids. "
         "When the connector action requires a specific structured account tool, include exact names from active_connector_providers.structured_tools in requested_tool_names. "
-        'Use requested_tool_names=["terminal_exec"] when the turn requires local shell execution and terminal_exec is registered. '
+        'Use requested_tool_names=["terminal_exec"] when the turn explicitly requires local shell execution, or as the last local fallback after a dedicated file/artifact tool cannot complete. '
+        "For local file discovery, include file_search first, then file_read/file_write as needed, and keep terminal_exec as the final local fallback rather than replacing the dedicated rung. "
+        "For image generation, expose image_generate before local shell so configured media providers and SVG/local fallbacks get a chance to finish the task. "
         "Do not choose connector for apps that appear only in skill-pack references or docs. "
         "Do not use connector gateways as a generic web-search fallback for ordinary chat. "
         "Use skill_pack reference only when an allowed connector or specialized capability needs its installed docs. "
@@ -1232,6 +1371,7 @@ def materialize_mini_agent_tool_scope_registry(
     *,
     model_client: object | None,
     user_message: str,
+    evidence: TurnToolEvidence | None = None,
 ):
     """Resolve fixed DeepAgent tool scope before mini-agent dispatch."""
 
@@ -1245,11 +1385,11 @@ def materialize_mini_agent_tool_scope_registry(
     ):
         return registry
     base_registry = getattr(registry, "_delegate", registry)
-    evidence = TurnToolEvidence()
+    scope_evidence = evidence or getattr(registry, "_evidence", None) or TurnToolEvidence()
     decision = build_turn_tool_scope_decision(
         model_client=model_client,
         user_message=user_message,
-        evidence=evidence,
+        evidence=scope_evidence,
         registry=base_registry,
         force_model_decision=True,
     )
@@ -1261,7 +1401,7 @@ def materialize_mini_agent_tool_scope_registry(
         or decision.requested_tool_names
     ):
         return registry
-    return ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
+    return ScopedTurnToolRegistry(base_registry, evidence=scope_evidence, tool_scope_decision=decision)
 
 
 def scoped_turn_tool_registry(
@@ -1270,10 +1410,12 @@ def scoped_turn_tool_registry(
     evidence: TurnToolEvidence,
     model_client: object | None = None,
     user_message: str | None = None,
+    memory_context: str = "",
 ):
     decision = build_turn_tool_scope_decision(
         model_client=model_client,
         user_message=user_message or "",
+        memory_context=memory_context,
         evidence=evidence,
         registry=registry,
     )
@@ -1292,9 +1434,14 @@ def turn_tool_evidence_needs_model_scope_decision(evidence: TurnToolEvidence) ->
     )
 
 
-def turn_tool_scope_decision_may_apply(evidence: TurnToolEvidence, *, user_message: str = "") -> bool:
+def turn_tool_scope_decision_may_apply(
+    evidence: TurnToolEvidence,
+    *,
+    user_message: str = "",
+    memory_context: str = "",
+) -> bool:
     del user_message
-    return turn_tool_evidence_needs_model_scope_decision(evidence)
+    return bool(str(memory_context or "").strip()) or turn_tool_evidence_needs_model_scope_decision(evidence)
 
 
 def tool_registry_allows_skill_pack_context(registry) -> bool:

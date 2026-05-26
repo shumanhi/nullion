@@ -75,7 +75,7 @@ def _compiled_delegated_artifact_graph():
 
 def _plan_requested_artifact(state: DelegatedArtifactState) -> dict[str, object]:
     group = state["group"]
-    extension = plan_attachment_format(group.original_message).extension
+    extension = plan_attachment_format(_attachment_request_text_for_group(group)).extension
     should_materialize = extension in _TEXT_ARTIFACT_EXTENSIONS
     return {
         "requested_extension": extension,
@@ -85,6 +85,29 @@ def _plan_requested_artifact(state: DelegatedArtifactState) -> dict[str, object]
         "existing_artifacts": [],
         "error": None,
     }
+
+
+def _attachment_request_text_for_group(group: TaskGroup) -> str:
+    message = str(getattr(group, "original_message", "") or "")
+    if not _is_scheduled_task_request(message):
+        return message
+    separators = (
+        "\n\nScheduled task execution context:",
+        "\nScheduled task execution context:",
+        "\n\nScheduled task delivery contract:",
+        "\nScheduled task delivery contract:",
+    )
+    end = len(message)
+    for separator in separators:
+        index = message.find(separator)
+        if index >= 0:
+            end = min(end, index)
+    return message[:end].strip() or message
+
+
+def _is_scheduled_task_request(message: str) -> bool:
+    text = str(message or "").lstrip()
+    return text.startswith("[Scheduled task: ") or text.startswith("[Manual scheduled task run: ")
 
 
 def _validate_existing_artifacts(state: DelegatedArtifactState) -> dict[str, object]:

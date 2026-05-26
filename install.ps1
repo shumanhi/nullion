@@ -2350,7 +2350,8 @@ switch ($SearchChoice) {
 
 Save-SearchCheckpoint
 
-# Account / API tools setup
+# Account / API tools setup. Preserve existing connector/email credentials during
+# upgrades so an installer rerun cannot silently drop account-aware tools.
 Write-Host ""
 Write-Host "  Choose account/API tools to enable:" -ForegroundColor White
 Write-Host "  These add account-aware tools. Native support is available for Gmail/Google"
@@ -2371,12 +2372,13 @@ $N8N_BASE_URL = Get-EnvValue "N8N_BASE_URL"
 $CUSTOM_API_BASE_URL = Get-EnvValue "NULLION_CUSTOM_API_BASE_URL"
 $CUSTOM_API_TOKEN = Get-EnvValue "NULLION_CUSTOM_API_TOKEN"
 $ExistingEnabledPlugins = Get-EnvValue "NULLION_ENABLED_PLUGINS"
+$ExistingAccountDone = Get-EnvValue "NULLION_SETUP_ACCOUNT_DONE"
 $ExistingConnectorGateway = Get-EnvValue "NULLION_CONNECTOR_GATEWAY"
 if ("$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$ExistingConnectorGateway") {
     $MATON_CONNECTOR_ENABLED = $true
     $CONNECTOR_SKILLS_ENABLED = $true
 }
-if (",$ExistingEnabledPlugins," -match ',(email_plugin|calendar_plugin),' -or $CONNECTOR_SKILLS_ENABLED) {
+if ($ExistingAccountDone -eq "true" -or ",$ExistingEnabledPlugins," -match ',(email_plugin|calendar_plugin),' -or $CONNECTOR_SKILLS_ENABLED) {
     Write-Info "Found existing account/API tools setup."
     if (Confirm-PromptDefaultYes "Use existing account/API setup instead of setting it up again?") {
         if ((Get-EnvValue "NULLION_PROVIDER_BINDINGS") -match 'email_plugin=custom_api_provider') {
@@ -2724,19 +2726,32 @@ Save-MediaCheckpoint
 
 # Skill pack setup
 Write-Host ""
-Write-Host "  Choose skill packs to enable:" -ForegroundColor White
-Write-Host "  All built-in skill packs ship with Nullion and are selected by default."
+Write-Host "  Skill packs:" -ForegroundColor White
+Write-Host "  Core skill packs ship with Nullion and are always installed."
 Write-Host "  Skill packs add workflow guidance only; account access still requires"
 Write-Host "  workspace-scoped provider connections and enabled tools."
 Write-Host ""
 
+$CORE_SKILL_PACKS = @(
+    "nullion/web-research",
+    "nullion/browser-automation",
+    "nullion/files-and-docs",
+    "nullion/pdf-documents",
+    "nullion/email-calendar",
+    "nullion/github-code",
+    "nullion/media-local",
+    "nullion/productivity-memory",
+    "nullion/connector-skills"
+)
 $selectedSkillPacks = New-Object System.Collections.Generic.List[string]
 function Add-SkillPackChoice {
     param([string]$PackId)
-    if ($PackId -and -not $selectedSkillPacks.Contains($PackId)) {
-        [void]$selectedSkillPacks.Add($PackId)
+    $normalized = "$PackId".Trim().ToLowerInvariant()
+    if ($normalized -and -not $selectedSkillPacks.Contains($normalized)) {
+        [void]$selectedSkillPacks.Add($normalized)
     }
 }
+foreach ($pack in $CORE_SKILL_PACKS) { Add-SkillPackChoice $pack }
 
 function Install-CustomSkillPackNow {
     param([string]$Source, [string]$PackId = "")
@@ -2756,47 +2771,28 @@ print(pack.pack_id)
 
 function Request-SkillPackChoices {
     if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
-        Write-Info "No interactive terminal detected; using all default skill packs."
-        return @("1", "2", "3", "4", "5", "6", "7", "8", "9")
+        Write-Info "No interactive terminal detected; using core skill packs."
+        return @()
     }
 
     $items = @(
-        @{ Title = "Web research"; Detail = "Search, fetch, source-backed answers"; Badge = ""; Choice = "1" },
-        @{ Title = "Browser automation"; Detail = "Web navigation, forms, screenshots"; Badge = ""; Choice = "2" },
-        @{ Title = "Files and documents"; Detail = "Local files, docs, sheets, decks"; Badge = ""; Choice = "3" },
-        @{ Title = "PDF documents"; Detail = "PDF generation, conversion, verification, delivery"; Badge = ""; Choice = "4" },
-        @{ Title = "Email and calendar"; Detail = "Inbox triage, replies, scheduling"; Badge = ""; Choice = "5" },
-        @{ Title = "GitHub and code review"; Detail = "Repos, PRs, issues, release notes"; Badge = ""; Choice = "6" },
-        @{ Title = "Local media"; Detail = "Audio transcription, OCR, image workflows"; Badge = ""; Choice = "7" },
-        @{ Title = "Productivity and memory"; Detail = "Tasks, routines, preferences, reminders"; Badge = ""; Choice = "8" },
-        @{ Title = "Connector/API skills"; Detail = "Maton, Composio, Nango, Activepieces, n8n, custom APIs"; Badge = ""; Choice = "9" },
-        @{ Title = "Install custom skill pack"; Detail = "Git URL, GitHub folder, or local folder with SKILL.md"; Badge = ""; Choice = "10" },
-        @{ Title = "No default skill packs"; Detail = "Start with no enabled reference packs"; Badge = ""; Choice = "11" }
+        @{ Title = "Install custom skill pack"; Detail = "Git URL, GitHub folder, or local folder with SKILL.md"; Badge = ""; Choice = "1" }
     )
 
     foreach ($item in $items) {
-        $badge = $item.Badge
-        if (-not $badge -and [int]$item.Choice -le 9) { $badge = "[default]" }
-        Write-MenuItem $item.Choice $item.Title $item.Detail $badge
+        Write-MenuItem $item.Choice $item.Title $item.Detail $item.Badge
     }
     Write-Host ""
-    Write-Info "Press Enter to use the default packs (1-9), or enter choices like 1,3,6."
-    $rawChoices = (Read-Host "  Skill packs [1,2,3,4,5,6,7,8,9]").Trim()
-    if (-not $rawChoices) { $rawChoices = "1,2,3,4,5,6,7,8,9" }
+    Write-Info "Core skill packs are already installed and cannot be deselected."
+    $rawChoices = (Read-Host "  Optional custom skill packs [Enter for none, 1 to add]").Trim()
 
     $choices = New-Object System.Collections.Generic.List[string]
     foreach ($choice in ($rawChoices -split '[^0-9]+')) {
         if (-not $choice) { continue }
-        if ($choice -eq "11") {
-            $choices.Clear()
-            [void]$choices.Add("11")
-            break
-        }
         if (($items | Where-Object { $_.Choice -eq $choice }) -and -not $choices.Contains($choice)) {
             [void]$choices.Add($choice)
         }
     }
-    if ($choices.Count -eq 0) { [void]$choices.Add("11") }
     return $choices.ToArray()
 }
 
@@ -2816,21 +2812,9 @@ if ($ExistingSkillPacks) {
 if (-not $SKIP_SKILL_SETUP) {
 $SkillChoices = Request-SkillPackChoices
 
-if ($SkillChoices -contains "11") {
-    Write-Info "Skipped default skill packs. You can enable them later in Settings."
-} else {
     foreach ($choice in $SkillChoices) {
         switch ($choice) {
-            "1" { Add-SkillPackChoice "nullion/web-research" }
-            "2" { Add-SkillPackChoice "nullion/browser-automation" }
-            "3" { Add-SkillPackChoice "nullion/files-and-docs" }
-            "4" { Add-SkillPackChoice "nullion/pdf-documents" }
-            "5" { Add-SkillPackChoice "nullion/email-calendar" }
-            "6" { Add-SkillPackChoice "nullion/github-code" }
-            "7" { Add-SkillPackChoice "nullion/media-local" }
-            "8" { Add-SkillPackChoice "nullion/productivity-memory" }
-            "9" { Add-SkillPackChoice "nullion/connector-skills" }
-            "10" {
+            "1" {
                 $CustomSkillPackSource = (Read-Host "  Skill pack source URL/path").Trim()
                 $CustomSkillPackId = (Read-Host "  Pack id [auto]").Trim()
                 if ($CustomSkillPackSource) {
@@ -2847,7 +2831,6 @@ if ($SkillChoices -contains "11") {
             default { Write-Info "Ignoring unknown skill choice: $choice" }
         }
     }
-}
 }
 
 $ENABLED_SKILL_PACKS = ($selectedSkillPacks -join ",")
@@ -2866,7 +2849,6 @@ $envLines = @(
     "NULLION_SETUP_PROVIDER_DONE=true"
     "NULLION_SETUP_BROWSER_DONE=true"
     "NULLION_SETUP_SEARCH_DONE=true"
-    "NULLION_SETUP_ACCOUNT_DONE=true"
     "NULLION_SETUP_MEDIA_DONE=true"
     "NULLION_SETUP_SKILLS_DONE=true"
 )
@@ -2904,15 +2886,6 @@ if ($BRAVE_SEARCH_KEY) { $envLines += "NULLION_BRAVE_SEARCH_API_KEY=`"$BRAVE_SEA
 if ($GOOGLE_SEARCH_KEY){ $envLines += "NULLION_GOOGLE_SEARCH_API_KEY=`"$GOOGLE_SEARCH_KEY`"" }
 if ($GOOGLE_SEARCH_CX) { $envLines += "NULLION_GOOGLE_SEARCH_CX=`"$GOOGLE_SEARCH_CX`"" }
 if ($PERPLEXITY_SEARCH_KEY){ $envLines += "NULLION_PERPLEXITY_API_KEY=`"$PERPLEXITY_SEARCH_KEY`"" }
-if ($MATON_API_KEY)        { $envLines += "MATON_API_KEY=`"$MATON_API_KEY`"" }
-if ($COMPOSIO_API_KEY)     { $envLines += "COMPOSIO_API_KEY=`"$COMPOSIO_API_KEY`"" }
-if ($NANGO_SECRET_KEY)     { $envLines += "NANGO_SECRET_KEY=`"$NANGO_SECRET_KEY`"" }
-if ($ACTIVEPIECES_API_KEY) { $envLines += "ACTIVEPIECES_API_KEY=`"$ACTIVEPIECES_API_KEY`"" }
-if ($N8N_BASE_URL)         { $envLines += "N8N_BASE_URL=`"$N8N_BASE_URL`"" }
-if ($N8N_API_KEY)          { $envLines += "N8N_API_KEY=`"$N8N_API_KEY`"" }
-if ($MATON_CONNECTOR_ENABLED) { $envLines += "NULLION_CONNECTOR_GATEWAY=`"maton`"" }
-if ($CUSTOM_API_BASE_URL)  { $envLines += "NULLION_CUSTOM_API_BASE_URL=`"$CUSTOM_API_BASE_URL`"" }
-if ($CUSTOM_API_TOKEN)     { $envLines += "NULLION_CUSTOM_API_TOKEN=`"$CUSTOM_API_TOKEN`"" }
 $enabledPlugins = "search_plugin,browser_plugin,workspace_plugin,media_plugin"
 $providerBindings = "search_plugin=$SEARCH_PROVIDER,media_plugin=local_media_provider"
 if ($EMAIL_CALENDAR_ENABLED) {

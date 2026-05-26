@@ -72,6 +72,23 @@ _OPENAI_COMPAT_PROVIDER_BASE_URLS = {
 }
 
 _VALID_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+_CORE_PLUGIN_DEFAULTS = (
+    "search_plugin",
+    "browser_plugin",
+    "workspace_plugin",
+    "media_plugin",
+)
+_CORE_SKILL_PACK_PLUGIN_DEFAULTS = {
+    "nullion/web-research": ("search_plugin", "browser_plugin"),
+    "nullion/browser-automation": ("browser_plugin",),
+    "nullion/files-and-docs": ("workspace_plugin",),
+    "nullion/pdf-documents": ("workspace_plugin",),
+    "nullion/media-local": ("media_plugin",),
+}
+_CORE_PROVIDER_BINDING_DEFAULTS = {
+    "search_plugin": "builtin_search_provider",
+    "media_plugin": "local_media_provider",
+}
 
 
 @dataclass(slots=True)
@@ -292,6 +309,36 @@ def _parse_provider_bindings(value: str | None) -> tuple[ProviderBinding, ...]:
     return tuple(bindings)
 
 
+def _normalize_core_enabled_plugins(
+    enabled_plugins: tuple[str, ...],
+    enabled_skill_packs: tuple[str, ...],
+) -> tuple[str, ...]:
+    ordered = list(dict.fromkeys(plugin.strip() for plugin in enabled_plugins if plugin.strip()))
+    if not ordered:
+        ordered.extend(_CORE_PLUGIN_DEFAULTS)
+    seen = set(ordered)
+    for pack_id in enabled_skill_packs:
+        for plugin_name in _CORE_SKILL_PACK_PLUGIN_DEFAULTS.get(str(pack_id or "").strip().lower(), ()):
+            if plugin_name not in seen:
+                ordered.append(plugin_name)
+                seen.add(plugin_name)
+    return tuple(ordered)
+
+
+def _normalize_core_provider_bindings(
+    provider_bindings: tuple[ProviderBinding, ...],
+    enabled_plugins: tuple[str, ...],
+) -> tuple[ProviderBinding, ...]:
+    ordered = list(provider_bindings)
+    seen = {binding.capability for binding in ordered}
+    for plugin_name in enabled_plugins:
+        provider = _CORE_PROVIDER_BINDING_DEFAULTS.get(plugin_name)
+        if provider and plugin_name not in seen:
+            ordered.append(ProviderBinding(capability=plugin_name, provider=provider))
+            seen.add(plugin_name)
+    return tuple(ordered)
+
+
 def load_settings(
     *,
     env: Mapping[str, str] | None = None,
@@ -367,23 +414,35 @@ def load_settings(
         launcher_command=terminal_launcher_command,
         launcher_args=terminal_launcher_args,
     )
-    settings.enabled_plugins = _split_csv_setting(
+    raw_enabled_plugins = _split_csv_setting(
         _first_nonempty_env_value(
             merged_env,
             "NULLION_ENABLED_PLUGINS",
         )
     )
-    settings.provider_bindings = _parse_provider_bindings(
+    from nullion.skill_pack_catalog import normalize_enabled_skill_pack_ids
+
+    settings.enabled_skill_packs = normalize_enabled_skill_pack_ids(
+        _split_csv_setting(
+            _first_nonempty_env_value(
+                merged_env,
+                "NULLION_ENABLED_SKILL_PACKS",
+            )
+        )
+    )
+    settings.enabled_plugins = _normalize_core_enabled_plugins(
+        raw_enabled_plugins,
+        settings.enabled_skill_packs,
+    )
+    raw_provider_bindings = _parse_provider_bindings(
         _first_nonempty_env_value(
             merged_env,
             "NULLION_PROVIDER_BINDINGS",
         )
     )
-    settings.enabled_skill_packs = _split_csv_setting(
-        _first_nonempty_env_value(
-            merged_env,
-            "NULLION_ENABLED_SKILL_PACKS",
-        )
+    settings.provider_bindings = _normalize_core_provider_bindings(
+        raw_provider_bindings,
+        settings.enabled_plugins,
     )
     settings.workspace_root = _first_nonempty_env_value(
         merged_env,

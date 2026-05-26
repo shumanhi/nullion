@@ -362,6 +362,7 @@ def _run_skill_pack_cli(args) -> None:
 
 
 def _enable_skill_pack_id(pack_id: str) -> str:
+    from nullion.skill_pack_catalog import normalize_enabled_skill_pack_ids
     from nullion.skill_pack_installer import BUILTIN_SKILL_PACK_PROMPTS, get_installed_skill_pack, normalize_pack_id
 
     normalized = normalize_pack_id(pack_id)
@@ -378,8 +379,16 @@ def _enable_skill_pack_id(pack_id: str) -> str:
                 break
     if normalized not in current:
         current.append(normalized)
-    _merge_env_updates(env_path, {"NULLION_ENABLED_SKILL_PACKS": ", ".join(current)})
-    os.environ["NULLION_ENABLED_SKILL_PACKS"] = ", ".join(current)
+    enabled_value = ", ".join(normalize_enabled_skill_pack_ids(tuple(current)))
+    _merge_env_updates(
+        env_path,
+        {
+            "NULLION_ENABLED_SKILL_PACKS": enabled_value,
+            "NULLION_SKILL_PACK_ACCESS_ENABLED": "true",
+        },
+    )
+    os.environ["NULLION_ENABLED_SKILL_PACKS"] = enabled_value
+    os.environ["NULLION_SKILL_PACK_ACCESS_ENABLED"] = "true"
     return normalized
 
 
@@ -1253,6 +1262,11 @@ def _write_windows_repair_wrappers(
 
 def _install_windows_repair_tasks(*, start: bool, dry_run: bool) -> list[str]:
     actions: list[str] = []
+    task_services = {
+        "Nullion Web Dashboard": "web",
+        "Nullion Tray": "tray",
+        "Nullion Telegram": "telegram",
+    }
     for spec in _WINDOWS_REPAIR_TASKS:
         task = str(spec["task"])
         bat = _NULLION_HOME / str(spec["bat"])
@@ -1262,7 +1276,12 @@ def _install_windows_repair_tasks(*, start: bool, dry_run: bool) -> list[str]:
         actions.append(f"{'Would recreate' if dry_run else 'Recreated'} Windows task {task}")
         if start:
             if not dry_run:
-                subprocess.run(["schtasks", "/Run", "/TN", task], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    from nullion.service_control import restart_managed_service
+
+                    restart_managed_service(task_services[task], manager="windows")
+                except Exception as exc:
+                    raise RuntimeError(f"Recreated {task}, but verified start failed: {exc}") from exc
             actions.append(f"{'Would start' if dry_run else 'Started'} Windows task {task}")
     return actions
 
@@ -1991,9 +2010,7 @@ def _restart_launchd_chat_services() -> None:
         _restart_managed_services_legacy(manager="launchd", names=("telegram", "slack", "discord"))
         return
 
-    for result in restart_managed_services(groups={"chat"}, continue_on_error=True):
-        if result.ok:
-            print(f"  {result.message}")
+    _print_restart_results_or_raise(restart_managed_services(groups={"chat"}, continue_on_error=True))
 
 
 def _restart_systemd_chat_services() -> None:
@@ -2005,9 +2022,7 @@ def _restart_systemd_chat_services() -> None:
         _restart_managed_services_legacy(manager="systemd", names=("telegram", "slack", "discord"))
         return
 
-    for result in restart_managed_services(groups={"chat"}, continue_on_error=True):
-        if result.ok:
-            print(f"  {result.message}")
+    _print_restart_results_or_raise(restart_managed_services(groups={"chat"}, continue_on_error=True))
 
 
 def _restart_all_managed_services(*, manager: str = "auto") -> None:
@@ -2019,9 +2034,21 @@ def _restart_all_managed_services(*, manager: str = "auto") -> None:
         _restart_managed_services_legacy(manager=manager)
         return
 
-    for result in restart_managed_services(continue_on_error=True, manager=manager):  # type: ignore[arg-type]
+    _print_restart_results_or_raise(restart_managed_services(continue_on_error=True, manager=manager))  # type: ignore[arg-type]
+
+
+def _print_restart_results_or_raise(results) -> None:  # noqa: ANN001
+    failures: list[str] = []
+    for result in results:
         if result.ok:
             print(f"  {result.message}")
+            continue
+        if str(result.message).startswith("No managed service is installed"):
+            continue
+        print(f"  Could not restart {result.service}: {result.message}")
+        failures.append(str(result.service))
+    if failures:
+        raise RuntimeError(f"Could not restart installed service(s): {', '.join(failures)}")
 
 
 _LEGACY_SERVICE_HINTS: dict[str, dict[str, tuple[str, ...]]] = {
@@ -2100,10 +2127,60 @@ def _restart_managed_services_legacy(*, manager: str, names: tuple[str, ...] | N
                 query = subprocess.run(["schtasks", "/Query", "/TN", task], check=False, capture_output=True, text=True)
                 if query.returncode != 0:
                     continue
-                subprocess.run(["schtasks", "/End", "/TN", task], check=False)
-                subprocess.run(["schtasks", "/Run", "/TN", task], check=False)
+                _legacy_restart_windows_task(task)
                 print(f"  Restarted {task}.")
                 break
+
+
+def _legacy_windows_task_status(task: str) -> str | None:
+    query = subprocess.run(
+        ["schtasks", "/Query", "/TN", task, "/FO", "LIST", "/V"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if query.returncode != 0:
+        return None
+    for line in (query.stdout or "").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() == "status":
+            return value.strip()
+    return None
+
+
+def _legacy_windows_task_is_running(task: str) -> bool:
+    return (_legacy_windows_task_status(task) or "").strip().lower() == "running"
+
+
+def _legacy_wait_for_windows_task(task: str, *, running: bool, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        is_running = _legacy_windows_task_is_running(task)
+        if is_running is running:
+            if not running:
+                return True
+            if stable_since is None:
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= 1.0:
+                return True
+        else:
+            stable_since = None
+        time.sleep(0.3)
+    return False
+
+
+def _legacy_restart_windows_task(task: str) -> None:
+    subprocess.run(["schtasks", "/End", "/TN", task], check=False, capture_output=True, text=True)
+    if not _legacy_wait_for_windows_task(task, running=False, timeout=15):
+        raise RuntimeError(f"{task} did not stop before restart.")
+    started = subprocess.run(["schtasks", "/Run", "/TN", task], check=False, capture_output=True, text=True)
+    if started.returncode != 0:
+        detail = _summarize_subprocess_error(started)
+        raise RuntimeError(f"{task} did not start: {detail}")
+    if not _legacy_wait_for_windows_task(task, running=True, timeout=20):
+        status = _legacy_windows_task_status(task) or "unknown"
+        raise RuntimeError(f"{task} did not stay running after start; status={status}")
 
 
 def _service_cmd(sm: str, action: str) -> None:

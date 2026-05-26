@@ -140,10 +140,11 @@ jobs:
       - name: Run private suite shard with coverage
         shell: bash
         env:
+          COVERAGE_FILE: .coverage
           NULLION_APP_REPO: ${{ github.workspace }}/nullion
         run: |
           python -m coverage erase
-          python -m coverage run --parallel-mode --source=nullion/src/nullion -m pytest -q $(cat /tmp/nullion-private-test-files.txt)
+          python -m coverage run --rcfile=nullion/pyproject.toml --parallel-mode --source=nullion/src/nullion -m pytest -q $(cat /tmp/nullion-private-test-files.txt)
 
       - name: Upload private coverage shard
         uses: actions/upload-artifact@v4
@@ -196,9 +197,11 @@ jobs:
 
       - name: Combine private coverage
         shell: bash
+        env:
+          COVERAGE_FILE: .coverage
         run: |
-          python -m coverage combine coverage-data
-          python -m coverage report --fail-under=70
+          python -m coverage combine --rcfile=nullion/pyproject.toml coverage-data
+          python -m coverage report --rcfile=nullion/pyproject.toml --fail-under=70
 
   docker-e2e:
     name: Docker e2e suite

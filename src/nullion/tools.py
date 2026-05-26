@@ -63,6 +63,7 @@ from nullion.policy import (
 from nullion.prompt_injection import scan_tool_output
 from nullion.redaction import redact_value
 from nullion.runtime_store import RuntimeStore
+from nullion.skill_pack_catalog import normalize_enabled_skill_pack_ids
 from nullion.tips import MEDIA_PROVIDER_SETUP_TIP, format_setup_tip
 from nullion.tool_boundaries import extract_boundary_facts
 
@@ -71,6 +72,23 @@ _WEB_FETCH_MAX_REDIRECTS = 5
 _WEB_FETCH_MAX_BODY_BYTES = 2_000_000
 _LEGACY_GLOBAL_PERMISSION_PRINCIPALS = ("operator", "workspace:workspace_admin")
 logger = logging.getLogger(__name__)
+
+
+class ConnectorHTTPError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        content_type: str | None = None,
+        body: str | None = None,
+        json_payload: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.content_type = content_type
+        self.body = body or ""
+        self.json_payload = json_payload
 
 
 class _SafeWebFetchRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -733,6 +751,8 @@ _COMPLETED_TOOL_STATUS_ALIASES = {"completed", "complete", "success", "succeeded
 _FAILED_TOOL_STATUS_ALIASES = {"failed", "failure", "error", "errored", "timeout", "timed_out", "partial"}
 _DENIED_TOOL_STATUS_ALIASES = {"denied", "blocked", "approval_required", "capability_denied", "capability_not_granted"}
 _NONTERMINAL_TOOL_STATUS_ALIASES = {"running", "pending", "started", "in_progress", "queued"}
+_ACCOUNT_TOOL_FAILURE_GUARD_SECONDS = 120.0
+_RECENT_ACCOUNT_TOOL_FAILURES: dict[tuple[str, str], float] = {}
 
 class ToolRiskLevel(str, Enum):
     LOW = "low"
@@ -2202,8 +2222,14 @@ def _connector_access_enabled() -> bool:
     raw = os.environ.get("NULLION_CONNECTOR_ACCESS_ENABLED")
     if raw is not None and raw.strip():
         return _env_flag("NULLION_CONNECTOR_ACCESS_ENABLED")
-    enabled_packs = str(os.environ.get("NULLION_ENABLED_SKILL_PACKS") or "").lower()
-    if "connector" in enabled_packs or "api-gateway" in enabled_packs:
+    enabled_packs = normalize_enabled_skill_pack_ids(
+        [
+            item
+            for item in str(os.environ.get("NULLION_ENABLED_SKILL_PACKS") or "").split(",")
+            if item.strip()
+        ]
+    )
+    if "nullion/connector-skills" in enabled_packs or "maton-ai/api-gateway-skill" in enabled_packs:
         return True
     try:
         from nullion.connections import load_connection_registry
@@ -2288,6 +2314,7 @@ def _account_tool_failure_output(
         output["id"] = message_id
     connector_providers = _available_connector_provider_summaries(principal_id)
     if connector_providers:
+        output["suppress_activity"] = True
         output["available_connector_providers"] = connector_providers
         output["next_step"] = (
             "A native provider failed. If an enabled connector skill covers this task, "
@@ -2465,6 +2492,7 @@ class ToolExecutor:
         self._allowed_tool_names = tuple(sorted(set(allowed_tool_names or ())))
         self._denied_tool_names = tuple(sorted(set(denied_tool_names or ())))
         self._sentinel_policy = sentinel_policy or _load_sentinel_policy()
+        self._failed_account_tools_by_capsule: dict[str, set[str]] = {}
 
     def _record_egress_event(self, event_type: str, invocation: ToolInvocation, payload: dict[str, object]) -> None:
         details = {
@@ -2706,6 +2734,10 @@ class ToolExecutor:
                 flow_kind="boundary_policy",
             ),
         }
+        if invocation.tool_name == "email_send":
+            # Email approvals must carry the exact reviewed draft across any
+            # later boundary pause so the user never sees an empty send card.
+            approval_context.setdefault("tool_arguments", redact_value(dict(invocation.arguments or {})))
         existing = self._find_pending_boundary_policy_approval(invocation, context=approval_context)
         if existing is not None:
             refreshed = _refresh_pending_approval_request(existing, context=approval_context, resource=target)
@@ -2795,6 +2827,15 @@ class ToolExecutor:
             return None
         for fact in extract_boundary_facts(invocation):
             if _connector_request_boundary_preapproved(invocation, fact):
+                continue
+            if (
+                invocation.tool_name == "email_send"
+                and fact.kind is BoundaryKind.ACCOUNT_ACCESS
+                and self._matching_email_send_review_grants(invocation)
+            ):
+                # The review approval is the user-visible consent for this
+                # exact email draft; a second account gate would be redundant
+                # and can lose the draft details on messaging surfaces.
                 continue
             policy_principal = _boundary_policy_principal_for_fact(invocation.principal_id, fact)
             if fact.kind is BoundaryKind.OUTBOUND_NETWORK:
@@ -2944,6 +2985,9 @@ class ToolExecutor:
 
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
         invocation = _with_resolved_virtual_workspace_paths(invocation)
+        repeated_account_result = self._repeated_account_tool_result(invocation)
+        if repeated_account_result is not None:
+            return repeated_account_result
         if invocation.tool_name in self._denied_tool_names:
             return self._deny_invocation(
                 invocation,
@@ -2960,7 +3004,16 @@ class ToolExecutor:
                 output={"reason": "capability_not_granted", "allowed_tools": list(self._allowed_tool_names)},
             )
 
-        spec = self._registry.get_spec(invocation.tool_name)
+        try:
+            spec = self._registry.get_spec(invocation.tool_name)
+        except KeyError:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"reason": "tool_not_available"},
+                error=f"Tool is not available in this turn: {invocation.tool_name}",
+            )
 
         tool_decision = (
             self._sentinel_policy.decision_for_risk(
@@ -3014,6 +3067,8 @@ class ToolExecutor:
             )
         duration_ms = (perf_counter() - started_at) * 1000
         result = normalize_tool_result(result)
+        self._clear_account_tool_failure_on_success(invocation, result)
+        self._remember_failed_account_tool(invocation, result)
         if invocation.tool_name == "email_send" and result.status != "denied":
             self._revoke_email_send_review_grants(invocation)
         self._record_egress_outcome(invocation, result, egress_attempts)
@@ -3074,6 +3129,72 @@ class ToolExecutor:
         except Exception:
             logger.debug("Builder route observation failed", exc_info=True)
         return result
+
+    def _account_tool_capsule_key(self, invocation: ToolInvocation) -> str:
+        return str(invocation.capsule_id or invocation.principal_id or "global")
+
+    def _repeated_account_tool_result(self, invocation: ToolInvocation) -> ToolResult | None:
+        if invocation.tool_name not in {"email_search", "email_read", "calendar_list"}:
+            return None
+        # Account connectors can fail in a way that makes repeated calls within
+        # the same turn waste time and produce duplicate HTTP errors. After the
+        # first failure, expose a structured recovery result so the model moves
+        # to setup/browser/manual options instead of hammering the same tool.
+        guard_key = (self._account_tool_capsule_key(invocation), invocation.tool_name)
+        now = perf_counter()
+        for key, failed_at in list(_RECENT_ACCOUNT_TOOL_FAILURES.items()):
+            if now - failed_at > _ACCOUNT_TOOL_FAILURE_GUARD_SECONDS:
+                _RECENT_ACCOUNT_TOOL_FAILURES.pop(key, None)
+        if guard_key in _RECENT_ACCOUNT_TOOL_FAILURES:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "reason": "account_tool_recovery_required",
+                    "suppress_activity": True,
+                    "next_step": (
+                        "The direct account tool is unavailable for this turn. Stop calling this same tool and give "
+                        "numbered recovery options: reconnect/setup, browser sign-in workflow, or manual paste/upload."
+                    ),
+                },
+                error=None,
+            )
+        failed_tools = self._failed_account_tools_by_capsule.get(self._account_tool_capsule_key(invocation), set())
+        if invocation.tool_name not in failed_tools:
+            return None
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "reason": "account_tool_recovery_required",
+                "suppress_activity": True,
+                "next_step": (
+                    "The direct account tool is unavailable for this turn. Stop calling this same tool and give "
+                    "numbered recovery options: reconnect/setup, browser sign-in workflow, or manual paste/upload."
+                ),
+            },
+            error=None,
+        )
+
+    def _remember_failed_account_tool(self, invocation: ToolInvocation, result: ToolResult) -> None:
+        if invocation.tool_name not in {"email_search", "email_read", "calendar_list"}:
+            return
+        if result.status not in {"failed", "denied"} and not result.error:
+            return
+        _RECENT_ACCOUNT_TOOL_FAILURES[(self._account_tool_capsule_key(invocation), invocation.tool_name)] = perf_counter()
+        failed_tools = self._failed_account_tools_by_capsule.setdefault(self._account_tool_capsule_key(invocation), set())
+        failed_tools.add(invocation.tool_name)
+        if len(self._failed_account_tools_by_capsule) > 128:
+            for key in list(self._failed_account_tools_by_capsule)[:64]:
+                self._failed_account_tools_by_capsule.pop(key, None)
+
+    def _clear_account_tool_failure_on_success(self, invocation: ToolInvocation, result: ToolResult) -> None:
+        if invocation.tool_name not in {"email_search", "email_read", "calendar_list"}:
+            return
+        if result.status == "completed" and not result.error:
+            _RECENT_ACCOUNT_TOOL_FAILURES.pop((self._account_tool_capsule_key(invocation), invocation.tool_name), None)
 
 
 
@@ -3205,6 +3326,58 @@ def _build_file_read_handler(
                 status="failed",
                 output={},
                 error=f"File not found: {path}",
+            )
+        except IsADirectoryError:
+            # Reading a folder is a recoverable file-navigation miss, not a
+            # terminal failure. Return a bounded listing so the next step can
+            # choose a concrete file without dumping an entire workspace.
+            try:
+                all_children = sorted(child.name for child in path.iterdir())
+            except OSError:
+                all_children = []
+            children = all_children[:50]
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "path": str(path),
+                    "is_directory": True,
+                    "entries": children,
+                    "entry_count": len(all_children),
+                    "shown_entry_count": len(children),
+                    "message": (
+                        "The path is a directory. Use one of these entries or call file_search with a more specific "
+                        "pattern before reading or delivering a file."
+                    ),
+                },
+                error=None,
+            )
+        except UnicodeDecodeError:
+            if path.suffix.lower() in VALID_ATTACHMENT_EXTENSIONS:
+                try:
+                    size_bytes = path.stat().st_size
+                except OSError:
+                    size_bytes = 0
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="completed",
+                    output={
+                        "path": str(path),
+                        "artifact_path": str(path),
+                        "binary": True,
+                        "size_bytes": size_bytes,
+                        "message": "Binary file exists; attach or deliver this file instead of reading it as UTF-8 text.",
+                    },
+                    error=None,
+                )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"path": str(path)},
+                error=f"File is not valid UTF-8 text: {path}",
             )
 
         return ToolResult(
@@ -4866,12 +5039,12 @@ def register_web_fetch_tool(
     return registry
 
 
-def _json_get(url: str, timeout_seconds: int) -> dict[str, object]:
+def _json_get(url: str, timeout_seconds: int) -> object:
     request = urllib.request.Request(url, headers={"User-Agent": "Nullion/1.0"})
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         payload = response.read(500_000)
     decoded = json.loads(payload.decode("utf-8"))
-    return decoded if isinstance(decoded, dict) else {}
+    return decoded if isinstance(decoded, (dict, list)) else {}
 
 
 def _coerce_float_arg(value: object, *, name: str) -> float | None:
@@ -4886,7 +5059,7 @@ def _coerce_float_arg(value: object, *, name: str) -> float | None:
 def _resolve_open_meteo_location(
     arguments: dict[str, object],
     *,
-    json_get: Callable[[str, int], dict[str, object]],
+    json_get: Callable[[str, int], object],
 ) -> dict[str, object]:
     latitude = _coerce_float_arg(arguments.get("latitude"), name="latitude")
     longitude = _coerce_float_arg(arguments.get("longitude"), name="longitude")
@@ -4903,20 +5076,28 @@ def _resolve_open_meteo_location(
     source_url = ""
     results: object = None
     searched_locations: list[str] = []
-    candidate_locations = [location_text]
-    zip_match = re.search(r"(?<!\d)(\d{5})(?:-\d{4})?(?!\d)", location_text)
-    if zip_match:
-        zip_code = zip_match.group(1)
-        if zip_code != location_text:
-            candidate_locations.append(zip_code)
+    candidate_locations = _weather_location_text_candidates(location_text)
     for candidate_location in dict.fromkeys(candidate_locations):
         searched_locations.append(candidate_location)
         query = urlencode({"name": candidate_location, "count": 1, "language": "en", "format": "json"})
         source_url = f"https://geocoding-api.open-meteo.com/v1/search?{query}"
         payload = json_get(source_url, 10)
-        results = payload.get("results")
+        results = payload.get("results") if isinstance(payload, dict) else None
         if isinstance(results, list) and results:
             break
+    if not isinstance(results, list) or not results:
+        # Open-Meteo's geocoder is city-oriented; it can miss valid user/profile
+        # locations such as street addresses, regional city abbreviations, or
+        # international postal formats. Keep this fallback region-agnostic so
+        # users do not see repeated failed weather tool calls before the model
+        # tries coordinates.
+        for candidate_location in dict.fromkeys(candidate_locations):
+            nominatim_result = _resolve_nominatim_weather_location(
+                candidate_location,
+                json_get=json_get,
+            )
+            if nominatim_result is not None:
+                return nominatim_result
     if not isinstance(results, list) or not results:
         searched = ", ".join(searched_locations)
         raise ValueError(f"Could not resolve location: {location_text}" + (f" (tried: {searched})" if searched else ""))
@@ -4939,6 +5120,57 @@ def _resolve_open_meteo_location(
         "name": label,
         "country": first.get("country"),
         "timezone": first.get("timezone"),
+        "source_url": source_url,
+    }
+
+
+def _weather_location_text_candidates(location_text: str) -> list[str]:
+    raw = str(location_text or "").strip()
+    if not raw:
+        return []
+    candidates = [raw]
+    parts = [" ".join(part.split()).strip() for part in raw.split(",") if part.strip()]
+    if len(parts) >= 2:
+        first = parts[0]
+        last = parts[-1]
+        if len(parts) >= 3 and first and last:
+            # Weather work should degrade from precise private/subaddress text
+            # to the nearest resolvable public locality instead of blocking the
+            # whole plan when a geocoder rejects one middle address segment.
+            first_last = f"{first}, {last}"
+            if first_last not in candidates:
+                candidates.append(first_last)
+        if first and first not in candidates:
+            candidates.append(first)
+        if last and len(last) > 2 and last not in candidates:
+            candidates.append(last)
+    return candidates
+
+
+def _resolve_nominatim_weather_location(
+    location_text: str,
+    *,
+    json_get: Callable[[str, int], object],
+) -> dict[str, object] | None:
+    query = urlencode({"q": location_text, "format": "jsonv2", "limit": 1, "addressdetails": 1})
+    source_url = f"https://nominatim.openstreetmap.org/search?{query}"
+    payload = json_get(source_url, 10)
+    if not isinstance(payload, list) or not payload:
+        return None
+    first = payload[0]
+    if not isinstance(first, dict):
+        return None
+    latitude = _coerce_float_arg(first.get("lat"), name="latitude")
+    longitude = _coerce_float_arg(first.get("lon"), name="longitude")
+    if latitude is None or longitude is None:
+        return None
+    label = str(first.get("display_name") or location_text).strip() or location_text
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "name": label,
+        "country": None,
+        "timezone": None,
         "source_url": source_url,
     }
 
@@ -5010,7 +5242,7 @@ def _daily_open_meteo_forecast(payload: dict[str, object]) -> list[dict[str, obj
 
 
 def _build_weather_forecast_handler(
-    json_get: Callable[[str, int], dict[str, object]],
+    json_get: Callable[[str, int], object],
 ) -> ToolHandler:
     def _handler(invocation: ToolInvocation) -> ToolResult:
         try:
@@ -5036,6 +5268,7 @@ def _build_weather_forecast_handler(
             )
             forecast_url = f"https://api.open-meteo.com/v1/forecast?{query}"
             payload = json_get(forecast_url, 15)
+            payload = payload if isinstance(payload, dict) else {}
             output = {
                 "provider": "open-meteo",
                 "source_url": forecast_url,
@@ -5152,8 +5385,8 @@ def _build_kernel_tool_registry(
                 name="spreadsheet_create",
                 description=(
                     "Create a real .xlsx spreadsheet artifact from structured rows, links, and existing image files. "
-                    "Use this for spreadsheet delivery instead of terminal_exec. "
-                    "If the tool reports missing_dependency, ask the user to approve installing the listed open-source package."
+                    "Use this as the first local spreadsheet-delivery rung; if it cannot complete, request local shell "
+                    "execution as the last-resort local fallback when no external account auth is required."
                 ),
                 risk_level=ToolRiskLevel.MEDIUM,
                 side_effect_class=ToolSideEffectClass.WRITE,
@@ -5172,8 +5405,8 @@ def _build_kernel_tool_registry(
                 name="presentation_create",
                 description=(
                     "Create a real .pptx slide deck artifact from structured slides and existing image files. "
-                    "Use this for PowerPoint or presentation delivery instead of terminal_exec. "
-                    "If the tool reports missing_dependency, ask the user to approve installing the listed open-source package."
+                    "Use this as the first local presentation-delivery rung; if it cannot complete, request local shell "
+                    "execution as the last-resort local fallback when no external account auth is required."
                 ),
                 risk_level=ToolRiskLevel.MEDIUM,
                 side_effect_class=ToolSideEffectClass.WRITE,
@@ -5193,7 +5426,7 @@ def _build_kernel_tool_registry(
                 description=(
                     "Create a real PDF artifact locally from existing image files and/or simple text pages. "
                     "Use this for packaging images, reports, or notes into a PDF. "
-                    "Prefer this over terminal_exec or installing command-line PDF tools."
+                    "Try this before terminal_exec; local shell remains the last-resort fallback when this cannot complete."
                 ),
                 risk_level=ToolRiskLevel.MEDIUM,
                 side_effect_class=ToolSideEffectClass.WRITE,
@@ -5213,7 +5446,7 @@ def _build_kernel_tool_registry(
                 description=(
                     "Edit a PDF locally into a new PDF artifact: keep/reorder pages, rotate pages, "
                     "append other PDFs, append image pages, or append text pages. "
-                    "Prefer this over terminal_exec or installing command-line PDF tools."
+                    "Try this before terminal_exec; local shell remains the last-resort fallback when this cannot complete."
                 ),
                 risk_level=ToolRiskLevel.MEDIUM,
                 side_effect_class=ToolSideEffectClass.WRITE,
@@ -5581,6 +5814,38 @@ def _connector_request_headers(connection: object | None, provider_id: str) -> d
     return headers
 
 
+def _connector_error_message(exc: urllib.error.HTTPError, body: str) -> str:
+    try:
+        parsed = json.loads(body or "{}")
+    except Exception:
+        parsed = {}
+    if isinstance(parsed, dict):
+        message = str(parsed.get("message") or parsed.get("error") or "").strip()
+        if message:
+            return message
+    return f"HTTP Error {exc.code}: {exc.reason}"
+
+
+def _connector_http_error_output(
+    exc: ConnectorHTTPError,
+    *,
+    provider_id: str,
+    url: str | None = None,
+) -> dict[str, object]:
+    output: dict[str, object] = {"provider_id": provider_id}
+    if url:
+        output["url"] = url
+    if exc.status_code is not None:
+        output["status_code"] = exc.status_code
+    if exc.content_type:
+        output["content_type"] = exc.content_type
+    if isinstance(exc.json_payload, dict):
+        output["json"] = exc.json_payload
+    elif exc.body:
+        output["text"] = exc.body[:20000]
+    return output
+
+
 _CONNECTOR_READ_METHODS = {"GET", "HEAD"}
 _CONNECTOR_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _CONNECTOR_ALLOWED_METHODS = _CONNECTOR_READ_METHODS | _CONNECTOR_WRITE_METHODS
@@ -5676,6 +5941,139 @@ def _email_messages_endpoint_for_provider(connection: object | None, provider_id
     return "https://api.maton.ai/google-mail/gmail/v1/users/me/messages"
 
 
+def _maton_api_base_url_for_provider(connection: object | None, provider_id: str) -> str | None:
+    for base_url in _connector_allowed_base_urls(connection, provider_id):
+        parsed = urlparse(base_url)
+        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
+            return f"{parsed.scheme}://{parsed.netloc}"
+    if "maton" in str(provider_id or "").lower():
+        return "https://api.maton.ai"
+    return None
+
+
+def _connector_json_payload_from_response(response) -> dict[str, object]:
+    body = response.read(1_000_000).decode("utf-8", "ignore")
+    payload = json.loads(body or "{}")
+    if not isinstance(payload, dict):
+        raise RuntimeError("connector returned non-object JSON")
+    return payload
+
+
+def _maton_connection_diagnostics(
+    invocation: ToolInvocation,
+    *,
+    provider_id: str,
+    connection: object | None,
+    app: str,
+) -> dict[str, object] | None:
+    base_url = _maton_api_base_url_for_provider(connection, provider_id)
+    if not base_url:
+        return None
+    url = f"{base_url}/connections"
+    request_url = _connector_request_url(url, None, connection, provider_id)
+    resolution = _resolve_web_fetch_resolution(request_url)
+    request = urllib.request.Request(
+        request_url,
+        headers=_connector_request_headers(connection, provider_id),
+        method="GET",
+    )
+    opener = _build_web_fetch_opener()
+    with _pinned_web_fetch_resolution(resolution):
+        with opener.open(request, timeout=_connector_request_timeout_seconds()) as response:
+            payload = _connector_json_payload_from_response(response)
+    raw_connections = payload.get("connections")
+    connections = raw_connections if isinstance(raw_connections, list) else []
+    app_connections: list[dict[str, object]] = []
+    for item in connections:
+        if not isinstance(item, dict) or str(item.get("app") or "").strip() != app:
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        summary: dict[str, object] = {
+            "app": app,
+            "status": str(item.get("status") or "").strip() or "UNKNOWN",
+        }
+        for key in ("connection_id", "creation_time", "last_updated_time", "method"):
+            value = item.get(key)
+            if value not in (None, "", [], {}):
+                summary[key] = value
+        email = metadata.get("email") if isinstance(metadata, dict) else None
+        if isinstance(email, str) and email.strip():
+            summary["email"] = email.strip()
+        connect_url = item.get("url")
+        if isinstance(connect_url, str) and connect_url.strip():
+            summary["connect_url"] = connect_url.strip()
+        app_connections.append(summary)
+    if not app_connections:
+        return {
+            "provider_id": provider_id,
+            "app": app,
+            "status": "MISSING",
+            "connections": [],
+        }
+    active = [item for item in app_connections if str(item.get("status") or "").upper() == "ACTIVE"]
+    statuses = sorted({str(item.get("status") or "UNKNOWN") for item in app_connections})
+    primary = active[0] if active else app_connections[0]
+    diagnostics: dict[str, object] = {
+        "provider_id": provider_id,
+        "app": app,
+        "status": "ACTIVE" if active else "RECONNECT_REQUIRED",
+        "connection_statuses": statuses,
+        "connections": app_connections,
+    }
+    for key in ("email", "connect_url", "connection_id", "last_updated_time"):
+        value = primary.get(key)
+        if value not in (None, "", [], {}):
+            diagnostics[key] = value
+    return diagnostics
+
+
+def _account_connection_recovery_result(
+    invocation: ToolInvocation,
+    *,
+    provider_id: str,
+    connection: object | None,
+    app: str,
+) -> ToolResult | None:
+    try:
+        diagnostics = _maton_connection_diagnostics(
+            invocation,
+            provider_id=provider_id,
+            connection=connection,
+            app=app,
+        )
+    except Exception:
+        logger.debug("Connector connection diagnostics failed provider_id=%s app=%s", provider_id, app, exc_info=True)
+        return None
+    if not diagnostics or diagnostics.get("status") == "ACTIVE":
+        return None
+    connect_url = str(diagnostics.get("connect_url") or "").strip()
+    email = str(diagnostics.get("email") or "").strip()
+    target = f" for {email}" if email else ""
+    result_text = (
+        f"Maton is configured, but its {app} connection is not active{target}. "
+        "Reconnect Gmail in Settings > Connections, then ask me to check email again."
+    )
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="completed",
+        output={
+            "reason": "account_connection_reconnect_required",
+            "suppress_activity": True,
+            "terminal_user_action_required": True,
+            "provider_id": provider_id,
+            "app": app,
+            "result_text": result_text,
+            "next_step": (
+                "Stop tool use for this turn and show the reconnect message to the user. "
+                "Do not call connector_request or browser tools for the provider reconnect URL."
+            ),
+            "connection_diagnostics": diagnostics,
+        },
+        error=None,
+    )
+
+
 def _calendar_events_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
     base_urls = _connector_allowed_base_urls(connection, provider_id)
     for base_url in base_urls:
@@ -5707,13 +6105,23 @@ def _connector_json_request(
         data = json.dumps(json_payload).encode("utf-8")
     request = urllib.request.Request(request_url, data=data, headers=headers, method=normalized_method)
     opener = _build_web_fetch_opener()
-    with _pinned_web_fetch_resolution(resolution):
-        with opener.open(request, timeout=_connector_request_timeout_seconds()) as response:
-            body = response.read(1_000_000).decode("utf-8", "ignore")
-    payload = json.loads(body or "{}")
-    if not isinstance(payload, dict):
-        raise RuntimeError("connector returned non-object JSON")
-    return payload
+    try:
+        with _pinned_web_fetch_resolution(resolution):
+            with opener.open(request, timeout=_connector_request_timeout_seconds()) as response:
+                return _connector_json_payload_from_response(response)
+    except urllib.error.HTTPError as exc:
+        body = exc.read(1_000_000).decode("utf-8", "ignore")
+        try:
+            parsed = json.loads(body or "{}")
+        except Exception:
+            parsed = None
+        raise ConnectorHTTPError(
+            _connector_error_message(exc, body),
+            status_code=exc.code,
+            content_type=exc.headers.get_content_type() if exc.headers else None,
+            body=body,
+            json_payload=parsed,
+        ) from exc
 
 
 def _connector_request_timeout_seconds() -> int:
@@ -6084,6 +6492,26 @@ def _build_connector_request_handler() -> ToolHandler:
                 output=output,
                 error=None,
             )
+        except urllib.error.HTTPError as exc:
+            body = exc.read(1_000_000).decode("utf-8", "ignore")
+            try:
+                parsed = json.loads(body or "{}")
+            except Exception:
+                parsed = None
+            connector_error = ConnectorHTTPError(
+                _connector_error_message(exc, body),
+                status_code=exc.code,
+                content_type=exc.headers.get_content_type() if exc.headers else None,
+                body=body,
+                json_payload=parsed,
+            )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=_connector_http_error_output(connector_error, provider_id=provider_id, url=raw_url.strip()),
+                error=str(connector_error),
+            )
         except Exception as exc:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -6122,6 +6550,14 @@ def _build_connector_email_search_handler() -> ToolHandler:
             if not provider_id:
                 provider_id = _default_email_connector_provider_id(invocation.principal_id)
             connection = _connector_connection_for_invocation(invocation, provider_id)
+            recovery_result = _account_connection_recovery_result(
+                invocation,
+                provider_id=provider_id,
+                connection=connection,
+                app="google-mail",
+            )
+            if recovery_result is not None:
+                return recovery_result
             endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
             listing = _connector_json_request(
                 invocation,
@@ -6185,6 +6621,14 @@ def _build_connector_email_read_handler() -> ToolHandler:
             if not provider_id:
                 provider_id = _default_email_connector_provider_id(invocation.principal_id)
             connection = _connector_connection_for_invocation(invocation, provider_id)
+            recovery_result = _account_connection_recovery_result(
+                invocation,
+                provider_id=provider_id,
+                connection=connection,
+                app="google-mail",
+            )
+            if recovery_result is not None:
+                return recovery_result
             endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
             message = _connector_json_request(
                 invocation,
@@ -6615,7 +7059,13 @@ def _build_file_search_handler(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"matches": matches},
+            output={
+                "matches": matches,
+                "search_scope": "allowed_roots",
+                "searched_root_count": len(search_roots),
+                "exhausted_scope": not matches,
+                "next_action": "use_terminal_exec_or_ask_for_folder" if not matches else "",
+            },
             error=None,
         )
 
@@ -7019,7 +7469,37 @@ def _build_image_generate_handler(
                 error="source_path must be a string when provided",
             )
         if image_generator is None:
-            return _missing_media_provider_result(invocation, "image_generate")
+            try:
+                from nullion.providers import _fallback_svg_image_generate
+
+                # Image generation is a core artifact operation: if no provider
+                # is wired in, produce a safe local SVG and carry setup guidance
+                # instead of making the tool disappear from this turn.
+                payload = _fallback_svg_image_generate(
+                    raw_prompt,
+                    raw_output_path,
+                    raw_size,
+                    fallback_error="No image-generation provider was registered for this runtime.",
+                )
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="completed",
+                    output={"output_path": raw_output_path, **payload},
+                    error=None,
+                )
+            except Exception as exc:  # pragma: no cover - fallback filesystem guard
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "reason": "provider_not_configured",
+                        "capability": "image_generate",
+                        "setup": format_setup_tip(MEDIA_PROVIDER_SETUP_TIP),
+                    },
+                    error=str(exc),
+                )
         try:
             if raw_source_path:
                 try:
@@ -7057,6 +7537,7 @@ def register_media_plugin(
     audio_transcriber: Callable[[str, str | None], dict[str, object]] | None = None,
     image_text_extractor: Callable[[str], dict[str, object]] | None = None,
     image_generator: Callable[[str, str, str | None], dict[str, object]] | None = None,
+    image_generation_enabled: bool | None = None,
 ) -> ToolRegistry:
     registry.require_plugin_registration_allowed()
     registry.mark_plugin_installed("media_plugin")
@@ -7090,14 +7571,17 @@ def register_media_plugin(
             ),
             _build_image_extract_text_handler(image_text_extractor),
         )
-    try:
-        registry.get_spec("image_generate")
-    except KeyError:
-        if image_generator is not None:
+    if image_generation_enabled is not False:
+        try:
+            registry.get_spec("image_generate")
+        except KeyError:
             registry.register(
                 ToolSpec(
                     name="image_generate",
-                    description="Generate an image file with the configured local image generation provider.",
+                    description=(
+                        "Generate an image file using the configured image model when available, "
+                        "or a safe local SVG fallback when no image model is configured."
+                    ),
                     risk_level=ToolRiskLevel.MEDIUM,
                     side_effect_class=ToolSideEffectClass.WRITE,
                     requires_approval=False,
@@ -7192,7 +7676,11 @@ def register_workspace_plugin(
         registry.register(
             ToolSpec(
                 name="file_search",
-                description="Search for local files inside the workspace.",
+                description=(
+                    "Search for local files inside the configured workspace/allowed roots. "
+                    "If it returns no matches, use the structured next_action to continue with "
+                    "an allowed terminal fallback or ask for a folder boundary."
+                ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
@@ -7931,8 +8419,6 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
             return []
         scored: list[tuple[int, object]] = []
         for candidate in jobs:
-            if not bool(getattr(candidate, "enabled", True)):
-                continue
             candidate_tokens = _significant_cron_tokens(_cron_search_text(candidate))
             overlap = query_tokens.intersection(candidate_tokens)
             fuzzy_overlap = _fuzzy_cron_token_overlap(tuple(query_tokens), tuple(candidate_tokens))
@@ -7945,10 +8431,14 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         return [candidate for score, candidate in scored if score == best_score]
 
     def _unique_cron_name_match(query: str, jobs: list[object]) -> tuple[object | None, list[object]]:
+        def _prefer_enabled_if_possible(candidates: list[object]) -> list[object]:
+            enabled_candidates = [candidate for candidate in candidates if bool(getattr(candidate, "enabled", True))]
+            return enabled_candidates or candidates
+
         ranked: list[tuple[int, object]] = []
         for candidate in jobs:
             rank = _cron_name_match_rank(query, str(getattr(candidate, "name", "") or ""))
-            if rank is None and bool(getattr(candidate, "enabled", True)):
+            if rank is None:
                 search_rank = _cron_reference_match_rank(query, _cron_search_text(candidate))
                 if search_rank is not None:
                     rank = search_rank + 2
@@ -7956,6 +8446,7 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
                 ranked.append((rank, candidate))
         if not ranked:
             descriptive_matches = _descriptive_cron_matches(query, jobs)
+            descriptive_matches = _prefer_enabled_if_possible(descriptive_matches)
             if len(descriptive_matches) == 1:
                 return descriptive_matches[0], descriptive_matches
             if descriptive_matches:
@@ -7963,9 +8454,11 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
             return None, []
         best_rank = min(rank for rank, _candidate in ranked)
         matches = [candidate for rank, candidate in ranked if rank == best_rank]
+        matches = _prefer_enabled_if_possible(matches)
         if len(matches) == 1:
             return matches[0], matches
         descriptive_matches = _descriptive_cron_matches(query, matches)
+        descriptive_matches = _prefer_enabled_if_possible(descriptive_matches)
         if len(descriptive_matches) == 1:
             return descriptive_matches[0], descriptive_matches
         if descriptive_matches:
@@ -8081,7 +8574,9 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
                     "final_text",
                     "message",
                     "result_text",
+                    "planner_status_text",
                     "status_delivered",
+                    "planner_status_owned_by_background",
                 })
             return {
                 key: value
@@ -8249,6 +8744,11 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
                 output["planner_summary"] = planner_summary
             if runner_output.get("status_delivered") is True:
                 output["status_delivered"] = True
+            if runner_output.get("planner_status_owned_by_background") is True:
+                output["planner_status_owned_by_background"] = True
+            planner_status_text = str(runner_output.get("planner_status_text") or "").strip()
+            if planner_status_text:
+                output["planner_status_text"] = planner_status_text
         if removed_media_count:
             output["foreground_media_directive_count"] = removed_media_count
         if isinstance(runner_output, dict):
