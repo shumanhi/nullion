@@ -99,6 +99,27 @@ def _event_text(event: dict[str, object]) -> str:
     )
 
 
+def _event_has_history_search_tool_result(event: dict[str, object]) -> bool:
+    tool_results = event.get("tool_results")
+    if not isinstance(tool_results, list):
+        return False
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        if str(result.get("tool_name") or "") == CHAT_HISTORY_SEARCH_TOOL_NAME:
+            return True
+    return False
+
+
+def _event_has_richer_runtime_metadata(event: dict[str, object]) -> bool:
+    return bool(
+        _event_has_history_search_tool_result(event)
+        or event.get("tool_results")
+        or event.get("branch_id")
+        or event.get("parent_turn_id")
+    )
+
+
 def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     record = {
         "index": index,
@@ -116,7 +137,12 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     return record
 
 
-def _chat_store_history_turns(runtime: object, conversation_id: str) -> list[dict[str, object]]:
+def _chat_store_history_turns(
+    runtime: object,
+    conversation_id: str,
+    *,
+    scan_limit: int | None,
+) -> list[dict[str, object]]:
     if not conversation_id:
         return []
     try:
@@ -131,9 +157,15 @@ def _chat_store_history_turns(runtime: object, conversation_id: str) -> list[dic
     try:
         from nullion.chat_store import ChatStore
 
-        messages = ChatStore(db_path=db_path, key_path=key_path).load_messages(
+        chat_store = ChatStore(db_path=db_path, key_path=key_path)
+        message_limit = (
+            max(1, scan_limit * 2)
+            if scan_limit is not None
+            else max(1, chat_store.message_count(conversation_id))
+        )
+        messages = chat_store.load_messages(
             conversation_id,
-            limit=_MAX_HISTORY_SCAN_LIMIT * 2,
+            limit=message_limit,
         )
     except Exception:
         return []
@@ -202,12 +234,18 @@ def _chat_store_history_turns(runtime: object, conversation_id: str) -> list[dic
                 "source": "chat_history",
             }
         )
-    return turns[-_MAX_HISTORY_SCAN_LIMIT:]
+    if scan_limit is not None:
+        return turns[-scan_limit:]
+    return turns
 
 
-def _dedupe_history_events(events: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+def _dedupe_history_events(
+    events: Iterable[dict[str, object]],
+    *,
+    scan_limit: int | None,
+) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str]] = set()
+    selected_indexes: dict[tuple[str, str], int] = {}
     for event in sorted(
         (dict(item) for item in events if isinstance(item, dict)),
         key=lambda item: _parse_created_at(item.get("created_at")),
@@ -216,42 +254,31 @@ def _dedupe_history_events(events: Iterable[dict[str, object]]) -> list[dict[str
             " ".join(str(event.get("user_message") or "").split()),
             " ".join(str(event.get("assistant_reply") or "").split()),
         )
-        if identity in seen:
+        selected_index = selected_indexes.get(identity)
+        if selected_index is not None:
+            existing = selected[selected_index]
+            if not _event_has_richer_runtime_metadata(existing) and _event_has_richer_runtime_metadata(event):
+                selected[selected_index] = event
             continue
-        seen.add(identity)
+        selected_indexes[identity] = len(selected)
         selected.append(event)
-    return selected[-_MAX_HISTORY_SCAN_LIMIT:]
+    if scan_limit is not None:
+        return selected[-scan_limit:]
+    return selected
 
 
-def _conversation_events_after_reset(runtime: object, store: object, conversation_id: str) -> list[dict[str, object]]:
+def _conversation_events_after_reset(
+    runtime: object,
+    store: object,
+    conversation_id: str,
+    *,
+    full_history: bool,
+) -> list[dict[str, object]]:
     if not conversation_id:
         return []
     event_history: list[dict[str, object]] = []
-    list_after_reset = getattr(store, "list_recent_conversation_events_after_reset", None)
-    if callable(list_after_reset):
-        try:
-            events = list_after_reset(
-                conversation_id,
-                event_type="conversation.chat_turn",
-                limit=_MAX_HISTORY_SCAN_LIMIT,
-            )
-            if isinstance(events, list):
-                event_history = [dict(event) for event in events if isinstance(event, dict)]
-        except Exception:
-            pass
-    if not event_history and callable(getattr(store, "list_recent_conversation_events", None)):
-        list_recent = getattr(store, "list_recent_conversation_events")
-        try:
-            events = list_recent(
-                conversation_id,
-                event_type="conversation.chat_turn",
-                limit=_MAX_HISTORY_SCAN_LIMIT,
-            )
-            if isinstance(events, list):
-                event_history = [dict(event) for event in events if isinstance(event, dict)]
-        except Exception:
-            pass
-    if not event_history and callable(getattr(store, "list_conversation_events", None)):
+    scan_limit = None if full_history else _MAX_HISTORY_SCAN_LIMIT
+    if full_history and callable(getattr(store, "list_conversation_events", None)):
         list_events = getattr(store, "list_conversation_events")
         try:
             events = list_events(conversation_id)
@@ -266,8 +293,55 @@ def _conversation_events_after_reset(runtime: object, store: object, conversatio
                 continue
             if event.get("event_type") == "conversation.chat_turn":
                 selected.append(dict(event))
-        event_history = selected[-_MAX_HISTORY_SCAN_LIMIT:]
-    return _dedupe_history_events([*event_history, *_chat_store_history_turns(runtime, conversation_id)])
+        event_history = selected
+    else:
+        list_after_reset = getattr(store, "list_recent_conversation_events_after_reset", None)
+        if callable(list_after_reset):
+            try:
+                events = list_after_reset(
+                    conversation_id,
+                    event_type="conversation.chat_turn",
+                    limit=_MAX_HISTORY_SCAN_LIMIT,
+                )
+                if isinstance(events, list):
+                    event_history = [dict(event) for event in events if isinstance(event, dict)]
+            except Exception:
+                pass
+        if not event_history and callable(getattr(store, "list_recent_conversation_events", None)):
+            list_recent = getattr(store, "list_recent_conversation_events")
+            try:
+                events = list_recent(
+                    conversation_id,
+                    event_type="conversation.chat_turn",
+                    limit=_MAX_HISTORY_SCAN_LIMIT,
+                )
+                if isinstance(events, list):
+                    event_history = [dict(event) for event in events if isinstance(event, dict)]
+            except Exception:
+                pass
+        if not event_history and callable(getattr(store, "list_conversation_events", None)):
+            list_events = getattr(store, "list_conversation_events")
+            try:
+                events = list_events(conversation_id)
+            except Exception:
+                events = []
+            selected: list[dict[str, object]] = []
+            for event in events if isinstance(events, list) else []:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event_type") == "conversation.session_reset":
+                    selected = []
+                    continue
+                if event.get("event_type") == "conversation.chat_turn":
+                    selected.append(dict(event))
+            event_history = selected[-_MAX_HISTORY_SCAN_LIMIT:]
+    return _dedupe_history_events(
+        [
+            *event_history,
+            *_chat_store_history_turns(runtime, conversation_id, scan_limit=scan_limit),
+        ],
+        scan_limit=scan_limit,
+    )
 
 
 def _ranked_history_events(
@@ -275,6 +349,7 @@ def _ranked_history_events(
     *,
     query: str,
     limit: int,
+    fallback_to_recent_on_no_match: bool,
 ) -> tuple[list[dict[str, object]], bool]:
     ordered = sorted(
         (dict(event) for event in events),
@@ -316,12 +391,16 @@ def _ranked_history_events(
             if token in user_tokens and token in assistant_tokens
         )
         if query_text and query_text in haystack:
-            score += max(1, len(query_tokens))
+            score += max(64, len(query_tokens) * 16)
+        if _event_has_history_search_tool_result(event):
+            score = max(1, score // 4)
         if score > 0:
             direct_scores_by_index[index] = score
             scored.append((score, index, event))
-    if not scored:
+    if not scored and fallback_to_recent_on_no_match:
         return ordered[-limit:], True
+    if not scored:
+        return [], False
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     selected_by_index: dict[int, dict[str, object]] = {}
 
@@ -381,8 +460,19 @@ def _chat_history_search_result(
     arguments = invocation.arguments or {}
     query = str(arguments.get("query") or "").strip()
     limit = _coerce_limit(arguments.get("limit"))
-    events = _conversation_events_after_reset(runtime, store, conversation_id)
-    selected, fallback_to_recent = _ranked_history_events(events, query=query, limit=limit)
+    full_history = bool(query)
+    events = _conversation_events_after_reset(
+        runtime,
+        store,
+        conversation_id,
+        full_history=full_history,
+    )
+    selected, fallback_to_recent = _ranked_history_events(
+        events,
+        query=query,
+        limit=limit,
+        fallback_to_recent_on_no_match=not full_history,
+    )
     records = [_event_record(event, index=index) for index, event in enumerate(selected, start=1)]
     return ToolResult(
         invocation_id=invocation.invocation_id,
@@ -393,6 +483,7 @@ def _chat_history_search_result(
             "query": query,
             "match_count": len(records),
             "searched_turn_count": len(events),
+            "searched_scope": "full_conversation_after_reset" if full_history else "recent_window_after_reset",
             "fallback_to_recent": fallback_to_recent,
             "matches": records,
             "message": (
