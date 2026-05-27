@@ -1158,6 +1158,8 @@ def _replace_owner_memory(store, owner: str, replacements: list[UserMemoryEntry]
     for entry in existing:
         if entry.entry_id in replacement_ids:
             continue
+        if entry.kind is UserMemoryKind.PREFERENCE:
+            continue
         if _remove_memory_entry(store, entry.entry_id):
             removed += 1
     return removed

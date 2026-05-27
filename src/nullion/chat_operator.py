@@ -1136,11 +1136,7 @@ def _handle_verbose_command(message: str) -> str | None:
 def _session_activity_trace_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
     conversation_id = _conversation_id_for_chat(chat_id)
     events = runtime.store.list_conversation_events(conversation_id)
-    reset_index = -1
-    for index, event in enumerate(events):
-        if event.get("event_type") == "conversation.session_reset":
-            reset_index = index
-    for event in reversed(events[reset_index + 1 :]):
+    for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
             continue
         value = event.get("activity_trace_enabled")
@@ -1201,11 +1197,7 @@ def set_verbose_mode_for_chat(runtime: PersistentRuntime | None, *, chat_id: str
 def _session_chat_streaming_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
     conversation_id = _conversation_id_for_chat(chat_id)
     events = runtime.store.list_conversation_events(conversation_id)
-    reset_index = -1
-    for index, event in enumerate(events):
-        if event.get("event_type") == "conversation.session_reset":
-            reset_index = index
-    for event in reversed(events[reset_index + 1 :]):
+    for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
             continue
         value = event.get("chat_streaming_enabled")
@@ -1217,11 +1209,7 @@ def _session_chat_streaming_setting(runtime: PersistentRuntime, *, chat_id: str 
 def _session_thinking_display_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
     conversation_id = _conversation_id_for_chat(chat_id)
     events = runtime.store.list_conversation_events(conversation_id)
-    reset_index = -1
-    for index, event in enumerate(events):
-        if event.get("event_type") == "conversation.session_reset":
-            reset_index = index
-    for event in reversed(events[reset_index + 1 :]):
+    for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
             continue
         value = event.get("thinking_display_enabled")
