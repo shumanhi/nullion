@@ -26045,8 +26045,15 @@ def _remember_web_chat_turn(
     )
     if not conversation_turn_id:
         conversation_turn_id = f"turn-web-{uuid4().hex[:12]}"
+    try:
+        from nullion.connections import workspace_id_for_principal
+
+        workspace_id = workspace_id_for_principal(conversation_id)
+    except Exception:
+        workspace_id = "workspace_admin"
     event = {
         "conversation_id": conversation_id,
+        "workspace_id": workspace_id,
         "event_type": "conversation.chat_turn",
         "turn_id": conversation_turn_id,
         "created_at": datetime.now(UTC).isoformat(),
@@ -27887,6 +27894,10 @@ def _run_turn_sync(
                 "and row-aligned local image artifact paths; do not use terminal_exec for normal spreadsheet creation. "
                 "For typed .pptx or slide deck artifact requirements, use presentation_create with structured slides "
                 "and existing image artifact paths; do not use terminal_exec for normal presentation creation. "
+                "For document-like deliverables such as PDF, DOCX, PPTX, reports, itineraries, and decks, provide "
+                "structured title/sections/slides/text pages so the artifact tool can produce a readable "
+                "report-quality layout. Do not deliver raw browser screenshots, loose image attachments, or "
+                "unformatted text dumps as a substitute for the requested formatted document. "
                 "For binary Office artifacts such as spreadsheets, slide decks, and documents, create the real "
                 "requested file format under the workspace artifact directory with the available artifact or "
                 "terminal tooling; do not substitute Markdown tables or prose. For ordinary saved files, use this "
@@ -28598,6 +28609,15 @@ def _resolve_browser_backend() -> str | None:
     be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip().lower()
     if be:
         return be
+
+    try:
+        from nullion.web_research_policy import preferred_browser_backend_from_env
+
+        preferred_backend = preferred_browser_backend_from_env()
+        if preferred_backend:
+            return preferred_backend
+    except Exception:
+        pass
 
     plugins_env = os.environ.get("NULLION_PLUGINS", "")
     if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):

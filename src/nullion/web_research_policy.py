@@ -68,6 +68,24 @@ def browser_disabled() -> bool:
     return not _truthy_env("NULLION_BROWSER_ENABLED", default=True)
 
 
+def preferred_browser_backend_from_env() -> str | None:
+    if browser_disabled():
+        return None
+    preferred = os.environ.get("NULLION_BROWSER_PREFERRED", "").strip().lower()
+    if preferred not in {"chrome", "chromium", "brave", "edge"}:
+        return None
+    plugin_names: set[str] = set()
+    for env_name in ("NULLION_ENABLED_PLUGINS", "NULLION_PLUGINS"):
+        plugin_names.update(
+            part.strip().lower()
+            for part in os.environ.get(env_name, "").split(",")
+            if part.strip()
+        )
+    if plugin_names.intersection({"browser", "browser_plugin"}):
+        return "auto"
+    return None
+
+
 def should_register_search_plugin(settings: Any) -> bool:
     return api_backed_search_configured(settings)
 

@@ -114,7 +114,7 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_navigate",
-            "Navigate to an HTTP/HTTPS URL, or to a local HTML file generated inside this workspace, in the browser. Returns when the page has loaded.",
+            "Navigate the configured agent browser backend to an HTTP/HTTPS URL, or to a local HTML file generated inside this workspace. Returns when the page has loaded.",
             risk=ToolRiskLevel.MEDIUM,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,

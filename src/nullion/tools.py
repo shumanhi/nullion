@@ -986,7 +986,13 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "type": "string",
                     "description": "Optional destination .docx path. If omitted, Nullion creates one in the artifact directory.",
                 },
-                "title": {"type": "string", "description": "Optional document title used for the heading and default filename."},
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Optional document title used for the heading and default filename. "
+                        "The generated document uses a report-quality layout profile with styled headings, readable spacing, and verified media embeds."
+                    ),
+                },
                 "paragraphs": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1117,7 +1123,13 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "type": "string",
                     "description": "Optional destination .pptx path. If omitted, Nullion creates one in the artifact directory.",
                 },
-                "title": {"type": "string", "description": "Optional deck title used for the default filename."},
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Optional deck title used for the default filename. "
+                        "The generated deck uses a report-quality slide profile with styled titles, readable text, and aspect-ratio-safe media placement."
+                    ),
+                },
                 "slides": {
                     "type": "array",
                     "items": {
@@ -1192,10 +1204,14 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "description": (
                         "Optional report text pages to render into the PDF with extractable text and clickable URL links. "
                         "For reports/tables/cards that include names, prices, citations, listing links, or other "
-                        "readable content, put that content here; image_paths alone creates an image-only PDF."
+                        "readable content, put that content here; image_paths alone creates an image-only PDF. "
+                        "The generated PDF uses a report-quality layout profile; do not use browser screenshots as a substitute for readable report content."
                     ),
                 },
-                "title": {"type": "string", "description": "Optional title used for metadata and default filename."},
+                "title": {
+                    "type": "string",
+                    "description": "Optional title used for metadata, visible report headers, and default filename.",
+                },
                 "page_size": {
                     "type": "string",
                     "enum": ["letter", "a4"],
@@ -4069,7 +4085,8 @@ def _build_document_create_handler(
 
         try:
             from docx import Document
-            from docx.shared import Inches
+            from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+            from docx.shared import Inches, Pt, RGBColor
         except ModuleNotFoundError as exc:
             return ToolResult(
                 invocation.invocation_id,
@@ -4118,9 +4135,34 @@ def _build_document_create_handler(
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Path is outside workspace root: {output_path}")
 
         document = Document()
-        document.add_heading(title, level=1)
+        section = document.sections[0]
+        section.top_margin = Inches(0.65)
+        section.bottom_margin = Inches(0.65)
+        section.left_margin = Inches(0.72)
+        section.right_margin = Inches(0.72)
+        styles = document.styles
+        normal_font = styles["Normal"].font
+        normal_font.name = "Arial"
+        normal_font.size = Pt(10.5)
+        heading_1 = styles["Heading 1"].font
+        heading_1.name = "Arial"
+        heading_1.size = Pt(22)
+        heading_1.bold = True
+        heading_1.color.rgb = RGBColor(17, 24, 39)
+        heading_2 = styles["Heading 2"].font
+        heading_2.name = "Arial"
+        heading_2.size = Pt(15)
+        heading_2.bold = True
+        heading_2.color.rgb = RGBColor(31, 41, 55)
+        try:
+            document.core_properties.title = title
+        except Exception:
+            pass
+        title_paragraph = document.add_heading(title, level=1)
+        title_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
         for paragraph in paragraphs:
-            _document_add_paragraph_with_links(document, paragraph)
+            paragraph_obj = _document_add_paragraph_with_links(document, paragraph)
+            paragraph_obj.paragraph_format.space_after = Pt(7)
 
         embedded_images: list[str] = []
         embedded_screenshots: list[str] = []
@@ -4159,11 +4201,15 @@ def _build_document_create_handler(
                 heading = str(section.get("heading") or "").strip()
                 body = str(section.get("body") or "").strip()
                 if heading:
-                    document.add_heading(heading, level=2)
+                    heading_paragraph = document.add_heading(heading, level=2)
+                    heading_paragraph.paragraph_format.space_before = Pt(10)
+                    heading_paragraph.paragraph_format.space_after = Pt(4)
                 if body:
-                    _document_add_paragraph_with_links(document, body)
+                    body_paragraph = _document_add_paragraph_with_links(document, body)
+                    body_paragraph.paragraph_format.space_after = Pt(7)
                 for bullet in section.get("bullets") or ():
-                    _document_add_paragraph_with_links(document, str(bullet), style="List Bullet")
+                    bullet_paragraph = _document_add_paragraph_with_links(document, str(bullet), style="List Bullet")
+                    bullet_paragraph.paragraph_format.space_after = Pt(3)
                 add_images([str(path) for path in section.get("image_paths") or ()])
                 add_images(
                     [str(path) for path in section.get("screenshot_paths") or ()],
@@ -4221,6 +4267,13 @@ def _build_document_create_handler(
                 "embedded_images": embedded_images,
                 "embedded_screenshots": embedded_screenshots,
                 "skipped_images": skipped_images,
+                "quality_profile": "report_quality_v1",
+                "layout_features": [
+                    "styled_headings",
+                    "readable_margins",
+                    "hyperlinked_urls",
+                    "verified_media_embeds",
+                ],
             },
             None,
         )
@@ -5054,7 +5107,17 @@ def _resolve_presentation_image_paths(
 
 
 def _add_presentation_text(slide, *, title: str, body: str, bullets: list[str], has_images: bool) -> None:
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
     from pptx.util import Inches, Pt
+
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = RGBColor(248, 250, 252)
+    accent = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.16), Inches(7.5))
+    accent.fill.solid()
+    accent.fill.fore_color.rgb = RGBColor(37, 99, 235)
+    accent.line.fill.background()
 
     title_box = slide.shapes.add_textbox(Inches(0.45), Inches(0.25), Inches(9.1), Inches(0.55))
     title_frame = title_box.text_frame
@@ -5063,6 +5126,7 @@ def _add_presentation_text(slide, *, title: str, body: str, bullets: list[str], 
     paragraph.text = title[:120]
     paragraph.font.bold = True
     paragraph.font.size = Pt(28)
+    paragraph.font.color.rgb = RGBColor(17, 24, 39)
 
     text_width = Inches(4.25 if has_images else 9.1)
     body_box = slide.shapes.add_textbox(Inches(0.55), Inches(1.05), text_width, Inches(5.6))
@@ -5077,6 +5141,8 @@ def _add_presentation_text(slide, *, title: str, body: str, bullets: list[str], 
         paragraph = text_frame.paragraphs[0] if first else text_frame.add_paragraph()
         paragraph.text = text[:700]
         paragraph.font.size = Pt(17 if first and body else 15)
+        paragraph.font.color.rgb = RGBColor(31, 41, 55)
+        paragraph.space_after = Pt(7)
         if not first or text in bullets:
             paragraph.level = 0
         first = False
@@ -5084,6 +5150,7 @@ def _add_presentation_text(slide, *, title: str, body: str, bullets: list[str], 
 
 def _add_presentation_images(slide, image_paths: list[Path]) -> tuple[list[str], list[str]]:
     from pptx.util import Inches
+    from PIL import Image
 
     embedded: list[str] = []
     failed: list[str] = []
@@ -5096,7 +5163,16 @@ def _add_presentation_images(slide, image_paths: list[Path]) -> tuple[list[str],
     for index, image_path in enumerate(image_paths[:2]):
         image_top = top + Inches(2.45 * index)
         try:
-            slide.shapes.add_picture(str(image_path), left, image_top, width=max_width, height=max_height)
+            with Image.open(image_path) as image:
+                width_px, height_px = image.size
+            if width_px <= 0 or height_px <= 0:
+                raise ValueError("image has invalid dimensions")
+            scale = min(float(max_width) / float(width_px), float(max_height) / float(height_px))
+            picture_width = int(width_px * scale)
+            picture_height = int(height_px * scale)
+            picture_left = int(left + (max_width - picture_width) / 2)
+            picture_top = int(image_top + (max_height - picture_height) / 2)
+            slide.shapes.add_picture(str(image_path), picture_left, picture_top, width=picture_width, height=picture_height)
             embedded.append(str(image_path))
         except Exception:
             failed.append(str(image_path))
@@ -5275,6 +5351,13 @@ def _build_presentation_create_handler(
                 "embedded_screenshots": embedded_screenshots,
                 "skipped_images": skipped_images,
                 "bytes_written": output_path.stat().st_size,
+                "quality_profile": "report_quality_v1",
+                "layout_features": [
+                    "styled_slide_titles",
+                    "readable_text_layout",
+                    "aspect_ratio_safe_media",
+                    "verified_media_embeds",
+                ],
             },
             None,
         )
@@ -5362,11 +5445,13 @@ def _image_to_pdf_page(path: Path, *, page_size: tuple[int, int]):
 def _text_to_pdf_page(text: str, *, title: str, page_size: tuple[int, int]):
     from PIL import Image, ImageDraw
 
-    page = Image.new("RGB", page_size, "white")
+    page = Image.new("RGB", page_size, "#f8fafc")
     draw = ImageDraw.Draw(page)
     body_font = _load_pdf_font(size_px=_pdf_points_to_px(12))
     title_font = _load_pdf_font(size_px=_pdf_points_to_px(18), bold=True)
+    meta_font = _load_pdf_font(size_px=_pdf_points_to_px(9))
     margin = _pdf_points_to_px(36)
+    header_height = _pdf_points_to_px(46)
     max_width = max(120, page_size[0] - margin * 2)
     body_line_height = max(22, int((draw.textbbox((0, 0), "Ag", font=body_font)[3]) * 1.35))
     title_line_height = max(30, int((draw.textbbox((0, 0), "Ag", font=title_font)[3]) * 1.25))
@@ -5393,18 +5478,27 @@ def _text_to_pdf_page(text: str, *, title: str, page_size: tuple[int, int]):
         lines.append(current)
         return lines
 
-    y = margin
+    draw.rectangle((0, 0, page_size[0], header_height), fill="#111827")
+    y = margin // 2
     if title.strip():
-        draw.text((margin, y), title.strip()[:140], fill="black", font=title_font)
-        y += title_line_height + _pdf_points_to_px(6)
+        draw.text((margin, y), title.strip()[:140], fill="#ffffff", font=title_font)
+    y = header_height + margin
+    draw.rounded_rectangle(
+        (margin // 2, header_height + margin // 2, page_size[0] - margin // 2, page_size[1] - margin // 2),
+        radius=_pdf_points_to_px(8),
+        fill="#ffffff",
+        outline="#e5e7eb",
+        width=max(1, _pdf_points_to_px(1)),
+    )
     for paragraph in str(text or "").splitlines() or [""]:
         lines = wrap_for_width(paragraph)
         for line in lines:
-            if y > page_size[1] - margin:
+            if y > page_size[1] - margin * 2:
                 return page
-            draw.text((margin, y), line, fill="black", font=body_font)
+            draw.text((margin, y), line, fill="#111827", font=body_font)
             y += body_line_height
         y += _pdf_points_to_px(6)
+    draw.text((margin, page_size[1] - margin), "Generated report", fill="#6b7280", font=meta_font)
     return page
 
 
@@ -5439,7 +5533,17 @@ def _pdf_text_html(text: str) -> str:
 
     linked = _TEXT_ARTIFACT_URL_RE.sub(replace_url, escaped)
     paragraphs = [line.strip() for line in linked.splitlines()]
-    return "".join(f"<p>{line or '&nbsp;'}</p>" for line in paragraphs or [""])
+    blocks: list[str] = []
+    for line in paragraphs or [""]:
+        if line.startswith(("- ", "* ")):
+            blocks.append(f"<p class=\"bullet\">{line[2:].strip() or '&nbsp;'}</p>")
+        elif re.match(r"^\d+[\).]\s+", line):
+            blocks.append(f"<p class=\"bullet\">{line}</p>")
+        elif line.endswith(":") and len(line) <= 90:
+            blocks.append(f"<h2>{line[:-1]}</h2>")
+        else:
+            blocks.append(f"<p>{line or '&nbsp;'}</p>")
+    return "".join(blocks)
 
 
 def _pdf_image_data_uri(path: Path) -> str:
@@ -5509,21 +5613,30 @@ def _save_text_pdf_with_chromium(
         text_html = _pdf_text_html(text_pages[index] if index < len(text_pages) else "")
         image_html = ""
         if index < len(image_paths):
-            image_html = f'<img class="product-image" src="{_pdf_image_data_uri(image_paths[index])}" alt="">'
+            image_html = f'<figure><img class="report-image" src="{_pdf_image_data_uri(image_paths[index])}" alt=""></figure>'
         page_blocks.append(
             "<section class=\"page\">"
+            "<header>"
+            f"<h1>{html.escape(title or 'Report')}</h1>"
+            "</header>"
+            "<main>"
             f"{image_html}"
             f"<div class=\"text\">{text_html}</div>"
+            "</main>"
             "</section>"
         )
     html_doc = (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         f"<title>{html.escape(title or 'PDF')}</title>"
         "<style>"
-        "@page{margin:0.55in;} body{font-family:Arial,Helvetica,sans-serif;color:#111827;margin:0;}"
-        ".page{break-after:page;page-break-after:always;} .page:last-child{break-after:auto;page-break-after:auto;}"
-        ".product-image{max-width:2.3in;max-height:2.3in;object-fit:contain;float:right;margin:0 0 0.18in 0.24in;}"
-        "h1{font-size:20px;margin:0 0 12px;} p{font-size:11.5px;line-height:1.35;margin:0 0 7px;}"
+        "@page{margin:0.45in;} body{font-family:Arial,Helvetica,sans-serif;color:#111827;margin:0;background:#f8fafc;}"
+        ".page{break-after:page;page-break-after:always;background:white;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;min-height:9.9in;}"
+        ".page:last-child{break-after:auto;page-break-after:auto;}"
+        "header{background:#111827;color:white;padding:18px 22px;} h1{font-size:20px;line-height:1.15;margin:0;}"
+        "main{padding:22px;} figure{float:right;margin:0 0 16px 22px;padding:8px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;}"
+        ".report-image{max-width:2.35in;max-height:2.2in;object-fit:contain;display:block;}"
+        "h2{font-size:14px;margin:13px 0 7px;color:#1f2937;} p{font-size:11.5px;line-height:1.45;margin:0 0 8px;}"
+        ".bullet{padding-left:14px;text-indent:-10px;} .bullet:before{content:'• ';color:#2563eb;font-weight:bold;}"
         "a{color:#0645ad;text-decoration:underline;word-break:break-word;}"
         "</style></head><body>"
         + "".join(page_blocks)
@@ -5774,6 +5887,13 @@ def _build_pdf_create_handler(
                             "source_image_paths": [str(path) for path in source_images],
                             "source_screenshot_paths": [str(path) for path in source_screenshots],
                             "text_layer": True,
+                            "quality_profile": "report_quality_v1",
+                            "layout_features": [
+                                "styled_report_pages",
+                                "clickable_links",
+                                "readable_text_layout",
+                                "verified_media_embeds",
+                            ],
                         },
                         error=None,
                     )
@@ -5835,6 +5955,12 @@ def _build_pdf_create_handler(
                 "page_count": len(source_images) + len(source_screenshots) + len(text_pages),
                 "source_image_paths": source_images,
                 "source_screenshot_paths": source_screenshots,
+                "quality_profile": "report_quality_v1",
+                "layout_features": [
+                    "styled_report_pages",
+                    "readable_text_layout",
+                    "verified_media_embeds",
+                ],
             },
             error=None,
         )
@@ -7443,6 +7569,7 @@ def _build_kernel_tool_registry(
                 name="document_create",
                 description=(
                     "Create a real .docx document artifact from structured paragraphs, sections, and existing image files. "
+                    "The built-in generator applies a report-quality layout profile; provide structured content instead of raw dumps. "
                     "Use this as the first local document-delivery rung; if it cannot complete, request local shell "
                     "execution as the last-resort local fallback when no external account auth is required."
                 ),
@@ -7486,6 +7613,7 @@ def _build_kernel_tool_registry(
                 name="presentation_create",
                 description=(
                     "Create a real .pptx slide deck artifact from structured slides and existing image files. "
+                    "The built-in generator applies a report-quality layout profile and preserves media aspect ratios. "
                     "Use this as the first local presentation-delivery rung; if it cannot complete, request local shell "
                     "execution as the last-resort local fallback when no external account auth is required."
                 ),
@@ -7505,8 +7633,8 @@ def _build_kernel_tool_registry(
             ToolSpec(
                 name="pdf_create",
                 description=(
-                    "Create a real PDF artifact locally from existing image files and/or simple text pages. "
-                    "Use this for packaging images, reports, or notes into a PDF. "
+                    "Create a real PDF artifact locally from existing image files and/or report text pages. "
+                    "Use text_pages for readable report content; image-only PDFs are only appropriate when the requested deliverable is image pages. "
                     "Try this before terminal_exec; local shell remains the last-resort fallback when this cannot complete."
                 ),
                 risk_level=ToolRiskLevel.MEDIUM,
@@ -9881,7 +10009,7 @@ def register_browser_plugin(
             ToolSpec(
                 name="browser_navigate",
                 description=(
-                    "Drive a real Chromium browser to a SPECIFIC URL you already have, "
+                    "Drive the configured browser automation backend to a SPECIFIC URL you already have, "
                     "and return page metadata. Use this only with a URL from explicit "
                     "runtime evidence, structured tool output, or a model-produced "
                     "structured recovery plan."

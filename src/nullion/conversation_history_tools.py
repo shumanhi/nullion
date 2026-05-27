@@ -1,4 +1,4 @@
-"""Per-turn tool overlay for current conversation history lookup."""
+"""Per-turn tool overlay for current workspace history lookup."""
 
 from __future__ import annotations
 
@@ -26,9 +26,9 @@ _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
 CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
     name=CHAT_HISTORY_SEARCH_TOOL_NAME,
     description=(
-        "Search or inspect the current conversation's saved chat history, including turns "
+        "Search or inspect the current workspace's saved chat history, including turns "
         "older than the visible prompt context. Use this before telling the user that recent "
-        "chat details are unavailable when the answer may be in this same conversation."
+        "chat details are unavailable when the answer may be in this workspace."
     ),
     risk_level=ToolRiskLevel.LOW,
     side_effect_class=ToolSideEffectClass.READ,
@@ -193,11 +193,15 @@ def _tool_names_from_event(event: dict[str, object]) -> list[str]:
 def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     record = {
         "index": index,
+        "conversation_id": str(event.get("conversation_id") or ""),
         "created_at": str(event.get("created_at") or ""),
         "turn_id": str(event.get("turn_id") or ""),
         "user_message": _snippet(event.get("user_message")),
         "assistant_reply": _snippet(event.get("assistant_reply")),
     }
+    workspace_id = str(event.get("workspace_id") or "").strip()
+    if workspace_id:
+        record["workspace_id"] = workspace_id
     score = event.get("_history_match_score")
     if isinstance(score, int):
         record["match_score"] = score
@@ -213,11 +217,41 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     return record
 
 
+def _workspace_id_for_conversation(conversation_id: str | None) -> str:
+    try:
+        from nullion.connections import workspace_id_for_principal
+
+        return str(workspace_id_for_principal(conversation_id)).strip()
+    except Exception:
+        return "workspace_admin"
+
+
+def _event_workspace_id(event: dict[str, object]) -> str:
+    workspace_id = str(event.get("workspace_id") or "").strip()
+    if workspace_id:
+        return workspace_id
+    context = event.get("context")
+    if isinstance(context, dict):
+        workspace_id = str(context.get("workspace_id") or "").strip()
+        if workspace_id:
+            return workspace_id
+    return _workspace_id_for_conversation(str(event.get("conversation_id") or ""))
+
+
+def _event_matches_workspace(event: dict[str, object], *, workspace_id: str) -> bool:
+    expected = str(workspace_id or "").strip()
+    if not expected:
+        return True
+    observed = _event_workspace_id(event)
+    return not observed or observed == expected
+
+
 def _chat_store_history_turns(
     runtime: object,
     conversation_id: str,
     *,
     scan_limit: int | None,
+    workspace_id: str,
 ) -> list[dict[str, object]]:
     if not conversation_id:
         return []
@@ -234,85 +268,133 @@ def _chat_store_history_turns(
         from nullion.chat_store import ChatStore
 
         chat_store = ChatStore(db_path=db_path, key_path=key_path)
-        message_limit = (
-            max(1, scan_limit * 2)
-            if scan_limit is not None
-            else max(1, chat_store.message_count(conversation_id))
+        conversation_ids = _workspace_chat_store_conversation_ids(
+            chat_store,
+            conversation_id=conversation_id,
+            workspace_id=workspace_id,
         )
-        messages = chat_store.load_messages(
-            conversation_id,
-            limit=message_limit,
-        )
+        messages_by_conversation: list[tuple[str, list[dict[str, object]]]] = []
+        for candidate_conversation_id in conversation_ids:
+            message_limit = (
+                max(1, scan_limit * 2)
+                if scan_limit is not None
+                else max(1, chat_store.message_count(candidate_conversation_id))
+            )
+            messages = chat_store.load_messages(
+                candidate_conversation_id,
+                limit=message_limit,
+            )
+            if isinstance(messages, list):
+                messages_by_conversation.append((candidate_conversation_id, messages))
     except Exception:
         return []
     turns: list[dict[str, object]] = []
-    pending_user: dict[str, object] | None = None
-    for message in messages if isinstance(messages, list) else []:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role") or "").strip().lower()
-        text = str(message.get("text") or "").strip()
-        if not text:
-            continue
-        created_at = str(message.get("created_at") or "").strip()
-        message_id = str(message.get("id") or "").strip()
-        if role == "user":
+    for candidate_conversation_id, messages in messages_by_conversation:
+        pending_user: dict[str, object] | None = None
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            text = str(message.get("text") or "").strip()
+            if not text:
+                continue
+            created_at = str(message.get("created_at") or "").strip()
+            message_id = str(message.get("id") or "").strip()
+            if role == "user":
+                if pending_user is not None:
+                    turns.append(
+                        {
+                            "conversation_id": candidate_conversation_id,
+                            "event_type": "conversation.chat_turn",
+                            "created_at": str(pending_user.get("created_at") or created_at),
+                            "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}",
+                            "user_message": str(pending_user.get("text") or ""),
+                            "assistant_reply": "",
+                            "workspace_id": workspace_id,
+                            "source": "chat_history",
+                        }
+                    )
+                pending_user = {"id": message_id, "text": text, "created_at": created_at}
+                continue
+            if role not in {"assistant", "bot"}:
+                continue
             if pending_user is not None:
                 turns.append(
                     {
-                        "conversation_id": conversation_id,
+                        "conversation_id": candidate_conversation_id,
                         "event_type": "conversation.chat_turn",
-                        "created_at": str(pending_user.get("created_at") or created_at),
-                        "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}",
+                        "created_at": created_at or str(pending_user.get("created_at") or ""),
+                        "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}:{message_id or len(turns)}",
                         "user_message": str(pending_user.get("text") or ""),
-                        "assistant_reply": "",
+                        "assistant_reply": text,
+                        "workspace_id": workspace_id,
                         "source": "chat_history",
                     }
                 )
-            pending_user = {"id": message_id, "text": text, "created_at": created_at}
-            continue
-        if role not in {"assistant", "bot"}:
-            continue
+                pending_user = None
+            else:
+                turns.append(
+                    {
+                        "conversation_id": candidate_conversation_id,
+                        "event_type": "conversation.chat_turn",
+                        "created_at": created_at,
+                        "turn_id": f"chat-store:{message_id or len(turns)}",
+                        "user_message": "",
+                        "assistant_reply": text,
+                        "workspace_id": workspace_id,
+                        "source": "chat_history",
+                    }
+                )
         if pending_user is not None:
             turns.append(
                 {
-                    "conversation_id": conversation_id,
+                    "conversation_id": candidate_conversation_id,
                     "event_type": "conversation.chat_turn",
-                    "created_at": created_at or str(pending_user.get("created_at") or ""),
-                    "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}:{message_id or len(turns)}",
+                    "created_at": str(pending_user.get("created_at") or ""),
+                    "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}",
                     "user_message": str(pending_user.get("text") or ""),
-                    "assistant_reply": text,
+                    "assistant_reply": "",
+                    "workspace_id": workspace_id,
                     "source": "chat_history",
                 }
             )
-            pending_user = None
-        else:
-            turns.append(
-                {
-                    "conversation_id": conversation_id,
-                    "event_type": "conversation.chat_turn",
-                    "created_at": created_at,
-                    "turn_id": f"chat-store:{message_id or len(turns)}",
-                    "user_message": "",
-                    "assistant_reply": text,
-                    "source": "chat_history",
-                }
-            )
-    if pending_user is not None:
-        turns.append(
-            {
-                "conversation_id": conversation_id,
-                "event_type": "conversation.chat_turn",
-                "created_at": str(pending_user.get("created_at") or ""),
-                "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}",
-                "user_message": str(pending_user.get("text") or ""),
-                "assistant_reply": "",
-                "source": "chat_history",
-            }
-        )
+    turns.sort(key=lambda event: _parse_created_at(event.get("created_at")))
     if scan_limit is not None:
         return turns[-scan_limit:]
     return turns
+
+
+def _workspace_chat_store_conversation_ids(
+    chat_store: object,
+    *,
+    conversation_id: str,
+    workspace_id: str,
+) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(candidate: object) -> None:
+        candidate_id = str(candidate or "").strip()
+        if not candidate_id or candidate_id in seen:
+            return
+        if workspace_id and _workspace_id_for_conversation(candidate_id) != workspace_id:
+            return
+        selected.append(candidate_id)
+        seen.add(candidate_id)
+
+    list_conversations = getattr(chat_store, "list_conversations", None)
+    if callable(list_conversations):
+        for status in ("active", "archived"):
+            try:
+                conversations = list_conversations(status=status, limit=1000)
+            except Exception:
+                conversations = []
+            for conversation in conversations if isinstance(conversations, list) else []:
+                if isinstance(conversation, dict):
+                    add_candidate(conversation.get("id"))
+
+    add_candidate(conversation_id)
+    return selected
 
 
 def _dedupe_history_events(
@@ -327,6 +409,7 @@ def _dedupe_history_events(
         key=lambda item: _parse_created_at(item.get("created_at")),
     ):
         identity = (
+            str(event.get("conversation_id") or ""),
             " ".join(str(event.get("user_message") or "").split()),
             " ".join(str(event.get("assistant_reply") or "").split()),
         )
@@ -349,28 +432,27 @@ def _conversation_events_after_reset(
     conversation_id: str,
     *,
     full_history: bool,
+    workspace_id: str,
 ) -> list[dict[str, object]]:
     if not conversation_id:
         return []
     event_history: list[dict[str, object]] = []
     scan_limit = None if full_history else _MAX_HISTORY_SCAN_LIMIT
-    if full_history and callable(getattr(store, "list_conversation_events", None)):
+    if callable(getattr(store, "list_conversation_events", None)):
         list_events = getattr(store, "list_conversation_events")
         try:
-            events = list_events(conversation_id)
+            events = list_events()
         except Exception:
-            events = []
-        selected: list[dict[str, object]] = []
-        for event in events if isinstance(events, list) else []:
-            if not isinstance(event, dict):
-                continue
-            if event.get("event_type") == "conversation.session_reset":
-                selected = []
-                continue
-            if event.get("event_type") == "conversation.chat_turn":
-                selected.append(dict(event))
-        event_history = selected
-    else:
+            try:
+                events = list_events(conversation_id)
+            except Exception:
+                events = []
+        event_history = _workspace_chat_turns_after_resets(
+            events if isinstance(events, list) else [],
+            workspace_id=workspace_id,
+            scan_limit=scan_limit,
+        )
+    if not event_history:
         list_after_reset = getattr(store, "list_recent_conversation_events_after_reset", None)
         if callable(list_after_reset):
             try:
@@ -380,7 +462,11 @@ def _conversation_events_after_reset(
                     limit=_MAX_HISTORY_SCAN_LIMIT,
                 )
                 if isinstance(events, list):
-                    event_history = [dict(event) for event in events if isinstance(event, dict)]
+                    event_history = [
+                        dict(event)
+                        for event in events
+                        if isinstance(event, dict) and _event_matches_workspace(event, workspace_id=workspace_id)
+                    ]
             except Exception:
                 pass
         if not event_history and callable(getattr(store, "list_recent_conversation_events", None)):
@@ -392,32 +478,59 @@ def _conversation_events_after_reset(
                     limit=_MAX_HISTORY_SCAN_LIMIT,
                 )
                 if isinstance(events, list):
-                    event_history = [dict(event) for event in events if isinstance(event, dict)]
+                    event_history = [
+                        dict(event)
+                        for event in events
+                        if isinstance(event, dict) and _event_matches_workspace(event, workspace_id=workspace_id)
+                    ]
             except Exception:
                 pass
-        if not event_history and callable(getattr(store, "list_conversation_events", None)):
-            list_events = getattr(store, "list_conversation_events")
-            try:
-                events = list_events(conversation_id)
-            except Exception:
-                events = []
-            selected: list[dict[str, object]] = []
-            for event in events if isinstance(events, list) else []:
-                if not isinstance(event, dict):
-                    continue
-                if event.get("event_type") == "conversation.session_reset":
-                    selected = []
-                    continue
-                if event.get("event_type") == "conversation.chat_turn":
-                    selected.append(dict(event))
-            event_history = selected[-_MAX_HISTORY_SCAN_LIMIT:]
     return _dedupe_history_events(
         [
             *event_history,
-            *_chat_store_history_turns(runtime, conversation_id, scan_limit=scan_limit),
+            *_chat_store_history_turns(
+                runtime,
+                conversation_id,
+                scan_limit=scan_limit,
+                workspace_id=workspace_id,
+            ),
         ],
         scan_limit=scan_limit,
     )
+
+
+def _workspace_chat_turns_after_resets(
+    events: Iterable[dict[str, object]],
+    *,
+    workspace_id: str,
+    scan_limit: int | None,
+) -> list[dict[str, object]]:
+    selected_by_conversation: dict[str, list[dict[str, object]]] = {}
+    for event in sorted(
+        (dict(item) for item in events if isinstance(item, dict)),
+        key=lambda item: _parse_created_at(item.get("created_at")),
+    ):
+        if not _event_matches_workspace(event, workspace_id=workspace_id):
+            continue
+        conversation_id = str(event.get("conversation_id") or "").strip()
+        if not conversation_id:
+            continue
+        event_type = str(event.get("event_type") or "")
+        if event_type == "conversation.session_reset":
+            selected_by_conversation[conversation_id] = []
+            continue
+        if event_type != "conversation.chat_turn":
+            continue
+        selected_by_conversation.setdefault(conversation_id, []).append(event)
+    selected = [
+        event
+        for conversation_events in selected_by_conversation.values()
+        for event in conversation_events
+    ]
+    selected.sort(key=lambda event: _parse_created_at(event.get("created_at")))
+    if scan_limit is not None:
+        return selected[-scan_limit:]
+    return selected
 
 
 def _ranked_history_events(
@@ -468,7 +581,7 @@ def _ranked_history_events(
         )
         if query_text and query_text in haystack:
             score += max(64, len(query_tokens) * 16)
-        if _event_has_history_search_tool_result(event):
+        if score > 0 and _event_has_history_search_tool_result(event):
             score = max(1, score // 4)
         if score > 0:
             direct_scores_by_index[index] = score
@@ -568,6 +681,7 @@ def _chat_history_search_result(
     runtime: object,
     conversation_id: str,
     invocation: ToolInvocation,
+    workspace_id: str | None = None,
 ) -> ToolResult:
     store = getattr(runtime, "store", None)
     if store is None:
@@ -582,11 +696,13 @@ def _chat_history_search_result(
     query = str(arguments.get("query") or "").strip()
     limit = _coerce_limit(arguments.get("limit"))
     full_history = bool(query)
+    workspace_id = str(workspace_id or _workspace_id_for_conversation(conversation_id)).strip()
     events = _conversation_events_after_reset(
         runtime,
         store,
         conversation_id,
         full_history=full_history,
+        workspace_id=workspace_id,
     )
     selected, fallback_to_recent = _ranked_history_events(
         events,
@@ -610,10 +726,11 @@ def _chat_history_search_result(
         status="completed",
         output={
             "conversation_id": conversation_id,
+            "workspace_id": workspace_id,
             "query": query,
             "match_count": len(records),
             "searched_turn_count": len(events),
-            "searched_scope": "full_conversation_after_reset" if full_history else "recent_window_after_reset",
+            "searched_scope": "full_workspace_after_reset" if full_history else "recent_workspace_after_reset",
             "fallback_to_recent": fallback_to_recent,
             "matches": records,
             "structured_matches": structured_records,
@@ -629,10 +746,18 @@ def _chat_history_search_result(
 class ConversationHistoryToolRegistry:
     """Read-through registry that adds a current-conversation history search tool."""
 
-    def __init__(self, delegate: object, *, runtime: object, conversation_id: str) -> None:
+    def __init__(
+        self,
+        delegate: object,
+        *,
+        runtime: object,
+        conversation_id: str,
+        workspace_id: str | None = None,
+    ) -> None:
         self._delegate = delegate
         self._runtime = runtime
         self._conversation_id = conversation_id
+        self._workspace_id = str(workspace_id or _workspace_id_for_conversation(conversation_id)).strip()
 
     def get_spec(self, name: str):
         if name == CHAT_HISTORY_SEARCH_TOOL_NAME:
@@ -668,6 +793,7 @@ class ConversationHistoryToolRegistry:
                 runtime=self._runtime,
                 conversation_id=self._conversation_id,
                 invocation=invocation,
+                workspace_id=self._workspace_id,
             )
         return self._delegate.invoke(invocation)
 
@@ -680,6 +806,7 @@ def with_conversation_history_tool(
     *,
     runtime: object,
     conversation_id: str | None,
+    workspace_id: str | None = None,
 ) -> object:
     normalized_conversation_id = str(conversation_id or "").strip()
     if registry is None or not normalized_conversation_id or getattr(runtime, "store", None) is None:
@@ -697,6 +824,7 @@ def with_conversation_history_tool(
         registry,
         runtime=runtime,
         conversation_id=normalized_conversation_id,
+        workspace_id=workspace_id,
     )
 
 

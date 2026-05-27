@@ -941,6 +941,7 @@ class BrowserTools:
             context.get("isolated_browser_session")
             or context.get("scheduled_task_run")
             or context.get("browser_session_scope")
+            or invocation.capsule_id
         )
 
     def _isolated_default_scope(self, invocation: ToolInvocation) -> str:

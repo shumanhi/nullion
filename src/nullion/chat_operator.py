@@ -3526,6 +3526,7 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         "- For typed .docx artifact requirements, use document_create with structured paragraphs, sections, and existing image artifact paths. Do not use terminal_exec for normal document creation.\n"
         "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, direct row-specific source links, and row-aligned local image artifact paths. Do not use terminal_exec for normal spreadsheet creation.\n"
         "- For typed .pptx or slide deck artifact requirements, use presentation_create with structured slides and existing image artifact paths. Do not use terminal_exec for normal presentation creation.\n"
+        "- For document-like deliverables such as PDF, DOCX, PPTX, reports, itineraries, and decks, provide structured title/sections/slides/text pages so the artifact tool can produce a readable report-quality layout. Do not deliver raw browser screenshots, loose image attachments, or unformatted text dumps as a substitute for the requested formatted document.\n"
         "- For ordinary saved files, use this user's workspace file folder.\n"
         f"{workspace_storage_text}\n"
         + (f"{workspace_registry_text}\n" if workspace_registry_text else "")
@@ -4653,6 +4654,12 @@ def _remember_chat_turn(
     if len(thread) > _MAX_CHAT_TURNS:
         del thread[:-_MAX_CHAT_TURNS]
 
+    try:
+        from nullion.connections import workspace_id_for_principal
+
+        workspace_id = workspace_id_for_principal(conversation_id)
+    except Exception:
+        workspace_id = "workspace_admin"
     now = datetime.now(UTC)
     existing_turn = (
         runtime.store.get_conversation_turn(conversation_turn_id)
@@ -4719,6 +4726,7 @@ def _remember_chat_turn(
     runtime.store.add_conversation_event(
         {
             "conversation_id": conversation_id,
+            "workspace_id": workspace_id,
             "event_type": "conversation.chat_turn",
             "created_at": now.isoformat(),
             "chat_id": chat_id,

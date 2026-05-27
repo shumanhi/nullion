@@ -205,6 +205,7 @@ def _artifact_paths_from_tool_result(
     *,
     runtime_store=None,
     include_file_write_path: bool = True,
+    include_browser_screenshot_path: bool = True,
 ) -> list[str]:
     if result.status != "completed":
         return []
@@ -217,6 +218,8 @@ def _artifact_paths_from_tool_result(
         elif isinstance(value, str) and value:
             forwarded_paths.append(value)
     if forwarded_paths:
+        if result.tool_name == "browser_screenshot" and not include_browser_screenshot_path:
+            return []
         return list(dict.fromkeys(forwarded_paths))
     if result.tool_name == "file_write" and include_file_write_path:
         path = output.get("path")
@@ -243,7 +246,7 @@ def _artifact_paths_from_tool_result(
             output["artifact_path"] = path
             output["artifact_paths"] = [path]
             output.pop("image_base64", None)
-            return [path]
+            return [path] if include_browser_screenshot_path else []
         except Exception:
             logger.warning("Failed to materialize browser screenshot artifact", exc_info=True)
     return []
@@ -1967,6 +1970,7 @@ def _execute_agent_turn_tool_uses(
             result,
             runtime_store=runtime_store,
             include_file_write_path=has_artifact_delivery_contract,
+            include_browser_screenshot_path=has_artifact_delivery_contract,
         )
         artifacts.extend(new_artifacts)
         if runtime_store is not None:

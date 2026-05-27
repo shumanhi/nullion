@@ -54,6 +54,7 @@ _MEDIA_ARTIFACT_FAILURE_REASONS = frozenset(
         "artifact_media_embed_failed",
         "artifact_media_inputs_failed",
         "artifact_media_required_by_prior_failure",
+        "artifact_media_required_by_prior_collection",
         "artifact_media_required_by_turn_contract",
         "spreadsheet_embed_paths_failed",
         "remote_image_paths_not_supported",
@@ -221,6 +222,20 @@ def _browser_image_collection_failed(result: ToolResult) -> bool:
     )
 
 
+def _browser_image_collection_paths(result: ToolResult) -> tuple[str, ...]:
+    if str(getattr(result, "tool_name", "") or "") != "browser_image_collect":
+        return ()
+    if normalize_tool_status(getattr(result, "status", None)) != "completed":
+        return ()
+    output = result.output if isinstance(result.output, dict) else {}
+    paths: list[str] = []
+    for key in ("image_paths", "artifact_paths"):
+        values = output.get(key)
+        if isinstance(values, (list, tuple)):
+            paths.extend(str(value).strip() for value in values if isinstance(value, str) and value.strip())
+    return tuple(dict.fromkeys(paths))
+
+
 def _browser_page_context_used(result: ToolResult) -> bool:
     tool_name = str(getattr(result, "tool_name", "") or "")
     return tool_name.startswith("browser_") and tool_name not in {"browser_image_collect", "browser_screenshot"}
@@ -242,7 +257,18 @@ def _artifact_result_required_media_extensions(result: ToolResult) -> tuple[str,
 
 def artifact_media_required_extensions(tool_results: Iterable[ToolResult] | None) -> tuple[str, ...]:
     extensions: list[str] = []
+    collected_browser_images_pending = False
     for result in tool_results or ():
+        if _browser_image_collection_paths(result):
+            collected_browser_images_pending = True
+            continue
+        extension = _artifact_media_tool_extension(getattr(result, "tool_name", None))
+        if collected_browser_images_pending and extension is not None:
+            output = result.output if isinstance(result.output, dict) else {}
+            if normalize_tool_status(getattr(result, "status", None)) == "completed" and _artifact_media_count(output) > 0:
+                collected_browser_images_pending = False
+            elif extension not in extensions:
+                extensions.append(extension)
         for extension in _artifact_result_required_media_extensions(result):
             if extension not in extensions:
                 extensions.append(extension)
@@ -255,7 +281,11 @@ def artifact_media_embedding_was_required(tool_results: Iterable[ToolResult] | N
 
 def artifact_media_embedding_obligation_outstanding(tool_results: Iterable[ToolResult] | None) -> bool:
     outstanding: set[str] = set()
+    collected_browser_images_pending = False
     for result in tool_results or ():
+        if _browser_image_collection_paths(result):
+            collected_browser_images_pending = True
+            continue
         for extension in _artifact_result_required_media_extensions(result):
             outstanding.add(extension)
         extension = _artifact_media_tool_extension(getattr(result, "tool_name", None))
@@ -264,7 +294,10 @@ def artifact_media_embedding_obligation_outstanding(tool_results: Iterable[ToolR
         output = result.output if isinstance(result.output, dict) else {}
         if normalize_tool_status(getattr(result, "status", None)) == "completed" and _artifact_media_count(output) > 0:
             outstanding.discard(extension)
+            collected_browser_images_pending = False
             continue
+        if collected_browser_images_pending:
+            outstanding.add(extension)
         if _artifact_result_reports_media_failure(result):
             outstanding.add(extension)
     return bool(outstanding)
@@ -287,7 +320,11 @@ def artifact_completed_embedded_media_paths(tool_results: Iterable[ToolResult] |
 def artifact_plain_replacement_artifact_paths(tool_results: Iterable[ToolResult] | None) -> tuple[str, ...]:
     outstanding: set[str] = set()
     paths: list[str] = []
+    collected_browser_images_pending = False
     for result in tool_results or ():
+        if _browser_image_collection_paths(result):
+            collected_browser_images_pending = True
+            continue
         for extension in _artifact_result_required_media_extensions(result):
             outstanding.add(extension)
         extension = _artifact_media_tool_extension(getattr(result, "tool_name", None))
@@ -297,6 +334,9 @@ def artifact_plain_replacement_artifact_paths(tool_results: Iterable[ToolResult]
         if normalize_tool_status(getattr(result, "status", None)) == "completed":
             if _artifact_media_count(output) > 0:
                 outstanding.discard(extension)
+                collected_browser_images_pending = False
+            elif collected_browser_images_pending:
+                paths.extend(_artifact_result_paths(result))
             elif extension in outstanding:
                 paths.extend(_artifact_result_paths(result))
             continue
@@ -336,7 +376,11 @@ def artifact_media_plain_replacement_guard_result(
     if extension is None:
         return None
     outstanding_extensions = set(normalize_artifact_media_required_extensions(required_embedded_media_extensions))
+    collected_browser_images_available = False
     for result in prior_tool_results or ():
+        if _browser_image_collection_paths(result):
+            collected_browser_images_available = True
+            continue
         outstanding_extensions.update(_artifact_result_required_media_extensions(result))
         result_extension = _artifact_media_tool_extension(getattr(result, "tool_name", None))
         if result_extension is None:
@@ -344,9 +388,12 @@ def artifact_media_plain_replacement_guard_result(
         output = result.output if isinstance(result.output, dict) else {}
         if normalize_tool_status(getattr(result, "status", None)) == "completed" and _artifact_media_count(output) > 0:
             outstanding_extensions.discard(result_extension)
+            collected_browser_images_available = False
             continue
         if _artifact_result_reports_media_failure(result):
             outstanding_extensions.add(result_extension)
+    if collected_browser_images_available:
+        outstanding_extensions.add(extension)
     if extension not in outstanding_extensions:
         return None
     if _artifact_invocation_has_media_inputs(invocation):
@@ -356,11 +403,15 @@ def artifact_media_plain_replacement_guard_result(
     reason = (
         "artifact_media_required_by_turn_contract"
         if first_attempt_required
+        else "artifact_media_required_by_prior_collection"
+        if collected_browser_images_available
         else "artifact_media_required_by_prior_failure"
     )
     error_prefix = (
         f"This turn requires the {label} artifact to contain embedded image/screenshot media. "
         if first_attempt_required
+        else f"Browser/page image artifacts were already collected for this turn's {label} artifact. "
+        if collected_browser_images_available
         else f"A previous {label} artifact tool call in this turn attempted image/screenshot embedding and failed. "
     )
     error = (

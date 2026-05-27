@@ -143,7 +143,8 @@
 - If you find uncommitted changes on `main`, stop and report them. Do not stage, amend, squash, reset, or commit them unless the user explicitly asks.
 - Agent work should happen on the pinned branch when one exists, otherwise on a user-named feature/bugfix branch, not on `main`.
 - Do not push directly to `main`. Work on a `nullion/...` branch and open a pull request.
-- Treat every push as a paid CI-triggering action. Do not push, force-push, or rerun remote workflows unless the user explicitly asks for that exact paid action after seeing the local verification result.
+- Treat every push as a paid CI-triggering action. Do not push, force-push, or rerun remote workflows unless the user explicitly grants permission for that exact individual push after seeing the local verification result.
+- Push permission is single-use. A prior "push", "keep going", "ship", "merge", or release-prep approval in the same conversation does not authorize any later push, force-push, rerun, or new CI-triggering remote action. Ask again and wait for an explicit yes before each push.
 - Before any push, run the strongest relevant local verification first, including the private suite from `nullion-test` when app changes can affect it. Report the exact command outcome and remaining risk before asking for push approval.
 - Never use `--no-verify`, `NULLION_SKIP_PRIVATE_TESTS=1`, or `NULLION_SKIP_IMPORTANT_CHECKS=1` for a push unless the user explicitly approves bypassing that specific gate.
 - If local verification fails because of hooks, environment, repo metadata, missing deps, or test harness issues, fix that local root cause and rerun locally. Do not discover those failures by burning CI runs.

@@ -46,6 +46,7 @@ from nullion.tools import (
 from nullion.web_research_policy import (
     default_browser_backend_for_web_research,
     direct_web_fetch_enabled,
+    preferred_browser_backend_from_env,
     should_register_search_plugin,
 )
 
@@ -149,6 +150,9 @@ def _resolve_browser_backend() -> str | None:
     be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip().lower()
     if be:
         return be
+    preferred_backend = preferred_browser_backend_from_env()
+    if preferred_backend:
+        return preferred_backend
     plugins_env = os.environ.get("NULLION_PLUGINS", "")
     if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):
         return "auto"
