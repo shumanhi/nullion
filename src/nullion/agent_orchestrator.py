@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, Iterable, Mapping, TypedDict
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -19,6 +19,7 @@ from langgraph.graph import END, START, StateGraph
 
 from nullion.missions import MissionContinuationPolicy, MissionRecord, MissionStep
 from nullion.mini_agent_runs import MiniAgentRunStatus, create_mini_agent_run, transition_mini_agent_run_status
+from nullion.messaging_delivery_contract import foreground_reply_should_be_suppressed
 from nullion.prompt_injection import (
     UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END,
     UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START,
@@ -32,7 +33,11 @@ from nullion.response_sanitizer import (
     safe_raw_tool_payload_replacement,
     sanitize_user_visible_reply,
 )
-from nullion.response_fulfillment_contract import evaluate_response_fulfillment
+from nullion.response_fulfillment_contract import (
+    evaluate_response_fulfillment,
+    artifact_media_plain_replacement_guard_result,
+    normalize_artifact_media_required_extensions,
+)
 from nullion.runtime import (
     mark_mission_completed,
     mark_mission_failed,
@@ -41,7 +46,7 @@ from nullion.runtime import (
 )
 from nullion.suspended_turns import SuspendedTurn
 from nullion.thinking_display import extract_thinking_text
-from nullion.tools import ToolInvocation, ToolRegistry, ToolResult
+from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +105,24 @@ def _apply_planner_timeout_policy(group: Any, *, single_task_fast_path: bool) ->
 
 
 def _task_has_artifact_delivery_scope(task: Any) -> bool:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if bool(metadata.get("requires_artifact_delivery") or metadata.get("required_artifact_kind")):
+        return True
+    artifact_role = str(metadata.get("artifact_role") or "").strip()
+    if artifact_role in {"deliverable", "deliver_receipt", "verify"}:
+        return True
     allowed_tools = {str(tool) for tool in (getattr(task, "allowed_tools", None) or [])}
     return bool(allowed_tools.intersection(_ARTIFACT_RECOVERY_TOOLS))
+
+
+def _task_has_explicit_artifact_delivery_contract(task: Any) -> bool:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if bool(metadata.get("requires_artifact_delivery") or metadata.get("required_artifact_kind")):
+        return True
+    artifact_role = str(metadata.get("artifact_role") or "").strip()
+    return artifact_role in {"deliver_receipt", "verify"}
 
 
 def _task_is_scheduled_background_run(task: Any) -> bool:
@@ -118,7 +139,6 @@ def _mini_agent_run_metadata_for_task(task: Any) -> dict[str, object]:
         "scheduled_task_run",
         "no_user_input_requests",
         "authoritative_scheduled_task_context",
-        "cached_cron_dispatch_plan",
     ):
         if metadata.get(key):
             compact[key] = True
@@ -180,7 +200,12 @@ def _run_tool_cleanup_hooks(tool_registry: ToolRegistry, scope_id: str) -> None:
         logger.debug("Tool cleanup failed for scope %s", scope_id, exc_info=True)
 
 
-def _artifact_paths_from_tool_result(result: ToolResult, *, runtime_store=None) -> list[str]:
+def _artifact_paths_from_tool_result(
+    result: ToolResult,
+    *,
+    runtime_store=None,
+    include_file_write_path: bool = True,
+) -> list[str]:
     if result.status != "completed":
         return []
     output = result.output if isinstance(result.output, dict) else {}
@@ -193,7 +218,7 @@ def _artifact_paths_from_tool_result(result: ToolResult, *, runtime_store=None) 
             forwarded_paths.append(value)
     if forwarded_paths:
         return list(dict.fromkeys(forwarded_paths))
-    if result.tool_name == "file_write":
+    if result.tool_name == "file_write" and include_file_write_path:
         path = output.get("path")
         return [path] if isinstance(path, str) and path else []
     if result.tool_name == "image_generate":
@@ -222,6 +247,23 @@ def _artifact_paths_from_tool_result(result: ToolResult, *, runtime_store=None) 
         except Exception:
             logger.warning("Failed to materialize browser screenshot artifact", exc_info=True)
     return []
+
+
+def _turn_has_artifact_delivery_contract(state: Mapping[str, Any]) -> bool:
+    tool_registry = state.get("tool_registry")
+    if _required_attachment_extensions_from_turn_scope(tool_registry):
+        return True
+    evidence = getattr(tool_registry, "_evidence", None)
+    if tuple(getattr(evidence, "requested_extensions", ()) or ()):
+        return True
+    if _required_embedded_media_extensions_from_turn_state(state):
+        return True
+    flow_context = state.get("tool_flow_context")
+    return isinstance(flow_context, dict) and bool(
+        flow_context.get("requires_artifact_delivery")
+        or flow_context.get("artifact_extensions")
+        or flow_context.get("required_artifact_extensions")
+    )
 
 
 def _artifact_root_snapshot(runtime_store, *, principal_id: str | None = None) -> dict[str, tuple[int, int]]:
@@ -424,6 +466,25 @@ def _malformed_tool_call_result(*, principal_id: str, reason: str, block: object
 def _terminal_tool_failure_text(result: ToolResult) -> str | None:
     output = result.output if isinstance(result.output, dict) else {}
     reason = output.get("reason")
+    if result.tool_name == "run_cron" and result.status == "failed":
+        matches = output.get("matches")
+        if isinstance(matches, list) and matches:
+            lines = []
+            for item in matches:
+                if not isinstance(item, dict):
+                    continue
+                index = str(item.get("selection_index") or item.get("reply_with") or "").strip()
+                name = str(item.get("name") or "").strip()
+                if index and name:
+                    lines.append(f"{index}. {name}")
+            if lines:
+                return "I found multiple matching cron jobs. Which one should I use?\n\n" + "\n".join(
+                    lines
+                ) + "\n\nReply with the number."
+        if result.error and str(result.error).startswith("No cron found"):
+            lookup = str(output.get("name") or output.get("id") or "").strip()
+            target = f" for `{lookup}`" if lookup else ""
+            return f"I couldn't find a scheduled cron job{target}."
     if (
         result.tool_name == "run_cron"
         and result.status == "failed"
@@ -442,7 +503,7 @@ def _foreground_suppressed_tool_completion_text(result: ToolResult) -> str | Non
     if result.status != "completed":
         return None
     output = result.output if isinstance(result.output, dict) else {}
-    if output.get("foreground_reply_suppressed") is not True:
+    if not foreground_reply_should_be_suppressed([result]):
         return None
     message = str(output.get("message") or "").strip()
     delivery_status = str(output.get("delivery_status") or "").strip()
@@ -514,7 +575,7 @@ def _tool_result_completion_text(tool_results: list[ToolResult], *, include_untr
         if result.status != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
-        if output.get("foreground_reply_suppressed") is True:
+        if foreground_reply_should_be_suppressed([result]):
             continue
         if is_untrusted_tool_name(result.tool_name):
             if not include_untrusted_fallback:
@@ -538,7 +599,7 @@ def _authoritative_tool_completion_text(tool_results: list[ToolResult]) -> str |
         if result.status != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
-        if output.get("foreground_reply_suppressed") is True:
+        if foreground_reply_should_be_suppressed([result]):
             continue
         value = output.get("delivery_text") or output.get("final_text") or output.get("result_text")
         if isinstance(value, str) and value.strip():
@@ -551,7 +612,7 @@ def _tool_result_structured_text(tool_results: list[ToolResult]) -> str | None:
         if result.status != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
-        if output.get("foreground_reply_suppressed") is True:
+        if foreground_reply_should_be_suppressed([result]):
             continue
         if is_untrusted_tool_name(result.tool_name):
             continue
@@ -830,10 +891,150 @@ def _required_tool_names_from_turn_scope(tool_registry: object | None) -> tuple[
     return tuple(
         dict.fromkeys(
             str(tool_name or "").strip()
-            for tool_name in (getattr(decision, "requested_tool_names", ()) or ())
+            for tool_name in (getattr(decision, "required_tool_names", ()) or ())
             if str(tool_name or "").strip()
         )
     )
+
+
+def _required_attachment_extensions_from_turn_scope(tool_registry: object | None) -> tuple[str, ...]:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(extension or "").strip().lower()
+            for extension in (getattr(decision, "requested_artifact_extensions", ()) or ())
+            if str(extension or "").strip().startswith(".")
+        )
+    )
+
+
+def _required_embedded_media_extensions_from_turn_scope(tool_registry: object | None) -> tuple[str, ...]:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return ()
+    return normalize_artifact_media_required_extensions(
+        getattr(decision, "required_embedded_media_extensions", ()) or ()
+    )
+
+
+def _required_embedded_media_extensions_from_turn_state(state: Mapping[str, object]) -> tuple[str, ...]:
+    extensions: list[str] = []
+    flow_context = state.get("tool_flow_context")
+    if isinstance(flow_context, dict):
+        for key in (
+            "required_embedded_media_extensions",
+            "embedded_media_artifact_extensions",
+            "media_required_artifact_extensions",
+        ):
+            for extension in normalize_artifact_media_required_extensions(flow_context.get(key)):
+                if extension not in extensions:
+                    extensions.append(extension)
+    for extension in _required_embedded_media_extensions_from_turn_scope(state.get("tool_registry")):
+        if extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+_SCHEDULER_RUN_ACTION_TOOLS = frozenset({"run_cron"})
+_SCHEDULER_MUTATE_ACTION_TOOLS = frozenset(
+    {
+        "create_cron",
+        "delete_cron",
+        "set_reminder",
+        "toggle_cron",
+        "update_cron",
+    }
+)
+_SCHEDULER_READ_ACTION_TOOLS = frozenset({"list_crons", "list_reminders"})
+
+
+def _completed_tool_names(tool_results: Iterable[ToolResult] | None) -> set[str]:
+    return {
+        str(getattr(result, "tool_name", "") or "")
+        for result in (tool_results or ())
+        if normalize_tool_status(getattr(result, "status", None)) == "completed"
+    }
+
+
+def _scope_requested_capabilities(tool_results: Iterable[ToolResult] | None) -> set[str]:
+    capabilities: set[str] = set()
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "request_tool_scope":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        raw_capabilities = output.get("capabilities")
+        if isinstance(raw_capabilities, list):
+            capabilities.update(
+                str(capability or "").strip().lower()
+                for capability in raw_capabilities
+                if str(capability or "").strip()
+            )
+    return capabilities
+
+
+def _scheduler_action_contract(tool_registry: object | None, tool_results: Iterable[ToolResult] | None) -> str:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    capabilities = _scope_requested_capabilities(tool_results)
+    if "scheduler_mutate" in capabilities:
+        scheduler_action = "mutate"
+    elif "scheduler_run" in capabilities and scheduler_action != "mutate":
+        scheduler_action = "run"
+    return scheduler_action if scheduler_action in {"run", "mutate"} else ""
+
+
+def _scheduler_action_contract_missing(
+    *,
+    tool_registry: object | None,
+    tool_results: Iterable[ToolResult] | None,
+) -> str:
+    action = _scheduler_action_contract(tool_registry, tool_results)
+    if not action:
+        return ""
+    completed = _completed_tool_names(tool_results)
+    if action == "mutate" and not completed.intersection(_SCHEDULER_MUTATE_ACTION_TOOLS):
+        return "scheduler mutation"
+    if action == "run" and not completed.intersection(_SCHEDULER_RUN_ACTION_TOOLS):
+        return "scheduler run"
+    return ""
+
+
+def _missing_scope_action_nudge(missing: str) -> str:
+    if missing == "scheduler mutation":
+        return (
+            "The current tool scope is for changing a scheduled task or reminder, but only read tools "
+            "have completed. Continue the same user request by running the appropriate registered "
+            "scheduler mutation tool, or ask the user for the missing schedule/detail. Do not finish by "
+            "listing scheduled tasks."
+        )
+    if missing == "scheduler run":
+        return (
+            "The current tool scope is for starting a scheduled task run, but no run tool has completed. "
+            "Continue the same user request by running the selected scheduled task, or ask the user which "
+            "scheduled task to run. Do not finish by listing scheduled tasks."
+        )
+    return (
+        "The requested action has not completed yet. Continue the same user request using the registered "
+        "tool required for the action, or ask the user for the missing detail."
+    )
+
+
+def _missing_scope_action_final_reply(missing: str) -> str:
+    if missing == "scheduler mutation":
+        return (
+            "I did not create or update a scheduled task yet. I need the missing schedule or task detail "
+            "before I can complete it."
+        )
+    if missing == "scheduler run":
+        return (
+            "I did not start a scheduled task run yet. I need the specific scheduled task selection before "
+            "I can run it."
+        )
+    return "I did not complete the requested action yet. I need one more detail before I can finish it."
 
 
 def _artifact_roots_for_agent_turn(runtime_store: object, principal_id: str) -> tuple[Any, ...]:
@@ -899,6 +1100,15 @@ def _tool_failure_fingerprint(*, result: ToolResult, invocation_signature: str) 
         "invocation": invocation_signature,
         "status": result.status,
     }
+    if result.tool_name == "connector_request":
+        # Connector retries often vary URL/operation while failing for the same
+        # capability/provider reason. Count those together so recovery can move
+        # to another available tool family before the agent loops.
+        failure_shape = {
+            "tool_name": result.tool_name,
+            "status": result.status,
+            "provider_id": output.get("provider_id"),
+        }
     for key in ("reason", "network_mode", "requires_approval"):
         value = output.get(key)
         if value is not None:
@@ -987,6 +1197,19 @@ class _BlockedToolRegistry:
             if not self._is_blocked(definition.get("name"))
         ]
 
+    def filesystem_allowed_roots(self):
+        roots = getattr(self._delegate, "filesystem_allowed_roots", None)
+        if callable(roots):
+            return roots()
+        return ()
+
+    def set_filesystem_allowed_roots(self, roots) -> None:
+        setter = getattr(self._delegate, "set_filesystem_allowed_roots", None)
+        if callable(setter):
+            setter(roots)
+            return
+        setattr(self._delegate, "_filesystem_allowed_roots", tuple(Path(root).resolve() for root in roots))
+
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
         if self._is_blocked(invocation.tool_name):
             return ToolResult(
@@ -1030,6 +1253,7 @@ def _synthetic_recovery_scope_result(
             [
                 "web_search",
                 "web_fetch",
+                "browser_open",
                 "browser_navigate",
                 "browser_extract_text",
                 "browser_find",
@@ -1077,7 +1301,7 @@ def _maybe_widen_scope_after_repeated_tool_failure(
     skipped_scopes = set(tool_recovery_scopes_attempted)
     if {"web", "local_shell"}.issubset(skipped_scopes):
         return None
-    failure_limit = int(state.get("repeated_failure_limit") or _repeated_tool_failure_limit())
+    failure_limit = _connector_recovery_failure_limit(state)
     connector_failure_count = _failed_tool_result_count(tool_results, tool_name="connector_request")
     if connector_failure_count < failure_limit and not _connector_failure_has_public_url_evidence(tool_results):
         return None
@@ -1109,6 +1333,105 @@ def _maybe_widen_scope_after_repeated_tool_failure(
                 continue
             return widened_registry, scope_result, recovery_scope
     return _synthetic_recovery_scope_result(state, tool_registry=tool_registry, skipped_scopes=skipped_scopes)
+
+
+def _scope_recovery_capabilities_for_tool_name(tool_name: str) -> tuple[str, ...]:
+    normalized = str(tool_name or "").strip().lower()
+    if not normalized:
+        return ()
+    if normalized.startswith("browser_") or normalized.startswith("web_"):
+        return ("web",)
+    if normalized in {"terminal_exec"}:
+        return ("local_shell",)
+    if normalized in {"file_read", "file_write", "file_search", "file_patch", "workspace_summary"}:
+        return ("local_files", "local_shell")
+    if normalized == "weather_forecast":
+        return ("weather",)
+    if normalized == "image_generate":
+        return ("image_generation",)
+    if normalized in {
+        "list_crons",
+        "list_reminders",
+        "run_cron",
+        "create_cron",
+        "update_cron",
+        "delete_cron",
+        "toggle_cron",
+        "set_reminder",
+    }:
+        if normalized in {"run_cron"}:
+            return ("scheduler_run", "scheduler_read")
+        if normalized in {"list_crons", "list_reminders"}:
+            return ("scheduler_read",)
+        return ("scheduler_mutate", "scheduler_read")
+    if normalized.startswith("connector_") or normalized.startswith("email_") or normalized.startswith("calendar_") or normalized.startswith("contacts_"):
+        return ("connector", "skill_pack")
+    return ()
+
+
+def _connector_recovery_failure_limit(state: Mapping[str, Any]) -> int:
+    configured = int(state.get("repeated_failure_limit") or _repeated_tool_failure_limit())
+    # Connector failures are often remote/provider-specific. Two failures are
+    # enough evidence to try another available tool family without waiting for
+    # a broader loop guard budget.
+    return min(max(1, configured), 2)
+
+
+def _maybe_widen_scope_after_scope_denial(
+    state: _AgentTurnGraphState,
+    *,
+    result: ToolResult,
+    tool_registry: ToolRegistry,
+    tool_results: list[ToolResult] | None = None,
+    tool_recovery_scopes_attempted: list[str],
+) -> tuple[ToolRegistry, ToolResult, str] | None:
+    if result.status not in {"denied", "failed"}:
+        return None
+    output = result.output if isinstance(result.output, dict) else {}
+    reason = str(output.get("reason") or "").strip().lower()
+    connector_failure_count = _failed_tool_result_count(tool_results or (), tool_name="connector_request")
+    repeated_connector_failure = (
+        result.tool_name == "connector_request"
+        and result.status == "failed"
+        and connector_failure_count >= _connector_recovery_failure_limit(state)
+    )
+    if reason not in {"tool_requires_structured_turn_scope", "unknown_tool"} and not repeated_connector_failure:
+        return None
+    capabilities = ("web", "local_shell") if repeated_connector_failure else _scope_recovery_capabilities_for_tool_name(result.tool_name)
+    if not capabilities:
+        return None
+    skipped_scopes = set(tool_recovery_scopes_attempted)
+    apply_scope_request = getattr(tool_registry, "apply_scope_request", None)
+    if callable(apply_scope_request):
+        for capability in capabilities:
+            if capability in skipped_scopes:
+                continue
+            invocation = ToolInvocation(
+                invocation_id=f"orchestrator-{uuid4().hex}",
+                tool_name="request_tool_scope",
+                principal_id=state["principal_id"],
+                arguments={"capabilities": [capability]},
+                capsule_id=state["cleanup_scope"],
+            )
+            try:
+                scope_result, widened_registry = apply_scope_request(invocation)
+            except Exception:
+                logger.debug("Could not widen tool scope after scope denial", exc_info=True)
+                continue
+            if scope_result.status != "completed":
+                continue
+            scope_output = scope_result.output if isinstance(scope_result.output, dict) else {}
+            available_tools = scope_output.get("available_tools")
+            if not isinstance(available_tools, list) or not any(str(tool).strip() for tool in available_tools):
+                continue
+            return widened_registry, scope_result, capability
+    if {"web", "local_shell"} & set(capabilities):
+        return _synthetic_recovery_scope_result(
+            state,
+            tool_registry=tool_registry,
+            skipped_scopes=skipped_scopes,
+        )
+    return None
 
 
 def _append_tool_scope_recovery_result(
@@ -1238,6 +1561,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     tool_result_callback: Callable[[ToolResult], None] | None
     text_delta_callback: Callable[[str], None] | None
     cancellation_checker: Callable[[], bool] | None
+    tool_flow_context: dict[str, object] | None
     cleanup_scope: str
     cleanup_done: bool
     tool_results: list[ToolResult]
@@ -1498,6 +1822,14 @@ def _execute_agent_turn_tool_uses(
     tool_recovery_scopes_attempted = list(state.get("tool_recovery_scopes_attempted") or [])
     tool_result_blocks: list[dict[str, object]] = []
 
+    def _emit_tool_activity(result: ToolResult) -> None:
+        if tool_result_callback is None:
+            return
+        try:
+            tool_result_callback(result)
+        except Exception:
+            logger.debug("Tool result callback failed", exc_info=True)
+
     for block in content:
         if _agent_turn_was_cancelled(state):
             return _cancelled_agent_turn_update(state)
@@ -1544,21 +1876,26 @@ def _execute_agent_turn_tool_uses(
             principal_id=principal_id,
             arguments=dict(tool_input),
             capsule_id=cleanup_scope,
+            flow_context=dict(state.get("tool_flow_context") or {}) or None,
         )
         if tool_name == "request_tool_scope":
             apply_scope_request = getattr(tool_registry, "apply_scope_request", None)
             if callable(apply_scope_request):
+                _emit_tool_activity(
+                    ToolResult(
+                        invocation_id=invocation.invocation_id,
+                        tool_name=tool_name,
+                        status="running",
+                        output={"suppress_activity": True},
+                    )
+                )
                 tool_started_at = time.perf_counter()
                 result, widened_registry = apply_scope_request(invocation)
                 tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
                 tool_registry = widened_registry
                 state["tool_registry"] = widened_registry
                 tool_results.append(result)
-                if tool_result_callback is not None:
-                    try:
-                        tool_result_callback(result)
-                    except Exception:
-                        logger.debug("Tool result callback failed", exc_info=True)
+                _emit_tool_activity(result)
                 if runtime_store is not None:
                     _record_agent_tool_timing(
                         runtime_store,
@@ -1587,20 +1924,50 @@ def _execute_agent_turn_tool_uses(
             else None
         )
         tool_started_at = time.perf_counter()
-        if runtime_store is not None:
-            from nullion.runtime import invoke_tool_with_boundary_policy
-
-            result = invoke_tool_with_boundary_policy(runtime_store, invocation, registry=tool_registry)
+        _emit_tool_activity(
+            ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=tool_name,
+                status="running",
+                output={},
+            )
+        )
+        guarded_result = artifact_media_plain_replacement_guard_result(
+            invocation,
+            tool_results,
+            required_embedded_media_extensions=_required_embedded_media_extensions_from_turn_state(state),
+        )
+        if guarded_result is not None:
+            result = guarded_result
         else:
-            result = tool_registry.invoke(invocation)
+            try:
+                if runtime_store is not None:
+                    from nullion.runtime import invoke_tool_with_boundary_policy
+
+                    result = invoke_tool_with_boundary_policy(runtime_store, invocation, registry=tool_registry)
+                else:
+                    result = tool_registry.invoke(invocation)
+            except KeyError as exc:
+                result = ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "reason": "unknown_tool",
+                        "requested_tool_name": invocation.tool_name,
+                        "suppress_activity": True,
+                    },
+                    error=str(exc),
+                )
         tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
         tool_results.append(result)
-        if tool_result_callback is not None:
-            try:
-                tool_result_callback(result)
-            except Exception:
-                logger.debug("Tool result callback failed", exc_info=True)
-        new_artifacts = _artifact_paths_from_tool_result(result, runtime_store=runtime_store)
+        _emit_tool_activity(result)
+        has_artifact_delivery_contract = _turn_has_artifact_delivery_contract(state)
+        new_artifacts = _artifact_paths_from_tool_result(
+            result,
+            runtime_store=runtime_store,
+            include_file_write_path=has_artifact_delivery_contract,
+        )
         artifacts.extend(new_artifacts)
         if runtime_store is not None:
             _record_agent_tool_timing(
@@ -1636,7 +2003,7 @@ def _execute_agent_turn_tool_uses(
             updated_state = dict(state)
             updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
             return _cancelled_agent_turn_update(updated_state)
-        if result.status == "completed" and artifact_snapshot is not None:
+        if result.status == "completed" and artifact_snapshot is not None and has_artifact_delivery_contract:
             artifacts.extend(
                 _new_artifact_paths_since(
                     artifact_snapshot,
@@ -1680,6 +2047,29 @@ def _execute_agent_turn_tool_uses(
                     approval_id=approval_id,
                 ),
             }
+
+        scope_recovery_update = _maybe_widen_scope_after_scope_denial(
+            state,
+            result=result,
+            tool_registry=tool_registry,
+            tool_results=tool_results,
+            tool_recovery_scopes_attempted=tool_recovery_scopes_attempted,
+        )
+        if scope_recovery_update is not None:
+            widened_registry, scope_result, recovery_scope = scope_recovery_update
+            if result.tool_name == "connector_request" and recovery_scope in {"web", "local_shell"}:
+                widened_registry = _block_tools_for_recovery(widened_registry, {result.tool_name})
+            tool_registry = widened_registry
+            state["tool_registry"] = widened_registry
+            tool_results.append(scope_result)
+            tool_recovery_scopes_attempted.append(recovery_scope)
+            _append_tool_scope_recovery_result(
+                tool_result_blocks=tool_result_blocks,
+                tool_use_id=tool_use_id,
+                failed_result=result,
+                scope_result=scope_result,
+            )
+            continue
 
         terminal_failure_text = _terminal_tool_failure_text(result)
         if terminal_failure_text is not None:
@@ -1818,9 +2208,54 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
             reached_iteration_limit=True,
         )
     iterations += 1
+    tool_registry = state["tool_registry"]
+    tool_results = list(state.get("tool_results") or [])
+    tool_recovery_scopes_attempted = list(state.get("tool_recovery_scopes_attempted") or [])
+    if _failed_tool_result_count(tool_results, tool_name="connector_request") >= _connector_recovery_failure_limit(state):
+        last_connector_failure = next(
+            (
+                result
+                for result in reversed(tool_results)
+                if result.tool_name == "connector_request" and result.status != "completed"
+            ),
+            None,
+        )
+        if last_connector_failure is not None:
+            recovery_update = _maybe_widen_scope_after_scope_denial(
+                state,
+                result=last_connector_failure,
+                tool_registry=tool_registry,
+                tool_results=tool_results,
+                tool_recovery_scopes_attempted=tool_recovery_scopes_attempted,
+            )
+            if recovery_update is not None:
+                widened_registry, scope_result, recovery_scope = recovery_update
+                tool_registry = _block_tools_for_recovery(widened_registry, {"connector_request"})
+                tool_results.append(scope_result)
+                tool_recovery_scopes_attempted.append(recovery_scope)
+                state = dict(state)
+                state.update(
+                    {
+                        "messages": [
+                            *list(state.get("messages") or []),
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": _tool_result_message_payload(scope_result),
+                                    }
+                                ],
+                            },
+                        ],
+                        "tool_registry": tool_registry,
+                        "tool_results": tool_results,
+                        "tool_recovery_scopes_attempted": tool_recovery_scopes_attempted,
+                    }
+                )
     create_kwargs: dict[str, Any] = {
         "messages": list(state.get("messages") or []),
-        "tools": state["tool_registry"].list_tool_definitions(),
+        "tools": tool_registry.list_tool_definitions(),
     }
     text_delta_callback = state.get("text_delta_callback")
     if text_delta_callback is not None:
@@ -1885,6 +2320,10 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
         thinking_parts.append(thinking_text)
     return {
         "iterations": iterations,
+        "messages": list(state.get("messages") or []),
+        "tool_registry": tool_registry,
+        "tool_results": tool_results,
+        "tool_recovery_scopes_attempted": tool_recovery_scopes_attempted,
         "response": response,
         "stop_reason": response.get("stop_reason"),
         "content": content_list,
@@ -1962,6 +2401,26 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                 final_text = _last_useful_tool_message(tool_results)
         else:
             final_text = _bare_completion_without_work_text(final_text)
+    missing_scope_action = _scheduler_action_contract_missing(
+        tool_registry=state.get("tool_registry"),
+        tool_results=tool_results,
+    )
+    if missing_scope_action:
+        if not state.get("post_tool_delivery_nudged", False):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": _missing_scope_action_nudge(missing_scope_action)}],
+                }
+            )
+            return {"messages": messages, "post_tool_delivery_nudged": True}
+        final_text = _missing_scope_action_final_reply(missing_scope_action)
     if (
         tool_results
         and not state.get("post_tool_delivery_nudged", False)
@@ -1978,6 +2437,10 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                 state["runtime_store"],
                 state["principal_id"],
             ),
+            required_attachment_extensions=_required_attachment_extensions_from_turn_scope(
+                state.get("tool_registry")
+            ),
+            required_embedded_media_extensions=_required_embedded_media_extensions_from_turn_state(state),
             required_tool_names=_required_tool_names_from_turn_scope(state.get("tool_registry")),
         )
         if not decision.satisfied:
@@ -2300,6 +2763,7 @@ class AgentOrchestrator:
         tool_result_callback: Callable[[ToolResult], None] | None = None,
         text_delta_callback: Callable[[str], None] | None = None,
         cancellation_checker: Callable[[], bool] | None = None,
+        tool_flow_context: dict[str, object] | None = None,
     ) -> TurnResult:
         runtime_store = _resolve_runtime_store(policy_store=policy_store, approval_store=approval_store)
         messages = list(conversation_history)
@@ -2318,6 +2782,7 @@ class AgentOrchestrator:
                 "tool_result_callback": tool_result_callback,
                 "text_delta_callback": text_delta_callback,
                 "cancellation_checker": cancellation_checker,
+                "tool_flow_context": dict(tool_flow_context or {}) or None,
                 "cleanup_scope": f"turn-{uuid4().hex}",
                 "cleanup_done": False,
                 "tool_results": [],
@@ -2355,6 +2820,7 @@ class AgentOrchestrator:
         approval_store,
         max_iterations: int | None = None,
         tool_result_callback: Callable[[ToolResult], None] | None = None,
+        tool_flow_context: dict[str, object] | None = None,
     ) -> TurnResult:
         """Continue a suspended turn from its stored assistant tool call."""
         if not messages_snapshot:
@@ -2368,6 +2834,7 @@ class AgentOrchestrator:
                 approval_store=approval_store,
                 max_iterations=max_iterations,
                 tool_result_callback=tool_result_callback,
+                tool_flow_context=tool_flow_context,
             )
 
         runtime_store = _resolve_runtime_store(policy_store=policy_store, approval_store=approval_store)
@@ -2392,6 +2859,7 @@ class AgentOrchestrator:
                 "runtime_store": runtime_store,
                 "max_iterations": max_iterations,
                 "tool_result_callback": tool_result_callback,
+                "tool_flow_context": dict(tool_flow_context or {}) or None,
                 "cleanup_scope": f"turn-{uuid4().hex}",
                 "cleanup_done": False,
                 "tool_results": [],
@@ -2687,6 +3155,11 @@ class AgentOrchestrator:
     def _can_recover_blocked_artifact_task(self, task: Any, failed_dependency_ids: list[str]) -> bool:
         if not failed_dependency_ids:
             return False
+        if _task_is_scheduled_background_run(task) and _task_has_explicit_artifact_delivery_contract(task):
+            # A scheduled report verifier/deliverer must not invent missing
+            # dependency context after an upstream failure. The terminal summary
+            # can still report partial findings from the failed step.
+            return False
         if not _task_has_artifact_delivery_scope(task):
             return False
         retry_count = int(getattr(task, "retry_count", 0) or 0)
@@ -2764,9 +3237,6 @@ class AgentOrchestrator:
                 if group.all_terminal():
                     await self._finalize_terminal_dispatch_group(group_id)
                     return
-                if _group_all_quiescent(group):
-                    return
-
                 now = datetime.now(UTC)
                 tasks_by_id = {task.task_id: task for task in group.tasks}
                 failed_deps = {
@@ -2779,7 +3249,7 @@ class AgentOrchestrator:
                 for task in group.tasks:
                     if task.is_terminal() or task.status == TaskStatus.WAITING_INPUT:
                         continue
-                    failed_dependency_ids = [dep_id for dep_id in task.dependencies if dep_id in failed_deps]
+                    failed_dependency_ids = _failed_dependency_ids(task, failed_deps, tasks_by_id)
                     if failed_dependency_ids:
                         if self._can_recover_blocked_artifact_task(task, failed_dependency_ids):
                             recoveries.append((task, failed_dependency_ids))
@@ -2858,6 +3328,12 @@ class AgentOrchestrator:
                         )
 
                 group = self._task_registry.get_group(group_id)
+                if group is not None and group.all_terminal():
+                    # Supervisor-created terminal transitions do not pass
+                    # through a runner task, so finalize them here before
+                    # treating the group as quiet.
+                    await self._finalize_terminal_dispatch_group(group_id)
+                    return
                 if group is None or _group_all_quiescent(group):
                     return
                 monotonic_now = time.monotonic()
@@ -3331,6 +3807,16 @@ class AgentOrchestrator:
             return self._task_registry.list_by_conversation(conversation_id)
         return list(getattr(self._task_registry, "_tasks", {}).values())
 
+    def live_dispatch_group_ids(self) -> set[str]:
+        """Return groups with an actual in-process runner task still alive."""
+        if not self._runner_tasks_by_group:
+            return set()
+        live: set[str] = set()
+        for group_id, tasks in self._runner_tasks_by_group.items():
+            if any(not task.done() for task in tasks):
+                live.add(str(group_id))
+        return live
+
     async def cancel_task(self, task_id: str) -> bool:
         if self._task_registry is None:
             return False
@@ -3498,6 +3984,25 @@ def _group_all_quiescent(group: Any) -> bool:
         task.is_terminal() or task.status is TaskStatus.WAITING_INPUT
         for task in getattr(group, "tasks", ()) or ()
     )
+
+
+def _failed_dependency_ids(task: Any, failed_deps: set[str], tasks_by_id: dict[str, Any]) -> list[str]:
+    """Return failed dependency roots, including failures hidden behind blocked intermediates."""
+    seen: set[str] = set()
+    failures: list[str] = []
+    stack = [str(dep_id) for dep_id in getattr(task, "dependencies", ()) or () if str(dep_id)]
+    while stack:
+        dep_id = stack.pop(0)
+        if dep_id in seen:
+            continue
+        seen.add(dep_id)
+        if dep_id in failed_deps:
+            failures.append(dep_id)
+            continue
+        parent = tasks_by_id.get(dep_id)
+        if parent is not None:
+            stack.extend(str(parent_dep) for parent_dep in getattr(parent, "dependencies", ()) or () if str(parent_dep))
+    return failures
 
 
 def _planner_summary_from_group(group: Any) -> str:

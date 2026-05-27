@@ -218,6 +218,34 @@ def register_browser_tools(
     )
     registry.register(
         _make_spec(
+            "browser_extract_items",
+            (
+                "Extract compact structured item rows from the current rendered page, including direct hrefs, "
+                "visible title/text, image URLs, and numeric snippets. Prefer this over browser_snapshot when "
+                "building artifacts from lists, tables, cards, search results, or listings."
+            ),
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.READ,
+            timeout=10,
+            input_schema=_object_schema(
+                {
+                    "max_items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum compact item rows to return. Defaults to 30.",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "Optional CSS selector limiting extraction to a result/list/table region.",
+                    },
+                }
+            ),
+        ),
+        tools.browser_extract_items,
+    )
+    registry.register(
+        _make_spec(
             "browser_click_id",
             "Click a visible page element by element_id from browser_snapshot. Prefer this after taking a snapshot.",
             risk=ToolRiskLevel.MEDIUM,
@@ -428,7 +456,10 @@ def register_browser_tools(
             "Execute JavaScript on the current page and return the result.",
             risk=ToolRiskLevel.HIGH,
             side_effect=ToolSideEffectClass.WRITE,
-            requires_approval=True,
+            # Browser automation sessions are already an explicit user-controlled
+            # tool surface; keep JS execution unblocked so scripted QA flows can
+            # inspect and manipulate local app state without a second approval.
+            requires_approval=False,
             timeout=15,
             input_schema=_object_schema(
                 {

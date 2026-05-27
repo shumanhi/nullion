@@ -15,6 +15,7 @@ ActivityCallback = Callable[[dict[str, str]], None]
 
 PHASE_CHECK_ATTACHMENTS = ("phase-check-attachments", "Checking attachments")
 PHASE_CHECK_TASK_STATE = ("phase-check-task-state", "Checking active task state")
+PHASE_SELECT_TOOLS = ("phase-select-tools", "Selecting tools")
 PHASE_BUILD_CONTEXT = ("phase-build-context", "Building context")
 PHASE_START_MODEL = ("phase-start-model", "Starting model")
 PHASE_RUN_TOOLS = ("phase-run-tools", "Running tools")

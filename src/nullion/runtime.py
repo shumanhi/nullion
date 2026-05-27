@@ -2985,9 +2985,55 @@ def _active_frame_for_linked_branch(
 ):
     active_task_frame_id = store.get_active_task_frame_id(conversation_id)
     frame = store.get_task_frame(active_task_frame_id) if isinstance(active_task_frame_id, str) else None
+    frame = _clear_delivered_artifact_active_frame(
+        store,
+        conversation_id=conversation_id,
+        frame=frame,
+    )
     if frame is None or branch is None:
         return frame
     return frame if frame.branch_id == branch.branch_id else None
+
+
+def _clear_delivered_artifact_active_frame(
+    store: RuntimeStore,
+    *,
+    conversation_id: str,
+    frame,
+):
+    if frame is None or frame.status in {
+        TaskFrameStatus.COMPLETED,
+        TaskFrameStatus.CANCELLED,
+        TaskFrameStatus.FAILED,
+        TaskFrameStatus.SUPERSEDED,
+    }:
+        return frame
+    if not frame.finish.requires_artifact_delivery:
+        return frame
+    metadata = frame.metadata if isinstance(frame.metadata, Mapping) else {}
+    last_outcome = metadata.get("last_outcome")
+    if not isinstance(last_outcome, Mapping):
+        return frame
+    rendered_reply = str(last_outcome.get("rendered_reply") or "")
+    if not _rendered_reply_has_existing_media_attachment(rendered_reply):
+        return frame
+
+    now = datetime.now(UTC)
+    completion_turn_id = last_outcome.get("completion_turn_id")
+    completed_frame = replace(
+        frame,
+        status=TaskFrameStatus.COMPLETED,
+        updated_at=now,
+        completion_turn_id=(
+            completion_turn_id
+            if isinstance(completion_turn_id, str) and completion_turn_id
+            else frame.source_turn_id
+        ),
+    )
+    store.add_task_frame(completed_frame)
+    if store.get_active_task_frame_id(conversation_id) == frame.frame_id:
+        store.set_active_task_frame_id(conversation_id, None)
+    return None
 
 
 def _is_context_linked_dispatch(
@@ -3368,11 +3414,14 @@ def update_active_task_frame_from_outcomes(
     }
     required_tool_completion = set(updated_frame.finish.required_tool_completion)
     required_tools_satisfied = not required_tool_completion or required_tool_completion.issubset(completed_tool_names)
+    media_attachment_delivered = _rendered_reply_has_existing_media_attachment(rendered_reply)
     artifact_delivery_satisfied = (
         (not updated_frame.finish.requires_artifact_delivery)
-        or (bool(completed_tool_names) and _rendered_reply_has_existing_media_attachment(rendered_reply))
+        or media_attachment_delivered
     )
-    if required_tools_satisfied and artifact_delivery_satisfied and completed_tool_names:
+    # Some provider paths return a final MEDIA attachment without preserving the
+    # producing tool result. The delivered artifact is still the frame contract.
+    if required_tools_satisfied and artifact_delivery_satisfied and (completed_tool_names or media_attachment_delivered):
         updated_frame = replace(
             updated_frame,
             status=TaskFrameStatus.COMPLETED,

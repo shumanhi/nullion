@@ -59,6 +59,7 @@ from nullion.messaging_adapters import list_platform_delivery_receipts
 from nullion.session_stop import (
     SessionStopResult,
     cancel_active_task_frame,
+    cancel_manual_cron_background_runs_for_conversation,
     cancel_orchestrator_conversation_sync,
     stop_session_reply,
 )
@@ -238,8 +239,13 @@ def _service_stop_result(service: object | None) -> SessionStopResult:
     runtime = getattr(service, "runtime", None)
     orchestrator = getattr(service, "agent_orchestrator", None)
     cancelled_tasks = cancel_orchestrator_conversation_sync(orchestrator, conversation_id)
+    cancelled_background = cancel_manual_cron_background_runs_for_conversation(conversation_id)
     cancelled_frame = cancel_active_task_frame(runtime, conversation_id)
-    return SessionStopResult(cancelled_task_count=cancelled_tasks, cancelled_task_frame=cancelled_frame)
+    return SessionStopResult(
+        cancelled_task_count=cancelled_tasks,
+        cancelled_background_count=cancelled_background,
+        cancelled_task_frame=cancelled_frame,
+    )
 
 
 def _render_command_reference(title: str, specs: tuple[OperatorCommandSpec, ...]) -> str:

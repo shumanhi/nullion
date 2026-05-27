@@ -88,6 +88,7 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
             "browser_type_field",
             "browser_type_id",
             "browser_select_combobox",
+            "browser_extract_items",
             "browser_extract_text",
             "browser_find",
             "browser_screenshot",

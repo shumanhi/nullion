@@ -7,6 +7,7 @@ from typing import Any, Iterable
 
 _ARTIFACT_DELIVERY_TOOLS = frozenset(
     {
+        "document_create",
         "file_write",
         "pdf_create",
         "pdf_edit",
@@ -17,6 +18,8 @@ _ARTIFACT_DELIVERY_TOOLS = frozenset(
 _TEXT_ARTIFACT_EXTENSIONS = frozenset({"", ".csv", ".htm", ".html", ".json", ".md", ".svg", ".tsv", ".txt", ".yaml", ".yml"})
 _EXTENSION_ARTIFACT_TOOLS = {
     ".pdf": frozenset({"pdf_create", "pdf_edit"}),
+    ".doc": frozenset({"document_create"}),
+    ".docx": frozenset({"document_create"}),
     ".ppt": frozenset({"presentation_create"}),
     ".pptx": frozenset({"presentation_create"}),
     ".csv": frozenset({"file_write", "spreadsheet_create"}),

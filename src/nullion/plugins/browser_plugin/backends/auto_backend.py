@@ -23,10 +23,16 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen
 
+from nullion.plugins.browser_plugin.browser_config import browser_user_data_dir
+
 
 _CDP_PORT = 9222
 _DEFAULT_CDP_HOST = "127.0.0.1"
 _BROWSER_KINDS = ("chrome", "chromium", "brave", "edge")
+_CDP_FALLBACK_NOTICE = (
+    "Could not connect to the shared browser through CDP; using Chromium instead. "
+    "Authenticated browser session state from the shared browser is not available."
+)
 
 # Candidate Chrome/Chromium paths by platform
 _CHROME_CANDIDATES: dict[str, list[str]] = {
@@ -99,6 +105,10 @@ def _cdp_url() -> str:
     from nullion.plugins.browser_plugin.backends.cdp_backend import normalized_cdp_url
 
     return normalized_cdp_url(os.environ.get("NULLION_BROWSER_CDP_URL", f"http://{_DEFAULT_CDP_HOST}:{_CDP_PORT}"))
+
+
+def _has_explicit_cdp_url() -> bool:
+    return bool(os.environ.get("NULLION_BROWSER_CDP_URL", "").strip())
 
 
 def _cdp_url_for(host: str, port: int) -> str:
@@ -265,6 +275,11 @@ def _find_reachable_preferred_cdp_port() -> int | None:
 
 
 def _reuse_preferred_cdp_if_available() -> bool:
+    # A configured CDP URL points at the browser/profile the operator set up.
+    # Do not silently hop to another matching browser on an adjacent port; that
+    # can attach the agent to a different logged-in session than the setup UI.
+    if _has_explicit_cdp_url():
+        return False
     port = _find_reachable_preferred_cdp_port()
     if port is None:
         return False
@@ -276,11 +291,8 @@ _launched_proc: subprocess.Popen | None = None
 
 
 def _browser_profile_dir(chrome_path: str) -> str:
-    configured = os.environ.get("NULLION_BROWSER_USER_DATA_DIR", "").strip()
-    if configured:
-        return os.path.expanduser(configured)
     kind = _browser_kind_from_text(chrome_path) or "chrome"
-    return os.path.expanduser(f"~/.nullion/browser-profile-{kind}")
+    return str(browser_user_data_dir(kind))
 
 
 def _launch_chrome(chrome_path: str) -> None:
@@ -339,6 +351,29 @@ class AutoBackend:
     def __init__(self) -> None:
         self._backend: Any = None
         self._lock = asyncio.Lock()
+        self._connection_notice: str | None = None
+
+    def connection_notice(self) -> str | None:
+        return self._connection_notice
+
+    def _use_playwright_fallback(self) -> Any:
+        self._connection_notice = _CDP_FALLBACK_NOTICE
+        self._backend = self._make_playwright()
+        return self._backend
+
+    @staticmethod
+    def _is_cdp_backend(backend: Any) -> bool:
+        return str(getattr(backend, "BACKEND_NAME", "") or "").strip().lower() == "cdp"
+
+    async def _call(self, method_name: str, *args, **kwargs):
+        backend = await self._ensure_backend()
+        try:
+            return await getattr(backend, method_name)(*args, **kwargs)
+        except Exception:
+            if self._is_cdp_backend(backend) and not _is_cdp_reachable():
+                fallback = self._use_playwright_fallback()
+                return await getattr(fallback, method_name)(*args, **kwargs)
+            raise
 
     async def _ensure_backend(self) -> Any:
         async with self._lock:
@@ -350,22 +385,31 @@ class AutoBackend:
             if not force_headless:
                 # 1. CDP already reachable?
                 if _is_cdp_reachable() and _running_cdp_matches_preference():
+                    self._connection_notice = None
                     self._backend = self._make_cdp()
                     return self._backend
                 if _reuse_preferred_cdp_if_available():
+                    self._connection_notice = None
                     self._backend = self._make_cdp()
                     return self._backend
 
                 # 2. Launch Chrome if available
                 chrome = _find_chrome()
                 if chrome:
-                    _launch_chrome(chrome)
+                    try:
+                        _launch_chrome(chrome)
+                    except Exception:
+                        return self._use_playwright_fallback()
+                    self._connection_notice = None
                     self._backend = self._make_cdp()
                     return self._backend
 
             # 3. Headless Playwright fallback
-            self._backend = self._make_playwright()
-            return self._backend
+            if force_headless:
+                self._connection_notice = None
+                self._backend = self._make_playwright()
+                return self._backend
+            return self._use_playwright_fallback()
 
     def _make_cdp(self) -> Any:
         from nullion.plugins.browser_plugin.backends.cdp_backend import CDPBackend
@@ -373,46 +417,37 @@ class AutoBackend:
 
     def _make_playwright(self) -> Any:
         from nullion.plugins.browser_plugin.backends.playwright_backend import PlaywrightBackend
-        os.environ.setdefault("NULLION_BROWSER_HEADLESS", "true")
+        os.environ["NULLION_BROWSER_HEADLESS"] = "true"
         return PlaywrightBackend()
 
     # ── Delegate all BrowserBackend protocol methods ──────────────────────────
 
     async def open(self, session_id: str) -> str:
-        b = await self._ensure_backend()
-        return await b.open(session_id)
+        return await self._call("open", session_id)
 
     async def navigate(self, session_id: str, url: str) -> str:
-        b = await self._ensure_backend()
-        return await b.navigate(session_id, url)
+        return await self._call("navigate", session_id, url)
 
     async def click(self, session_id: str, selector: str) -> None:
-        b = await self._ensure_backend()
-        await b.click(session_id, selector)
+        await self._call("click", session_id, selector)
 
     async def click_element(self, session_id: str, target: dict[str, Any]) -> None:
-        b = await self._ensure_backend()
-        await b.click_element(session_id, target)
+        await self._call("click_element", session_id, target)
 
     async def type_text(self, session_id: str, selector: str, text: str) -> None:
-        b = await self._ensure_backend()
-        await b.type_text(session_id, selector, text)
+        await self._call("type_text", session_id, selector, text)
 
     async def type_field(self, session_id: str, target: dict[str, Any], text: str) -> None:
-        b = await self._ensure_backend()
-        await b.type_field(session_id, target, text)
+        await self._call("type_field", session_id, target, text)
 
     async def extract_text(self, session_id: str, selector: str | None) -> str:
-        b = await self._ensure_backend()
-        return await b.extract_text(session_id, selector)
+        return await self._call("extract_text", session_id, selector)
 
     async def screenshot(self, session_id: str, mode: str = "auto"):
-        b = await self._ensure_backend()
-        return await b.screenshot(session_id, mode=mode)
+        return await self._call("screenshot", session_id, mode=mode)
 
     async def scroll(self, session_id: str, direction: str, amount: int) -> None:
-        b = await self._ensure_backend()
-        await b.scroll(session_id, direction, amount)
+        await self._call("scroll", session_id, direction, amount)
 
     async def wait_for(
         self,
@@ -422,19 +457,16 @@ class AutoBackend:
         text: str | None,
         timeout: float,
     ) -> None:
-        b = await self._ensure_backend()
         try:
-            await b.wait_for(session_id, selector, url_pattern, text, timeout)
+            await self._call("wait_for", session_id, selector, url_pattern, text, timeout)
         except TypeError:
-            await b.wait_for(session_id, selector, url_pattern, timeout)
+            await self._call("wait_for", session_id, selector, url_pattern, timeout)
 
     async def find(self, session_id: str, selector: str) -> list[dict[str, str]]:
-        b = await self._ensure_backend()
-        return await b.find(session_id, selector)
+        return await self._call("find", session_id, selector)
 
     async def run_js(self, session_id: str, script: str) -> Any:
-        b = await self._ensure_backend()
-        return await b.run_js(session_id, script)
+        return await self._call("run_js", session_id, script)
 
     async def close_session(self, session_id: str) -> None:
         if self._backend:

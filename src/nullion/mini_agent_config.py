@@ -8,6 +8,7 @@ import os
 
 DEFAULT_MINI_AGENT_TIMEOUT_SECONDS = 180.0
 DEFAULT_PLANNER_MINI_AGENT_TIMEOUT_SECONDS = 420.0
+DEFAULT_SCHEDULED_MINI_AGENT_TIMEOUT_SECONDS = 900.0
 DEFAULT_PLANNER_DEPENDENCY_RECOVERY_ATTEMPTS = 1
 DEFAULT_MINI_AGENT_MAX_ITERATIONS = 12
 DEFAULT_MINI_AGENT_MAX_CONTINUATIONS = 1
@@ -48,6 +49,14 @@ def planner_mini_agent_timeout_seconds() -> float:
     return _float_env(
         "NULLION_PLANNER_MINI_AGENT_TIMEOUT_SECONDS",
         DEFAULT_PLANNER_MINI_AGENT_TIMEOUT_SECONDS,
+        minimum=1.0,
+    )
+
+
+def scheduled_mini_agent_timeout_seconds() -> float:
+    return _float_env(
+        "NULLION_SCHEDULED_MINI_AGENT_TIMEOUT_SECONDS",
+        DEFAULT_SCHEDULED_MINI_AGENT_TIMEOUT_SECONDS,
         minimum=1.0,
     )
 
@@ -95,6 +104,7 @@ __all__ = [
     "DEFAULT_MINI_AGENT_TIMEOUT_SECONDS",
     "DEFAULT_PLANNER_DEPENDENCY_RECOVERY_ATTEMPTS",
     "DEFAULT_PLANNER_MINI_AGENT_TIMEOUT_SECONDS",
+    "DEFAULT_SCHEDULED_MINI_AGENT_TIMEOUT_SECONDS",
     "mini_agent_max_continuations",
     "mini_agent_max_iterations",
     "mini_agent_stale_after",
@@ -102,4 +112,5 @@ __all__ = [
     "mini_agent_timeout_seconds",
     "planner_dependency_recovery_attempts",
     "planner_mini_agent_timeout_seconds",
+    "scheduled_mini_agent_timeout_seconds",
 ]

@@ -17,7 +17,7 @@ from uuid import uuid4
 MAX_ROUTE_OBSERVATIONS = 300
 MAX_ROUTE_HINTS = 6
 SLOW_TOOL_MS = 8_000
-_WEB_ROUTE_TOOLS = frozenset({"web_search", "web_fetch", "browser_navigate", "browser_extract_text"})
+_WEB_ROUTE_TOOLS = frozenset({"web_search", "web_fetch", "browser_navigate", "browser_extract_items", "browser_extract_text"})
 _OPERATIONAL_ROUTE_TOOLS = frozenset(
     {
         "create_cron",

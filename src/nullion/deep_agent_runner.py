@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 
@@ -16,6 +17,7 @@ from nullion.artifacts import (
     artifact_descriptor_for_path,
     artifact_path_for_generated_workspace_file,
     artifact_root_for_principal,
+    media_candidate_paths_from_text,
 )
 from nullion.deep_agent_profiles import (
     deep_agent_skill_files_for_task,
@@ -47,6 +49,23 @@ class DeepAgentEvidenceFallbackUnavailable(RuntimeError):
 
 _DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS_ENV = "NULLION_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS"
 _DEFAULT_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS = 20.0
+_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS_ENV = "NULLION_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS"
+_DEFAULT_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS = 15.0
+_HTML_DYNAMIC_CONTENT_ASSIGNMENT_RE = re.compile(
+    r"""
+    (?:document\s*\.\s*getElementById\(\s*["'](?P<id>[^"']+)["']\s*\)
+      |document\s*\.\s*querySelector\(\s*["']\#(?P<selector_id>[^"']+)["']\s*\))
+    \s*\.\s*(?:innerHTML|outerHTML)\s*=\s*(?P<rhs>[^;]{0,1200})
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+_HTML_ID_ELEMENT_RE = re.compile(
+    r"""<(?P<tag>[A-Za-z][\w:-]*)\b(?P<attrs>[^>]*)\bid\s*=\s*["'](?P<id>[^"']+)["'][^>]*>(?P<body>.*?)</(?P=tag)>""",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_SCRIPT_OR_STYLE_RE = re.compile(r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_DYNAMIC_PRIMARY_MARKERS = ("map(", "join(", "<article", "<li", "<tr", "<section", "<div", "<table")
 
 
 class DeepAgentMiniAgentRunner:
@@ -211,11 +230,18 @@ class DeepAgentMiniAgentRunner:
             response = {"content": [{"type": "text", "text": fallback_text}]}
         output_text = _extract_response_text(response)
         if not output_text:
-            return TaskResult(
-                task_id=task.task_id,
-                status="failure",
-                error="Deep Agent finished without a final answer.",
-            )
+            try:
+                output_text = await _fallback_answer_from_tool_evidence(
+                    config,
+                    tool_results=tool_results,
+                    model_client=anthropic_client,
+                )
+            except DeepAgentEvidenceFallbackUnavailable:
+                return TaskResult(
+                    task_id=task.task_id,
+                    status="failure",
+                    error="Deep Agent finished without a final answer.",
+                )
         output_text = sanitize_user_visible_reply(
             user_message=task.description,
             reply=output_text,
@@ -277,12 +303,78 @@ class DeepAgentMiniAgentRunner:
                 error=artifact_failure,
                 context_out=output_text,
             )
+        if deliverable_artifacts and _html_static_primary_content_required(task):
+            static_delivery_failure = _html_static_delivery_failure_for_paths(deliverable_artifacts)
+            if static_delivery_failure is not None:
+                return TaskResult(
+                    task_id=task.task_id,
+                    status="failure",
+                    error=static_delivery_failure,
+                    context_out=output_text,
+                )
+        artifact_verification_failure = _artifact_verification_failure_for_task(
+            config,
+            context_in=context_in,
+            output_text=output_text,
+            tool_results=tool_results,
+            deliverable_artifacts=deliverable_artifacts,
+        )
+        if artifact_verification_failure is not None:
+            return TaskResult(
+                task_id=task.task_id,
+                status="failure",
+                error=artifact_verification_failure,
+                context_out=output_text,
+            )
+        context_out = _context_out_for_task(
+            config,
+            output_text=output_text,
+            deliverable_artifacts=deliverable_artifacts,
+        )
+        completion_decision = await _scheduled_task_completion_decision(
+            config,
+            output_text=output_text,
+            tool_results=tool_results,
+            model_client=anthropic_client,
+        )
+        if completion_decision is not None and completion_decision.get("status") != "success":
+            reason = str(
+                completion_decision.get("answer")
+                or "The scheduled task could not verify enough evidence to complete this step."
+            ).strip()
+            if _should_emit_best_effort_scheduled_result(config, tool_results):
+                # Product invariant: scheduled runs should deliver best-effort
+                # output whenever verified tool work exists.
+                try:
+                    best_effort_answer = await _fallback_answer_from_tool_evidence(
+                        config,
+                        tool_results=tool_results,
+                        model_client=anthropic_client,
+                    )
+                except DeepAgentEvidenceFallbackUnavailable:
+                    best_effort_answer = reason
+                best_effort_answer = str(best_effort_answer or reason).strip() or reason
+                return TaskResult(
+                    task_id=task.task_id,
+                    status="success",
+                    output=best_effort_answer,
+                    context_out=best_effort_answer,
+                )
+            return TaskResult(
+                task_id=task.task_id,
+                status="failure",
+                error=reason,
+            )
+        if completion_decision is not None:
+            answer = str(completion_decision.get("answer") or "").strip()
+            if answer:
+                output_text = answer
         return TaskResult(
             task_id=task.task_id,
             status="success",
             output=output_text,
             artifacts=deliverable_artifacts,
-            context_out=output_text,
+            context_out=context_out,
             )
 
 
@@ -293,12 +385,34 @@ def _is_scheduled_background_config(config: Any) -> bool:
     return bool(metadata.get("scheduled_task_run"))
 
 
+def _completed_tool_results(tool_results: list[Any]) -> list[Any]:
+    return [
+        result
+        for result in (tool_results or [])
+        if str(getattr(result, "status", "") or "").lower() in {"completed", "success", "succeeded"}
+    ]
+
+
+def _should_emit_best_effort_scheduled_result(config: Any, tool_results: list[Any]) -> bool:
+    if not _is_scheduled_background_config(config):
+        return False
+    task = getattr(config, "task", None)
+    if getattr(task, "context_key_out", None):
+        # Context-producing steps are dependency contracts. If validation says
+        # evidence is insufficient, do not publish best-effort text as verified
+        # context for downstream report/artifact steps.
+        return False
+    return bool(_completed_tool_results(tool_results))
+
+
 def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = None) -> str:
     task = config.task
     artifact_root = _artifact_root_for_prompt(task)
     tool_inventory = _scoped_tool_inventory_for_prompt(task, tool_registry=tool_registry)
     metadata = getattr(task, "metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
+    artifact_kind = str(metadata.get("required_artifact_kind") or "").strip().lower().removeprefix(".")
+    delivery_contract = _delivery_contract_metadata_for_task(task)
     scheduled_task_guidance = ""
     if metadata.get("scheduled_task_run"):
         scheduled_task_guidance = (
@@ -309,6 +423,39 @@ def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = Non
             "- If a step cannot be completed from the stored context and scoped tools, return concise "
             "blocked evidence instead of pausing for input.\n\n"
         )
+    html_artifact_guidance = ""
+    if (artifact_kind == "html" and _task_requires_user_file_delivery(task)) or _task_requires_static_html_delivery(task):
+        if delivery_contract:
+            contract_lines = [
+                "HTML delivery/render contract:",
+                f"- platform: {delivery_contract.get('platform') or 'unknown'}",
+                f"- delivery_mode: {delivery_contract.get('delivery_mode') or 'attachment'}",
+                f"- supports_javascript: {str(bool(delivery_contract.get('supports_javascript'))).lower()}",
+                "- requires_static_primary_content: "
+                f"{str(bool(delivery_contract.get('requires_static_primary_content'))).lower()}",
+            ]
+        else:
+            platform = _delivery_platform_for_task(task) or "unknown"
+            requires_static_primary_content = (
+                artifact_kind == "html" and _task_requires_user_file_delivery(task)
+            ) or _task_requires_static_html_delivery(task)
+            supports_javascript = not requires_static_primary_content
+            contract_lines = [
+                "HTML delivery/render contract:",
+                f"- platform: {platform}",
+                "- delivery_mode: attachment",
+                f"- supports_javascript: {str(supports_javascript).lower()}",
+                f"- requires_static_primary_content: {str(requires_static_primary_content).lower()}",
+            ]
+        html_artifact_guidance = (
+            "\n".join(contract_lines)
+            + "\n- If requires_static_primary_content is true, build primary user-visible rows, cards, tables, "
+            "lists, and key summary facts in static HTML markup.\n"
+            "- JavaScript may enhance the page only when supports_javascript is true, and it must not be required "
+            "when requires_static_primary_content is true.\n"
+            "- Do not leave primary result containers empty for JavaScript to fill later unless the delivery "
+            "contract explicitly allows JavaScript-only rendering.\n\n"
+        )
     prompt = (
         "You are a scoped Deep Agent running inside Nullion. Complete only the assigned task. "
         "Use the provided Nullion tools for side effects so Sentinel policy remains authoritative. "
@@ -316,19 +463,37 @@ def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = Non
         "Return a concise final answer for the user.\n\n"
         f"{scheduled_task_guidance}"
         f"{tool_inventory}"
+        f"{html_artifact_guidance}"
         "File delivery rules:\n"
         f"- Save final user-facing files under the workspace artifact directory: {artifact_root}\n"
         "- Do not use /tmp, /var/tmp, or arbitrary absolute paths for final files the user asked to receive.\n"
         "- Temporary scratch files must also stay inside the workspace storage area unless a tool explicitly returns "
         "a workspace-safe generated path.\n"
+        "- For typed .docx artifact requirements, use document_create with structured paragraphs, sections, "
+        "and existing image artifact paths instead of terminal_exec.\n"
         "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, links, and existing "
         "image artifact paths instead of terminal_exec.\n"
-        "- Mention a saved or attached file only after file_write, pdf_create, or another file-producing tool "
+        "- Mention a saved or attached file only after file_write, document_create, pdf_create, or another file-producing tool "
         "returns a path in the workspace artifact directory.\n\n"
         f"Task: {task.description}"
     )
     if context_in is not None:
         prompt += f"\n\nContext input ({task.context_key_in}):\n{context_in}"
+    expected_artifacts = _expected_artifact_paths_from_context(config, context_in=context_in)
+    if expected_artifacts and _is_artifact_verifier_task(task):
+        prompt += (
+            "\n\nArtifact verification contract:\n"
+            "- The dependency context contains current-run artifact descriptors.\n"
+            "- Verify exactly these current-run artifact paths; do not substitute a similar or newer-looking "
+            "workspace file found by search:\n"
+            + "\n".join(f"  - {path}" for path in expected_artifacts)
+            + "\n- If those paths cannot be read and validated, return a failure for this verifier step."
+            "\n- For HTML artifacts, validate the delivered file with scripts disabled: primary user-visible "
+            "rows, cards, tables, lists, and key summary facts must exist in static markup, not only in "
+            "JavaScript-populated containers."
+            "\n- Compare artifact claims against dependency context and tool evidence; fail if the artifact "
+            "contains unsupported options, counts, or claims from inconclusive upstream evidence."
+        )
     return prompt
 
 
@@ -395,6 +560,282 @@ def _deliverable_artifact_paths_for_task(config, artifact_paths: list[str]) -> l
         if descriptor is not None:
             deliverable.append(descriptor.path)
     return list(dict.fromkeys(deliverable))
+
+
+def _context_out_for_task(config, *, output_text: str, deliverable_artifacts: list[str]) -> object:
+    """Publish artifact identity as typed context so dependent tasks stay bound.
+
+    Free-form summaries are not enough for multi-step report workflows: a
+    verifier can otherwise search the workspace and accidentally validate an
+    older sibling file.  Artifact descriptors are runtime evidence, so dependent
+    tasks can verify the exact current-run path without parsing prose.
+    """
+
+    if not deliverable_artifacts:
+        return output_text
+    task = config.task
+    try:
+        artifact_root = artifact_root_for_principal(task.principal_id)
+    except Exception:
+        logger.debug("Could not resolve artifact root for context descriptor", exc_info=True)
+        artifact_root = None
+    descriptors: list[dict[str, object]] = []
+    for raw_path in deliverable_artifacts:
+        descriptor = None
+        if artifact_root is not None:
+            try:
+                descriptor = artifact_descriptor_for_path(Path(raw_path), artifact_root=artifact_root)
+            except Exception:
+                descriptor = None
+        if descriptor is not None:
+            descriptors.append(descriptor.to_dict())
+        else:
+            descriptors.append({"path": str(raw_path), "name": Path(str(raw_path)).name})
+    return {
+        "output": output_text,
+        "artifact_paths": [str(item.get("path")) for item in descriptors if item.get("path")],
+        "artifacts": descriptors,
+        "source_task_id": getattr(task, "task_id", None),
+        "source_group_id": getattr(task, "group_id", None),
+    }
+
+
+def _is_artifact_verifier_task(task: Any) -> bool:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return str(metadata.get("artifact_role") or "").strip() == "verify"
+
+
+def _delivery_contract_metadata_for_task(task: Any) -> dict[str, object]:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    contract = metadata.get("delivery_contract")
+    return dict(contract) if isinstance(contract, dict) else {}
+
+
+def _delivery_platform_for_task(task: Any) -> str:
+    contract = _delivery_contract_metadata_for_task(task)
+    platform = str(contract.get("platform") or "").strip().lower()
+    if platform:
+        return platform
+    for value in (getattr(task, "principal_id", None), getattr(task, "conversation_id", None)):
+        raw = str(value or "").strip().lower()
+        if ":" not in raw:
+            continue
+        prefix = raw.split(":", 1)[0]
+        if prefix:
+            return prefix
+    return ""
+
+
+def _task_requires_static_html_delivery(task: Any) -> bool:
+    contract = _delivery_contract_metadata_for_task(task)
+    if "requires_static_primary_content" in contract:
+        return bool(contract.get("requires_static_primary_content"))
+    platform = _delivery_platform_for_task(task)
+    return platform in {"telegram", "slack", "discord", "unknown"}
+
+
+def _html_static_primary_content_required(task: Any) -> bool:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    contract = _delivery_contract_metadata_for_task(task)
+    if "requires_static_primary_content" in contract:
+        return bool(contract.get("requires_static_primary_content"))
+    if _task_requires_static_html_delivery(task):
+        return True
+    artifact_kind = str(metadata.get("required_artifact_kind") or "").strip().lower().removeprefix(".")
+    if artifact_kind != "html":
+        return False
+    finish = getattr(task, "finish", None)
+    output = getattr(task, "output", None)
+    return bool(
+        getattr(finish, "requires_artifact_delivery", False)
+        or getattr(output, "artifact_kind", None)
+        or metadata.get("requires_artifact_delivery")
+        or metadata.get("required_artifact_kind")
+    )
+
+
+def _artifact_verification_failure_for_task(
+    config,
+    *,
+    context_in: Any,
+    output_text: str,
+    tool_results: list[Any],
+    deliverable_artifacts: list[str],
+) -> str | None:
+    task = config.task
+    if not _is_artifact_verifier_task(task):
+        return None
+    expected_paths = _expected_artifact_paths_from_context(config, context_in=context_in)
+    if not expected_paths:
+        return None
+    observed_paths = _observed_artifact_paths_for_verification(
+        config,
+        output_text=output_text,
+        tool_results=tool_results,
+        deliverable_artifacts=deliverable_artifacts,
+    )
+    matched_expected_paths = [path for path in expected_paths if path in observed_paths]
+    if matched_expected_paths:
+        if _html_static_primary_content_required(task):
+            static_delivery_failure = _html_static_delivery_failure_for_paths(matched_expected_paths)
+            if static_delivery_failure is not None:
+                return static_delivery_failure
+        return None
+    observed_text = ", ".join(Path(path).name for path in observed_paths[:4]) or "no current-run artifact path"
+    expected_text = ", ".join(Path(path).name for path in expected_paths[:4])
+    return (
+        "The verifier did not validate the current-run artifact from dependency context. "
+        f"Expected {expected_text}; observed {observed_text}."
+    )
+
+
+def _html_static_delivery_failure_for_paths(paths: list[str]) -> str | None:
+    """Reject delivered HTML whose primary report content only appears after JS runs."""
+
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.suffix.lower() not in {".html", ".htm"}:
+            continue
+        try:
+            html = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        empty_targets = _html_dynamic_primary_targets_without_static_content(html)
+        if not empty_targets:
+            continue
+        target_text = ", ".join(empty_targets[:4])
+        return (
+            "The HTML artifact is not statically deliverable: primary content for empty container(s) "
+            f"{target_text} is populated only by JavaScript. Include the delivered rows, cards, tables, "
+            "or lists in static HTML so Telegram, mobile previews, and no-script viewers can render them."
+        )
+    return None
+
+
+def _html_dynamic_primary_targets_without_static_content(html: str) -> list[str]:
+    target_ids: list[str] = []
+    for match in _HTML_DYNAMIC_CONTENT_ASSIGNMENT_RE.finditer(html):
+        rhs = str(match.group("rhs") or "").lower()
+        if not any(marker in rhs for marker in _HTML_DYNAMIC_PRIMARY_MARKERS):
+            continue
+        target_id = str(match.group("id") or match.group("selector_id") or "").strip()
+        if target_id:
+            target_ids.append(target_id)
+    if not target_ids:
+        return []
+
+    static_bodies = _static_html_element_bodies_by_id(html)
+    empty_targets: list[str] = []
+    for target_id in dict.fromkeys(target_ids):
+        body = static_bodies.get(target_id)
+        if body is None:
+            continue
+        if not _html_fragment_has_static_user_content(body):
+            empty_targets.append(target_id)
+    return empty_targets
+
+
+def _static_html_element_bodies_by_id(html: str) -> dict[str, str]:
+    html_without_scripts = _HTML_SCRIPT_OR_STYLE_RE.sub("", html)
+    return {
+        str(match.group("id") or "").strip(): str(match.group("body") or "")
+        for match in _HTML_ID_ELEMENT_RE.finditer(html_without_scripts)
+        if str(match.group("id") or "").strip()
+    }
+
+
+def _html_fragment_has_static_user_content(fragment: str) -> bool:
+    if re.search(r"<\s*(?:a|article|figure|img|li|p|section|table|td|th|tr)\b", fragment, re.IGNORECASE):
+        return True
+    text = _HTML_TAG_RE.sub(" ", fragment)
+    return len(" ".join(text.split())) >= 24
+
+
+def _expected_artifact_paths_from_context(config, *, context_in: Any) -> list[str]:
+    task = getattr(config, "task", None)
+    if context_in is None or task is None:
+        return []
+    try:
+        artifact_root = artifact_root_for_principal(task.principal_id)
+    except Exception:
+        logger.debug("Could not resolve artifact root for expected artifact extraction", exc_info=True)
+        return []
+    return _normalize_artifact_path_candidates(
+        _artifact_path_candidates_from_value(context_in),
+        artifact_root=artifact_root,
+    )
+
+
+def _observed_artifact_paths_for_verification(
+    config,
+    *,
+    output_text: str,
+    tool_results: list[Any],
+    deliverable_artifacts: list[str],
+) -> list[str]:
+    task = config.task
+    try:
+        artifact_root = artifact_root_for_principal(task.principal_id)
+    except Exception:
+        logger.debug("Could not resolve artifact root for observed artifact extraction", exc_info=True)
+        return []
+    candidates: list[str] = []
+    candidates.extend(deliverable_artifacts)
+    candidates.extend(_artifact_path_candidates_from_value(output_text))
+    for result in tool_results or ():
+        output = getattr(result, "output", None)
+        candidates.extend(_artifact_path_candidates_from_value(output))
+    return _normalize_artifact_path_candidates(candidates, artifact_root=artifact_root)
+
+
+def _artifact_path_candidates_from_value(value: Any) -> list[str]:
+    candidates: list[str] = []
+    if value is None:
+        return candidates
+    if isinstance(value, str):
+        candidates.extend(str(path) for path in media_candidate_paths_from_text(value))
+        return candidates
+    if isinstance(value, dict):
+        for key in ("path", "artifact_path"):
+            raw_path = value.get(key)
+            if isinstance(raw_path, str) and raw_path.strip():
+                candidates.append(raw_path)
+        for key in ("artifact_paths", "artifacts", "files"):
+            raw_values = value.get(key)
+            if isinstance(raw_values, (list, tuple)):
+                for item in raw_values:
+                    candidates.extend(_artifact_path_candidates_from_value(item))
+            elif isinstance(raw_values, dict):
+                candidates.extend(_artifact_path_candidates_from_value(raw_values))
+        for key in ("output", "summary", "message", "text", "content"):
+            nested = value.get(key)
+            if nested is not value:
+                candidates.extend(_artifact_path_candidates_from_value(nested))
+        return candidates
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            candidates.extend(_artifact_path_candidates_from_value(item))
+    return candidates
+
+
+def _normalize_artifact_path_candidates(candidates: list[str], *, artifact_root: Path) -> list[str]:
+    paths: list[str] = []
+    for raw_path in candidates:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = artifact_root / candidate.name
+        try:
+            descriptor = artifact_descriptor_for_path(candidate, artifact_root=artifact_root)
+        except Exception:
+            descriptor = None
+        if descriptor is not None:
+            paths.append(descriptor.path)
+    return list(dict.fromkeys(paths))
 
 
 def _relocate_external_artifact_paths_for_task(config, artifact_paths: list[str]) -> list[str]:
@@ -485,6 +926,11 @@ def _task_requires_user_file_delivery(task) -> bool:
         return True
     metadata = getattr(task, "metadata", None)
     if isinstance(metadata, dict):
+        # Verifier and receipt tasks consume an artifact contract produced by an
+        # upstream step. They should validate or summarize that contract, not be
+        # failed for not creating another downloadable file themselves.
+        if str(metadata.get("artifact_role") or "").strip() in {"verify", "deliver_receipt"}:
+            return False
         return bool(metadata.get("requires_artifact_delivery") or metadata.get("required_artifact_kind"))
     return False
 
@@ -642,17 +1088,86 @@ def _evidence_fallback_timeout_seconds() -> float:
     )
 
 
+def _completion_decision_timeout_seconds() -> float:
+    return _float_env(
+        _DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS_ENV,
+        _DEFAULT_DEEP_AGENT_COMPLETION_DECISION_TIMEOUT_SECONDS,
+        minimum=0.1,
+    )
+
+
+async def _scheduled_task_completion_decision(
+    config,
+    *,
+    output_text: str,
+    tool_results: list[Any],
+    model_client: Any,
+) -> dict[str, str] | None:
+    """Validate scheduled mini-agent completion before publishing dependency context."""
+    if not _is_scheduled_background_config(config):
+        return None
+    create = getattr(model_client, "create", None)
+    if create is None or not _model_client_can_make_evidence_fallback_decision(model_client):
+        return None
+    task = getattr(config, "task", None)
+    evidence = _tool_evidence_payload(tool_results)
+    system_prompt = (
+        "You validate one completed Nullion scheduled-task step. "
+        "Use only the assigned task, dependency context, final answer, and verified tool-result evidence. "
+        "Output only JSON with this schema: "
+        '{"status":"success"|"failure","answer":"string"}. '
+        "Set status=failure when required evidence, data, side effects, or verification are insufficient. "
+        "For a reasoning/synthesis-only step with no side-effect tool to perform, do not set failure solely "
+        "because some candidate items are unverified; return success when the answer can report verified "
+        "partial findings with clear caveats and avoid unsafe downstream claims. "
+        "External platform delivery is performed by Nullion after this step; do not require proof that a "
+        "message, report, or artifact was already sent unless the assigned task had an available side-effect "
+        "tool and the final answer claims that tool-side effect already happened. "
+        "For success, keep answer as the concise user-facing task result. "
+        "Do not mention internal validation, tools, or orchestration."
+    )
+    user_payload = {
+        "task": str(getattr(task, "description", "") or getattr(task, "title", "") or ""),
+        "allowed_tools": list(getattr(task, "allowed_tools", ()) or ()),
+        "dependency_context": getattr(config, "context_in", None),
+        "final_answer": str(output_text or ""),
+        "tool_evidence": evidence,
+    }
+    create_kwargs = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": json.dumps(user_payload, ensure_ascii=False, default=str)}],
+            }
+        ],
+        "tools": [],
+        "max_tokens": 700,
+        "system": system_prompt,
+    }
+    try:
+        response = await asyncio.wait_for(
+            _call_model_create(create, create_kwargs),
+            timeout=_completion_decision_timeout_seconds(),
+        )
+    except Exception:
+        logger.warning(
+            "DeepAgent scheduled completion validation failed; preserving original result "
+            "agent_id=%s task_id=%s",
+            getattr(config, "agent_id", ""),
+            str(getattr(task, "task_id", "") or ""),
+            exc_info=True,
+        )
+        return None
+    return _parse_evidence_fallback_decision(_extract_response_text(response))
+
+
 async def _fallback_answer_from_tool_evidence(
     config,
     *,
     tool_results: list[Any],
     model_client: Any,
 ) -> str:
-    completed_results = [
-        result
-        for result in tool_results
-        if str(getattr(result, "status", "") or "").lower() in {"completed", "success", "succeeded"}
-    ]
+    completed_results = _completed_tool_results(tool_results)
     if not completed_results:
         raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence was unavailable for recovery.")
     deterministic_answer = _deterministic_scheduled_tool_evidence_answer(config, completed_results)
@@ -709,7 +1224,9 @@ async def _fallback_answer_from_tool_evidence(
         ) from exc
     decision = _parse_evidence_fallback_decision(_extract_response_text(response))
     if decision is None:
-        raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence recovery returned no valid structured decision.")
+        if deterministic_answer:
+            return deterministic_answer
+        return _generic_tool_evidence_answer(config, completed_results)
     if decision.get("status") != "success":
         reason = str(decision.get("answer") or "Verified tool evidence was insufficient to finish the task.").strip()
         metadata = getattr(config.task, "metadata", None)
@@ -719,11 +1236,15 @@ async def _fallback_answer_from_tool_evidence(
         raise DeepAgentEvidenceFallbackUnavailable(reason)
     answer = str(decision.get("answer") or "").strip()
     if not answer:
-        raise DeepAgentEvidenceFallbackUnavailable("Verified tool evidence recovery returned an empty answer.")
+        if deterministic_answer:
+            return deterministic_answer
+        return _generic_tool_evidence_answer(config, completed_results)
     return answer
 
 
 def _model_client_can_make_evidence_fallback_decision(model_client: Any) -> bool:
+    if callable(getattr(model_client, "create", None)):
+        return True
     provider = str(getattr(model_client, "provider", "") or "").strip()
     model = str(getattr(model_client, "model", "") or "").strip()
     if provider or model:
@@ -752,26 +1273,19 @@ def _deterministic_scheduled_tool_evidence_answer(config, tool_results: list[Any
     metadata = metadata if isinstance(metadata, dict) else {}
     if not metadata.get("scheduled_task_run"):
         return ""
-    evidence = _tool_evidence_payload(tool_results, max_results=8, max_chars=700)
-    if not evidence:
+    completed_results = _completed_tool_results(tool_results)
+    if not completed_results:
         return ""
     title = str(getattr(task, "title", "") or "Scheduled subtask").strip()
-    lines = [f"{title} completed with verified runtime evidence."]
-    for item in evidence:
-        tool_name = str(item.get("tool_name") or "tool").strip() or "tool"
-        status = str(item.get("status") or "completed").strip() or "completed"
-        output = str(item.get("output") or "").strip()
-        error = str(item.get("error") or "").strip()
-        if tool_name == "connector_request":
-            output = "[connector response captured by runtime]"
-        elif len(output) > 700:
-            output = output[:700].rstrip() + "...[truncated]"
-        detail = output or error
-        if detail:
-            lines.append(f"- {tool_name} ({status}): {detail}")
-        else:
-            lines.append(f"- {tool_name} ({status})")
-    return "\n".join(lines)
+    tool_names = [
+        str(getattr(result, "tool_name", "") or "").strip()
+        for result in completed_results
+        if str(getattr(result, "tool_name", "") or "").strip()
+    ]
+    tool_summary = ", ".join(dict.fromkeys(tool_names[:6]))
+    if tool_summary:
+        return f"{title} completed with verified runtime evidence from {tool_summary}."
+    return f"{title} completed with verified runtime evidence."
 
 
 def _tool_evidence_payload(tool_results: list[Any], *, max_results: int = 12, max_chars: int = 1200) -> list[dict[str, Any]]:

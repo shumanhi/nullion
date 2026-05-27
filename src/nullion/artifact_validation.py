@@ -57,6 +57,11 @@ _OFFICE_REQUIRED_MEMBERS = {
     ".docx": ("[Content_Types].xml", "word/document.xml"),
     ".pptx": ("[Content_Types].xml", "ppt/presentation.xml"),
 }
+_HTML_DYNAMIC_RENDER_TARGET_RE = re.compile(
+    r"document\s*\.\s*getElementById\s*\(\s*['\"](?P<target>[^'\"]+)['\"]\s*\)"
+    r"\s*\.\s*(?:innerHTML|textContent|appendChild)\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,8 +237,37 @@ def _validate_html_artifact(path: Path) -> list[ArtifactValidationIssue]:
                 "HTML artifact appears to contain duplicate document/page roots.",
             )
         )
+    issues.extend(_validate_html_static_primary_content(path, text))
     issues.extend(_validate_html_report_consistency(path, text, parser))
     return issues
+
+
+def _validate_html_static_primary_content(path: Path, text: str) -> list[ArtifactValidationIssue]:
+    for target in {
+        match.group("target").strip()
+        for match in _HTML_DYNAMIC_RENDER_TARGET_RE.finditer(text)
+        if match.group("target").strip()
+    }:
+        if _html_has_empty_render_target(text, target):
+            return [
+                _issue(
+                    str(path),
+                    "html_primary_content_script_dependent",
+                    "HTML artifact relies on client-side JavaScript to populate visible content.",
+                )
+            ]
+    return []
+
+
+def _html_has_empty_render_target(text: str, target: str) -> bool:
+    escaped = re.escape(target)
+    return bool(
+        re.search(
+            rf"<(?P<tag>[a-z][\w:-]*)\b(?=[^>]*\bid\s*=\s*['\"]{escaped}['\"])[^>]*>\s*</(?P=tag)>",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
 
 
 def _validate_xml_artifact(path: Path, suffix: str) -> list[ArtifactValidationIssue]:

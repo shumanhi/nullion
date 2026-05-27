@@ -21,6 +21,7 @@ from nullion.messaging_adapters import (
     MessagingAdapterDependencyError,
     MessagingIngress,
     build_platform_delivery_receipt,
+    delivery_receipt_transport_succeeded,
     handle_messaging_ingress_result,
     platform_delivery_failure_reply,
     prepare_reply_for_platform_delivery,
@@ -46,7 +47,7 @@ from nullion.users import resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
-_WORKING_ACK_TEXT = "Working on your request now. You can keep sending requests."
+_WORKING_ACK_TEXT = "⧖ Working on your request now. You can keep sending requests while it runs..."
 
 
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
@@ -376,7 +377,7 @@ async def send_discord_platform_delivery(
                     transport_ok=True,
                 )
                 record_platform_delivery_receipt(receipt)
-                return receipt.status == "succeeded"
+                return delivery_receipt_transport_succeeded(receipt)
             try:
                 response = await client.post(url, headers=headers, json={"content": delivery.text or ""})
                 response.raise_for_status()
@@ -395,7 +396,7 @@ async def send_discord_platform_delivery(
                 transport_ok=True,
             )
             record_platform_delivery_receipt(receipt)
-            return receipt.status == "succeeded"
+            return delivery_receipt_transport_succeeded(receipt)
     except Exception:
         logger.warning("Discord platform delivery failed", exc_info=True)
         if delivery is not None:

@@ -14,6 +14,7 @@ from importlib.util import find_spec
 from typing import Any
 from uuid import uuid4
 
+from nullion.response_fulfillment_contract import artifact_media_plain_replacement_guard_result
 from nullion.tools import ToolInvocation, ToolResult
 
 
@@ -52,6 +53,7 @@ def nullion_tools_as_langchain_tools(
         raise RuntimeError("LangChain tool adapter requires langchain-core") from exc
 
     tool_definitions = _scoped_tool_definitions(tool_registry, allowed_tools=allowed_tools)
+    shared_tool_results: list[ToolResult] = []
     return [
         StructuredTool.from_function(
             coroutine=_make_langchain_tool_coroutine(
@@ -62,6 +64,7 @@ def nullion_tools_as_langchain_tools(
                 tool_registry=tool_registry,
                 policy_store=policy_store,
                 tool_result_callback=tool_result_callback,
+                prior_tool_results=shared_tool_results,
             ),
             name=str(tool_def.get("name")),
             description=_enhanced_tool_description(tool_def),
@@ -176,6 +179,7 @@ def _make_langchain_tool_coroutine(
     tool_registry: Any,
     policy_store: Any,
     tool_result_callback: Any,
+    prior_tool_results: list[ToolResult],
 ):
     async def _run_nullion_tool(**kwargs: Any) -> str:
         invocation = ToolInvocation(
@@ -185,7 +189,7 @@ def _make_langchain_tool_coroutine(
             arguments=dict(kwargs),
             capsule_id=cleanup_scope,
         )
-        result = _invoke_nullion_tool(
+        result = artifact_media_plain_replacement_guard_result(invocation, prior_tool_results) or _invoke_nullion_tool(
             invocation,
             tool_registry=tool_registry,
             policy_store=policy_store,
@@ -209,6 +213,7 @@ def _make_langchain_tool_coroutine(
                 if not _result_allows_fallback(fallback_result):
                     result = fallback_result
                     break
+        prior_tool_results.extend(emitted_results)
         if tool_result_callback is not None:
             for emitted_result in emitted_results:
                 tool_result_callback(emitted_result)
@@ -469,7 +474,16 @@ def _tool_group_for_name(name: str) -> str:
         return "browser"
     if lowered in {"web_search", "web_fetch"}:
         return "research"
-    if lowered in {"file_write", "pdf_create", "pdf_edit", "render", "image_generate"} or "screenshot" in lowered:
+    if lowered in {
+        "document_create",
+        "file_write",
+        "pdf_create",
+        "pdf_edit",
+        "presentation_create",
+        "render",
+        "image_generate",
+        "spreadsheet_create",
+    } or "screenshot" in lowered:
         return "artifact"
     if lowered in {"file_read", "file_search", "workspace_summary"}:
         return "repo_analysis"

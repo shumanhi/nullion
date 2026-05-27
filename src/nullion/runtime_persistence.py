@@ -101,6 +101,16 @@ def _runtime_store_file_lock(target: Path):
             elif msvcrt is not None:
                 lock_file.seek(0)
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def runtime_store_file_lock(path: str | Path):
+    """Share the runtime DB file lock with sidecar stores that write into it."""
+
+    with _runtime_store_file_lock(Path(path)):
+        yield
+
+
 RUNTIME_SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 
 _BUILDER_PROPOSAL_FALLBACK_CREATED_AT = datetime.fromtimestamp(0, tz=UTC)
@@ -244,7 +254,7 @@ def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeSto
             store.mini_agent_runs[key] = previous_run
         else:
             store.mini_agent_runs[key] = _mini_agent_run_merge_value(current_run, previous_run)
-    for attr in ("events", "audit_records"):
+    for attr in ("events", "audit_records", "conversation_events"):
         _merge_list_records(getattr(store, attr), getattr(previous, attr))
     if getattr(previous, "builder_route_observations", None):
         from nullion.builder_routes import trim_route_observations
@@ -329,6 +339,7 @@ _SQLITE_RUNTIME_TABLES: dict[str, str] = {
     "conversation_ingress_ids": "conversation_events",
     "conversation_events": "conversation_events",
 }
+_SQLITE_APPEND_ONLY_COLLECTIONS = frozenset({"conversation_events"})
 
 _SQLITE_TABLE_NAMES = tuple(dict.fromkeys(_SQLITE_RUNTIME_TABLES.values()))
 _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE = {
@@ -340,6 +351,9 @@ _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE = {
     for table_name in _SQLITE_TABLE_NAMES
 }
 _ENCRYPTED_SQLITE_COLLECTIONS = frozenset({"user_facts", "preferences", "environment_facts"})
+_SQLITE_AUXILIARY_COLLECTIONS_BY_TABLE = {
+    "reminders_crons": ("cron_jobs",),
+}
 
 
 def _is_sqlite_runtime_path(path: Path) -> bool:
@@ -1676,6 +1690,163 @@ CREATE TABLE IF NOT EXISTS runtime_meta (
 """ + "\n".join(table_blocks) + runtime_event_indexes
 
 
+def _sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _valid_auxiliary_sqlite_row(collection: str, payload: str) -> bool:
+    if collection != "cron_jobs":
+        return True
+    try:
+        decoded = json.loads(payload)
+    except Exception:
+        return False
+    return isinstance(decoded, dict) and bool(str(decoded.get("id") or "").strip())
+
+
+def _read_sqlite_auxiliary_rows(source: Path) -> dict[str, list[tuple[str, str, str, str]]]:
+    rows_by_table: dict[str, list[tuple[str, str, str, str]]] = {}
+    source_uri = f"file:{source}?mode=ro&immutable=1"
+    with sqlite3.connect(source_uri, uri=True, timeout=10) as conn:
+        for table_name, collections in _SQLITE_AUXILIARY_COLLECTIONS_BY_TABLE.items():
+            if not _sqlite_table_exists(conn, table_name):
+                continue
+            table_rows: list[tuple[str, str, str, str]] = []
+            for collection in collections:
+                for row in conn.execute(
+                    f"""SELECT collection, item_key, payload, updated_at
+                        FROM {table_name}
+                        WHERE collection = ?
+                        ORDER BY rowid""",
+                    (collection,),
+                ):
+                    row_collection = str(row[0] or "")
+                    item_key = str(row[1] or "")
+                    payload = str(row[2] or "")
+                    updated_at = str(row[3] or "")
+                    if not row_collection or not item_key or not payload or not updated_at:
+                        continue
+                    if not _valid_auxiliary_sqlite_row(row_collection, payload):
+                        continue
+                    table_rows.append((row_collection, item_key, payload, updated_at))
+            if table_rows:
+                rows_by_table[table_name] = table_rows
+    return rows_by_table
+
+
+def _auxiliary_row_count(rows_by_table: dict[str, list[tuple[str, str, str, str]]]) -> int:
+    return sum(len(rows) for rows in rows_by_table.values())
+
+
+def _auxiliary_latest_updated_at(rows_by_table: dict[str, list[tuple[str, str, str, str]]]) -> str:
+    updated_values = [
+        str(row[3] or "")
+        for rows in rows_by_table.values()
+        for row in rows
+        if len(row) >= 4 and str(row[3] or "")
+    ]
+    return max(updated_values, default="")
+
+
+def _runtime_auxiliary_backup_candidates(target: Path) -> list[Path]:
+    candidates: list[Path] = []
+    candidates.extend(target.parent.glob(f"{target.name}.bak*"))
+    candidates.extend(target.parent.glob(f"{target.name}.before-*"))
+    candidates.extend(target.parent.glob(f"{target.name}.pre-*"))
+    candidates.extend(target.parent.glob(f"{target.name}.corrupt-*"))
+    backups_dir = target.parent / "backups"
+    if backups_dir.exists():
+        candidates.extend(backups_dir.glob("**/runtime.db"))
+    return sorted(
+        (candidate for candidate in candidates if candidate.exists() and candidate.is_file()),
+        key=lambda candidate: candidate.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def restore_sqlite_auxiliary_rows_from_candidates(
+    sources: list[str | Path] | tuple[str | Path, ...],
+    target: str | Path,
+) -> int:
+    """Restore auxiliary runtime rows from the best readable SQLite source."""
+
+    target_path = Path(target)
+    best_source: Path | None = None
+    best_rows: dict[str, list[tuple[str, str, str, str]]] = {}
+    best_score: tuple[int, str] = (0, "")
+    seen: set[Path] = set()
+    for raw_source in sources:
+        source_path = Path(raw_source)
+        if not source_path.exists() or not source_path.is_file():
+            continue
+        try:
+            resolved = source_path.resolve()
+        except OSError:
+            resolved = source_path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            rows_by_table = _read_sqlite_auxiliary_rows(source_path)
+        except sqlite3.Error as exc:
+            logger.warning("Could not read auxiliary runtime rows from %s: %s", source_path, exc)
+            continue
+        row_count = _auxiliary_row_count(rows_by_table)
+        score = (row_count, _auxiliary_latest_updated_at(rows_by_table))
+        if score > best_score:
+            best_source = source_path
+            best_rows = rows_by_table
+            best_score = score
+    restored = _auxiliary_row_count(best_rows)
+    if best_source is None or restored <= 0:
+        logger.warning("No auxiliary runtime rows could be restored into %s.", target_path)
+        return 0
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with sqlite3.connect(str(target_path), timeout=10) as conn:
+            conn.executescript(_sqlite_runtime_ddl())
+            for table_name, rows in best_rows.items():
+                collections = tuple(dict.fromkeys(row[0] for row in rows))
+                conn.executemany(
+                    f"DELETE FROM {table_name} WHERE collection = ?",
+                    [(collection,) for collection in collections],
+                )
+                conn.executemany(
+                    f"""INSERT OR REPLACE INTO {table_name}
+                        (collection, item_key, payload, updated_at)
+                        VALUES (?, ?, ?, ?)""",
+                    rows,
+                )
+    except sqlite3.Error as exc:
+        logger.warning(
+            "Could not restore auxiliary runtime rows from %s into %s: %s",
+            best_source,
+            target_path,
+            exc,
+        )
+        return 0
+    logger.warning(
+        "Restored %d auxiliary runtime row(s) from %s into %s.",
+        restored,
+        best_source,
+        target_path,
+    )
+    return restored
+
+
+def restore_sqlite_auxiliary_rows(source: str | Path, target: str | Path) -> int:
+    """Restore sidecar runtime rows that are not serialized in RuntimeStore."""
+
+    target_path = Path(target)
+    if not _is_sqlite_runtime_path(target_path):
+        return 0
+    return restore_sqlite_auxiliary_rows_from_candidates((source,), target_path)
+
+
 def _log_runtime_sqlite_timing(
     operation: str,
     started_at: float,
@@ -1715,6 +1886,18 @@ def _sqlite_collection_item_key(collection: str, index: int, item: object) -> st
             event_id = item.get("event_id")
             if isinstance(event_id, str) and event_id:
                 return event_id
+            # Conversation events are append-only history. Most chat/session
+            # events do not have an event_id, and using conversation_id here
+            # collapses every event in a chat into one SQLite row after restart.
+            created_at = item.get("created_at")
+            event_type = item.get("event_type")
+            if isinstance(created_at, str) and created_at:
+                stable_payload = json.dumps(item, sort_keys=True, default=str, separators=(",", ":"))
+                digest = hashlib.sha256(stable_payload.encode("utf-8")).hexdigest()[:16]
+                if isinstance(event_type, str) and event_type:
+                    return f"{created_at}:{event_type}:{digest}"
+                return f"{created_at}:{digest}"
+            return f"{index:012d}"
         for key in (
             "approval_id",
             "grant_id",
@@ -1776,6 +1959,7 @@ def _save_runtime_store_sqlite(
                     "mini_agent_runs",
                     "events",
                     "audit_records",
+                    "conversation_events",
                     "builder_route_observations",
                 ),
             )
@@ -1825,7 +2009,11 @@ def _save_runtime_store_sqlite(
                         (collection,),
                     )
                 }
-                stale_keys = set(existing_rows) - set(encoded_rows)
+                stale_keys = (
+                    set()
+                    if collection in _SQLITE_APPEND_ONLY_COLLECTIONS
+                    else set(existing_rows) - set(encoded_rows)
+                )
                 if stale_keys:
                     conn.executemany(
                         f"DELETE FROM {table_name} WHERE collection = ? AND item_key = ?",
@@ -1889,8 +2077,13 @@ def _load_runtime_store_sqlite_payload(
             payload["format_version"] = int(version_row["value"])
         for collection in collections:
             table_name = _SQLITE_RUNTIME_TABLES[collection]
+            order_clause = (
+                "json_extract(payload, '$.created_at'), rowid"
+                if collection == "conversation_events"
+                else "rowid"
+            )
             rows = conn.execute(
-                f"SELECT rowid, item_key, payload FROM {table_name} WHERE collection = ? ORDER BY rowid",
+                f"SELECT rowid, item_key, payload FROM {table_name} WHERE collection = ? ORDER BY {order_clause}",
                 (collection,),
             ).fetchall()
             decoded_rows: list[dict[str, object]] = []
@@ -2022,7 +2215,32 @@ def save_runtime_store(
     target = Path(path)
     if _is_sqlite_runtime_path(target):
         with _runtime_store_file_lock(target):
-            return _save_runtime_store_sqlite(store, target, merge_existing=merge_existing, payload=payload)
+            try:
+                return _save_runtime_store_sqlite(store, target, merge_existing=merge_existing, payload=payload)
+            except sqlite3.DatabaseError as exc:
+                error_text = str(exc).lower()
+                if (
+                    "malformed" not in error_text
+                    and "database disk image" not in error_text
+                    and "file is not a database" not in error_text
+                ):
+                    raise
+                auxiliary_source: Path | None = None
+                if target.exists():
+                    backup = target.with_name(
+                        f"{target.name}.corrupt-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+                    )
+                    shutil.move(str(target), str(backup))
+                    auxiliary_source = backup
+                    logger.error("Runtime SQLite checkpoint was corrupt; moved aside to %s", backup)
+                saved_target = _save_runtime_store_sqlite(store, target, merge_existing=False, payload=payload)
+                restore_sources = [
+                    source
+                    for source in (auxiliary_source, *_runtime_auxiliary_backup_candidates(target))
+                    if source is not None
+                ]
+                restore_sqlite_auxiliary_rows_from_candidates(restore_sources, saved_target)
+                return saved_target
     with _runtime_store_file_lock(target):
         previous_payload = target.read_text(encoding="utf-8") if target.exists() else None
         merged_previous = False
@@ -2264,6 +2482,9 @@ def build_runtime_from_settings(settings: object) -> "PersistentRuntime":
 __all__ = [
     "save_runtime_store",
     "load_runtime_store",
+    "runtime_store_file_lock",
+    "restore_sqlite_auxiliary_rows",
+    "restore_sqlite_auxiliary_rows_from_candidates",
     "migrate_runtime_store_payload",
     "migrate_sqlite_runtime_memory_payloads",
     "list_runtime_store_backups",

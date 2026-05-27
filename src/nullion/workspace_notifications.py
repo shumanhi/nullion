@@ -141,6 +141,7 @@ class _ApprovalBroadcastState(TypedDict, total=False):
     delivered: tuple[str, ...]
     skipped_origin: bool
     skip_reason: str
+    include_origin: bool
 
 
 def _deliver_approval_notification_target(
@@ -227,8 +228,9 @@ def _approval_broadcast_deliver_node(state: _ApprovalBroadcastState) -> dict[str
     origin = state.get("origin")
     delivered: list[str] = []
     skipped_origin = False
+    include_origin = bool(state.get("include_origin"))
     for target in state.get("targets") or ():
-        if _is_origin_delivery_target(target, origin):
+        if not include_origin and _is_origin_delivery_target(target, origin):
             skipped_origin = True
             continue
         try:
@@ -271,9 +273,16 @@ def broadcast_approval_request(
     approval: ApprovalRequest,
     *,
     settings: NullionSettings | None,
+    include_origin: bool = False,
 ) -> tuple[str, ...]:
     final_state = _compiled_approval_broadcast_graph().invoke(
-        {"runtime": runtime, "approval": approval, "settings": settings, "delivered": ()},
+        {
+            "runtime": runtime,
+            "approval": approval,
+            "settings": settings,
+            "delivered": (),
+            "include_origin": include_origin,
+        },
         config={"configurable": {"thread_id": f"approval-broadcast:{approval.approval_id}"}},
     )
     return tuple(final_state.get("delivered") or ())
@@ -284,6 +293,7 @@ def broadcast_new_pending_approvals(
     *,
     before_ids: Iterable[str],
     settings: NullionSettings | None,
+    include_origin: bool = False,
 ) -> tuple[str, ...]:
     store = getattr(runtime, "store", None)
     if store is None:
@@ -295,7 +305,12 @@ def broadcast_new_pending_approvals(
             continue
         if approval.approval_id in before:
             continue
-        delivered.extend(broadcast_approval_request(runtime, approval, settings=settings))
+        delivered.extend(broadcast_approval_request(
+            runtime,
+            approval,
+            settings=settings,
+            include_origin=include_origin,
+        ))
     return tuple(delivered)
 
 
@@ -304,6 +319,7 @@ def broadcast_pending_approval(
     approval_id: str | None,
     *,
     settings: NullionSettings | None,
+    include_origin: bool = False,
 ) -> tuple[str, ...]:
     if not approval_id:
         return ()
@@ -313,7 +329,7 @@ def broadcast_pending_approval(
     approval = store.get_approval_request(str(approval_id))
     if approval is None:
         return ()
-    return broadcast_approval_request(runtime, approval, settings=settings)
+    return broadcast_approval_request(runtime, approval, settings=settings, include_origin=include_origin)
 
 
 __all__ = [

@@ -62,7 +62,7 @@ _PREVIEW_CACHE: dict[tuple[str, tuple[str, ...]], _CachedPreviewEntry] = {}
 _PERSIST_CACHE_LOADED = False
 _PREVIEW_CACHE_NAMESPACE = "cron.planner_preview"
 _PREVIEW_CACHE_MESSAGE_NAMESPACE = "cron.planner_preview.message"
-_PREVIEW_CACHE_VERSION = "v2"
+_PREVIEW_CACHE_VERSION = "v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +250,7 @@ def build_cron_planner_status_preview(
         available_tools=tools,
         dag_plan=dag_plan,
     )
+    group = _strip_runtime_delivery_only_tasks(group)
     preview = CronPlannerStatusPreview(
         group=group,
         planner_summary=_planner_summary_from_disposition(
@@ -363,6 +364,8 @@ def _cron_preview_request_text(user_message: str, *, subject: str) -> str:
         "required_inputs_resolved=true",
         "clarification_allowed=false",
         "decompose_best_effort=true",
+        "external_platform_delivery_managed_by_runtime=true",
+        "omit_runtime_delivery_only_terminal_steps=true",
     ]
     if task_name:
         lines.append(f"scheduled_task_name={task_name}")
@@ -771,8 +774,19 @@ def _materialize_cached_preview(
     group_id = make_group_id()
     task_ids = [make_task_id() for _ in template.tasks]
     tasks: list[TaskRecord] = []
+    disposition = _disposition_from_planner_summary(template.planner_summary)
     for idx, task_template in enumerate(template.tasks):
-        dependencies = [task_ids[dep_idx] for dep_idx in task_template.dependency_indexes if dep_idx < len(task_ids)]
+        dependency_indexes = [
+            dep_idx
+            for dep_idx in task_template.dependency_indexes
+            if 0 <= dep_idx < idx
+        ]
+        # Cached previews can outlive planner fixes. Preserve the user-visible
+        # contract: a sequential preview must not dispatch later steps until the
+        # previous step has completed successfully.
+        if disposition == "sequential_mission" and idx > 0 and (idx - 1) not in dependency_indexes:
+            dependency_indexes.append(idx - 1)
+        dependencies = [task_ids[dep_idx] for dep_idx in sorted(set(dependency_indexes)) if dep_idx < len(task_ids)]
         tasks.append(
             TaskRecord(
                 task_id=task_ids[idx],
@@ -794,16 +808,86 @@ def _materialize_cached_preview(
         tasks=tasks,
         planner_metadata={
             "planner": "model_dag",
-            "disposition": _disposition_from_planner_summary(template.planner_summary),
+            "disposition": disposition,
             "dispatchable_when_requested": True,
             "from_cache": True,
         },
     )
+    group = _strip_runtime_delivery_only_tasks(group)
+    planner_summary = _planner_summary_from_disposition(
+        disposition=disposition,
+        task_count=len(group.tasks),
+    )
     return CronPlannerStatusPreview(
         group=group,
-        planner_summary=template.planner_summary,
+        planner_summary=planner_summary,
         subject=subject or template.subject,
     )
+
+
+def _strip_runtime_delivery_only_tasks(group: TaskGroup) -> TaskGroup:
+    """Remove terminal presentation/delivery placeholders from cron previews.
+
+    Platform delivery happens after the scheduled run. A terminal task with no
+    tools, no artifact contract, and no context output has no runtime work for a
+    mini-agent to perform, so keeping it in the DAG only creates false failures.
+    """
+    tasks = list(group.tasks or [])
+    if len(tasks) <= 1:
+        return group
+    kept = {task.task_id for task in tasks}
+    removed_any = False
+    while True:
+        dependents = {
+            dep
+            for task in tasks
+            if task.task_id in kept
+            for dep in (task.dependencies or [])
+            if dep in kept
+        }
+        removable = {
+            task.task_id
+            for task in tasks
+            if task.task_id in kept
+            and task.task_id not in dependents
+            and not _task_has_runtime_work(task)
+        }
+        if not removable or len(kept - removable) == 0:
+            break
+        kept -= removable
+        removed_any = True
+    if not removed_any:
+        return group
+    filtered = [
+        replace(
+            task,
+            dependencies=[dep for dep in (task.dependencies or []) if dep in kept],
+        )
+        for task in tasks
+        if task.task_id in kept
+    ]
+    return TaskGroup(
+        group_id=group.group_id,
+        conversation_id=group.conversation_id,
+        original_message=group.original_message,
+        tasks=filtered,
+        planner_metadata=dict(group.planner_metadata or {}),
+        created_at=group.created_at,
+    )
+
+
+def _task_has_runtime_work(task: TaskRecord) -> bool:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if any(str(tool or "").strip() for tool in (getattr(task, "allowed_tools", None) or ())):
+        return True
+    if str(getattr(task, "context_key_out", "") or "").strip():
+        return True
+    if metadata.get("requires_artifact_delivery") or metadata.get("required_artifact_kind"):
+        return True
+    if str(metadata.get("artifact_role") or "").strip():
+        return True
+    return False
 
 
 def _disposition_from_planner_summary(summary: str) -> str:

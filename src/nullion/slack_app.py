@@ -21,6 +21,7 @@ from nullion.messaging_adapters import (
     MessagingAdapterDependencyError,
     MessagingIngress,
     build_platform_delivery_receipt,
+    delivery_receipt_transport_succeeded,
     handle_messaging_ingress_result,
     platform_delivery_failure_reply,
     prepare_reply_for_platform_delivery,
@@ -46,7 +47,7 @@ from nullion.users import resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
-_WORKING_ACK_TEXT = "Working on your request now. You can keep sending requests."
+_WORKING_ACK_TEXT = "⧖ Working on your request now. You can keep sending requests while it runs..."
 
 
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
@@ -415,7 +416,7 @@ async def send_slack_platform_delivery(
                 error=None if uploaded else "attachment_upload_failed",
             )
             record_platform_delivery_receipt(receipt)
-            return receipt.status == "succeeded"
+            return delivery_receipt_transport_succeeded(receipt)
         await _post_slack_message_with_plain_fallback(
             client,
             channel=channel,
@@ -429,7 +430,7 @@ async def send_slack_platform_delivery(
             transport_ok=True,
         )
         record_platform_delivery_receipt(receipt)
-        return receipt.status == "succeeded"
+        return delivery_receipt_transport_succeeded(receipt)
     except Exception:
         logger.warning("Slack platform delivery failed", exc_info=True)
         if delivery is not None:

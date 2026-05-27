@@ -48,6 +48,21 @@ _RAW_FUNCTION_CALL_RE = re.compile(
     r"<\s*function\b[\s\S]*?</\s*function\s*>|#\{\s*<\s*function\b[\s\S]*?</\s*function\s*>\s*\}",
     flags=re.IGNORECASE,
 )
+_SCHEDULER_ACTION_TOOLS = frozenset(
+    {
+        "create_cron",
+        "run_cron",
+        "update_cron",
+        "delete_cron",
+        "toggle_cron",
+        "set_reminder",
+        "create_reminder",
+        "update_reminder",
+        "delete_reminder",
+    }
+)
+_SCHEDULER_READ_TOOLS = frozenset({"list_crons", "list_reminders"})
+_ACTION_RECEIPT_REPLY_EXCLUDED_TOOLS = frozenset({"terminal_exec"})
 
 
 def user_requested_raw_output(user_message: str | None) -> bool:
@@ -75,6 +90,10 @@ def sanitize_user_visible_reply(
     raw = _sanitize_internal_tool_state_phrasing(raw, results)
     raw = _sanitize_account_tool_family_drift(raw, results)
     raw = _prefix_account_tool_reply(raw, results)
+    if action_receipt_reply := _action_receipt_reply_over_drift(raw, results):
+        return _sanitize_local_paths(action_receipt_reply)
+    if scheduler_action_reply := _scheduler_action_reply_over_read_drift(raw, results):
+        return _sanitize_local_paths(scheduler_action_reply)
     if numbered_reply := _structured_numbered_choice_reply(results):
         return numbered_reply
     if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
@@ -131,6 +150,101 @@ def _cron_list_reply_over_empty_reminder_drift(text: str, results: list[ToolResu
     return None
 
 
+def _scheduler_action_reply_over_read_drift(text: str, results: list[ToolResult]) -> str | None:
+    action_message = ""
+    for result in reversed(results):
+        if result.status != "completed" or result.tool_name not in _SCHEDULER_ACTION_TOOLS:
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        message = output.get("message")
+        if isinstance(message, str) and message.strip():
+            action_message = message.strip()
+            break
+    if not action_message:
+        return None
+    normalized_reply = _normalized_reply_text(text)
+    normalized_action = _normalized_reply_text(action_message)
+    if normalized_action and normalized_action in normalized_reply:
+        return None
+    for result in results:
+        if result.status != "completed" or result.tool_name not in _SCHEDULER_READ_TOOLS:
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        message = output.get("message")
+        if not isinstance(message, str) or not message.strip():
+            continue
+        if _normalized_reply_text(message) == normalized_reply:
+            return action_message
+    return None
+
+
+def _format_action_receipt(output: dict[str, object]) -> str | None:
+    receipt = output.get("action_receipt")
+    if not isinstance(receipt, dict):
+        return None
+    summary = str(receipt.get("summary") or output.get("message") or "").strip()
+    if not summary:
+        return None
+    lines = [summary]
+    details = receipt.get("details")
+    if isinstance(details, list):
+        clean_details = [str(detail).strip() for detail in details if str(detail or "").strip()]
+        if clean_details:
+            lines.extend(["", "Details:"])
+            lines.extend(f"- {detail}" for detail in clean_details)
+    return "\n".join(lines).strip()
+
+
+def _reply_contains_action_receipt(text: str, receipt_text: str) -> bool:
+    normalized_reply = _normalized_reply_text(text)
+    normalized_receipt = _normalized_reply_text(receipt_text)
+    if normalized_receipt and normalized_receipt in normalized_reply:
+        return True
+    first_line = receipt_text.splitlines()[0] if receipt_text else ""
+    normalized_first = _normalized_reply_text(first_line)
+    if normalized_first and normalized_first in normalized_reply:
+        detail_lines = [
+            line.removeprefix("-").strip()
+            for line in receipt_text.splitlines()
+            if line.strip().startswith("-")
+        ]
+        if not detail_lines:
+            return True
+        return any(_normalized_reply_text(detail) in normalized_reply for detail in detail_lines)
+    return False
+
+
+def _action_receipt_reply_over_drift(text: str, results: list[ToolResult]) -> str | None:
+    receipt_text = ""
+    receipt_tool_name = ""
+    for result in reversed(results):
+        if result.status != "completed" or not isinstance(result.output, dict):
+            continue
+        if result.tool_name in _ACTION_RECEIPT_REPLY_EXCLUDED_TOOLS:
+            continue
+        formatted = _format_action_receipt(result.output)
+        if formatted:
+            receipt_text = formatted
+            receipt_tool_name = result.tool_name
+            break
+    if not receipt_text or _reply_contains_action_receipt(text, receipt_text):
+        return None
+
+    normalized_reply = _normalized_reply_text(text)
+    if receipt_tool_name not in _SCHEDULER_ACTION_TOOLS:
+        return None
+    for result in results:
+        if result.status != "completed" or result.tool_name not in _SCHEDULER_READ_TOOLS:
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        message = output.get("message")
+        if isinstance(message, str) and message.strip() and _normalized_reply_text(message) == normalized_reply:
+            return receipt_text
+    if not normalized_reply:
+        return receipt_text
+    return None
+
+
 _EMAIL_TRANSPORT_PAREN_RE = re.compile(
     r"\s*\((?:\s*(?:status\s+\d{3}|message\s+id\s+[A-Za-z0-9_.:-]+)\s*,?)+\)",
     flags=re.IGNORECASE,
@@ -180,14 +294,14 @@ _INTERNAL_TOOL_STATE_START_RE = re.compile(
 _INTERNAL_TOOL_NAME_RE = re.compile(
     r"\b(?:"
     r"calendar_list|connector_request|email_read|email_search|email_send|skill_pack_read|"
-    r"browser_extract_text|browser_navigate|browser_screenshot|terminal_exec|file_read|file_write"
+    r"browser_extract_items|browser_extract_text|browser_navigate|browser_screenshot|terminal_exec|file_read|file_write"
     r")\b"
 )
 _INTERNAL_TOOL_NAME_SENTENCE_RE = re.compile(
     r"(?:(?:^|(?<=[.!?])\s+))"
     r"[^.!?\n]*"
     r"(?:calendar_list|connector_request|email_read|email_search|email_send|skill_pack_read|"
-    r"browser_extract_text|browser_navigate|browser_screenshot|terminal_exec|file_read|file_write)"
+    r"browser_extract_items|browser_extract_text|browser_navigate|browser_screenshot|terminal_exec|file_read|file_write)"
     r"[^.!?\n]*[.!?]?",
     flags=re.IGNORECASE,
 )
