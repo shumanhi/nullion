@@ -391,6 +391,7 @@ class TurnToolEvidence:
     has_attachments: bool = False
     requested_extensions: tuple[str, ...] = ()
     context_linked: bool = False
+    saved_history_available: bool = False
     slash_prefixed_literal: bool = False
     prior_tool_scopes: tuple[str, ...] = ()
 
@@ -578,7 +579,14 @@ class ScopedTurnToolRegistry:
                 )
             )
         if tool_name in _CONVERSATION_HISTORY_TOOLS:
-            return tool_name in set(self.turn_tool_scope_decision.requested_tool_names)
+            return (
+                tool_name in set(self.turn_tool_scope_decision.requested_tool_names)
+                or self._evidence.saved_history_available
+                or (
+                    self._evidence.context_linked
+                    and self._evidence.has_prior_tool_scope("conversation_history")
+                )
+            )
         if self._evidence.context_linked:
             return True
         if tool_name == "file_read" and self._evidence.slash_prefixed_literal and not self._evidence.has_attachments:
@@ -959,6 +967,7 @@ def build_turn_tool_evidence(
     conversation_result: object | None,
     has_attachments: bool = False,
     requested_extensions: Iterable[str] | None = None,
+    saved_history_available: bool = False,
     prior_tool_scopes: Iterable[str] | None = None,
 ) -> TurnToolEvidence:
     normalized_extensions = tuple(
@@ -986,6 +995,7 @@ def build_turn_tool_evidence(
         has_attachments=bool(has_attachments),
         requested_extensions=normalized_extensions,
         context_linked=turn_is_context_linked(conversation_result),
+        saved_history_available=bool(saved_history_available),
         slash_prefixed_literal=is_slash_prefixed_literal_message(user_message),
         prior_tool_scopes=normalized_prior_tool_scopes,
     )
