@@ -556,6 +556,50 @@ async def _edit_text_with_plain_fallback(
             )
 
 
+async def _deliver_callback_action_result(message, acknowledgement: str, reply: str) -> None:
+    """Update callback cards without losing oversized action output."""
+    formatted_reply, reply_kwargs = format_telegram_text(reply)
+    reply_kwargs = {**reply_kwargs, "reply_markup": None}
+    if len(formatted_reply) <= _TELEGRAM_MESSAGE_CHUNK_SIZE:
+        try:
+            await _edit_text_with_plain_fallback(
+                message.edit_text,
+                formatted_reply,
+                reply,
+                **reply_kwargs,
+            )
+        except Exception as exc:
+            if not _is_telegram_message_not_modified_error(exc):
+                raise
+            logger.debug("Telegram callback acknowledgement already reflected in message.")
+        return
+
+    summary_text = (
+        f"{acknowledgement}\n\n"
+        "The result is too long for one Telegram message, so I am sending it below."
+    )
+    formatted_summary, summary_kwargs = format_telegram_text(summary_text)
+    summary_kwargs = {**summary_kwargs, "reply_markup": None}
+    try:
+        await _edit_text_with_plain_fallback(
+            message.edit_text,
+            formatted_summary,
+            summary_text,
+            **summary_kwargs,
+        )
+    except Exception as exc:
+        if not _is_telegram_message_not_modified_error(exc):
+            raise
+        logger.debug("Telegram callback acknowledgement already reflected in message.")
+    await _reply_text_in_chunks_with_plain_fallback(
+        message,
+        formatted_reply,
+        reply,
+        do_quote=False,
+        **reply_kwargs,
+    )
+
+
 async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool, **kwargs) -> bool:
     reply_text = getattr(message, "reply_text", None)
     if reply_text is None:
@@ -4802,16 +4846,7 @@ class ChatOperatorService:
             )
             if message is None or skip_message_edit:
                 return
-            formatted_reply, reply_kwargs = format_telegram_text(reply)
-            reply_kwargs = {**reply_kwargs, "reply_markup": None}
-            try:
-                await retry_messaging_delivery_operation(
-                    lambda: message.edit_text(formatted_reply, **reply_kwargs)
-                )
-            except Exception as exc:
-                if not _is_telegram_message_not_modified_error(exc):
-                    raise
-                logger.debug("Telegram callback acknowledgement already reflected in message.")
+            await _deliver_callback_action_result(message, acknowledgement, reply)
             should_resume_approval = kind == "approval" and action in {"approve", "allow_session", "allow_once", "always_allow"}
             if should_resume_approval:
                 approval = self.runtime.store.get_approval_request(record_id)

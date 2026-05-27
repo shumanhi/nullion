@@ -10211,8 +10211,8 @@ async function updateDoctorItem(kind, id, action) {
       ? 'Safe fix applied successfully.'
       : `${action.replaceAll('_', ' ')} completed.`);
     doctorActionFeedback.set(stateKey, message);
-    if (kind === 'doctor' && action === 'repair') {
-      addAssistantNotice('Safe fix applied', `${label}: ${message}`);
+    if (kind === 'doctor') {
+      addAssistantNotice(action === 'repair' ? 'Safe fix applied' : 'Doctor action result', `${label}: ${message}`);
     }
     recordActivity('Doctor action updated', `${label}: ${message}`);
     await refreshDashboard();
