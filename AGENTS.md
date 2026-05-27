@@ -17,6 +17,16 @@
 - Durable user preferences that affect safety or consent, such as requiring confirmation before sending emails, must be saved as memory and injected into future turns across supported chat surfaces. Capture them through structured memory extraction or explicit memory tooling, not product-routing keyword checks.
 - Any user-facing prompt that asks the user to choose from multiple options or provide one of several possible inputs must present numbered options and must allow a numeric reply such as `1`, `2`, or `3`. Do not require exact text names or internal ids as the only path for a normal user.
 
+## Anti-Use-Case Patching
+
+- Never fix a reported bug by embedding the reporter's concrete prompt wording, nouns, account names, chat ids, repo names, branch names, product names, marketplace names, people names, country/language, screenshots, sample artifacts, URL path shapes, or vendor-specific semantics into Nullion core behavior.
+- Treat every concrete report as an example of a product invariant. First state the invariant in implementation notes, then implement that invariant with typed runtime evidence such as tool schemas/results, URL/domain records as opaque references, attachment metadata, artifact descriptors, task/frame state, approval state, stored memory records, or model-produced structured plans.
+- Core may preserve opaque structured evidence, like `{"type": "url", "domain": "...", "url": "..."}` or tool names/result status, but core must not interpret provider-specific URL paths, repo semantics, marketplace semantics, order semantics, or connector defaults. Put provider behavior in the connector, adapter, skill pack, or tool metadata that owns it.
+- When multiple saved-history, memory, tool, artifact, or URL candidates exist, do not choose by old rank, English wording, or the user's previous example. Use current structured evidence and live tools when available; otherwise ask a brief clarification.
+- Search, memory, and recent-context fixes must be language- and user-agnostic. Use corpus statistics, recency, typed evidence, and structured relationships instead of English trigger words, regex synonym lists, or one user's recurring topics.
+- Tests for these fixes must use neutral synthetic fixtures and include at least one wording or language variant that does not depend on the original English example. Do not use the reporter's actual accounts, products, stores, repos, branches, or chat ids as the thing that proves core behavior.
+- Before handoff for a routing, memory, search, tool-scope, or delivery fix, audit the touched app diff for reporter-specific and vendor-specific strings. Remove them from core behavior, or explicitly justify each remaining provider name as adapter/UI copy, documentation, or test fixture data rather than routing logic.
+
 ## Planner Cards And Activity Display
 
 - Planner card visibility is controlled only by the settings-backed planner/task-card setting, such as `NULLION_TASK_PLANNER_FEED_MODE` and the matching UI setting, not by `/verbose`.

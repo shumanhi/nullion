@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import re
 from typing import Iterable
+from urllib.parse import urlparse
 
 from nullion.tools import ToolInvocation, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
 
@@ -15,9 +16,11 @@ CHAT_HISTORY_SEARCH_TOOL_NAME = "chat_history_search"
 _MAX_HISTORY_SCAN_LIMIT = 200
 _MAX_HISTORY_RETURN_LIMIT = 50
 _MAX_SNIPPET_CHARS = 900
-_MIN_SEARCH_TOKEN_CHARS = 3
+_MIN_SEARCH_TOKEN_CHARS = 2
 _MATCH_CONTEXT_PREVIOUS_TURNS = 4
 _MATCH_CONTEXT_FOLLOWING_TURNS = 1
+_MAX_STRUCTURED_REFERENCES = 8
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
 
 
 CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
@@ -78,9 +81,59 @@ def _snippet(value: object, *, max_chars: int = _MAX_SNIPPET_CHARS) -> str:
     return text[: max_chars - 1].rstrip() + "..."
 
 
+def _normalized_url(raw_url: str) -> str | None:
+    text = str(raw_url or "").strip().rstrip(".,;:!?)]}")
+    if not text:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return text
+
+
+def _structured_references_from_text(text: object) -> list[dict[str, object]]:
+    refs: list[dict[str, object]] = []
+    seen: set[tuple[object, ...]] = set()
+    for raw_url in _URL_RE.findall(str(text or "")):
+        url = _normalized_url(raw_url)
+        if url is None:
+            continue
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        ref: dict[str, object] = {"type": "url", "domain": domain, "url": url}
+        identity = tuple(sorted(ref.items()))
+        if identity in seen:
+            continue
+        refs.append(ref)
+        seen.add(identity)
+        if len(refs) >= _MAX_STRUCTURED_REFERENCES:
+            break
+    return refs
+
+
+def _structured_references_from_event(event: dict[str, object]) -> list[dict[str, object]]:
+    refs: list[dict[str, object]] = []
+    seen: set[tuple[object, ...]] = set()
+    for source in (
+        event.get("user_message"),
+        event.get("assistant_reply"),
+    ):
+        for ref in _structured_references_from_text(source):
+            identity = tuple(sorted(ref.items()))
+            if identity in seen:
+                continue
+            refs.append(ref)
+            seen.add(identity)
+            if len(refs) >= _MAX_STRUCTURED_REFERENCES:
+                return refs
+    return refs
+
+
 def _tokenize(value: object) -> tuple[str, ...]:
     tokens: list[str] = []
-    for token in re.findall(r"[\w.-]+", str(value or "")):
+    for token in re.findall(r"\w+", str(value or "")):
         normalized = token.lower()
         if len(normalized) < _MIN_SEARCH_TOKEN_CHARS:
             continue
@@ -120,6 +173,23 @@ def _event_has_richer_runtime_metadata(event: dict[str, object]) -> bool:
     )
 
 
+def _tool_names_from_event(event: dict[str, object]) -> list[str]:
+    tool_results = event.get("tool_results")
+    if not isinstance(tool_results, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        name = str(result.get("tool_name") or "").strip()
+        if not name or name in seen:
+            continue
+        names.append(name)
+        seen.add(name)
+    return names
+
+
 def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     record = {
         "index": index,
@@ -134,6 +204,12 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     context = event.get("_history_context")
     if isinstance(context, str) and context.strip():
         record["context"] = context.strip()
+    structured_refs = _structured_references_from_event(event)
+    if structured_refs:
+        record["structured_refs"] = structured_refs
+    tool_names = _tool_names_from_event(event)
+    if tool_names:
+        record["tool_names"] = tool_names
     return record
 
 
@@ -442,6 +518,51 @@ def _ranked_history_events(
     return selected[:limit], False
 
 
+def _ranked_structured_reference_events(
+    events: Iterable[dict[str, object]],
+    *,
+    query: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    ordered = sorted(
+        (dict(event) for event in events),
+        key=lambda event: _parse_created_at(event.get("created_at")),
+    )
+    query_tokens = set(_tokenize(query.lower()))
+    token_document_counts: dict[str, int] = {token: 0 for token in query_tokens}
+    for event in ordered:
+        event_tokens = set(_tokenize(_event_text(event).lower()))
+        for token in query_tokens.intersection(event_tokens):
+            token_document_counts[token] = token_document_counts.get(token, 0) + 1
+    total_documents = max(1, len(ordered))
+
+    def _token_weight(token: str) -> int:
+        document_count = token_document_counts.get(token, 0)
+        if document_count <= 0:
+            return 0
+        return max(1, min(16, int(round(math.log2((total_documents + 1) / (document_count + 1)) * 4))))
+
+    scored: list[tuple[int, datetime, int, dict[str, object]]] = []
+    for index, event in enumerate(ordered):
+        if not _structured_references_from_event(event):
+            continue
+        event_tokens = set(_tokenize(_event_text(event).lower()))
+        matched_tokens = query_tokens.intersection(event_tokens)
+        if query_tokens and not matched_tokens:
+            continue
+        score = sum(_token_weight(token) for token in matched_tokens)
+        if not query_tokens:
+            score = 1
+        if score <= 0:
+            continue
+        selected_event = dict(event)
+        selected_event["_history_match_score"] = score
+        selected_event["_history_context"] = "structured_reference"
+        scored.append((score, _parse_created_at(event.get("created_at")), index, selected_event))
+    scored.sort(key=lambda item: (item[0] // 16, item[1], item[0], item[2]), reverse=True)
+    return [event for _score, _created, _index, event in scored[:limit]]
+
+
 def _chat_history_search_result(
     *,
     runtime: object,
@@ -473,7 +594,16 @@ def _chat_history_search_result(
         limit=limit,
         fallback_to_recent_on_no_match=not full_history,
     )
+    structured_selected = _ranked_structured_reference_events(
+        events,
+        query=query,
+        limit=min(_MAX_HISTORY_RETURN_LIMIT, max(limit, 12)),
+    )
     records = [_event_record(event, index=index) for index, event in enumerate(selected, start=1)]
+    structured_records = [
+        _event_record(event, index=index)
+        for index, event in enumerate(structured_selected, start=1)
+    ]
     return ToolResult(
         invocation_id=invocation.invocation_id,
         tool_name=invocation.tool_name,
@@ -486,6 +616,7 @@ def _chat_history_search_result(
             "searched_scope": "full_conversation_after_reset" if full_history else "recent_window_after_reset",
             "fallback_to_recent": fallback_to_recent,
             "matches": records,
+            "structured_matches": structured_records,
             "message": (
                 f"Found {len(records)} saved conversation turn{'s' if len(records) != 1 else ''}."
                 if records
