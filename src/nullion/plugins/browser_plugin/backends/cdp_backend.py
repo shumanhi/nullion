@@ -23,6 +23,7 @@ from typing import Any
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse, urlunparse
 
+from nullion.plugins.browser_plugin.browser_config import DEFAULT_AGENT_BROWSER_SESSION_ID
 from nullion.plugins.browser_plugin.browser_session import (
     BrowserScreenshotResult,
     auto_screenshot_uses_full_page,
@@ -972,6 +973,17 @@ class CDPBackend:
         self._pages: dict[str, "Page | _RawCDPPage"] = {}
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _new_page_unsupported_error(exc: Exception) -> RuntimeError:
+        return RuntimeError(
+            "Connected to CDP, but this browser does not allow Playwright to create a new tab. "
+            "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
+        )
+
+    @staticmethod
+    def _requires_dedicated_page(session_id: str) -> bool:
+        return session_id.startswith("isolated-")
+
     async def _ensure_raw_browser(self) -> "_RawCDPBrowser":
         browser = _RawCDPBrowser(self._cdp_url)
         self._browser = await browser.refresh()
@@ -1018,18 +1030,30 @@ class CDPBackend:
                         "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
                     )
                 pages = await _prune_extra_blank_pages(list(ctx.pages))
-                if pages:
-                    self._pages[session_id] = pages[-1]
+                if session_id == DEFAULT_AGENT_BROWSER_SESSION_ID:
+                    if pages:
+                        self._pages[session_id] = pages[-1]
+                    else:
+                        try:
+                            self._pages[session_id] = await ctx.new_page()
+                        except Exception as exc:
+                            message = str(exc)
+                            if "Browser context management is not supported" in message:
+                                raise self._new_page_unsupported_error(exc) from exc
+                            raise
                 else:
+                    if isinstance(ctx, _RawCDPContext) and pages and not self._requires_dedicated_page(session_id):
+                        self._pages[session_id] = pages[-1]
+                        return self._pages[session_id]
                     try:
                         self._pages[session_id] = await ctx.new_page()
                     except Exception as exc:
                         message = str(exc)
                         if "Browser context management is not supported" in message:
-                            raise RuntimeError(
-                                "Connected to CDP, but this browser does not allow Playwright to create a new tab. "
-                                "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
-                            ) from exc
+                            if self._requires_dedicated_page(session_id) or not pages:
+                                raise self._new_page_unsupported_error(exc) from exc
+                            self._pages[session_id] = pages[-1]
+                            return self._pages[session_id]
                         raise
         return self._pages[session_id]
 

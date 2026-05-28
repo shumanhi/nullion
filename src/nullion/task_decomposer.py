@@ -254,8 +254,14 @@ class TaskDecomposer:
         task_ids = [make_task_id() for _ in raw_tasks]
 
         records: list[TaskRecord] = []
+        enforce_sequential_chain = dag_plan.disposition == "sequential_mission" and len(raw_tasks) > 1
         for i, dt in enumerate(raw_tasks):
-            dep_ids = [task_ids[j] for j in dt.dep_indices if 0 <= j < len(task_ids)]
+            dep_indexes = (
+                _sequential_dependency_indexes(dt, i)
+                if enforce_sequential_chain
+                else [j for j in dt.dep_indices if 0 <= j < len(task_ids)]
+            )
+            dep_ids = [task_ids[j] for j in dep_indexes if 0 <= j < len(task_ids)]
             if len(raw_tasks) == 1:
                 initial_status = TaskStatus.QUEUED   # single-task fast path
             elif dep_ids:
@@ -263,10 +269,18 @@ class TaskDecomposer:
             else:
                 initial_status = TaskStatus.QUEUED
 
-            task_metadata = {
-                **dict(dt.metadata or {}),
-                **deep_agent_task_metadata_for_tools(dt.tool_scope, tool_profile_metadata),
-            }
+            task_metadata = dict(dt.metadata or {})
+            if task_metadata.get("requires_artifact_delivery") or task_metadata.get("required_artifact_kind"):
+                task_metadata.setdefault(
+                    "delivery_contract",
+                    _artifact_delivery_contract_metadata(
+                        conversation_id=conversation_id,
+                        requires_artifact_delivery=bool(task_metadata.get("requires_artifact_delivery")),
+                        required_artifact_kind=str(task_metadata.get("required_artifact_kind") or ""),
+                    ),
+                )
+            if not bool(task_metadata.get("skip_tool_profile_inference")):
+                task_metadata.update(deep_agent_task_metadata_for_tools(dt.tool_scope, tool_profile_metadata))
             record = TaskRecord(
                 task_id=task_ids[i],
                 group_id=gid,
@@ -570,6 +584,20 @@ def _parse_decomposed_tasks(raw: str) -> list[DecomposedTask]:
     return list(plan.tasks) if plan is not None else []
 
 
+def _sequential_dependency_indexes(task: DecomposedTask, index: int) -> list[int]:
+    dependencies = [
+        dep
+        for dep in (task.dep_indices or [])
+        if 0 <= dep < index
+    ]
+    # A plan labeled sequential must behave sequentially. If the model omits a
+    # dependency, chain the step to its immediate predecessor so later work
+    # cannot run with missing or failed upstream evidence.
+    if index > 0 and (index - 1) not in dependencies:
+        dependencies.append(index - 1)
+    return sorted(set(dependencies))
+
+
 def _parse_json_payload(raw: str) -> object | None:
     # Strip markdown fences if present
     text = raw.strip()
@@ -754,8 +782,53 @@ def _normalize_task_tool_scope_from_structured_evidence(
     )
 
 
-_ARTIFACT_PRODUCER_TOOLS = frozenset({"file_write", "pdf_create", "pdf_edit", "render", "image_generate"})
+_ARTIFACT_PRODUCER_TOOLS = frozenset(
+    {
+        "document_create",
+        "file_write",
+        "pdf_create",
+        "pdf_edit",
+        "presentation_create",
+        "render",
+        "image_generate",
+        "spreadsheet_create",
+    }
+)
 _UNCHANGED = object()
+_NO_SCRIPT_ATTACHMENT_PLATFORMS = frozenset({"telegram", "slack", "discord", "unknown"})
+
+
+def _delivery_platform_from_conversation_id(conversation_id: str | None) -> str:
+    raw = str(conversation_id or "").strip()
+    if not raw:
+        return "unknown"
+    if ":" in raw:
+        return raw.split(":", 1)[0].strip().lower() or "unknown"
+    return "unknown"
+
+
+def _artifact_delivery_contract_metadata(
+    *,
+    conversation_id: str,
+    requires_artifact_delivery: bool,
+    required_artifact_kind: str | None,
+) -> dict[str, object]:
+    artifact_kind = str(required_artifact_kind or "").strip().lower().removeprefix(".")
+    platform = _delivery_platform_from_conversation_id(conversation_id)
+    delivery_mode = "attachment" if requires_artifact_delivery else "message"
+    supports_javascript = platform not in _NO_SCRIPT_ATTACHMENT_PLATFORMS
+    return {
+        "platform": platform,
+        "delivery_mode": delivery_mode,
+        "artifact_kind": artifact_kind or None,
+        "portable_file": bool(requires_artifact_delivery),
+        "supports_javascript": supports_javascript,
+        "requires_static_primary_content": bool(
+            artifact_kind == "html"
+            and requires_artifact_delivery
+            and not supports_javascript
+        ),
+    }
 
 
 def _with_artifact_verification_tasks(
@@ -813,8 +886,12 @@ def _with_artifact_verification_tasks(
             DecomposedTask(
                 title="Verify artifact",
                 description=(
-                    "Verify the generated artifact from context, including path, expected format, "
-                    "and delivery evidence before any user-visible success claim."
+                    "Verify the current-run artifact descriptors from context, including exact path, "
+                    "expected format, and delivery evidence before any user-visible success claim. "
+                    "Do not substitute a similar prior workspace artifact. For HTML artifacts, verify "
+                    "that primary user-visible content renders from static markup without depending on "
+                    "JavaScript-populated rows, cards, tables, or lists, and reject unsupported claims "
+                    "that are not backed by upstream task evidence."
                 ),
                 tool_scope=verify_tools,
                 priority=TaskPriority.NORMAL,

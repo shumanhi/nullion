@@ -67,10 +67,11 @@ class PlatformDelivery:
     attachments: tuple[Path, ...]
     media_directive_count: int = 0
     unavailable_attachment_count: int = 0
+    pending_attachment_count: int = 0
 
     @property
     def requires_attachment_delivery(self) -> bool:
-        return self.media_directive_count > 0
+        return self.media_directive_count > 0 or self.pending_attachment_count > 0
 
     @property
     def has_deliverable_attachments(self) -> bool:
@@ -87,6 +88,7 @@ class PlatformDeliveryReceipt:
     attachment_count: int
     attachment_required: bool
     unavailable_attachment_count: int = 0
+    pending_attachment_count: int = 0
     request_id: str | None = None
     message_id: str | None = None
     error: str | None = None
@@ -103,6 +105,7 @@ class PlatformDeliveryReceipt:
             "attachment_count": self.attachment_count,
             "attachment_required": self.attachment_required,
             "unavailable_attachment_count": self.unavailable_attachment_count,
+            "pending_attachment_count": self.pending_attachment_count,
             "request_id": self.request_id,
             "message_id": self.message_id,
             "error": self.error,
@@ -155,8 +158,15 @@ _ATTACHMENT_UPLOAD_FAILED_REPLY = (
     "I couldn't upload the requested attachment to this platform. "
     "I won't mark it delivered."
 )
+_PRIMARY_RENDERED_ATTACHMENT_SUFFIXES = frozenset(
+    {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm"}
+)
+_TEXT_SIDECAR_ATTACHMENT_SUFFIXES = frozenset({".txt", ".md"})
+_IMAGE_ATTACHMENT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
 _MESSAGING_ATTACHMENT_UPLOAD_ATTEMPTS = 3
 _MESSAGING_ATTACHMENT_UPLOAD_RETRY_DELAY_SECONDS = 0.5
+_MESSAGING_DELIVERY_RETRY_AFTER_MAX_SECONDS = 600.0
+_DEFAULT_MAX_AUTOMATIC_ATTACHMENT_BATCH = 12
 _EXTERNAL_INLINE_TAG_PATTERN = re.compile(
     r"</?(?:b|strong|i|em|u|s|strike|code|span)(?:\s+[^>]*)?>",
     re.IGNORECASE,
@@ -201,11 +211,25 @@ def delivery_receipt_status(
     unavailable = int(getattr(delivery, "unavailable_attachment_count", 0) or 0)
     required = bool(getattr(delivery, "requires_attachment_delivery", False))
     attachments = tuple(getattr(delivery, "attachments", ()) or ())
+    pending = int(getattr(delivery, "pending_attachment_count", 0) or 0)
+    if pending and not attachments:
+        return "pending_confirmation"
     if required and not attachments:
         return "failed"
     if unavailable:
         return "partial"
     return "succeeded"
+
+
+def delivery_receipt_transport_succeeded(receipt: PlatformDeliveryReceipt) -> bool:
+    """Return whether the platform boundary accepted the message we sent.
+
+    `pending_confirmation` means Nullion intentionally sent a confirmation or
+    narrowing prompt instead of flooding the chat with attachments. That is a
+    successful platform delivery even though the original attachment request is
+    still pending user choice.
+    """
+    return receipt.status in {"succeeded", "partial", "pending_confirmation"}
 
 
 def build_platform_delivery_receipt(
@@ -227,6 +251,7 @@ def build_platform_delivery_receipt(
         attachment_count=len(tuple(getattr(delivery, "attachments", ()) or ())) if transport_ok else 0,
         attachment_required=bool(getattr(delivery, "requires_attachment_delivery", False)),
         unavailable_attachment_count=int(getattr(delivery, "unavailable_attachment_count", 0) or 0),
+        pending_attachment_count=int(getattr(delivery, "pending_attachment_count", 0) or 0),
         request_id=request_id,
         message_id=message_id,
         error=error,
@@ -568,8 +593,7 @@ def _new_doctor_action_text_fallbacks(runtime, before_ids: frozenset[str]) -> tu
         lines.extend([
             "",
             "Inspect: /doctor latest",
-            "Mark resolved: /doctor complete latest",
-            "Dismiss: /doctor dismiss latest",
+            "Hide: /doctor dismiss latest",
         ])
         fallbacks.append("\n".join(lines))
     return tuple(fallbacks)
@@ -850,7 +874,7 @@ def delivery_contract_for_turn(
             allow_plain_paths=True,
             required_attachment_extensions=required_extensions,
         )
-    if artifact_paths:
+    if artifact_paths and (requires_attachment_delivery or bool(required_extensions)):
         return DeliveryContract.attachment_required(
             source="artifact_result",
             allow_plain_paths=True,
@@ -860,12 +884,6 @@ def delivery_contract_for_turn(
         return DeliveryContract.attachment_required(
             source="media_directive",
             allow_plain_paths=False,
-            required_attachment_extensions=required_extensions,
-        )
-    if _reply_mentions_structured_attachment_path(reply, required_extensions=required_extensions):
-        return DeliveryContract.attachment_required(
-            source="reply_structured_path",
-            allow_plain_paths=True,
             required_attachment_extensions=required_extensions,
         )
     return DeliveryContract.message_only()
@@ -933,6 +951,10 @@ def delivery_contract_for_runtime_turn(
     finish = getattr(frame, "finish", None)
     if frame is None or not bool(getattr(finish, "requires_artifact_delivery", False)):
         return base_contract
+    if getattr(frame, "status", None) == TaskFrameStatus.WAITING_INPUT and not base_contract.requires_attachment_delivery:
+        # Clarification turns should be delivered as questions even when the
+        # parent frame will eventually produce an attachment.
+        return base_contract
     output = getattr(frame, "output", None)
     required_extension = _extension_for_artifact_kind(
         getattr(finish, "required_artifact_kind", None) or getattr(output, "artifact_kind", None)
@@ -967,7 +989,25 @@ def _required_attachment_extensions_from_contract(
     planned_extension = plan_attachment_format(text or "").extension
     if planned_extension:
         extensions.append(planned_extension.lower())
+    filename_extension = _contract_filename_extension(text)
+    if filename_extension:
+        extensions.append(filename_extension)
     return tuple(dict.fromkeys(extensions))
+
+
+def _contract_filename_extension(text: str | None) -> str | None:
+    for match in re.finditer(r"(?<![\w./\\-])([A-Za-z0-9][\w .()@+-]{0,180}\.([A-Za-z0-9]{1,16}))(?![\w./\\-])", str(text or "")):
+        token = match.group(1).strip()
+        if "/" in token or "\\" in token or "=" in token:
+            continue
+        extension = f".{match.group(2).lower()}"
+        if extension in {".ai", ".app", ".co", ".com", ".dev", ".edu", ".gov", ".io", ".net", ".org", ".us"}:
+            continue
+        # This helper is only used after structured delivery evidence exists
+        # (MEDIA, artifact result, or task contract). A bare filename here is a
+        # format filter for an already-produced attachment, not task routing.
+        return extension
+    return None
 
 
 def _attachments_matching_contract(
@@ -982,6 +1022,63 @@ def _attachments_matching_contract(
     return tuple(path for path in attachments if path.suffix.lower() in required_extensions)
 
 
+def _drop_primary_artifact_text_sidecars(attachments: tuple[Path, ...]) -> tuple[Path, ...]:
+    # Generated artifacts often have status/summary sidecars for internal QA.
+    # Chat delivery should send the primary artifact unless the sidecar was
+    # explicitly requested, otherwise users receive duplicate/confusing files.
+    primary_stems: set[str] = set()
+    for path in attachments:
+        if path.suffix.lower() in _PRIMARY_RENDERED_ATTACHMENT_SUFFIXES:
+            primary_stems.add(path.stem)
+    if not primary_stems:
+        return attachments
+
+    def is_summary_sidecar(path: Path) -> bool:
+        if path.suffix.lower() not in _TEXT_SIDECAR_ATTACHMENT_SUFFIXES:
+            return False
+        stem = path.stem.lower()
+        return any(
+            stem.startswith(f"{primary_stem.lower()}{separator}{sidecar_kind}")
+            for primary_stem in primary_stems
+            for separator in ("_", "-", ".")
+            for sidecar_kind in ("summary", "completion", "status", "request", "note", "notes")
+        )
+
+    return tuple(
+        path
+        for path in attachments
+        if not is_summary_sidecar(path)
+    )
+
+
+def _collapse_mixed_image_sidecars(attachments: tuple[Path, ...]) -> tuple[Path, ...]:
+    # Only suppress image files that look like support captures for a primary
+    # rendered artifact. Unrelated images may be the actual deliverable set.
+    report_stems = tuple(
+        path.stem.lower()
+        for path in attachments
+        if path.suffix.lower() in _PRIMARY_RENDERED_ATTACHMENT_SUFFIXES
+    )
+    if not report_stems:
+        return attachments
+
+    def is_report_image_sidecar(path: Path) -> bool:
+        if path.suffix.lower() not in _IMAGE_ATTACHMENT_SUFFIXES:
+            return False
+        stem = path.stem.lower()
+        for report_stem in report_stems:
+            if stem == report_stem:
+                return True
+            if any(stem.startswith(f"{report_stem}{separator}") for separator in ("_", "-", ".")):
+                return True
+            if any(stem.endswith(f"{separator}{report_stem}") for separator in ("_", "-", ".")):
+                return True
+        return False
+
+    collapsed = tuple(path for path in attachments if not is_report_image_sidecar(path))
+    return collapsed or attachments
+
+
 def _plain_candidate_paths_from_text(text: str) -> list[Path]:
     paths: list[Path] = []
     for match in _PLAIN_ABSOLUTE_PATH_RE.finditer(str(text or "")):
@@ -993,31 +1090,6 @@ def _plain_candidate_paths_from_text(text: str) -> list[Path]:
         if raw:
             paths.append(Path(raw))
     return list(dict.fromkeys(paths))
-
-
-def _structured_relative_output_candidates(paths: list[Path]) -> tuple[Path, ...]:
-    structured: list[Path] = []
-    for path in paths:
-        if path.is_absolute():
-            continue
-        parts = path.parts
-        if not parts or parts[0] not in {"artifacts", "files", "media"}:
-            continue
-        structured.append(path)
-    return tuple(dict.fromkeys(structured))
-
-
-def _reply_mentions_structured_attachment_path(
-    reply: str | None,
-    *,
-    required_extensions: tuple[str, ...],
-) -> bool:
-    if not isinstance(reply, str) or not reply.strip() or not required_extensions:
-        return False
-    allowed_extensions = {extension.lower() for extension in required_extensions if extension}
-    if not allowed_extensions:
-        return False
-    return any(path.suffix.lower() in allowed_extensions for path in _plain_candidate_paths_from_text(reply))
 
 
 def _caption_without_attached_paths(
@@ -1075,6 +1147,38 @@ def _sanitize_platform_visible_text(text: str | None) -> str | None:
     ) or text
 
 
+def _max_automatic_attachment_batch() -> int:
+    raw = os.environ.get("NULLION_MAX_AUTOMATIC_ATTACHMENT_BATCH")
+    try:
+        value = int(str(raw or "").strip())
+    except Exception:
+        return _DEFAULT_MAX_AUTOMATIC_ATTACHMENT_BATCH
+    return max(2, min(100, value))
+
+
+def _attachment_batch_confirmation_text(
+    attachments: tuple[Path, ...],
+    *,
+    batch_limit: int,
+) -> str:
+    total = len(attachments)
+    preview_count = min(10, total)
+    preview_lines = [
+        f"{index + 1}. `{attachments[index].name or str(attachments[index])}`"
+        for index in range(preview_count)
+    ]
+    remaining = total - preview_count
+    if remaining > 0:
+        preview_lines.append(f"...and {remaining} more file{'s' if remaining != 1 else ''}.")
+    preview_block = "\n".join(preview_lines) if preview_lines else "(No files)"
+    return (
+        f"I prepared **{total} files**, and sending that many at once can fail on this chat surface.\n"
+        "I did not send attachments yet.\n\n"
+        f"Preview:\n{preview_block}\n\n"
+        f"Ask me to send a smaller range, up to {batch_limit} files, or name the specific files you want."
+    )
+
+
 def prepare_reply_for_platform_delivery(
     reply: str | None,
     *,
@@ -1097,36 +1201,18 @@ def prepare_reply_for_platform_delivery(
             )
         else:
             delivery_contract = delivery_contract_for_turn(None, reply=text)
-    media_candidates = media_candidate_paths_from_text(text)
+    media_candidates = list(
+        _drop_primary_artifact_text_sidecars(tuple(media_candidate_paths_from_text(text)))
+    )
+    automatic_batch_limit = _max_automatic_attachment_batch()
     caption, attachments = split_reply_for_platform_delivery(text, principal_id=principal_id)
     plain_candidates = _plain_candidate_paths_from_text(text)
-    structured_plain_candidates = _structured_relative_output_candidates(plain_candidates)
     if media_candidates and not delivery_contract.allow_attachment_delivery:
         return PlatformDelivery(
             text=_sanitize_platform_visible_text(caption if caption else None),
             attachments=(),
             media_directive_count=0,
         )
-    if not media_candidates and structured_plain_candidates:
-        opportunistic_attachments = tuple(
-            resolved_path
-            for path in structured_plain_candidates
-            for resolved_path in (_resolve_messaging_attachment_path(path, principal_id=principal_id),)
-            if _is_deliverable_messaging_attachment(resolved_path, principal_id=principal_id)
-        )
-        opportunistic_attachments = _attachments_matching_contract(opportunistic_attachments, delivery_contract)
-        opportunistic_attachments = tuple(dict.fromkeys(opportunistic_attachments))
-        if opportunistic_attachments:
-            visible_text = _caption_without_attached_paths(
-                text,
-                opportunistic_attachments,
-                candidate_path_texts=tuple(str(path) for path in structured_plain_candidates),
-            )
-            return PlatformDelivery(
-                text=_sanitize_platform_visible_text(visible_text),
-                attachments=opportunistic_attachments,
-                media_directive_count=len(opportunistic_attachments),
-            )
     if (
         not media_candidates
         and delivery_contract.allow_attachment_delivery
@@ -1140,7 +1226,19 @@ def prepare_reply_for_platform_delivery(
         )
         plain_attachments = _attachments_matching_contract(plain_attachments, delivery_contract)
         plain_attachments = tuple(dict.fromkeys(plain_attachments))
+        plain_attachments = _collapse_mixed_image_sidecars(plain_attachments)
         if plain_attachments:
+            if len(plain_attachments) > automatic_batch_limit:
+                confirmation_text = _attachment_batch_confirmation_text(
+                    plain_attachments,
+                    batch_limit=automatic_batch_limit,
+                )
+                return PlatformDelivery(
+                    text=_sanitize_platform_visible_text(confirmation_text),
+                    attachments=(),
+                    media_directive_count=len(plain_attachments),
+                    pending_attachment_count=len(plain_attachments),
+                )
             visible_text = _caption_without_attached_paths(
                 text,
                 plain_attachments,
@@ -1160,8 +1258,24 @@ def prepare_reply_for_platform_delivery(
                 unavailable_attachment_count=1,
             )
         return PlatformDelivery(text=_sanitize_platform_visible_text(text if text else None), attachments=())
-    attachments = _attachments_matching_contract(attachments, delivery_contract)
-    unavailable_count = max(0, len(media_candidates) - len(attachments))
+    attachments = _drop_primary_artifact_text_sidecars(
+        _attachments_matching_contract(attachments, delivery_contract)
+    )
+    collapsed_attachments = _collapse_mixed_image_sidecars(attachments)
+    suppressed_sidecar_count = max(0, len(attachments) - len(collapsed_attachments))
+    attachments = collapsed_attachments
+    if len(attachments) > automatic_batch_limit:
+        confirmation_text = _attachment_batch_confirmation_text(
+            attachments,
+            batch_limit=automatic_batch_limit,
+        )
+        return PlatformDelivery(
+            text=_sanitize_platform_visible_text(confirmation_text),
+            attachments=(),
+            media_directive_count=len(media_candidates),
+            pending_attachment_count=len(attachments),
+        )
+    unavailable_count = max(0, len(media_candidates) - len(attachments) - suppressed_sidecar_count)
     if not attachments:
         return PlatformDelivery(
             text=_ATTACHMENT_UNAVAILABLE_REPLY,
@@ -1202,6 +1316,29 @@ def is_retryable_messaging_delivery_error(exc: Exception) -> bool:
     return status in {408, 409, 425, 429, 500, 502, 503, 504}
 
 
+def _messaging_delivery_retry_after_seconds(exc: Exception) -> float | None:
+    for attribute in ("retry_after", "retry_after_seconds"):
+        value = getattr(exc, attribute, None)
+        if value is None:
+            continue
+        if hasattr(value, "total_seconds"):
+            value = value.total_seconds()
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            return min(seconds, _MESSAGING_DELIVERY_RETRY_AFTER_MAX_SECONDS)
+    return None
+
+
+def _messaging_delivery_retry_delay_seconds(exc: Exception, fallback_seconds: float) -> float:
+    retry_after_seconds = _messaging_delivery_retry_after_seconds(exc)
+    if retry_after_seconds is not None:
+        return retry_after_seconds
+    return fallback_seconds
+
+
 async def retry_messaging_delivery_operation(
     operation,
     *,
@@ -1219,7 +1356,9 @@ async def retry_messaging_delivery_operation(
             last_exc = exc
             if attempt >= attempts - 1 or not is_retryable_messaging_delivery_error(exc):
                 break
-            await asyncio.sleep(retry_delay_seconds * (attempt + 1))
+            await asyncio.sleep(
+                _messaging_delivery_retry_delay_seconds(exc, retry_delay_seconds * (attempt + 1))
+            )
     assert last_exc is not None
     raise last_exc
 
@@ -1286,6 +1425,7 @@ __all__ = [
     "build_platform_delivery_receipt",
     "delivery_contract_for_runtime_turn",
     "delivery_contract_for_turn",
+    "delivery_receipt_transport_succeeded",
     "delivery_receipt_status",
     "ensure_messaging_storage_roots",
     "handle_messaging_ingress",

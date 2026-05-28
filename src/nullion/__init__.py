@@ -1,5 +1,14 @@
 """Project Nullion package."""
 
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*default value of [`'\"]?allowed_objects[`'\"]? will change in a future version.*",
+    category=Warning,
+    module=r"langgraph\.cache\.base\.__init__",
+)
+
 from nullion.version import __version__
 from nullion.codebase_summary import CodebaseSummary, build_codebase_summary, format_codebase_summary
 from nullion.builder import (

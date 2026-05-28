@@ -19,10 +19,11 @@ class SessionStopResult:
     cancelled_task_count: int = 0
     cancelled_task_frame: bool = False
     cancelled_activity_count: int = 0
+    cancelled_background_count: int = 0
 
     @property
     def cancelled_count(self) -> int:
-        explicit_count = len(self.cancelled_turn_ids) + self.cancelled_task_count
+        explicit_count = len(self.cancelled_turn_ids) + self.cancelled_task_count + self.cancelled_background_count
         if explicit_count:
             return explicit_count
         if self.cancelled_activity_count:
@@ -133,17 +134,33 @@ async def stop_session_async(
         except Exception:
             logger.debug("Unable to cancel active turn tracker tasks", exc_info=True)
     cancelled_task_count = await cancel_orchestrator_conversation(agent_orchestrator, conversation_id)
+    cancelled_background_count = cancel_manual_cron_background_runs_for_conversation(conversation_id)
     cancelled_task_frame = cancel_active_task_frame(runtime, conversation_id)
     return SessionStopResult(
         cancelled_turn_ids=cancelled_turn_ids,
         cancelled_task_count=cancelled_task_count,
+        cancelled_background_count=cancelled_background_count,
         cancelled_task_frame=cancelled_task_frame,
     )
+
+
+def cancel_manual_cron_background_runs_for_conversation(conversation_id: str | None) -> int:
+    try:
+        from nullion.cron_delivery import cancel_manual_cron_background_runs
+    except Exception:
+        logger.debug("Unable to import manual cron background cancellation helper", exc_info=True)
+        return 0
+    try:
+        return max(0, int(cancel_manual_cron_background_runs(conversation_id) or 0))
+    except Exception:
+        logger.debug("Unable to cancel manual cron background runs", exc_info=True)
+        return 0
 
 
 __all__ = [
     "SessionStopResult",
     "cancel_active_task_frame",
+    "cancel_manual_cron_background_runs_for_conversation",
     "cancel_orchestrator_conversation",
     "cancel_orchestrator_conversation_sync",
     "stop_session_async",

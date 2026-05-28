@@ -265,8 +265,10 @@ def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
         count = len(crons)
         return f"{count} scheduled task{'s' if count != 1 else ''}"
     if normalized_tool == "run_cron":
-        delivery_status = output.get("delivery_status")
+        delivery_status = output.get("delivery_status") or output.get("cron_delivery_status")
         if isinstance(delivery_status, str) and delivery_status.strip():
+            if delivery_status.strip().lower() == "deferred":
+                return "background run started"
             return f"delivery {delivery_status.strip()[:80]}"
         name = output.get("name")
         if isinstance(name, str) and name.strip():

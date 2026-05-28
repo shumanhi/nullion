@@ -167,6 +167,81 @@ def _wait_for_launchd_running(label: str, *, timeout: float = 10.0) -> bool:
     return False
 
 
+def _active_nullion_home() -> Path:
+    configured = os.environ.get("NULLION_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    configured = os.environ.get("NULLION_ENV_FILE")
+    if configured:
+        return Path(configured).expanduser().parent
+    return Path.home() / ".nullion"
+
+
+def _launchd_bootstrap(uid: int, plist: Path, label: str) -> subprocess.CompletedProcess[str]:
+    last = subprocess.CompletedProcess(["launchctl", "bootstrap"], 1, stdout="", stderr="launchctl bootstrap failed")
+    for attempt in range(4):
+        last = _run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], timeout=15)
+        if last.returncode == 0 or _launchd_print(label).returncode == 0:
+            return last
+        if attempt < 3:
+            time.sleep(0.4)
+    return last
+
+
+def _stale_launchd_process_matchers(service: ManagedService) -> tuple[str, ...]:
+    home = _active_nullion_home()
+    venv_bin = home / "venv" / "bin"
+    matchers: list[str] = []
+    if service.command_hint:
+        matchers.append(str(venv_bin / service.command_hint))
+    if service.name == "web":
+        matchers.append(f"{venv_bin / 'python'} -m nullion.web_app")
+    if service.name == "tray":
+        matchers.append(f"{venv_bin / 'python'} -m nullion.webview_app")
+    return tuple(matchers)
+
+
+def _stale_launchd_process_pids(service: ManagedService) -> list[int]:
+    matchers = _stale_launchd_process_matchers(service)
+    if not matchers:
+        return []
+    current_pid = os.getpid()
+    result = _run(["ps", "-axo", "pid=,command="], timeout=10)
+    if result.returncode != 0:
+        return []
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if any(matcher in command for matcher in matchers):
+            pids.append(pid)
+    return pids
+
+
+def _terminate_stale_launchd_processes(service: ManagedService) -> None:
+    pids = _stale_launchd_process_pids(service)
+    if not pids:
+        return
+    for pid in pids:
+        _run(["kill", "-TERM", str(pid)], timeout=3)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        remaining = set(_stale_launchd_process_pids(service))
+        if not remaining.intersection(pids):
+            return
+        time.sleep(0.2)
+    for pid in pids:
+        _run(["kill", "-KILL", str(pid)], timeout=3)
+
+
 def _restart_launchd_service(service: ManagedService) -> str | None:
     uid = os.getuid()
     for label in service.launchd_labels:
@@ -177,8 +252,12 @@ def _restart_launchd_service(service: ManagedService) -> str | None:
         _run(["launchctl", "bootout", target], timeout=15)
         if not _wait_for_launchd_stopped(label, timeout=10):
             raise RuntimeError(f"{service.display_name} launchd service did not stop before restart ({label}).")
-        bootstrapped = _run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], timeout=15)
+        _terminate_stale_launchd_processes(service)
+        bootstrapped = _launchd_bootstrap(uid, plist, label)
         restarted = _run(["launchctl", "kickstart", "-k", target], timeout=15)
+        if restarted.returncode != 0 and _launchd_print(label).returncode != 0:
+            bootstrapped = _launchd_bootstrap(uid, plist, label)
+            restarted = _run(["launchctl", "kickstart", "-k", target], timeout=15)
         if restarted.returncode == 0 and _wait_for_launchd_running(label, timeout=10):
             return f"Restarted the {service.display_name} service ({label})."
         if _launchd_service_running(label):

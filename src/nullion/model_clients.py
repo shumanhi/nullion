@@ -163,6 +163,28 @@ def _codex_max_output_tokens_unsupported(detail: str) -> bool:
     return "unsupported parameter" in lowered and "max_output_tokens" in lowered
 
 
+def _httpx_timeout_exception_types() -> tuple[type[BaseException], ...]:
+    if _httpx is None:
+        return ()
+    exceptions: list[type[BaseException]] = []
+    for name in ("TimeoutException", "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"):
+        candidate = getattr(_httpx, name, None)
+        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+            exceptions.append(candidate)
+    return tuple(dict.fromkeys(exceptions))
+
+
+def _httpx_transient_exception_types() -> tuple[type[BaseException], ...]:
+    if _httpx is None:
+        return ()
+    exceptions: list[type[BaseException]] = list(_httpx_timeout_exception_types())
+    for name in ("TransportError", "NetworkError", "RemoteProtocolError", "ConnectError"):
+        candidate = getattr(_httpx, name, None)
+        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+            exceptions.append(candidate)
+    return tuple(dict.fromkeys(exceptions))
+
+
 def _chat_completions_input_budget_chars() -> int:
     raw_value = os.environ.get("NULLION_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS")
     if raw_value is None:
@@ -1039,7 +1061,19 @@ class CodexResponsesModelClient:
             return {"stop_reason": stop_reason, "content": content_blocks}
 
         try:
-            return _invoke(body)
+            try:
+                return _invoke(body)
+            except _httpx_transient_exception_types() as exc:
+                logger.warning(
+                    "Codex Responses request hit a transient transport error; retrying once: %s",
+                    exc,
+                )
+                try:
+                    return _invoke(body)
+                except _httpx_transient_exception_types() as retry_exc:
+                    raise ModelClientConfigurationError(
+                        "Codex Responses request failed while waiting for model response."
+                    ) from retry_exc
         except ModelClientConfigurationError as exc:
             if "max_output_tokens" in body and _codex_max_output_tokens_unsupported(str(exc)):
                 retry_body = dict(body)

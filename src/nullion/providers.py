@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from urllib.parse import quote, urlencode
 import urllib.error
 import urllib.request
@@ -714,13 +715,90 @@ def _fallback_svg_image_generate(
 </svg>
 """
     resolved_output.write_text(svg, encoding="utf-8")
+    raster_path = _write_fallback_raster_image(
+        requested,
+        cleaned_prompt=cleaned_prompt,
+        title=title,
+        subtitle=subtitle,
+        size=size,
+    )
     return {
         "path": str(resolved_output),
         "provider": "local_svg_fallback",
         "size": size,
         "fallback_used": True,
+        "setup": "Configure an LLM/image provider that supports image generation for raster output.",
+        **({"raster_path": str(raster_path)} if raster_path is not None else {}),
         **({"fallback_error": fallback_error} if fallback_error else {}),
     }
+
+
+def _fallback_raster_size(size: str | None) -> tuple[int, int]:
+    if isinstance(size, str):
+        match = re.match(r"^\s*(\d{2,4})\s*x\s*(\d{2,4})\s*$", size)
+        if match:
+            width = max(256, min(2048, int(match.group(1))))
+            height = max(256, min(2048, int(match.group(2))))
+            return width, height
+    return 1024, 1024
+
+
+def _write_fallback_raster_image(
+    requested: Path,
+    *,
+    cleaned_prompt: str,
+    title: str,
+    subtitle: str,
+    size: str | None,
+) -> Path | None:
+    if requested.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+    try:
+        width, height = _fallback_raster_size(size)
+        image = Image.new("RGB", (width, height), "#12212f")
+        draw = ImageDraw.Draw(image)
+        for y in range(height):
+            blend = y / max(1, height - 1)
+            r = int(18 * (1 - blend) + 21 * blend)
+            g = int(33 * (1 - blend) + 82 * blend)
+            b = int(47 * (1 - blend) + 68 * blend)
+            draw.line((0, y, width, y), fill=(r, g, b))
+        for radius, color in (
+            (int(width * 0.36), "#2b806e"),
+            (int(width * 0.24), "#314d82"),
+        ):
+            x0 = width // 2 - radius
+            y0 = int(height * 0.42) - radius
+            draw.ellipse((x0, y0, x0 + radius * 2, y0 + radius * 2), outline=color, width=max(4, width // 80))
+        title_font = ImageFont.load_default(size=max(20, width // 22))
+        body_font = ImageFont.load_default(size=max(14, width // 42))
+        small_font = ImageFont.load_default(size=max(12, width // 54))
+        title_lines = textwrap.wrap(title, width=28)[:3]
+        y = int(height * 0.10)
+        for line in title_lines:
+            bbox = draw.textbbox((0, 0), line, font=title_font)
+            draw.text(((width - (bbox[2] - bbox[0])) // 2, y), line, fill="#f7fbff", font=title_font)
+            y += bbox[3] - bbox[1] + max(8, height // 80)
+        prompt_lines = textwrap.wrap(cleaned_prompt[:260], width=45)[:5]
+        y = int(height * 0.70)
+        for line in prompt_lines:
+            bbox = draw.textbbox((0, 0), line, font=body_font)
+            draw.text(((width - (bbox[2] - bbox[0])) // 2, y), line, fill="#effffb", font=body_font)
+            y += bbox[3] - bbox[1] + max(5, height // 120)
+        bbox = draw.textbbox((0, 0), subtitle, font=small_font)
+        draw.text(((width - (bbox[2] - bbox[0])) // 2, int(height * 0.90)), subtitle, fill="#d6fff4", font=small_font)
+        requested.parent.mkdir(parents=True, exist_ok=True)
+        if requested.suffix.lower() in {".jpg", ".jpeg"}:
+            image.save(requested, quality=92)
+        else:
+            image.save(requested)
+        return requested
+    except Exception:
+        return None
 
 
 def _command_image_generate(

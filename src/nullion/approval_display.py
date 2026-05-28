@@ -41,6 +41,7 @@ _TOOL_LABELS = {
     "browser_run_js": "run JavaScript in the browser",
     "browser_screenshot": "capture a browser screenshot",
     "browser_snapshot": "inspect browser page elements",
+    "browser_extract_items": "extract browser page item rows",
     "browser_extract_text": "read browser page text",
     "doctor_check": "run a health check",
     "create_task": "create a task",

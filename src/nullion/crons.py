@@ -16,6 +16,7 @@ lightweight built-in parser that handles the most common expressions.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -53,11 +54,9 @@ def _nullion_home() -> Path:
 
 
 _RUNTIME_DB_PATH: Path | None = None
-_CRONS_PATH = _nullion_home() / "crons.json"
 _DEFAULT_WORKSPACE_ID = "workspace_admin"
 _CRON_COLLECTION = "cron_jobs"
 _CRON_TABLE = "reminders_crons"
-_STORE_FRESHNESS_SKEW = timedelta(seconds=1)
 _LOCAL_CRON_SCHEDULE_CUTOFF = datetime(2026, 5, 15, 12, 45, tzinfo=timezone.utc)
 
 # ── Data model ─────────────────────────────────────────────────────────────────
@@ -71,6 +70,8 @@ class CronJob:
     workspace_id: str = _DEFAULT_WORKSPACE_ID
     delivery_channel: str = "" # web | telegram; blank means legacy/default routing
     delivery_target: str = ""  # chat id, conversation id, or other channel-specific target
+    html_image_delivery_mode: str = ""  # linked | auto | self_contained (blank keeps runtime default)
+    artifact_delivery_options: dict[str, object] = field(default_factory=dict)
     schedule_timezone: str = "" # blank means legacy UTC schedule for pre-local-time jobs
     enabled:     bool  = True
     created_at:  str   = ""
@@ -85,9 +86,17 @@ class CronJob:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CronJob":
+        from nullion.cron_delivery import normalize_html_image_delivery_mode
+
         known = {f for f in cls.__dataclass_fields__}
         payload = {k: v for k, v in d.items() if k in known}
         payload["workspace_id"] = str(payload.get("workspace_id") or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID
+        options = payload.get("artifact_delivery_options")
+        payload["artifact_delivery_options"] = dict(options) if isinstance(options, dict) else {}
+        mode_value = payload.get("html_image_delivery_mode")
+        if mode_value in {None, ""} and d.get("html_image_mode") is not None:
+            mode_value = d.get("html_image_mode")
+        payload["html_image_delivery_mode"] = normalize_html_image_delivery_mode(mode_value)
         return cls(**payload)
 
     def next_run_dt(self) -> datetime | None:
@@ -450,9 +459,6 @@ def _return_crons(jobs: list[CronJob], *, persist_refreshed: bool = True) -> lis
 def _runtime_db_path() -> Path:
     if _RUNTIME_DB_PATH is not None:
         return _RUNTIME_DB_PATH
-    legacy_path = _legacy_crons_json_path()
-    if legacy_path != _nullion_home() / "crons.json":
-        return legacy_path.with_name("runtime.db")
     return _nullion_home() / "runtime.db"
 
 
@@ -485,28 +491,6 @@ def _ensure_cron_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def _load_crons_json() -> list[CronJob]:
-    try:
-        data = json.loads(_CRONS_PATH.read_text())
-        return [CronJob.from_dict(d) for d in data]
-    except FileNotFoundError:
-        return []
-    except Exception as exc:
-        log.warning("Failed to load crons from %s: %s", _CRONS_PATH, exc)
-        return []
-
-
-def _has_crons_json_rows() -> bool:
-    try:
-        data = json.loads(_CRONS_PATH.read_text())
-    except FileNotFoundError:
-        return False
-    except Exception as exc:
-        log.warning("Failed to inspect cron JSON mirror %s: %s", _CRONS_PATH, exc)
-        return False
-    return isinstance(data, list) and bool(data)
-
-
 def _load_crons_db_snapshot() -> tuple[list[CronJob], datetime | None] | None:
     db_path = _runtime_db_path()
     if not db_path.exists():
@@ -537,76 +521,10 @@ def _load_crons_db() -> list[CronJob] | None:
     return snapshot[0]
 
 
-def _legacy_crons_json_path() -> Path:
-    return Path(_CRONS_PATH).expanduser()
-
-
-def _crons_json_mtime() -> datetime | None:
-    path = _legacy_crons_json_path()
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        log.warning("Failed to stat cron JSON mirror %s: %s", path, exc)
-        return None
-
-
-def _load_legacy_crons_json() -> tuple[list[CronJob], datetime] | None:
-    path = _legacy_crons_json_path()
-    if not path.exists():
-        return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            return None
-        stat = path.stat()
-        jobs = [CronJob.from_dict(item) for item in raw if isinstance(item, dict)]
-        return jobs, datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-    except Exception as exc:
-        log.warning("Failed to load legacy crons JSON %s: %s", path, exc)
-        return None
-
-
 def load_crons(*, refresh_next_runs: bool = True) -> list[CronJob]:
     db_snapshot = _load_crons_db_snapshot()
-    legacy_snapshot = _load_legacy_crons_json()
     if db_snapshot is None:
-        if legacy_snapshot is not None and legacy_snapshot[0]:
-            _save_crons_db(legacy_snapshot[0])
-            return _return_crons(legacy_snapshot[0], persist_refreshed=refresh_next_runs)
         return []
-    if legacy_snapshot is not None:
-        legacy_jobs, legacy_updated_at = legacy_snapshot
-        db_jobs, db_updated_at = db_snapshot
-        json_updated_at = _crons_json_mtime()
-        if not db_jobs and _has_crons_json_rows():
-            legacy_jobs = _load_crons_json()
-            save_crons(legacy_jobs)
-            log.warning(
-                "Runtime DB had no cron rows; restored %d cron(s) from legacy JSON mirror.",
-                len(legacy_jobs),
-            )
-            return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
-        if json_updated_at is not None and (
-            db_updated_at is None or json_updated_at > db_updated_at + _STORE_FRESHNESS_SKEW
-        ):
-            legacy_jobs = _load_crons_json()
-            if not legacy_jobs and db_jobs:
-                log.warning(
-                    "Ignoring newer empty cron JSON mirror because runtime DB still has %d cron(s).",
-                    len(db_jobs),
-                )
-                return _return_crons(db_jobs, persist_refreshed=refresh_next_runs)
-            save_crons(legacy_jobs)
-            log.info(
-                "Imported %d cron(s) from newer legacy JSON mirror into runtime DB.",
-                len(legacy_jobs),
-            )
-            return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
-        if legacy_updated_at and db_updated_at is None and legacy_jobs and not db_jobs:
-            _save_crons_db(legacy_jobs)
-            return _return_crons(legacy_jobs, persist_refreshed=refresh_next_runs)
     return _return_crons(db_snapshot[0], persist_refreshed=refresh_next_runs)
 
 
@@ -623,16 +541,23 @@ def _save_crons_db(jobs: list[CronJob]) -> bool:
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc).isoformat()
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
-            _ensure_cron_table(conn)
-            conn.execute(f"DELETE FROM {_CRON_TABLE} WHERE collection = ?", (_CRON_COLLECTION,))
-            for job in jobs:
-                conn.execute(
-                    f"""INSERT OR REPLACE INTO {_CRON_TABLE}
-                        (collection, item_key, payload, updated_at)
-                        VALUES (?, ?, ?, ?)""",
-                    (_CRON_COLLECTION, job.id, json.dumps(job.to_dict(), sort_keys=True), now),
-                )
+        try:
+            from nullion.runtime_persistence import runtime_store_file_lock
+
+            lock_context = runtime_store_file_lock(db_path)
+        except Exception:
+            lock_context = nullcontext()
+        with lock_context:
+            with sqlite3.connect(str(db_path), timeout=10) as conn:
+                _ensure_cron_table(conn)
+                conn.execute(f"DELETE FROM {_CRON_TABLE} WHERE collection = ?", (_CRON_COLLECTION,))
+                for job in jobs:
+                    conn.execute(
+                        f"""INSERT OR REPLACE INTO {_CRON_TABLE}
+                            (collection, item_key, payload, updated_at)
+                            VALUES (?, ?, ?, ?)""",
+                        (_CRON_COLLECTION, job.id, json.dumps(job.to_dict(), sort_keys=True), now),
+                    )
         return True
     except sqlite3.Error as exc:
         log.warning("Failed to save crons to runtime DB %s: %s", db_path, exc)
@@ -641,9 +566,7 @@ def _save_crons_db(jobs: list[CronJob]) -> bool:
 
 def _persisted_cron_count() -> int:
     snapshot = _load_crons_db_snapshot()
-    db_count = 0 if snapshot is None else len(snapshot[0])
-    json_count = len(_load_crons_json())
-    return max(db_count, json_count)
+    return 0 if snapshot is None else len(snapshot[0])
 
 
 def save_crons(jobs: list[CronJob], *, allow_empty: bool = False) -> None:
@@ -687,10 +610,12 @@ def add_cron(
     enabled: bool = True,
     delivery_channel: str = "",
     delivery_target: str = "",
+    html_image_delivery_mode: str = "",
+    artifact_delivery_options: dict[str, object] | None = None,
     workspace_id: str = _DEFAULT_WORKSPACE_ID,
 ) -> CronJob:
     """Create and persist a new cron job. Returns the saved CronJob."""
-    from nullion.cron_delivery import normalize_cron_delivery_channel
+    from nullion.cron_delivery import normalize_cron_delivery_channel, normalize_html_image_delivery_mode
 
     _validate_cron_fields(name, schedule, task)
     jobs = load_crons()
@@ -702,6 +627,8 @@ def add_cron(
         workspace_id=str(workspace_id or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID,
         delivery_channel=normalize_cron_delivery_channel(delivery_channel),
         delivery_target=str(delivery_target or "").strip(),
+        html_image_delivery_mode=normalize_html_image_delivery_mode(html_image_delivery_mode),
+        artifact_delivery_options=dict(artifact_delivery_options or {}),
         schedule_timezone=_timezone_display_name(_cron_timezone()),
         enabled=enabled,
         created_at=_now_iso(),
@@ -738,16 +665,30 @@ def toggle_cron(cron_id: str, enabled: bool) -> CronJob | None:
 
 def update_cron(cron_id: str, **kwargs) -> CronJob | None:
     """Update mutable fields (name, schedule, task, enabled). Recomputes next_run."""
-    from nullion.cron_delivery import normalize_cron_delivery_channel
+    from nullion.cron_delivery import normalize_cron_delivery_channel, normalize_html_image_delivery_mode
 
     jobs = load_crons()
     for job in jobs:
         if job.id == cron_id:
-            mutable = {"name", "schedule", "task", "enabled", "delivery_channel", "delivery_target", "workspace_id"}
+            mutable = {
+                "name",
+                "schedule",
+                "task",
+                "enabled",
+                "delivery_channel",
+                "delivery_target",
+                "workspace_id",
+                "html_image_delivery_mode",
+                "artifact_delivery_options",
+            }
             for k, v in kwargs.items():
                 if k in mutable:
                     if k == "delivery_channel":
                         v = normalize_cron_delivery_channel(v)
+                    elif k == "html_image_delivery_mode":
+                        v = normalize_html_image_delivery_mode(v)
+                    elif k == "artifact_delivery_options":
+                        v = dict(v) if isinstance(v, dict) else {}
                     setattr(job, k, v)
             if "schedule" in kwargs:
                 job.schedule_timezone = _timezone_display_name(_cron_timezone())

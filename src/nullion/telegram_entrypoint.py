@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-import json
 import logging
 import os
 from pathlib import Path
@@ -15,24 +14,19 @@ import sqlite3
 import time
 import inspect
 import threading
-import uuid
+from typing import Callable
 
 from nullion.config import ProviderBinding, load_env_file_into_environ, load_settings
-from nullion.cron_planner_status import (
-    build_cron_planner_status_fallback,
-    build_cron_planner_status_preview,
-    cron_planner_run_succeeded,
-)
-from nullion.cron_execution_tools import (
-    CronExecutionToolRegistry,
-    build_cron_connector_scope_decision,
-)
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.artifacts import ensure_artifact_root
 from nullion.messaging_adapters import messaging_file_allowed_roots, retry_messaging_delivery_operation
 from nullion.providers import resolve_plugin_provider_kwargs
 from nullion.runtime import bootstrap_persistent_runtime
-from nullion.runtime_persistence import list_runtime_store_backups, restore_runtime_store_backup
+from nullion.runtime_persistence import (
+    list_runtime_store_backups,
+    restore_runtime_store_backup,
+    restore_sqlite_auxiliary_rows_from_candidates,
+)
 from nullion.telegram_app import build_messaging_operator_service, build_telegram_operator_service
 from nullion.telegram_transport import build_telegram_bot
 from nullion.tools import (
@@ -52,6 +46,7 @@ from nullion.tools import (
 from nullion.web_research_policy import (
     default_browser_backend_for_web_research,
     direct_web_fetch_enabled,
+    preferred_browser_backend_from_env,
     should_register_search_plugin,
 )
 
@@ -155,6 +150,9 @@ def _resolve_browser_backend() -> str | None:
     be = os.environ.get("NULLION_BROWSER_BACKEND", "").strip().lower()
     if be:
         return be
+    preferred_backend = preferred_browser_backend_from_env()
+    if preferred_backend:
+        return preferred_backend
     plugins_env = os.environ.get("NULLION_PLUGINS", "")
     if any(p.strip().lower() == "browser" for p in plugins_env.split(",")):
         return "auto"
@@ -229,6 +227,7 @@ def _recover_runtime_from_corrupt_checkpoint(checkpoint: Path, error: Exception)
             candidate,
             backup.get("name"),
         )
+        restore_sqlite_auxiliary_rows_from_candidates((candidate, checkpoint), checkpoint)
         return bootstrap_persistent_runtime(checkpoint)
     logger.warning(
         "No restorable runtime checkpoint backup found; starting with a new runtime "
@@ -238,6 +237,7 @@ def _recover_runtime_from_corrupt_checkpoint(checkpoint: Path, error: Exception)
     )
     runtime = bootstrap_persistent_runtime(checkpoint)
     runtime.checkpoint()
+    restore_sqlite_auxiliary_rows_from_candidates((candidate,), checkpoint)
     return runtime
 
 
@@ -614,469 +614,50 @@ def _build_runtime_service_from_settings(
             return "cron_run_reached_iteration_limit"
         if result.get("suspended_for_approval"):
             return "waiting_for_approval"
+        if result.get("raw_tool_payload_blocked"):
+            return "cron_run_raw_tool_payload"
         _ = text
         return cron_structured_result_block_reason(result, artifacts, text=text)
 
-    def _cron_agent_history(
-        conv_id: str,
-        *,
-        tool_registry,
-        include_connector_context: bool,
-    ) -> list[dict]:
-        from nullion.artifacts import artifact_root_for_principal
-        from nullion.builder_capabilities import format_installed_dependency_context
-        from nullion.connections import format_workspace_connections_for_prompt
-        from nullion.runtime_config import format_runtime_config_for_prompt
-        from nullion.skill_pack_catalog import skill_pack_access_prompt
-        from nullion.skill_pack_installer import format_cached_enabled_skill_pack_index_for_prompt
-        from nullion.system_context import build_system_context_snapshot, format_compact_system_context_for_prompt
-        from nullion.workspace_storage import format_workspace_storage_for_prompt
+    def _notify_cron_approval_required(job, channel: str, target: str, result: dict) -> None:
+        _ = (job, channel, target)
+        approval_id = str((result or {}).get("approval_id") or "").strip()
+        if not approval_id:
+            return
+        try:
+            from nullion.workspace_notifications import broadcast_pending_approval
 
-        current_settings = _current_service_settings()
-        history: list[dict] = []
-        caps_text = format_compact_system_context_for_prompt(build_system_context_snapshot(tool_registry=tool_registry))
-        dependency_text = format_installed_dependency_context(runtime)
-        if dependency_text:
-            caps_text = (caps_text + "\n\n" + dependency_text).strip()
-        if caps_text:
-            history.append({
-                "role": "system",
-                "content": [{"type": "text", "text": (
-                    "You are Nullion, a security-first AI agent. Use only registered tools. "
-                    "Below is the live inventory of tools registered in this session.\n\n"
-                    + caps_text
-                )}],
-            })
-        config_text = format_runtime_config_for_prompt(model_client=getattr(service, "model_client", None))
-        if config_text:
-            history.append({"role": "system", "content": [{"type": "text", "text": config_text}]})
-        connections_text = format_workspace_connections_for_prompt(
-            principal_id=conv_id,
-            include_external_connectors=include_connector_context,
-        )
-        if connections_text:
-            history.append({"role": "system", "content": [{"type": "text", "text": connections_text}]})
-        skill_text = format_cached_enabled_skill_pack_index_for_prompt(
-            current_settings.enabled_skill_packs,
-            max_total_chars=900,
-        )
-        access_text = (
-            skill_pack_access_prompt(current_settings.enabled_skill_packs, principal_id=conv_id, compact=True)
-            if include_connector_context
-            else ""
-        )
-        if access_text:
-            skill_text = (skill_text + "\n\n" + access_text).strip()
-        if skill_text:
-            history.append({"role": "system", "content": [{"type": "text", "text": skill_text}]})
-        artifact_root = artifact_root_for_principal(conv_id)
-        storage_text = format_workspace_storage_for_prompt(principal_id=conv_id)
-        history.append({
-            "role": "system",
-            "content": [{"type": "text", "text": (
-                "Cron delivery contract: create requested deliverable files under this artifact directory "
-                f"and attach them with explicit MEDIA lines: {artifact_root}. "
-                "Keep scratch, checkpoint, and state files in the workspace unless they are requested deliverables.\n\n"
-                "If a tool requires approval, pause and wait for the approval decision card. "
-                "After approval, resume from the suspended step; if denied, stop the run.\n\n"
-                f"{storage_text}"
-            )}],
-        })
-        return history
+            broadcast_pending_approval(
+                runtime,
+                approval_id,
+                settings=_current_service_settings(),
+                include_origin=True,
+            )
+        except Exception:
+            logger.debug("Could not deliver manual cron approval request", exc_info=True)
 
     def _run_cron_agent_turn(
         job,
         conv_id: str,
         *,
         label: str,
-        planner_status_preview: bool = False,
-        preferred_planner_group_id: str | None = None,
+        cancellation_checker=None,
     ) -> dict:
-        from nullion.cron_delivery import cron_agent_prompt, cron_deep_agent_dispatch_plan
-        from nullion.run_activity import format_tool_activity_detail
-
-        preflight_started_at = time.perf_counter()
-
-        def _record_agent_preflight(stage: str, **extra: object) -> None:
-            elapsed_ms = round((time.perf_counter() - preflight_started_at) * 1000, 1)
-            logger.info(
-                "cron delivery agent preflight conversation_id=%s stage=%s elapsed_ms=%.1f extra=%s",
-                conv_id,
-                stage,
-                elapsed_ms,
-                extra,
-            )
-            if os.environ.get("NULLION_CRON_PREFLIGHT_TIMING_EVENTS", "").strip() != "1":
-                return
-            _record_cron_delivery_event(
-                "cron.delivery.agent_preflight",
-                job,
-                "",
-                "",
-                conv_id,
-                stage=stage,
-                elapsed_ms=elapsed_ms,
-                **extra,
-            )
+        from nullion.cron_delivery import run_single_agent_cron_turn
 
         orchestrator = getattr(service, "agent_orchestrator", None)
-        if orchestrator is None:
-            return {"cron_run_failed": True, "reason": "agent_orchestrator_unavailable", "text": ""}
-        prompt = cron_agent_prompt(job, label=label)
-        planner_preview_prompt = (
-            f"{str(getattr(job, 'name', '') or '').strip()}\n"
-            f"{str(getattr(job, 'task', '') or '').strip()}"
-        ).strip() or prompt
-        deliver_fn = getattr(orchestrator, "_deliver_fn", None)
-        connector_scope_prompt = json.dumps(
-            {
-                "name": str(getattr(job, "name", "") or ""),
-                "task": str(getattr(job, "task", "") or ""),
-            },
-            ensure_ascii=False,
+        return run_single_agent_cron_turn(
+            job,
+            conv_id,
+            label=label,
+            orchestrator=orchestrator,
+            runtime=runtime,
+            tool_registry=active_tool_registry,
+            settings=_current_service_settings(),
+            model_client=getattr(service, "model_client", None),
+            record_event=_record_cron_delivery_event,
+            cancellation_checker=cancellation_checker,
         )
-        preview = None
-        display_preview = None
-        planner_group_id = str(preferred_planner_group_id or "").strip()
-        planner_terminal_sent = False
-        planner_status_delivered = False
-        cron_tool_results: list[object] = []
-
-        def _planner_group_has_started_runs(group_id: str) -> bool:
-            group_id = str(group_id or "").strip()
-            if not group_id:
-                return False
-            try:
-                for run in getattr(runtime.store, "list_mini_agent_runs", lambda: [])():
-                    if str(getattr(run, "capsule_id", "") or "") == group_id:
-                        return True
-            except Exception:
-                logger.debug("Could not inspect Telegram cron planner group runs", exc_info=True)
-            return False
-
-        def _deferred_dispatch_payload(error: BaseException) -> dict[str, object]:
-            error_text = str(error).strip() or error.__class__.__name__
-            logger.warning(
-                "Telegram cron DeepAgent dispatch raised after planner group started; preserving deferred delivery "
-                "conversation_id=%s group_id=%s error=%s",
-                conv_id,
-                planner_group_id,
-                error_text,
-                exc_info=True,
-            )
-            return {
-                "text": (
-                    "Manual scheduled task run started. The result will be delivered when ready."
-                    if str(label).lower().startswith("manual")
-                    else "Scheduled task run started. The result will be delivered when ready."
-                ),
-                "tool_results": [],
-                "artifacts": [],
-                "mini_agent_dispatch": True,
-                "task_group_id": planner_group_id,
-                "planner_summary": (
-                    str(getattr(display_preview, "summary", "") or "")
-                    if display_preview is not None
-                    else ""
-                ),
-                "status_delivered": bool(planner_status_delivered),
-                "dispatch_error_recovered": True,
-                "dispatch_error": error_text,
-            }
-
-        def _deliver_buffered_tool_activity() -> None:
-            if not planner_group_id or not callable(deliver_fn) or not cron_tool_results:
-                return
-            try:
-                detail = format_tool_activity_detail(cron_tool_results).strip()
-            except Exception:
-                logger.debug("Could not format Telegram cron planner tool activity", exc_info=True)
-                return
-            if not detail:
-                return
-            try:
-                deliver_fn(
-                    conv_id,
-                    detail,
-                    is_status=True,
-                    group_id=planner_group_id,
-                    status_kind="tool_activity",
-                    activity_id="cron-tools",
-                    activity_label="Tools",
-                )
-            except Exception:
-                logger.debug("Could not deliver Telegram cron planner tool activity", exc_info=True)
-
-        def _install_planner_preview(candidate, *, preserve_group_id: bool = False) -> None:  # noqa: ANN001
-            nonlocal preview, display_preview, planner_group_id, planner_status_delivered
-            if candidate is None:
-                return
-            if planner_group_id:
-                with_group_id = getattr(candidate, "with_group_id", None)
-                if callable(with_group_id):
-                    candidate = with_group_id(planner_group_id)
-            preview = candidate
-            display_preview = candidate
-            planner_group_id = planner_group_id or str(getattr(candidate, "group_id", None) or "")
-            try:
-                deliver_fn(
-                    conv_id,
-                    candidate.initial_text(),
-                    is_status=True,
-                    group_id=planner_group_id,
-                    status_kind="task_summary",
-                )
-                planner_status_delivered = True
-                _deliver_buffered_tool_activity()
-            except Exception:
-                logger.debug("Could not deliver Telegram cron planner status preview", exc_info=True)
-
-        _record_agent_preflight("started", planner_status_preview=bool(planner_status_preview))
-        if planner_status_preview:
-            try:
-                preview_registry = CronExecutionToolRegistry(
-                    active_tool_registry,
-                )
-                preview = build_cron_planner_status_preview(
-                    model_client=getattr(orchestrator, "model_client", None),
-                    user_message=planner_preview_prompt,
-                    conversation_id=conv_id,
-                    principal_id=conv_id,
-                    tool_registry=preview_registry,
-                    subject=str(getattr(job, "name", "") or ""),
-                    cache_only=True,
-                )
-            except Exception:
-                logger.debug("Could not build Telegram cron planner status preview", exc_info=True)
-                preview = None
-            _install_planner_preview(preview)
-            _record_agent_preflight(
-                "planner_preview",
-                preview_available=preview is not None,
-                allowed_tools=len(preview.allowed_tools) if preview is not None else 0,
-                cache_only=True,
-            )
-            if preview is None:
-                try:
-                    preview = build_cron_planner_status_preview(
-                        model_client=getattr(orchestrator, "model_client", None),
-                        user_message=planner_preview_prompt,
-                        conversation_id=conv_id,
-                        principal_id=conv_id,
-                        tool_registry=preview_registry,
-                        subject=str(getattr(job, "name", "") or ""),
-                    )
-                except Exception:
-                    logger.debug("Could not build synchronous Telegram cron planner status preview", exc_info=True)
-                    preview = None
-                _install_planner_preview(preview)
-                _record_agent_preflight(
-                    "planner_preview_sync_build",
-                    preview_available=preview is not None,
-                    allowed_tools=len(preview.allowed_tools) if preview is not None else 0,
-                )
-            if preview is None:
-                fallback_preview = build_cron_planner_status_fallback(
-                    user_message=planner_preview_prompt,
-                    conversation_id=conv_id,
-                    principal_id=conv_id,
-                    subject=str(getattr(job, "name", "") or ""),
-                )
-                _install_planner_preview(fallback_preview)
-                _record_agent_preflight(
-                    "planner_preview_metadata_fallback_installed",
-                    fallback_group_id=fallback_preview.group_id,
-                )
-
-                preview_ready = threading.Event()
-                preview_holder: dict[str, object] = {}
-
-                def _build_planner_preview_background() -> None:
-                    try:
-                        candidate = build_cron_planner_status_preview(
-                            model_client=getattr(orchestrator, "model_client", None),
-                            user_message=planner_preview_prompt,
-                            conversation_id=conv_id,
-                            principal_id=conv_id,
-                            tool_registry=preview_registry,
-                            subject=str(getattr(job, "name", "") or ""),
-                        )
-                        _record_agent_preflight(
-                            "planner_preview_async",
-                            preview_available=candidate is not None,
-                            allowed_tools=len(candidate.allowed_tools) if candidate is not None else 0,
-                        )
-                        preview_holder["candidate"] = candidate
-                        if candidate is not None and not planner_terminal_sent:
-                            _install_planner_preview(candidate, preserve_group_id=True)
-                    except Exception:
-                        logger.debug("Could not build async Telegram cron planner status preview", exc_info=True)
-                    finally:
-                        preview_ready.set()
-
-                planner_thread = threading.Thread(
-                    target=_build_planner_preview_background,
-                    name="nullion-telegram-cron-planner-preview",
-                    daemon=True,
-                )
-                planner_thread.start()
-                try:
-                    sync_wait_seconds = max(
-                        0.0,
-                        float(os.environ.get("NULLION_CRON_PLANNER_PREVIEW_SYNC_WAIT_SECONDS", "6")),
-                    )
-                except ValueError:
-                    sync_wait_seconds = 6.0
-                if sync_wait_seconds and preview_ready.wait(sync_wait_seconds):
-                    if preview_holder.get("candidate") is not None:
-                        _record_agent_preflight(
-                            "planner_preview_sync_wait_ready",
-                            wait_s=sync_wait_seconds,
-                        )
-                else:
-                    _record_agent_preflight(
-                        "planner_preview_sync_wait_timeout",
-                        wait_s=sync_wait_seconds,
-                    )
-        connector_scope = build_cron_connector_scope_decision(
-            model_client=getattr(orchestrator, "model_client", None),
-            user_message=connector_scope_prompt,
-            principal_id=conv_id,
-            registry=active_tool_registry,
-            planned_tool_names=preview.allowed_tools if preview is not None and preview.allowed_tools else None,
-        )
-        _record_agent_preflight(
-            "connector_scope",
-            connector_allowed=bool(connector_scope.allow_connector_tools),
-            connector_providers=len(connector_scope.provider_ids),
-        )
-        def _deliver_cron_planner_tool_activity(tool_result) -> None:  # noqa: ANN001
-            cron_tool_results.append(tool_result)
-            _deliver_buffered_tool_activity()
-
-        execution_registry = CronExecutionToolRegistry(
-            active_tool_registry,
-            # Planner preview tool lists are display hints and can be partial
-            # (cache hits, timeouts, decomposer drift). Do not hard-gate cron
-            # execution on them; rely on runtime capability policy instead.
-            allowed_tool_names=None,
-            allow_connector_tools=connector_scope.allow_connector_tools,
-            connector_provider_ids=connector_scope.provider_ids,
-        )
-        raw_cron_deep_agent_enabled = str(
-            os.environ.get("NULLION_CRON_DEEP_AGENT_EXECUTION_ENABLED") or ""
-        ).strip().lower()
-        cron_deep_agent_enabled = (
-            raw_cron_deep_agent_enabled not in {"0", "false", "no", "off"}
-        )
-        if cron_deep_agent_enabled and hasattr(orchestrator, "dispatch_request_sync"):
-            _record_agent_preflight("deep_agent_dispatch_start")
-            dag_plan = cron_deep_agent_dispatch_plan(
-                job,
-                label=label,
-                tool_registry=execution_registry,
-                planner_preview=preview,
-            )
-            try:
-                dispatch_result = orchestrator.dispatch_request_sync(
-                    conversation_id=conv_id,
-                    principal_id=conv_id,
-                    user_message=prompt,
-                    tool_registry=execution_registry,
-                    policy_store=runtime.store,
-                    approval_store=runtime.store,
-                    available_tools=list(dict.fromkeys(
-                        tool
-                        for task in getattr(dag_plan, "tasks", []) or []
-                        for tool in (getattr(task, "tool_scope", []) or [])
-                    )),
-                    single_task_fast_path=False,
-                    dag_plan=dag_plan,
-                    preferred_group_id=planner_group_id or None,
-                )
-                _record_agent_preflight(
-                    "deep_agent_dispatch_done",
-                    task_count=int(getattr(dispatch_result, "task_count", 0) or 0),
-                )
-                payload: dict[str, object] = {
-                    "text": str(getattr(dispatch_result, "acknowledgment", "") or ""),
-                    "tool_results": [],
-                    "artifacts": [],
-                    "mini_agent_dispatch": True,
-                    "task_group_id": str(getattr(dispatch_result, "group_id", "") or ""),
-                    "planner_summary": str(getattr(dispatch_result, "planner_summary", "") or ""),
-                    "status_delivered": bool(planner_status_delivered)
-                    or bool(getattr(dispatch_result, "status_delivered", False)),
-                }
-            except BaseException as exc:
-                if planner_group_id and _planner_group_has_started_runs(planner_group_id):
-                    payload = _deferred_dispatch_payload(exc)
-                    _record_agent_preflight("deep_agent_dispatch_recovered", error=payload["dispatch_error"])
-                else:
-                    raise
-        else:
-            _record_agent_preflight("guarded_turn_start")
-            result = orchestrator.run_turn(
-                conversation_id=conv_id,
-                principal_id=conv_id,
-                user_message=prompt,
-                conversation_history=_cron_agent_history(
-                    conv_id,
-                    tool_registry=execution_registry,
-                    include_connector_context=connector_scope.allow_connector_tools,
-                ),
-                tool_registry=execution_registry,
-                policy_store=runtime.store,
-                approval_store=runtime.store,
-                tool_result_callback=_deliver_cron_planner_tool_activity if planner_status_preview else None,
-            )
-            _record_agent_preflight(
-                "guarded_turn_done",
-                tool_results=len(result.tool_results),
-            )
-            payload = {
-                "text": result.final_text or "",
-                "tool_results": list(result.tool_results),
-                "artifacts": list(result.artifacts),
-                "suspended_for_approval": result.suspended_for_approval,
-                "approval_id": result.approval_id,
-                "reached_iteration_limit": result.reached_iteration_limit,
-                "raw_tool_payload_blocked": getattr(result, "raw_tool_payload_blocked", False),
-            }
-        if (
-            display_preview is None
-            and planner_status_preview
-            and callable(deliver_fn)
-        ):
-            fallback_preview = build_cron_planner_status_fallback(
-                user_message=planner_preview_prompt,
-                conversation_id=conv_id,
-                principal_id=conv_id,
-                subject=str(getattr(job, "name", "") or ""),
-            )
-            _install_planner_preview(fallback_preview)
-            _record_agent_preflight(
-                "planner_preview_terminal_fallback_installed",
-                fallback_group_id=fallback_preview.group_id,
-            )
-        if (
-            display_preview is not None
-            and planner_group_id
-            and callable(deliver_fn)
-            and not payload.get("mini_agent_dispatch")
-        ):
-            try:
-                planner_terminal_sent = True
-                deliver_fn(
-                    conv_id,
-                    display_preview.terminal_text(success=cron_planner_run_succeeded(payload)),
-                    is_status=True,
-                    group_id=planner_group_id,
-                    status_kind="task_summary",
-                )
-            except Exception:
-                logger.debug("Could not deliver Telegram cron planner terminal status", exc_info=True)
-        return payload
 
     def _send_cron_platform_delivery(
         job,
@@ -1127,6 +708,88 @@ def _build_runtime_service_from_settings(
             ))
         return False
 
+    def _send_manual_cron_status_update(
+        job,
+        group_id: str,
+        status_text: str,
+        *,
+        terminal: bool,
+        channel: str,
+        target: str,
+    ) -> bool:
+        if channel != "telegram":
+            return False
+        target = str(target or "").strip()
+        group_id = str(group_id or "").strip()
+        status_text = str(status_text or "").strip()
+        if not target or not group_id or not status_text:
+            return False
+        current_settings = _current_service_settings()
+        bot_token = str(current_settings.telegram.bot_token or "").strip()
+        if not bot_token:
+            return False
+        try:
+            from nullion.platform_activity import PlatformTaskCardStore, platform_activity_capabilities, should_deliver_task_status
+            from nullion.telegram_app import (
+                _send_or_edit_telegram_task_status_message,
+                _schedule_or_run_telegram_status_delivery,
+                _telegram_allows_status_streaming,
+                activity_trace_enabled_for_chat,
+            )
+        except Exception:
+            logger.debug("Could not import Telegram status delivery helpers", exc_info=True)
+            return False
+        try:
+            if not _telegram_allows_status_streaming(runtime, chat_id=target):
+                return False
+            include_activity = activity_trace_enabled_for_chat(runtime, chat_id=target)
+            if not should_deliver_task_status(
+                status_kind="task_summary",
+                planner_feed_enabled=True,
+                include_activity=include_activity,
+            ):
+                return False
+            task_card_store = getattr(service, "_task_card_store", None)
+            if task_card_store is None:
+                task_card_store = PlatformTaskCardStore(platform_activity_capabilities("telegram"))
+            rendered_status = task_card_store.update(
+                target_id=target,
+                group_id=group_id,
+                status_kind="task_summary",
+                text=status_text,
+                include_activity=include_activity,
+            )
+            if not rendered_status:
+                return False
+
+            async def _deliver_status(_loop_bound_state: bool) -> bool:
+                delivered = False
+                try:
+                    delivered = bool(await _send_or_edit_telegram_task_status_message(
+                        bot_token,
+                        getattr(service, "_status_messages", {}),
+                        chat_id=target,
+                        group_id=group_id,
+                        text=rendered_status,
+                        runtime=runtime,
+                        bot_token=bot_token,
+                        status_texts=getattr(service, "_status_texts", None),
+                        status_locks=None,
+                        typing_tasks=None,
+                    ))
+                    return delivered
+                finally:
+                    if terminal and delivered:
+                        try:
+                            task_card_store.clear(target_id=target, group_id=group_id)
+                        except Exception:
+                            logger.debug("Could not clear manual cron status card state", exc_info=True)
+
+            return _schedule_or_run_telegram_status_delivery(_deliver_status, confirm=terminal)
+        except Exception:
+            logger.debug("Could not send manual cron status update for %s", getattr(job, "id", ""), exc_info=True)
+            return False
+
     def _save_cron_web_delivery(job, conv_id: str, text: str, artifacts: object, result: dict) -> bool:
         _ = (job, conv_id, text, artifacts, result)
         return False
@@ -1154,11 +817,15 @@ def _build_runtime_service_from_settings(
         return _operator_chat_id or ""
 
     def _cron_tool_runner(job, invocation=None):
-        from nullion.cron_delivery import CronRunDeliveryCallbacks, run_cron_delivery_workflow
+        from nullion.cron_delivery import (
+            CronRunDeliveryCallbacks,
+            cron_conversation_id,
+            manual_cron_silent_delivery_text,
+            run_cron_delivery_workflow,
+            start_manual_cron_background_delivery,
+        )
 
         manual_target = _manual_telegram_delivery_target(invocation)
-        invocation_id = str(getattr(invocation, "invocation_id", "") or "").strip()
-        manual_group_id = f"cron-{getattr(job, 'id', 'run')}-{invocation_id or uuid.uuid4().hex[:12]}"
 
         def _manual_effective_channel(cron_job) -> str:
             principal_id = str(getattr(invocation, "principal_id", "") or "").strip()
@@ -1169,7 +836,7 @@ def _build_runtime_service_from_settings(
                 return manual_target
             return _cron_delivery_target(cron_job, channel)
 
-        def _background_manual_cron_run() -> None:
+        def _start_manual_cron_monitor() -> Callable[[], None] | None:
             monitor_seconds = _manual_cron_doctor_monitor_seconds()
             monitor_fired = threading.Event()
             monitor_finished = threading.Event()
@@ -1209,60 +876,57 @@ def _build_runtime_service_from_settings(
                 monitor_timer.daemon = True
                 monitor_timer.start()
 
-            try:
-                result = run_cron_delivery_workflow(
-                    job,
-                    label="Manual scheduled task run",
-                    callbacks=CronRunDeliveryCallbacks(
-                        effective_channel=_manual_effective_channel,
-                        delivery_target=_manual_delivery_target,
-                        run_agent_turn=lambda cron_job, conv_id: _run_cron_agent_turn(
-                            cron_job,
-                            conv_id,
-                            label="Manual scheduled task run",
-                            planner_status_preview=True,
-                            preferred_planner_group_id=manual_group_id,
-                        ),
-                        record_event=_record_cron_delivery_event,
-                        block_reason=_cron_result_block_reason,
-                        save_web_delivery=_save_cron_web_delivery,
-                        send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
-                            cron_job,
-                            channel,
-                            target,
-                            text,
-                            run_label="Manual scheduled task run",
-                        ),
-                        start_background_delivery=None,
-                        clear_background_delivery=None,
-                    ),
-                )
-                if isinstance(result, dict) and (result.get("cron_delivery_failed") or result.get("cron_run_failed")):
-                    logger.warning(
-                        "Manual Telegram cron background run failed [%s]: %s",
-                        getattr(job, "id", ""),
-                        result.get("reason") or result,
-                    )
-            except Exception:
-                logger.warning("Manual Telegram cron background run error [%s]", getattr(job, "id", ""), exc_info=True)
-            finally:
+            def _cleanup_monitor() -> None:
                 monitor_finished.set()
                 if monitor_timer is not None:
                     monitor_timer.cancel()
 
-        thread = threading.Thread(
-            target=_background_manual_cron_run,
-            name=f"nullion-telegram-manual-cron-{getattr(job, 'id', 'run')}",
-            daemon=True,
+            return _cleanup_monitor
+
+        channel = _manual_effective_channel(job)
+        target = _manual_delivery_target(job, channel)
+
+        return start_manual_cron_background_delivery(
+            job,
+            label="Manual scheduled task run",
+            callbacks=CronRunDeliveryCallbacks(
+                effective_channel=_manual_effective_channel,
+                delivery_target=_manual_delivery_target,
+                run_agent_turn=lambda cron_job, conv_id, cancellation_checker=None: _run_cron_agent_turn(
+                    cron_job,
+                    conv_id,
+                    label="Manual scheduled task run",
+                    cancellation_checker=cancellation_checker,
+                ),
+                record_event=_record_cron_delivery_event,
+                block_reason=_cron_result_block_reason,
+                save_web_delivery=_save_cron_web_delivery,
+                send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
+                    cron_job,
+                    channel,
+                    target,
+                    text,
+                    run_label="Manual scheduled task run",
+                ),
+                start_background_delivery=None,
+                clear_background_delivery=None,
+                silent_delivery_text=manual_cron_silent_delivery_text,
+                notify_approval_required=_notify_cron_approval_required,
+            ),
+            origin_conversation_id=cron_conversation_id(job, channel, target),
+            thread_name_prefix="nullion-telegram-manual-cron",
+            before_run=_start_manual_cron_monitor,
+            workflow_runner=run_cron_delivery_workflow,
+            status_update_callback=lambda group_id, status_text, terminal: _send_manual_cron_status_update(
+                job,
+                group_id,
+                status_text,
+                terminal=terminal,
+                channel=channel,
+                target=target,
+            ),
+            status_update_interval_seconds=6.0,
         )
-        thread.start()
-        return {
-            "cron_delivery_status": "deferred",
-            "mini_agent_dispatch": True,
-            "task_group_id": manual_group_id,
-            "text": "Manual scheduled task run started. The result will be delivered when ready.",
-            "status_delivered": False,
-        }
 
     register_cron_tools(
         active_tool_registry,
@@ -1344,6 +1008,7 @@ async def _send_operator_telegram_delivery(
 
         from nullion.messaging_adapters import (
             build_platform_delivery_receipt,
+            delivery_receipt_transport_succeeded,
             prepare_reply_for_platform_delivery,
             record_platform_delivery_receipt,
         )
@@ -1379,7 +1044,7 @@ async def _send_operator_telegram_delivery(
                     transport_ok=True,
                 )
                 record_platform_delivery_receipt(receipt)
-                return receipt.status in {"succeeded", "partial"}
+                return delivery_receipt_transport_succeeded(receipt)
             message_kwargs = {}
             if reply_markup is not None:
                 message_kwargs["reply_markup"] = reply_markup
@@ -1401,7 +1066,7 @@ async def _send_operator_telegram_delivery(
                 transport_ok=True,
             )
             record_platform_delivery_receipt(receipt)
-            return receipt.status == "succeeded"
+            return delivery_receipt_transport_succeeded(receipt)
     except Exception:
         logger.warning("Failed to deliver operator notification message", exc_info=True)
         if delivery is not None:

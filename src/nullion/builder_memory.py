@@ -97,10 +97,12 @@ _CRON_EXPRESSION_RE = re.compile(
 )
 _ISO_DATETIME_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b")
 _EMAIL_ADDRESS_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+# Reject runtime/scheduler/report state, but do not reject durable preferences
+# solely because they mention a structured tool or protocol name.
 _OPERATIONAL_MEMORY_VALUE_RE = re.compile(
     r"\b(?:"
     r"audience metrics|can be triggered on request|configured destination|delivery saves|failed metric sources|"
-    r"gh api|list_crons|public awareness|run_cron|scheduled cron|scheduled monitor|scheduled task|"
+    r"list_crons|public awareness|run_cron|scheduled cron|scheduled monitor|scheduled task|"
     r"traffic metrics|web scraping"
     r")\b",
     re.I,
@@ -373,6 +375,51 @@ def capture_turn_memory_claims_verified(
     if managed.written or managed.skipped is None:
         return managed
     return result
+
+
+def record_turn_memory_capture_event(
+    runtime,
+    *,
+    conversation_id: str | None,
+    owner: str | None,
+    source: str,
+    result: BuilderMemoryResult | None = None,
+    status: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Persist an audit event for off-path turn memory capture."""
+
+    store = getattr(runtime, "store", None)
+    if store is None or not hasattr(store, "add_conversation_event"):
+        return
+    normalized_owner = str(owner or "").strip()
+    normalized_conversation_id = str(conversation_id or "").strip() or normalized_owner or "memory:capture"
+    if not normalized_conversation_id:
+        return
+    result_payload = result if isinstance(result, BuilderMemoryResult) else BuilderMemoryResult(skipped="unknown")
+    normalized_status = str(status or "").strip()
+    if not normalized_status:
+        normalized_status = "written" if result_payload.written else "skipped"
+    event = {
+        "conversation_id": normalized_conversation_id,
+        "event_type": "conversation.memory_capture",
+        "created_at": datetime.now(UTC).isoformat(),
+        "owner": normalized_owner,
+        "source": str(source or "turn_memory_capture").strip() or "turn_memory_capture",
+        "status": normalized_status,
+        "written": int(result_payload.written or 0),
+        "removed": int(result_payload.removed or 0),
+        "skipped": result_payload.skipped,
+    }
+    if error:
+        event["error"] = str(error)
+    try:
+        store.add_conversation_event(event)
+        checkpoint = getattr(runtime, "checkpoint", None)
+        if callable(checkpoint):
+            checkpoint()
+    except Exception:
+        logger.debug("builder_memory: unable to record memory capture event", exc_info=True)
 
 
 def _memory_precheck_node(state: _BuilderMemoryState) -> dict[str, object]:
@@ -1110,6 +1157,8 @@ def _replace_owner_memory(store, owner: str, replacements: list[UserMemoryEntry]
     removed = 0
     for entry in existing:
         if entry.entry_id in replacement_ids:
+            continue
+        if entry.kind is UserMemoryKind.PREFERENCE:
             continue
         if _remove_memory_entry(store, entry.entry_id):
             removed += 1

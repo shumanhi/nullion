@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import shlex
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from nullion.policy import BoundaryFact, BoundaryKind
 
@@ -216,6 +216,43 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
                 target=raw_url,
             )
         ]
+
+    if invocation.tool_name == "browser_image_collect":
+        facts = []
+        raw_page_url = invocation.arguments.get("page_url")
+        page_url = raw_page_url.strip() if isinstance(raw_page_url, str) else ""
+        parsed_page = urlparse(page_url)
+        if parsed_page.scheme in {"http", "https"} and parsed_page.netloc:
+            facts.append(
+                _network_boundary_fact(
+                    tool_name=invocation.tool_name,
+                    operation="http_get",
+                    target=page_url,
+                )
+            )
+        raw_image_urls = invocation.arguments.get("image_urls")
+        if isinstance(raw_image_urls, str):
+            raw_image_urls = [raw_image_urls]
+        if isinstance(raw_image_urls, (list, tuple)):
+            seen_targets = {fact.target for fact in facts}
+            for raw_image_url in raw_image_urls:
+                if not isinstance(raw_image_url, str) or not raw_image_url.strip():
+                    continue
+                image_url = urljoin(page_url, raw_image_url.strip()) if page_url else raw_image_url.strip()
+                parsed_image = urlparse(image_url)
+                if parsed_image.scheme not in {"http", "https"} or not parsed_image.netloc:
+                    continue
+                if image_url in seen_targets:
+                    continue
+                seen_targets.add(image_url)
+                facts.append(
+                    _network_boundary_fact(
+                        tool_name=invocation.tool_name,
+                        operation="http_get",
+                        target=image_url,
+                    )
+                )
+        return facts
 
     if invocation.tool_name == "connector_request":
         facts = []

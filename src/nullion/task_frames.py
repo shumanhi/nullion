@@ -268,6 +268,18 @@ def _task_frame_start_or_continue_node(state: _TaskFrameContinuationState) -> di
             execution=None,
             finish=None,
         )}
+    if getattr(active_frame, "status", None) is TaskFrameStatus.WAITING_INPUT:
+        # The product explicitly asked a follow-up question; the next answer
+        # belongs to that same frame unless a structured interrupt says
+        # otherwise.
+        return {"decision": TaskFrameContinuationDecision(
+            mode=TaskFrameContinuationMode.CONTINUE,
+            operation=active_frame.operation,
+            target=active_frame.target,
+            output=active_frame.output,
+            execution=active_frame.execution,
+            finish=active_frame.finish,
+        )}
     return {}
 
 

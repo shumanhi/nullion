@@ -14,6 +14,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -57,6 +58,22 @@ _FILENAME_TOKEN_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w .()@+-]{0,180}\.[A
 _ARTIFACT_DELIVERY_ROLES = frozenset({"deliverable", "deliver_receipt", "verify"})
 _ARTIFACT_PRODUCER_TOOLS = frozenset({"file_write", "document_create", "spreadsheet_create", "presentation_create"})
 _INTERNAL_ARTIFACT_SUFFIXES = frozenset({".json", ".jsonl", ".db", ".sqlite", ".sqlite3"})
+_RAW_TOOL_PAYLOAD_KEYS = frozenset(
+    {
+        "artifact_path",
+        "artifact_paths",
+        "artifacts",
+        "command",
+        "exit_code",
+        "network_mode",
+        "provider_id",
+        "shell",
+        "stderr",
+        "stdout",
+        "timeout_seconds",
+        "tool_name",
+    }
+)
 
 
 @dataclass
@@ -197,7 +214,13 @@ class ResultAggregator:
             requested_extension=requested_extension,
         )
         if requested_extension and not deliverable_artifacts:
-            summary = _missing_requested_artifact_summary(group, requested_extension)
+            # Preserve real terminal failure context, then append the missing
+            # requested-artifact note when it adds useful delivery clarity.
+            summary = _merge_missing_requested_artifact_summary(
+                group,
+                summary,
+                requested_extension=requested_extension,
+            )
         summary = _strip_attached_artifact_references(summary, deliverable_artifacts)
         if not deliverable_artifacts:
             summary = _strip_unverified_attachment_claims(summary)
@@ -223,7 +246,7 @@ class ResultAggregator:
         for task in group.tasks:
             if task.result:
                 status_label = "✓" if task.result.status == "success" else "✗"
-                output = (task.result.output or task.result.error or "(no output)")[:300]
+                output = _safe_task_result_preview(task, max_chars=300) or "(no user-visible output)"
                 task_summaries.append(f"{status_label} {task.title}: {output}")
             else:
                 task_summaries.append(f"— {task.title}: (no result)")
@@ -281,9 +304,26 @@ class ResultAggregator:
             parts.append(f"{failed} failed.")
         if cancelled:
             parts.append(f"{cancelled} cancelled.")
+        failure_details = []
         for task in group.tasks:
-            if task.result and task.result.output:
-                parts.append(f"• {task.title}: {task.result.output[:120]}")
+            preview = (
+                _safe_result_text_preview(task.result.output, max_chars=120)
+                if task.result and task.result.output
+                else ""
+            )
+            if preview:
+                parts.append(f"• {task.title}: {preview}")
+            if task.status == TaskStatus.FAILED and task.result and task.result.error:
+                failure = _safe_result_text_preview(task.result.error, max_chars=180)
+                if failure:
+                    failure_details.append(f"{task.title}: {failure}")
+        if failure_details:
+            # The fallback is often what users see when a scheduled task fails;
+            # keep the causal failure visible instead of reducing the result to counts.
+            details = "; ".join(failure_details[:3])
+            if len(failure_details) > 3:
+                details = f"{details}; {len(failure_details) - 3} more failed task(s)"
+            parts.append(f"Failure reasons: {details}.")
         return " ".join(parts)
 
     @staticmethod
@@ -292,7 +332,7 @@ class ResultAggregator:
         if failed <= 0:
             return False
         return not any(
-            task.result and (task.result.output or task.result.artifacts)
+            task.result and (task.result.output or task.result.error or task.result.artifacts)
             for task in group.tasks
         )
 
@@ -301,10 +341,106 @@ class ResultAggregator:
             result = self._deliver_fn(conversation_id, text, **kwargs)
             if asyncio.iscoroutine(result):
                 result = await result
-            return result is not False
+            delivered = result is not False
+            if not delivered:
+                logger.warning(
+                    "ResultAggregator: deliver_fn returned false conversation_id=%s group_id=%s is_artifact=%s",
+                    conversation_id,
+                    kwargs.get("group_id"),
+                    bool(kwargs.get("is_artifact")),
+                )
+            return delivered
         except Exception as exc:
-            logger.debug("ResultAggregator: deliver_fn failed: %s", exc)
+            logger.warning(
+                "ResultAggregator: deliver_fn failed conversation_id=%s group_id=%s is_artifact=%s: %s",
+                conversation_id,
+                kwargs.get("group_id"),
+                bool(kwargs.get("is_artifact")),
+                exc,
+            )
             return False
+
+
+def _safe_task_result_preview(task: TaskRecord, *, max_chars: int) -> str:
+    result = getattr(task, "result", None)
+    if result is None:
+        return ""
+    text = getattr(result, "output", None) or getattr(result, "error", None) or ""
+    preview = _safe_result_text_preview(text, max_chars=max_chars)
+    if preview:
+        return preview
+    if getattr(result, "artifacts", None):
+        return "completed with a verified artifact."
+    if getattr(result, "status", "") == "success":
+        return "completed with verified runtime evidence."
+    return ""
+
+
+def _safe_result_text_preview(value: object, *, max_chars: int) -> str:
+    text = _plain_result_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"\b(?:MEDIA|ARTIFACT):?\s+[^ \n\r\t]+", "", text)
+    text = "\n".join(line for line in text.splitlines() if not line.strip().startswith("MEDIA:"))
+    text = text.replace("\\n", " ")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    parsed = _parse_jsonish_result(text)
+    if parsed is not None:
+        return _safe_structured_result_preview(parsed)
+    if _looks_like_raw_tool_payload(text):
+        return "completed with verified runtime evidence."
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "..."
+    return text
+
+
+def _plain_result_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            return str(value)
+    return str(value).strip()
+
+
+def _parse_jsonish_result(text: str) -> object | None:
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "[{":
+        return None
+    try:
+        return json.loads(stripped)
+    except Exception:
+        return None
+
+
+def _safe_structured_result_preview(value: object) -> str:
+    if isinstance(value, dict):
+        lower_keys = {str(key).lower() for key in value}
+        if lower_keys & _RAW_TOOL_PAYLOAD_KEYS:
+            status = str(value.get("status") or "").strip().lower()
+            if status in {"failed", "failure", "error"}:
+                return "failed with structured runtime evidence."
+            return "completed with structured runtime evidence."
+        for key in ("summary", "message", "answer", "result"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip() and not _looks_like_raw_tool_payload(candidate):
+                return _safe_result_text_preview(candidate, max_chars=180)
+        return "completed with structured runtime evidence."
+    if isinstance(value, list):
+        return "completed with structured runtime evidence."
+    return ""
+
+
+def _looks_like_raw_tool_payload(text: str) -> bool:
+    lowered = text.lower()
+    return any(f'"{key}"' in lowered or f"{key}:" in lowered for key in _RAW_TOOL_PAYLOAD_KEYS)
 
 
 def _summary_with_original_request_context(group: TaskGroup, summary: str) -> str:
@@ -431,6 +567,12 @@ def _artifact_paths_for_group_delivery(
         result = task.result
         if result is None:
             continue
+        if getattr(result, "status", None) != "success":
+            # Failure text is explanatory evidence, not an attachment contract.
+            # In scheduled/report flows it often names the expected file and the
+            # wrong file that caused the failure; treating those names as media
+            # candidates can attach stale artifacts after a verifier rejects them.
+            continue
         task_paths = [str(path) for path in (result.artifacts or []) if isinstance(path, str) and path.strip()]
         explicit_paths.extend(task_paths)
         if _task_has_artifact_delivery_scope(task) or (task.task_id in leaf_task_ids and not scheduled_group):
@@ -439,9 +581,13 @@ def _artifact_paths_for_group_delivery(
     artifact_task_paths.extend(str(path) for path in (recovered_artifacts or []) if isinstance(path, str) and path.strip())
     roots = _artifact_roots_for_group(group)
     summary_paths = _existing_artifacts_referenced_by_text(str(summary or ""), artifact_roots=roots)
+    if _group_has_artifact_verifier(group) and not _group_has_successful_artifact_verifier(group):
+        return []
     for task in group.tasks:
         result = task.result
         if result is None:
+            continue
+        if getattr(result, "status", None) != "success":
             continue
         task_produces_artifacts = bool(
             set(str(tool).lower() for tool in (getattr(task, "allowed_tools", None) or ()))
@@ -469,6 +615,8 @@ def _artifact_paths_for_group_delivery(
             elif scheduled_group and task.task_id not in leaf_task_ids:
                 scheduled_fallback_paths.extend(found)
     requested_extension = _normalize_requested_extension(requested_extension)
+    if scheduled_group and not requested_extension and not _group_has_explicit_artifact_delivery(group):
+        return []
     if requested_extension:
         candidate_groups = (
             (artifact_task_paths, summary_paths, scheduled_fallback_paths, explicit_paths, all_text_paths)
@@ -502,9 +650,8 @@ def _artifact_paths_for_group_delivery(
 
 
 def _requested_attachment_extension_for_group(group: TaskGroup, *, model_client: Any | None) -> str | None:
-    del model_client
     try:
-        return plan_attachment_format(group.original_message, model_client=None).extension
+        return plan_attachment_format(group.original_message, model_client=model_client).extension
     except Exception:
         logger.debug("Could not plan requested attachment extension for group %s", group.group_id, exc_info=True)
         return None
@@ -535,6 +682,24 @@ def _filter_internal_artifact_paths(paths: list[str] | tuple[str, ...]) -> list[
 
 def _group_has_explicit_artifact_delivery(group: TaskGroup) -> bool:
     return any(_task_has_artifact_delivery_scope(task) for task in getattr(group, "tasks", ()) or ())
+
+
+def _group_has_artifact_verifier(group: TaskGroup) -> bool:
+    return any(_task_artifact_role(task) == "verify" for task in getattr(group, "tasks", ()) or ())
+
+
+def _group_has_successful_artifact_verifier(group: TaskGroup) -> bool:
+    return any(
+        _task_artifact_role(task) == "verify"
+        and getattr(getattr(task, "result", None), "status", None) == "success"
+        for task in getattr(group, "tasks", ()) or ()
+    )
+
+
+def _task_artifact_role(task: TaskRecord) -> str:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return str(metadata.get("artifact_role") or "").strip()
 
 
 def _collapse_same_format_scheduled_artifacts(paths: list[str] | tuple[str, ...]) -> list[str]:
@@ -581,6 +746,56 @@ def _missing_requested_artifact_summary(group: TaskGroup, requested_extension: s
         f"I could not attach the requested {normalized} file because no verified "
         f"{normalized} artifact was produced for this run."
     )
+
+
+def _merge_missing_requested_artifact_summary(
+    group: TaskGroup,
+    summary: str | None,
+    *,
+    requested_extension: str,
+) -> str:
+    missing_note = _missing_requested_artifact_summary(group, requested_extension).strip()
+    text = str(summary or "").strip()
+    if not text:
+        return missing_note
+    if _summary_already_mentions_missing_artifact(text, requested_extension):
+        return text
+    if _group_has_failed_or_cancelled_tasks(group) or _summary_looks_like_terminal_failure(text):
+        separator = "" if text.endswith((".", "!", "?")) else "."
+        return f"{text}{separator} Also, {missing_note}"
+    return missing_note
+
+
+def _summary_already_mentions_missing_artifact(summary: str, requested_extension: str) -> bool:
+    normalized = _normalize_requested_extension(requested_extension) or str(requested_extension)
+    haystack = str(summary or "").strip().lower()
+    return (
+        f"requested {normalized.lower()} file" in haystack
+        and "artifact was produced for this run" in haystack
+    )
+
+
+def _group_has_failed_or_cancelled_tasks(group: TaskGroup) -> bool:
+    return any(
+        task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}
+        for task in (group.tasks or ())
+    )
+
+
+def _summary_looks_like_terminal_failure(summary: str) -> bool:
+    text = str(summary or "").strip().lower()
+    if not text:
+        return False
+    failure_markers = (
+        "failed",
+        "could not",
+        "couldn't",
+        "unable",
+        "insufficient",
+        "did not",
+        "no html artifact",
+    )
+    return any(marker in text for marker in failure_markers)
 
 
 def _artifact_roots_for_group(group: TaskGroup) -> tuple[Path, ...]:

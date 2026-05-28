@@ -12,11 +12,11 @@ from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 from nullion.artifacts import artifact_path_for_generated_workspace_file, path_is_within
+from nullion.plugins.browser_plugin.browser_config import DEFAULT_AGENT_BROWSER_SESSION_ID
 from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy, BrowserPolicyViolation
 from nullion.plugins.browser_plugin.browser_session import BrowserBackend, BrowserScreenshotResult, BrowserSessionPool
 from nullion.tools import ToolInvocation, ToolResult
-from nullion.connections import workspace_id_for_principal
-from nullion.workspace_storage import sanitize_workspace_id, workspace_storage_roots_for_principal
+from nullion.workspace_storage import workspace_storage_roots_for_principal
 
 
 def _ok(invocation: ToolInvocation, output: dict[str, Any]) -> ToolResult:
@@ -154,6 +154,306 @@ def _browser_snapshot_script(*, max_elements: int = 120) -> str:
     ? document.activeElement.dataset.nullionEid || ''
     : '';
   return {{url: location.href, title: document.title, active_element_id: active, element_count: elements.length, elements}};
+}})()
+"""
+
+
+def _browser_extract_items_script(*, max_items: int = 30, selector: str | None = None) -> str:
+    return f"""
+(() => {{
+  const maxItems = Math.max(1, Math.min(100, {int(max_items)}));
+  const rootSelector = {json.dumps(selector or "")};
+  const textOf = (value, limit = 360) => (value || '').replace(/\\s+/g, ' ').trim().slice(0, limit);
+  const visible = (el) => {{
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  }};
+  const absoluteUrl = (value) => {{
+    try {{
+      const url = new URL(String(value || ''), location.href);
+      if (!['http:', 'https:'].includes(url.protocol)) return '';
+      url.hash = '';
+      return url.href;
+    }} catch (_) {{
+      return '';
+    }}
+  }};
+  const pathDepth = (url) => {{
+    try {{
+      return new URL(url).pathname.split('/').filter(Boolean).length;
+    }} catch (_) {{
+      return 0;
+    }}
+  }};
+  const nestedHttpUrl = (value) => {{
+    const raw = String(value || '');
+    const candidates = [];
+    const looksLikeNestedUrl = (candidate) => {{
+      const text = String(candidate || '').trim();
+      return /^https?:\/\//i.test(text) || /^\/(?!\/)/.test(text) || /^\/\/[^/]/.test(text);
+    }};
+    try {{
+      const parsed = new URL(raw, location.href);
+      for (const paramValue of parsed.searchParams.values()) {{
+        const decoded = (() => {{
+          try {{ return decodeURIComponent(paramValue); }} catch (_) {{ return String(paramValue || ''); }}
+        }})();
+        if (!looksLikeNestedUrl(decoded)) continue;
+        const nested = absoluteUrl(decoded);
+        if (nested && nested !== parsed.href) candidates.push(nested);
+      }}
+    }} catch (_) {{}}
+    const decodedRaw = (() => {{
+      try {{ return decodeURIComponent(raw); }} catch (_) {{ return raw; }}
+    }})();
+    for (const match of decodedRaw.matchAll(/https?:\/\//ig)) {{
+      const start = Number(match.index || 0);
+      if (start <= 0) continue;
+      const nested = absoluteUrl(decodedRaw.slice(start));
+      if (nested) candidates.push(nested);
+    }}
+    const matches = decodedRaw.match(/https?:\/\/[^\s"'<>]+/g) || [];
+    for (const match of matches.slice(1)) {{
+      const nested = absoluteUrl(match);
+      if (nested) candidates.push(nested);
+    }}
+    return candidates.filter(Boolean).pop() || '';
+  }};
+  const canonicalUrl = (value) => {{
+    const resolved = nestedHttpUrl(value) || absoluteUrl(value);
+    if (!resolved) return '';
+    try {{
+      const url = new URL(resolved);
+      url.hash = '';
+      if (pathDepth(url.href) >= 2) url.search = '';
+      return url.href;
+    }} catch (_) {{
+      return resolved;
+    }}
+  }};
+	  const tokenSet = (value) => new Set((String(value || '').toLowerCase().match(/[\p{{L}}\p{{N}}]{{3,}}/gu) || []).slice(0, 50));
+	  const searchQueryTokens = (() => {{
+	    try {{
+	      const params = new URL(location.href).searchParams;
+	      const values = [];
+	      for (const name of ['q', 'k', 'query', 'search']) {{
+	        for (const value of params.getAll(name)) {{
+	          if (value) values.push(value);
+	        }}
+	      }}
+	      return Array.from(tokenSet(values.join(' '))).slice(0, 8);
+	    }} catch (_) {{
+	      return [];
+	    }}
+	  }})();
+	  const matchesSearchQuery = (value) => {{
+	    if (!searchQueryTokens.length) return true;
+	    const haystack = String(value || '').toLowerCase();
+	    return searchQueryTokens.some((token) => haystack.includes(token));
+	  }};
+	  const stableTextKey = (value) => (String(value || '').toLowerCase().match(/[\p{{L}}\p{{N}}]+/gu) || [])
+	    .slice(0, 32)
+	    .join(' ');
+  const tokenOverlap = (left, right) => {{
+    const leftTokens = tokenSet(left);
+    const rightTokens = tokenSet(right);
+    if (!leftTokens.size || !rightTokens.size) return 0;
+    let overlap = 0;
+    for (const token of leftTokens) {{
+      if (rightTokens.has(token)) overlap += 1;
+    }}
+    return overlap / Math.max(1, Math.min(leftTokens.size, rightTokens.size));
+  }};
+  const firstSrcsetUrl = (value) => {{
+    const first = String(value || '').split(',').map((part) => part.trim().split(/\\s+/)[0]).find(Boolean);
+    return absoluteUrl(first);
+  }};
+  const imageUrlFor = (img) => {{
+    if (!img) return '';
+    const candidates = [
+      img.currentSrc,
+      img.src,
+      img.getAttribute('src'),
+      img.getAttribute('data-src'),
+      img.getAttribute('data-original'),
+      img.getAttribute('data-lazy-src'),
+      img.getAttribute('data-image'),
+      img.getAttribute('data-image-src'),
+      firstSrcsetUrl(img.getAttribute('srcset') || img.getAttribute('data-srcset')),
+    ];
+    return candidates.map(absoluteUrl).find(Boolean) || '';
+  }};
+  const usefulImage = (root) => {{
+    for (const img of Array.from(root.querySelectorAll('img, source'))) {{
+      const url = imageUrlFor(img);
+      if (!url) continue;
+      const rect = img.getBoundingClientRect();
+      const naturalWidth = Number(img.naturalWidth || img.width || rect.width || 0);
+      const naturalHeight = Number(img.naturalHeight || img.height || rect.height || 0);
+      if ((visible(img) || naturalWidth >= 80 || naturalHeight >= 80) && naturalWidth >= 48 && naturalHeight >= 48) {{
+        return {{
+          url,
+          alt: textOf(img.getAttribute('alt') || img.getAttribute('title') || '', 140),
+          width: Math.round(naturalWidth || rect.width || 0),
+          height: Math.round(naturalHeight || rect.height || 0),
+        }};
+      }}
+    }}
+    return {{url: '', alt: '', width: 0, height: 0}};
+  }};
+  const bestRootFor = (anchor) => {{
+    const semantic = anchor.closest('article, li, [role="listitem"], [role="article"], [itemtype], [itemscope]');
+    if (semantic && visible(semantic)) {{
+      const semanticText = String(semantic.innerText || semantic.textContent || '');
+      const semanticLinks = semantic.querySelectorAll ? semantic.querySelectorAll('a[href]').length : 0;
+      if (semanticText.length <= 1400 && semanticLinks <= 12) return semantic;
+    }}
+    let best = anchor;
+    let node = anchor;
+    for (let depth = 0; depth < 6 && node && node !== document.body; depth += 1, node = node.parentElement) {{
+      const rect = node.getBoundingClientRect();
+      const linkCount = node.querySelectorAll ? node.querySelectorAll('a[href]').length : 0;
+      const imageCount = node.querySelectorAll ? node.querySelectorAll('img, source').length : 0;
+      const rawText = String(node.innerText || node.textContent || '');
+      const text = textOf(rawText, 600);
+      if (
+        visible(node) && rect.width >= 80 && rect.height >= 40 &&
+        rawText.length <= 1400 && text.length >= 12 &&
+        (imageCount || linkCount <= 8)
+      ) {{
+        best = node;
+        if (imageCount && text.length >= 20) break;
+      }}
+    }}
+    return best;
+  }};
+  const titleFrom = (anchor, root, image) => {{
+    const candidates = [
+      anchor.getAttribute('aria-label'),
+      anchor.getAttribute('title'),
+      anchor.innerText,
+      anchor.textContent,
+      image.alt,
+      root.querySelector('h1,h2,h3,h4,[role="heading"]')?.innerText,
+      root.innerText,
+    ];
+    for (const value of candidates) {{
+      const text = textOf(value, 160);
+      if (text.length >= 3) return text;
+    }}
+    return '';
+  }};
+  const numericSnippets = (text) => {{
+    const snippets = [];
+    for (const line of String(text || '').split(/\\n+/)) {{
+      const compact = textOf(line, 90);
+      if (!compact || compact.length < 2) continue;
+      if (/[\\p{{Sc}}]|\\b[A-Z]{{3}}\\b|\\d/u.test(compact)) snippets.push(compact);
+      if (snippets.length >= 3) break;
+    }}
+    return snippets;
+  }};
+  const priceSnippets = (text) => {{
+    const snippets = [];
+    const source = String(text || '');
+    const pattern = /(?:[\\p{{Sc}}]\\s*\\d[\\d,]*(?:\\.\\d{{2}})?|\\d[\\d,]*(?:\\.\\d{{2}})?\\s*(?:USD|CAD|EUR|GBP|AUD|NZD|JPY|CNY|INR))/giu;
+    for (const match of source.matchAll(pattern)) {{
+      const compact = textOf(match[0], 40);
+      if (!compact || snippets.includes(compact)) continue;
+      snippets.push(compact);
+      if (snippets.length >= 3) break;
+    }}
+    return snippets;
+  }};
+  const roots = [];
+  if (rootSelector) {{
+    for (const root of Array.from(document.querySelectorAll(rootSelector))) {{
+      if (visible(root)) roots.push(root);
+    }}
+  }}
+  const anchors = roots.length
+    ? roots.flatMap((root) => Array.from(root.querySelectorAll('a[href]')))
+    : Array.from(document.querySelectorAll('a[href]'));
+  const candidates = [];
+  let sourceIndex = 0;
+  for (const anchor of anchors) {{
+    if (!visible(anchor) && !anchor.querySelector('img, source')) continue;
+    const url = absoluteUrl(anchor.getAttribute('href') || anchor.href);
+    if (!url) continue;
+    const root = bestRootFor(anchor);
+    const image = usefulImage(root);
+    const rawRootText = root.innerText || root.textContent || anchor.innerText || anchor.textContent || '';
+    const compactText = textOf(rawRootText, 180);
+    const snippets = numericSnippets(rawRootText);
+    const prices = priceSnippets(rawRootText);
+	    const title = titleFrom(anchor, root, image);
+	    const canonical = canonicalUrl(url);
+	    const depth = pathDepth(canonical || url);
+	    const titleImageOverlap = tokenOverlap(title, image.alt);
+	    const anchorTitleOverlap = tokenOverlap(anchor.innerText || anchor.textContent || '', title);
+	    if (!title && !image.url && compactText.length < 12) continue;
+	    if (!matchesSearchQuery([title, image.alt, compactText, anchor.innerText || anchor.textContent || ''].join(' '))) continue;
+	    if (!image.url && !snippets.length && depth < 2) continue;
+    sourceIndex += 1;
+    const score =
+      (image.url ? 40 : 0) +
+      (snippets.length ? 14 : 0) +
+      Math.min(depth, 4) * 4 +
+      (title.length >= 8 ? 6 : 0) +
+      (titleImageOverlap >= 0.5 ? 18 : titleImageOverlap >= 0.25 ? 8 : 0) +
+      (anchorTitleOverlap >= 0.5 ? 6 : 0) +
+      (compactText.length >= 30 ? 4 : 0) -
+      (depth < 2 ? 12 : 0) -
+      (image.url && titleImageOverlap < 0.15 && anchorTitleOverlap < 0.15 ? 14 : 0);
+    candidates.push({{
+      score,
+      source_index: sourceIndex,
+      url: canonical || url,
+      canonical_url: canonical,
+      url_path_depth: depth,
+      title,
+      link_text: textOf(anchor.innerText || anchor.textContent || '', 140),
+      image_url: image.url,
+      image_alt: image.alt,
+      image_width: image.width,
+      image_height: image.height,
+      price_text: prices[0] || '',
+      price_candidates: prices,
+      compact_text: compactText,
+      numeric_snippets: snippets,
+    }});
+  }}
+  candidates.sort((left, right) => right.score - left.score || left.source_index - right.source_index);
+  const unique = [];
+  const seenUrls = new Set();
+  const seenImages = new Set();
+  const seenTitles = new Set();
+  for (const item of candidates) {{
+    const urlKey = item.canonical_url || item.url;
+    const imageKey = item.image_url || '';
+    const titleKey = stableTextKey(item.title || item.link_text || item.compact_text);
+    if (urlKey && seenUrls.has(urlKey)) continue;
+    if (imageKey && seenImages.has(imageKey)) continue;
+    if (titleKey && seenTitles.has(titleKey)) continue;
+    if (urlKey) seenUrls.add(urlKey);
+    if (imageKey) seenImages.add(imageKey);
+    if (titleKey) seenTitles.add(titleKey);
+    unique.push(item);
+    if (unique.length >= maxItems) break;
+  }}
+  const items = unique.map((item, index) => {{
+    const {{score, canonical_url, ...rest}} = item;
+    return {{...rest, source_index: index + 1}};
+  }});
+  return {{
+	    url: location.href,
+	    title: document.title,
+	    query_tokens: searchQueryTokens,
+	    item_count: items.length,
+	    items,
+  }};
 }})()
 """
 
@@ -619,12 +919,37 @@ class BrowserTools:
                 suffix = raw_session_id.removeprefix("isolated:").strip()
                 if suffix:
                     return f"isolated-{hashlib.sha256(suffix.encode('utf-8')).hexdigest()[:16]}"
-            return self._workspace_default_session_id(invocation)
+            if raw_session_id and raw_session_id != "default":
+                return raw_session_id
+            if self._uses_isolated_default_session(invocation):
+                scope = self._isolated_default_scope(invocation)
+                return f"isolated-{hashlib.sha256(scope.encode('utf-8')).hexdigest()[:16]}"
+            # Visible browser backends represent the operator's real logged-in
+            # browser. Keep the default session global so setup/login opened by
+            # Web is the same browser session later used by Telegram, Slack,
+            # Discord, Web, and mini-agent browser tools.
+            return DEFAULT_AGENT_BROWSER_SESSION_ID
         if raw_session_id and raw_session_id != "default":
             return raw_session_id
         scope = self._cleanup_scope(invocation)
         digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
         return f"default-{digest}"
+
+    def _uses_isolated_default_session(self, invocation: ToolInvocation) -> bool:
+        context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        return bool(
+            context.get("isolated_browser_session")
+            or context.get("scheduled_task_run")
+            or context.get("browser_session_scope")
+            or invocation.capsule_id
+        )
+
+    def _isolated_default_scope(self, invocation: ToolInvocation) -> str:
+        context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        explicit_scope = str(context.get("browser_session_scope") or "").strip()
+        if explicit_scope:
+            return explicit_scope
+        return self._cleanup_scope(invocation)
 
     def _cleanup_scope(self, invocation: ToolInvocation) -> str:
         return str(invocation.capsule_id or invocation.principal_id or "global")
@@ -637,13 +962,20 @@ class BrowserTools:
             return os.environ.get("NULLION_BROWSER_HEADLESS", "").strip().lower() != "true"
         return False
 
-    def _workspace_default_session_id(self, invocation: ToolInvocation) -> str:
-        workspace_id = sanitize_workspace_id(workspace_id_for_principal(invocation.principal_id))
-        digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:16]
-        return f"workspace-{digest}"
+    def _connection_notice_output(self) -> dict[str, Any]:
+        notice_fn = getattr(self._backend, "connection_notice", None)
+        if not callable(notice_fn):
+            return {}
+        notice = str(notice_fn() or "").strip()
+        if not notice:
+            return {}
+        return {
+            "browser_connection_notice": notice,
+            "used_shared_authenticated_browser": False,
+        }
 
     def _remember_session(self, invocation: ToolInvocation, session_id: str) -> None:
-        if session_id.startswith("workspace-") and self._uses_shared_default_session():
+        if self._uses_shared_default_session() and session_id == DEFAULT_AGENT_BROWSER_SESSION_ID:
             return
         scope = self._cleanup_scope(invocation)
         with self._cleanup_lock:
@@ -726,7 +1058,7 @@ class BrowserTools:
         self._remember_session(invocation, session_id)
         try:
             result = _run(self._backend.open(session_id))
-            return _ok(invocation, {"result": result, "session_id": session_id})
+            return _ok(invocation, {"result": result, "session_id": session_id, **self._connection_notice_output()})
         except Exception as e:
             return _fail(invocation, f"Open failed: {e}")
 
@@ -746,7 +1078,7 @@ class BrowserTools:
         self._remember_session(invocation, session_id)
         try:
             result = _run(self._backend.navigate(session_id, navigate_url))
-            return _ok(invocation, {"result": result, "session_id": session_id})
+            return _ok(invocation, {"result": result, "session_id": session_id, **self._connection_notice_output()})
         except Exception as e:
             return _fail(invocation, f"Navigation failed: {e}")
 
@@ -833,6 +1165,37 @@ class BrowserTools:
             return _ok(invocation, {"snapshot": result, "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"Snapshot failed: {e}")
+
+    def browser_extract_items(self, invocation: ToolInvocation) -> ToolResult:
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            max_items = int(invocation.arguments.get("max_items") or 30)
+        except (TypeError, ValueError):
+            return _fail(invocation, "max_items must be an integer")
+        max_items = max(1, min(max_items, 100))
+        selector = invocation.arguments.get("selector")
+        if selector is not None and not isinstance(selector, str):
+            return _fail(invocation, "selector must be a string")
+        try:
+            result = _run(
+                self._backend.run_js(
+                    session_id,
+                    _browser_extract_items_script(max_items=max_items, selector=selector.strip() if selector else None),
+                )
+            )
+            if not isinstance(result, dict):
+                return _fail(invocation, "Item extraction returned an invalid result.")
+            items = result.get("items")
+            if not isinstance(items, list):
+                return _fail(invocation, "Item extraction returned no item list.")
+            page = {
+                "url": result.get("url"),
+                "title": result.get("title"),
+            }
+            return _ok(invocation, {"page": page, "items": items, "item_count": len(items), "session_id": session_id})
+        except Exception as e:
+            return _fail(invocation, f"Item extraction failed: {e}")
 
     def browser_click_id(self, invocation: ToolInvocation) -> ToolResult:
         element_id = str(invocation.arguments.get("element_id") or "").strip()
@@ -1001,7 +1364,10 @@ class BrowserTools:
         self._remember_session(invocation, session_id)
         try:
             text = _run(self._backend.extract_text(session_id, selector))
-            return _ok(invocation, {"text": text, "length": len(text), "session_id": session_id})
+            return _ok(
+                invocation,
+                {"text": text, "length": len(text), "session_id": session_id, **self._connection_notice_output()},
+            )
         except Exception as e:
             return _fail(invocation, f"Extract text failed: {e}")
 
@@ -1050,6 +1416,7 @@ class BrowserTools:
                     "size_bytes": len(png_bytes),
                     "session_id": session_id,
                     **screenshot_metadata,
+                    **self._connection_notice_output(),
                 },
             )
         except Exception as e:

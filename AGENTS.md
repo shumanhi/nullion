@@ -17,6 +17,16 @@
 - Durable user preferences that affect safety or consent, such as requiring confirmation before sending emails, must be saved as memory and injected into future turns across supported chat surfaces. Capture them through structured memory extraction or explicit memory tooling, not product-routing keyword checks.
 - Any user-facing prompt that asks the user to choose from multiple options or provide one of several possible inputs must present numbered options and must allow a numeric reply such as `1`, `2`, or `3`. Do not require exact text names or internal ids as the only path for a normal user.
 
+## Anti-Use-Case Patching
+
+- Never fix a reported bug by embedding the reporter's concrete prompt wording, nouns, account names, chat ids, repo names, branch names, product names, marketplace names, people names, country/language, screenshots, sample artifacts, URL path shapes, or vendor-specific semantics into Nullion core behavior.
+- Treat every concrete report as an example of a product invariant. First state the invariant in implementation notes, then implement that invariant with typed runtime evidence such as tool schemas/results, URL/domain records as opaque references, attachment metadata, artifact descriptors, task/frame state, approval state, stored memory records, or model-produced structured plans.
+- Core may preserve opaque structured evidence, like `{"type": "url", "domain": "...", "url": "..."}` or tool names/result status, but core must not interpret provider-specific URL paths, repo semantics, marketplace semantics, order semantics, or connector defaults. Put provider behavior in the connector, adapter, skill pack, or tool metadata that owns it.
+- When multiple saved-history, memory, tool, artifact, or URL candidates exist, do not choose by old rank, English wording, or the user's previous example. Use current structured evidence and live tools when available; otherwise ask a brief clarification.
+- Search, memory, and recent-context fixes must be language- and user-agnostic. Use corpus statistics, recency, typed evidence, and structured relationships instead of English trigger words, regex synonym lists, or one user's recurring topics.
+- Tests for these fixes must use neutral synthetic fixtures and include at least one wording or language variant that does not depend on the original English example. Do not use the reporter's actual accounts, products, stores, repos, branches, or chat ids as the thing that proves core behavior.
+- Before handoff for a routing, memory, search, tool-scope, or delivery fix, audit the touched app diff for reporter-specific and vendor-specific strings. Remove them from core behavior, or explicitly justify each remaining provider name as adapter/UI copy, documentation, or test fixture data rather than routing logic.
+
 ## Planner Cards And Activity Display
 
 - Planner card visibility is controlled only by the settings-backed planner/task-card setting, such as `NULLION_TASK_PLANNER_FEED_MODE` and the matching UI setting, not by `/verbose`.
@@ -103,6 +113,7 @@
 
 - For live behavior reports from prod, stage, dev, Telegram, Web, Slack, Discord, or cron delivery, inspect runtime evidence before guessing or patching: relevant logs, `runtime.db` events/tool timings, process/import path, active lane, provider/connector status, and exact user-visible error text. Do not diagnose from screenshots or assumptions alone when logs/runtime state are available.
 - For user-visible delivery bugs, verify with the live API or platform boundary after patching, not only helper tests. Reuse the same prompt shape and surface that failed when the user authorizes it.
+- For Telegram-facing changes, do not count `/api/chat`, helper tests, or bot-token-only Bot API sends as full Telegram validation. A bot token can send messages as the bot but cannot impersonate the user's inbound Telegram account, so it does not prove the real inbound user-message path. Full Telegram validation requires a real user-sent Telegram message on the target lane while the agent watches the matching Telegram logs, `runtime.db` turn/tool/artifact records, and user-visible delivery outcome. If a fake `Update` or handler test is used, label it clearly as handler-only coverage and still request/perform live user-message verification before claiming Telegram is tested.
 - For tool-scope, connector, media-generation, scheduler, weather, or artifact-delivery regressions, record the exact failed turn before guessing. The failure chain must include the selected surface, conversation id or request id when available, scoped tool list/tool count, tool results, artifacts, and timing.
 - Artifact delivery regressions must be tested against prior fixed cases before handoff: generated cron reports, email/send receipts with attachments, platform captions, and internal sidecar/state-file suppression.
 - The active pre-commit hook is `.githooks/pre-commit`, selected by `core.hooksPath=.githooks`.
@@ -132,7 +143,8 @@
 - If you find uncommitted changes on `main`, stop and report them. Do not stage, amend, squash, reset, or commit them unless the user explicitly asks.
 - Agent work should happen on the pinned branch when one exists, otherwise on a user-named feature/bugfix branch, not on `main`.
 - Do not push directly to `main`. Work on a `nullion/...` branch and open a pull request.
-- Treat every push as a paid CI-triggering action. Do not push, force-push, or rerun remote workflows unless the user explicitly asks for that exact paid action after seeing the local verification result.
+- Treat every push as a paid CI-triggering action. Do not push, force-push, or rerun remote workflows unless the user explicitly grants permission for that exact individual push after seeing the local verification result.
+- Push permission is single-use. A prior "push", "keep going", "ship", "merge", or release-prep approval in the same conversation does not authorize any later push, force-push, rerun, or new CI-triggering remote action. Ask again and wait for an explicit yes before each push.
 - Before any push, run the strongest relevant local verification first, including the private suite from `nullion-test` when app changes can affect it. Report the exact command outcome and remaining risk before asking for push approval.
 - Never use `--no-verify`, `NULLION_SKIP_PRIVATE_TESTS=1`, or `NULLION_SKIP_IMPORTANT_CHECKS=1` for a push unless the user explicitly approves bypassing that specific gate.
 - If local verification fails because of hooks, environment, repo metadata, missing deps, or test harness issues, fix that local root cause and rerun locally. Do not discover those failures by burning CI runs.

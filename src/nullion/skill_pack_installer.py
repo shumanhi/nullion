@@ -282,7 +282,7 @@ def read_skill_pack_reference(
     relative = Path(clean_path)
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError("relative_path must stay inside the skill pack")
-    if relative.suffix.lower() not in {".md", ".txt", ".json", ".yaml", ".yml"}:
+    if relative.suffix.lower() not in {"", ".md", ".txt", ".json", ".yaml", ".yml"}:
         raise ValueError("only text skill reference files can be read")
     builtin_prompt = BUILTIN_SKILL_PACK_PROMPTS.get(normalized_pack_id)
     if builtin_prompt is not None:
@@ -301,7 +301,22 @@ def read_skill_pack_reference(
     except ValueError as exc:
         raise ValueError("relative_path must stay inside the skill pack") from exc
     if not file_path.is_file():
-        raise FileNotFoundError(f"skill reference not found: {relative.as_posix()}")
+        # Installed API gateway packs commonly expose service docs as
+        # references/<service>/README.md. Accept the file-shaped shorthand only
+        # when that exact structured reference exists.
+        if len(relative.parts) == 1 and relative.suffix.lower() in {"", ".md", ".txt"}:
+            reference_name = relative.stem if relative.suffix else relative.name
+            fallback_path = pack_path / "references" / reference_name / "README.md"
+            try:
+                fallback_path.resolve().relative_to(pack_path)
+            except ValueError as exc:
+                raise ValueError("relative_path must stay inside the skill pack") from exc
+            if fallback_path.is_file():
+                file_path = fallback_path
+            else:
+                raise FileNotFoundError(f"skill reference not found: {relative.as_posix()}")
+        else:
+            raise FileNotFoundError(f"skill reference not found: {relative.as_posix()}")
     text = file_path.read_text(encoding="utf-8", errors="replace")
     if len(text) <= max_chars:
         return text

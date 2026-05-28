@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -163,6 +164,13 @@ def run_single_instance_entrypoint(
 
 def run_user_facing_entrypoint(func: Callable[[], T]) -> T:
     """Turn an intentional terminal cancel into a clean process exit."""
+    # Keep user-facing shells clean from known third-party warning noise.
+    # This warning does not affect Nullion runtime behavior.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*default value of [`'\"]?allowed_objects[`'\"]? will change.*",
+        category=Warning,
+    )
     try:
         return func()
     except KeyboardInterrupt:

@@ -747,6 +747,8 @@ def _systemd_service_for_name(name: str) -> Path:
     return Path.home() / ".config" / "systemd" / "user" / name
 
 def _detect_service_manager() -> str:
+    if os.name == "nt":
+        return "windows"
     if sys.platform == "darwin" and _launchd_plist().exists():
         return "launchd"
     if shutil.which("systemctl") and _systemd_service().exists():
@@ -1470,7 +1472,12 @@ def _install_tray_windows_task(*, exe: Path, port: int, env_file: Path, home: Pa
             print(f"  Task Scheduler interactive mode was refused: {_summarize_subprocess_error(result)}")
             print("  Retrying tray task without interactive-only mode.")
             continue
-        print(f"  Could not install tray scheduled task: {_summarize_subprocess_error(result)}")
+        summary = _summarize_subprocess_error(result)
+        if "access is denied" in summary.casefold():
+            print(f"  Tray autostart task could not be installed: {summary}")
+            print("  Continuing without Windows autostart. The tray will still be launched directly for this session.")
+        else:
+            print(f"  Could not install tray scheduled task: {summary}")
     print(f"  Tray can still be started manually with: {exe} --port {port} --env-file {env_file}")
     return False
 
@@ -2138,6 +2145,39 @@ def _service_cmd(sm: str, action: str) -> None:
             _open_desktop_entrypoint(port=_default_web_port(), force_reload=True)
         else:
             subprocess.run(cmds[action], check=False)
+    elif sm == "windows":
+        if action == "restart":
+            _begin_gateway_restart_notice()
+            _restart_all_managed_services(manager="windows")
+            _open_desktop_entrypoint(port=_default_web_port(), force_reload=True)
+            print("  Restarted.")
+            return
+        if action == "stop":
+            _stop_tray_service()
+            stopped_any = False
+            for name in ("web", "telegram", "slack", "discord", "recovery"):
+                for task in _LEGACY_SERVICE_HINTS.get(name, {}).get("windows", ()):
+                    query = subprocess.run(["schtasks", "/Query", "/TN", task], check=False, capture_output=True, text=True)
+                    if query.returncode != 0:
+                        continue
+                    subprocess.run(["schtasks", "/End", "/TN", task], check=False)
+                    stopped_any = True
+            if stopped_any:
+                print("  Stopped.")
+            else:
+                print("  No managed Windows tasks found to stop.")
+            return
+        if action == "status":
+            shown_any = False
+            for task in ("Nullion Web Dashboard", "Nullion Tray", "Nullion Telegram", "Nullion Slack", "Nullion Discord", "Nullion Recovery"):
+                query = subprocess.run(["schtasks", "/Query", "/TN", task], check=False, capture_output=True, text=True)
+                if query.returncode != 0:
+                    continue
+                shown_any = True
+                subprocess.run(["schtasks", "/Query", "/TN", task, "/FO", "LIST", "/V"], check=False)
+            if not shown_any:
+                print("  No managed Windows tasks found.")
+            return
     else:
         if action == "stop" and (sys.platform == "darwin" or os.name == "nt"):
             _stop_tray_service()
@@ -2150,6 +2190,7 @@ def _service_cmd(sm: str, action: str) -> None:
         print("  Could not detect service manager. Try:")
         print("    macOS:  launchctl unload ~/Library/LaunchAgents/com.nullion.web.plist")
         print("    Linux:  systemctl --user stop nullion")
+        print("    Windows:  schtasks /End /TN \"Nullion Web Dashboard\"")
 
 
 if __name__ == "__main__":
