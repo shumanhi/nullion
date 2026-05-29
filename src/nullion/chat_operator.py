@@ -4787,11 +4787,23 @@ def _append_chat_artifacts_to_reply(
         base_candidate_paths,
         suppress_paths={*browser_screenshot_paths, *source_paths},
     )
-    screenshot_is_primary_delivery = bool(browser_screenshot_paths) and requested_extension == ".png"
+    referenced_browser_screenshot_paths = {
+        path
+        for path in browser_screenshot_paths
+        if _reply_visible_text_references_artifact_path(reply, path, artifact_roots=artifact_roots)
+    }
+    screenshot_is_primary_delivery = bool(browser_screenshot_paths) and (
+        requested_extension == ".png"
+        or (
+            requested_extension is None
+            and bool(referenced_browser_screenshot_paths)
+            and not non_screenshot_candidate_paths
+        )
+    )
     suppressed_screenshot_paths = set() if screenshot_is_primary_delivery else browser_screenshot_paths
     candidate_paths = list(base_candidate_paths)
     if screenshot_is_primary_delivery and not candidate_paths:
-        candidate_paths = sorted(browser_screenshot_paths)
+        candidate_paths = sorted(referenced_browser_screenshot_paths or browser_screenshot_paths)
     candidate_paths = _filter_suppressed_artifact_paths(
         candidate_paths,
         suppress_paths={*suppressed_screenshot_paths, *source_paths},
