@@ -27,7 +27,12 @@ from nullion.approval_display import (
 from nullion.approvals import ApprovalStatus
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
 from nullion.artifacts import is_safe_artifact_path, split_media_reply_attachments
-from nullion.chat_attachments import VIDEO_EXTENSIONS, is_supported_chat_file
+from nullion.chat_attachments import (
+    VIDEO_EXTENSIONS,
+    is_supported_audio_attachment,
+    is_supported_chat_file,
+    normalize_chat_attachments,
+)
 from nullion.events import make_event
 from nullion.latency_phases import record_surface_latency_timing
 from nullion.config import NullionSettings, web_session_allow_duration_label, web_session_allow_expires_at
@@ -82,6 +87,7 @@ from nullion.operator_commands import (
 )
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.remediation import remediation_buttons_for_recommendation_code
+from nullion.tools import ToolInvocation
 from nullion.users import resolve_messaging_user
 from nullion.model_clients import (
     ModelClientConfigurationError,
@@ -161,6 +167,49 @@ def _message_text_or_caption(message) -> str | None:
     if text is not None:
         return text
     return getattr(message, "caption", None)
+
+
+def _voice_instruction_transcript(
+    attachments: list[dict[str, str]] | None,
+    *,
+    registry: object | None,
+    principal_id: str = "telegram_chat",
+) -> str | None:
+    """Return a transcript to use as the turn text for a Telegram voice message."""
+    if not attachments or len(attachments) != 1:
+        return None
+    raw_attachment = attachments[0]
+    if not isinstance(raw_attachment, dict) or str(raw_attachment.get("source_kind") or "") != "voice":
+        return None
+    normalized = normalize_chat_attachments([raw_attachment])
+    if len(normalized) != 1 or not is_supported_audio_attachment(normalized[0]):
+        return None
+    if registry is None or not callable(getattr(registry, "invoke", None)):
+        return None
+    try:
+        registry.get_spec("audio_transcribe")
+    except Exception:
+        return None
+    attachment = normalized[0]
+    try:
+        result = registry.invoke(
+            ToolInvocation(
+                invocation_id=f"telegram-voice-instruction-{uuid.uuid4().hex[:12]}",
+                tool_name="audio_transcribe",
+                principal_id=principal_id,
+                arguments={"path": attachment.path},
+            )
+        )
+    except Exception:
+        logger.debug("Telegram voice instruction transcription failed", exc_info=True)
+        return None
+    if str(getattr(result, "status", "") or "").strip().lower() != "completed":
+        return None
+    output = getattr(result, "output", None)
+    if not isinstance(output, dict):
+        return None
+    transcript = str(output.get("text") or output.get("transcript") or "").strip()
+    return transcript or None
 
 
 def _telegram_reply_context(message) -> dict[str, object] | None:
@@ -2688,6 +2737,7 @@ def _call_handle_update_with_activity(
     update,
     *,
     attachments: list[dict[str, str]] | None = None,
+    text_override: str | None = None,
     activity_callback=None,
     text_delta_callback=None,
     append_activity_trace: bool = True,
@@ -2720,6 +2770,8 @@ def _call_handle_update_with_activity(
             kwargs["text_delta_callback"] = text_delta_callback
         if "attachments" in parameters:
             kwargs["attachments"] = attachments
+        if "text_override" in parameters:
+            kwargs["text_override"] = text_override
         if "turn_dispatch_decision" in parameters:
             kwargs["turn_dispatch_decision"] = turn_dispatch_decision
         if "cancellation_checker" in parameters:
@@ -2852,10 +2904,10 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
     started_at = time.perf_counter()
     timing_marks: list[str] = []
     timing_last_at = started_at
-    candidates: list[tuple[object, str, str | None]] = []
+    candidates: list[tuple[object, str, str | None, str]] = []
     photos = list(getattr(message, "photo", []) or [])
     if photos:
-        candidates.append((photos[-1], "telegram-photo.png", "image/png"))
+        candidates.append((photos[-1], "telegram-photo.png", "image/png", "photo"))
     audio = getattr(message, "audio", None)
     if audio is not None:
         candidates.append(
@@ -2863,11 +2915,12 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
                 audio,
                 str(getattr(audio, "file_name", "") or "telegram-audio.mp3"),
                 str(getattr(audio, "mime_type", "") or "audio/mpeg"),
+                "audio",
             )
         )
     voice = getattr(message, "voice", None)
     if voice is not None:
-        candidates.append((voice, "telegram-voice.ogg", str(getattr(voice, "mime_type", "") or "audio/ogg")))
+        candidates.append((voice, "telegram-voice.ogg", str(getattr(voice, "mime_type", "") or "audio/ogg"), "voice"))
     video = getattr(message, "video", None)
     if video is not None:
         candidates.append(
@@ -2875,6 +2928,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
                 video,
                 str(getattr(video, "file_name", "") or "telegram-video.mp4"),
                 str(getattr(video, "mime_type", "") or "video/mp4"),
+                "video",
             )
         )
     document = getattr(message, "document", None)
@@ -2882,7 +2936,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
         mime_type = str(getattr(document, "mime_type", "") or "")
         file_name = str(getattr(document, "file_name", "") or "")
         if is_supported_chat_file(filename=file_name, media_type=mime_type):
-            candidates.append((document, file_name or "telegram-document", mime_type or None))
+            candidates.append((document, file_name or "telegram-document", mime_type or None, "document"))
     attachments: list[dict[str, str]] = []
     chat = None if message is None else getattr(message, "chat", None)
     chat_id = None if chat is None else getattr(chat, "id", None)
@@ -2895,7 +2949,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
         timing_marks.append(f"{label}:{round((now - timing_last_at) * 1000, 1)}ms")
         timing_last_at = now
 
-    for file_ref, filename, media_type in candidates:
+    for file_ref, filename, media_type, source_kind in candidates:
         _mark_timing(f"file_attempt_start:{filename}")
         attempts = 0
         data = None
@@ -2920,6 +2974,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
             principal_id=principal_id,
         )
         if saved is not None:
+            saved["source_kind"] = source_kind
             attachments.append(saved)
             _mark_timing(f"file_saved:{filename}")
         else:
@@ -3906,6 +3961,7 @@ class ChatOperatorService:
         update,
         *,
         attachments: list[dict[str, str]] | None = None,
+        text_override: str | None = None,
         activity_callback=None,
         text_delta_callback=None,
         append_activity_trace: bool = True,
@@ -3930,7 +3986,7 @@ class ChatOperatorService:
             return None
         _mark_timing("message_read")
 
-        text = _message_text_or_caption(message)
+        text = text_override if isinstance(text_override, str) and text_override.strip() else _message_text_or_caption(message)
         if text is None and not attachments:
             chat = getattr(message, "chat", None)
             chat_id = None if chat is None else getattr(chat, "id", None)
@@ -4232,8 +4288,19 @@ class ChatOperatorService:
             if media_group_messages is not None
             else await _download_telegram_attachments(message, context, settings=self.settings)
         )
+        text_override_for_handler = None
         if text_for_ack is None and telegram_attachments:
-            text_for_ack = "Please analyze the attached file(s)."
+            voice_transcript = _voice_instruction_transcript(
+                telegram_attachments,
+                registry=getattr(self.runtime, "active_tool_registry", None),
+                principal_id=f"telegram:{chat_id_text}" if chat_id_text else "telegram_chat",
+            )
+            if voice_transcript:
+                text_for_ack = voice_transcript
+                text_override_for_handler = voice_transcript
+                telegram_attachments = []
+            else:
+                text_for_ack = "Please analyze the attached file(s)."
         _mark_timing("attachments_downloaded")
 
         inflight_key = chat_id_text or "default"
@@ -4494,6 +4561,7 @@ class ChatOperatorService:
                         self,
                         update,
                         attachments=telegram_attachments,
+                        text_override=text_override_for_handler,
                         activity_callback=activity_callback,
                         text_delta_callback=text_streamer.emit,
                         append_activity_trace=(

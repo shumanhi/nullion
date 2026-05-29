@@ -2398,8 +2398,6 @@ def _automatic_saved_chat_history_prompt(
         )
         for turn in visible_turns
     }
-    normalized_query = " ".join(query.lower().split())
-
     def _history_match_sort_key(match: dict[str, object]) -> tuple[int, int, float, int]:
         context = str(match.get("context") or "").strip()
         context_rank = {
@@ -2420,11 +2418,6 @@ def _automatic_saved_chat_history_prompt(
             score = 0
         return context_rank, adjacent_reply_rank, -created_timestamp, -score
 
-    has_non_repeat_candidate = any(
-        " ".join(str(match.get("user_message") or "").lower().split()) != normalized_query
-        for match in matches
-    )
-
     candidates: list[dict[str, object]] = []
     for match in sorted(matches, key=_history_match_sort_key):
         try:
@@ -2436,8 +2429,6 @@ def _automatic_saved_chat_history_prompt(
         user_message = str(match.get("user_message") or "").strip()
         assistant_reply = str(match.get("assistant_reply") or "").strip()
         if not user_message and not assistant_reply:
-            continue
-        if has_non_repeat_candidate and " ".join(user_message.lower().split()) == normalized_query:
             continue
         if (user_message, assistant_reply) in visible_pairs:
             continue
@@ -2543,12 +2534,49 @@ def _automatic_saved_chat_history_prompt(
         ]
         return bool(_structured_refs(match) or concrete_tool_names or _tool_evidence(match))
 
+    def _is_scope_only_history_candidate(match: dict[str, object]) -> bool:
+        tool_names = set(_tool_names(match))
+        return bool(
+            tool_names
+            and tool_names <= {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+            and not _structured_refs(match)
+            and not _tool_evidence(match)
+        )
+
+    candidates = [match for match in candidates if not _is_scope_only_history_candidate(match)]
+    recent_scan_candidates = [
+        match for match in recent_scan_candidates if not _is_scope_only_history_candidate(match)
+    ]
+
     def _structured_ref_identity(ref: dict[str, object]) -> tuple[object, ...]:
+        ref_type = str(ref.get("type") or "url").strip()
+        if ref_type == "scheduled_task":
+            return (
+                ref_type,
+                str(ref.get("task") or "").strip(),
+                str(ref.get("channel") or "").strip().lower(),
+            )
+        if ref_type == "github_pr":
+            return (
+                ref_type,
+                str(ref.get("owner") or "").strip().lower(),
+                str(ref.get("repo") or "").strip().lower(),
+                str(ref.get("number") or "").strip(),
+            )
         return (
-            str(ref.get("type") or "url").strip(),
+            ref_type,
             str(ref.get("domain") or "").strip().lower(),
             str(ref.get("url") or "").strip(),
         )
+
+    def _structured_ref_query_score(ref: dict[str, object]) -> int:
+        ref_tokens = {
+            token
+            for key, value in ref.items()
+            if str(key) != "type"
+            for token in _context_tokens(str(value or ""))
+        }
+        return sum(_query_token_weight(token) for token in query_tokens_for_refs.intersection(ref_tokens))
 
     def _context_tokens(value: object) -> set[str]:
         return {
@@ -2582,7 +2610,12 @@ def _automatic_saved_chat_history_prompt(
         document_count = token_document_counts.get(token, 0)
         if document_count <= 0:
             return 0
-        return max(1, min(16, int(round(math.log2((total_token_sources + 1) / (document_count + 1)) * 4))))
+        rarity = math.log2((total_token_sources + 1) / (document_count + 1))
+        # Use corpus rarity instead of a fixed stop-word list so short references
+        # do not get anchored by generic filler tokens.
+        if total_token_sources > 5 and (rarity < 1.0 or (len(token) <= 2 and rarity < 5.0)):
+            return 0
+        return max(1, min(16, int(round(rarity * 4))))
 
     def _structured_match_score(match: dict[str, object]) -> int:
         try:
@@ -2602,7 +2635,7 @@ def _automatic_saved_chat_history_prompt(
             )
         )
         weighted_score = sum(_query_token_weight(token) for token in query_tokens_for_refs.intersection(match_tokens))
-        return max(recorded_score, weighted_score)
+        return weighted_score
 
     def _recent_runtime_evidence_candidates() -> list[dict[str, object]]:
         evidence: dict[tuple[str, str], dict[str, object]] = {}
@@ -2653,8 +2686,28 @@ def _automatic_saved_chat_history_prompt(
                 if item[0] > 0
             ]
         scored_sources.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        for _score, _created, match in scored_sources:
+        github_pr_sources: list[tuple[int, float, dict[str, object], dict[str, object]]] = []
+        for score, created_ts, match in scored_sources:
             for ref in _structured_refs(match):
+                if str(ref.get("type") or "").strip() == "github_pr":
+                    github_pr_sources.append((score, created_ts, ref, match))
+        if github_pr_sources:
+            github_pr_sources.sort(key=lambda item: (item[1], item[0]), reverse=True)
+            _score, _created_ts, ref, match = github_pr_sources[0]
+            return [(ref, match)]
+        scored_refs: list[tuple[int, int, float, dict[str, object], dict[str, object]]] = []
+        for score, created, match in scored_sources:
+            for ref in _structured_refs(match):
+                ref_score = _structured_ref_query_score(ref)
+                scored_refs.append((ref_score, score, created, ref, match))
+        if any(ref_score > 0 for ref_score, _score, _created, _ref, _match in scored_refs):
+            scored_refs = [
+                item
+                for item in scored_refs
+                if item[0] > 0
+            ]
+        scored_refs.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        for _ref_score, _score, _created, ref, match in scored_refs:
                 identity = _structured_ref_identity(ref)
                 if identity in selected:
                     continue

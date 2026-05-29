@@ -6857,7 +6857,7 @@ def _terminal_deliverable_artifact_paths_since(
                             stat = path.stat()
                         except (OSError, RuntimeError, ValueError):
                             continue
-                        if stat.st_size <= 0 or stat.st_mtime < since_timestamp:
+                        if stat.st_size <= 0 or stat.st_mtime < (since_timestamp - 1.0):
                             continue
                         resolved = str(path)
                         if resolved in seen:
