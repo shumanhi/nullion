@@ -16551,7 +16551,7 @@ def _inline_artifact_headers(descriptor) -> dict[str, str]:
     return headers
 
 
-_WEB_PLAIN_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])(/[^\s`'\"<>|]+)")
+_WEB_PLAIN_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./:-])(/(?!/)[^\s`'\"<>|]+)")
 
 
 def _web_plain_artifact_paths_from_reply(reply: str | None) -> list[str]:
@@ -16794,6 +16794,7 @@ def _filter_web_artifact_paths_for_requested_format(
     explicit_extensions = {
         f".{match.group(1).lower()}"
         for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(prompt or ""))
+        if f".{match.group(1).lower()}" in VALID_ATTACHMENT_EXTENSIONS
     }
     if len(explicit_extensions) > 1:
         return paths
@@ -16897,18 +16898,6 @@ def _web_delivery_artifact_paths(
         artifact_paths=raw_artifact_candidates,
         required_attachment_extensions=((requested_extension,) if requested_extension else ()),
     )
-    if (
-        raw_artifact_candidates
-        and not explicit_result_artifact_paths
-        and not explicit_media_paths
-        and not email_attachment_paths
-        and not _web_has_completed_image_generate_path(tool_results)
-        and not delivery_contract.requires_attachment_delivery
-    ):
-        # Match the platform adapters: raw tool/runtime artifact paths are
-        # internal evidence until a typed artifact contract or explicit
-        # artifact descriptor asks Web to surface them.
-        return []
     non_screenshot_candidates = [
         path
         for path in candidates
@@ -16931,6 +16920,19 @@ def _web_delivery_artifact_paths(
             and not non_screenshot_candidates
         )
     )
+    if (
+        raw_artifact_candidates
+        and not explicit_result_artifact_paths
+        and not explicit_media_paths
+        and not email_attachment_paths
+        and not _web_has_completed_image_generate_path(tool_results)
+        and not screenshot_is_primary_delivery
+        and not delivery_contract.requires_attachment_delivery
+    ):
+        # Match the platform adapters: raw tool/runtime artifact paths are
+        # internal evidence until a typed artifact contract or explicit
+        # artifact descriptor asks Web to surface them.
+        return []
     if screenshot_is_primary_delivery:
         candidates = [*non_screenshot_candidates, *(referenced_browser_screenshot_paths or verified_browser_screenshot_paths)]
     elif browser_screenshot_paths and not explicit_media_paths:
