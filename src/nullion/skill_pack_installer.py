@@ -102,6 +102,39 @@ BUILTIN_SKILL_PACK_PROMPTS: dict[str, str] = {
         "For custom email bridges, Nullion's native custom_api_provider expects /email/search and /email/read/{id}. "
         "Always ask before writes, sends, deletes, payments, or account changes, and mention when a requested app still needs a connector or skill pack installed."
     ),
+    "maton-ai/api-gateway-skill": (
+        "Skill pack: maton-ai/api-gateway-skill\n"
+        "Use when the active workspace has a Maton API gateway connection. Maton uses https://api.maton.ai/{app}/{native-api-path}; "
+        "the first path segment is the connected app name, such as google-mail, google-calendar, slack, notion, or hubspot. "
+        "MATON_API_KEY or the active connection credential_ref authenticates the gateway, but each third-party app still requires an authorized Maton connection. "
+        "Use skill references or connector_request for exact service paths, list/check app connections before claiming access when unsure, "
+        "and require approval before creating, sending, modifying, deleting, or triggering external actions."
+    ),
+    "composio/mcp-connector-skill": (
+        "Skill pack: composio/mcp-connector-skill\n"
+        "Use when the active workspace has a Composio MCP or direct API connector. Composio exposes app tools through its MCP/tooling layer; "
+        "do not assume Gmail, Calendar, CRM, or other service routes from the API key alone. Discover available tools from the configured MCP/server/tool metadata, "
+        "then call connector_request only for URLs under the configured Composio base URL or the MCP adapter selected by the workspace. "
+        "COMPOSIO_API_KEY or the active connection credential_ref identifies the Composio account. Require approval before writes, sends, deletes, or account changes."
+    ),
+    "nango/mcp-connector-skill": (
+        "Skill pack: nango/mcp-connector-skill\n"
+        "Use when the active workspace has a Nango MCP connector or integration-specific endpoint. Nango access is per connection and integration; "
+        "do not infer service capabilities from NANGO_SECRET_KEY alone. Use the configured MCP/server metadata to discover actions and connection identifiers, "
+        "and keep connector_request calls inside the workspace's configured Nango base URL. Require approval before writes, sends, deletes, or sync-triggering actions."
+    ),
+    "activepieces/mcp-connector-skill": (
+        "Skill pack: activepieces/mcp-connector-skill\n"
+        "Use when the active workspace has an Activepieces MCP server or automation API connection. Activepieces exposes pieces, flows, and tools through its configured server; "
+        "do not assume app-specific routes from ACTIVEPIECES_API_KEY alone. Discover available MCP tools or flow endpoints before acting, "
+        "and require approval before running flows or changing connected app data."
+    ),
+    "n8n/mcp-connector-skill": (
+        "Skill pack: n8n/mcp-connector-skill\n"
+        "Use when the active workspace has an n8n MCP server, workflow tool endpoint, or API connection. n8n capabilities depend on the instance and exposed workflows; "
+        "do not infer email, calendar, or SaaS tools from N8N_API_KEY alone. Discover exposed tools/workflows from the configured instance metadata, "
+        "keep requests under N8N_BASE_URL or the workspace connection base URL, and require approval before executing workflows that write or trigger external side effects."
+    ),
 }
 
 

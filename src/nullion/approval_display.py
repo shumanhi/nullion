@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from pathlib import Path
 from typing import Any
 
 
@@ -206,6 +207,8 @@ def _email_send_review_detail(context: dict[str, object]) -> str | None:
         to_text = _string(recipients)
     subject = _string(arguments.get("subject"))
     body = _string(arguments.get("body"))
+    html_body = _string(arguments.get("html_body") or arguments.get("html_path"))
+    preview_path = _string(context.get("html_preview_path"))
     attachments = arguments.get("attachment_paths") or arguments.get("attachments")
     if isinstance(attachments, (list, tuple)):
         attachment_lines = [_string(value) for value in attachments if _string(value)]
@@ -217,7 +220,13 @@ def _email_send_review_detail(context: dict[str, object]) -> str | None:
         lines.append(f"> To: {to_text}")
     if subject:
         lines.append(f"> Subject: {subject}")
-    if body:
+    if html_body:
+        preview_name = Path(preview_path).name if preview_path else "HTML preview"
+        lines.extend(["", f"> HTML preview: {preview_name}"])
+        if body:
+            lines.extend(["", "> Plain-text fallback:"])
+            lines.extend(f"> {line}" if line else ">" for line in body.splitlines())
+    elif body:
         lines.extend(["", "> Body:"])
         lines.extend(f"> {line}" if line else ">" for line in body.splitlines())
     if attachment_lines:

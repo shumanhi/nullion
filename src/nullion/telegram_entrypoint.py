@@ -480,6 +480,15 @@ def _build_runtime_service_from_settings(
         runtime = bootstrap_persistent_runtime(checkpoint)
     except (ValueError, sqlite3.Error) as exc:
         runtime = _recover_runtime_from_corrupt_checkpoint(checkpoint, exc)
+    try:
+        from nullion.cron_delivery import record_interrupted_cron_delivery_runs
+
+        interrupted = record_interrupted_cron_delivery_runs(runtime.store, actor="telegram_startup")
+        if interrupted:
+            runtime.checkpoint()
+            logger.info("Marked %d interrupted cron delivery run(s) after Telegram startup.", interrupted)
+    except Exception:
+        logger.debug("Could not reconcile interrupted cron delivery runs on Telegram startup.", exc_info=True)
     workspace_root = (
         Path(settings.workspace_root).expanduser()
         if isinstance(settings.workspace_root, str) and settings.workspace_root.strip()
@@ -1023,6 +1032,8 @@ async def _send_operator_telegram_delivery(
                     caption_kwargs = {}
                     if caption_text:
                         caption_text, caption_kwargs = format_telegram_text(caption_text)
+                    if index == 0 and reply_markup is not None:
+                        caption_kwargs = {**caption_kwargs, "reply_markup": reply_markup}
                     async def send_document(
                         attachment_path=attachment_path,
                         caption_text=caption_text,

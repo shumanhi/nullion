@@ -47,7 +47,7 @@ from nullion.users import resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
-_WORKING_ACK_TEXT = "⧖ Working on your request now. You can keep sending requests while it runs..."
+_WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
 
 
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"

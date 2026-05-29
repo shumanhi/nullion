@@ -85,6 +85,7 @@ def run_chat_startup_warmup(
             logger.debug("startup warmup step failed: %s", name, exc_info=True)
 
     step("settings", lambda: __import__("nullion.config", fromlist=["load_settings"]).load_settings())
+    step("chat_history_store", lambda: __import__("nullion.chat_store", fromlist=["get_chat_store"]).get_chat_store().list_channels())
 
     if registry is not None:
         step("tool_registry", lambda: registry.list_tool_definitions())

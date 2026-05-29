@@ -146,6 +146,21 @@ def _email_send_account_target(invocation: "ToolInvocation") -> str:
     provider_id = str(invocation.arguments.get("provider_id") or "").strip()
     if not provider_id:
         try:
+            from nullion.connections import connection_for_principal, infer_email_plugin_provider
+
+            native_provider_id = infer_email_plugin_provider(principal_id=invocation.principal_id) or ""
+            native_connection = (
+                connection_for_principal(invocation.principal_id, native_provider_id) if native_provider_id else None
+            )
+            permission_mode = (
+                str(getattr(native_connection, "permission_mode", "read") or "read").strip().lower().replace("-", "_")
+            )
+            if permission_mode in {"write", "read_write", "readwrite", "rw", "read_and_write"}:
+                provider_id = native_provider_id
+        except Exception:
+            provider_id = ""
+    if not provider_id:
+        try:
             from nullion.connections import default_email_connector_provider_id
 
             provider_id = default_email_connector_provider_id(invocation.principal_id) or ""
@@ -156,6 +171,13 @@ def _email_send_account_target(invocation: "ToolInvocation") -> str:
 
 def _email_read_account_target(invocation: "ToolInvocation") -> str:
     provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+    if not provider_id:
+        try:
+            from nullion.connections import infer_email_plugin_provider
+
+            provider_id = infer_email_plugin_provider(principal_id=invocation.principal_id) or ""
+        except Exception:
+            provider_id = ""
     if not provider_id:
         try:
             from nullion.connections import default_email_connector_provider_id

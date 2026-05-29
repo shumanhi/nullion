@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL_TOOL_RESULT_MAX_CHARS = 87_420
 _ALWAYS_COMPACT_MODEL_TOOL_OUTPUTS = frozenset({"terminal_exec", "workspace_summary"})
+_SCHEDULER_CREATION_TOOLS = frozenset({"create_cron", "set_reminder"})
 
 
 _ARTIFACT_RECOVERY_TOOLS = frozenset(
@@ -84,6 +85,41 @@ def _mini_agent_runner_concurrency_limit() -> int:
     except ValueError:
         value = 3
     return max(1, min(value, 8))
+
+
+def _scheduler_creation_guard_result(
+    invocation: ToolInvocation,
+    tool_results: Iterable[ToolResult],
+) -> ToolResult | None:
+    if invocation.tool_name not in _SCHEDULER_CREATION_TOOLS:
+        return None
+    flow_context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+    if flow_context.get("allow_multiple_scheduler_creations") is True:
+        return None
+    for result in tool_results:
+        if result.tool_name not in _SCHEDULER_CREATION_TOOLS:
+            continue
+        if normalize_tool_status(result.status) != "completed":
+            continue
+        if result.tool_name == invocation.tool_name:
+            continue
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="failed",
+            output={
+                "reason": "multiple_scheduler_creation_tools_in_turn",
+                "existing_scheduler_creation_tool": result.tool_name,
+                "requested_scheduler_creation_tool": invocation.tool_name,
+                "suppress_activity": True,
+            },
+            error=(
+                "This turn already created a scheduler object. Do not create another "
+                "cron/reminder unless structured flow state explicitly allows multiple "
+                "scheduler creations."
+            ),
+        )
+    return None
 
 
 def _group_uses_planner_timeout(group: Any, *, single_task_fast_path: bool) -> bool:
@@ -945,9 +981,11 @@ _SCHEDULER_MUTATE_ACTION_TOOLS = frozenset(
     {
         "create_cron",
         "delete_cron",
+        "delete_reminder",
         "set_reminder",
         "toggle_cron",
         "update_cron",
+        "update_reminder",
     }
 )
 _SCHEDULER_READ_ACTION_TOOLS = frozenset({"list_crons", "list_reminders"})
@@ -979,6 +1017,32 @@ def _scope_requested_capabilities(tool_results: Iterable[ToolResult] | None) -> 
     return capabilities
 
 
+def _scope_required_tool_names(
+    tool_registry: object | None,
+    tool_results: Iterable[ToolResult] | None,
+) -> set[str]:
+    required: set[str] = set()
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    for tool_name in getattr(decision, "required_tool_names", ()) or ():
+        normalized = str(tool_name or "").strip()
+        if normalized:
+            required.add(normalized)
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "request_tool_scope":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        raw_required = output.get("required_tool_names")
+        if isinstance(raw_required, list):
+            required.update(
+                str(tool_name or "").strip()
+                for tool_name in raw_required
+                if str(tool_name or "").strip()
+            )
+    return required
+
+
 def _scheduler_action_contract(tool_registry: object | None, tool_results: Iterable[ToolResult] | None) -> str:
     decision = getattr(tool_registry, "turn_tool_scope_decision", None)
     scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
@@ -1002,7 +1066,11 @@ def _scheduler_action_contract_missing(
     if action == "mutate" and not completed.intersection(_SCHEDULER_MUTATE_ACTION_TOOLS):
         return "scheduler mutation"
     if action == "run" and not completed.intersection(_SCHEDULER_RUN_ACTION_TOOLS):
-        return "scheduler run"
+        required = _scope_required_tool_names(tool_registry, tool_results)
+        if "run_cron" in required:
+            return "scheduler run"
+        if not completed.intersection(_SCHEDULER_READ_ACTION_TOOLS | _SCHEDULER_MUTATE_ACTION_TOOLS):
+            return "scheduler action"
     return ""
 
 
@@ -1011,14 +1079,24 @@ def _missing_scope_action_nudge(missing: str) -> str:
         return (
             "The current tool scope is for changing a scheduled task or reminder, but only read tools "
             "have completed. Continue the same user request by running the appropriate registered "
-            "scheduler mutation tool, or ask the user for the missing schedule/detail. Do not finish by "
-            "listing scheduled tasks."
+            "scheduler mutation tool, or ask the user for the missing schedule/detail with numbered "
+            "options that allow a numeric reply. Do not finish by listing scheduled tasks or with a "
+            "generic failure."
         )
     if missing == "scheduler run":
         return (
             "The current tool scope is for starting a scheduled task run, but no run tool has completed. "
             "Continue the same user request by running the selected scheduled task, or ask the user which "
             "scheduled task to run. Do not finish by listing scheduled tasks."
+        )
+    if missing == "scheduler action":
+        return (
+            "Scheduler tools were exposed, but no scheduler action has completed. Continue the same user "
+            "request using the appropriate registered scheduler tool. If the request is changing a reminder "
+            "or scheduled task, request scheduler_mutate and use set_reminder, create_cron, update_cron, "
+            "update_reminder, delete_reminder, delete_cron, or toggle_cron with the verified details. If "
+            "the request is running an existing scheduled task, use run_cron with a verified target or ask "
+            "for a numbered selection."
         )
     return (
         "The requested action has not completed yet. Continue the same user request using the registered "
@@ -1029,13 +1107,27 @@ def _missing_scope_action_nudge(missing: str) -> str:
 def _missing_scope_action_final_reply(missing: str) -> str:
     if missing == "scheduler mutation":
         return (
-            "I did not create or update a scheduled task yet. I need the missing schedule or task detail "
-            "before I can complete it."
+            "I can set that up, but I need the missing schedule or task detail first.\n\n"
+            "Reply with one option:\n"
+            "1. The exact schedule and what I should check.\n"
+            "2. The frequency, such as hourly, daily, weekdays, or weekly.\n"
+            "3. Any missing source details, like the site, URL, account, or tracking reference."
         )
     if missing == "scheduler run":
         return (
-            "I did not start a scheduled task run yet. I need the specific scheduled task selection before "
-            "I can run it."
+            "I can run it, but I need the specific scheduled task first.\n\n"
+            "Reply with one option:\n"
+            "1. The number from the cron list.\n"
+            "2. The exact scheduled task name.\n"
+            "3. Ask me to list the available scheduled tasks."
+        )
+    if missing == "scheduler action":
+        return (
+            "I can do that, but I need one more scheduler detail first.\n\n"
+            "Reply with one option:\n"
+            "1. The schedule and task details.\n"
+            "2. The scheduled task number or exact name.\n"
+            "3. Ask me to list the available scheduled tasks."
         )
     return "I did not complete the requested action yet. I need one more detail before I can finish it."
 
@@ -1359,8 +1451,10 @@ def _scope_recovery_capabilities_for_tool_name(tool_name: str) -> tuple[str, ...
         "create_cron",
         "update_cron",
         "delete_cron",
+        "delete_reminder",
         "toggle_cron",
         "set_reminder",
+        "update_reminder",
     }:
         if normalized in {"run_cron"}:
             return ("scheduler_run", "scheduler_read")
@@ -1787,6 +1881,12 @@ def _complete_agent_turn(
 ) -> dict[str, object]:
     cleanup_done = bool(state.get("cleanup_done"))
     tool_registry = state.get("tool_registry")
+    missing_scope_action = _scheduler_action_contract_missing(
+        tool_registry=tool_registry,
+        tool_results=list(state.get("tool_results") or []),
+    )
+    if missing_scope_action and not suspended_for_approval:
+        final_text = _missing_scope_action_final_reply(missing_scope_action)
     cleanup_scope = state.get("cleanup_scope") or f"turn-{uuid4().hex}"
     if not cleanup_done and tool_registry is not None:
         _run_tool_cleanup_hooks(tool_registry, cleanup_scope)
@@ -1940,6 +2040,8 @@ def _execute_agent_turn_tool_uses(
             tool_results,
             required_embedded_media_extensions=_required_embedded_media_extensions_from_turn_state(state),
         )
+        if guarded_result is None:
+            guarded_result = _scheduler_creation_guard_result(invocation, tool_results)
         if guarded_result is not None:
             result = guarded_result
         else:
@@ -2206,9 +2308,18 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
             state.get("conversation_id"),
             len(state.get("tool_results") or []),
         )
+        tool_results = list(state.get("tool_results") or [])
+        missing_scope_action = _scheduler_action_contract_missing(
+            tool_registry=state.get("tool_registry"),
+            tool_results=tool_results,
+        )
         return _complete_agent_turn(
             state,
-            final_text=_last_useful_tool_message(list(state.get("tool_results") or [])),
+            final_text=(
+                _missing_scope_action_final_reply(missing_scope_action)
+                if missing_scope_action
+                else _last_useful_tool_message(tool_results)
+            ),
             reached_iteration_limit=True,
         )
     iterations += 1
@@ -2520,6 +2631,20 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         tool_results=tool_results,
         source="agent",
     )
+    try:
+        from nullion.artifacts import materialize_inline_html_reply_artifact
+
+        final_text, html_artifact_path = materialize_inline_html_reply_artifact(
+            final_text,
+            principal_id=state["principal_id"],
+            stem="html-preview",
+        )
+        if html_artifact_path:
+            artifacts.append(html_artifact_path)
+            artifacts = list(dict.fromkeys(artifacts))
+            state["artifacts"] = artifacts
+    except Exception:
+        logger.debug("Failed to materialize inline HTML reply artifact", exc_info=True)
     return _complete_agent_turn(
         state,
         final_text=final_text,

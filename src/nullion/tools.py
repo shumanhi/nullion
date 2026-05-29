@@ -547,6 +547,61 @@ def _refresh_pending_approval_request(approval: ApprovalRequest, *, context: dic
     )
 
 
+def _plain_text_from_html_body(html_body: str) -> str:
+    text = re.sub(r"(?is)<\s*br\s*/?\s*>", "\n", str(html_body or ""))
+    text = re.sub(r"(?is)</\s*(?:p|div|section|article|tr|h[1-6])\s*>", "\n", text)
+    text = re.sub(r"(?is)<\s*style\b[\s\S]*?</\s*style\s*>", " ", text)
+    text = re.sub(r"(?is)<\s*script\b[\s\S]*?</\s*script\s*>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = unescape(text)
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _email_html_body_from_invocation(invocation: ToolInvocation) -> str:
+    inline_html = str(invocation.arguments.get("html_body") or "").strip()
+    if inline_html:
+        return inline_html
+    html_path = str(invocation.arguments.get("html_path") or "").strip()
+    if not html_path:
+        return ""
+    effective_roots = _principal_workspace_file_roots(invocation.principal_id)
+    resolved = _resolve_local_workspace_file_input(
+        html_path,
+        principal_id=invocation.principal_id,
+        effective_roots=effective_roots,
+        trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
+    )
+    if resolved is None:
+        resolved = Path(_resolve_virtual_workspace_path(html_path, principal_id=invocation.principal_id)).expanduser()
+    if not resolved.exists() or not resolved.is_file():
+        raise FileNotFoundError(f"HTML path does not exist or is not a file: {html_path}")
+    return resolved.read_text(encoding="utf-8", errors="ignore").strip()
+
+
+def _email_html_preview_path_for_invocation(invocation: ToolInvocation) -> str | None:
+    try:
+        html_path = str(invocation.arguments.get("html_path") or "").strip()
+        if html_path:
+            return html_path
+        html_body = str(invocation.arguments.get("html_body") or "").strip()
+        if not html_body:
+            return None
+        from nullion.artifacts import artifact_path_for_generated_workspace_file, normalize_html_document
+
+        preview_path = artifact_path_for_generated_workspace_file(
+            principal_id=invocation.principal_id,
+            suffix=".html",
+            stem="email-preview",
+        )
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_text(normalize_html_document(html_body, title="Email Preview"), encoding="utf-8")
+        return str(preview_path)
+    except Exception:
+        logger.debug("Could not create email HTML approval preview", exc_info=True)
+        return None
+
+
 def _selector_matches_www_family(*, selector: str, target: str) -> bool:
     selector_base_url = selector[:-2] if selector.endswith("/*") else selector
     parsed_selector = urlparse(selector_base_url)
@@ -930,6 +985,29 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "required": ["id"],
             "additionalProperties": False,
         },
+        "delete_reminder": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "description": "Reminder task id to delete."}},
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+        "update_reminder": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Reminder task id to update."},
+                "text": {"type": "string", "description": "New reminder message. Omit to keep the current text."},
+                "due_at": {
+                    "type": "string",
+                    "description": "New absolute ISO 8601 due time. Include timezone offset when known.",
+                },
+                "due_in_seconds": {
+                    "type": "number",
+                    "description": "New relative delay from the current moment, in seconds.",
+                },
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
         "toggle_cron": {
             "type": "object",
             "properties": {
@@ -1030,6 +1108,38 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     },
                     "description": "Structured document sections.",
                 },
+                "tables": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "headers": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Column headers for a real Word table.",
+                            },
+                            "rows": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "number"},
+                                            {"type": "integer"},
+                                            {"type": "boolean"},
+                                            {"type": "null"},
+                                        ],
+                                    },
+                                },
+                                "description": "Table rows aligned to headers.",
+                            },
+                        },
+                        "required": ["headers", "rows"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Optional real Word tables to include after introductory paragraphs.",
+                },
                 "image_paths": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1113,6 +1223,35 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "aligned to rows when possible."
                     ),
                 },
+                "charts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "Chart title."},
+                            "type": {
+                                "type": "string",
+                                "enum": ["bar", "line", "pie"],
+                                "description": "Chart type.",
+                            },
+                            "categories_column": {
+                                "type": "string",
+                                "description": "Column name to use for category labels.",
+                            },
+                            "values_column": {
+                                "type": "string",
+                                "description": "Column name containing numeric chart values.",
+                            },
+                            "anchor": {
+                                "type": "string",
+                                "description": "Optional Excel anchor cell, for example H2.",
+                            },
+                        },
+                        "required": ["type", "categories_column", "values_column"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Optional real Excel charts generated from existing row columns.",
+                },
             },
             "additionalProperties": False,
         },
@@ -1188,7 +1327,8 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "items": {"type": "string"},
                     "description": (
                         "Existing content image artifact paths to place into the PDF, one image per page. "
-                        "Browser screenshot artifacts must be supplied through screenshot_paths."
+                        "When paired with text_pages, provide text_pages in the same order so each page's text "
+                        "matches the corresponding image. Browser screenshot artifacts must be supplied through screenshot_paths."
                     ),
                 },
                 "screenshot_paths": {
@@ -1205,7 +1345,18 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "Optional report text pages to render into the PDF with extractable text and clickable URL links. "
                         "For reports/tables/cards that include names, prices, citations, listing links, or other "
                         "readable content, put that content here; image_paths alone creates an image-only PDF. "
+                        "For multi-item reports with images, prefer one text page per image in matching order. "
                         "The generated PDF uses a report-quality layout profile; do not use browser screenshots as a substitute for readable report content."
+                    ),
+                },
+                "media_alignment": {
+                    "type": "string",
+                    "enum": ["auto", "align_pages", "preserve_text_pages"],
+                    "description": (
+                        "Controls how text_pages and media are paired. Use preserve_text_pages by default. "
+                        "Use align_pages when each image/screenshot should share a page with its matching text section. "
+                        "Use preserve_text_pages when the requested layout intentionally keeps the supplied text pages unchanged, "
+                        "including one-page reports that contain multiple images."
                     ),
                 },
                 "title": {
@@ -1408,7 +1559,21 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "description": "Recipient email address(es).",
                 },
                 "subject": {"type": "string", "description": "Email subject."},
-                "body": {"type": "string", "description": "Plain text email body."},
+                "body": {
+                    "type": "string",
+                    "description": "Plain text email body. Provide this as the fallback text when sending HTML.",
+                },
+                "html_body": {
+                    "type": "string",
+                    "description": (
+                        "Optional HTML email body. Use this when the reviewed draft is HTML or styled email content; "
+                        "the send tool will deliver it as a text/html alternative."
+                    ),
+                },
+                "html_path": {
+                    "type": "string",
+                    "description": "Optional local HTML artifact path to send as the email HTML body.",
+                },
                 "cc": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1429,7 +1594,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "description": "Optional connector provider id. Defaults to an active Google Mail connector.",
                 },
             },
-            "required": ["to", "subject", "body"],
+            "required": ["to", "subject"],
             "additionalProperties": False,
         },
         "skill_pack_read": {
@@ -2623,22 +2788,24 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 
 
 def _connector_access_enabled() -> bool:
+    def _has_connector_configuration() -> bool:
+        if str(os.environ.get("NULLION_CONNECTOR_GATEWAY") or "").strip():
+            return True
+        try:
+            from nullion.connections import load_connection_registry
+
+            return any(
+                _connector_provider_id_looks_external(getattr(connection, "provider_id", ""))
+                for connection in load_connection_registry().connections
+                if getattr(connection, "active", True)
+            )
+        except Exception:
+            return False
+
     raw = os.environ.get("NULLION_CONNECTOR_ACCESS_ENABLED")
     if raw is not None and raw.strip():
-        return _env_flag("NULLION_CONNECTOR_ACCESS_ENABLED")
-    enabled_packs = str(os.environ.get("NULLION_ENABLED_SKILL_PACKS") or "").lower()
-    if "connector" in enabled_packs or "api-gateway" in enabled_packs:
-        return True
-    try:
-        from nullion.connections import load_connection_registry
-
-        return any(
-            _connector_provider_id_looks_external(getattr(connection, "provider_id", ""))
-            for connection in load_connection_registry().connections
-            if getattr(connection, "active", True)
-        )
-    except Exception:
-        return False
+        return _env_flag("NULLION_CONNECTOR_ACCESS_ENABLED") and _has_connector_configuration()
+    return _has_connector_configuration()
 
 
 def _connector_provider_id_looks_external(provider_id: object) -> bool:
@@ -2726,11 +2893,18 @@ def _connector_request_boundary_preapproved(invocation: "ToolInvocation", fact: 
     if not provider_id:
         if invocation.tool_name in {"email_search", "email_read"}:
             try:
-                from nullion.connections import default_email_connector_provider_id
+                from nullion.connections import infer_email_plugin_provider
 
-                provider_id = default_email_connector_provider_id(invocation.principal_id) or ""
+                provider_id = infer_email_plugin_provider(principal_id=invocation.principal_id) or ""
             except Exception:
                 provider_id = ""
+            if not provider_id:
+                try:
+                    from nullion.connections import default_email_connector_provider_id
+
+                    provider_id = default_email_connector_provider_id(invocation.principal_id) or ""
+                except Exception:
+                    provider_id = ""
         if not provider_id:
             return False
     try:
@@ -2764,7 +2938,6 @@ def _connector_request_boundary_preapproved(invocation: "ToolInvocation", fact: 
         allowed_bases = _connector_allowed_base_urls(connection, provider_id)
         return bool(allowed_bases) and any(_url_is_under_base(url, base_url) for base_url in allowed_bases)
     return False
-
 
 def _boundary_risk_score(fact: BoundaryFact) -> int:
     if fact.kind is BoundaryKind.ACCOUNT_ACCESS:
@@ -3081,28 +3254,34 @@ class ToolExecutor:
             workspace_id = workspace_id_for_principal(invocation.principal_id)
         except Exception:
             pass
+        tool_arguments = redact_value(dict(invocation.arguments or {}))
+        approval_context = {
+            "workspace_id": workspace_id,
+            FLOW_TRIGGER_CONTEXT_KEY: dict(invocation.flow_context)
+            if isinstance(invocation.flow_context, dict)
+            else build_trigger_flow_context(
+                principal_id=invocation.principal_id,
+                invocation_id=invocation.invocation_id,
+                capsule_id=invocation.capsule_id,
+                flow_kind="tool_invocation",
+            ),
+            "tool_name": invocation.tool_name,
+            "tool_description": spec.description,
+            "tool_risk_level": str(getattr(spec.risk_level, "value", spec.risk_level)),
+            "tool_side_effect_class": str(getattr(spec.side_effect_class, "value", spec.side_effect_class)),
+            "requires_approval": spec.requires_approval,
+            "tool_permission_scope": spec.permission_scope,
+            "tool_arguments": tool_arguments,
+        }
+        if invocation.tool_name == "email_send":
+            preview_path = _email_html_preview_path_for_invocation(invocation)
+            if preview_path:
+                approval_context["html_preview_path"] = preview_path
         approval = create_approval_request(
             requested_by=invocation.principal_id,
             action="use_tool",
             resource=invocation.tool_name,
-            context={
-                "workspace_id": workspace_id,
-                FLOW_TRIGGER_CONTEXT_KEY: dict(invocation.flow_context)
-                if isinstance(invocation.flow_context, dict)
-                else build_trigger_flow_context(
-                    principal_id=invocation.principal_id,
-                    invocation_id=invocation.invocation_id,
-                    capsule_id=invocation.capsule_id,
-                    flow_kind="tool_invocation",
-                ),
-                "tool_name": invocation.tool_name,
-                "tool_description": spec.description,
-                "tool_risk_level": str(getattr(spec.risk_level, "value", spec.risk_level)),
-                "tool_side_effect_class": str(getattr(spec.side_effect_class, "value", spec.side_effect_class)),
-                "requires_approval": spec.requires_approval,
-                "tool_permission_scope": spec.permission_scope,
-                "tool_arguments": redact_value(dict(invocation.arguments or {})),
-            },
+            context=approval_context,
         )
         self._store.add_approval_request(approval)
         return approval
@@ -3134,6 +3313,9 @@ class ToolExecutor:
             # Boundary approvals must carry the reviewed email draft so a later
             # account pause cannot render an empty send-review card.
             approval_context.setdefault("tool_arguments", redact_value(dict(invocation.arguments or {})))
+            preview_path = _email_html_preview_path_for_invocation(invocation)
+            if preview_path:
+                approval_context["html_preview_path"] = preview_path
         existing = self._find_pending_boundary_policy_approval(invocation, context=approval_context)
         if existing is not None:
             refreshed = _refresh_pending_approval_request(existing, context=approval_context, resource=target)
@@ -3969,6 +4151,35 @@ def _document_sections(raw_sections: object) -> tuple[list[dict[str, object]], s
     return sections, None
 
 
+def _document_tables(raw_tables: object) -> tuple[list[dict[str, object]], str | None]:
+    if raw_tables is None:
+        return [], None
+    if not isinstance(raw_tables, list):
+        return [], "tables must be a list"
+    tables: list[dict[str, object]] = []
+    for index, raw_table in enumerate(raw_tables, start=1):
+        if not isinstance(raw_table, dict):
+            return [], "tables entries must be objects"
+        headers, header_error = _coerce_string_list(raw_table.get("headers"), field=f"tables[{index}].headers")
+        if header_error is not None:
+            return [], header_error
+        if not headers:
+            return [], f"tables[{index}].headers must include at least one column"
+        raw_rows = raw_table.get("rows") or []
+        if not isinstance(raw_rows, list):
+            return [], f"tables[{index}].rows must be a list"
+        rows: list[list[str]] = []
+        for row_index, raw_row in enumerate(raw_rows, start=1):
+            if not isinstance(raw_row, (list, tuple)):
+                return [], f"tables[{index}].rows[{row_index}] must be a list"
+            row_values = [str(value if value is not None else "") for value in raw_row[: len(headers)]]
+            if len(row_values) < len(headers):
+                row_values.extend([""] * (len(headers) - len(row_values)))
+            rows.append(row_values)
+        tables.append({"headers": headers, "rows": rows})
+    return tables, None
+
+
 _DOCUMENT_URL_RE = re.compile(r"https?://[^\s\"'<>]+", flags=re.IGNORECASE)
 
 
@@ -4111,6 +4322,9 @@ def _build_document_create_handler(
         sections, section_error = _document_sections(invocation.arguments.get("sections"))
         if section_error is not None:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, section_error)
+        tables, table_error = _document_tables(invocation.arguments.get("tables"))
+        if table_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, table_error)
         image_paths, image_error = _coerce_string_list(invocation.arguments.get("image_paths"), field="image_paths")
         if image_error is not None:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, image_error)
@@ -4163,6 +4377,20 @@ def _build_document_create_handler(
         for paragraph in paragraphs:
             paragraph_obj = _document_add_paragraph_with_links(document, paragraph)
             paragraph_obj.paragraph_format.space_after = Pt(7)
+        for table_spec in tables:
+            headers = list(table_spec["headers"])
+            table_rows = list(table_spec["rows"])
+            table = document.add_table(rows=1, cols=len(headers))
+            table.style = "Table Grid"
+            for cell, header in zip(table.rows[0].cells, headers):
+                cell.text = str(header)
+                for run in cell.paragraphs[0].runs:
+                    run.bold = True
+            for row_values in table_rows:
+                cells = table.add_row().cells
+                for cell, value in zip(cells, row_values):
+                    cell.text = str(value)
+            document.add_paragraph()
 
         embedded_images: list[str] = []
         embedded_screenshots: list[str] = []
@@ -4226,6 +4454,7 @@ def _build_document_create_handler(
                     "reason": "artifact_media_inputs_failed",
                     "paragraphs": len(paragraphs),
                     "sections": len(sections),
+                    "tables": len(tables),
                     "embedded_images": embedded_images,
                     "embedded_screenshots": embedded_screenshots,
                     "skipped_images": skipped_images,
@@ -4242,6 +4471,7 @@ def _build_document_create_handler(
                     "reason": "artifact_media_embed_failed",
                     "paragraphs": len(paragraphs),
                     "sections": len(sections),
+                    "tables": len(tables),
                     "embedded_images": embedded_images,
                     "embedded_screenshots": embedded_screenshots,
                     "skipped_images": skipped_images,
@@ -4264,6 +4494,7 @@ def _build_document_create_handler(
                 "artifact_paths": [str(output_path)],
                 "paragraphs": len(paragraphs),
                 "sections": len(sections),
+                "tables": len(tables),
                 "embedded_images": embedded_images,
                 "embedded_screenshots": embedded_screenshots,
                 "skipped_images": skipped_images,
@@ -4566,6 +4797,53 @@ def _spreadsheet_row_screenshot_path(row: object, fallback: object) -> tuple[str
     return _spreadsheet_row_media_path(row, fallback, is_media_key=_spreadsheet_is_screenshot_key)
 
 
+def _spreadsheet_chart_specs(raw_charts: object, columns: list[str]) -> tuple[list[dict[str, str]], str | None]:
+    if raw_charts is None:
+        return [], None
+    if not isinstance(raw_charts, list):
+        return [], "charts must be a list"
+    column_set = set(columns)
+    chart_specs: list[dict[str, str]] = []
+    for index, raw_chart in enumerate(raw_charts, start=1):
+        if not isinstance(raw_chart, dict):
+            return [], "charts entries must be objects"
+        chart_type = str(raw_chart.get("type") or "").strip().lower()
+        if chart_type not in {"bar", "line", "pie"}:
+            return [], f"charts[{index}].type must be one of bar, line, or pie"
+        categories_column = str(raw_chart.get("categories_column") or "").strip()
+        values_column = str(raw_chart.get("values_column") or "").strip()
+        if categories_column not in column_set:
+            return [], f"charts[{index}].categories_column must match a spreadsheet column"
+        if values_column not in column_set:
+            return [], f"charts[{index}].values_column must match a spreadsheet column"
+        anchor = str(raw_chart.get("anchor") or "").strip().upper() or f"H{2 + ((index - 1) * 16)}"
+        if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", anchor):
+            return [], f"charts[{index}].anchor must be an Excel cell reference"
+        chart_specs.append(
+            {
+                "type": chart_type,
+                "title": str(raw_chart.get("title") or "").strip(),
+                "categories_column": categories_column,
+                "values_column": values_column,
+                "anchor": anchor,
+            }
+        )
+    return chart_specs, None
+
+
+def _spreadsheet_row_has_media_contract(
+    row: object,
+    fallback: object,
+    *,
+    is_media_key: Callable[[object], bool],
+) -> bool:
+    if fallback is not None:
+        return True
+    if not isinstance(row, dict):
+        return False
+    return any(is_media_key(key) for key in row)
+
+
 def _embeddable_image_path(image_path: Path) -> Path:
     if image_path.suffix.lower() != ".svg":
         return image_path
@@ -4691,6 +4969,31 @@ def _build_spreadsheet_create_handler(
         row_image_invalid_values = [invalid for _path, invalid in row_image_specs]
         row_screenshot_paths = [path for path, _invalid in row_screenshot_specs]
         row_screenshot_invalid_values = [invalid for _path, invalid in row_screenshot_specs]
+        row_has_image_contract = [
+            _spreadsheet_row_has_media_contract(
+                row,
+                image_paths[index] if index < len(image_paths) else None,
+                is_media_key=_spreadsheet_is_image_key,
+            )
+            for index, row in enumerate(rows)
+        ]
+        row_has_screenshot_contract = [
+            _spreadsheet_row_has_media_contract(
+                row,
+                screenshot_paths[index] if index < len(screenshot_paths) else None,
+                is_media_key=_spreadsheet_is_screenshot_key,
+            )
+            for index, row in enumerate(rows)
+        ]
+        media_contract_row_indices = {
+            index
+            for index, has_contract in enumerate(row_has_image_contract)
+            if has_contract or row_image_paths[index] or row_image_invalid_values[index]
+        } | {
+            index
+            for index, has_contract in enumerate(row_has_screenshot_contract)
+            if has_contract or row_screenshot_paths[index] or row_screenshot_invalid_values[index]
+        }
         include_image_column = any(row_image_paths) or any(row_image_invalid_values)
         include_screenshot_column = any(row_screenshot_paths) or any(row_screenshot_invalid_values)
         workbook_columns = [
@@ -4710,13 +5013,16 @@ def _build_spreadsheet_create_handler(
             invocation.trusted_filesystem_selectors,
         ):
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Path is outside workspace root: {output_path}")
+        chart_specs, chart_error = _spreadsheet_chart_specs(invocation.arguments.get("charts"), columns)
+        if chart_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, chart_error)
 
         row_values_by_row = [_spreadsheet_row_values(row, columns) for row in rows]
         missing_image_rows = [
             index + 2
             for index, image_path_text in enumerate(row_image_paths)
             if include_image_column
-            and isinstance(rows[index], dict)
+            and row_has_image_contract[index]
             and not image_path_text
             and not row_image_invalid_values[index]
         ]
@@ -4730,7 +5036,8 @@ def _build_spreadsheet_create_handler(
             {"row": row_index + 2, "column": columns[column_index]}
             for row_index, row_values in enumerate(row_values_by_row)
             for column_index in link_column_indices
-            if column_index < len(row_values)
+            if row_index in media_contract_row_indices
+            and column_index < len(row_values)
             and not row_values[column_index][1]
             and _spreadsheet_required_text_missing(row_values[column_index][0])
         ]
@@ -4739,45 +5046,12 @@ def _build_spreadsheet_create_handler(
             for index, column in enumerate(columns)
             if _spreadsheet_is_price_column(column)
         ]
-        duplicate_image_path_rows: list[dict[str, object]] = []
-        if include_image_column and (link_column_indices or price_column_indices):
-            seen_image_path_rows: dict[str, tuple[int, str]] = {}
-            for index, image_path_text in enumerate(row_image_paths):
-                if not image_path_text or _spreadsheet_http_url(image_path_text):
-                    continue
-                path_key = str(Path(image_path_text).expanduser())
-                row_signature = json.dumps(
-                    [value for value, _hyperlink in row_values_by_row[index]],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                )
-                previous = seen_image_path_rows.get(path_key)
-                if previous is not None and previous[1] != row_signature:
-                    duplicate_image_path_rows.append({"path": path_key, "rows": [previous[0], index + 2]})
-                    continue
-                seen_image_path_rows[path_key] = (index + 2, row_signature)
-        if duplicate_image_path_rows:
-            return ToolResult(
-                invocation.invocation_id,
-                invocation.tool_name,
-                "failed",
-                {
-                    "path": str(output_path),
-                    "rows": len(rows),
-                    "columns": len(workbook_columns),
-                    "embedded_images": [],
-                    "embedded_screenshots": [],
-                    "reason": "duplicate_image_paths_for_distinct_rows",
-                    "duplicate_image_path_rows": duplicate_image_path_rows,
-                },
-                "spreadsheet_create cannot attach repeated local image paths across distinct linked/priced rows; provide the row-specific local image path for each row.",
-            )
         missing_price_cells = [
             {"row": row_index + 2, "column": columns[column_index]}
             for row_index, row_values in enumerate(row_values_by_row)
             for column_index in price_column_indices
-            if column_index < len(row_values)
+            if row_index in media_contract_row_indices
+            and column_index < len(row_values)
             and _spreadsheet_required_price_missing(row_values[column_index][0])
         ]
         if missing_image_rows or missing_link_cells or missing_price_cells:
@@ -4945,6 +5219,49 @@ def _build_spreadsheet_create_handler(
                 "spreadsheet_create row links must be direct row-specific source/item URLs; aggregate homepage/search/result URLs cannot be used as per-row links.",
             )
 
+        embedded_charts: list[dict[str, str]] = []
+        if chart_specs and rows:
+            try:
+                from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+            except ModuleNotFoundError as exc:
+                return ToolResult(
+                    invocation.invocation_id,
+                    invocation.tool_name,
+                    "failed",
+                    {"reason": "missing_dependency", "dependency": "openpyxl.chart"},
+                    f"spreadsheet_create requires openpyxl chart support: {exc}",
+                )
+            for chart_spec in chart_specs:
+                category_column_index = columns.index(chart_spec["categories_column"]) + 1
+                value_column_index = columns.index(chart_spec["values_column"]) + 1
+                chart_type = chart_spec["type"]
+                if chart_type == "line":
+                    chart = LineChart()
+                elif chart_type == "pie":
+                    chart = PieChart()
+                else:
+                    chart = BarChart()
+                chart.title = chart_spec["title"] or None
+                data = Reference(
+                    ws,
+                    min_col=value_column_index,
+                    min_row=1,
+                    max_row=len(rows) + 1,
+                )
+                categories = Reference(
+                    ws,
+                    min_col=category_column_index,
+                    min_row=2,
+                    max_row=len(rows) + 1,
+                )
+                chart.add_data(data, titles_from_data=True)
+                chart.set_categories(categories)
+                if chart_type != "pie":
+                    chart.y_axis.title = chart_spec["values_column"]
+                    chart.x_axis.title = chart_spec["categories_column"]
+                ws.add_chart(chart, chart_spec["anchor"])
+                embedded_charts.append(chart_spec)
+
         for column_cells in ws.columns:
             header = str(column_cells[0].value or "")
             max_length = max(len(str(cell.value or "")) for cell in column_cells[:100])
@@ -4968,6 +5285,7 @@ def _build_spreadsheet_create_handler(
                 "columns": len(workbook_columns),
                 "embedded_images": embedded_images,
                 "embedded_screenshots": embedded_screenshots,
+                "embedded_charts": embedded_charts,
                 "skipped_images": skipped_images,
                 "remote_image_urls": remote_image_urls,
             },
@@ -5519,8 +5837,18 @@ def _pdf_chromium_executable() -> str | None:
     return None
 
 
+def _normalize_pdf_report_text(text: str) -> str:
+    normalized_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.replace("Â·", "•").replace("\u00c2\u00b7", "•")
+        line = re.sub(r"^(\s*)(?:[-*•]\s+)?(?:b7|B7)(?=\s+)", r"\1- ", line)
+        line = re.sub(r"(?<=\S)\s+(?:b7|B7)\s+(?=\S)", " · ", line)
+        normalized_lines.append(line)
+    return "\n".join(normalized_lines)
+
+
 def _pdf_text_html(text: str) -> str:
-    escaped = html.escape(text or "")
+    escaped = html.escape(_normalize_pdf_report_text(text))
 
     def replace_url(match: re.Match[str]) -> str:
         url = match.group(0)
@@ -5546,10 +5874,45 @@ def _pdf_text_html(text: str) -> str:
     return "".join(blocks)
 
 
+_PDF_SECTION_MARKER_RE = re.compile(r"^\s*(?:[-*•]\s*)?\d+[\).]\s+\S+")
+
+
+def _split_single_pdf_report_page_for_media(text_pages: list[str], *, media_count: int) -> tuple[list[str], bool]:
+    if media_count <= 1 or len(text_pages) != 1:
+        return text_pages, False
+
+    text = str(text_pages[0] or "")
+    lines = text.splitlines()
+    section_starts = [index for index, line in enumerate(lines) if _PDF_SECTION_MARKER_RE.match(line.strip())]
+    if len(section_starts) != media_count:
+        return text_pages, False
+
+    preamble = "\n".join(lines[: section_starts[0]]).strip()
+    aligned_pages: list[str] = []
+    for section_index, start in enumerate(section_starts):
+        end = section_starts[section_index + 1] if section_index + 1 < len(section_starts) else len(lines)
+        section = "\n".join(lines[start:end]).strip()
+        if section_index == 0 and preamble:
+            section = f"{preamble}\n\n{section}".strip()
+        aligned_pages.append(section)
+    if len(aligned_pages) != media_count or any(not page.strip() for page in aligned_pages):
+        return text_pages, False
+    return aligned_pages, True
+
+
 def _pdf_image_data_uri(path: Path) -> str:
     mime = mimetypes.guess_type(str(path))[0] or "image/png"
     data = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{data}"
+
+
+def _pdf_page_count(path: Path, *, fallback: int) -> int:
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(str(path)).pages)
+    except Exception:
+        return fallback
 
 
 def _resolve_pdf_image_sources(
@@ -5607,13 +5970,24 @@ def _save_text_pdf_with_chromium(
     except Exception:
         return False
 
-    page_count = max(len(text_pages), len(image_paths), 1)
+    preserve_text_pages = bool(text_pages) and len(text_pages) < len(image_paths)
+    page_count = max(len(text_pages), 1) if preserve_text_pages else max(len(text_pages), len(image_paths), 1)
     page_blocks: list[str] = []
     for index in range(page_count):
         text_html = _pdf_text_html(text_pages[index] if index < len(text_pages) else "")
-        image_html = ""
-        if index < len(image_paths):
-            image_html = f'<figure><img class="report-image" src="{_pdf_image_data_uri(image_paths[index])}" alt=""></figure>'
+        page_image_paths: list[Path] = []
+        if preserve_text_pages:
+            start = index
+            end = len(image_paths) if index == page_count - 1 else index + 1
+            page_image_paths = image_paths[start:end]
+        elif index < len(image_paths):
+            page_image_paths = [image_paths[index]]
+        image_html = "".join(
+            f'<figure><img class="report-image" src="{_pdf_image_data_uri(image_path)}" alt=""></figure>'
+            for image_path in page_image_paths
+        )
+        if len(page_image_paths) > 1:
+            image_html = f'<div class="report-image-grid">{image_html}</div>'
         page_blocks.append(
             "<section class=\"page\">"
             "<header>"
@@ -5634,6 +6008,9 @@ def _save_text_pdf_with_chromium(
         ".page:last-child{break-after:auto;page-break-after:auto;}"
         "header{background:#111827;color:white;padding:18px 22px;} h1{font-size:20px;line-height:1.15;margin:0;}"
         "main{padding:22px;} figure{float:right;margin:0 0 16px 22px;padding:8px;border:1px solid #e5e7eb;border-radius:6px;background:#fff;}"
+        ".report-image-grid{float:right;width:2.55in;margin:0 0 16px 22px;display:grid;grid-template-columns:1fr;gap:7px;}"
+        ".report-image-grid figure{float:none;margin:0;}"
+        ".report-image-grid .report-image{max-height:1.38in;}"
         ".report-image{max-width:2.35in;max-height:2.2in;object-fit:contain;display:block;}"
         "h2{font-size:14px;margin:13px 0 7px;color:#1f2937;} p{font-size:11.5px;line-height:1.45;margin:0 0 8px;}"
         ".bullet{padding-left:14px;text-indent:-10px;} .bullet:before{content:'• ';color:#2563eb;font-weight:bold;}"
@@ -5820,6 +6197,15 @@ def _build_pdf_create_handler(
             )
 
         if text_pages:
+            raw_media_alignment = str(invocation.arguments.get("media_alignment") or "preserve_text_pages").strip().lower()
+            if raw_media_alignment not in {"auto", "align_pages", "preserve_text_pages"}:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={},
+                    error=f"Unsupported media_alignment: {raw_media_alignment}",
+                )
             source_images, image_source_error = _resolve_pdf_image_sources(
                 image_paths,
                 roots=effective_roots,
@@ -5864,15 +6250,34 @@ def _build_pdf_create_handler(
                     },
                     error=screenshot_source_error,
                 )
+            media_count = len(source_images) + len(source_screenshots)
+            text_pages_for_render, media_alignment_applied = _split_single_pdf_report_page_for_media(
+                text_pages,
+                media_count=media_count,
+            ) if raw_media_alignment == "align_pages" else (text_pages, False)
             try:
                 if _save_text_pdf_with_chromium(
                     output_path,
                     title=title,
-                    text_pages=text_pages,
+                    text_pages=text_pages_for_render,
                     image_paths=[*source_images, *source_screenshots],
                     page_size_name=raw_page_size,
                 ):
                     size_bytes = output_path.stat().st_size if output_path.exists() else 0
+                    expected_page_count = (
+                        max(len(text_pages_for_render), media_count, 1)
+                        if media_alignment_applied
+                        else max(len(text_pages_for_render), 1)
+                    )
+                    actual_page_count = _pdf_page_count(output_path, fallback=expected_page_count)
+                    layout_features = [
+                        "styled_report_pages",
+                        "clickable_links",
+                        "readable_text_layout",
+                        "verified_media_embeds",
+                    ]
+                    if media_alignment_applied:
+                        layout_features.append("media_aligned_report_pages")
                     return ToolResult(
                         invocation_id=invocation.invocation_id,
                         tool_name=invocation.tool_name,
@@ -5882,23 +6287,19 @@ def _build_pdf_create_handler(
                             "artifact_path": str(output_path),
                             "artifact_paths": [str(output_path)],
                             "bytes_written": size_bytes,
-                            "page_count": max(len(text_pages), len(source_images) + len(source_screenshots), 1),
-                            "text_pages": len(text_pages),
+                            "page_count": actual_page_count,
+                            "text_pages": len(text_pages_for_render),
                             "source_image_paths": [str(path) for path in source_images],
                             "source_screenshot_paths": [str(path) for path in source_screenshots],
                             "text_layer": True,
                             "quality_profile": "report_quality_v1",
-                            "layout_features": [
-                                "styled_report_pages",
-                                "clickable_links",
-                                "readable_text_layout",
-                                "verified_media_embeds",
-                            ],
+                            "layout_features": layout_features,
                         },
                         error=None,
                     )
             except Exception as exc:
                 logger.info("text_pdf_chromium_failed: %s", exc, exc_info=True)
+            text_pages = text_pages_for_render
 
         pages, source_images, source_screenshots, page_error = _build_pdf_pages(
             image_paths=image_paths,
@@ -6831,6 +7232,25 @@ def _browser_image_srcset_urls(value: object, *, base_url: str | None = None) ->
     return urls
 
 
+_PLACEHOLDER_IMAGE_HOSTS = frozenset(
+    {
+        "dummyimage.com",
+        "httpbin.org",
+        "placehold.co",
+        "placeholder.com",
+        "via.placeholder.com",
+    }
+)
+
+
+def _is_placeholder_image_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower()
+    if host in _PLACEHOLDER_IMAGE_HOSTS:
+        return True
+    return host.startswith("placeholder.") or host.endswith(".placeholder.com")
+
+
 class _BrowserImageCandidateHTMLParser(HTMLParser):
     def __init__(self, *, base_url: str | None = None) -> None:
         super().__init__(convert_charrefs=True)
@@ -6908,6 +7328,8 @@ def _fetch_browser_image_binary(url: str, timeout_seconds: int) -> dict[str, obj
     resolution = _resolve_web_fetch_resolution(url)
     parsed = urlparse(url)
     host = parsed.hostname
+    if _is_placeholder_image_url(url):
+        raise ValueError(f"Blocked placeholder image URL for browser_image_collect: {url}")
     if (
         parsed.scheme not in {"http", "https"}
         or not isinstance(host, str)
@@ -7934,7 +8356,8 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
                 name="email_search",
                 description=(
                     "Search messages through an active Google Mail connector. Use this for inbox checks, "
-                    "triage, and finding messages before reading them."
+                    "triage, and finding message ids. Search results are metadata-only; call email_read "
+                    "with a returned id before summarizing body content or claiming the message was read."
                 ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
@@ -7951,7 +8374,10 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
         registry.register(
             ToolSpec(
                 name="email_read",
-                description="Read one message through an active Google Mail connector using an id from email_search.",
+                description=(
+                    "Read one full message through an active Google Mail connector using an id from email_search. "
+                    "Use this whenever the user asks to read, summarize, inspect, or act on message body content."
+                ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
@@ -8023,6 +8449,7 @@ def _connector_request_headers(connection: object | None, provider_id: str) -> d
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {_connector_credential_value(connection, provider_id)}",
+        "Connection": "close",
         "User-Agent": "Nullion connector_request/0.1",
     }
     return headers
@@ -8046,6 +8473,25 @@ def _connector_connection_allows_write(connection: object | None) -> bool:
     return mode in {"write", "read_write", "readwrite", "rw", "read_and_write"}
 
 
+def _native_email_send_provider_has_write_connection(provider_id: str = "imap_smtp_provider") -> bool:
+    try:
+        from nullion.connections import load_connection_registry
+    except Exception:
+        return False
+    try:
+        connections = load_connection_registry().connections
+    except Exception:
+        return False
+    for connection in connections:
+        if str(getattr(connection, "provider_id", "") or "").strip() != provider_id:
+            continue
+        if not getattr(connection, "active", True):
+            continue
+        if _connector_connection_allows_write(connection):
+            return True
+    return False
+
+
 def _string_list_argument(raw_value: object) -> list[str]:
     if raw_value is None:
         return []
@@ -8063,11 +8509,14 @@ def _string_list_argument(raw_value: object) -> list[str]:
     return [value] if value else []
 
 
-def _default_email_connector_provider_id(principal_id: str | None) -> str:
+def _default_email_connector_provider_id(principal_id: str | None, *, require_write: bool = False) -> str:
     try:
         from nullion.connections import default_email_connector_provider_id
 
-        provider_id = default_email_connector_provider_id(principal_id)
+        try:
+            provider_id = default_email_connector_provider_id(principal_id, require_write=require_write)
+        except TypeError:
+            provider_id = default_email_connector_provider_id(principal_id)
         if provider_id:
             return provider_id
     except Exception:
@@ -8448,6 +8897,9 @@ def _email_message_for_invocation(invocation: ToolInvocation) -> tuple[EmailMess
         raise ValueError("Missing required argument: to")
     subject = str(invocation.arguments.get("subject") or "").strip()
     body = str(invocation.arguments.get("body") or "")
+    html_body = _email_html_body_from_invocation(invocation)
+    if html_body and not body.strip():
+        body = _plain_text_from_html_body(html_body)
     msg = EmailMessage()
     msg["To"] = ", ".join(recipients)
     cc = _string_list_argument(invocation.arguments.get("cc"))
@@ -8458,6 +8910,10 @@ def _email_message_for_invocation(invocation: ToolInvocation) -> tuple[EmailMess
         msg["Bcc"] = ", ".join(bcc)
     msg["Subject"] = subject
     msg.set_content(body)
+    if html_body:
+        from nullion.artifacts import normalize_html_document
+
+        msg.add_alternative(normalize_html_document(html_body, title=subject or "Email"), subtype="html")
 
     attached_paths: list[str] = []
     effective_roots = _principal_workspace_file_roots(invocation.principal_id)
@@ -8650,12 +9106,10 @@ def _connector_request_url(raw_url: str, raw_params: object, connection: object 
     url = raw_url.strip()
     parsed = urlparse(url)
     host = parsed.hostname
-    resolution = _resolve_web_fetch_resolution(url)
     if (
         parsed.scheme not in {"http", "https"}
         or not isinstance(host, str)
         or not host
-        or (resolution is None and not _is_global_literal_ip(host))
     ):
         raise ValueError(f"Blocked URL for connector_request: {url}")
     params: dict[str, str] = {}
@@ -8668,9 +9122,13 @@ def _connector_request_url(raw_url: str, raw_params: object, connection: object 
         separator = "&" if parsed.query else "?"
         url += separator + urlencode(params)
     allowed_bases = _connector_allowed_base_urls(connection, provider_id)
-    if allowed_bases and not any(_url_is_under_base(url, base_url) for base_url in allowed_bases):
+    is_under_configured_base = bool(allowed_bases) and any(_url_is_under_base(url, base_url) for base_url in allowed_bases)
+    if allowed_bases and not is_under_configured_base:
         labels = ", ".join(allowed_bases)
         raise ValueError(f"Blocked URL for connector_request: {url} is not under configured connector base URL(s): {labels}")
+    resolution = _resolve_web_fetch_resolution(url)
+    if resolution is None and not _is_global_literal_ip(host) and not is_under_configured_base:
+        raise ValueError(f"Blocked URL for connector_request: {url}")
     return url
 
 
@@ -8836,6 +9294,9 @@ def _build_connector_email_search_handler() -> ToolHandler:
                     "provider_id": provider_id,
                     "resultSizeEstimate": listing.get("resultSizeEstimate"),
                     "results": results,
+                    "body_included": False,
+                    "next_tool_for_body": "email_read",
+                    "body_requires_tool": "email_read",
                 },
                 error=None,
             )
@@ -8990,7 +9451,7 @@ def _build_connector_email_send_handler() -> ToolHandler:
         provider_id = str(invocation.arguments.get("provider_id") or "").strip()
         try:
             if not provider_id:
-                provider_id = _default_email_connector_provider_id(invocation.principal_id)
+                provider_id = _default_email_connector_provider_id(invocation.principal_id, require_write=True)
             connection = _connector_connection_for_invocation(invocation, provider_id)
             if not _connector_connection_allows_write(connection):
                 return ToolResult(
@@ -9486,33 +9947,33 @@ def register_email_plugin(
     *,
     email_searcher: Callable[[str, int], list[dict[str, object]]] | None = None,
     email_reader: Callable[[str], dict[str, object]] | None = None,
+    email_sender: Callable[[EmailMessage, list[str]], dict[str, object]] | None = None,
 ) -> ToolRegistry:
     registry.require_plugin_registration_allowed()
     registry.mark_plugin_installed("email_plugin")
     if email_searcher is None:
         raise ValueError("email_plugin requires email_searcher")
-    try:
-        registry.get_spec("email_search")
-    except KeyError:
+    registry.unregister("email_search")
+    registry.register(
+        ToolSpec(
+            name="email_search",
+                description=(
+                    "Search email messages via the configured provider. Search results are metadata-only; "
+                    "call email_read with a returned id before summarizing body content or claiming the message was read."
+                ),
+            risk_level=ToolRiskLevel.LOW,
+            side_effect_class=ToolSideEffectClass.READ,
+            requires_approval=False,
+            timeout_seconds=20,
+            capability_tags=("email", "connector", "account_read"),
+        ),
+        _build_email_search_handler(email_searcher),
+    )
+    if email_reader is not None:
+        registry.unregister("email_read")
         registry.register(
             ToolSpec(
-                name="email_search",
-                description="Search email messages via the configured provider.",
-                risk_level=ToolRiskLevel.LOW,
-                side_effect_class=ToolSideEffectClass.READ,
-                requires_approval=False,
-                timeout_seconds=20,
-                capability_tags=("email", "connector", "account_read"),
-            ),
-            _build_email_search_handler(email_searcher),
-        )
-    if email_reader is not None:
-        try:
-            registry.get_spec("email_read")
-        except KeyError:
-            registry.register(
-                ToolSpec(
-                    name="email_read",
+                name="email_read",
                 description="Read a single email message via the configured provider.",
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
@@ -9521,6 +9982,30 @@ def register_email_plugin(
                 capability_tags=("email", "connector", "account_read"),
             ),
             _build_email_read_handler(email_reader),
+        )
+    if email_sender is not None:
+        try:
+            registry.get_spec("email_send")
+            existing_email_send = True
+        except KeyError:
+            existing_email_send = False
+        if existing_email_send and not _native_email_send_provider_has_write_connection():
+            return registry
+        registry.unregister("email_send")
+        registry.register(
+            ToolSpec(
+                name="email_send",
+                description=(
+                    "Send a plain-text email, optionally with local artifact/media attachments, "
+                    "through the configured email provider."
+                ),
+                risk_level=ToolRiskLevel.HIGH,
+                side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
+                requires_approval=True,
+                timeout_seconds=20,
+                capability_tags=("email", "account_write"),
+            ),
+            _build_email_send_handler(email_sender),
         )
     return registry
 
@@ -9590,7 +10075,13 @@ def _build_email_search_handler(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"query": raw_query, "results": results},
+            output={
+                "query": raw_query,
+                "results": results,
+                "body_included": False,
+                "next_tool_for_body": "email_read",
+                "body_requires_tool": "email_read",
+            },
             error=None,
         )
 
@@ -9628,6 +10119,48 @@ def _build_email_read_handler(
             output={"id": raw_id, "message": message},
             error=None,
         )
+
+    return handler
+
+
+def _build_email_send_handler(
+    email_sender: Callable[[EmailMessage, list[str]], dict[str, object]],
+) -> ToolHandler:
+    connector_handler = _build_connector_email_send_handler()
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        if provider_id and _connector_provider_id_looks_external(provider_id):
+            return connector_handler(invocation)
+        try:
+            message, attached_paths = _email_message_for_invocation(invocation)
+            output = _call_provider_with_principal(
+                email_sender,
+                message,
+                attached_paths,
+                principal_id=invocation.principal_id,
+            )
+            if not isinstance(output, dict):
+                output = {"result": output}
+            output.setdefault("to", _string_list_argument(invocation.arguments.get("to")))
+            output.setdefault("subject", str(invocation.arguments.get("subject") or "").strip())
+            output.setdefault("attachment_count", len(attached_paths))
+            output.setdefault("attachment_paths", attached_paths)
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output=output,
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=_account_tool_failure_output(invocation.principal_id),
+                error=str(exc),
+            )
 
     return handler
 
@@ -10179,6 +10712,10 @@ def _build_set_reminder_handler(runtime, *, default_chat_id: str | None) -> Tool
                 text=text.strip(),
                 due_at=due_at,
             )
+            try:
+                runtime.checkpoint(force=True)
+            except TypeError:
+                runtime.checkpoint()
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
@@ -10252,13 +10789,209 @@ def _build_list_reminders_handler(runtime) -> ToolHandler:
     return handler
 
 
+def _build_delete_reminder_handler(runtime) -> ToolHandler:
+    """Return a handler that deletes a one-off reminder by task id."""
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        from nullion.reminders import reminder_due_at_output
+
+        task_id = invocation.arguments.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: task_id",
+            )
+        normalized_task_id = task_id.strip()
+        try:
+            reminder = runtime.store.get_reminder(normalized_task_id)
+            if reminder is None:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={},
+                    error=f"Reminder not found: {normalized_task_id}",
+                )
+            removed = runtime.store.remove_reminder(normalized_task_id)
+            runtime.store.scheduled_tasks.pop(normalized_task_id, None)
+            try:
+                runtime.checkpoint(force=True)
+            except TypeError:
+                runtime.checkpoint()
+            if not removed:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={},
+                    error=f"Reminder not found: {normalized_task_id}",
+                )
+            due_at_details = reminder_due_at_output(reminder.due_at)
+            due_at_display = due_at_details.get("due_at_display") or due_at_details.get("due_at") or reminder.due_at.isoformat()
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "task_id": normalized_task_id,
+                    "text": reminder.text,
+                    "chat_id": reminder.chat_id,
+                    **due_at_details,
+                    "message": f"Reminder deleted: {reminder.text}",
+                    "action_receipt": _action_receipt(
+                        action="deleted",
+                        object_type="reminder",
+                        object_id=normalized_task_id,
+                        object_name=reminder.text,
+                        summary=f"Reminder deleted: {reminder.text}",
+                        details=[
+                            f"Reminder text: {_receipt_value_summary(reminder.text)}.",
+                            f"Due at: {due_at_display}.",
+                        ],
+                    ),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=f"Failed to delete reminder: {exc}",
+            )
+
+    return handler
+
+
+def _build_update_reminder_handler(runtime) -> ToolHandler:
+    """Return a handler that updates a pending one-off reminder."""
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        from nullion.reminders import (
+            due_at_from_relative_seconds,
+            normalize_reminder_due_at,
+            reminder_due_at_output,
+        )
+
+        task_id = invocation.arguments.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: task_id",
+            )
+        normalized_task_id = task_id.strip()
+        reminder = runtime.store.get_reminder(normalized_task_id)
+        if reminder is None:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=f"Reminder not found: {normalized_task_id}",
+            )
+
+        text_arg = invocation.arguments.get("text")
+        due_at_str = invocation.arguments.get("due_at")
+        due_in_seconds = invocation.arguments.get("due_in_seconds")
+        new_text = reminder.text
+        if isinstance(text_arg, str) and text_arg.strip():
+            new_text = text_arg.strip()
+        elif text_arg is not None:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Invalid argument: text must be a non-empty string when provided",
+            )
+
+        has_due_at = isinstance(due_at_str, str) and bool(due_at_str.strip())
+        relative_delay_seconds: float | None = None
+        if isinstance(due_in_seconds, (int, float)) and not isinstance(due_in_seconds, bool):
+            relative_delay_seconds = float(due_in_seconds)
+        elif isinstance(due_in_seconds, str) and due_in_seconds.strip():
+            try:
+                relative_delay_seconds = float(due_in_seconds)
+            except ValueError:
+                relative_delay_seconds = None
+        has_relative_delay = relative_delay_seconds is not None
+        if not has_due_at and not has_relative_delay and new_text == reminder.text:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="No reminder updates provided: text, due_at, or due_in_seconds is required",
+            )
+
+        try:
+            if has_relative_delay:
+                new_due_at = due_at_from_relative_seconds(relative_delay_seconds)
+            elif has_due_at:
+                new_due_at = datetime.fromisoformat(str(due_at_str).replace("Z", "+00:00"))
+                new_due_at = normalize_reminder_due_at(new_due_at)
+            else:
+                new_due_at = normalize_reminder_due_at(reminder.due_at)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error=f"Invalid due_at datetime: {exc}",
+            )
+
+        updated = replace(reminder, text=new_text, due_at=new_due_at, delivered_at=None)
+        runtime.store.add_reminder(updated)
+        task = runtime.store.get_scheduled_task(normalized_task_id)
+        if task is not None:
+            runtime.store.add_scheduled_task(replace(task, enabled=True))
+        try:
+            runtime.checkpoint(force=True)
+        except TypeError:
+            runtime.checkpoint()
+        due_at_details = reminder_due_at_output(new_due_at)
+        due_at_display = due_at_details.get("due_at_display") or due_at_details.get("due_at") or new_due_at.isoformat()
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "task_id": normalized_task_id,
+                "text": new_text,
+                "chat_id": updated.chat_id,
+                **due_at_details,
+                "message": f"Reminder updated: {new_text}",
+                "action_receipt": _action_receipt(
+                    action="updated",
+                    object_type="reminder",
+                    object_id=normalized_task_id,
+                    object_name=new_text,
+                    summary=f"Reminder updated: {new_text}",
+                    details=[
+                        f"Reminder text: {_receipt_value_summary(new_text)}.",
+                        f"Due at: {due_at_display}.",
+                    ],
+                ),
+            },
+        )
+
+    return handler
+
+
 def register_reminder_tools(
     registry: ToolRegistry,
     runtime,
     *,
     default_chat_id: str | None = None,
 ) -> None:
-    """Register set_reminder and list_reminders tools into an existing ToolRegistry.
+    """Register reminder tools into an existing ToolRegistry.
 
     These tools are runtime-store-aware: they require a live ``runtime`` reference
     because they write/read directly from ``runtime.store``.  Wire them in after
@@ -10322,6 +11055,62 @@ def register_reminder_tools(
             },
         ),
         _build_list_reminders_handler(runtime),
+    )
+    registry.register(
+        ToolSpec(
+            name="delete_reminder",
+            description=(
+                "Delete or cancel a pending one-off reminder by task_id. "
+                "Use list_reminders first when the task_id is not already known."
+            ),
+            risk_level=ToolRiskLevel.LOW,
+            side_effect_class=ToolSideEffectClass.WRITE,
+            requires_approval=False,
+            timeout_seconds=10,
+            capability_tags=("scheduler", "reminder"),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Reminder task id to delete."},
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        ),
+        _build_delete_reminder_handler(runtime),
+    )
+    registry.register(
+        ToolSpec(
+            name="update_reminder",
+            description=(
+                "Update a pending one-off reminder by task_id. "
+                "Use list_reminders first when the task_id is not already known. "
+                "Provide text to change the message and either due_in_seconds or due_at to change the time."
+            ),
+            risk_level=ToolRiskLevel.LOW,
+            side_effect_class=ToolSideEffectClass.WRITE,
+            requires_approval=False,
+            timeout_seconds=10,
+            capability_tags=("scheduler", "reminder"),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Reminder task id to update."},
+                    "text": {"type": "string", "description": "New reminder message. Omit to keep the current text."},
+                    "due_at": {
+                        "type": "string",
+                        "description": "New absolute ISO 8601 due time. Include timezone offset when known.",
+                    },
+                    "due_in_seconds": {
+                        "type": "number",
+                        "description": "New relative delay from the current moment, in seconds.",
+                    },
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        ),
+        _build_update_reminder_handler(runtime),
     )
 
 
@@ -10449,20 +11238,16 @@ def _build_list_crons_handler():
     def _cron_display_line(index: int, job: object, display: dict[str, str]) -> str:
         name = str(getattr(job, "name", "") or "Untitled scheduled task").strip()
         schedule = str(getattr(job, "schedule", "") or "").strip()
-        workspace_id = str(getattr(job, "workspace_id", "") or "").strip()
         enabled = bool(getattr(job, "enabled", False))
         next_run = str(getattr(job, "next_run", "") or "").strip()
         status = "enabled" if enabled else "disabled"
-        parts = [f"{index}. {name}", f"Status: {status}"]
+        parts = [f"{index}. {name}", f"   Status: {status}"]
         if schedule:
-            parts.append(f"Schedule: {display['schedule_description']}")
+            parts.append(f"   Schedule: {display['schedule_description']}")
         if next_run:
             next_description = display["next_run_description"] or next_run
-            parts.append(f"Next run: {next_description}")
-        if workspace_id:
-            parts.append(f"Workspace: {workspace_id}")
-        parts.append(f'Run by name: run_cron name="{name}"')
-        return " · ".join(parts)
+            parts.append(f"   Next run: {next_description}")
+        return "\n".join(parts)
 
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.connections import workspace_id_for_principal
@@ -10512,11 +11297,12 @@ def _build_list_crons_handler():
                     "has_last_result": bool(str(j.last_result or "").strip()),
                 }
             )
+        header = f"Here are your {len(crons)} crons:"
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"crons": crons, "message": "\n".join(lines)},
+            output={"crons": crons, "message": f"{header}\n\n" + "\n\n".join(lines)},
             error=None,
         )
     return handle

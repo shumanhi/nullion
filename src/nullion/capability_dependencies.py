@@ -166,6 +166,40 @@ def capability_dependency_status(dependency: CapabilityDependency) -> Capability
     return CapabilityDependencyStatus(dependency=dependency, installed=True, installed_version=version)
 
 
+def _capability_dependency_status_for_python(
+    dependency: CapabilityDependency,
+    python_executable: str | None,
+) -> CapabilityDependencyStatus:
+    if not python_executable:
+        return capability_dependency_status(dependency)
+    code = (
+        "import importlib.metadata as m, sys\n"
+        "try:\n"
+        "    print(m.version(sys.argv[1]))\n"
+        "except m.PackageNotFoundError:\n"
+        "    raise SystemExit(3)\n"
+    )
+    try:
+        completed = subprocess.run(
+            [python_executable, "-c", code, dependency.package],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return CapabilityDependencyStatus(dependency=dependency, installed=True)
+    if completed.returncode == 0:
+        return CapabilityDependencyStatus(
+            dependency=dependency,
+            installed=True,
+            installed_version=completed.stdout.strip() or None,
+        )
+    if completed.returncode == 3:
+        return CapabilityDependencyStatus(dependency=dependency, installed=False)
+    return CapabilityDependencyStatus(dependency=dependency, installed=True)
+
+
 def list_capability_dependency_statuses() -> tuple[CapabilityDependencyStatus, ...]:
     return tuple(capability_dependency_status(dependency) for dependency in _DEPENDENCY_CATALOG)
 
@@ -291,7 +325,7 @@ def install_dependency(
         text=True,
         timeout=timeout_seconds,
     )
-    status = capability_dependency_status(dependency)
+    status = _capability_dependency_status_for_python(dependency, python_executable)
     return {
         "dependency_id": dependency.dependency_id,
         "package": dependency.package,
@@ -320,7 +354,7 @@ def uninstall_dependency(
         text=True,
         timeout=timeout_seconds,
     )
-    status = capability_dependency_status(dependency)
+    status = _capability_dependency_status_for_python(dependency, python_executable)
     return {
         "dependency_id": dependency.dependency_id,
         "package": dependency.package,

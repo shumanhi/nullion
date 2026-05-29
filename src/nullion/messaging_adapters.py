@@ -989,25 +989,34 @@ def _required_attachment_extensions_from_contract(
     planned_extension = plan_attachment_format(text or "").extension
     if planned_extension:
         extensions.append(planned_extension.lower())
-    filename_extension = _contract_filename_extension(text)
-    if filename_extension:
-        extensions.append(filename_extension)
+    extensions.extend(_contract_filename_extensions(text))
     return tuple(dict.fromkeys(extensions))
 
 
 def _contract_filename_extension(text: str | None) -> str | None:
-    for match in re.finditer(r"(?<![\w./\\-])([A-Za-z0-9][\w .()@+-]{0,180}\.([A-Za-z0-9]{1,16}))(?![\w./\\-])", str(text or "")):
-        token = match.group(1).strip()
+    extensions = _contract_filename_extensions(text)
+    return extensions[0] if extensions else None
+
+
+def _contract_filename_extensions(text: str | None) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for raw_token in re.split(r"[\s,;:]+", str(text or "")):
+        token = raw_token.strip().strip("`'\"<>[](){}")
+        if not token or "/" in token or "\\" in token or "=" in token:
+            continue
+        match = re.search(r"\.([A-Za-z0-9]{1,16})(?:[.!?])?$", token)
+        if not match:
+            continue
         if "/" in token or "\\" in token or "=" in token:
             continue
-        extension = f".{match.group(2).lower()}"
+        extension = f".{match.group(1).lower()}"
         if extension in {".ai", ".app", ".co", ".com", ".dev", ".edu", ".gov", ".io", ".net", ".org", ".us"}:
             continue
         # This helper is only used after structured delivery evidence exists
         # (MEDIA, artifact result, or task contract). A bare filename here is a
         # format filter for an already-produced attachment, not task routing.
-        return extension
-    return None
+        extensions.append(extension)
+    return tuple(dict.fromkeys(extensions))
 
 
 def _attachments_matching_contract(

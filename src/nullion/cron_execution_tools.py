@@ -17,11 +17,13 @@ CRON_EXECUTION_BLOCKED_TOOLS = frozenset(
     {
         "create_cron",
         "delete_cron",
+        "delete_reminder",
         "list_crons",
         "list_reminders",
         "run_cron",
         "set_reminder",
         "toggle_cron",
+        "update_reminder",
     }
 )
 CRON_EXECUTION_CONNECTOR_CAPABILITY_TAGS = frozenset({"connector"})

@@ -174,6 +174,13 @@ def build_cron_planner_status_preview(
     """Return a display-only planner card from a validated structured DAG."""
     if model_client is None:
         return None
+    if not _cron_planner_model_preview_enabled():
+        return build_cron_planner_status_fallback(
+            user_message=user_message,
+            conversation_id=conversation_id,
+            principal_id=principal_id,
+            subject=subject,
+        )
     if cache_only:
         cached = _preview_cache_get_by_message(str(user_message or ""), subject=subject)
         if cached is not None:
@@ -270,6 +277,13 @@ def build_cron_planner_status_preview(
         len(tools),
     )
     return preview
+
+
+def _cron_planner_model_preview_enabled() -> bool:
+    raw = os.environ.get("NULLION_CRON_PLANNER_MODEL_PREVIEW_ENABLED")
+    if raw is None or raw.strip() == "":
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def build_cron_planner_status_fallback(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import math
 from pathlib import Path
 import re
@@ -16,6 +17,8 @@ CHAT_HISTORY_SEARCH_TOOL_NAME = "chat_history_search"
 _MAX_HISTORY_SCAN_LIMIT = 200
 _MAX_HISTORY_RETURN_LIMIT = 50
 _MAX_SNIPPET_CHARS = 900
+_MAX_TOOL_EVIDENCE_ITEMS = 4
+_MAX_TOOL_EVIDENCE_OUTPUT_CHARS = 1600
 _MIN_SEARCH_TOKEN_CHARS = 2
 _MATCH_CONTEXT_PREVIOUS_TURNS = 4
 _MATCH_CONTEXT_FOLLOWING_TURNS = 1
@@ -190,6 +193,41 @@ def _tool_names_from_event(event: dict[str, object]) -> list[str]:
     return names
 
 
+def _compact_tool_evidence_output(value: object) -> str:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        encoded = str(value)
+    return _snippet(encoded, max_chars=_MAX_TOOL_EVIDENCE_OUTPUT_CHARS)
+
+
+def _tool_evidence_from_event(event: dict[str, object]) -> list[dict[str, object]]:
+    tool_results = event.get("tool_results")
+    if not isinstance(tool_results, list):
+        return []
+    evidence: list[dict[str, object]] = []
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        name = str(result.get("tool_name") or "").strip()
+        if not name or name in {CHAT_HISTORY_SEARCH_TOOL_NAME, "request_tool_scope"}:
+            continue
+        item: dict[str, object] = {
+            "tool_name": name,
+            "status": str(result.get("status") or "").strip(),
+        }
+        output = result.get("output")
+        if output not in (None, "", {}, []):
+            item["output_preview"] = _compact_tool_evidence_output(output)
+        error = str(result.get("error") or "").strip()
+        if error:
+            item["error"] = _snippet(error, max_chars=500)
+        evidence.append(item)
+        if len(evidence) >= _MAX_TOOL_EVIDENCE_ITEMS:
+            break
+    return evidence
+
+
 def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     record = {
         "index": index,
@@ -214,6 +252,9 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     tool_names = _tool_names_from_event(event)
     if tool_names:
         record["tool_names"] = tool_names
+    tool_evidence = _tool_evidence_from_event(event)
+    if tool_evidence:
+        record["tool_evidence"] = tool_evidence
     return record
 
 

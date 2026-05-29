@@ -75,7 +75,11 @@ print_bold()   { echo -e "\n  ${BOLD}${CYAN}◆${RESET} ${BOLD}$*${RESET}"; }
 print_chip()   { echo -e "  ${DIM}[$1]${RESET} $2"; }
 
 prompt_read() {
-    if [[ -r /dev/tty ]]; then
+    if [[ "${NULLION_INSTALLER_SMOKE:-false}" == "true" ]]; then
+        read "$@"
+        return
+    fi
+    if [[ -r /dev/tty ]] && { : </dev/tty; } 2>/dev/null; then
         read "$@" </dev/tty
     else
         read "$@"
@@ -769,7 +773,7 @@ checkpoint_account_setup() {
     checkpoint_env_value_if_set "ACTIVEPIECES_API_KEY" "${ACTIVEPIECES_API_KEY:-}"
     checkpoint_env_value_if_set "N8N_BASE_URL" "${N8N_BASE_URL:-}"
     checkpoint_env_value_if_set "N8N_API_KEY" "${N8N_API_KEY:-}"
-    [[ "${MATON_CONNECTOR_ENABLED:-false}" == "true" ]] && checkpoint_env_value "NULLION_CONNECTOR_GATEWAY" "maton"
+    checkpoint_env_value_if_set "NULLION_CONNECTOR_GATEWAY" "${CONNECTOR_GATEWAY:-}"
     checkpoint_env_value_if_set "NULLION_CUSTOM_API_BASE_URL" "${CUSTOM_API_BASE_URL:-}"
     checkpoint_env_value_if_set "NULLION_CUSTOM_API_TOKEN" "${CUSTOM_API_TOKEN:-}"
 }
@@ -811,7 +815,7 @@ checkpoint_skill_setup() {
     if [[ -n "${ENABLED_SKILL_PACKS:-}" ]]; then
         checkpoint_env_raw "NULLION_SKILL_PACK_ACCESS_ENABLED" true
     fi
-    if [[ ",${ENABLED_SKILL_PACKS:-}," == *",nullion/connector-skills,"* || "${ENABLED_SKILL_PACKS:-}" == *"api-gateway"* ]]; then
+    if [[ -n "${CONNECTOR_GATEWAY:-}" ]]; then
         checkpoint_env_raw "NULLION_CONNECTOR_ACCESS_ENABLED" true
     fi
 }
@@ -1891,8 +1895,9 @@ echo "  compatible HTTP API."
 echo
 
 EMAIL_CALENDAR_ENABLED=false
-MATON_CONNECTOR_ENABLED=false
+CONNECTOR_CREDENTIALS_ENABLED=false
 CONNECTOR_SKILLS_ENABLED=false
+CONNECTOR_SELECTED_SKILL_PACKS=""
 CUSTOM_EMAIL_API_ENABLED=false
 MATON_API_KEY="$(env_value MATON_API_KEY)"
 COMPOSIO_API_KEY="$(env_value COMPOSIO_API_KEY)"
@@ -1904,9 +1909,26 @@ CUSTOM_API_BASE_URL="$(env_value NULLION_CUSTOM_API_BASE_URL)"
 CUSTOM_API_TOKEN="$(env_value NULLION_CUSTOM_API_TOKEN)"
 EXISTING_ENABLED_PLUGINS="$(env_value NULLION_ENABLED_PLUGINS)"
 EXISTING_ACCOUNT_DONE="$(env_value NULLION_SETUP_ACCOUNT_DONE)"
-EXISTING_CONNECTOR_GATEWAY="$(env_value NULLION_CONNECTOR_GATEWAY)"
-if [[ -n "$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$EXISTING_CONNECTOR_GATEWAY" ]]; then
-    MATON_CONNECTOR_ENABLED=true
+CONNECTOR_GATEWAY="$(env_value NULLION_CONNECTOR_GATEWAY)"
+infer_connector_gateway() {
+    if [[ -n "${CONNECTOR_GATEWAY:-}" ]]; then
+        return 0
+    fi
+    if [[ -n "${MATON_API_KEY:-}" ]]; then
+        CONNECTOR_GATEWAY="maton"
+    elif [[ -n "${COMPOSIO_API_KEY:-}" ]]; then
+        CONNECTOR_GATEWAY="composio"
+    elif [[ -n "${NANGO_SECRET_KEY:-}" ]]; then
+        CONNECTOR_GATEWAY="nango"
+    elif [[ -n "${ACTIVEPIECES_API_KEY:-}" ]]; then
+        CONNECTOR_GATEWAY="activepieces"
+    elif [[ -n "${N8N_API_KEY:-}${N8N_BASE_URL:-}" ]]; then
+        CONNECTOR_GATEWAY="n8n"
+    fi
+}
+if [[ -n "$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$CONNECTOR_GATEWAY" ]]; then
+    infer_connector_gateway
+    CONNECTOR_CREDENTIALS_ENABLED=true
     CONNECTOR_SKILLS_ENABLED=true
 fi
 if [[ "$EXISTING_ACCOUNT_DONE" == "true" || ",$EXISTING_ENABLED_PLUGINS," == *",email_plugin,"* || ",$EXISTING_ENABLED_PLUGINS," == *",calendar_plugin,"* || "$CONNECTOR_SKILLS_ENABLED" == "true" ]]; then
@@ -1917,15 +1939,16 @@ if [[ "$EXISTING_ACCOUNT_DONE" == "true" || ",$EXISTING_ENABLED_PLUGINS," == *",
         elif [[ ",$EXISTING_ENABLED_PLUGINS," == *",email_plugin,"* || ",$EXISTING_ENABLED_PLUGINS," == *",calendar_plugin,"* ]]; then
             EMAIL_CALENDAR_ENABLED=true
         fi
-        if [[ -n "$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$EXISTING_CONNECTOR_GATEWAY" ]]; then
-            MATON_CONNECTOR_ENABLED=true
+        if [[ -n "$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$CONNECTOR_GATEWAY" ]]; then
+            infer_connector_gateway
+            CONNECTOR_CREDENTIALS_ENABLED=true
             CONNECTOR_SKILLS_ENABLED=true
         fi
         print_ok "Using existing account/API setup."
     fi
 fi
 
-if [[ "$EMAIL_CALENDAR_ENABLED" == "false" && "$CUSTOM_EMAIL_API_ENABLED" == "false" && "$MATON_CONNECTOR_ENABLED" == "false" ]]; then
+if [[ "$EMAIL_CALENDAR_ENABLED" == "false" && "$CUSTOM_EMAIL_API_ENABLED" == "false" && "$CONNECTOR_CREDENTIALS_ENABLED" == "false" ]]; then
     print_menu_item "1" "Gmail / Google Calendar" "Local setup with Himalaya plus the Google API wrapper" "[recommended]"
     print_menu_item "2" "Connector skill credentials" "Maton, Composio, Nango, Activepieces, n8n, or custom gateway"
     print_menu_item "3" "Custom email API bridge" "Bind Nullion email tools to your own HTTP bridge"
@@ -1959,7 +1982,6 @@ if [[ "$EMAIL_CALENDAR_ENABLED" == "false" && "$CUSTOM_EMAIL_API_ENABLED" == "fa
             print_ok "Email/calendar plugins will be enabled."
             ;;
         2)
-            MATON_CONNECTOR_ENABLED=true
             CONNECTOR_SKILLS_ENABLED=true
             echo
             echo "  Connector skills are broad workflow guidance for SaaS/API gateways."
@@ -1970,40 +1992,56 @@ if [[ "$EMAIL_CALENDAR_ENABLED" == "false" && "$CUSTOM_EMAIL_API_ENABLED" == "fa
             print_menu_item "3" "Nango" "Open-source OAuth and integration platform"
             print_menu_item "4" "Activepieces" "Open-source automation pieces"
             print_menu_item "5" "n8n" "Self-hostable workflow automation"
-            print_menu_item "6" "Skip credentials" "Enable the connector skills only"
+            print_menu_item "6" "Custom MCP/HTTP gateway" "Use your own connector base URL and token"
+            print_menu_item "7" "Skip credentials" "Enable the connector skills only"
             echo
-            prompt_read -rp "  Select one or more [1]: " CONNECTOR_CHOICES
-            CONNECTOR_CHOICES="${CONNECTOR_CHOICES:-1}"
+            prompt_read -rp "  Select one or more [7]: " CONNECTOR_CHOICES
+            CONNECTOR_CHOICES="${CONNECTOR_CHOICES:-7}"
             CONNECTOR_CHOICES_NORMALIZED="$(echo "$CONNECTOR_CHOICES" | tr -cs '0-9' ',')"
             CONNECTOR_CHOICES_NORMALIZED=",${CONNECTOR_CHOICES_NORMALIZED#,}"
             if [[ "$CONNECTOR_CHOICES_NORMALIZED" != *, ]]; then
                 CONNECTOR_CHOICES_NORMALIZED="${CONNECTOR_CHOICES_NORMALIZED},"
             fi
             if [[ "$CONNECTOR_CHOICES_NORMALIZED" == *",1,"* ]]; then
+                CONNECTOR_SELECTED_SKILL_PACKS="${CONNECTOR_SELECTED_SKILL_PACKS},maton-ai/api-gateway-skill"
                 echo -n "  Maton API key (hidden): "
                 prompt_read -rs MATON_API_KEY
                 echo
             fi
             if [[ "$CONNECTOR_CHOICES_NORMALIZED" == *",2,"* ]]; then
+                CONNECTOR_SELECTED_SKILL_PACKS="${CONNECTOR_SELECTED_SKILL_PACKS},composio/mcp-connector-skill"
                 echo -n "  Composio API key (hidden): "
                 prompt_read -rs COMPOSIO_API_KEY
                 echo
             fi
             if [[ "$CONNECTOR_CHOICES_NORMALIZED" == *",3,"* ]]; then
+                CONNECTOR_SELECTED_SKILL_PACKS="${CONNECTOR_SELECTED_SKILL_PACKS},nango/mcp-connector-skill"
                 echo -n "  Nango secret key (hidden): "
                 prompt_read -rs NANGO_SECRET_KEY
                 echo
             fi
             if [[ "$CONNECTOR_CHOICES_NORMALIZED" == *",4,"* ]]; then
+                CONNECTOR_SELECTED_SKILL_PACKS="${CONNECTOR_SELECTED_SKILL_PACKS},activepieces/mcp-connector-skill"
                 echo -n "  Activepieces API key (hidden): "
                 prompt_read -rs ACTIVEPIECES_API_KEY
                 echo
             fi
             if [[ "$CONNECTOR_CHOICES_NORMALIZED" == *",5,"* ]]; then
+                CONNECTOR_SELECTED_SKILL_PACKS="${CONNECTOR_SELECTED_SKILL_PACKS},n8n/mcp-connector-skill"
                 prompt_read -rp "  n8n base URL (e.g. http://localhost:5678): " N8N_BASE_URL
                 echo -n "  n8n API key (hidden): "
                 prompt_read -rs N8N_API_KEY
                 echo
+            fi
+            if [[ "$CONNECTOR_CHOICES_NORMALIZED" == *",6,"* ]]; then
+                prompt_read -rp "  Connector base URL: " CUSTOM_CONNECTOR_BASE_URL
+                echo -n "  Connector bearer token (hidden): "
+                prompt_read -rs CUSTOM_CONNECTOR_TOKEN
+                echo
+            fi
+            infer_connector_gateway
+            if [[ -n "${CUSTOM_CONNECTOR_BASE_URL:-}${CUSTOM_CONNECTOR_TOKEN:-}" ]]; then
+                CONNECTOR_GATEWAY="${CONNECTOR_GATEWAY:-custom}"
             fi
             print_ok "Connector/API skill pack will be enabled."
             ;;
@@ -2529,11 +2567,13 @@ print_ok "Media setup checkpoint saved to $NULLION_ENV_FILE"
 
 # ── Skill pack setup ───────────────────────────────────────────────────────
 echo
-print_bold "  Choose skill packs to enable:"
-echo "  All built-in skill packs ship with Nullion and are selected by default."
+print_bold "  Skill packs:"
+echo "  Core skill packs ship with Nullion and are enabled automatically."
+echo "  Add or remove custom skill packs later in Settings."
 echo "  Skill packs add workflow guidance only; account access still requires"
 echo "  workspace-scoped provider connections and enabled tools."
 echo
+CORE_SKILL_PACKS="nullion/web-research,nullion/browser-automation,nullion/files-and-docs,nullion/pdf-documents,nullion/email-calendar,nullion/github-code,nullion/media-local,nullion/productivity-memory,nullion/connector-skills"
 ENABLED_SKILL_PACKS=""
 trim_skill_pack_id() {
     local value="$1"
@@ -2590,184 +2630,12 @@ print_skill_pack_list() {
     IFS="$old_ifs"
 }
 
-install_custom_skill_pack_now() {
-    local source="$1"
-    local pack_id="$2"
-    local force_flag="${3:-false}"
-    "$VENV_DIR/bin/python" -c '
-import sys
-from nullion.skill_pack_installer import install_skill_pack
-source = sys.argv[1]
-pack_id = sys.argv[2] or None
-force = sys.argv[3].lower() == "true"
-pack = install_skill_pack(source, pack_id=pack_id, force=force)
-print(pack.pack_id)
-' "$source" "$pack_id" "$force_flag"
-}
-
-request_skill_pack_choices() {
-    SKILL_CHOICES=""
-    if [[ ! -t 0 ]]; then
-        SKILL_CHOICES="1,2,3,4,5,6,7,8,9"
-        print_info "No interactive terminal detected; using all default skill packs."
-        return 0
-    fi
-
-    local titles=(
-        "Web research"
-        "Browser automation"
-        "Files and documents"
-        "PDF documents"
-        "Email and calendar"
-        "GitHub and code review"
-        "Local media"
-        "Productivity and memory"
-        "Connector/API skills"
-        "Install custom skill pack"
-        "No default skill packs"
-    )
-    local details=(
-        "Search, fetch, source-backed answers"
-        "Web navigation, forms, screenshots"
-        "Local files, docs, sheets, decks"
-        "PDF generation, conversion, verification, delivery"
-        "Inbox triage, replies, scheduling"
-        "Repos, PRs, issues, release notes"
-        "Audio transcription, OCR, image workflows"
-        "Tasks, routines, preferences, reminders"
-        "Maton, Composio, Nango, Activepieces, n8n, custom APIs"
-        "Git URL, GitHub folder, or local folder with SKILL.md"
-        "Start with no enabled reference packs"
-    )
-    local choice_values=(1 2 3 4 5 6 7 8 9 10 11)
-    local badges=("" "" "" "" "" "" "" "" "" "" "")
-    local selected=(true true true true true true true true true false false)
-    local current=0
-    local total=${#titles[@]}
-    local key
-    local old_stty=""
-    local alt_screen=false
-
-    toggle_current_item() {
-        if [[ "${choice_values[$current]}" == "11" ]]; then
-            for ((i = 0; i < total - 1; i++)); do selected[$i]=false; done
-            selected[$current]=true
-        else
-            if [[ "${selected[$current]}" == "true" ]]; then
-                selected[$current]=false
-            else
-                selected[$current]=true
-            fi
-            selected[$((total - 1))]=false
-        fi
-    }
-    draw_menu() {
-        printf '\033[H\033[J'
-        echo "  Use ↑/↓ to move, Space to select/deselect, Enter to continue."
-        echo "  You can also press the visible number for single-digit items."
-        echo
-        for ((i = 0; i < total; i++)); do
-            print_check_item "${selected[$i]}" "$([[ $i -eq $current ]] && echo true || echo false)" "$((i + 1)). ${titles[$i]}" "${details[$i]}" "${badges[$i]}"
-        done
-        echo
-        echo -e "  ${DIM}Enter confirms the checked items.${RESET}"
-    }
-
-    old_stty="$(stty -g 2>/dev/null || true)"
-    [[ -n "$old_stty" ]] && stty -echo -icanon min 1 time 0 2>/dev/null || true
-    tput civis 2>/dev/null || true
-    if [[ -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] && tput smcup 2>/dev/null; then
-        alt_screen=true
-    fi
-    while true; do
-        draw_menu
-
-        IFS= prompt_read -rsn1 key || key=""
-        if [[ "$key" == $'\x1b' ]]; then
-            local seq=""
-            IFS= prompt_read -rsn2 -t 1 seq || true
-            case "$seq" in
-                "[A" | "OA") current=$(((current - 1 + total) % total)) ;;
-                "[B" | "OB") current=$(((current + 1) % total)) ;;
-            esac
-        elif [[ "$key" =~ ^[1-9]$ ]]; then
-            current=$((key - 1))
-            toggle_current_item
-        elif [[ "$key" == " " ]]; then
-            toggle_current_item
-        elif [[ "$key" == "" || "$key" == $'\n' || "$key" == $'\r' ]]; then
-            break
-        fi
-    done
-    [[ "$alt_screen" == "true" ]] && tput rmcup 2>/dev/null || true
-    [[ -n "$old_stty" ]] && stty "$old_stty" 2>/dev/null || true
-    tput cnorm 2>/dev/null || true
-
-    local choices=()
-    for ((i = 0; i < total; i++)); do
-        [[ "${selected[$i]}" == "true" ]] && choices+=("${choice_values[$i]}")
-    done
-    if ((${#choices[@]} == 0)); then
-        choices=(11)
-    fi
-    SKILL_CHOICES="$(IFS=,; echo "${choices[*]}")"
-}
-
 EXISTING_SKILL_PACKS="$(normalize_skill_pack_list "$(env_value NULLION_ENABLED_SKILL_PACKS)")"
-EXISTING_SKILLS_DONE="$(env_value NULLION_SETUP_SKILLS_DONE)"
-SKIP_SKILL_SETUP=false
-if [[ "$EXISTING_SKILLS_DONE" == "true" || -n "$EXISTING_SKILL_PACKS" ]]; then
-    print_skill_pack_list "Found existing skill packs" "$EXISTING_SKILL_PACKS"
-    if confirm_yes "Use existing skill packs instead of choosing them again?"; then
-        add_skill_pack_list "$EXISTING_SKILL_PACKS"
-        SKIP_SKILL_SETUP=true
-        print_ok "Using existing skill packs."
-    fi
-fi
-
-if [[ "$SKIP_SKILL_SETUP" == "false" ]]; then
-request_skill_pack_choices
-
-if [[ ",${SKILL_CHOICES// /}," == *",11,"* ]]; then
-    print_info "Skipped default skill packs. You can enable them later in Settings."
-else
-    IFS=',' read -ra _SKILL_PARTS <<< "$SKILL_CHOICES"
-    for choice in "${_SKILL_PARTS[@]}"; do
-        choice="$(echo "$choice" | tr -d '[:space:]')"
-        case "$choice" in
-            1) add_skill_pack "nullion/web-research" ;;
-            2) add_skill_pack "nullion/browser-automation" ;;
-            3) add_skill_pack "nullion/files-and-docs" ;;
-            4) add_skill_pack "nullion/pdf-documents" ;;
-            5) add_skill_pack "nullion/email-calendar" ;;
-            6) add_skill_pack "nullion/github-code" ;;
-            7) add_skill_pack "nullion/media-local" ;;
-            8) add_skill_pack "nullion/productivity-memory" ;;
-            9) add_skill_pack "nullion/connector-skills" ;;
-            10)
-                prompt_read -rp "  Skill pack source URL/path: " CUSTOM_SKILL_PACK_SOURCE
-                prompt_read -rp "  Pack id [auto]: " CUSTOM_SKILL_PACK_ID
-                if [[ -n "$CUSTOM_SKILL_PACK_SOURCE" ]]; then
-                    if CUSTOM_INSTALLED_PACK_ID="$(install_custom_skill_pack_now "$CUSTOM_SKILL_PACK_SOURCE" "$CUSTOM_SKILL_PACK_ID" "true")"; then
-                        add_skill_pack "$CUSTOM_INSTALLED_PACK_ID"
-                        print_ok "Installed skill pack: $CUSTOM_INSTALLED_PACK_ID"
-                    else
-                        print_err "Could not install custom skill pack. You can add it later in Settings."
-                    fi
-                fi
-                ;;
-            "") ;;
-            *) print_info "Ignoring unknown skill choice: $choice" ;;
-        esac
-    done
-    if [[ -n "$ENABLED_SKILL_PACKS" ]]; then
-        print_skill_pack_list "Skill packs enabled" "$ENABLED_SKILL_PACKS"
-    else
-        print_info "No skill packs selected."
-    fi
-fi
-fi
+add_skill_pack_list "$CORE_SKILL_PACKS"
+add_skill_pack_list "$EXISTING_SKILL_PACKS"
+add_skill_pack_list "$CONNECTOR_SELECTED_SKILL_PACKS"
 ENABLED_SKILL_PACKS="$(normalize_skill_pack_list "$ENABLED_SKILL_PACKS")"
+print_skill_pack_list "Skill packs enabled" "$ENABLED_SKILL_PACKS"
 
 checkpoint_skill_setup
 print_ok "Skill setup checkpoint saved to $NULLION_ENV_FILE"
@@ -2863,7 +2731,9 @@ fi
     [[ -n "$ACTIVEPIECES_API_KEY" ]] && echo "ACTIVEPIECES_API_KEY=\"$ACTIVEPIECES_API_KEY\""
     [[ -n "$N8N_BASE_URL" ]] && echo "N8N_BASE_URL=\"$N8N_BASE_URL\""
     [[ -n "$N8N_API_KEY" ]] && echo "N8N_API_KEY=\"$N8N_API_KEY\""
-    [[ "$MATON_CONNECTOR_ENABLED" == "true" ]] && echo "NULLION_CONNECTOR_GATEWAY=\"maton\""
+    [[ -n "${CUSTOM_CONNECTOR_BASE_URL:-}" ]] && echo "NULLION_CUSTOM_CONNECTOR_BASE_URL=\"$CUSTOM_CONNECTOR_BASE_URL\""
+    [[ -n "${CUSTOM_CONNECTOR_TOKEN:-}" ]] && echo "NULLION_CUSTOM_CONNECTOR_TOKEN=\"$CUSTOM_CONNECTOR_TOKEN\""
+    [[ -n "$CONNECTOR_GATEWAY" ]] && echo "NULLION_CONNECTOR_GATEWAY=\"$CONNECTOR_GATEWAY\""
     [[ -n "$CUSTOM_API_BASE_URL" ]] && echo "NULLION_CUSTOM_API_BASE_URL=\"$CUSTOM_API_BASE_URL\""
     [[ -n "$CUSTOM_API_TOKEN" ]] && echo "NULLION_CUSTOM_API_TOKEN=\"$CUSTOM_API_TOKEN\""
     echo "NULLION_ENABLED_PLUGINS=\"${ENABLED_PLUGINS}\""

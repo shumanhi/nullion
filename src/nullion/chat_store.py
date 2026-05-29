@@ -192,6 +192,42 @@ def _collapse_adjacent_duplicate_bot_messages(messages: list[dict]) -> list[dict
     return collapsed
 
 
+def _artifact_metadata_from_runtime_turn(turn: dict) -> dict[str, Any] | None:
+    paths: list[str] = []
+
+    def add_path(value: object) -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        candidate = Path(value).expanduser()
+        try:
+            if not candidate.is_file():
+                return
+        except OSError:
+            return
+        paths.append(str(candidate))
+
+    for result in turn.get("tool_results") or ():
+        if not isinstance(result, dict):
+            continue
+        output = result.get("output")
+        if not isinstance(output, dict):
+            continue
+        for key in ("path", "artifact_path", "output_path"):
+            add_path(output.get(key))
+        for key in ("artifact_paths", "created_paths", "files"):
+            values = output.get(key)
+            if isinstance(values, (list, tuple)):
+                for value in values:
+                    if isinstance(value, dict):
+                        add_path(value.get("path"))
+                    else:
+                        add_path(value)
+    deduped = list(dict.fromkeys(paths))
+    if not deduped:
+        return None
+    return {"artifacts": [{"path": path} for path in deduped]}
+
+
 def _channel_label_for_conversation(conversation_id: str) -> str:
     if conversation_id == "web" or conversation_id.startswith("web:"):
         return "Web"
@@ -576,7 +612,9 @@ class ChatStore:
         """
         started_at = perf_counter()
         # Validate the date shape while keeping local-date grouping in Python.
-        datetime.strptime(date, "%Y-%m-%d")
+        target_date = datetime.strptime(date, "%Y-%m-%d")
+        expanded_start = (target_date - timedelta(days=1)).date().isoformat()
+        expanded_end = (target_date + timedelta(days=2)).date().isoformat()
         tz = _local_history_timezone()
         with self._connect() as conn:
             candidate_rows = conn.execute(
@@ -587,8 +625,9 @@ class ChatStore:
                    JOIN messages m ON m.conversation_id = c.id
                    WHERE c.id NOT LIKE 'web:live-stage-contract:%'
                      AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
+                     AND m.created_at >= ? AND m.created_at < ?
                    ORDER BY m.created_at ASC""",
-                (channel, channel),
+                (channel, channel, expanded_start, expanded_end),
             ).fetchall()
             grouped: dict[str, dict[str, Any]] = {}
             for row in candidate_rows:
@@ -645,21 +684,27 @@ class ChatStore:
 
         Returns the number of conversation records removed.
         """
+        target_date = datetime.strptime(date, "%Y-%m-%d")
+        expanded_start = (target_date - timedelta(days=1)).date().isoformat()
+        expanded_end = (target_date + timedelta(days=2)).date().isoformat()
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT DISTINCT c.id
                    FROM conversations c
                    JOIN messages m ON m.conversation_id = c.id
                    WHERE c.id NOT LIKE 'web:live-stage-contract:%'
-                     AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))""",
-                (channel, channel),
+                     AND (c.channel = ? OR (? = 'web' AND c.channel LIKE 'web:%'))
+                     AND m.created_at >= ? AND m.created_at < ?""",
+                (channel, channel, expanded_start, expanded_end),
             ).fetchall()
             tz = _local_history_timezone()
             conv_ids = []
             for row in rows:
                 hit = conn.execute(
-                    "SELECT created_at FROM messages WHERE conversation_id = ?",
-                    (row["id"],),
+                    """SELECT created_at FROM messages
+                       WHERE conversation_id = ?
+                         AND created_at >= ? AND created_at < ?""",
+                    (row["id"], expanded_start, expanded_end),
                 ).fetchall()
                 if any(_local_date_for_timestamp(item["created_at"], tz) == date for item in hit):
                     conv_ids.append(row["id"])
@@ -782,7 +827,7 @@ class ChatStore:
         persisted directly to ``chat_history.db``.
         """
         imported = 0
-        existing_by_conversation: dict[str, set[tuple[str, str]]] = {}
+        existing_by_conversation: dict[str, dict[tuple[str, str], tuple[int, dict[str, Any] | None]]] = {}
         sorted_turns = sorted(
             (turn for turn in turns if isinstance(turn, dict)),
             key=lambda turn: str(turn.get("created_at") or ""),
@@ -804,13 +849,16 @@ class ChatStore:
 
                 if conversation_id not in existing_by_conversation:
                     rows = conn.execute(
-                        """SELECT role, text FROM messages
+                        """SELECT id, role, text, metadata FROM messages
                            WHERE conversation_id = ?
                            ORDER BY id ASC""",
                         (conversation_id,),
                     ).fetchall()
                     existing_by_conversation[conversation_id] = {
-                        (str(row["role"]), self._decrypt_text(row["text"]) or "")
+                        (str(row["role"]), self._decrypt_text(row["text"]) or ""): (
+                            int(row["id"]),
+                            json.loads(raw_metadata) if (raw_metadata := (self._decrypt_text(row["metadata"]) if row["metadata"] else "")) else None,
+                        )
                         for row in rows
                     }
 
@@ -828,7 +876,23 @@ class ChatStore:
                         continue
                     safe_text = redact_text(raw_text)
                     key = (role, safe_text)
+                    metadata = _artifact_metadata_from_runtime_turn(turn) if role == "bot" else None
+                    metadata_text = (
+                        json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+                        if metadata
+                        else None
+                    )
                     if key in existing_by_conversation[conversation_id]:
+                        existing_id, existing_metadata = existing_by_conversation[conversation_id][key]
+                        if _metadata_weight(metadata) > _metadata_weight(existing_metadata):
+                            conn.execute(
+                                "UPDATE messages SET metadata = ? WHERE id = ?",
+                                (
+                                    self._encrypt_text(metadata_text) if metadata_text else None,
+                                    existing_id,
+                                ),
+                            )
+                            existing_by_conversation[conversation_id][key] = (existing_id, metadata)
                         continue
                     if role == "user":
                         existing_title = conn.execute(
@@ -840,9 +904,15 @@ class ChatStore:
                                 (self._encrypt_text(_make_title(safe_text)), conversation_id),
                             )
                     conn.execute(
-                        "INSERT INTO messages (conversation_id, role, text, is_error, created_at) "
-                        "VALUES (?, ?, ?, 0, ?)",
-                        (conversation_id, role, self._encrypt_text(safe_text), created_at),
+                        "INSERT INTO messages (conversation_id, role, text, metadata, is_error, created_at) "
+                        "VALUES (?, ?, ?, ?, 0, ?)",
+                        (
+                            conversation_id,
+                            role,
+                            self._encrypt_text(safe_text),
+                            self._encrypt_text(metadata_text) if metadata_text else None,
+                            created_at,
+                        ),
                     )
                     conn.execute(
                         """UPDATE conversations
@@ -853,7 +923,7 @@ class ChatStore:
                            WHERE id = ?""",
                         (created_at, created_at, conversation_id),
                     )
-                    existing_by_conversation[conversation_id].add(key)
+                    existing_by_conversation[conversation_id][key] = (int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]), metadata)
                     imported += 1
         return imported
 

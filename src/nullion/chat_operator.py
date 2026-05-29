@@ -164,6 +164,7 @@ from nullion.turn_relationship_evidence import has_structured_turn_relationship_
 from nullion.turn_context_policy import (
     ScopedTurnToolRegistry,
     TurnToolScopeDecision,
+    build_turn_tool_scope_decision,
     build_turn_tool_evidence,
     is_slash_prefixed_literal_message,
     materialize_mini_agent_tool_scope_registry,
@@ -229,7 +230,7 @@ class StreamedChatReply(str):
     """String reply marker for platform adapters that already streamed it."""
 
     reply_already_sent: bool = True
-_MAX_CHAT_TURNS = 16
+_MAX_CHAT_TURNS = 6
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 16
 _MAX_APPROVAL_PROMPT_TURNS = 20
 _MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
@@ -250,6 +251,7 @@ _PRIMARY_RENDERED_ARTIFACT_STEM_TOKENS = frozenset(
 _IMAGE_ARTIFACT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"})
 _MODEL_ISSUE_SIGNAL_MAX_AGE_SECONDS = 30 * 60
 _MODEL_ISSUE_RECOVERED_AT_BY_RUNTIME: dict[str, datetime] = {}
+_MODEL_ISSUE_RECOVERY_CHECKED_AT_BY_RUNTIME: dict[str, datetime] = {}
 
 
 def _model_issue_runtime_key(runtime: PersistentRuntime) -> str:
@@ -321,6 +323,12 @@ def _recent_model_issue_doctor_records(runtime: PersistentRuntime) -> list[dict[
 def _recover_stale_model_issue_if_possible(runtime: PersistentRuntime, model_client: object | None) -> bool:
     if model_client is None:
         return False
+    runtime_key = _model_issue_runtime_key(runtime)
+    now = datetime.now(UTC)
+    last_checked = _MODEL_ISSUE_RECOVERY_CHECKED_AT_BY_RUNTIME.get(runtime_key)
+    if last_checked is not None and (now - last_checked).total_seconds() < _model_issue_recovery_probe_min_interval_seconds():
+        return False
+    _MODEL_ISSUE_RECOVERY_CHECKED_AT_BY_RUNTIME[runtime_key] = now
     try:
         from nullion.health_monitor import clear_recovered_service_doctor_actions
         from nullion.health_probes import make_model_api_probe
@@ -333,11 +341,44 @@ def _recover_stale_model_issue_if_possible(runtime: PersistentRuntime, model_cli
             "model_api",
             reason="model API probe recovered during chat preflight",
         )
-        _MODEL_ISSUE_RECOVERED_AT_BY_RUNTIME[_model_issue_runtime_key(runtime)] = datetime.now(UTC)
+        _clear_recovered_model_issue_doctor_actions(
+            runtime,
+            reason="model API probe recovered during chat preflight",
+        )
+        _MODEL_ISSUE_RECOVERED_AT_BY_RUNTIME[runtime_key] = datetime.now(UTC)
         return True
     except Exception:
         logger.debug("Could not verify model API recovery during chat preflight", exc_info=True)
         return False
+
+
+def _clear_recovered_model_issue_doctor_actions(runtime: PersistentRuntime, *, reason: str) -> int:
+    cleared = 0
+    try:
+        actions = list(runtime.store.list_doctor_actions())
+    except Exception:
+        return 0
+    for action in actions:
+        if str(action.get("status") or "").strip().lower() != "pending":
+            continue
+        if _model_issue_reply_for_doctor_record(action) is None:
+            continue
+        action_id = str(action.get("action_id") or "").strip()
+        if not action_id:
+            continue
+        try:
+            runtime.cancel_doctor_action(action_id, reason=reason)
+            cleared += 1
+        except Exception:
+            logger.debug("Could not clear recovered model issue doctor action %s", action_id, exc_info=True)
+    return cleared
+
+
+def _model_issue_recovery_probe_min_interval_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("NULLION_MODEL_RECOVERY_PROBE_MIN_INTERVAL_SECONDS", "300")))
+    except ValueError:
+        return 300.0
 
 
 def _chat_model_issue_reply(runtime: PersistentRuntime, *, message: str, model_client: object | None = None) -> str | None:
@@ -686,6 +727,37 @@ def _requested_attachment_extension(
             continue
         planning_prompt = planning_prompt.replace(name, "attached file")
     return plan_attachment_format(planning_prompt, model_client=planner_model_client).extension
+
+
+def _literal_requested_attachment_extensions(prompt: str) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for raw_token in re.split(r"\s+", str(prompt or "")):
+        token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
+        if not token:
+            continue
+        extension = Path(token).suffix.lower().strip()
+        if extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+def _requested_attachment_extensions(
+    prompt: str,
+    *,
+    model_client: object | None = None,
+    allow_model_planning: bool = False,
+    source_attachment_names: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    extensions: list[str] = list(_literal_requested_attachment_extensions(prompt))
+    planned = _requested_attachment_extension(
+        prompt,
+        model_client=model_client,
+        allow_model_planning=allow_model_planning,
+        source_attachment_names=source_attachment_names,
+    )
+    if planned and planned not in extensions:
+        extensions.append(planned)
+    return tuple(extensions)
 
 
 def _required_attachment_extensions_from_tool_scope(
@@ -1853,6 +1925,120 @@ def _reply_context_prompt(reply_context: dict[str, object] | None) -> str | None
     return " ".join(parts) + "."
 
 
+def _scheduled_task_name_from_reply_context(reply_context: dict[str, object] | None) -> str | None:
+    if not isinstance(reply_context, dict):
+        return None
+    if reply_context.get("reply_to_from_bot") is not True:
+        return None
+    text = str(reply_context.get("reply_to_text") or "").strip()
+    if not text:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    header = lines[0].upper()
+    if "SCHEDULED TASK" not in header and "MANUAL SCHEDULED" not in header:
+        return None
+    for line in lines[1:4]:
+        match = re.match(r"^For:\s*(?P<name>.+?)\s*$", line)
+        if match:
+            name = match.group("name").strip(" .:-")
+            return name or None
+    match = re.match(
+        r"^(?:[^\w\[]+\s*)?(?:MANUAL\s+)?SCHEDULED\s+TASK(?:\s+RUN)?\s*:\s*(?P<name>.+?)\s*$",
+        lines[0],
+        flags=re.IGNORECASE,
+    )
+    if match:
+        name = match.group("name").strip(" .:-")
+        return name or None
+    return None
+
+
+def _turn_scope_requests_delete_cron(tool_registry: object) -> bool:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if scheduler_action != "mutate":
+        return False
+    selected_tools = {
+        str(tool_name or "").strip()
+        for tool_name in (
+            tuple(getattr(decision, "requested_tool_names", ()) or ())
+            + tuple(getattr(decision, "required_tool_names", ()) or ())
+        )
+        if str(tool_name or "").strip()
+    }
+    return "delete_cron" in selected_tools
+
+
+def _delete_cron_reply_from_result(result: ToolResult, cron_name: str) -> str:
+    if normalize_tool_status(result.status) == "completed":
+        output_name = ""
+        if isinstance(result.output, dict):
+            output_name = str(result.output.get("name") or "").strip()
+        name = output_name or cron_name
+        return f"Done - I deleted the **{name}** cron.\n\nIt will no longer run."
+    return result.error or f"I could not delete the **{cron_name}** cron."
+
+
+def _delete_cron_args_for_quoted_name(principal_id: str, cron_name: str) -> tuple[dict[str, str] | None, str | None]:
+    try:
+        from nullion.connections import workspace_id_for_principal
+        from nullion.crons import list_crons
+    except Exception:
+        logger.debug("Could not import cron lookup helpers for reply-context delete", exc_info=True)
+        return None, "I could not inspect your scheduled tasks right now."
+    workspace_id = workspace_id_for_principal(principal_id)
+    target = str(cron_name or "").strip()
+    if not target:
+        return None, "I could not identify the scheduled task from the quoted message."
+    try:
+        jobs = list_crons(workspace_id=workspace_id)
+    except Exception:
+        logger.debug("Could not list crons for reply-context delete", exc_info=True)
+        return None, "I could not inspect your scheduled tasks right now."
+    matches = [
+        job
+        for job in jobs
+        if str(getattr(job, "name", "") or "").strip().casefold() == target.casefold()
+    ]
+    if len(matches) != 1:
+        return None, (
+            f"I found the quoted scheduled task name **{target}**, but could not match it to one current cron."
+            if not matches
+            else f"I found more than one current cron named **{target}**."
+        )
+    cron_id = str(getattr(matches[0], "id", "") or "").strip()
+    if not cron_id:
+        return None, f"I found **{target}**, but it does not have a usable cron id."
+    return {"id": cron_id}, None
+
+
+def _reply_context_history_anchor(reply_context_text: str | None) -> list[dict[str, object]]:
+    text = str(reply_context_text or "").strip()
+    if not text:
+        return []
+    return [
+        {
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": (
+                    "Reply anchor: the immediately following assistant message is the exact platform "
+                    "message the user replied to. Interpret the current user message against this "
+                    "reply anchor before unrelated recent turns."
+                ),
+            }],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": _trim_context_text(text, 3000)}],
+        },
+    ]
+
+
 
 def _messaging_channel_and_identity_for_chat(chat_id: str | None) -> tuple[str, str | None]:
     if chat_id is None:
@@ -1960,17 +2146,38 @@ def _remember_explicit_memory(
     if _is_internal_scheduled_task_context(prompt):
         return
     owner = _memory_owner_for_chat(chat_id, settings)
-    written = capture_explicit_user_memory(
-        runtime.store,
-        owner=owner,
-        text=prompt,
-        source="telegram_chat",
-    )
-    if written:
+
+    def _worker() -> None:
         try:
-            runtime.checkpoint()
+            written = capture_explicit_user_memory(
+                runtime.store,
+                owner=owner,
+                text=prompt,
+                source="telegram_chat",
+            )
+            if written:
+                runtime.checkpoint()
         except Exception:
-            logger.debug("Unable to checkpoint explicit chat memory", exc_info=True)
+            logger.debug("Unable to capture explicit chat memory", exc_info=True)
+
+    try:
+        sync_capture = _feature_enabled("NULLION_CHAT_EXPLICIT_MEMORY_SYNC_CAPTURE", default=False)
+    except TypeError:
+        sync_capture = _feature_enabled("NULLION_CHAT_EXPLICIT_MEMORY_SYNC_CAPTURE")
+    if sync_capture:
+        _worker()
+        return
+    timer = threading.Timer(_chat_background_memory_start_delay_seconds(), _worker)
+    timer.name = "nullion-chat-explicit-memory"
+    timer.daemon = True
+    timer.start()
+
+
+def _chat_background_memory_start_delay_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("NULLION_CHAT_BACKGROUND_MEMORY_START_DELAY_SECONDS", "15")))
+    except ValueError:
+        return 15.0
 
 
 def _chat_turn_memory_min_user_chars() -> int:
@@ -1992,6 +2199,12 @@ def _schedule_chat_turn_memory_capture(
 ) -> None:
     """Persist explicit durable preferences from ordinary chat turns off-path."""
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
+        return
+    try:
+        no_tool_memory_enabled = _feature_enabled("NULLION_MEMORY_NO_TOOL_CAPTURE_ENABLED", default=False)
+    except TypeError:
+        no_tool_memory_enabled = _feature_enabled("NULLION_MEMORY_NO_TOOL_CAPTURE_ENABLED")
+    if not no_tool_memory_enabled:
         return
     if tool_results:
         return
@@ -2058,7 +2271,10 @@ def _schedule_chat_turn_memory_capture(
     except Exception:
         logger.debug("Unable to schedule chat memory capture", exc_info=True)
 
-    threading.Thread(target=_worker, name="nullion-chat-memory-capture", daemon=True).start()
+    timer = threading.Timer(_chat_background_memory_start_delay_seconds(), _worker)
+    timer.name = "nullion-chat-memory-capture"
+    timer.daemon = True
+    timer.start()
 
 
 
@@ -2080,6 +2296,8 @@ def _registry_has_context_selecting_tools(registry: object | None) -> bool:
         "create_cron",
         "update_cron",
         "delete_cron",
+        "delete_reminder",
+        "update_reminder",
         "enable_cron",
         "disable_cron",
     }
@@ -2135,6 +2353,15 @@ def _automatic_saved_chat_history_prompt(
     query = str(prompt or "").strip()
     if not query or not conversation_id:
         return None
+    search_query_parts = [query]
+    for visible_turn in visible_turns[-2:]:
+        user_text = str(visible_turn.get("user") or "").strip()
+        assistant_text = str(visible_turn.get("assistant") or "").strip()
+        if user_text:
+            search_query_parts.append(_trim_context_text(user_text, 500))
+        if assistant_text:
+            search_query_parts.append(_trim_context_text(assistant_text, 700))
+    search_query = "\n".join(search_query_parts)
     try:
         registry = with_conversation_history_tool(
             ToolRegistry(),
@@ -2146,7 +2373,7 @@ def _automatic_saved_chat_history_prompt(
                 invocation_id=f"auto-history-{uuid4().hex}",
                 tool_name=CHAT_HISTORY_SEARCH_TOOL_NAME,
                 principal_id="conversation_history:auto",
-                arguments={"query": query, "limit": max(_AUTO_HISTORY_CONTEXT_LIMIT * 4, 24)},
+                arguments={"query": search_query, "limit": max(_AUTO_HISTORY_CONTEXT_LIMIT * 4, 24)},
             )
         )
     except Exception:
@@ -2292,8 +2519,29 @@ def _automatic_saved_chat_history_prompt(
             if str(name).strip()
         ]
 
+    def _tool_evidence(match: dict[str, object]) -> list[dict[str, object]]:
+        evidence = match.get("tool_evidence")
+        if not isinstance(evidence, list):
+            return []
+        return [item for item in evidence if isinstance(item, dict)]
+
+    def _format_tool_evidence(match: dict[str, object]) -> str | None:
+        evidence = _tool_evidence(match)
+        if not evidence:
+            return None
+        try:
+            text = json.dumps(evidence[:4], ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            text = str(evidence[:4])
+        return _trim_context_text(text, 2200)
+
     def _has_runtime_evidence(match: dict[str, object]) -> bool:
-        return bool(_structured_refs(match) or _tool_names(match))
+        concrete_tool_names = [
+            name
+            for name in _tool_names(match)
+            if name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+        ]
+        return bool(_structured_refs(match) or concrete_tool_names or _tool_evidence(match))
 
     def _structured_ref_identity(ref: dict[str, object]) -> tuple[object, ...]:
         return (
@@ -2437,6 +2685,9 @@ def _automatic_saved_chat_history_prompt(
             lines.append(" ".join(header_parts))
             if tool_names:
                 lines.append("Tools: " + ", ".join(tool_names[:10]))
+            tool_evidence = _format_tool_evidence(match)
+            if tool_evidence:
+                lines.append("Tool evidence: " + tool_evidence)
             if user_message:
                 lines.append("User: " + user_message)
             if assistant_reply:
@@ -2521,6 +2772,30 @@ def _automatic_saved_chat_history_prompt(
         if assistant_reply:
             lines.append(f"Assistant: {assistant_reply}")
     return "\n".join(lines)
+
+
+def _should_auto_include_saved_chat_history(
+    conversation_result: object | None,
+    *,
+    reply_context_prompt: str | None,
+    numbered_option_context: str | None,
+    requested_extensions: Iterable[str] | None,
+) -> bool:
+    if turn_is_context_linked(conversation_result):
+        return True
+    if reply_context_prompt or numbered_option_context:
+        return True
+    return any(str(extension or "").strip() for extension in (requested_extensions or ()))
+
+
+_NUMBERED_CHOICE_LINE_RE = re.compile(r"(?m)^\s*\d{1,2}\.\s+\S")
+
+
+def _assistant_reply_has_numbered_choice_prompt(reply: object) -> bool:
+    text = str(reply or "").strip()
+    if not text:
+        return False
+    return len(_NUMBERED_CHOICE_LINE_RE.findall(text)) >= 2
 
 
 def _conversation_context_boundary_prompt(result) -> str | None:
@@ -2627,6 +2902,41 @@ def _registry_tool_names(registry: object) -> set[str]:
     return {name for name in names if name}
 
 
+class _ToolRegistryWithoutRequestScope:
+    def __init__(self, registry: object) -> None:
+        self._registry = registry
+        self.turn_tool_scope_decision = getattr(registry, "turn_tool_scope_decision", None)
+
+    def list_tool_definitions(self) -> list[dict[str, object]]:
+        return [
+            definition
+            for definition in self._registry.list_tool_definitions()
+            if str(definition.get("name") or "") != "request_tool_scope"
+        ]
+
+    def list_specs(self):
+        return [
+            spec
+            for spec in self._registry.list_specs()
+            if str(getattr(spec, "name", "") or "") != "request_tool_scope"
+        ]
+
+    def get_spec(self, name: str):
+        if name == "request_tool_scope":
+            raise KeyError(name)
+        return self._registry.get_spec(name)
+
+    def invoke(self, invocation):
+        if getattr(invocation, "tool_name", None) == "request_tool_scope":
+            raise KeyError("request_tool_scope")
+        return self._registry.invoke(invocation)
+
+    def filesystem_allowed_roots(self):
+        if hasattr(self._registry, "filesystem_allowed_roots"):
+            return self._registry.filesystem_allowed_roots()
+        return ()
+
+
 def _saved_history_evidence_tool_names(history_context: str | None, *, evidence_limit: int) -> tuple[str, ...]:
     if not history_context or evidence_limit <= 0:
         return ()
@@ -2661,10 +2971,16 @@ def _saved_history_evidence_tool_names(history_context: str | None, *, evidence_
             continue
         if not line.startswith("Tools: "):
             continue
+        added_for_evidence = False
         for raw_name in line.removeprefix("Tools: ").split(","):
             name = raw_name.strip()
+            if name in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}:
+                continue
             if name and name not in names:
                 names.append(name)
+                added_for_evidence = True
+        if added_for_evidence and len(names) >= evidence_limit:
+            break
     return tuple(names)
 
 
@@ -2716,7 +3032,9 @@ def _augment_tool_registry_from_saved_history_context(
         confidence=max(float(getattr(existing, "confidence", 0.0) or 0.0), 1.0),
         valid=True,
     )
-    return ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
+    return _ToolRegistryWithoutRequestScope(
+        ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
+    )
 
 
 def _saved_history_tool_scope_prompt(history_context: str | None) -> str | None:
@@ -2737,6 +3055,33 @@ def _saved_history_tool_scope_prompt(history_context: str | None) -> str | None:
         + ". If the requested answer depends on current external state for the resolved target, use the matching "
         "live tool before finalizing. Do not ask the user to resend target details already identified by the saved "
         "runtime evidence."
+    )
+
+
+def _saved_history_live_verification_retry_prompt(history_context: str | None) -> str | None:
+    tool_names = _saved_history_evidence_tool_names(
+        history_context,
+        evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+    )
+    live_tool_names = [
+        name
+        for name in tool_names
+        if name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    if not live_tool_names:
+        return (
+            "The previous attempt used saved chat history without a concrete live verification tool. "
+            "Saved history can identify the target, but it is not enough by itself for a current check. "
+            "Use the available tool-scope mechanism to request an appropriate live read tool for the resolved "
+            "structured target before finalizing when current state is needed."
+        )
+    return (
+        "The previous attempt used saved chat history without a concrete live verification tool. "
+        "Saved history can identify the target, but it is not enough by itself for a current check "
+        "when matching live tools are available. Use one of these matching live tools before finalizing "
+        "if the user is asking to check, verify, update, or confirm current state: "
+        + ", ".join(live_tool_names[:12])
+        + "."
     )
 
 
@@ -3159,6 +3504,8 @@ def _chat_ambiguity_classifier(
         except Exception:
             return None
         if str(decision.reason or "").startswith("model_structured_"):
+            if reply_anchor_text and decision.disposition is ConversationTurnDisposition.INTERRUPT:
+                return ConversationTurnDisposition.INDEPENDENT
             return decision.disposition
         return None
 
@@ -4143,7 +4490,8 @@ def _append_chat_artifacts_to_reply(
         required_attachment_extensions,
         tool_results,
     )
-    requested_extension = (tuple(required_attachment_extensions or ()) or (None,))[0]
+    requested_extensions = tuple(required_attachment_extensions or ())
+    requested_extension = requested_extensions[0] if len(requested_extensions) == 1 else None
     artifact_roots = tuple(dict.fromkeys((artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))))
     email_attachment_paths = _completed_email_attachment_paths(tool_results)
     browser_screenshot_paths = _browser_screenshot_artifact_paths(tool_results)
@@ -4309,7 +4657,11 @@ def _append_chat_artifacts_to_reply(
         prompt,
         descriptors,
         requested_extension=requested_extension
-        or (None if reply_media_paths or supporting_assets_promoted else _requested_attachment_extension(prompt)),
+        or (
+            None
+            if reply_media_paths or supporting_assets_promoted or len(requested_extensions) > 1
+            else _requested_attachment_extension(prompt)
+        ),
     )
     descriptors = _filter_text_sidecar_artifact_descriptors(
         descriptors,
@@ -4986,7 +5338,7 @@ def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id:
                 scopes.append("skill_pack")
             elif tool_name == CHAT_HISTORY_SEARCH_TOOL_NAME:
                 scopes.append("conversation_history")
-            elif tool_name in {"list_crons", "run_cron", "create_cron", "update_cron", "delete_cron"}:
+            elif tool_name in {"list_crons", "run_cron", "create_cron", "update_cron", "delete_cron", "delete_reminder", "update_reminder"}:
                 scopes.append("scheduler")
             elif tool_name.startswith("browser_") or tool_name in {"web_fetch", "web_search"}:
                 scopes.append("web")
@@ -5150,11 +5502,7 @@ def _execute_compound_chat_turn(
         )
 
     combined_reply = "\n\n".join(replies)
-    requested_attachment_extensions = tuple(
-        extension
-        for extension in (_requested_attachment_extension(prompt, model_client=model_client),)
-        if extension
-    )
+    requested_attachment_extensions = _requested_attachment_extensions(prompt, model_client=model_client)
     contract = _build_chat_response_contract(
         runtime,
         prompt=prompt,
@@ -5943,21 +6291,16 @@ def _render_chat_turn(
     phase_tracker.emit(PHASE_CHECK_ATTACHMENTS, "running")
     normalized_attachments = normalize_chat_attachments(attachments or [])
     phase_tracker.done(PHASE_CHECK_ATTACHMENTS, "attachments", f"{len(normalized_attachments)} attachment{'s' if len(normalized_attachments) != 1 else ''}")
-    requested_attachment_extensions = tuple(
-        extension for extension in (
-            _requested_attachment_extension(
-                effective_prompt,
-                model_client=model_client,
-                allow_model_planning=(
-                    planner_requested
-                    or bool(numbered_option_context)
-                    or bool(normalized_attachments)
-                    or extract_url_target(effective_prompt) is not None
-                ),
-                source_attachment_names=(attachment.name for attachment in normalized_attachments),
-            ),
-        )
-        if extension
+    requested_attachment_extensions = _requested_attachment_extensions(
+        effective_prompt,
+        model_client=model_client,
+        allow_model_planning=(
+            planner_requested
+            or bool(numbered_option_context)
+            or bool(normalized_attachments)
+            or extract_url_target(effective_prompt) is not None
+        ),
+        source_attachment_names=(attachment.name for attachment in normalized_attachments),
     )
     scope_requested_extensions = _inferred_scope_extensions_from_recent_artifacts(
         runtime,
@@ -5981,9 +6324,13 @@ def _render_chat_turn(
         saved_history_available=_saved_conversation_history_available(runtime, conversation_id),
         prior_tool_scopes=_recent_tool_scopes_for_context(runtime, conversation_id),
     )
+    quoted_cron_name = _scheduled_task_name_from_reply_context(reply_context)
+    tool_scope_user_message = "\n\n".join(
+        part for part in (effective_prompt, reply_context_prompt if quoted_cron_name else None) if part
+    )
     fast_profile_candidate = _messaging_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
-        user_message=effective_prompt,
+        user_message=tool_scope_user_message,
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
@@ -5998,6 +6345,8 @@ def _render_chat_turn(
         force_mini_agent_dispatch=False,
         turn_dispatch_decision=turn_dispatch_decision,
     )
+    if quoted_cron_name:
+        skip_tool_scope_decision = False
     phase_tracker.emit(PHASE_SELECT_TOOLS, "running")
     base_tool_registry = with_conversation_history_tool(
         runtime.active_tool_registry or ToolRegistry(),
@@ -6009,7 +6358,7 @@ def _render_chat_turn(
             base_tool_registry,
             evidence=turn_tool_evidence,
             model_client=None,
-            user_message=effective_prompt,
+            user_message=tool_scope_user_message,
         )
         _mark_timing("tool_scope_decision_skipped")
     else:
@@ -6021,9 +6370,26 @@ def _render_chat_turn(
             base_tool_registry,
             evidence=turn_tool_evidence,
             model_client=tool_scope_model_client,
-            user_message=effective_prompt,
+            user_message=tool_scope_user_message,
         )
         _mark_timing("tool_scope_registry_done")
+    if quoted_cron_name and not _turn_scope_requests_delete_cron(active_turn_tool_registry):
+        forced_scope_client = getattr(agent_orchestrator, "model_client", None) or model_client
+        if fast_profile_candidate:
+            forced_scope_client = _model_client_with_interactive_fast_profile(forced_scope_client)
+        forced_decision = build_turn_tool_scope_decision(
+            model_client=forced_scope_client,
+            user_message=tool_scope_user_message,
+            evidence=turn_tool_evidence,
+            registry=base_tool_registry,
+            force_model_decision=True,
+        )
+        if forced_decision.valid:
+            active_turn_tool_registry = ScopedTurnToolRegistry(
+                base_tool_registry,
+                evidence=turn_tool_evidence,
+                tool_scope_decision=forced_decision,
+            )
     phase_tracker.done(PHASE_SELECT_TOOLS, "tool_scope_registry")
     try:
         turn_latency.set(scoped_tool_count=len(active_turn_tool_registry.list_tool_definitions()))
@@ -6038,6 +6404,67 @@ def _render_chat_turn(
         enabled=fast_profile_candidate,
         tool_registry=active_turn_tool_registry,
     )
+    if quoted_cron_name and _turn_scope_requests_delete_cron(active_turn_tool_registry):
+        if activity_callback is not None:
+            activity_callback({
+                "id": "delete-cron-reply-context",
+                "label": "Deleting quoted cron",
+                "status": "running",
+            })
+        delete_cron_args, delete_cron_arg_error = _delete_cron_args_for_quoted_name(principal_id, quoted_cron_name)
+        if delete_cron_args is None:
+            delete_cron_result = ToolResult(
+                invocation_id=f"reply-context-delete-cron-{request_id or uuid4().hex}",
+                tool_name="delete_cron",
+                status="failed",
+                output={"name": quoted_cron_name},
+                error=delete_cron_arg_error or "Could not resolve the quoted cron.",
+            )
+        else:
+            delete_cron_result = invoke_tool_with_boundary_policy(
+                runtime.store,
+                ToolInvocation(
+                    invocation_id=f"reply-context-delete-cron-{request_id or uuid4().hex}",
+                    tool_name="delete_cron",
+                    principal_id=principal_id,
+                    arguments=delete_cron_args,
+                    capsule_id=None,
+                ),
+                registry=active_turn_tool_registry,
+            )
+        if activity_callback is not None:
+            detail = delete_cron_result.error or (
+                str(delete_cron_result.output.get("message") or "")[:140]
+                if isinstance(delete_cron_result.output, dict)
+                else ""
+            )
+            activity_callback({
+                "id": "delete-cron-reply-context",
+                "label": "Deleting quoted cron",
+                "status": "done" if normalize_tool_status(delete_cron_result.status) == "completed" else "failed",
+                **({"detail": detail} if detail else {}),
+            })
+        reply = _delete_cron_reply_from_result(delete_cron_result, quoted_cron_name)
+        _remember_chat_turn(
+            runtime,
+            chat_id=chat_id,
+            user_message=prompt,
+            assistant_reply=reply,
+            conversation_turn_id=conversation_result.turn.turn_id,
+            tool_results=[delete_cron_result],
+        )
+        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        runtime.checkpoint()
+        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("delete_cron_reply_context")
+        _log_timing_if_slow(
+            "delete_cron_reply_context",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+            tool_count=1,
+        )
+        _finish_latency("delete_cron_reply_context", tool_count=1)
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
     cron_selection_args = _pending_run_cron_numbered_selection_args(
         runtime,
         conversation_id=conversation_id,
@@ -6402,11 +6829,20 @@ def _render_chat_turn(
                 thread,
                 active_turn_tool_registry,
             )
-            automatic_history_context = _automatic_saved_chat_history_prompt(
-                runtime,
-                conversation_id=conversation_id,
-                prompt=effective_prompt,
-                visible_turns=visible_conversation_turns,
+            automatic_history_context = (
+                _automatic_saved_chat_history_prompt(
+                    runtime,
+                    conversation_id=conversation_id,
+                    prompt=effective_prompt,
+                    visible_turns=visible_conversation_turns,
+                )
+                if _should_auto_include_saved_chat_history(
+                    conversation_result,
+                    reply_context_prompt=reply_context_prompt,
+                    numbered_option_context=numbered_option_context,
+                    requested_extensions=requested_attachment_extensions,
+                )
+                else None
             )
             if automatic_history_context:
                 widened_tool_registry = _augment_tool_registry_from_saved_history_context(
@@ -6450,6 +6886,14 @@ def _render_chat_turn(
                     "role": "assistant",
                     "content": [{"type": "text", "text": past_turn["assistant"]}],
                 })
+            if reply_context_text:
+                last_visible_assistant = (
+                    str(visible_conversation_turns[-1].get("assistant") or "").strip()
+                    if visible_conversation_turns
+                    else ""
+                )
+                if last_visible_assistant != reply_context_text:
+                    orchestrator_conversation_history.extend(_reply_context_history_anchor(reply_context_text))
             # Skill injection: if a stored skill matches the current message well,
             # prepend its steps as a system-level procedure hint so the LLM follows
             # the learned workflow instead of starting from scratch.
@@ -6790,6 +7234,76 @@ def _render_chat_turn(
                     tool_flow_context=turn_tool_flow_context,
                 )
                 _mark_timing("model_tools")
+                turn_result_tool_results = list(getattr(turn_result, "tool_results", None) or [])
+                turn_result_used_history_search = any(
+                    getattr(result, "tool_name", None) == CHAT_HISTORY_SEARCH_TOOL_NAME
+                    for result in turn_result_tool_results
+                )
+                turn_result_has_substantive_tools = any(
+                    getattr(result, "tool_name", None) not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+                    for result in turn_result_tool_results
+                )
+                if (
+                    not turn_result_has_substantive_tools
+                    and not getattr(turn_result, "artifacts", None)
+                    and not getattr(turn_result, "suspended_for_approval", False)
+                    and (
+                        turn_result_used_history_search
+                        or _assistant_reply_has_numbered_choice_prompt(getattr(turn_result, "final_text", None))
+                    )
+                ):
+                    retry_history_context = automatic_history_context or _automatic_saved_chat_history_prompt(
+                        runtime,
+                        conversation_id=conversation_id,
+                        prompt=effective_prompt,
+                        visible_turns=visible_conversation_turns,
+                    )
+                    if retry_history_context:
+                        retry_tool_registry = _augment_tool_registry_from_saved_history_context(
+                            active_turn_tool_registry,
+                            base_registry=base_tool_registry,
+                            evidence=turn_tool_evidence,
+                            history_context=retry_history_context,
+                        )
+                        retry_history = list(orchestrator_conversation_history)
+                        retry_tool_scope_prompt = _saved_history_tool_scope_prompt(retry_history_context)
+                        if retry_tool_scope_prompt:
+                            retry_history.append({
+                                "role": "system",
+                                "content": [{"type": "text", "text": retry_tool_scope_prompt}],
+                            })
+                        if turn_result_used_history_search:
+                            retry_live_prompt = _saved_history_live_verification_retry_prompt(retry_history_context)
+                            if retry_live_prompt:
+                                retry_history.append({
+                                    "role": "system",
+                                    "content": [{"type": "text", "text": retry_live_prompt}],
+                                })
+                        retry_history.append({
+                            "role": "system",
+                            "content": [{"type": "text", "text": retry_history_context}],
+                        })
+                        retry_reference_context_message = _saved_history_reference_context_message(
+                            retry_history_context
+                        )
+                        if retry_reference_context_message:
+                            retry_history.append(retry_reference_context_message)
+                        turn_result = agent_orchestrator.run_turn(
+                            conversation_id=conversation_id,
+                            principal_id=principal_id,
+                            user_message=effective_prompt,
+                            user_content_blocks=user_content_blocks,
+                            conversation_history=retry_history,
+                            tool_registry=retry_tool_registry,
+                            policy_store=runtime.store,
+                            approval_store=runtime.store,
+                            tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                            text_delta_callback=_safe_text_delta_callback if streaming_safe else None,
+                            cancellation_checker=cancellation_checker,
+                            tool_flow_context=turn_tool_flow_context,
+                        )
+                        active_turn_tool_registry = retry_tool_registry
+                        _mark_timing("saved_history_retry")
                 phase_tracker.done(PHASE_RUN_TOOLS, "model_tools", format_tool_results_activity_detail(turn_result.tool_results))
                 activity_tool_results = list(turn_result.tool_results)
                 thinking_text = getattr(turn_result, "thinking_text", None)

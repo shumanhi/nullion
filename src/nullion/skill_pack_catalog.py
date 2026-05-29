@@ -188,6 +188,116 @@ SKILL_PACK_CATALOG: tuple[SkillPackCatalogEntry, ...] = (
         ),
     ),
     SkillPackCatalogEntry(
+        pack_id="maton-ai/api-gateway-skill",
+        name="Maton API Gateway",
+        source_url="built-in",
+        status="built-in",
+        summary="Maton gateway workflow guidance for authorized third-party SaaS/API connections.",
+        coverage=(
+            "Maton app-prefixed API gateway paths",
+            "Connection management and account authorization checks",
+            "Service reference lookup before connector_request calls",
+        ),
+        setup_hint="Add a workspace connection with base URL https://api.maton.ai and a Maton API key credential reference.",
+        required_tools=("connector_request",),
+        auth_providers=(
+            SkillPackAuthProvider(
+                provider_id="skill_pack_connector_maton_ai_api_gateway_skill",
+                name="Maton API gateway",
+                credential_policy="admin_decides",
+                notes="Use for a Maton API key and api.maton.ai base URL.",
+            ),
+        ),
+    ),
+    SkillPackCatalogEntry(
+        pack_id="composio/mcp-connector-skill",
+        name="Composio MCP Connector",
+        source_url="built-in",
+        status="built-in",
+        summary="Composio MCP/direct API connector guidance with dynamic tool discovery.",
+        coverage=(
+            "Composio MCP and connected app tool discovery",
+            "Workspace credential references for Composio accounts",
+            "Connector_request boundary guidance for configured Composio URLs",
+        ),
+        setup_hint="Add a workspace connection for the Composio MCP/server URL or API base and COMPOSIO_API_KEY credential reference.",
+        required_tools=("connector_request",),
+        auth_providers=(
+            SkillPackAuthProvider(
+                provider_id="skill_pack_connector_composio_mcp_connector_skill",
+                name="Composio MCP connector",
+                credential_policy="admin_decides",
+                notes="Use for Composio MCP or direct API connector credentials.",
+            ),
+        ),
+    ),
+    SkillPackCatalogEntry(
+        pack_id="nango/mcp-connector-skill",
+        name="Nango MCP Connector",
+        source_url="built-in",
+        status="built-in",
+        summary="Nango integration connector guidance for connection-scoped actions.",
+        coverage=(
+            "Nango MCP/integration action discovery",
+            "Connection and integration identifiers",
+            "Workspace-scoped Nango secret references",
+        ),
+        setup_hint="Add a workspace connection for the Nango MCP/server URL or API base and NANGO_SECRET_KEY credential reference.",
+        required_tools=("connector_request",),
+        auth_providers=(
+            SkillPackAuthProvider(
+                provider_id="skill_pack_connector_nango_mcp_connector_skill",
+                name="Nango MCP connector",
+                credential_policy="admin_decides",
+                notes="Use for Nango MCP or integration action credentials.",
+            ),
+        ),
+    ),
+    SkillPackCatalogEntry(
+        pack_id="activepieces/mcp-connector-skill",
+        name="Activepieces MCP Connector",
+        source_url="built-in",
+        status="built-in",
+        summary="Activepieces MCP/automation connector guidance for exposed pieces and flows.",
+        coverage=(
+            "Activepieces MCP tool discovery",
+            "Flow and piece execution boundaries",
+            "Workspace-scoped Activepieces credential references",
+        ),
+        setup_hint="Add a workspace connection for the Activepieces MCP/server URL or API base and ACTIVEPIECES_API_KEY credential reference.",
+        required_tools=("connector_request",),
+        auth_providers=(
+            SkillPackAuthProvider(
+                provider_id="skill_pack_connector_activepieces_mcp_connector_skill",
+                name="Activepieces MCP connector",
+                credential_policy="admin_decides",
+                notes="Use for Activepieces MCP or automation API credentials.",
+            ),
+        ),
+    ),
+    SkillPackCatalogEntry(
+        pack_id="n8n/mcp-connector-skill",
+        name="n8n MCP Connector",
+        source_url="built-in",
+        status="built-in",
+        summary="n8n MCP/workflow connector guidance for instance-specific tools and workflows.",
+        coverage=(
+            "n8n MCP tool and workflow discovery",
+            "Instance base URL boundary checks",
+            "Workspace-scoped n8n API credential references",
+        ),
+        setup_hint="Add a workspace connection for the n8n instance or MCP server and N8N_API_KEY credential reference.",
+        required_tools=("connector_request",),
+        auth_providers=(
+            SkillPackAuthProvider(
+                provider_id="skill_pack_connector_n8n_mcp_connector_skill",
+                name="n8n MCP connector",
+                credential_policy="admin_decides",
+                notes="Use for n8n MCP, workflow, or API credentials.",
+            ),
+        ),
+    ),
+    SkillPackCatalogEntry(
         pack_id="google/skills",
         name="Google Skills",
         source_url="https://github.com/google/skills",
@@ -261,7 +371,7 @@ def builtin_nullion_skill_pack_ids() -> tuple[str, ...]:
 
 
 def default_enabled_skill_pack_ids() -> tuple[str, ...]:
-    """Skill packs enabled by default; users can disable any of them in setup or Settings."""
+    """Skill packs enabled by default; built-in packs are core runtime knowledge."""
     return builtin_nullion_skill_pack_ids()
 
 
