@@ -24,6 +24,12 @@ _MATCH_CONTEXT_PREVIOUS_TURNS = 4
 _MATCH_CONTEXT_FOLLOWING_TURNS = 1
 _MAX_STRUCTURED_REFERENCES = 8
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
+_SCHEDULED_TASK_DELIVERY_CONTEXT_RE = re.compile(
+    r"^\[Scheduled task delivery context\]\s*task=(?P<task>[^;\n]+)"
+    r"(?:;\s*channel=(?P<channel>[^;\n]+))?"
+    r"(?:;\s*artifacts=(?P<artifacts>[^\n]+))?",
+    re.IGNORECASE,
+)
 
 
 CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
@@ -97,6 +103,19 @@ def _normalized_url(raw_url: str) -> str | None:
 def _structured_references_from_text(text: object) -> list[dict[str, object]]:
     refs: list[dict[str, object]] = []
     seen: set[tuple[object, ...]] = set()
+    scheduled_context = _SCHEDULED_TASK_DELIVERY_CONTEXT_RE.match(str(text or "").strip())
+    if scheduled_context:
+        task = str(scheduled_context.group("task") or "").strip()
+        if task:
+            ref: dict[str, object] = {"type": "scheduled_task", "task": task}
+            channel = str(scheduled_context.group("channel") or "").strip()
+            artifacts = str(scheduled_context.group("artifacts") or "").strip()
+            if channel:
+                ref["channel"] = channel
+            if artifacts:
+                ref["artifacts"] = artifacts
+            refs.append(ref)
+            seen.add(tuple(sorted(ref.items())))
     for raw_url in _URL_RE.findall(str(text or "")):
         url = _normalized_url(raw_url)
         if url is None:
@@ -132,6 +151,22 @@ def _structured_references_from_event(event: dict[str, object]) -> list[dict[str
             if len(refs) >= _MAX_STRUCTURED_REFERENCES:
                 return refs
     return refs
+
+
+def _event_has_non_url_structured_reference(event: dict[str, object]) -> bool:
+    return any(
+        str(ref.get("type") or "").strip().lower() != "url"
+        for ref in _structured_references_from_event(event)
+    )
+
+
+def _structured_reference_tokens(ref: dict[str, object]) -> set[str]:
+    tokens: set[str] = set()
+    for key, value in ref.items():
+        if str(key) == "type":
+            continue
+        tokens.update(_tokenize(str(value or "").lower()))
+    return tokens
 
 
 def _tokenize(value: object) -> tuple[str, ...]:
@@ -698,15 +733,24 @@ def _ranked_structured_reference_events(
 
     scored: list[tuple[int, datetime, int, dict[str, object]]] = []
     for index, event in enumerate(ordered):
-        if not _structured_references_from_event(event):
+        structured_refs = _structured_references_from_event(event)
+        if not structured_refs:
             continue
         event_tokens = set(_tokenize(_event_text(event).lower()))
         matched_tokens = query_tokens.intersection(event_tokens)
+        non_url_ref_tokens: set[str] = set()
+        for ref in structured_refs:
+            if str(ref.get("type") or "").strip().lower() == "url":
+                continue
+            non_url_ref_tokens.update(_structured_reference_tokens(ref))
+        matched_non_url_ref_tokens = query_tokens.intersection(non_url_ref_tokens)
         if query_tokens and not matched_tokens:
             continue
         score = sum(_token_weight(token) for token in matched_tokens)
         if not query_tokens:
             score = 1
+        if score > 0 and matched_non_url_ref_tokens:
+            score += 64 + sum(_token_weight(token) * 16 for token in matched_non_url_ref_tokens)
         if score <= 0:
             continue
         selected_event = dict(event)
