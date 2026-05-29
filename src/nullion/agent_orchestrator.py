@@ -53,6 +53,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MODEL_TOOL_RESULT_MAX_CHARS = 87_420
 _ALWAYS_COMPACT_MODEL_TOOL_OUTPUTS = frozenset({"terminal_exec", "workspace_summary"})
 _SCHEDULER_CREATION_TOOLS = frozenset({"create_cron", "set_reminder"})
+_SCHEDULER_MUTATION_TOOLS = frozenset(
+    {
+        "create_cron",
+        "delete_cron",
+        "delete_reminder",
+        "set_reminder",
+        "toggle_cron",
+        "update_cron",
+        "update_reminder",
+    }
+)
 
 
 _ARTIFACT_RECOVERY_TOOLS = frozenset(
@@ -91,9 +102,33 @@ def _scheduler_creation_guard_result(
     invocation: ToolInvocation,
     tool_results: Iterable[ToolResult],
 ) -> ToolResult | None:
+    flow_context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+    if invocation.tool_name == "run_cron":
+        if flow_context.get("allow_scheduler_run_after_mutation") is True:
+            return None
+        for result in tool_results:
+            if result.tool_name not in _SCHEDULER_MUTATION_TOOLS:
+                continue
+            if normalize_tool_status(result.status) != "completed":
+                continue
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "reason": "scheduler_run_after_mutation_in_turn",
+                    "existing_scheduler_mutation_tool": result.tool_name,
+                    "requested_scheduler_run_tool": invocation.tool_name,
+                    "suppress_activity": True,
+                },
+                error=(
+                    "This turn already changed a scheduler object. Do not run a newly created or "
+                    "updated scheduled task immediately unless structured flow state explicitly "
+                    "allows a run after mutation."
+                ),
+            )
     if invocation.tool_name not in _SCHEDULER_CREATION_TOOLS:
         return None
-    flow_context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
     if flow_context.get("allow_multiple_scheduler_creations") is True:
         return None
     for result in tool_results:

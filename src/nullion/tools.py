@@ -11117,6 +11117,29 @@ def register_reminder_tools(
 # ── Cron tools ────────────────────────────────────────────────────────────────
 
 def _build_create_cron_handler(*, default_delivery_channel: str = "", default_delivery_target: str = ""):
+    def _matching_existing_cron(
+        *,
+        name: str,
+        workspace_id: str,
+        delivery_channel: str,
+        delivery_target: str,
+    ):
+        from nullion.crons import list_crons
+
+        normalized_name = str(name or "").strip().casefold()
+        normalized_workspace = str(workspace_id or "").strip()
+        normalized_channel = str(delivery_channel or "").strip()
+        normalized_target = str(delivery_target or "").strip()
+        for job in list_crons(workspace_id=normalized_workspace):
+            if str(getattr(job, "name", "") or "").strip().casefold() != normalized_name:
+                continue
+            if str(getattr(job, "delivery_channel", "") or "").strip() != normalized_channel:
+                continue
+            if str(getattr(job, "delivery_target", "") or "").strip() != normalized_target:
+                continue
+            return job
+        return None
+
     def _delivery_context_from_identifier(identifier: object, fallback_channel: str = "") -> tuple[str, str]:
         from nullion.cron_delivery import normalize_cron_delivery_channel
 
@@ -11170,7 +11193,7 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
 
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.cron_delivery import normalize_cron_delivery_channel
-        from nullion.crons import add_cron, cron_display_fields
+        from nullion.crons import add_cron, cron_display_fields, update_cron
         args = invocation.arguments or {}
         name     = str(args.get("name", "")).strip()
         schedule = str(args.get("schedule", "")).strip()
@@ -11196,6 +11219,108 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
                 status="failed",
                 output={},
                 error="name, schedule and task are all required",
+            )
+        existing = None
+        flow_context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        if flow_context.get("allow_duplicate_cron_creation") is not True:
+            existing = _matching_existing_cron(
+                name=name,
+                workspace_id=workspace_id,
+                delivery_channel=delivery_channel,
+                delivery_target=delivery_target,
+            )
+        if existing is not None:
+            updates = {
+                "name": name,
+                "schedule": schedule,
+                "task": task,
+                "enabled": enabled,
+                "delivery_channel": delivery_channel,
+                "delivery_target": delivery_target,
+                "workspace_id": workspace_id,
+                "html_image_delivery_mode": html_image_delivery_mode,
+            }
+            try:
+                job = update_cron(existing.id, **updates)
+            except Exception as exc:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "id": getattr(existing, "id", ""),
+                        "name": getattr(existing, "name", name),
+                        "reason": "duplicate_cron_create_update_failed",
+                    },
+                    error=f"Failed to update existing cron from duplicate create request: {exc}",
+                )
+            if job is None:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "id": getattr(existing, "id", ""),
+                        "name": getattr(existing, "name", name),
+                        "reason": "duplicate_cron_create_existing_missing",
+                    },
+                    error=f"Existing cron {getattr(existing, 'id', '')!r} was not found during duplicate create handling.",
+                )
+            display = cron_display_fields(job)
+            schedule_description = display["schedule_description"]
+            next_description = display["next_run_description"]
+            changes = _cron_update_changes(existing, job, updates)
+            changed_labels = [str(change.get("label")) for change in changes if change.get("changed") is not False]
+            if changed_labels:
+                update_message = (
+                    f"Existing cron updated: '{job.name}' (id={job.id}). "
+                    f"Changed: {', '.join(changed_labels)}."
+                )
+            else:
+                update_message = (
+                    f"Existing cron matched: '{job.name}' (id={job.id}). "
+                    "No values changed; the requested fields were already set."
+                )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "id": job.id,
+                    "existing_cron_id": job.id,
+                    "created_new": False,
+                    "name": job.name,
+                    "schedule": job.schedule,
+                    "task": job.task,
+                    "workspace_id": job.workspace_id,
+                    "delivery_channel": job.delivery_channel,
+                    "delivery_target": job.delivery_target,
+                    "html_image_delivery_mode": getattr(job, "html_image_delivery_mode", ""),
+                    "enabled": job.enabled,
+                    "next_run": job.next_run,
+                    "schedule_description": schedule_description,
+                    "next_run_description": next_description,
+                    "changed_fields": [change["field"] for change in changes if change.get("changed") is not False],
+                    "changes": changes,
+                    "reason": "duplicate_cron_create_resolved_as_update",
+                    "message": update_message,
+                    "action_receipt": _action_receipt(
+                        action="updated",
+                        object_type="cron",
+                        object_id=job.id,
+                        object_name=job.name,
+                        summary=update_message,
+                        details=[
+                            *_cron_change_details(changes),
+                            f"Schedule: {schedule_description}.",
+                            *( [f"Next run: {next_description}."] if next_description else [] ),
+                            f"Workspace: {job.workspace_id}.",
+                            f"Delivery: {job.delivery_channel or '(default)'}{(':' + job.delivery_target) if job.delivery_target else ''}.",
+                        ],
+                        changes=changes,
+                    ),
+                },
+                error=None,
             )
         try:
             job = add_cron(
