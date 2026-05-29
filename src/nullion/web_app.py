@@ -16710,6 +16710,75 @@ def _web_browser_screenshot_artifact_paths(
     return list(dict.fromkeys(paths))
 
 
+_WEB_UNVERIFIED_SCREENSHOT_URLS = frozenset({"", "about:blank", "chrome://newtab/", "brave://newtab/"})
+
+
+def _web_normalized_path_identity(path: object) -> str:
+    return str(Path(str(path or "").strip()).expanduser())
+
+
+def _web_browser_screenshot_paths_with_unverified_state(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    paths: set[str] = set()
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "browser_screenshot":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        page_url = str(output.get("page_url") or output.get("current_url") or output.get("url") or "").strip()
+        if page_url.lower() not in _WEB_UNVERIFIED_SCREENSHOT_URLS:
+            continue
+        paths.update(_web_normalized_path_identity(path) for path in _web_browser_screenshot_artifact_paths((result,)))
+    return paths
+
+
+def _web_reply_references_artifact_path(reply: str | None, path: str) -> bool:
+    reply_text = str(reply or "")
+    if not reply_text or not path:
+        return False
+    expanded = _web_normalized_path_identity(path)
+    name = Path(expanded).name
+    if expanded in reply_text:
+        return True
+    return bool(name and f"artifacts/{name}" in reply_text)
+
+
+def _web_latest_browser_extract_text_excerpt(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    max_chars: int = 5000,
+) -> str | None:
+    for result in reversed(list(tool_results or ())):
+        if str(getattr(result, "tool_name", "") or "") != "browser_extract_text":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        text = output.get("text") or output.get("content") or output.get("result")
+        if isinstance(text, str) and text.strip():
+            return text.strip()[:max_chars]
+    return None
+
+
+def _web_reply_is_browser_extract_text_dump(
+    reply: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    extracted = _web_latest_browser_extract_text_excerpt(tool_results)
+    if not extracted:
+        return False
+    normalize = lambda value: re.sub(r"\s+", " ", str(value or "")).strip()
+    reply_text = normalize(reply)
+    extracted_text = normalize(extracted)
+    if not reply_text or not extracted_text:
+        return False
+    return extracted_text.startswith(reply_text[: min(len(reply_text), 500)]) or reply_text.startswith(
+        extracted_text[: min(len(extracted_text), 500)]
+    )
+
+
 def _web_is_email_confirmation_text_artifact(path_text: object) -> bool:
     path = Path(str(path_text or "").strip())
     return path.suffix.lower() == ".txt" and "confirmation" in path.name.casefold()
@@ -16764,6 +16833,12 @@ def _web_delivery_artifact_paths(
 ) -> list[str]:
     email_attachment_paths = _web_email_attachment_paths_from_tool_results(tool_results)
     browser_screenshot_paths = _web_browser_screenshot_artifact_paths(tool_results)
+    unverified_browser_screenshot_paths = _web_browser_screenshot_paths_with_unverified_state(tool_results)
+    verified_browser_screenshot_paths = [
+        path
+        for path in browser_screenshot_paths
+        if _web_normalized_path_identity(path) not in unverified_browser_screenshot_paths
+    ]
     explicit_media_paths = [str(path) for path in media_candidate_paths_from_text(str(reply or ""))]
     explicit_result_artifact_paths = [
         str(path)
@@ -16836,12 +16911,34 @@ def _web_delivery_artifact_paths(
     non_screenshot_candidates = [
         path
         for path in candidates
-        if str(Path(path).expanduser()) not in {str(Path(value).expanduser()) for value in browser_screenshot_paths}
+        if _web_normalized_path_identity(path)
+        not in {_web_normalized_path_identity(value) for value in browser_screenshot_paths}
     ]
-    if browser_screenshot_paths and requested_extension == ".png":
-        candidates = [*candidates, *browser_screenshot_paths]
+    referenced_browser_screenshot_paths = [
+        path for path in verified_browser_screenshot_paths if _web_reply_references_artifact_path(reply, path)
+    ]
+    screenshot_is_primary_delivery = bool(verified_browser_screenshot_paths) and (
+        requested_extension == ".png"
+        or (
+            requested_extension is None
+            and bool(referenced_browser_screenshot_paths)
+            and not non_screenshot_candidates
+        )
+        or (
+            requested_extension is None
+            and _web_reply_is_browser_extract_text_dump(reply, tool_results)
+            and not non_screenshot_candidates
+        )
+    )
+    if screenshot_is_primary_delivery:
+        candidates = [*non_screenshot_candidates, *(referenced_browser_screenshot_paths or verified_browser_screenshot_paths)]
     elif browser_screenshot_paths and not explicit_media_paths:
         candidates = non_screenshot_candidates
+    candidates = [
+        path
+        for path in candidates
+        if _web_normalized_path_identity(path) not in unverified_browser_screenshot_paths
+    ]
     candidates = list(dict.fromkeys(str(path) for path in candidates if str(path or "").strip()))
     if email_attachment_paths:
         candidates = [path for path in candidates if not _web_is_email_confirmation_text_artifact(path)]
