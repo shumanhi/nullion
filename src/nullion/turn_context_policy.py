@@ -114,6 +114,7 @@ _SCOPE_REQUIRED_TOOL_CANDIDATES = frozenset(
     {
         "create_cron",
         "delete_cron",
+        "delete_reminder",
         "document_create",
         "email_send",
         "file_patch",
@@ -128,6 +129,7 @@ _SCOPE_REQUIRED_TOOL_CANDIDATES = frozenset(
         "terminal_exec",
         "toggle_cron",
         "update_cron",
+        "update_reminder",
     }
 )
 _CONNECTOR_TOOLS = frozenset({"connector_request"})
@@ -145,8 +147,10 @@ _SCHEDULER_MUTATE_TOOLS = frozenset({
     "create_cron",
     "update_cron",
     "delete_cron",
+    "delete_reminder",
     "toggle_cron",
     "set_reminder",
+    "update_reminder",
 })
 _SKILL_PACK_TOOLS = frozenset({"skill_pack_read"})
 _SKILL_PACK_CAPABILITY_TAGS = frozenset({"skill_pack"})
@@ -229,8 +233,10 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "create_cron",
                         "update_cron",
                         "delete_cron",
+                        "delete_reminder",
                         "toggle_cron",
                         "set_reminder",
+                        "update_reminder",
                         "web_search",
                         "web_fetch",
                         "browser_open",
@@ -600,6 +606,12 @@ class ScopedTurnToolRegistry:
                 return True
             requested_url_tools = self._requested_names_in(_URL_BOUNDARY_TOOLS)
             if requested_url_tools:
+                if (
+                    "browser_image_collect" in requested_url_tools
+                    and self._should_collect_embedded_web_media_without_shell()
+                    and tool_name in _DEFAULT_WEB_SCOPE_TOOLS
+                ):
+                    return True
                 return tool_name in requested_url_tools
             if tool_name not in _DEFAULT_WEB_SCOPE_TOOLS:
                 return False
@@ -729,8 +741,10 @@ class ScopedTurnToolRegistry:
                         "create_cron",
                         "update_cron",
                         "delete_cron",
+                        "delete_reminder",
                         "toggle_cron",
                         "set_reminder",
+                        "update_reminder",
                         "run_cron",
                     ]
                 )
@@ -759,6 +773,8 @@ class ScopedTurnToolRegistry:
             and (self._evidence.has_url_target or "web" in capabilities or self.turn_tool_scope_decision.allow_web_tools)
         ):
             requested.append("browser_image_collect")
+            requested.extend(_BROWSER_INTERACTION_SCOPE_TOOLS)
+            requested.append("web_fetch")
             requested = [tool_name for tool_name in requested if tool_name not in _LOCAL_SHELL_TOOLS]
         if any(extension not in _TEXT_WRITE_EXTENSIONS for extension in requested_artifact_extensions):
             requested = [tool_name for tool_name in requested if tool_name != "file_write"]
@@ -1565,6 +1581,8 @@ def build_turn_tool_scope_decision(
         "For screenshot capture of a current or prior browser page, include browser_screenshot in requested_tool_names when registered. "
         "Use web_action=none when the request can be answered without web/browser tools. "
         "Use scheduler actions only for scheduled-task or reminder control. "
+        "When a scheduled-task mutation has a clear exact action, include the exact registered mutation tool "
+        "in requested_tool_names and required_tool_names, for example delete_cron for deleting a quoted or selected cron. "
         "Do not choose scheduler just because a saved task could answer the domain. "
         "Use requested_tool_names=[\"chat_history_search\"] when the answer may be in saved current-conversation turns that are not visible in the prompt context. "
         "Use connector only when the request needs a connected external API/account and active_connector_providers lists an active_app_ids value that can satisfy it. "

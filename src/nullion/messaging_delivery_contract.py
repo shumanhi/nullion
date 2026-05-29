@@ -91,6 +91,12 @@ def deferred_cron_status_owned_by_background_from_event(event: dict[str, object]
         output = result.get("output")
         if isinstance(output, dict) and _first_bool((output,), ("planner_status_owned_by_background",)):
             return True
+        if (
+            isinstance(output, dict)
+            and _first_bool((output,), ("status_delivered",))
+            and _deferred_cron_status_from_output(output) is not None
+        ):
+            return True
     return False
 
 
@@ -159,7 +165,7 @@ def _deferred_cron_status_from_output(output: object) -> tuple[str, str] | None:
         return None
     status_text = "\n".join(
         [
-            "❖ SCHEDULED TASKS",
+            "⏱️ SCHEDULED TASKS",
             f"For: {len(deferred_results)} manual scheduled task run(s)",
             *rows,
             "  Results will be delivered to the configured destinations when ready.",

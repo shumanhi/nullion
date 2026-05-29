@@ -1384,6 +1384,8 @@ class BrowserTools:
                 screenshot_metadata = {
                     "mode": screenshot.mode,
                     "requested_mode": screenshot.requested_mode,
+                    "page_url": screenshot.page_url,
+                    "page_title": screenshot.page_title,
                     "viewport_width": screenshot.viewport_width,
                     "viewport_height": screenshot.viewport_height,
                     "document_width": screenshot.document_width,

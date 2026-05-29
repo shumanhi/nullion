@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import math
 from pathlib import Path
 import re
@@ -16,11 +17,22 @@ CHAT_HISTORY_SEARCH_TOOL_NAME = "chat_history_search"
 _MAX_HISTORY_SCAN_LIMIT = 200
 _MAX_HISTORY_RETURN_LIMIT = 50
 _MAX_SNIPPET_CHARS = 900
+_MAX_TOOL_EVIDENCE_ITEMS = 4
+_MAX_TOOL_EVIDENCE_OUTPUT_CHARS = 1600
 _MIN_SEARCH_TOKEN_CHARS = 2
 _MATCH_CONTEXT_PREVIOUS_TURNS = 4
 _MATCH_CONTEXT_FOLLOWING_TURNS = 1
 _MAX_STRUCTURED_REFERENCES = 8
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
+_GITHUB_PULL_PATH_RE = re.compile(r"^/([^/\s]+)/([^/\s]+)/pull/(\d+)(?:/|$)", re.IGNORECASE)
+_GITHUB_REPO_CODE_RE = re.compile(r"`([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)`")
+_PR_NUMBER_TEXT_RE = re.compile(r"\b(?:PR|Pull Request)\s*#?\s*(\d+)\b", re.IGNORECASE)
+_SCHEDULED_TASK_DELIVERY_CONTEXT_RE = re.compile(
+    r"^\[Scheduled task delivery context\]\s*task=(?P<task>[^;\n]+)"
+    r"(?:;\s*channel=(?P<channel>[^;\n]+))?"
+    r"(?:;\s*artifacts=(?P<artifacts>[^\n]+))?",
+    re.IGNORECASE,
+)
 
 
 CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
@@ -94,7 +106,21 @@ def _normalized_url(raw_url: str) -> str | None:
 def _structured_references_from_text(text: object) -> list[dict[str, object]]:
     refs: list[dict[str, object]] = []
     seen: set[tuple[object, ...]] = set()
-    for raw_url in _URL_RE.findall(str(text or "")):
+    text_value = str(text or "")
+    scheduled_context = _SCHEDULED_TASK_DELIVERY_CONTEXT_RE.match(str(text or "").strip())
+    if scheduled_context:
+        task = str(scheduled_context.group("task") or "").strip()
+        if task:
+            ref: dict[str, object] = {"type": "scheduled_task", "task": task}
+            channel = str(scheduled_context.group("channel") or "").strip()
+            artifacts = str(scheduled_context.group("artifacts") or "").strip()
+            if channel:
+                ref["channel"] = channel
+            if artifacts:
+                ref["artifacts"] = artifacts
+            refs.append(ref)
+            seen.add(tuple(sorted(ref.items())))
+    for raw_url in _URL_RE.findall(text_value):
         url = _normalized_url(raw_url)
         if url is None:
             continue
@@ -102,6 +128,22 @@ def _structured_references_from_text(text: object) -> list[dict[str, object]]:
         domain = parsed.netloc.lower()
         if domain.startswith("www."):
             domain = domain[4:]
+        pull_match = _GITHUB_PULL_PATH_RE.match(parsed.path or "") if domain == "github.com" else None
+        if pull_match:
+            owner, repo, number = pull_match.groups()
+            ref = {
+                "type": "github_pr",
+                "owner": owner,
+                "repo": repo,
+                "number": number,
+                "url": url,
+            }
+            identity = tuple(sorted(ref.items()))
+            if identity not in seen:
+                refs.append(ref)
+                seen.add(identity)
+                if len(refs) >= _MAX_STRUCTURED_REFERENCES:
+                    break
         ref: dict[str, object] = {"type": "url", "domain": domain, "url": url}
         identity = tuple(sorted(ref.items()))
         if identity in seen:
@@ -110,16 +152,32 @@ def _structured_references_from_text(text: object) -> list[dict[str, object]]:
         seen.add(identity)
         if len(refs) >= _MAX_STRUCTURED_REFERENCES:
             break
+    if len(refs) < _MAX_STRUCTURED_REFERENCES:
+        pr_match = _PR_NUMBER_TEXT_RE.search(text_value)
+        repo_match = _GITHUB_REPO_CODE_RE.search(text_value)
+        if pr_match and repo_match:
+            owner, repo = repo_match.groups()
+            ref = {
+                "type": "github_pr",
+                "owner": owner,
+                "repo": repo,
+                "number": pr_match.group(1),
+                "url": f"https://github.com/{owner}/{repo}/pull/{pr_match.group(1)}",
+            }
+            identity = tuple(sorted(ref.items()))
+            if identity not in seen:
+                refs.append(ref)
     return refs
 
 
 def _structured_references_from_event(event: dict[str, object]) -> list[dict[str, object]]:
     refs: list[dict[str, object]] = []
     seen: set[tuple[object, ...]] = set()
-    for source in (
-        event.get("user_message"),
-        event.get("assistant_reply"),
-    ):
+    sources = [event.get("user_message")]
+    assistant_reply = str(event.get("assistant_reply") or "").strip()
+    if not assistant_reply.startswith("I found the saved chat target for this reference."):
+        sources.append(assistant_reply)
+    for source in sources:
         for ref in _structured_references_from_text(source):
             identity = tuple(sorted(ref.items()))
             if identity in seen:
@@ -129,6 +187,22 @@ def _structured_references_from_event(event: dict[str, object]) -> list[dict[str
             if len(refs) >= _MAX_STRUCTURED_REFERENCES:
                 return refs
     return refs
+
+
+def _event_has_non_url_structured_reference(event: dict[str, object]) -> bool:
+    return any(
+        str(ref.get("type") or "").strip().lower() != "url"
+        for ref in _structured_references_from_event(event)
+    )
+
+
+def _structured_reference_tokens(ref: dict[str, object]) -> set[str]:
+    tokens: set[str] = set()
+    for key, value in ref.items():
+        if str(key) == "type":
+            continue
+        tokens.update(_tokenize(str(value or "").lower()))
+    return tokens
 
 
 def _tokenize(value: object) -> tuple[str, ...]:
@@ -190,6 +264,41 @@ def _tool_names_from_event(event: dict[str, object]) -> list[str]:
     return names
 
 
+def _compact_tool_evidence_output(value: object) -> str:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        encoded = str(value)
+    return _snippet(encoded, max_chars=_MAX_TOOL_EVIDENCE_OUTPUT_CHARS)
+
+
+def _tool_evidence_from_event(event: dict[str, object]) -> list[dict[str, object]]:
+    tool_results = event.get("tool_results")
+    if not isinstance(tool_results, list):
+        return []
+    evidence: list[dict[str, object]] = []
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        name = str(result.get("tool_name") or "").strip()
+        if not name or name in {CHAT_HISTORY_SEARCH_TOOL_NAME, "request_tool_scope"}:
+            continue
+        item: dict[str, object] = {
+            "tool_name": name,
+            "status": str(result.get("status") or "").strip(),
+        }
+        output = result.get("output")
+        if output not in (None, "", {}, []):
+            item["output_preview"] = _compact_tool_evidence_output(output)
+        error = str(result.get("error") or "").strip()
+        if error:
+            item["error"] = _snippet(error, max_chars=500)
+        evidence.append(item)
+        if len(evidence) >= _MAX_TOOL_EVIDENCE_ITEMS:
+            break
+    return evidence
+
+
 def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     record = {
         "index": index,
@@ -211,9 +320,17 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     structured_refs = _structured_references_from_event(event)
     if structured_refs:
         record["structured_refs"] = structured_refs
-    tool_names = _tool_names_from_event(event)
-    if tool_names:
-        record["tool_names"] = tool_names
+    context_text = str(record.get("context") or "")
+    include_tool_evidence = not (
+        context_text.startswith("previous_turn") or context_text.startswith("following_turn")
+    ) and not _event_has_history_search_tool_result(event)
+    if include_tool_evidence:
+        tool_names = _tool_names_from_event(event)
+        if tool_names:
+            record["tool_names"] = tool_names
+        tool_evidence = _tool_evidence_from_event(event)
+        if tool_evidence:
+            record["tool_evidence"] = tool_evidence
     return record
 
 
@@ -561,7 +678,13 @@ def _ranked_history_events(
         document_count = token_document_counts.get(token, 0)
         if document_count <= 0:
             return 0
-        return max(1, min(16, int(round(math.log2((total_documents + 1) / (document_count + 1)) * 4))))
+        rarity = math.log2((total_documents + 1) / (document_count + 1))
+        # For short follow-ups, common conversational tokens are actively harmful:
+        # they make unrelated recent turns look relevant. Keep only distinctive
+        # evidence-bearing tokens instead of maintaining a language-specific stop list.
+        if total_documents > 5 and (rarity < 1.0 or (len(token) <= 2 and rarity < 5.0)):
+            return 0
+        return max(1, min(16, int(round(rarity * 4))))
 
     scored: list[tuple[int, int, dict[str, object]]] = []
     direct_scores_by_index: dict[int, int] = {}
@@ -653,19 +776,31 @@ def _ranked_structured_reference_events(
         document_count = token_document_counts.get(token, 0)
         if document_count <= 0:
             return 0
-        return max(1, min(16, int(round(math.log2((total_documents + 1) / (document_count + 1)) * 4))))
+        rarity = math.log2((total_documents + 1) / (document_count + 1))
+        if total_documents > 5 and (rarity < 1.0 or (len(token) <= 2 and rarity < 5.0)):
+            return 0
+        return max(1, min(16, int(round(rarity * 4))))
 
     scored: list[tuple[int, datetime, int, dict[str, object]]] = []
     for index, event in enumerate(ordered):
-        if not _structured_references_from_event(event):
+        structured_refs = _structured_references_from_event(event)
+        if not structured_refs:
             continue
         event_tokens = set(_tokenize(_event_text(event).lower()))
         matched_tokens = query_tokens.intersection(event_tokens)
+        non_url_ref_tokens: set[str] = set()
+        for ref in structured_refs:
+            if str(ref.get("type") or "").strip().lower() == "url":
+                continue
+            non_url_ref_tokens.update(_structured_reference_tokens(ref))
+        matched_non_url_ref_tokens = query_tokens.intersection(non_url_ref_tokens)
         if query_tokens and not matched_tokens:
             continue
         score = sum(_token_weight(token) for token in matched_tokens)
         if not query_tokens:
             score = 1
+        if score > 0 and matched_non_url_ref_tokens:
+            score += 64 + sum(_token_weight(token) * 16 for token in matched_non_url_ref_tokens)
         if score <= 0:
             continue
         selected_event = dict(event)
@@ -674,6 +809,15 @@ def _ranked_structured_reference_events(
         scored.append((score, _parse_created_at(event.get("created_at")), index, selected_event))
     scored.sort(key=lambda item: (item[0] // 16, item[1], item[0], item[2]), reverse=True)
     return [event for _score, _created, _index, event in scored[:limit]]
+
+
+def _history_event_identity(event: dict[str, object]) -> tuple[str, str, str, str]:
+    return (
+        str(event.get("conversation_id") or ""),
+        str(event.get("turn_id") or ""),
+        " ".join(str(event.get("user_message") or "").split()),
+        " ".join(str(event.get("assistant_reply") or "").split()),
+    )
 
 
 def _chat_history_search_result(
@@ -715,6 +859,20 @@ def _chat_history_search_result(
         query=query,
         limit=min(_MAX_HISTORY_RETURN_LIMIT, max(limit, 12)),
     )
+    if query and structured_selected:
+        structured_identities = {
+            _history_event_identity(event)
+            for event in structured_selected
+        }
+        selected = [
+            event
+            for event in selected
+            if _history_event_identity(event) in structured_identities
+        ]
+        if not selected:
+            selected = structured_selected[:limit]
+        else:
+            selected = selected[:limit]
     records = [_event_record(event, index=index) for index, event in enumerate(selected, start=1)]
     structured_records = [
         _event_record(event, index=index)

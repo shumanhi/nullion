@@ -42,6 +42,10 @@ def approval_notification_text(approval: ApprovalRequest) -> str:
     ]
     if display.detail:
         lines.append(format_approval_detail_markdown(display.detail))
+    context = approval.context if isinstance(approval.context, dict) else {}
+    html_preview_path = str(context.get("html_preview_path") or "").strip()
+    if html_preview_path:
+        lines.append(f"MEDIA:{html_preview_path}")
     lines.append(f"Approval ID: {approval.approval_id}")
     lines.append("Open the web dashboard or use the originating chat approval controls to decide.")
     return "\n".join(lines)

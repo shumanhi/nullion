@@ -94,6 +94,8 @@ def sanitize_user_visible_reply(
         return _sanitize_local_paths(action_receipt_reply)
     if scheduler_action_reply := _scheduler_action_reply_over_read_drift(raw, results):
         return _sanitize_local_paths(scheduler_action_reply)
+    if scheduler_read_reply := _scheduler_read_reply_over_model_reformat(raw, results):
+        return _sanitize_local_paths(scheduler_read_reply)
     if numbered_reply := _structured_numbered_choice_reply(results):
         return numbered_reply
     if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
@@ -148,6 +150,40 @@ def _cron_list_reply_over_empty_reminder_drift(text: str, results: list[ToolResu
     if isinstance(message, str) and message.strip():
         return message.strip()
     return None
+
+
+def _scheduler_read_reply_over_model_reformat(text: str, results: list[ToolResult]) -> str | None:
+    if any(
+        result.tool_name in _SCHEDULER_ACTION_TOOLS and result.status == "completed"
+        for result in results
+    ):
+        return None
+    completed_cron_lists = [
+        result
+        for result in results
+        if result.tool_name == "list_crons"
+        and result.status == "completed"
+        and isinstance(result.output, dict)
+        and isinstance(result.output.get("crons"), list)
+    ]
+    if not completed_cron_lists:
+        return None
+    cron_result = completed_cron_lists[-1]
+    message = cron_result.output.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    return _compact_cron_list_reply(cron_result)
+
+
+def _compact_cron_list_reply(result: ToolResult) -> str | None:
+    output = result.output if isinstance(result.output, dict) else {}
+    crons = output.get("crons")
+    if not isinstance(crons, list):
+        return None
+    message = output.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return "No crons scheduled." if not crons else None
 
 
 def _scheduler_action_reply_over_read_drift(text: str, results: list[ToolResult]) -> str | None:

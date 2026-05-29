@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import html
 import mimetypes
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Iterable
 from urllib.parse import quote
@@ -43,6 +45,13 @@ _ARTIFACT_MEDIA_TYPES_BY_SUFFIX = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
+_FENCED_HTML_BLOCK_RE = re.compile(
+    r"```(?P<language>html|htm)\s*\n(?P<body>[\s\S]*?)```",
+    flags=re.IGNORECASE,
+)
+_HTML_DOCUMENT_RE = re.compile(r"<\s*(?:!doctype\s+html|html|body|head)\b", flags=re.IGNORECASE)
+_HTML_FRAGMENT_RE = re.compile(r"<\s*(?:div|table|section|article|main|style|p|h[1-6]|img|a)\b", flags=re.IGNORECASE)
+_MIN_INLINE_HTML_ARTIFACT_CHARS = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +298,67 @@ def artifact_path_for_generated_workspace_file(
     root = artifact_root_for_principal(principal_id)
     normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
     return root / f"{stem}-{uuid4().hex[:12]}{normalized_suffix}"
+
+
+def normalize_html_document(html_text: str, *, title: str = "Nullion HTML Preview") -> str:
+    text = str(html_text or "").strip()
+    if not text:
+        return ""
+    if _HTML_DOCUMENT_RE.search(text[:1024]):
+        return text
+    escaped_title = html.escape(title, quote=True)
+    return (
+        "<!doctype html>\n"
+        "<html>\n"
+        "<head>\n"
+        '  <meta charset="utf-8">\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"  <title>{escaped_title}</title>\n"
+        "</head>\n"
+        "<body>\n"
+        f"{text}\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def _looks_like_substantial_html(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if len(stripped) < _MIN_INLINE_HTML_ARTIFACT_CHARS:
+        return False
+    return bool(_HTML_DOCUMENT_RE.search(stripped[:2048]) or _HTML_FRAGMENT_RE.search(stripped[:2048]))
+
+
+def materialize_inline_html_reply_artifact(
+    reply: str | None,
+    *,
+    principal_id: str | None,
+    stem: str = "html-preview",
+) -> tuple[str | None, str | None]:
+    """Promote substantial fenced HTML in a reply into a workspace artifact."""
+
+    if reply is None or "```" not in str(reply):
+        return reply, None
+    text = str(reply)
+    match = _FENCED_HTML_BLOCK_RE.search(text)
+    if match is None:
+        return reply, None
+    html_text = str(match.group("body") or "").strip()
+    if not _looks_like_substantial_html(html_text):
+        return reply, None
+    artifact_path = artifact_path_for_generated_workspace_file(
+        principal_id=principal_id,
+        suffix=".html",
+        stem=stem,
+    )
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(normalize_html_document(html_text), encoding="utf-8")
+    before = text[: match.start()].rstrip()
+    after = text[match.end() :].strip()
+    parts = [part for part in (before, after) if part]
+    parts.append("I attached the HTML preview so you can open it.")
+    parts.append(f"MEDIA:{artifact_path}")
+    return "\n\n".join(parts), str(artifact_path)
 
 
 def is_safe_artifact_path(path: Path, *, artifact_root: Path | None = None) -> bool:

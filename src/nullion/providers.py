@@ -15,10 +15,13 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import smtplib
+import ssl
 import subprocess
 import sys
 import tempfile
 import textwrap
+from email.utils import getaddresses
 from urllib.parse import quote, urlencode
 import urllib.error
 import urllib.request
@@ -1339,17 +1342,22 @@ def _custom_api_connection(principal_id: str | None):
 
 
 def _custom_api_base_url(connection: object | None) -> str:
+    from nullion.connections import normalize_connection_text
+
     profile = getattr(connection, "provider_profile", None)
-    if isinstance(profile, str) and profile.strip().startswith(("http://", "https://")):
-        return profile.strip().rstrip("/")
+    normalized = normalize_connection_text(profile)
+    if normalized.startswith(("http://", "https://")):
+        return normalized.rstrip("/")
     return _require_env("NULLION_CUSTOM_API_BASE_URL", provider_name="custom_api_provider").rstrip("/")
 
 
 def _custom_api_token(connection: object | None) -> str:
+    from nullion.connections import normalize_connection_text
+
     credential_ref = getattr(connection, "credential_ref", None) or getattr(connection, "provider_profile", None)
     candidates: list[str] = []
-    if isinstance(credential_ref, str) and credential_ref.strip():
-        ref = credential_ref.strip()
+    ref = normalize_connection_text(credential_ref)
+    if ref:
         candidates.append(ref.removeprefix("env:"))
     candidates.append("NULLION_CUSTOM_API_TOKEN")
     for name in candidates:
@@ -1401,7 +1409,9 @@ def _custom_api_email_read(
 
 
 def _env_key_from_reference(value: object, *, default: str = "ACCOUNT") -> str:
-    text = re.sub(r"[^A-Z0-9_]+", "_", str(value or "").strip().upper()).strip("_")
+    from nullion.connections import normalize_connection_text
+
+    text = re.sub(r"[^A-Z0-9_]+", "_", normalize_connection_text(value).upper()).strip("_")
     return text or default
 
 
@@ -1417,11 +1427,61 @@ def _imap_env_prefix(connection: object | None) -> str:
 
 
 def _imap_required_env(prefix: str, name: str) -> str:
+    from nullion.connections import normalize_connection_text
+
     env_name = f"{prefix}_{name}"
-    value = os.environ.get(env_name, "").strip()
+    value = normalize_connection_text(os.environ.get(env_name, ""))
     if not value:
         raise RuntimeError(f"imap_smtp_provider requires {env_name}")
     return value
+
+
+def _imap_optional_env(prefix: str, name: str, default: str = "") -> str:
+    from nullion.connections import normalize_connection_text
+
+    return normalize_connection_text(os.environ.get(f"{prefix}_{name}", default))
+
+
+def _imap_security_mode(prefix: str) -> str:
+    raw = _imap_optional_env(prefix, "SECURITY").lower()
+    if raw in {"ssl", "ssl_tls", "tls", "implicit_tls"}:
+        return "ssl"
+    if raw in {"starttls", "start_tls"}:
+        return "starttls"
+    if raw in {"plain", "none", "off", "false", "0", "no"}:
+        return "plain"
+    legacy_ssl = os.environ.get(f"{prefix}_SSL")
+    if legacy_ssl is not None and legacy_ssl.strip().lower() in {"0", "false", "no", "off"}:
+        return "plain"
+    return "ssl"
+
+
+def _imap_timeout_seconds(prefix: str) -> int:
+    raw = _imap_optional_env(prefix, "TIMEOUT_SECONDS")
+    if not raw:
+        return 15
+    try:
+        value = int(raw)
+    except ValueError:
+        return 15
+    return max(3, min(value, 60))
+
+
+def _imap4_ssl_client(host: str, port: int, *, timeout: int, context: ssl.SSLContext) -> imaplib.IMAP4:
+    try:
+        return imaplib.IMAP4_SSL(host, port, ssl_context=context, timeout=timeout)
+    except TypeError:
+        try:
+            return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        except TypeError:
+            return imaplib.IMAP4_SSL(host, port)
+
+
+def _imap4_plain_client(host: str, port: int, *, timeout: int) -> imaplib.IMAP4:
+    try:
+        return imaplib.IMAP4(host, port, timeout=timeout)
+    except TypeError:
+        return imaplib.IMAP4(host, port)
 
 
 def _imap_connect(connection: object | None) -> imaplib.IMAP4:
@@ -1429,21 +1489,31 @@ def _imap_connect(connection: object | None) -> imaplib.IMAP4:
     host = _imap_required_env(prefix, "HOST")
     username = _imap_required_env(prefix, "USERNAME")
     password = _imap_required_env(prefix, "PASSWORD")
-    raw_port = os.environ.get(f"{prefix}_PORT", "").strip()
-    port = int(raw_port) if raw_port else 993
-    use_ssl = os.environ.get(f"{prefix}_SSL", "true").strip().lower() not in {"0", "false", "no", "off"}
-    client: imaplib.IMAP4
-    if use_ssl:
-        client = imaplib.IMAP4_SSL(host, port)
+    from nullion.connections import normalize_connection_text
+
+    raw_port = normalize_connection_text(os.environ.get(f"{prefix}_PORT", ""))
+    security = _imap_security_mode(prefix)
+    port = int(raw_port) if raw_port else (993 if security == "ssl" else 143)
+    timeout = _imap_timeout_seconds(prefix)
+    context = ssl.create_default_context()
+    if security == "ssl":
+        client = _imap4_ssl_client(host, port, timeout=timeout, context=context)
     else:
-        client = imaplib.IMAP4(host, port)
+        client = _imap4_plain_client(host, port, timeout=timeout)
+        if security == "starttls":
+            try:
+                client.starttls(ssl_context=context)
+            except TypeError:
+                client.starttls()
     client.login(username, password)
     return client
 
 
 def _imap_select_mailbox(client: imaplib.IMAP4, connection: object | None, *, readonly: bool = True) -> None:
     prefix = _imap_env_prefix(connection)
-    mailbox = os.environ.get(f"{prefix}_MAILBOX", "INBOX").strip() or "INBOX"
+    from nullion.connections import normalize_connection_text
+
+    mailbox = normalize_connection_text(os.environ.get(f"{prefix}_MAILBOX", "INBOX")) or "INBOX"
     status, _ = client.select(mailbox, readonly=readonly)
     if status != "OK":
         raise RuntimeError(f"imap_smtp_provider could not select mailbox {mailbox}")
@@ -1531,14 +1601,21 @@ def _imap_search_ids(client: imaplib.IMAP4, query: str) -> list[str]:
         ("SEARCH", "TEXT", query),
         ("SEARCH", "ALL"),
     )
+    last_error: Exception | None = None
     for args in attempts:
-        status, data = client.uid(*args)
+        try:
+            status, data = client.uid(*args)
+        except imaplib.IMAP4.error as exc:
+            last_error = exc
+            continue
         if status == "OK":
             raw_ids = data[0] if data else b""
             if isinstance(raw_ids, bytes):
                 return [item.decode("ascii", errors="ignore") for item in raw_ids.split() if item]
             if isinstance(raw_ids, str):
                 return [item for item in raw_ids.split() if item]
+    if last_error is not None:
+        raise RuntimeError(f"imap_smtp_provider email search failed: {last_error}") from last_error
     raise RuntimeError("imap_smtp_provider email search failed")
 
 
@@ -1581,6 +1658,112 @@ def _imap_smtp_email_read(
             client.logout()
         except Exception:
             pass
+
+
+def _smtp_security_mode(prefix: str) -> str:
+    from nullion.connections import normalize_connection_text
+
+    raw = normalize_connection_text(os.environ.get(f"{prefix}_SMTP_SECURITY", "starttls")).lower()
+    if raw in {"ssl", "tls", "smtps"}:
+        return "ssl"
+    if raw in {"plain", "none", "off"}:
+        return "plain"
+    return "starttls"
+
+
+def _smtp_default_port(security: str) -> int:
+    if security == "ssl":
+        return 465
+    if security == "starttls":
+        return 587
+    return 25
+
+
+def _smtp_optional_env(prefix: str, name: str, fallback: str = "") -> str:
+    from nullion.connections import normalize_connection_text
+
+    return normalize_connection_text(os.environ.get(f"{prefix}_{name}", "")) or fallback
+
+
+def _smtp_recipients(message: email.message.EmailMessage) -> list[str]:
+    headers = [value for name in ("To", "Cc", "Bcc") if (value := str(message.get(name, "")).strip())]
+    return [address for _display, address in getaddresses(headers) if address]
+
+
+def _smtp_sender(message: email.message.EmailMessage, username: str) -> str:
+    headers = [value for name in ("Sender", "From") if (value := str(message.get(name, "")).strip())]
+    for _display, address in getaddresses(headers):
+        if address:
+            return address
+    return username
+
+
+def _connection_allows_email_write(connection: object | None) -> bool:
+    mode = str(getattr(connection, "permission_mode", "read") or "read").strip().lower().replace("-", "_")
+    return mode in {"write", "read_write", "readwrite", "rw", "read_and_write"}
+
+
+def _imap_smtp_email_send(
+    message: email.message.EmailMessage,
+    attached_paths: list[str] | None = None,
+    *,
+    principal_id: str | None = None,
+) -> dict[str, object]:
+    connection = _imap_smtp_connection(principal_id)
+    if not _connection_allows_email_write(connection):
+        raise RuntimeError(
+            "imap_smtp_provider is configured as read-only for email_send. "
+            "Change this connection's permission mode to write before sending email."
+        )
+    prefix = _imap_env_prefix(connection)
+    host = _imap_required_env(prefix, "SMTP_HOST")
+    security = _smtp_security_mode(prefix)
+    raw_port = _smtp_optional_env(prefix, "SMTP_PORT")
+    port = int(raw_port) if raw_port else _smtp_default_port(security)
+    username = _smtp_optional_env(prefix, "SMTP_USERNAME", _imap_required_env(prefix, "USERNAME"))
+    password = _smtp_optional_env(prefix, "SMTP_PASSWORD", _imap_required_env(prefix, "PASSWORD"))
+    timeout = _imap_timeout_seconds(prefix)
+    context = ssl.create_default_context()
+    if security == "ssl":
+        client = smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
+    else:
+        client = smtplib.SMTP(host, port, timeout=timeout)
+        if security == "starttls":
+            client.starttls(context=context)
+    recipients = _smtp_recipients(message)
+    if not recipients:
+        raise RuntimeError("imap_smtp_provider email_send requires at least one recipient")
+    sender = _smtp_sender(message, username)
+    message_for_send = email.message_from_bytes(message.as_bytes(), policy=policy.default)
+    if "Bcc" in message_for_send:
+        del message_for_send["Bcc"]
+    if "From" not in message_for_send and sender:
+        message_for_send["From"] = sender
+    try:
+        if username or password:
+            client.login(username, password)
+        refused = client.send_message(message_for_send, from_addr=sender or None, to_addrs=recipients)
+    finally:
+        try:
+            client.quit()
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+    return {
+        "provider_id": "imap_smtp_provider",
+        "smtp_host": host,
+        "smtp_port": port,
+        "smtp_security": security,
+        "username": username,
+        "from": sender,
+        "to": recipients,
+        "subject": str(message.get("Subject", "")),
+        "attachment_count": len(attached_paths or []),
+        "attachment_paths": list(attached_paths or []),
+        "refused_recipients": refused,
+    }
 
 
 
@@ -1627,6 +1810,7 @@ def resolve_plugin_provider_kwargs(*, plugin_name: str, provider_name: str) -> d
             return {
                 "email_searcher": _imap_smtp_email_search,
                 "email_reader": _imap_smtp_email_read,
+                "email_sender": _imap_smtp_email_send,
             }
         raise ValueError(f"unknown provider binding for email_plugin: {provider_name}")
     if plugin_name == "calendar_plugin":

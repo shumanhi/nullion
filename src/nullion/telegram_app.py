@@ -27,7 +27,12 @@ from nullion.approval_display import (
 from nullion.approvals import ApprovalStatus
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
 from nullion.artifacts import is_safe_artifact_path, split_media_reply_attachments
-from nullion.chat_attachments import VIDEO_EXTENSIONS, is_supported_chat_file
+from nullion.chat_attachments import (
+    VIDEO_EXTENSIONS,
+    is_supported_audio_attachment,
+    is_supported_chat_file,
+    normalize_chat_attachments,
+)
 from nullion.events import make_event
 from nullion.latency_phases import record_surface_latency_timing
 from nullion.config import NullionSettings, web_session_allow_duration_label, web_session_allow_expires_at
@@ -82,6 +87,7 @@ from nullion.operator_commands import (
 )
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.remediation import remediation_buttons_for_recommendation_code
+from nullion.tools import ToolInvocation
 from nullion.users import resolve_messaging_user
 from nullion.model_clients import (
     ModelClientConfigurationError,
@@ -161,6 +167,49 @@ def _message_text_or_caption(message) -> str | None:
     if text is not None:
         return text
     return getattr(message, "caption", None)
+
+
+def _voice_instruction_transcript(
+    attachments: list[dict[str, str]] | None,
+    *,
+    registry: object | None,
+    principal_id: str = "telegram_chat",
+) -> str | None:
+    """Return a transcript to use as the turn text for a Telegram voice message."""
+    if not attachments or len(attachments) != 1:
+        return None
+    raw_attachment = attachments[0]
+    if not isinstance(raw_attachment, dict) or str(raw_attachment.get("source_kind") or "") != "voice":
+        return None
+    normalized = normalize_chat_attachments([raw_attachment])
+    if len(normalized) != 1 or not is_supported_audio_attachment(normalized[0]):
+        return None
+    if registry is None or not callable(getattr(registry, "invoke", None)):
+        return None
+    try:
+        registry.get_spec("audio_transcribe")
+    except Exception:
+        return None
+    attachment = normalized[0]
+    try:
+        result = registry.invoke(
+            ToolInvocation(
+                invocation_id=f"telegram-voice-instruction-{uuid.uuid4().hex[:12]}",
+                tool_name="audio_transcribe",
+                principal_id=principal_id,
+                arguments={"path": attachment.path},
+            )
+        )
+    except Exception:
+        logger.debug("Telegram voice instruction transcription failed", exc_info=True)
+        return None
+    if str(getattr(result, "status", "") or "").strip().lower() != "completed":
+        return None
+    output = getattr(result, "output", None)
+    if not isinstance(output, dict):
+        return None
+    transcript = str(output.get("text") or output.get("transcript") or "").strip()
+    return transcript or None
 
 
 def _telegram_reply_context(message) -> dict[str, object] | None:
@@ -247,7 +296,30 @@ async def _reply_document_attachment(message, attachment_path: Path, **kwargs) -
         with attachment_path.open("rb") as document:
             return await message.reply_document(document, **delivery_kwargs)
 
-    await retry_messaging_delivery_operation(operation, attempts=1)
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            await retry_messaging_delivery_operation(operation, attempts=1)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= 2 or not _is_pre_upload_telegram_attachment_connect_failure(exc):
+                break
+            await asyncio.sleep(0.5 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _is_pre_upload_telegram_attachment_connect_failure(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        error_name = current.__class__.__name__.lower()
+        if "connecttimeout" in error_name or "connecterror" in error_name:
+            return True
+        if "readtimeout" in error_name:
+            return False
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _telegram_attachment_caption_kwargs(caption: str | None) -> tuple[str | None, dict[str, Any], bool]:
@@ -301,6 +373,10 @@ async def _answer_callback_query_safely(callback_query, *args, **kwargs) -> bool
 logger = logging.getLogger(__name__)
 _TYPING_KEEPALIVE_INTERVAL_SECONDS = 2.0
 _TELEGRAM_ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
+_TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS = max(
+    0.2,
+    float(os.environ.get("NULLION_TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS", "1.25")),
+)
 _TELEGRAM_MESSAGE_CHUNK_SIZE = 3900
 _TELEGRAM_BOT_TOKEN_PATTERN = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{20,}$")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -1163,6 +1239,12 @@ def _approval_card_text(approval) -> str:
         )
     else:
         lines.extend(["", format_approval_detail_markdown(detail)])
+    context = getattr(approval, "context", None)
+    html_preview_path = ""
+    if isinstance(context, dict):
+        html_preview_path = str(context.get("html_preview_path") or "").strip()
+    if html_preview_path:
+        lines.extend(["", f"MEDIA:{html_preview_path}"])
     return "\n".join(lines)
 
 
@@ -1381,18 +1463,7 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
         if proposal_id not in _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS
     ]
     if new_proposal_ids:
-        proposal = pending_builder_proposals[new_proposal_ids[0]]
-        proposal_id = proposal.proposal_id
-        _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS.add(proposal_id)
-        return DecisionCard(
-            text=_builder_proposal_card_text(proposal),
-            reply_markup=_build_decision_markup(
-                kind="proposal",
-                record_id=proposal_id,
-                actions=(("Review", "review"), ("Approve", "accept"), ("Dismiss", "reject")),
-            ),
-            supplemental=True,
-        )
+        _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS.update(new_proposal_ids)
 
     pending_doctor_actions = {
         str(action["action_id"]): action
@@ -1419,6 +1490,15 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
         )
 
     return None
+
+
+def _promote_reminder_card_to_primary(
+    decision_card: DecisionCard | None,
+    reminder_card: DecisionCard | None,
+) -> tuple[DecisionCard | None, DecisionCard | None]:
+    if decision_card is None and reminder_card is not None:
+        return reminder_card, None
+    return decision_card, reminder_card
 
 
 def _existing_pending_approval_card(runtime: PersistentRuntime, reply: str | None) -> DecisionCard | None:
@@ -1522,7 +1602,7 @@ async def _deliver_reply(
         timing_marks.append(f"{label}:{round((now - timing_last_at) * 1000, 1)}ms")
         timing_last_at = now
 
-    visible_reply = strip_tool_approval_marker(reply)
+    visible_reply = decision_card.text if decision_card is not None else strip_tool_approval_marker(reply)
     delivery_kwargs: dict[str, object] = {"principal_id": principal_id}
     if allow_attachments is not None:
         delivery_kwargs["allow_attachments"] = allow_attachments
@@ -1552,12 +1632,15 @@ async def _deliver_reply(
         try:
             _mark_timing("upload_attachments")
             for index, attachment_path in enumerate(attachment_paths):
+                attachment_kwargs = caption_kwargs if index == 0 else {}
+                if index == 0 and decision_card is not None and decision_card.reply_markup is not None:
+                    attachment_kwargs = {**attachment_kwargs, "reply_markup": decision_card.reply_markup}
                 await _reply_document_attachment(
                     message,
                     attachment_path,
                     caption=formatted_caption if index == 0 else None,
                     do_quote=do_quote if index == 0 else False,
-                    **(caption_kwargs if index == 0 else {}),
+                    **attachment_kwargs,
                 )
             _record_telegram_delivery_receipt(message, delivery, transport_ok=True)
         except Exception:
@@ -2654,6 +2737,7 @@ def _call_handle_update_with_activity(
     update,
     *,
     attachments: list[dict[str, str]] | None = None,
+    text_override: str | None = None,
     activity_callback=None,
     text_delta_callback=None,
     append_activity_trace: bool = True,
@@ -2686,6 +2770,8 @@ def _call_handle_update_with_activity(
             kwargs["text_delta_callback"] = text_delta_callback
         if "attachments" in parameters:
             kwargs["attachments"] = attachments
+        if "text_override" in parameters:
+            kwargs["text_override"] = text_override
         if "turn_dispatch_decision" in parameters:
             kwargs["turn_dispatch_decision"] = turn_dispatch_decision
         if "cancellation_checker" in parameters:
@@ -2818,10 +2904,10 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
     started_at = time.perf_counter()
     timing_marks: list[str] = []
     timing_last_at = started_at
-    candidates: list[tuple[object, str, str | None]] = []
+    candidates: list[tuple[object, str, str | None, str]] = []
     photos = list(getattr(message, "photo", []) or [])
     if photos:
-        candidates.append((photos[-1], "telegram-photo.png", "image/png"))
+        candidates.append((photos[-1], "telegram-photo.png", "image/png", "photo"))
     audio = getattr(message, "audio", None)
     if audio is not None:
         candidates.append(
@@ -2829,11 +2915,12 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
                 audio,
                 str(getattr(audio, "file_name", "") or "telegram-audio.mp3"),
                 str(getattr(audio, "mime_type", "") or "audio/mpeg"),
+                "audio",
             )
         )
     voice = getattr(message, "voice", None)
     if voice is not None:
-        candidates.append((voice, "telegram-voice.ogg", str(getattr(voice, "mime_type", "") or "audio/ogg")))
+        candidates.append((voice, "telegram-voice.ogg", str(getattr(voice, "mime_type", "") or "audio/ogg"), "voice"))
     video = getattr(message, "video", None)
     if video is not None:
         candidates.append(
@@ -2841,6 +2928,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
                 video,
                 str(getattr(video, "file_name", "") or "telegram-video.mp4"),
                 str(getattr(video, "mime_type", "") or "video/mp4"),
+                "video",
             )
         )
     document = getattr(message, "document", None)
@@ -2848,7 +2936,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
         mime_type = str(getattr(document, "mime_type", "") or "")
         file_name = str(getattr(document, "file_name", "") or "")
         if is_supported_chat_file(filename=file_name, media_type=mime_type):
-            candidates.append((document, file_name or "telegram-document", mime_type or None))
+            candidates.append((document, file_name or "telegram-document", mime_type or None, "document"))
     attachments: list[dict[str, str]] = []
     chat = None if message is None else getattr(message, "chat", None)
     chat_id = None if chat is None else getattr(chat, "id", None)
@@ -2861,7 +2949,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
         timing_marks.append(f"{label}:{round((now - timing_last_at) * 1000, 1)}ms")
         timing_last_at = now
 
-    for file_ref, filename, media_type in candidates:
+    for file_ref, filename, media_type, source_kind in candidates:
         _mark_timing(f"file_attempt_start:{filename}")
         attempts = 0
         data = None
@@ -2886,6 +2974,7 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
             principal_id=principal_id,
         )
         if saved is not None:
+            saved["source_kind"] = source_kind
             attachments.append(saved)
             _mark_timing(f"file_saved:{filename}")
         else:
@@ -2902,6 +2991,40 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
             ", ".join(timing_marks),
         )
     return attachments
+
+
+async def _download_telegram_attachment_messages(
+    messages: list[object] | tuple[object, ...],
+    context,
+    *,
+    settings: NullionSettings | None = None,
+) -> list[dict[str, str]]:
+    attachments: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for message in messages:
+        for attachment in await _download_telegram_attachments(message, context, settings=settings):
+            path = str(attachment.get("path") or "")
+            if path and path in seen_paths:
+                continue
+            if path:
+                seen_paths.add(path)
+            attachments.append(attachment)
+    return attachments
+
+
+def _telegram_media_group_id(message: object | None) -> str | None:
+    value = getattr(message, "media_group_id", None)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _telegram_primary_media_group_message(messages: list[object] | tuple[object, ...]) -> object | None:
+    for message in messages:
+        if _message_text_or_caption(message):
+            return message
+    return messages[0] if messages else None
 
 
 async def _send_typing_indicator(message, *, runtime: PersistentRuntime, text: str | None) -> None:
@@ -3475,7 +3598,7 @@ def _foreground_working_ack_text(
         return None
     if _local_chat_reply_body(prompt) is not None:
         return None
-    return "⧖ Working on your request now. You can keep sending requests while it runs..."
+    return "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
 
 
 def _telegram_tool_event_should_emit_working_ack(event: dict[str, str]) -> bool:
@@ -3517,6 +3640,9 @@ class ChatOperatorService:
     _status_texts: dict[tuple[str, str], str] = field(default_factory=dict)
     _status_locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict)
     _status_typing_tasks: dict[tuple[str, str], asyncio.Task[None]] = field(default_factory=dict)
+    _media_group_messages: dict[tuple[str, str], list[object]] = field(default_factory=dict)
+    _media_group_claimed: set[tuple[str, str]] = field(default_factory=set)
+    _media_group_locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict)
     _task_card_store: PlatformTaskCardStore = field(
         default_factory=lambda: PlatformTaskCardStore(platform_activity_capabilities("telegram"))
     )
@@ -3524,6 +3650,27 @@ class ChatOperatorService:
     def __post_init__(self) -> None:
         self.settings = copy.deepcopy(self.settings)
         self._live_config_signature_cache = self._live_config_signature()
+
+    async def _collect_media_group_messages(
+        self,
+        *,
+        chat_id: str | None,
+        media_group_id: str,
+        message: object,
+    ) -> list[object] | None:
+        key = (str(chat_id or "default"), media_group_id)
+        lock = self._media_group_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            self._media_group_messages.setdefault(key, []).append(message)
+            if key in self._media_group_claimed:
+                return None
+            self._media_group_claimed.add(key)
+        await asyncio.sleep(_TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS)
+        async with lock:
+            messages = list(self._media_group_messages.pop(key, []))
+            self._media_group_claimed.discard(key)
+            self._media_group_locks.pop(key, None)
+        return messages
 
     def _live_config_signature(self) -> tuple[object, ...]:
         paths: list[Path] = []
@@ -3814,6 +3961,7 @@ class ChatOperatorService:
         update,
         *,
         attachments: list[dict[str, str]] | None = None,
+        text_override: str | None = None,
         activity_callback=None,
         text_delta_callback=None,
         append_activity_trace: bool = True,
@@ -3838,7 +3986,7 @@ class ChatOperatorService:
             return None
         _mark_timing("message_read")
 
-        text = _message_text_or_caption(message)
+        text = text_override if isinstance(text_override, str) and text_override.strip() else _message_text_or_caption(message)
         if text is None and not attachments:
             chat = getattr(message, "chat", None)
             chat_id = None if chat is None else getattr(chat, "id", None)
@@ -4044,16 +4192,42 @@ class ChatOperatorService:
         chat_id_text = None if chat_id is None else str(chat_id)
         early_conversation_id = None if chat_id_text is None else f"telegram:{chat_id_text}"
         _mark_timing("received")
+        media_group_messages: list[object] | None = None
+        media_group_id = _telegram_media_group_id(message)
+        if message is not None and media_group_id is not None:
+            media_group_messages = await self._collect_media_group_messages(
+                chat_id=chat_id_text,
+                media_group_id=media_group_id,
+                message=message,
+            )
+            if media_group_messages is None:
+                turn_outcome = "media_group_buffered"
+                _mark_timing("media_group_buffered")
+                _log_turn_timing(turn_outcome)
+                return
+            primary_media_message = _telegram_primary_media_group_message(media_group_messages)
+            if primary_media_message is not None:
+                message = primary_media_message
+                text_for_ack = _message_text_or_caption(message)
+                chat = getattr(message, "chat", None)
+                chat_id = None if chat is None else getattr(chat, "id", None)
+                chat_id_text = None if chat_id is None else str(chat_id)
+                early_conversation_id = None if chat_id_text is None else f"telegram:{chat_id_text}"
+            request_id_local = f"telegram-media-group:{chat_id_text or 'default'}:{media_group_id}"
+            message_id_local = request_id_local
+            _mark_timing(f"media_group_collected:{len(media_group_messages)}")
 
         # ── First-run: self-discover operator chat if not yet configured ────
         if await self._maybe_do_first_run_setup(message, chat_id_text):
             turn_outcome = "first_run_setup"
             _log_turn_timing(turn_outcome)
             return
-        request_id = _telegram_request_id(update)
+        request_id = request_id_local or _telegram_request_id(update)
         request_id_local = request_id
         if message is not None and request_id_local is not None:
-            message_id_local = _telegram_message_id(message=message, chat_id=chat_id_text)
+            message_id_local = message_id_local or _telegram_message_id(message=message, chat_id=chat_id_text)
+        self.refresh_live_configuration()
+        _mark_timing("config_refreshed")
         if isinstance(text_for_ack, str) and (
             not text_for_ack.startswith("/")
             or not is_operator_command_text(text_for_ack)
@@ -4108,12 +4282,25 @@ class ChatOperatorService:
             turn_outcome = "stop_command"
             _log_turn_timing(turn_outcome)
             return
-        self.refresh_live_configuration()
-        _mark_timing("config_refreshed")
 
-        telegram_attachments = await _download_telegram_attachments(message, context, settings=self.settings)
+        telegram_attachments = (
+            await _download_telegram_attachment_messages(media_group_messages, context, settings=self.settings)
+            if media_group_messages is not None
+            else await _download_telegram_attachments(message, context, settings=self.settings)
+        )
+        text_override_for_handler = None
         if text_for_ack is None and telegram_attachments:
-            text_for_ack = "Please analyze the attached file(s)."
+            voice_transcript = _voice_instruction_transcript(
+                telegram_attachments,
+                registry=getattr(self.runtime, "active_tool_registry", None),
+                principal_id=f"telegram:{chat_id_text}" if chat_id_text else "telegram_chat",
+            )
+            if voice_transcript:
+                text_for_ack = voice_transcript
+                text_override_for_handler = voice_transcript
+                telegram_attachments = []
+            else:
+                text_for_ack = "Please analyze the attached file(s)."
         _mark_timing("attachments_downloaded")
 
         inflight_key = chat_id_text or "default"
@@ -4121,7 +4308,7 @@ class ChatOperatorService:
         should_decrement = False
         if request_id is None:
             request_id = _telegram_request_id(update)
-        message_id = _telegram_message_id(message=message, chat_id=chat_id_text)
+        message_id = message_id_local or _telegram_message_id(message=message, chat_id=chat_id_text)
         reply_context = _telegram_reply_context(message)
         dedupe_key = _ingress_dedupe_key(request_id=request_id, message_id=message_id)
         request_id_local = request_id
@@ -4374,6 +4561,7 @@ class ChatOperatorService:
                         self,
                         update,
                         attachments=telegram_attachments,
+                        text_override=text_override_for_handler,
                         activity_callback=activity_callback,
                         text_delta_callback=text_streamer.emit,
                         append_activity_trace=(
@@ -4459,6 +4647,10 @@ class ChatOperatorService:
                         decision_card = _existing_pending_approval_card(self.runtime, reply)
                     # UX-16: detect newly-created reminders for a confirmation card.
                     _new_reminder_card = _check_new_reminder_card(self.runtime, _reminder_ids_before)
+                    decision_card, _new_reminder_card = _promote_reminder_card_to_primary(
+                        decision_card,
+                        _new_reminder_card,
+                    )
                     # UX-9: detect safe-alternative suggestions in refusal replies.
                     _suggestion_markup = None
                     if decision_card is None and isinstance(reply, str):

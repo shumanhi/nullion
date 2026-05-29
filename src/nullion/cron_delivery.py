@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from functools import lru_cache
 import html
 import json
@@ -36,9 +37,9 @@ MAX_CRON_TEXT_ARTIFACT_CHARS = 12000
 MAX_CRON_ATTACHMENT_FALLBACK_CHARS = 420
 DEFAULT_CRON_NO_OUTPUT_MESSAGE = "Cron ran successfully; no output was produced."
 CRON_DELIVERY_REPLY_PREFIX = "⏰ "
-CRON_DELIVERY_REPLY_PREFIXES = (CRON_DELIVERY_REPLY_PREFIX, "❖ ")
-SCHEDULED_TASK_STATUS_TITLE = "❖ SCHEDULED TASK"
-SCHEDULED_TASK_DELIVERY_PREFIX = "❖ SCHEDULED TASK:"
+CRON_DELIVERY_REPLY_PREFIXES = (CRON_DELIVERY_REPLY_PREFIX, "⏱️ ", "❖ ")
+SCHEDULED_TASK_STATUS_TITLE = "⏱️ SCHEDULED TASK"
+SCHEDULED_TASK_DELIVERY_PREFIX = "⏱️ SCHEDULED TASK:"
 CRON_INTERNAL_CAPABILITY_TAGS = frozenset({"scheduler"})
 CRON_INTERNAL_REFERENCE_TOOLS = frozenset({"request_tool_scope", "skill_pack_read"})
 CRON_DELIVERABLE_ARTIFACT_TOOLS = frozenset(
@@ -68,6 +69,29 @@ HTML_IMAGE_DELIVERY_MODE_SELF_CONTAINED = "self_contained"
 _HTML_SELF_CONTAINED_REMOTE_SRC_RE = re.compile(
     r"<img\b[^>]*\bsrc\s*=\s*[\"']\s*https?://[^\"']+[\"']",
     flags=re.IGNORECASE,
+)
+_CRON_INTERNAL_PREVIEW_SCHEMA_RE = re.compile(r'"(?:original_chars|preview)"\s*:', re.IGNORECASE)
+_CRON_INTERNAL_UUID_TOKEN_RE = re.compile(
+    r"\$[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_CRON_SPACED_TOKEN_RE = re.compile(r"(?:\b[A-Za-z]\s+){4,}[A-Za-z]\b")
+_CRON_RESTART_ACTIVE_EVENT_TYPES = frozenset(
+    {
+        "cron.delivery.started",
+        "cron.delivery.agent_preflight",
+        "cron.delivery.deferred",
+        "cron.delivery.blocked",
+    }
+)
+_CRON_RESTART_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        "cron.delivery.sent",
+        "cron.delivery.failed",
+        "cron.delivery.saved",
+        "cron.delivery.silent",
+        "cron.delivery.cancelled",
+    }
 )
 
 
@@ -242,6 +266,98 @@ def _cron_agent_exception_result(exc: BaseException) -> dict[str, object]:
     }
 
 
+def _coerce_utc_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    return None
+
+
+def record_interrupted_cron_delivery_runs(
+    store: object,
+    *,
+    actor: str = "cron_scheduler",
+    now: datetime | None = None,
+) -> int:
+    """Mark non-terminal cron delivery runs interrupted by a scheduler restart."""
+
+    list_events = getattr(store, "list_events", None)
+    add_event = getattr(store, "add_event", None)
+    if not callable(list_events) or not callable(add_event):
+        return 0
+    try:
+        events = list(list_events() or [])
+    except Exception:
+        return 0
+    if not events:
+        return 0
+
+    observed_at = now or datetime.now(UTC)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    else:
+        observed_at = observed_at.astimezone(UTC)
+
+    latest_by_cron: dict[str, tuple[str, datetime | None, dict[str, object]]] = {}
+    for event in reversed(events):
+        event_type = str(getattr(event, "event_type", "") or "").strip()
+        if not event_type.startswith("cron.delivery."):
+            continue
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        cron_id = str(payload.get("cron_id") or "").strip()
+        if not cron_id or cron_id in latest_by_cron:
+            continue
+        latest_by_cron[cron_id] = (
+            event_type,
+            _coerce_utc_datetime(getattr(event, "created_at", None)),
+            dict(payload),
+        )
+
+    if not latest_by_cron:
+        return 0
+
+    from nullion.events import make_event
+
+    recorded = 0
+    for cron_id, (event_type, created_at, payload) in latest_by_cron.items():
+        if event_type in _CRON_RESTART_TERMINAL_EVENT_TYPES:
+            continue
+        if event_type not in _CRON_RESTART_ACTIVE_EVENT_TYPES:
+            continue
+        if created_at is not None and created_at > observed_at:
+            continue
+        failure_payload = {
+            **payload,
+            "cron_id": cron_id,
+            "reason": "cron_run_interrupted_by_runtime_restart",
+            "error": "Scheduled task was interrupted by runtime restart before terminal delivery.",
+            "interrupted_at": observed_at.isoformat(),
+            "previous_event_type": event_type,
+        }
+        try:
+            add_event(make_event("cron.delivery.failed", actor, failure_payload))
+            recorded += 1
+        except Exception:
+            logger.debug("Could not record interrupted cron delivery for %s", cron_id, exc_info=True)
+    return recorded
+
+
 def _manual_cron_failure_detail(reason: str, error: str) -> str:
     if reason == "cron_run_model_timeout":
         return "  Reason: Model/provider response timed out before the scheduled task finished."
@@ -253,6 +369,12 @@ def _manual_cron_failure_detail(reason: str, error: str) -> str:
         return "  Reason: Scheduled task produced raw tool output instead of a deliverable report."
     if reason == "cron_run_internal_tool_output_leaked":
         return "  Reason: Scheduled task tried to deliver internal tool reference content."
+    if reason == "cron_run_malformed_delivery_text":
+        return "  Reason: Scheduled task produced malformed internal text instead of a deliverable report."
+    if reason == "cron_run_without_completed_tool_evidence":
+        return "  Reason: Scheduled task did not complete a data-gathering tool before producing a result."
+    if reason == "cron_run_account_connection_unavailable":
+        return f"  Reason: {error or 'Account connection is unavailable. Reconnect or update the connection, then try again.'}."
     if error and error != reason:
         return f"  Reason: {error}."
     if reason:
@@ -384,6 +506,7 @@ def cron_agent_history(
     principal_id: str,
     tool_registry: object,
     include_connector_context: bool,
+    include_structured_connection_context: bool = False,
 ) -> list[dict[str, object]]:
     """Build the single cron-agent context shared by every delivery surface."""
 
@@ -417,7 +540,7 @@ def cron_agent_history(
 
     connections_text = format_workspace_connections_for_prompt(
         principal_id=principal_id,
-        include_external_connectors=include_connector_context,
+        include_external_connectors=include_connector_context or include_structured_connection_context,
     )
     if connections_text:
         history.append({"role": "system", "content": [{"type": "text", "text": connections_text}]})
@@ -558,6 +681,7 @@ def run_single_agent_cron_turn(
                     principal_id=conversation_id,
                     tool_registry=execution_registry,
                     include_connector_context=connector_scope.allow_connector_tools,
+                    include_structured_connection_context=bool(structured_tool_names),
                 ),
                 tool_registry=execution_registry,
                 policy_store=getattr(runtime, "store", None),
@@ -927,7 +1051,7 @@ def scheduled_task_delivery_text(job: object, text: str, *, run_label: str | Non
     timestamp_suffix, normalized_body = _strip_leading_cron_report_heading(body, name)
     if timestamp_suffix or normalized_body != body:
         body = normalized_body
-    header = f"❖ {label.upper()}: {name}"
+    header = f"⏱️ {label.upper()}: {name}"
     if timestamp_suffix:
         header = f"{header} — {timestamp_suffix}"
     return f"{header}\n\n{body}" if body else header
@@ -1095,6 +1219,12 @@ def _tool_result_name(result: object) -> str:
     return str(getattr(result, "tool_name", "") or "")
 
 
+def _tool_result_error(result: object) -> str:
+    if isinstance(result, dict):
+        return str(result.get("error") or "").strip()
+    return str(getattr(result, "error", "") or "").strip()
+
+
 def _tool_result_status(result: object) -> str:
     if isinstance(result, dict):
         return str(result.get("status") or "")
@@ -1194,6 +1324,31 @@ def _cron_result_has_empty_scope_request(result: dict[str, object]) -> bool:
     return False
 
 
+def _cron_result_account_connection_failure(result: dict[str, object]) -> str | None:
+    for tool_result in result.get("tool_results") or ():
+        tool_name = _tool_result_name(tool_result)
+        if tool_name not in _CRON_SENSITIVE_ACCOUNT_TOOLS:
+            continue
+        output = _tool_result_output(tool_result)
+        error = _tool_result_error(tool_result)
+        result_text = str(output.get("result_text") or "").strip()
+        if output.get("terminal_user_action_required") is True and result_text:
+            return result_text
+        connection_state = str(output.get("connection_state") or "").strip()
+        if connection_state in {"pending_or_failed", "missing_credential", "unavailable"}:
+            connector_app = str(output.get("connector_app_id") or output.get("app") or "account").strip()
+            return f"{connector_app} connection is unavailable. Reconnect or update the connection, then try again."
+        if " requires " in error and ("_TOKEN" in error or "_API_KEY" in error or "_BASE_URL" in error):
+            provider = tool_name
+            provider_id = output.get("provider_id")
+            if isinstance(provider_id, str) and provider_id.strip():
+                provider = provider_id.strip()
+            else:
+                provider = error.split(" requires ", 1)[0].strip() or provider
+            return f"{provider} is missing required connection configuration: {error}"
+    return None
+
+
 def cron_structured_result_block_reason(
     result: dict[str, object],
     artifacts: object,
@@ -1213,10 +1368,16 @@ def cron_structured_result_block_reason(
         return "cron_run_raw_tool_payload"
     if _cron_result_leaked_internal_tool_output(result, text):
         return "cron_run_internal_tool_output_leaked"
+    if _cron_delivery_text_is_malformed_or_internal(text):
+        return "cron_run_malformed_delivery_text"
     if _cron_result_has_empty_scope_request(result):
         return "cron_run_tool_scope_unavailable"
     if _cron_result_has_internal_capability_denial(result):
         return "cron_run_denied_internal_capability"
+    account_connection_failure = _cron_result_account_connection_failure(result)
+    if account_connection_failure:
+        result["error"] = account_connection_failure
+        return "cron_run_account_connection_unavailable"
     if (
         result.get("tool_results")
         and not artifacts
@@ -1224,6 +1385,26 @@ def cron_structured_result_block_reason(
     ):
         return "cron_run_without_completed_tool_evidence"
     return None
+
+
+def _cron_delivery_text_is_malformed_or_internal(text: str | None) -> bool:
+    raw = str(text or "")
+    stripped = raw.strip()
+    if not stripped:
+        return False
+    if _CRON_INTERNAL_PREVIEW_SCHEMA_RE.search(stripped):
+        return True
+    replacement_count = stripped.count("\ufffd")
+    if replacement_count >= 2:
+        return True
+    if replacement_count and (
+        _CRON_SPACED_TOKEN_RE.search(stripped)
+        or _CRON_INTERNAL_UUID_TOKEN_RE.search(stripped)
+    ):
+        return True
+    if _CRON_INTERNAL_UUID_TOKEN_RE.search(stripped) and _CRON_SPACED_TOKEN_RE.search(stripped):
+        return True
+    return False
 
 
 def _artifact_paths_from_value(value: object) -> tuple[str, ...]:
@@ -2264,6 +2445,61 @@ def legacy_cron_delivery_text_with_media(text: str, artifacts: object) -> str:
     return "\n\n".join([text, "\n".join(dict.fromkeys(media_lines))])
 
 
+def record_cron_delivery_chat_turn(
+    store: object,
+    job: object,
+    *,
+    conversation_id: str,
+    delivery_channel: str,
+    delivery_target: str = "",
+    delivered_text: str,
+) -> None:
+    """Persist a terminal scheduled-task delivery as chat-visible context."""
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id:
+        return
+    from nullion.artifacts import media_candidate_paths_from_text
+
+    try:
+        from nullion.connections import workspace_id_for_principal
+
+        workspace_id = workspace_id_for_principal(conversation_id)
+    except Exception:
+        workspace_id = str(getattr(job, "workspace_id", "") or "workspace_admin")
+    summary = str(getattr(job, "name", "") or "").strip() or "Scheduled task"
+    artifact_names = [
+        Path(str(path)).name
+        for path in media_candidate_paths_from_text(str(delivered_text or ""))
+        if str(path).strip()
+    ]
+    artifact_summary = ", ".join(artifact_names[:3]) if artifact_names else "none"
+    if len(artifact_names) > 3:
+        artifact_summary = f"{artifact_summary} (+{len(artifact_names) - 3} more)"
+    now = datetime.now(UTC).isoformat()
+    event = {
+        "conversation_id": conversation_id,
+        "workspace_id": workspace_id,
+        "event_type": "conversation.chat_turn",
+        "created_at": now,
+        "chat_id": str(delivery_target or "").strip() or None,
+        "turn_id": f"cron-{getattr(job, 'id', '') or uuid4().hex}-{uuid4().hex[:12]}",
+        "user_message": (
+            f"[Scheduled task delivery context] task={summary}; "
+            f"channel={delivery_channel}; artifacts={artifact_summary}"
+        ),
+        "assistant_reply": str(delivered_text or ""),
+        "tool_results": [],
+        "source": "cron",
+        "cron_id": str(getattr(job, "id", "") or ""),
+        "cron_name": summary,
+        "delivery_channel": str(delivery_channel or "").strip(),
+        "delivery_target": str(delivery_target or "").strip(),
+    }
+    add_conversation_event = getattr(store, "add_conversation_event", None)
+    if callable(add_conversation_event):
+        add_conversation_event(event)
+
+
 @dataclass(frozen=True)
 class CronRunDeliveryCallbacks:
     effective_channel: Callable[[object], str]
@@ -2277,6 +2513,7 @@ class CronRunDeliveryCallbacks:
     clear_background_delivery: Callable[[str], None] | None = None
     silent_delivery_text: Callable[[object, str, dict[str, object]], str | None] | None = None
     notify_approval_required: Callable[[object, str, str, dict[str, object]], None] | None = None
+    record_chat_turn: Callable[[object, str, str, str, str], None] | None = None
 
 
 class _CronRunDeliveryState(TypedDict, total=False):
@@ -2558,14 +2795,15 @@ def _cron_run_silent_node(state: _CronRunDeliveryState) -> dict[str, object]:
 def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
     callbacks = state["callbacks"]
     result = dict(state.get("result") or {})
+    delivered_text = scheduled_task_delivery_text(
+        state["job"],
+        str(state.get("text") or ""),
+        run_label=state.get("label"),
+    )
     callbacks.save_web_delivery(
         state["job"],
         state["conversation_id"],
-        scheduled_task_delivery_text(
-            state["job"],
-            str(state.get("text") or ""),
-            run_label=state.get("label"),
-        ),
+        delivered_text,
         state.get("artifacts"),
         result,
     )
@@ -2576,6 +2814,17 @@ def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, objec
         state["delivery_target"],
         state["conversation_id"],
     )
+    if callbacks.record_chat_turn is not None:
+        try:
+            callbacks.record_chat_turn(
+                state["job"],
+                state["conversation_id"],
+                state["delivery_channel"],
+                state["delivery_target"],
+                delivered_text,
+            )
+        except Exception:
+            logger.debug("Could not record saved cron delivery conversation turn", exc_info=True)
     result["cron_delivery_status"] = "saved"
     _attach_cron_execution_outcome(
         state,
@@ -2618,6 +2867,17 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
             state["delivery_target"],
             state["conversation_id"],
         )
+        if callbacks.record_chat_turn is not None:
+            try:
+                callbacks.record_chat_turn(
+                    state["job"],
+                    state["conversation_id"],
+                    state["delivery_channel"],
+                    state["delivery_target"],
+                    text,
+                )
+            except Exception:
+                logger.debug("Could not record cron delivery conversation turn", exc_info=True)
         result["cron_delivery_status"] = "sent"
         _attach_cron_execution_outcome(
             state,
@@ -2650,6 +2910,17 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
                 state["conversation_id"],
                 reason="attachment delivery failed after text fallback",
             )
+            if callbacks.record_chat_turn is not None:
+                try:
+                    callbacks.record_chat_turn(
+                        state["job"],
+                        state["conversation_id"],
+                        state["delivery_channel"],
+                        state["delivery_target"],
+                        fallback_text,
+                    )
+                except Exception:
+                    logger.debug("Could not record partial cron delivery conversation turn", exc_info=True)
             result["cron_delivery_status"] = "partial_success"
             result["cron_delivery_partial_success"] = True
             result["cron_delivery_attachment_failed"] = True
@@ -2773,6 +3044,7 @@ __all__ = [
     "manual_cron_terminal_status_text",
     "normalize_cron_delivery_channel",
     "normalize_html_image_delivery_mode",
+    "record_interrupted_cron_delivery_runs",
     "run_cron_delivery_workflow",
     "run_single_agent_cron_turn",
     "scheduled_task_delivery_text",

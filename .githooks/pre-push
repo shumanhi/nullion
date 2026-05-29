@@ -7,15 +7,31 @@ while IFS= read -r git_env_name; do
   unset "$git_env_name"
 done < <(git rev-parse --local-env-vars)
 
-if [[ -x ".venv/bin/python" ]]; then
+if [[ -n "${NULLION_PYTHON:-}" && -x "${NULLION_PYTHON:-}" ]]; then
+  PYTHON_CMD="$NULLION_PYTHON"
+elif [[ -x ".venv/bin/python" ]]; then
   PYTHON_CMD=".venv/bin/python"
+elif [[ -x "$HOME/.nullion/venv/bin/python" ]]; then
+  PYTHON_CMD="$HOME/.nullion/venv/bin/python"
+elif command -v python3.11 >/dev/null 2>&1; then
+  PYTHON_CMD="python3.11"
 elif command -v python3 >/dev/null 2>&1; then
   PYTHON_CMD="python3"
 else
   PYTHON_CMD="python"
 fi
 
-TEST_REPO="${NULLION_TEST_REPO:-"$(dirname "$ROOT")/nullion-test"}"
+if [[ -n "${NULLION_TEST_REPO:-}" ]]; then
+  TEST_REPO="$NULLION_TEST_REPO"
+else
+  ROOT_PARENT="$(dirname "$ROOT")"
+  ROOT_BASENAME="$(basename "$ROOT")"
+  if [[ "$ROOT_BASENAME" == nullion-* && -d "$ROOT_PARENT/nullion-test-${ROOT_BASENAME#nullion-}" ]]; then
+    TEST_REPO="$ROOT_PARENT/nullion-test-${ROOT_BASENAME#nullion-}"
+  else
+    TEST_REPO="$ROOT_PARENT/nullion-test"
+  fi
+fi
 TEST_PATH="$TEST_REPO/tests"
 
 if [[ "${NULLION_SKIP_PRIVATE_TESTS:-0}" == "1" ]]; then
@@ -70,6 +86,13 @@ elif [[ -x "$IMPORTANT_CHECK" ]]; then
   echo "pre-push: running Nullion important/e2e checks..."
   "$IMPORTANT_CHECK"
   echo "pre-push: Nullion important/e2e checks passed."
+elif [[ -x "$TEST_REPO/scripts/e2e-docker.sh" ]]; then
+  echo "pre-push: local important/e2e harness not found; running paired Docker E2E suite from $TEST_REPO..."
+  NULLION_APP_REPO="$ROOT" "$TEST_REPO/scripts/e2e-docker.sh"
+  echo "pre-push: paired Docker E2E suite passed."
 else
-  echo "pre-push: local important/e2e check harness not found; skipping $IMPORTANT_CHECK"
+  echo "pre-push: required important/e2e check harness not found: $IMPORTANT_CHECK" >&2
+  echo "pre-push: paired Docker E2E runner not found or not executable: $TEST_REPO/scripts/e2e-docker.sh" >&2
+  echo "pre-push: refusing to push without local important/e2e coverage." >&2
+  exit 1
 fi

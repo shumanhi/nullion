@@ -756,7 +756,7 @@ function Save-AccountCheckpoint {
     if ($ACTIVEPIECES_API_KEY) { Set-EnvValue "ACTIVEPIECES_API_KEY" $ACTIVEPIECES_API_KEY }
     if ($N8N_BASE_URL) { Set-EnvValue "N8N_BASE_URL" $N8N_BASE_URL }
     if ($N8N_API_KEY) { Set-EnvValue "N8N_API_KEY" $N8N_API_KEY }
-    if ($MATON_CONNECTOR_ENABLED) { Set-EnvValue "NULLION_CONNECTOR_GATEWAY" "maton" }
+    if ($CONNECTOR_GATEWAY) { Set-EnvValue "NULLION_CONNECTOR_GATEWAY" $CONNECTOR_GATEWAY }
     if ($CUSTOM_API_BASE_URL) { Set-EnvValue "NULLION_CUSTOM_API_BASE_URL" $CUSTOM_API_BASE_URL }
     if ($CUSTOM_API_TOKEN) { Set-EnvValue "NULLION_CUSTOM_API_TOKEN" $CUSTOM_API_TOKEN }
     Write-Ok "Account/API setup checkpoint saved to $NULLION_ENV_FILE"
@@ -799,7 +799,7 @@ function Save-SkillCheckpoint {
     if ($ENABLED_SKILL_PACKS) {
         Set-EnvValue "NULLION_ENABLED_SKILL_PACKS" $ENABLED_SKILL_PACKS
         Set-EnvValue "NULLION_SKILL_PACK_ACCESS_ENABLED" "true" -Raw
-        if (",$ENABLED_SKILL_PACKS," -like "*,nullion/connector-skills,*" -or $ENABLED_SKILL_PACKS -like "*api-gateway*") {
+        if ($CONNECTOR_GATEWAY) {
             Set-EnvValue "NULLION_CONNECTOR_ACCESS_ENABLED" "true" -Raw
         }
     }
@@ -1368,7 +1368,7 @@ function Request-MediaApiKey {
     if (-not $key) {
         Write-Host "  Get an API key at $KeyUrl" -ForegroundColor Cyan
         $secure = Read-Host "  Paste $(Get-MediaProviderLabel $Provider) media API key (hidden)" -AsSecureString
-        $key = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $key = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         Set-MediaProviderKey $Provider $key
     }
@@ -1872,7 +1872,7 @@ if (($MESSAGING_CHOICES -match '1') -or ($MESSAGING_CHOICES -match 'telegram')) 
     if (-not $BOT_TOKEN) {
         while ($true) {
             $secureBotToken = Read-Host "  Paste your bot token here (hidden)" -AsSecureString
-            $BOT_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            $BOT_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                 [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureBotToken))
             $BOT_TOKEN = $BOT_TOKEN.Trim()
             if ($BOT_TOKEN -match '^\d{6,}:[A-Za-z0-9_\-]{20,}$') {
@@ -2053,7 +2053,7 @@ switch ($providerChoice) {
             Write-Host "  Get an API key at https://platform.openai.com/api-keys" -ForegroundColor Cyan
             while ($true) {
                 $secure = Read-Host "  Paste your OpenAI API key (hidden)" -AsSecureString
-                $plain  = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                $plain  = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                               [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
                 if ($plain -match '^sk-') {
                     $OPENAI_KEY = $plain
@@ -2073,7 +2073,7 @@ switch ($providerChoice) {
         while ($true) {
             # Read-Host -AsSecureString hides input like a password
             $secure = Read-Host "  Paste your Anthropic API key (hidden)" -AsSecureString
-            $plain  = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            $plain  = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                           [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
             if ($plain -match '^sk-ant-') {
                 $ANTHROPIC_KEY = $plain
@@ -2092,7 +2092,7 @@ switch ($providerChoice) {
         Write-Host "  Get an API key at https://openrouter.ai/keys" -ForegroundColor Cyan
         while ($true) {
             $secure = Read-Host "  Paste your OpenRouter API key (hidden)" -AsSecureString
-            $plain  = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            $plain  = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                           [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
             if ($plain -match '^sk-or-') {
                 $OPENAI_KEY = $plain
@@ -2110,7 +2110,7 @@ switch ($providerChoice) {
         Write-Host ""
         Write-Host "  Get an API key at https://aistudio.google.com/app/apikey" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your Gemini API key (hidden)" -AsSecureString
-        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         $MODEL_NAME = Read-ModelName $MODEL_NAME
         Write-Ok "Gemini selected."
@@ -2131,7 +2131,7 @@ switch ($providerChoice) {
         $MODEL_NAME = "llama-3.3-70b-versatile"
         Write-Host "  Get an API key at https://console.groq.com/keys" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your Groq API key (hidden)" -AsSecureString
-        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         $MODEL_NAME = Read-ModelName $MODEL_NAME
     }
@@ -2141,7 +2141,7 @@ switch ($providerChoice) {
         $MODEL_NAME = "mistral-large-latest"
         Write-Host "  Get an API key at https://console.mistral.ai/api-keys/" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your Mistral API key (hidden)" -AsSecureString
-        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         $MODEL_NAME = Read-ModelName $MODEL_NAME
     }
@@ -2151,7 +2151,7 @@ switch ($providerChoice) {
         $MODEL_NAME = "deepseek-chat"
         Write-Host "  Get an API key at https://platform.deepseek.com/api_keys" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your DeepSeek API key (hidden)" -AsSecureString
-        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         $MODEL_NAME = Read-ModelName $MODEL_NAME
     }
@@ -2161,7 +2161,7 @@ switch ($providerChoice) {
         $MODEL_NAME = "grok-4"
         Write-Host "  Get an API key at https://console.x.ai/" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your xAI API key (hidden)" -AsSecureString
-        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         $MODEL_NAME = Read-ModelName $MODEL_NAME
     }
@@ -2171,7 +2171,7 @@ switch ($providerChoice) {
         $MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
         Write-Host "  Get an API key at https://api.together.xyz/settings/api-keys" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your Together API key (hidden)" -AsSecureString
-        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         $MODEL_NAME = Read-ModelName $MODEL_NAME
     }
@@ -2182,7 +2182,7 @@ switch ($providerChoice) {
         $MODEL_NAME = (Read-Host "  Model name").Trim()
         if (Confirm-Prompt "Does this endpoint require an API key?") {
             $secure = Read-Host "  Paste API key (hidden)" -AsSecureString
-            $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            $OPENAI_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                 [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         } else {
             $OPENAI_KEY = "local"
@@ -2313,7 +2313,7 @@ switch ($SearchChoice) {
         Write-Host "  Open https://api-dashboard.search.brave.com/app/keys" -ForegroundColor Cyan
         Write-Host "  Sign in, create a Search API key, then paste it here."
         $secure = Read-Host "  Paste your Brave Search API key (hidden)" -AsSecureString
-        $BRAVE_SEARCH_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $BRAVE_SEARCH_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         Write-Ok "Brave Search selected."
     }
@@ -2325,7 +2325,7 @@ switch ($SearchChoice) {
         $SEARCH_PROVIDER = "google_custom_search_provider"
         Write-Host "  Custom Search docs: https://developers.google.com/custom-search/v1/overview" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your Google Search API key (hidden)" -AsSecureString
-        $GOOGLE_SEARCH_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $GOOGLE_SEARCH_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         $GOOGLE_SEARCH_CX = Read-Host "  Paste your Programmable Search Engine ID (cx)"
         Write-Ok "Google Custom Search selected."
@@ -2334,7 +2334,7 @@ switch ($SearchChoice) {
         $SEARCH_PROVIDER = "perplexity_search_provider"
         Write-Host "  Get a key at https://www.perplexity.ai/settings/api" -ForegroundColor Cyan
         $secure = Read-Host "  Paste your Perplexity API key (hidden)" -AsSecureString
-        $PERPLEXITY_SEARCH_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        $PERPLEXITY_SEARCH_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
         Write-Ok "Perplexity Search selected."
     }
@@ -2359,8 +2359,9 @@ Write-Host "  compatible HTTP API."
 Write-Host ""
 
 $EMAIL_CALENDAR_ENABLED = $false
-$MATON_CONNECTOR_ENABLED = $false
+$CONNECTOR_CREDENTIALS_ENABLED = $false
 $CONNECTOR_SKILLS_ENABLED = $false
+$CONNECTOR_SELECTED_SKILL_PACKS = @()
 $CUSTOM_EMAIL_API_ENABLED = $false
 $MATON_API_KEY = Get-EnvValue "MATON_API_KEY"
 $COMPOSIO_API_KEY = Get-EnvValue "COMPOSIO_API_KEY"
@@ -2368,12 +2369,24 @@ $NANGO_SECRET_KEY = Get-EnvValue "NANGO_SECRET_KEY"
 $ACTIVEPIECES_API_KEY = Get-EnvValue "ACTIVEPIECES_API_KEY"
 $N8N_API_KEY = Get-EnvValue "N8N_API_KEY"
 $N8N_BASE_URL = Get-EnvValue "N8N_BASE_URL"
+$CUSTOM_CONNECTOR_BASE_URL = Get-EnvValue "NULLION_CUSTOM_CONNECTOR_BASE_URL"
+$CUSTOM_CONNECTOR_TOKEN = Get-EnvValue "NULLION_CUSTOM_CONNECTOR_TOKEN"
 $CUSTOM_API_BASE_URL = Get-EnvValue "NULLION_CUSTOM_API_BASE_URL"
 $CUSTOM_API_TOKEN = Get-EnvValue "NULLION_CUSTOM_API_TOKEN"
 $ExistingEnabledPlugins = Get-EnvValue "NULLION_ENABLED_PLUGINS"
-$ExistingConnectorGateway = Get-EnvValue "NULLION_CONNECTOR_GATEWAY"
-if ("$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$ExistingConnectorGateway") {
-    $MATON_CONNECTOR_ENABLED = $true
+$CONNECTOR_GATEWAY = Get-EnvValue "NULLION_CONNECTOR_GATEWAY"
+function Get-ConnectorGatewayFromCredentials {
+    if ($CONNECTOR_GATEWAY) { return $CONNECTOR_GATEWAY }
+    if ($MATON_API_KEY) { return "maton" }
+    if ($COMPOSIO_API_KEY) { return "composio" }
+    if ($NANGO_SECRET_KEY) { return "nango" }
+    if ($ACTIVEPIECES_API_KEY) { return "activepieces" }
+    if ("$N8N_API_KEY$N8N_BASE_URL") { return "n8n" }
+    return ""
+}
+if ("$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$CONNECTOR_GATEWAY") {
+    $CONNECTOR_GATEWAY = Get-ConnectorGatewayFromCredentials
+    $CONNECTOR_CREDENTIALS_ENABLED = $true
     $CONNECTOR_SKILLS_ENABLED = $true
 }
 if (",$ExistingEnabledPlugins," -match ',(email_plugin|calendar_plugin),' -or $CONNECTOR_SKILLS_ENABLED) {
@@ -2384,15 +2397,16 @@ if (",$ExistingEnabledPlugins," -match ',(email_plugin|calendar_plugin),' -or $C
         } elseif (",$ExistingEnabledPlugins," -match ',(email_plugin|calendar_plugin),') {
             $EMAIL_CALENDAR_ENABLED = $true
         }
-        if ("$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$ExistingConnectorGateway") {
-            $MATON_CONNECTOR_ENABLED = $true
+        if ("$MATON_API_KEY$COMPOSIO_API_KEY$NANGO_SECRET_KEY$ACTIVEPIECES_API_KEY$N8N_API_KEY$CONNECTOR_GATEWAY") {
+            $CONNECTOR_GATEWAY = Get-ConnectorGatewayFromCredentials
+            $CONNECTOR_CREDENTIALS_ENABLED = $true
             $CONNECTOR_SKILLS_ENABLED = $true
         }
         Write-Ok "Using existing account/API setup."
     }
 }
 
-if ((-not $EMAIL_CALENDAR_ENABLED) -and (-not $CUSTOM_EMAIL_API_ENABLED) -and (-not $MATON_CONNECTOR_ENABLED)) {
+if ((-not $EMAIL_CALENDAR_ENABLED) -and (-not $CUSTOM_EMAIL_API_ENABLED) -and (-not $CONNECTOR_CREDENTIALS_ENABLED)) {
     Write-MenuItem "1" "Gmail / Google Calendar" "Local setup with Himalaya plus the Google API wrapper" "[recommended]"
     Write-MenuItem "2" "Connector skill credentials" "Maton, Composio, Nango, Activepieces, n8n, or custom gateway"
     Write-MenuItem "3" "Custom email API bridge" "Bind Nullion email tools to your own HTTP bridge"
@@ -2428,7 +2442,6 @@ if ((-not $EMAIL_CALENDAR_ENABLED) -and (-not $CUSTOM_EMAIL_API_ENABLED) -and (-
             Write-Ok "Email/calendar plugins will be enabled."
         }
         "2" {
-            $MATON_CONNECTOR_ENABLED = $true
             $CONNECTOR_SKILLS_ENABLED = $true
             Write-Host ""
             Write-Host "  Connector skills are broad workflow guidance for SaaS/API gateways."
@@ -2439,36 +2452,52 @@ if ((-not $EMAIL_CALENDAR_ENABLED) -and (-not $CUSTOM_EMAIL_API_ENABLED) -and (-
             Write-MenuItem "3" "Nango" "Open-source OAuth and integration platform"
             Write-MenuItem "4" "Activepieces" "Open-source automation pieces"
             Write-MenuItem "5" "n8n" "Self-hostable workflow automation"
-            Write-MenuItem "6" "Skip credentials" "Enable the connector skills only"
+            Write-MenuItem "6" "Custom MCP/HTTP gateway" "Use your own connector base URL and token"
+            Write-MenuItem "7" "Skip credentials" "Enable the connector skills only"
             Write-Host ""
-            $ConnectorChoices = Read-Host "  Select one or more [1]"
-            if (-not $ConnectorChoices) { $ConnectorChoices = "1" }
+            $ConnectorChoices = Read-Host "  Select one or more [7]"
+            if (-not $ConnectorChoices) { $ConnectorChoices = "7" }
             $ConnectorChoices = "," + (($ConnectorChoices -replace '[^0-9]+', ',').Trim(',')) + ","
             if ($ConnectorChoices -match ',1,') {
+                $CONNECTOR_SELECTED_SKILL_PACKS += "maton-ai/api-gateway-skill"
                 $secure = Read-Host "  Maton API key (hidden)" -AsSecureString
-                $MATON_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                $MATON_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
             }
             if ($ConnectorChoices -match ',2,') {
+                $CONNECTOR_SELECTED_SKILL_PACKS += "composio/mcp-connector-skill"
                 $secure = Read-Host "  Composio API key (hidden)" -AsSecureString
-                $COMPOSIO_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                $COMPOSIO_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
             }
             if ($ConnectorChoices -match ',3,') {
+                $CONNECTOR_SELECTED_SKILL_PACKS += "nango/mcp-connector-skill"
                 $secure = Read-Host "  Nango secret key (hidden)" -AsSecureString
-                $NANGO_SECRET_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                $NANGO_SECRET_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
             }
             if ($ConnectorChoices -match ',4,') {
+                $CONNECTOR_SELECTED_SKILL_PACKS += "activepieces/mcp-connector-skill"
                 $secure = Read-Host "  Activepieces API key (hidden)" -AsSecureString
-                $ACTIVEPIECES_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                $ACTIVEPIECES_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
             }
             if ($ConnectorChoices -match ',5,') {
+                $CONNECTOR_SELECTED_SKILL_PACKS += "n8n/mcp-connector-skill"
                 $N8N_BASE_URL = (Read-Host "  n8n base URL (e.g. http://localhost:5678)").Trim()
                 $secure = Read-Host "  n8n API key (hidden)" -AsSecureString
-                $N8N_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                $N8N_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            }
+            if ($ConnectorChoices -match ',6,') {
+                $CUSTOM_CONNECTOR_BASE_URL = (Read-Host "  Connector base URL").Trim()
+                $secure = Read-Host "  Connector bearer token (hidden)" -AsSecureString
+                $CUSTOM_CONNECTOR_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            }
+            $CONNECTOR_GATEWAY = Get-ConnectorGatewayFromCredentials
+            if ("$CUSTOM_CONNECTOR_BASE_URL$CUSTOM_CONNECTOR_TOKEN" -and -not $CONNECTOR_GATEWAY) {
+                $CONNECTOR_GATEWAY = "custom"
             }
             Write-Ok "Connector/API skill pack will be enabled."
         }
@@ -2481,7 +2510,7 @@ if ((-not $EMAIL_CALENDAR_ENABLED) -and (-not $CUSTOM_EMAIL_API_ENABLED) -and (-
             Write-Host "  A bridge can call Maton, Composio, n8n, Activepieces, Nango, or any API behind those endpoints."
             $CUSTOM_API_BASE_URL = (Read-Host "  Custom API base URL").Trim()
             $secure = Read-Host "  Custom API bearer token (hidden)" -AsSecureString
-            $CUSTOM_API_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            $CUSTOM_API_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
                 [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
             Write-Ok "Custom email API tools will be enabled."
         }
@@ -2724,130 +2753,45 @@ Save-MediaCheckpoint
 
 # Skill pack setup
 Write-Host ""
-Write-Host "  Choose skill packs to enable:" -ForegroundColor White
-Write-Host "  All built-in skill packs ship with Nullion and are selected by default."
+Write-Host "  Skill packs:" -ForegroundColor White
+Write-Host "  Core skill packs ship with Nullion and are enabled automatically."
+Write-Host "  Add or remove custom skill packs later in Settings."
 Write-Host "  Skill packs add workflow guidance only; account access still requires"
 Write-Host "  workspace-scoped provider connections and enabled tools."
 Write-Host ""
 
 $selectedSkillPacks = New-Object System.Collections.Generic.List[string]
+$CORE_SKILL_PACKS = @(
+    "nullion/web-research",
+    "nullion/browser-automation",
+    "nullion/files-and-docs",
+    "nullion/pdf-documents",
+    "nullion/email-calendar",
+    "nullion/github-code",
+    "nullion/media-local",
+    "nullion/productivity-memory",
+    "nullion/connector-skills"
+)
 function Add-SkillPackChoice {
     param([string]$PackId)
+    $PackId = ([string]$PackId).Trim()
     if ($PackId -and -not $selectedSkillPacks.Contains($PackId)) {
         [void]$selectedSkillPacks.Add($PackId)
     }
 }
 
-function Install-CustomSkillPackNow {
-    param([string]$Source, [string]$PackId = "")
-    $pythonExe = Join-Path $NULLION_VENV_DIR "Scripts\python.exe"
-    $code = @'
-import sys
-from nullion.skill_pack_installer import install_skill_pack
-source = sys.argv[1]
-pack_id = sys.argv[2] or None
-pack = install_skill_pack(source, pack_id=pack_id, force=True)
-print(pack.pack_id)
-'@
-    $result = & $pythonExe -c $code $Source $PackId
-    if ($LASTEXITCODE -ne 0) { throw "skill pack install failed" }
-    return ([string]$result).Trim()
-}
-
-function Request-SkillPackChoices {
-    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
-        Write-Info "No interactive terminal detected; using all default skill packs."
-        return @("1", "2", "3", "4", "5", "6", "7", "8", "9")
-    }
-
-    $items = @(
-        @{ Title = "Web research"; Detail = "Search, fetch, source-backed answers"; Badge = ""; Choice = "1" },
-        @{ Title = "Browser automation"; Detail = "Web navigation, forms, screenshots"; Badge = ""; Choice = "2" },
-        @{ Title = "Files and documents"; Detail = "Local files, docs, sheets, decks"; Badge = ""; Choice = "3" },
-        @{ Title = "PDF documents"; Detail = "PDF generation, conversion, verification, delivery"; Badge = ""; Choice = "4" },
-        @{ Title = "Email and calendar"; Detail = "Inbox triage, replies, scheduling"; Badge = ""; Choice = "5" },
-        @{ Title = "GitHub and code review"; Detail = "Repos, PRs, issues, release notes"; Badge = ""; Choice = "6" },
-        @{ Title = "Local media"; Detail = "Audio transcription, OCR, image workflows"; Badge = ""; Choice = "7" },
-        @{ Title = "Productivity and memory"; Detail = "Tasks, routines, preferences, reminders"; Badge = ""; Choice = "8" },
-        @{ Title = "Connector/API skills"; Detail = "Maton, Composio, Nango, Activepieces, n8n, custom APIs"; Badge = ""; Choice = "9" },
-        @{ Title = "Install custom skill pack"; Detail = "Git URL, GitHub folder, or local folder with SKILL.md"; Badge = ""; Choice = "10" },
-        @{ Title = "No default skill packs"; Detail = "Start with no enabled reference packs"; Badge = ""; Choice = "11" }
-    )
-
-    foreach ($item in $items) {
-        $badge = $item.Badge
-        if (-not $badge -and [int]$item.Choice -le 9) { $badge = "[default]" }
-        Write-MenuItem $item.Choice $item.Title $item.Detail $badge
-    }
-    Write-Host ""
-    Write-Info "Press Enter to use the default packs (1-9), or enter choices like 1,3,6."
-    $rawChoices = (Read-Host "  Skill packs [1,2,3,4,5,6,7,8,9]").Trim()
-    if (-not $rawChoices) { $rawChoices = "1,2,3,4,5,6,7,8,9" }
-
-    $choices = New-Object System.Collections.Generic.List[string]
-    foreach ($choice in ($rawChoices -split '[^0-9]+')) {
-        if (-not $choice) { continue }
-        if ($choice -eq "11") {
-            $choices.Clear()
-            [void]$choices.Add("11")
-            break
-        }
-        if (($items | Where-Object { $_.Choice -eq $choice }) -and -not $choices.Contains($choice)) {
-            [void]$choices.Add($choice)
-        }
-    }
-    if ($choices.Count -eq 0) { [void]$choices.Add("11") }
-    return $choices.ToArray()
-}
-
 $ExistingSkillPacks = Get-EnvValue "NULLION_ENABLED_SKILL_PACKS"
-$SKIP_SKILL_SETUP = $false
+foreach ($pack in $CORE_SKILL_PACKS) {
+    Add-SkillPackChoice $pack
+}
 if ($ExistingSkillPacks) {
     Write-Info "Found existing skill packs: $ExistingSkillPacks"
-    if (Confirm-PromptDefaultYes "Use existing skill packs instead of choosing them again?") {
-        $SKIP_SKILL_SETUP = $true
-        foreach ($pack in ($ExistingSkillPacks -split ',')) {
-            Add-SkillPackChoice $pack
-        }
-        Write-Ok "Using existing skill packs."
+    foreach ($pack in ($ExistingSkillPacks -split ',')) {
+        Add-SkillPackChoice $pack
     }
 }
-
-if (-not $SKIP_SKILL_SETUP) {
-$SkillChoices = Request-SkillPackChoices
-
-if ($SkillChoices -contains "11") {
-    Write-Info "Skipped default skill packs. You can enable them later in Settings."
-} else {
-    foreach ($choice in $SkillChoices) {
-        switch ($choice) {
-            "1" { Add-SkillPackChoice "nullion/web-research" }
-            "2" { Add-SkillPackChoice "nullion/browser-automation" }
-            "3" { Add-SkillPackChoice "nullion/files-and-docs" }
-            "4" { Add-SkillPackChoice "nullion/pdf-documents" }
-            "5" { Add-SkillPackChoice "nullion/email-calendar" }
-            "6" { Add-SkillPackChoice "nullion/github-code" }
-            "7" { Add-SkillPackChoice "nullion/media-local" }
-            "8" { Add-SkillPackChoice "nullion/productivity-memory" }
-            "9" { Add-SkillPackChoice "nullion/connector-skills" }
-            "10" {
-                $CustomSkillPackSource = (Read-Host "  Skill pack source URL/path").Trim()
-                $CustomSkillPackId = (Read-Host "  Pack id [auto]").Trim()
-                if ($CustomSkillPackSource) {
-                    try {
-                        $CustomInstalledPackId = Install-CustomSkillPackNow $CustomSkillPackSource $CustomSkillPackId
-                        Add-SkillPackChoice $CustomInstalledPackId
-                        Write-Ok "Installed skill pack: $CustomInstalledPackId"
-                    } catch {
-                        Write-Err "Could not install custom skill pack. You can add it later in Settings."
-                    }
-                }
-            }
-            ""  { }
-            default { Write-Info "Ignoring unknown skill choice: $choice" }
-        }
-    }
-}
+foreach ($pack in $CONNECTOR_SELECTED_SKILL_PACKS) {
+    Add-SkillPackChoice $pack
 }
 
 $ENABLED_SKILL_PACKS = ($selectedSkillPacks -join ",")
@@ -2910,7 +2854,9 @@ if ($NANGO_SECRET_KEY)     { $envLines += "NANGO_SECRET_KEY=`"$NANGO_SECRET_KEY`
 if ($ACTIVEPIECES_API_KEY) { $envLines += "ACTIVEPIECES_API_KEY=`"$ACTIVEPIECES_API_KEY`"" }
 if ($N8N_BASE_URL)         { $envLines += "N8N_BASE_URL=`"$N8N_BASE_URL`"" }
 if ($N8N_API_KEY)          { $envLines += "N8N_API_KEY=`"$N8N_API_KEY`"" }
-if ($MATON_CONNECTOR_ENABLED) { $envLines += "NULLION_CONNECTOR_GATEWAY=`"maton`"" }
+if ($CUSTOM_CONNECTOR_BASE_URL) { $envLines += "NULLION_CUSTOM_CONNECTOR_BASE_URL=`"$CUSTOM_CONNECTOR_BASE_URL`"" }
+if ($CUSTOM_CONNECTOR_TOKEN) { $envLines += "NULLION_CUSTOM_CONNECTOR_TOKEN=`"$CUSTOM_CONNECTOR_TOKEN`"" }
+if ($CONNECTOR_GATEWAY) { $envLines += "NULLION_CONNECTOR_GATEWAY=`"$CONNECTOR_GATEWAY`"" }
 if ($CUSTOM_API_BASE_URL)  { $envLines += "NULLION_CUSTOM_API_BASE_URL=`"$CUSTOM_API_BASE_URL`"" }
 if ($CUSTOM_API_TOKEN)     { $envLines += "NULLION_CUSTOM_API_TOKEN=`"$CUSTOM_API_TOKEN`"" }
 $enabledPlugins = "search_plugin,browser_plugin,workspace_plugin,media_plugin"
@@ -2956,7 +2902,7 @@ if ($MEDIA_ENABLED) {
 if ($ENABLED_SKILL_PACKS) {
     $envLines += "NULLION_ENABLED_SKILL_PACKS=`"$ENABLED_SKILL_PACKS`""
     $envLines += "NULLION_SKILL_PACK_ACCESS_ENABLED=true"
-    if (",$ENABLED_SKILL_PACKS," -like "*,nullion/connector-skills,*" -or $ENABLED_SKILL_PACKS -like "*api-gateway*") {
+    if ($CONNECTOR_GATEWAY) {
         $envLines += "NULLION_CONNECTOR_ACCESS_ENABLED=true"
     }
 }

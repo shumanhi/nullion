@@ -58,6 +58,7 @@ _DEFAULT_WORKSPACE_ID = "workspace_admin"
 _CRON_COLLECTION = "cron_jobs"
 _CRON_TABLE = "reminders_crons"
 _LOCAL_CRON_SCHEDULE_CUTOFF = datetime(2026, 5, 15, 12, 45, tzinfo=timezone.utc)
+_CRON_DELETED_MARKER = "_deleted"
 
 # ── Data model ─────────────────────────────────────────────────────────────────
 
@@ -474,6 +475,41 @@ def _parse_store_timestamp(value: object) -> datetime | None:
         return None
 
 
+def _cron_delivery_started_since(cron_id: str, scheduled_for: datetime, *, now: datetime) -> str | None:
+    """Return the first recorded delivery start for this scheduled occurrence."""
+    cron_id = str(cron_id or "").strip()
+    if not cron_id:
+        return None
+    if scheduled_for.tzinfo is None:
+        scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    scheduled_iso = scheduled_for.astimezone(timezone.utc).isoformat()
+    now_iso = now.astimezone(timezone.utc).isoformat()
+    try:
+        with sqlite3.connect(str(_runtime_db_path()), timeout=10) as conn:
+            row = conn.execute(
+                """
+                SELECT json_extract(payload, '$.created_at')
+                FROM runtime_events
+                WHERE collection = 'events'
+                  AND json_extract(payload, '$.event_type') = 'cron.delivery.started'
+                  AND json_extract(payload, '$.payload.cron_id') = ?
+                  AND json_extract(payload, '$.created_at') >= ?
+                  AND json_extract(payload, '$.created_at') <= ?
+                ORDER BY json_extract(payload, '$.created_at') ASC
+                LIMIT 1
+                """,
+                (cron_id, scheduled_iso, now_iso),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    started_at = str(row[0] or "").strip()
+    return started_at or None
+
+
 def _ensure_cron_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"""
@@ -506,7 +542,14 @@ def _load_crons_db_snapshot() -> tuple[list[CronJob], datetime | None] | None:
     except sqlite3.Error as exc:
         log.warning("Failed to load crons from runtime DB %s: %s", db_path, exc)
         return None
-    jobs = [CronJob.from_dict(json.loads(str(row["payload"]))) for row in rows]
+    jobs: list[CronJob] = []
+    for row in rows:
+        payload = json.loads(str(row["payload"]))
+        if isinstance(payload, dict) and payload.get(_CRON_DELETED_MARKER) is True:
+            continue
+        job = CronJob.from_dict(payload)
+        job._persisted_updated_at = str(row["updated_at"] or "")
+        jobs.append(job)
     updated_at = max(
         (dt for dt in (_parse_store_timestamp(row["updated_at"]) for row in rows) if dt is not None),
         default=None,
@@ -536,11 +579,36 @@ def list_crons(*, workspace_id: str | None = None, refresh_next_runs: bool = Tru
     return [job for job in jobs if (job.workspace_id or _DEFAULT_WORKSPACE_ID) == requested_workspace]
 
 
-def _save_crons_db(jobs: list[CronJob]) -> bool:
+def _cron_deleted_payload(cron_id: str, *, deleted_at: str) -> str:
+    return json.dumps(
+        {
+            "id": str(cron_id or "").strip(),
+            _CRON_DELETED_MARKER: True,
+            "deleted_at": deleted_at,
+        },
+        sort_keys=True,
+    )
+
+
+def _payload_is_deleted(value: object) -> bool:
+    try:
+        payload = json.loads(str(value or "{}"))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and payload.get(_CRON_DELETED_MARKER) is True
+
+
+def _save_crons_db(
+    jobs: list[CronJob],
+    *,
+    deleted_ids: tuple[str, ...] = (),
+    replace_missing: bool = False,
+) -> bool:
     db_path = _runtime_db_path()
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc).isoformat()
+        job_ids = {str(job.id or "").strip() for job in jobs if str(job.id or "").strip()}
         try:
             from nullion.runtime_persistence import runtime_store_file_lock
 
@@ -550,14 +618,55 @@ def _save_crons_db(jobs: list[CronJob]) -> bool:
         with lock_context:
             with sqlite3.connect(str(db_path), timeout=10) as conn:
                 _ensure_cron_table(conn)
-                conn.execute(f"DELETE FROM {_CRON_TABLE} WHERE collection = ?", (_CRON_COLLECTION,))
+                effective_deleted_ids = {
+                    str(cron_id or "").strip()
+                    for cron_id in deleted_ids
+                    if str(cron_id or "").strip()
+                }
+                if replace_missing:
+                    rows = conn.execute(
+                        f"SELECT item_key, payload FROM {_CRON_TABLE} WHERE collection = ?",
+                        (_CRON_COLLECTION,),
+                    ).fetchall()
+                    effective_deleted_ids.update(
+                        str(row[0] or "").strip()
+                        for row in rows
+                        if str(row[0] or "").strip()
+                        and str(row[0] or "").strip() not in job_ids
+                        and not _payload_is_deleted(row[1])
+                    )
+                for cron_id in sorted(effective_deleted_ids):
+                    conn.execute(
+                        f"""INSERT OR REPLACE INTO {_CRON_TABLE}
+                            (collection, item_key, payload, updated_at)
+                            VALUES (?, ?, ?, ?)""",
+                        (
+                            _CRON_COLLECTION,
+                            cron_id,
+                            _cron_deleted_payload(cron_id, deleted_at=now),
+                            now,
+                        ),
+                    )
                 for job in jobs:
+                    existing = conn.execute(
+                        f"SELECT payload, updated_at FROM {_CRON_TABLE} WHERE collection = ? AND item_key = ?",
+                        (_CRON_COLLECTION, job.id),
+                    ).fetchone()
+                    if existing is not None and _payload_is_deleted(existing[0]):
+                        log.warning("Skipping stale save for deleted cron %s.", job.id)
+                        continue
+                    expected_updated_at = str(getattr(job, "_persisted_updated_at", "") or "")
+                    existing_updated_at = str(existing[1] or "") if existing is not None else ""
+                    if expected_updated_at and existing_updated_at and existing_updated_at != expected_updated_at:
+                        log.warning("Skipping stale save for concurrently updated cron %s.", job.id)
+                        continue
                     conn.execute(
                         f"""INSERT OR REPLACE INTO {_CRON_TABLE}
                             (collection, item_key, payload, updated_at)
                             VALUES (?, ?, ?, ?)""",
                         (_CRON_COLLECTION, job.id, json.dumps(job.to_dict(), sort_keys=True), now),
                     )
+                    job._persisted_updated_at = now
         return True
     except sqlite3.Error as exc:
         log.warning("Failed to save crons to runtime DB %s: %s", db_path, exc)
@@ -573,7 +682,7 @@ def save_crons(jobs: list[CronJob], *, allow_empty: bool = False) -> None:
     if not jobs and not allow_empty and _persisted_cron_count() > 0:
         log.error("Refusing to overwrite existing cron store with an implicit empty cron list.")
         raise RuntimeError("Refusing to overwrite existing cron store with an implicit empty cron list.")
-    saved_to_db = _save_crons_db(jobs)
+    saved_to_db = _save_crons_db(jobs, replace_missing=allow_empty)
     if saved_to_db:
         log.debug("Saved %d cron(s) to runtime DB.", len(jobs))
 
@@ -646,7 +755,9 @@ def remove_cron(cron_id: str) -> bool:
     new_jobs = [j for j in jobs if j.id != cron_id]
     if len(new_jobs) == len(jobs):
         return False
-    save_crons(new_jobs, allow_empty=True)
+    saved = _save_crons_db(new_jobs, deleted_ids=(cron_id,))
+    if not saved:
+        return False
     log.info("Cron deleted: %s", cron_id)
     return True
 
@@ -775,6 +886,20 @@ class CronScheduler:
                 continue
 
             if now >= next_dt:
+                existing_started_at = _cron_delivery_started_since(job.id, next_dt, now=now)
+                if existing_started_at:
+                    log.warning(
+                        "Skipping duplicate cron delivery for %r [%s]; occurrence %s already started at %s",
+                        job.name,
+                        job.id,
+                        next_dt.isoformat(),
+                        existing_started_at,
+                    )
+                    job.last_run = existing_started_at
+                    job.next_run = _compute_job_next_run(job, after=now)
+                    changed = True
+                    continue
+
                 log.info("Firing cron %r [%s]: %s", job.name, job.id, job.task[:80])
                 # Advance next_run and persist BEFORE firing so a crash mid-fire
                 # doesn't cause a double-fire on the next scheduler tick.

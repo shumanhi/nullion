@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,20 @@ _NATIVE_EMAIL_PROVIDER_IDS = frozenset(
         "imap_smtp_provider",
     }
 )
+
+
+def normalize_connection_text(value: object, *, strip: bool = True) -> str:
+    """Normalize copied connection fields before using them in protocol commands."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = "".join(
+        " " if char in "\t\r\n\f\v"
+        else " " if unicodedata.category(char).startswith("Z")
+        else "" if unicodedata.category(char) in {"Cf", "Cc"}
+        else char
+        for char in text
+    )
+    text = re.sub(r"[\t\r\n\f\v]+", " ", text)
+    return text.strip() if strip else text
 
 
 def _provider_id_looks_external_connector(provider_id: object) -> bool:
@@ -79,24 +94,24 @@ class ConnectionRegistry:
 
 
 def _clean_id(value: object, *, default: str) -> str:
-    text = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", str(value or "").strip()).strip("_")
+    text = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", normalize_connection_text(value)).strip("_")
     return text or default
 
 
 def _clean_optional(value: object) -> str | None:
-    text = str(value or "").strip()
+    text = normalize_connection_text(value)
     return text or None
 
 
 def _clean_credential_scope(value: object) -> str:
-    text = str(value or "").strip().lower()
+    text = normalize_connection_text(value).lower()
     if text in {"shared", "global", "admin_shared", "all_workspaces"}:
         return "shared"
     return "workspace"
 
 
 def _clean_permission_mode(value: object) -> str:
-    text = str(value or "").strip().lower().replace("-", "_")
+    text = normalize_connection_text(value).lower().replace("-", "_")
     if text in {"write", "read_write", "readwrite", "rw", "read_and_write"}:
         return "write"
     return "read"
@@ -141,7 +156,8 @@ def load_connection_registry(*, path: Path | str | None = None) -> ConnectionReg
             if (connection := _coerce_connection(item)) is not None
         ]
     )
-    _append_inferred_env_connections(registry)
+    if path is None:
+        _append_inferred_env_connections(registry)
     return registry
 
 
@@ -164,16 +180,188 @@ def _connector_credential_ref_for_gateway(gateway: str) -> str | None:
     prefix = re.sub(r"[^A-Z0-9]+", "_", gateway.upper()).strip("_")
     if not prefix:
         return None
-    for name in (f"{prefix}_API_KEY", f"{prefix}_TOKEN", f"{prefix}_SECRET_KEY"):
+    names = [f"{prefix}_API_KEY", f"{prefix}_TOKEN", f"{prefix}_SECRET_KEY"]
+    if prefix == "CUSTOM":
+        names.insert(0, "NULLION_CUSTOM_CONNECTOR_TOKEN")
+    for name in names:
         if str(os.environ.get(name) or "").strip():
             return name
     return None
+
+
+def _connector_profile_for_gateway(gateway: str) -> str | None:
+    prefix = re.sub(r"[^A-Z0-9]+", "_", gateway.upper()).strip("_")
+    names = [f"{prefix}_BASE_URL"] if prefix else []
+    if prefix == "CUSTOM":
+        names.insert(0, "NULLION_CUSTOM_CONNECTOR_BASE_URL")
+    for name in names:
+        value = str(os.environ.get(name) or "").strip()
+        if value.lower().startswith(("http://", "https://")):
+            return value
+    return None
+
+
+def _external_provider_env_prefix(provider_id: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", str(provider_id or "").upper()).strip("_")
+
+
+def _external_provider_credential_candidates(connection: "ProviderConnection") -> tuple[str, ...]:
+    candidates: list[str] = []
+    if connection.credential_ref:
+        candidates.append(connection.credential_ref.removeprefix("env:"))
+    prefix = _external_provider_env_prefix(connection.provider_id)
+    if prefix:
+        candidates.extend((f"{prefix}_API_KEY", f"{prefix}_TOKEN", f"{prefix}_SECRET_KEY"))
+        for suffix in ("_CONNECTOR_PROVIDER", "_CONNECTOR"):
+            if prefix.endswith(suffix):
+                gateway_prefix = prefix.removesuffix(suffix).strip("_")
+                if gateway_prefix:
+                    candidates.extend(
+                        (
+                            f"{gateway_prefix}_API_KEY",
+                            f"{gateway_prefix}_TOKEN",
+                            f"{gateway_prefix}_SECRET_KEY",
+                        )
+                    )
+        if prefix.startswith("SKILL_PACK_CONNECTOR_"):
+            gateway_prefix = prefix.removeprefix("SKILL_PACK_CONNECTOR_").strip("_")
+            if gateway_prefix:
+                candidates.extend(
+                    (
+                        f"{gateway_prefix}_API_KEY",
+                        f"{gateway_prefix}_TOKEN",
+                        f"{gateway_prefix}_SECRET_KEY",
+                    )
+                )
+    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def _imap_env_prefix(connection: "ProviderConnection") -> str:
+    ref = connection.credential_ref or connection.provider_profile
+    text = re.sub(r"[^A-Z0-9_]+", "_", normalize_connection_text(ref).upper()).strip("_") or "ACCOUNT"
+    return f"NULLION_IMAP_{text}"
+
+
+def connection_missing_runtime_credentials(connection: "ProviderConnection") -> tuple[str, ...]:
+    """Return env references required before this saved connection is usable."""
+    provider_id = str(connection.provider_id or "").strip()
+    if provider_id == "custom_api_provider":
+        missing: list[str] = []
+        profile = normalize_connection_text(connection.provider_profile)
+        if not profile.startswith(("http://", "https://")) and not os.environ.get("NULLION_CUSTOM_API_BASE_URL", "").strip():
+            missing.append("NULLION_CUSTOM_API_BASE_URL")
+        token_candidates = []
+        if connection.credential_ref:
+            token_candidates.append(connection.credential_ref.removeprefix("env:"))
+        token_candidates.append("NULLION_CUSTOM_API_TOKEN")
+        if not any(os.environ.get(candidate, "").strip() for candidate in token_candidates):
+            missing.extend(token_candidates)
+        return tuple(dict.fromkeys(missing))
+    if provider_id == "imap_smtp_provider":
+        prefix = _imap_env_prefix(connection)
+        return tuple(
+            f"{prefix}_{name}"
+            for name in ("HOST", "USERNAME", "PASSWORD")
+            if not os.environ.get(f"{prefix}_{name}", "").strip()
+        )
+    if _provider_id_looks_external_connector(provider_id):
+        candidates = _external_provider_credential_candidates(connection)
+        if candidates and not any(os.environ.get(candidate, "").strip() for candidate in candidates):
+            return candidates
+    return ()
+
+
+def connection_has_runtime_credentials(connection: "ProviderConnection") -> bool:
+    return not connection_missing_runtime_credentials(connection)
+
+
+def _skill_pack_provider_id(pack_id: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(pack_id or "").strip().lower()).strip("_") or "custom_skill"
+    return f"skill_pack_connector_{slug}"
+
+
+def _skill_pack_required_env_vars(skill_file: Path) -> tuple[str, ...]:
+    try:
+        text = skill_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ()
+    if not text.startswith("---"):
+        return ()
+    end = text.find("\n---", 3)
+    if end < 0:
+        return ()
+    header = text[3:end]
+    env_vars: list[str] = []
+    in_env_block = False
+    for raw_line in header.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped == "env:":
+            in_env_block = True
+            continue
+        if not in_env_block:
+            continue
+        if stripped.startswith("- "):
+            name = stripped.removeprefix("- ").strip().strip("'\"")
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+                env_vars.append(name)
+            continue
+        if stripped and not line.startswith((" ", "\t")):
+            in_env_block = False
+    return tuple(dict.fromkeys(env_vars))
+
+
+def _append_inferred_skill_pack_connections(registry: ConnectionRegistry) -> None:
+    try:
+        from nullion.skill_pack_installer import list_installed_skill_packs
+    except Exception:
+        return
+    try:
+        packs = list_installed_skill_packs()
+    except Exception:
+        return
+    for pack in packs:
+        pack_id = str(getattr(pack, "pack_id", "") or "").strip()
+        pack_path = Path(str(getattr(pack, "path", "") or ""))
+        if not pack_id or not pack_path.exists():
+            continue
+        required_envs: list[str] = []
+        for skill_file in sorted(pack_path.rglob("SKILL.md")):
+            required_envs.extend(_skill_pack_required_env_vars(skill_file))
+        credential_ref = next((name for name in dict.fromkeys(required_envs) if os.environ.get(name, "").strip()), None)
+        if not credential_ref:
+            continue
+        provider_id = _skill_pack_provider_id(pack_id)
+        if _has_connection(registry, workspace_id=_ADMIN_WORKSPACE_ID, provider_id=provider_id):
+            continue
+        if any(
+            connection.active
+            and _provider_id_looks_external_connector(connection.provider_id)
+            and (connection.credential_ref or "").removeprefix("env:") == credential_ref
+            for connection in registry.connections
+        ):
+            continue
+        registry.connections.append(
+            ProviderConnection(
+                connection_id=f"env_{provider_id}_admin",
+                workspace_id=_ADMIN_WORKSPACE_ID,
+                provider_id=provider_id,
+                display_name=f"{pack_id} connector",
+                credential_ref=credential_ref,
+                notes="Inferred from installed skill pack environment requirements.",
+                credential_scope="shared",
+                permission_mode=_clean_permission_mode(
+                    os.environ.get("NULLION_CONNECTOR_PERMISSION_MODE") or "write"
+                ),
+            )
+        )
 
 
 def _append_inferred_env_connections(registry: ConnectionRegistry) -> None:
     """Expose installer-saved connector credentials in the UI without storing secrets."""
     gateway = _clean_id(os.environ.get("NULLION_CONNECTOR_GATEWAY"), default="").lower()
     if not gateway:
+        _append_inferred_skill_pack_connections(registry)
         return
     provider_id = f"{gateway}_connector_provider"
     if _has_connection(
@@ -181,6 +369,7 @@ def _append_inferred_env_connections(registry: ConnectionRegistry) -> None:
         workspace_id=_ADMIN_WORKSPACE_ID,
         provider_id=provider_id,
     ):
+        _append_inferred_skill_pack_connections(registry)
         return
     registry.connections.append(
         ProviderConnection(
@@ -188,12 +377,14 @@ def _append_inferred_env_connections(registry: ConnectionRegistry) -> None:
             workspace_id=_ADMIN_WORKSPACE_ID,
             provider_id=provider_id,
             display_name=f"{gateway} connector",
+            provider_profile=_connector_profile_for_gateway(gateway),
             credential_ref=_connector_credential_ref_for_gateway(gateway),
             notes="Inferred from local environment.",
             credential_scope="shared",
             permission_mode=_clean_permission_mode(os.environ.get("NULLION_CONNECTOR_PERMISSION_MODE")),
         )
     )
+    _append_inferred_skill_pack_connections(registry)
 
 
 def save_connection_registry(
@@ -279,8 +470,13 @@ def connection_for_principal(
     )
 
 
-def default_email_connector_provider_id(principal_id: str | None = None, *, path: Path | str | None = None) -> str | None:
-    """Return the write-capable external connector most likely to handle email."""
+def default_email_connector_provider_id(
+    principal_id: str | None = None,
+    *,
+    path: Path | str | None = None,
+    require_write: bool = False,
+) -> str | None:
+    """Return the external connector most likely to handle email."""
     fallback_provider_id = ""
     for connection in load_connection_registry(path=path).connections:
         provider_id = str(connection.provider_id or "").strip()
@@ -289,7 +485,11 @@ def default_email_connector_provider_id(principal_id: str | None = None, *, path
         if not _provider_id_looks_external_connector(provider_id):
             continue
         scoped_connection = connection_for_principal(principal_id, provider_id, path=path)
-        if scoped_connection is None or scoped_connection.permission_mode != "write":
+        if scoped_connection is None:
+            continue
+        if require_write and scoped_connection.permission_mode != "write":
+            continue
+        if not connection_has_runtime_credentials(scoped_connection):
             continue
         lowered_provider = provider_id.lower()
         display_name = str(scoped_connection.display_name or "").lower()
@@ -349,6 +549,7 @@ def format_workspace_connections_for_prompt(
         "Never print, log, or reveal token values.",
     ]
     for connection in active:
+        missing_credentials = connection_missing_runtime_credentials(connection)
         parts = [
             f"workspace={connection.workspace_id}",
             f"provider={connection.provider_id}",
@@ -358,6 +559,8 @@ def format_workspace_connections_for_prompt(
             parts.append(f"profile={connection.provider_profile}")
         if connection.credential_ref:
             parts.append(f"credential_ref={connection.credential_ref}")
+        if missing_credentials:
+            parts.append("credential_status=missing_env:" + ",".join(missing_credentials))
         if connection.credential_scope == "shared":
             parts.append("credential_scope=shared_by_admin")
         parts.append(
@@ -384,7 +587,7 @@ def infer_email_plugin_provider(*, principal_id: str | None = None, path: Path |
             if connection.workspace_id in {workspace_id, _ADMIN_WORKSPACE_ID}
         ]
     for connection in active:
-        if connection.provider_id in _NATIVE_EMAIL_PROVIDER_IDS:
+        if connection.provider_id in _NATIVE_EMAIL_PROVIDER_IDS and (path is not None or connection_has_runtime_credentials(connection)):
             return connection.provider_id
     return None
 
@@ -394,6 +597,8 @@ __all__ = [
     "ProviderConnection",
     "connection_for_principal",
     "connection_for_workspace",
+    "connection_has_runtime_credentials",
+    "connection_missing_runtime_credentials",
     "format_workspace_connections_for_prompt",
     "infer_email_plugin_provider",
     "load_connection_registry",
