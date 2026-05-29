@@ -172,7 +172,18 @@ def _scheduler_read_reply_over_model_reformat(text: str, results: list[ToolResul
     message = cron_result.output.get("message")
     if not isinstance(message, str) or not message.strip():
         return None
-    return message.strip()
+    return _compact_cron_list_reply(cron_result)
+
+
+def _compact_cron_list_reply(result: ToolResult) -> str | None:
+    output = result.output if isinstance(result.output, dict) else {}
+    crons = output.get("crons")
+    if not isinstance(crons, list):
+        return None
+    message = output.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return "No crons scheduled." if not crons else None
 
 
 def _scheduler_action_reply_over_read_drift(text: str, results: list[ToolResult]) -> str | None:

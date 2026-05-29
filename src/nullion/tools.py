@@ -11117,18 +11117,44 @@ def register_reminder_tools(
 # ── Cron tools ────────────────────────────────────────────────────────────────
 
 def _build_create_cron_handler(*, default_delivery_channel: str = "", default_delivery_target: str = ""):
+    def _delivery_context_from_identifier(identifier: object, fallback_channel: str = "") -> tuple[str, str]:
+        from nullion.cron_delivery import normalize_cron_delivery_channel
+
+        value = str(identifier or "").strip()
+        if not value:
+            return "", ""
+        channel, separator, target = value.partition(":")
+        normalized_channel = normalize_cron_delivery_channel(channel)
+        if separator and normalized_channel and target.strip():
+            if normalized_channel == "web":
+                return normalized_channel, value
+            return normalized_channel, target.strip()
+        fallback = normalize_cron_delivery_channel(fallback_channel)
+        if fallback and value:
+            return fallback, value
+        return "", ""
+
     def _current_delivery_context_defaults() -> tuple[str, str]:
         try:
-            from nullion.cron_delivery import normalize_cron_delivery_channel
             from nullion.reminders import current_reminder_chat_id
 
-            chat_id = str(current_reminder_chat_id() or "").strip()
-            channel, separator, target = chat_id.partition(":")
-            normalized_channel = normalize_cron_delivery_channel(channel)
-            if separator and normalized_channel and target.strip():
-                return normalized_channel, target.strip()
+            return _delivery_context_from_identifier(current_reminder_chat_id(), default_delivery_channel)
         except Exception:
             pass
+        return "", ""
+
+    def _invocation_delivery_context_defaults(invocation: ToolInvocation) -> tuple[str, str]:
+        from nullion.cron_delivery import normalize_cron_delivery_channel
+
+        configured_default_channel = normalize_cron_delivery_channel(default_delivery_channel)
+        channel, target = _delivery_context_from_identifier(invocation.principal_id)
+        if channel and target:
+            return channel, target
+        flow_context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        for key in ("conversation_id", "chat_id", "delivery_target", "delivery_target_id"):
+            channel, target = _delivery_context_from_identifier(flow_context.get(key), configured_default_channel)
+            if channel and target:
+                return channel, target
         return "", ""
 
     def _workspace_id_from_invocation(invocation: ToolInvocation, args: dict[str, object]) -> str:
@@ -11153,6 +11179,8 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
         html_image_delivery_mode = str(args.get("html_image_delivery_mode") or "").strip()
         workspace_id = _workspace_id_from_invocation(invocation, args)
         context_channel, context_target = _current_delivery_context_defaults()
+        if not context_channel or not context_target:
+            context_channel, context_target = _invocation_delivery_context_defaults(invocation)
         configured_default_channel = normalize_cron_delivery_channel(default_delivery_channel)
         default_channel = context_channel or configured_default_channel
         default_target = context_target if context_channel else str(default_delivery_target or "").strip()
