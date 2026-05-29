@@ -678,10 +678,16 @@ class PlaywrightBackend:
             and auto_screenshot_uses_full_page(getattr(page, "url", None), exceeds_viewport)
         )
         data = await page.screenshot(type="png", full_page=full_page, timeout=8_000)
+        try:
+            page_title = await page.title()
+        except Exception:
+            page_title = None
         return BrowserScreenshotResult(
             data=data,
             mode="full_page" if full_page else "viewport",
             requested_mode=requested_mode,
+            page_url=getattr(page, "url", None),
+            page_title=page_title,
             viewport_width=viewport_width,
             viewport_height=viewport_height,
             document_width=document_width,

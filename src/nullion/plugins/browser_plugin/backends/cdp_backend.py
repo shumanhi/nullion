@@ -1172,10 +1172,17 @@ class CDPBackend:
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, str) or not data:
             raise RuntimeError("CDP did not return screenshot data.")
+        page_url = _page_url(page)
+        try:
+            page_title = await page.evaluate("document.title")
+        except Exception:
+            page_title = None
         return BrowserScreenshotResult(
             data=base64.b64decode(data),
             mode="full_page" if full_page else "viewport",
             requested_mode=requested_mode,
+            page_url=page_url,
+            page_title=str(page_title or "") or None,
             viewport_width=viewport_width,
             viewport_height=viewport_height,
             document_width=document_width,

@@ -13,6 +13,8 @@ class BrowserScreenshotResult:
     data: bytes
     mode: str
     requested_mode: str
+    page_url: str | None = None
+    page_title: str | None = None
     viewport_width: int | None = None
     viewport_height: int | None = None
     document_width: int | None = None

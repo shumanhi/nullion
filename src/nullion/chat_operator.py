@@ -4467,6 +4467,29 @@ def _browser_screenshot_artifact_paths(
     return paths
 
 
+_UNVERIFIED_SCREENSHOT_URLS = frozenset({"", "about:blank", "chrome://newtab/", "brave://newtab/"})
+
+
+def _browser_screenshot_paths_with_unverified_state(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    paths: set[str] = set()
+    for result in tool_results or ():
+        if result.tool_name != "browser_screenshot" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        page_url = str(
+            output.get("page_url")
+            or output.get("current_url")
+            or output.get("url")
+            or ""
+        ).strip()
+        if page_url.lower() not in _UNVERIFIED_SCREENSHOT_URLS:
+            continue
+        paths.update(_browser_screenshot_artifact_paths((result,)))
+    return paths
+
+
 def _filter_suppressed_artifact_paths(
     paths: list[str] | tuple[str, ...],
     *,
@@ -4522,6 +4545,23 @@ def _latest_browser_extract_text_excerpt(
                 return text
             return text[:max_chars].rstrip() + "\n\n..."
     return None
+
+
+def _reply_is_browser_extract_text_dump(
+    reply: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    extracted = _latest_browser_extract_text_excerpt(tool_results, max_chars=5000)
+    if not extracted:
+        return False
+    normalize = lambda value: re.sub(r"\s+", " ", str(value or "")).strip()
+    reply_text = normalize(reply)
+    extracted_text = normalize(extracted)
+    if not reply_text or not extracted_text:
+        return False
+    return extracted_text.startswith(reply_text[: min(len(reply_text), 500)]) or reply_text.startswith(
+        extracted_text[: min(len(extracted_text), 500)]
+    )
 
 
 def _string_paths_from_value(value: object) -> tuple[str, ...]:
@@ -4652,6 +4692,8 @@ def _append_chat_artifacts_to_reply(
     artifact_roots = tuple(dict.fromkeys((artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))))
     email_attachment_paths = _completed_email_attachment_paths(tool_results)
     browser_screenshot_paths = _browser_screenshot_artifact_paths(tool_results)
+    unverified_browser_screenshot_paths = _browser_screenshot_paths_with_unverified_state(tool_results)
+    verified_browser_screenshot_paths = browser_screenshot_paths - unverified_browser_screenshot_paths
     source_paths = {str(Path(path).expanduser()) for path in source_attachment_paths or () if str(path or "").strip()}
     suppressed_screenshot_paths: set[str] = set()
     initial_reply_candidate_paths = _artifact_candidate_paths_from_reply(
@@ -4787,23 +4829,43 @@ def _append_chat_artifacts_to_reply(
         base_candidate_paths,
         suppress_paths={*browser_screenshot_paths, *source_paths},
     )
+    reply_is_browser_text_dump = _reply_is_browser_extract_text_dump(reply, tool_results)
     referenced_browser_screenshot_paths = {
         path
-        for path in browser_screenshot_paths
+        for path in verified_browser_screenshot_paths
         if _reply_visible_text_references_artifact_path(reply, path, artifact_roots=artifact_roots)
     }
-    screenshot_is_primary_delivery = bool(browser_screenshot_paths) and (
+    screenshot_is_primary_delivery = bool(verified_browser_screenshot_paths) and (
         requested_extension == ".png"
         or (
             requested_extension is None
             and bool(referenced_browser_screenshot_paths)
             and not non_screenshot_candidate_paths
         )
+        or (
+            requested_extension is None
+            and reply_is_browser_text_dump
+            and not non_screenshot_candidate_paths
+        )
     )
-    suppressed_screenshot_paths = set() if screenshot_is_primary_delivery else browser_screenshot_paths
+    if (
+        requested_extension == ".png"
+        and browser_screenshot_paths
+        and not verified_browser_screenshot_paths
+        and not non_screenshot_candidate_paths
+    ):
+        return (
+            "I couldn't attach a verified browser screenshot. "
+            "The browser was not on a loaded page when the screenshot was captured."
+        )
+    suppressed_screenshot_paths = (
+        set(unverified_browser_screenshot_paths)
+        if screenshot_is_primary_delivery
+        else set(browser_screenshot_paths)
+    )
     candidate_paths = list(base_candidate_paths)
     if screenshot_is_primary_delivery and not candidate_paths:
-        candidate_paths = sorted(referenced_browser_screenshot_paths or browser_screenshot_paths)
+        candidate_paths = sorted(referenced_browser_screenshot_paths or verified_browser_screenshot_paths)
     candidate_paths = _filter_suppressed_artifact_paths(
         candidate_paths,
         suppress_paths={*suppressed_screenshot_paths, *source_paths},
@@ -4876,6 +4938,15 @@ def _append_chat_artifacts_to_reply(
         if should_keep_descriptor(descriptor)
     ]
     if not descriptors:
+        if (
+            requested_extension == ".png"
+            and browser_screenshot_paths
+            and not verified_browser_screenshot_paths
+        ):
+            return (
+                "I couldn't attach a verified browser screenshot. "
+                "The browser was not on a loaded page when the screenshot was captured."
+            )
         if suppressed_screenshot_paths:
             extracted_text = _latest_browser_extract_text_excerpt(tool_results)
             if extracted_text:
