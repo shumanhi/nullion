@@ -2445,6 +2445,61 @@ def legacy_cron_delivery_text_with_media(text: str, artifacts: object) -> str:
     return "\n\n".join([text, "\n".join(dict.fromkeys(media_lines))])
 
 
+def record_cron_delivery_chat_turn(
+    store: object,
+    job: object,
+    *,
+    conversation_id: str,
+    delivery_channel: str,
+    delivery_target: str = "",
+    delivered_text: str,
+) -> None:
+    """Persist a terminal scheduled-task delivery as chat-visible context."""
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id:
+        return
+    from nullion.artifacts import media_candidate_paths_from_text
+
+    try:
+        from nullion.connections import workspace_id_for_principal
+
+        workspace_id = workspace_id_for_principal(conversation_id)
+    except Exception:
+        workspace_id = str(getattr(job, "workspace_id", "") or "workspace_admin")
+    summary = str(getattr(job, "name", "") or "").strip() or "Scheduled task"
+    artifact_names = [
+        Path(str(path)).name
+        for path in media_candidate_paths_from_text(str(delivered_text or ""))
+        if str(path).strip()
+    ]
+    artifact_summary = ", ".join(artifact_names[:3]) if artifact_names else "none"
+    if len(artifact_names) > 3:
+        artifact_summary = f"{artifact_summary} (+{len(artifact_names) - 3} more)"
+    now = datetime.now(UTC).isoformat()
+    event = {
+        "conversation_id": conversation_id,
+        "workspace_id": workspace_id,
+        "event_type": "conversation.chat_turn",
+        "created_at": now,
+        "chat_id": str(delivery_target or "").strip() or None,
+        "turn_id": f"cron-{getattr(job, 'id', '') or uuid4().hex}-{uuid4().hex[:12]}",
+        "user_message": (
+            f"[Scheduled task delivery context] task={summary}; "
+            f"channel={delivery_channel}; artifacts={artifact_summary}"
+        ),
+        "assistant_reply": str(delivered_text or ""),
+        "tool_results": [],
+        "source": "cron",
+        "cron_id": str(getattr(job, "id", "") or ""),
+        "cron_name": summary,
+        "delivery_channel": str(delivery_channel or "").strip(),
+        "delivery_target": str(delivery_target or "").strip(),
+    }
+    add_conversation_event = getattr(store, "add_conversation_event", None)
+    if callable(add_conversation_event):
+        add_conversation_event(event)
+
+
 @dataclass(frozen=True)
 class CronRunDeliveryCallbacks:
     effective_channel: Callable[[object], str]
@@ -2458,6 +2513,7 @@ class CronRunDeliveryCallbacks:
     clear_background_delivery: Callable[[str], None] | None = None
     silent_delivery_text: Callable[[object, str, dict[str, object]], str | None] | None = None
     notify_approval_required: Callable[[object, str, str, dict[str, object]], None] | None = None
+    record_chat_turn: Callable[[object, str, str, str, str], None] | None = None
 
 
 class _CronRunDeliveryState(TypedDict, total=False):
@@ -2739,14 +2795,15 @@ def _cron_run_silent_node(state: _CronRunDeliveryState) -> dict[str, object]:
 def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, object]:
     callbacks = state["callbacks"]
     result = dict(state.get("result") or {})
+    delivered_text = scheduled_task_delivery_text(
+        state["job"],
+        str(state.get("text") or ""),
+        run_label=state.get("label"),
+    )
     callbacks.save_web_delivery(
         state["job"],
         state["conversation_id"],
-        scheduled_task_delivery_text(
-            state["job"],
-            str(state.get("text") or ""),
-            run_label=state.get("label"),
-        ),
+        delivered_text,
         state.get("artifacts"),
         result,
     )
@@ -2757,6 +2814,17 @@ def _cron_run_web_delivery_node(state: _CronRunDeliveryState) -> dict[str, objec
         state["delivery_target"],
         state["conversation_id"],
     )
+    if callbacks.record_chat_turn is not None:
+        try:
+            callbacks.record_chat_turn(
+                state["job"],
+                state["conversation_id"],
+                state["delivery_channel"],
+                state["delivery_target"],
+                delivered_text,
+            )
+        except Exception:
+            logger.debug("Could not record saved cron delivery conversation turn", exc_info=True)
     result["cron_delivery_status"] = "saved"
     _attach_cron_execution_outcome(
         state,
@@ -2799,6 +2867,17 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
             state["delivery_target"],
             state["conversation_id"],
         )
+        if callbacks.record_chat_turn is not None:
+            try:
+                callbacks.record_chat_turn(
+                    state["job"],
+                    state["conversation_id"],
+                    state["delivery_channel"],
+                    state["delivery_target"],
+                    text,
+                )
+            except Exception:
+                logger.debug("Could not record cron delivery conversation turn", exc_info=True)
         result["cron_delivery_status"] = "sent"
         _attach_cron_execution_outcome(
             state,
@@ -2831,6 +2910,17 @@ def _cron_run_messaging_delivery_node(state: _CronRunDeliveryState) -> dict[str,
                 state["conversation_id"],
                 reason="attachment delivery failed after text fallback",
             )
+            if callbacks.record_chat_turn is not None:
+                try:
+                    callbacks.record_chat_turn(
+                        state["job"],
+                        state["conversation_id"],
+                        state["delivery_channel"],
+                        state["delivery_target"],
+                        fallback_text,
+                    )
+                except Exception:
+                    logger.debug("Could not record partial cron delivery conversation turn", exc_info=True)
             result["cron_delivery_status"] = "partial_success"
             result["cron_delivery_partial_success"] = True
             result["cron_delivery_attachment_failed"] = True

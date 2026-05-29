@@ -97,6 +97,7 @@ from nullion.cron_delivery import (
     cron_structured_result_block_reason,
     effective_cron_delivery_channel,
     manual_cron_silent_delivery_text,
+    record_cron_delivery_chat_turn,
     run_cron_delivery_workflow,
     scheduled_task_delivery_text,
 )
@@ -19108,26 +19109,17 @@ def create_app(runtime, orchestrator, registry):
         *,
         conversation_id: str,
         delivery_channel: str,
+        delivery_target: str = "",
         delivered_text: str,
     ) -> None:
-        summary = str(getattr(job, "name", "") or "").strip() or "Scheduled task"
-        artifact_names = [
-            Path(str(path)).name
-            for path in media_candidate_paths_from_text(str(delivered_text or ""))
-            if str(path).strip()
-        ]
-        artifact_summary = ", ".join(artifact_names[:3]) if artifact_names else "none"
-        if len(artifact_names) > 3:
-            artifact_summary = f"{artifact_summary} (+{len(artifact_names) - 3} more)"
-        synthetic_user_message = (
-            f"[Scheduled task delivery context] task={summary}; channel={delivery_channel}; artifacts={artifact_summary}"
-        )
         try:
-            _remember_web_chat_turn(
-                runtime,
+            record_cron_delivery_chat_turn(
+                runtime.store,
+                job,
                 conversation_id=conversation_id,
-                user_message=synthetic_user_message,
-                assistant_reply=str(delivered_text or ""),
+                delivery_channel=delivery_channel,
+                delivery_target=delivery_target,
+                delivered_text=delivered_text,
             )
         except Exception:
             logger.debug("Could not persist scheduled-task delivery context turn", exc_info=True)
@@ -19142,15 +19134,6 @@ def create_app(runtime, orchestrator, registry):
     ) -> bool:
         if channel == "telegram":
             sent = _send_cron_telegram_delivery(job, text, target=target, run_label=run_label)
-            if sent:
-                final_message = scheduled_task_delivery_text(job, text, run_label=run_label)
-                conv_id = cron_conversation_id(job, "telegram", target)
-                _record_cron_delivery_chat_turn(
-                    job,
-                    conversation_id=conv_id,
-                    delivery_channel="telegram",
-                    delivered_text=final_message,
-                )
             return sent
         target = str(target or "").strip() or _cron_delivery_target(job, channel)
         if not target:
@@ -19166,42 +19149,24 @@ def create_app(runtime, orchestrator, registry):
                 bot_token = settings.slack.bot_token
                 if not bot_token:
                     return False
-                sent = _run_cron_platform_delivery(lambda: send_slack_platform_delivery(
+                return _run_cron_platform_delivery(lambda: send_slack_platform_delivery(
                     bot_token=bot_token,
                     channel=target,
                     text=message,
                     principal_id=f"slack:{target}",
                 ))
-                if sent:
-                    conv_id = cron_conversation_id(job, "slack", target)
-                    _record_cron_delivery_chat_turn(
-                        job,
-                        conversation_id=conv_id,
-                        delivery_channel="slack",
-                        delivered_text=message,
-                    )
-                return sent
             if channel == "discord":
                 from nullion.discord_app import send_discord_platform_delivery
 
                 bot_token = settings.discord.bot_token
                 if not bot_token:
                     return False
-                sent = _run_cron_platform_delivery(lambda: send_discord_platform_delivery(
+                return _run_cron_platform_delivery(lambda: send_discord_platform_delivery(
                     bot_token=bot_token,
                     channel_id=target,
                     text=message,
                     principal_id=f"discord:{target}",
                 ))
-                if sent:
-                    conv_id = cron_conversation_id(job, "discord", target)
-                    _record_cron_delivery_chat_turn(
-                        job,
-                        conversation_id=conv_id,
-                        delivery_channel="discord",
-                        delivered_text=message,
-                    )
-                return sent
         except Exception:
             logger.warning("Cron %s delivery failed [%s]", channel, getattr(job, "id", ""), exc_info=True)
         return False
@@ -19262,12 +19227,6 @@ def create_app(runtime, orchestrator, registry):
                 )
             except Exception:
                 logger.debug("Could not broadcast web cron fallback delivery", exc_info=True)
-        _record_cron_delivery_chat_turn(
-            job,
-            conversation_id=conv_id,
-            delivery_channel="web",
-            delivered_text=visible_text,
-        )
         return True
 
     def _run_single_agent_cron_for_delivery(
@@ -19364,6 +19323,7 @@ def create_app(runtime, orchestrator, registry):
                 clear_background_delivery=None,
                 silent_delivery_text=manual_cron_silent_delivery_text if manual_delivery_channel is not None else None,
                 notify_approval_required=_notify_cron_approval_required,
+                record_chat_turn=_record_cron_delivery_chat_turn,
             ),
         )
 
@@ -19540,6 +19500,7 @@ def create_app(runtime, orchestrator, registry):
                         clear_background_delivery=None,
                         silent_delivery_text=manual_cron_silent_delivery_text,
                         notify_approval_required=_notify_cron_approval_required,
+                        record_chat_turn=_record_cron_delivery_chat_turn,
                     ),
                     origin_conversation_id=(
                         principal_id

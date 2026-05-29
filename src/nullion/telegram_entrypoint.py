@@ -594,6 +594,28 @@ def _build_runtime_service_from_settings(
         except Exception:
             logger.debug("Could not record Telegram cron delivery event", exc_info=True)
 
+    def _record_cron_delivery_chat_turn(
+        job,
+        conversation_id: str,
+        delivery_channel: str,
+        delivery_target: str,
+        delivered_text: str,
+    ) -> None:
+        try:
+            from nullion.cron_delivery import record_cron_delivery_chat_turn
+
+            record_cron_delivery_chat_turn(
+                runtime.store,
+                job,
+                conversation_id=conversation_id,
+                delivery_channel=delivery_channel,
+                delivery_target=delivery_target,
+                delivered_text=delivered_text,
+            )
+            runtime.checkpoint()
+        except Exception:
+            logger.debug("Could not record Telegram cron delivery chat turn", exc_info=True)
+
     def _refresh_service_live_config() -> None:
         refresh = getattr(service, "refresh_live_configuration", None)
         if callable(refresh):
@@ -921,6 +943,7 @@ def _build_runtime_service_from_settings(
                 clear_background_delivery=None,
                 silent_delivery_text=manual_cron_silent_delivery_text,
                 notify_approval_required=_notify_cron_approval_required,
+                record_chat_turn=_record_cron_delivery_chat_turn,
             ),
             origin_conversation_id=cron_conversation_id(job, channel, target),
             thread_name_prefix="nullion-telegram-manual-cron",
