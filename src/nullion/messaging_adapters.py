@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import html
+import logging
 import os
 from pathlib import Path
 import re
@@ -34,12 +36,31 @@ from nullion.workspace_storage import workspace_storage_roots_for_principal
 from nullion.task_frames import TaskFrameStatus
 
 
+logger = logging.getLogger(__name__)
+WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
+
+
 class MessagingAdapterConfigurationError(ValueError):
     """Raised when a messaging adapter is enabled without required settings."""
 
 
 class MessagingAdapterDependencyError(RuntimeError):
     """Raised when an adapter dependency is not installed."""
+
+
+def should_emit_separate_working_ack(
+    event: dict[str, object],
+    *,
+    visible_activity_stream: bool = False,
+) -> bool:
+    """Return whether a separate working acknowledgement adds useful signal."""
+    if visible_activity_stream:
+        return False
+    event_id = str(event.get("id") or "")
+    event_tool_name = str(event.get("tool_name") or "")
+    if event_tool_name == "run_cron":
+        return False
+    return event_id.startswith("tool-") or event_id == "mini-agents" or bool(event_tool_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +132,23 @@ class PlatformDeliveryReceipt:
             "error": self.error,
             "created_at": created_at.isoformat(),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformDeliveryResult:
+    delivery: PlatformDelivery
+    receipt: PlatformDeliveryReceipt
+    text_sent: bool = False
+    attachments_sent: bool = False
+    fallback_text_sent: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return delivery_receipt_transport_succeeded(self.receipt)
+
+
+PlatformTextSender = Callable[[str], Awaitable[bool | None]]
+PlatformAttachmentSender = Callable[[str | None, tuple[Path, ...]], Awaitable[bool]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +361,21 @@ def messaging_file_allowed_roots(*extra_roots: object) -> tuple[Path, ...]:
 
 def require_authorized_ingress(ingress: MessagingIngress, settings: NullionSettings) -> bool:
     return is_authorized_messaging_identity(ingress.channel, ingress.user_id, settings)
+
+
+def messaging_chat_enabled(channel: str, settings: NullionSettings | None) -> bool:
+    normalized = str(channel or "").strip().lower()
+    if settings is None:
+        return False
+    if normalized == "telegram":
+        return bool(getattr(getattr(settings, "telegram", None), "chat_enabled", False))
+    if normalized == "slack":
+        return bool(getattr(getattr(settings, "slack", None), "enabled", False))
+    if normalized == "discord":
+        return bool(getattr(getattr(settings, "discord", None), "enabled", False))
+    if normalized == "web":
+        return True
+    return False
 
 
 def _history_channel_label(ingress: MessagingIngress) -> str:
@@ -1312,6 +1365,104 @@ def platform_delivery_failure_reply(_delivery: PlatformDelivery | None = None) -
     return _ATTACHMENT_UPLOAD_FAILED_REPLY
 
 
+async def execute_platform_reply_delivery(
+    reply: str | None,
+    *,
+    channel: str,
+    target_id: str | None,
+    principal_id: str | None = None,
+    delivery_contract: DeliveryContract | None = None,
+    request_id: str | None = None,
+    message_id: str | None = None,
+    reply_already_sent: bool = False,
+    send_text: PlatformTextSender,
+    send_attachments: PlatformAttachmentSender | None = None,
+) -> PlatformDeliveryResult:
+    """Run the common final-delivery boundary for chat platforms.
+
+    Platform wrappers own the actual API calls. This helper owns the shared
+    Nullion delivery contract: normalize/split the reply, choose attachment or
+    text delivery, persist receipts, and use one failure message for upload
+    failures.
+    """
+    delivery = prepare_reply_for_platform_delivery(
+        reply,
+        principal_id=principal_id,
+        delivery_contract=delivery_contract,
+    )
+    target = None if target_id is None else str(target_id)
+    if reply_already_sent and not delivery.attachments:
+        receipt = build_platform_delivery_receipt(
+            channel=channel,
+            target_id=target,
+            delivery=delivery,
+            transport_ok=True,
+            request_id=request_id,
+            message_id=message_id,
+        )
+        record_platform_delivery_receipt(receipt)
+        return PlatformDeliveryResult(delivery=delivery, receipt=receipt)
+
+    if delivery.attachments:
+        uploaded = False
+        if send_attachments is not None:
+            try:
+                uploaded = bool(await send_attachments(delivery.text, delivery.attachments))
+            except Exception:
+                uploaded = False
+        if uploaded:
+            receipt = build_platform_delivery_receipt(
+                channel=channel,
+                target_id=target,
+                delivery=delivery,
+                transport_ok=True,
+                request_id=request_id,
+                message_id=message_id,
+            )
+            record_platform_delivery_receipt(receipt)
+            return PlatformDeliveryResult(delivery=delivery, receipt=receipt, attachments_sent=True)
+
+        receipt = build_platform_delivery_receipt(
+            channel=channel,
+            target_id=target,
+            delivery=delivery,
+            transport_ok=False,
+            request_id=request_id,
+            message_id=message_id,
+            error="attachment_upload_failed",
+        )
+        record_platform_delivery_receipt(receipt)
+        fallback_text = platform_delivery_failure_reply(delivery)
+        try:
+            await send_text(fallback_text)
+            fallback_sent = True
+        except Exception:
+            fallback_sent = False
+        return PlatformDeliveryResult(
+            delivery=delivery,
+            receipt=receipt,
+            text_sent=fallback_sent,
+            fallback_text_sent=fallback_sent,
+        )
+
+    text = delivery.text or ""
+    try:
+        text_ok = bool(await send_text(text))
+    except Exception:
+        text_ok = False
+    receipt = build_platform_delivery_receipt(
+        channel=channel,
+        target_id=target,
+        delivery=delivery,
+        transport_ok=text_ok,
+        request_id=request_id,
+        message_id=message_id,
+        error=None if text_ok else "text_delivery_failed",
+    )
+    record_platform_delivery_receipt(receipt)
+    return PlatformDeliveryResult(delivery=delivery, receipt=receipt, text_sent=text_ok)
+
+
 def is_retryable_messaging_delivery_error(exc: Exception) -> bool:
     error_name = type(exc).__name__.lower()
     if any(token in error_name for token in ("timeout", "timedout", "network", "connection", "retryafter")):
@@ -1393,6 +1544,44 @@ def split_reply_for_platform(reply: str | None, *, limit: int) -> list[str]:
     return chunks
 
 
+def platform_plain_format_fallback_text(platform: str, plain_text: str) -> str:
+    label = str(platform or "platform").strip() or "platform"
+    plain = sanitize_external_inline_markup(plain_text or "")
+    return (
+        f"{label} could not send the formatted reply, so here is the same text as plain output:\n\n"
+        "```text\n"
+        f"{plain}"
+        "\n```"
+    )
+
+
+def formatted_reply_chunks(
+    reply: str | None,
+    *,
+    limit: int,
+    formatter: Callable[[str], str],
+) -> list[tuple[str, str]]:
+    chunks = split_reply_for_platform(sanitize_external_inline_markup(reply or ""), limit=limit)
+    return [(formatter(chunk), chunk) for chunk in chunks]
+
+
+async def send_with_plain_text_fallback(
+    *,
+    platform: str,
+    formatted_text: str,
+    plain_text: str,
+    send_formatted: Callable[[str], Awaitable[object]],
+    send_plain: Callable[[str], Awaitable[object]] | None = None,
+) -> None:
+    try:
+        await send_formatted(formatted_text or "")
+        return
+    except Exception:
+        logger.warning("%s formatted message delivery failed; retrying as plain text.", platform, exc_info=True)
+    fallback_sender = send_plain or send_formatted
+    await fallback_sender(platform_plain_format_fallback_text(platform, plain_text or ""))
+
+
 def save_messaging_attachment(
     *,
     filename: str,
@@ -1427,8 +1616,10 @@ def save_messaging_attachment(
 __all__ = [
     "MessagingAdapterConfigurationError",
     "MessagingAdapterDependencyError",
+    "WORKING_ACK_TEXT",
     "MessagingIngress",
     "PlatformDelivery",
+    "PlatformDeliveryResult",
     "PlatformDeliveryReceipt",
     "DeliveryContract",
     "build_platform_delivery_receipt",
@@ -1437,6 +1628,8 @@ __all__ = [
     "delivery_receipt_transport_succeeded",
     "delivery_receipt_status",
     "ensure_messaging_storage_roots",
+    "execute_platform_reply_delivery",
+    "formatted_reply_chunks",
     "handle_messaging_ingress",
     "handle_messaging_ingress_result",
     "list_platform_delivery_receipts",
@@ -1445,6 +1638,7 @@ __all__ = [
     "messaging_upload_root",
     "messaging_delivery_receipts_path",
     "platform_delivery_failure_reply",
+    "platform_plain_format_fallback_text",
     "prepare_reply_for_platform_delivery",
     "principal_id_for_messaging_identity",
     "record_platform_delivery_receipt",
@@ -1452,6 +1646,8 @@ __all__ = [
     "retry_messaging_delivery_operation",
     "save_messaging_attachment",
     "save_messaging_chat_history",
+    "send_with_plain_text_fallback",
+    "should_emit_separate_working_ack",
     "split_reply_for_platform_delivery",
     "split_reply_for_platform",
     "text_or_attachments_expect_attachment_delivery",

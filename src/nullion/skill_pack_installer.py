@@ -106,6 +106,8 @@ BUILTIN_SKILL_PACK_PROMPTS: dict[str, str] = {
         "Skill pack: maton-ai/api-gateway-skill\n"
         "Use when the active workspace has a Maton API gateway connection. Maton uses https://api.maton.ai/{app}/{native-api-path}; "
         "the first path segment is the connected app name, such as google-mail, google-calendar, slack, notion, or hubspot. "
+        "For Gmail, the native API path starts with gmail/v1, for example https://api.maton.ai/google-mail/gmail/v1/users/me/messages. "
+        "For Google Calendar, the native API path starts with calendar/v3. "
         "MATON_API_KEY or the active connection credential_ref authenticates the gateway, but each third-party app still requires an authorized Maton connection. "
         "Use skill references or connector_request for exact service paths, list/check app connections before claiming access when unsure, "
         "and require approval before creating, sending, modifying, deleting, or triggering external actions."
@@ -152,6 +154,12 @@ def default_skill_pack_root() -> Path:
     configured = os.environ.get("NULLION_SKILL_PACK_DIR", "").strip()
     if configured:
         return Path(configured).expanduser()
+    data_dir = os.environ.get("NULLION_DATA_DIR", "").strip()
+    if data_dir:
+        return Path(data_dir).expanduser() / "skill-packs"
+    home = os.environ.get("NULLION_HOME", "").strip()
+    if home:
+        return Path(home).expanduser() / "skill-packs"
     return Path.home() / ".nullion" / "skill-packs"
 
 

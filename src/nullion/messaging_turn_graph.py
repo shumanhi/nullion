@@ -66,13 +66,11 @@ def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
     handler = service.handle_text_message
     runtime = getattr(service, "runtime", None)
     settings = getattr(service, "settings", None)
-    chat_enabled = bool(getattr(getattr(settings, "telegram", None), "chat_enabled", False))
     message = ingress.text
     if (
         runtime is not None
         and isinstance(message, str)
         and (not message.startswith("/") or not is_operator_command_text(message))
-        and chat_enabled
     ):
         health_reply = _chat_model_issue_reply(
             runtime,

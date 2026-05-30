@@ -221,6 +221,14 @@ def is_stop_command_text(text: object) -> bool:
     return normalize_operator_command_head(parts[0]) == "/stop"
 
 
+def is_new_command_text(text: object) -> bool:
+    command = str(text or "").strip()
+    if not command.startswith("/"):
+        return False
+    head = command.split(maxsplit=1)[0]
+    return normalize_operator_command_head(head) == "/new"
+
+
 def _service_stop_result(service: object | None) -> SessionStopResult:
     if service is None:
         return SessionStopResult()

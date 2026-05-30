@@ -38,6 +38,36 @@ def stop_session_reply(result: SessionStopResult | int) -> str:
     return f"Stopped {cancelled_count} active task{'s' if cancelled_count != 1 else ''} in this session."
 
 
+def reset_conversation_session(
+    runtime: object | None,
+    conversation_id: str | None,
+    *,
+    chat_id: str | None = None,
+    checkpoint: bool = True,
+) -> bool:
+    conversation_key = str(conversation_id or "").strip()
+    store = getattr(runtime, "store", None)
+    if store is None or not conversation_key:
+        return False
+    event: dict[str, object] = {
+        "conversation_id": conversation_key,
+        "event_type": "conversation.session_reset",
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    if chat_id is not None:
+        event["chat_id"] = chat_id
+    try:
+        store.add_conversation_event(event)
+        store.set_active_task_frame_id(conversation_key, None)
+        runtime_checkpoint = getattr(runtime, "checkpoint", None)
+        if checkpoint and callable(runtime_checkpoint):
+            runtime_checkpoint()
+        return True
+    except Exception:
+        logger.debug("Unable to reset conversation session", exc_info=True)
+        return False
+
+
 def cancel_active_task_frame(runtime: object, conversation_id: str | None) -> bool:
     conversation_key = str(conversation_id or "").strip()
     store = getattr(runtime, "store", None)
@@ -163,6 +193,7 @@ __all__ = [
     "cancel_manual_cron_background_runs_for_conversation",
     "cancel_orchestrator_conversation",
     "cancel_orchestrator_conversation_sync",
+    "reset_conversation_session",
     "stop_session_async",
     "stop_session_reply",
 ]

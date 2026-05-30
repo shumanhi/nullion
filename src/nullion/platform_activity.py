@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 import re
 import time
@@ -29,6 +31,18 @@ class PlatformTaskCardState:
     activity: dict[str, str] = field(default_factory=dict)
     last_emit_at: float = 0.0
     spinner_frame: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformTaskStatusUpdate:
+    target_id: str
+    group_id: str
+    key: tuple[str, str]
+    rendered_text: str | None
+
+
+PlatformStatusMessageSender = Callable[[str, str], Awaitable[object | None]]
+PlatformStatusMessageEditor = Callable[[object, str, str], Awaitable[bool]]
 
 
 class PlatformTaskCardStore:
@@ -118,6 +132,92 @@ def should_deliver_task_status(
     if kind == "tool_activity":
         return bool(include_activity)
     return False
+
+
+def prepare_platform_task_status_update(
+    *,
+    target_id: str,
+    group_id: str,
+    text: str,
+    status_kind: str,
+    activity_id: str,
+    activity_label: str,
+    task_card_store: PlatformTaskCardStore,
+    planner_feed_enabled: bool,
+    include_activity: bool,
+) -> PlatformTaskStatusUpdate | None:
+    target = str(target_id or "").strip()
+    group = str(group_id or "").strip()
+    if (
+        not target
+        or not group
+        or not should_deliver_task_status(
+            status_kind=status_kind,
+            planner_feed_enabled=planner_feed_enabled,
+            include_activity=include_activity,
+        )
+    ):
+        return None
+    rendered_status = task_card_store.update(
+        target_id=target,
+        group_id=group,
+        status_kind=status_kind,
+        text=text,
+        activity_id=activity_id,
+        activity_label=activity_label,
+        include_activity=include_activity,
+    )
+    return PlatformTaskStatusUpdate(
+        target_id=target,
+        group_id=group,
+        key=(target, group),
+        rendered_text=rendered_status,
+    )
+
+
+async def deliver_platform_task_status_update(
+    *,
+    target_id: str,
+    group_id: str,
+    text: str,
+    status_kind: str,
+    activity_id: str,
+    activity_label: str,
+    task_card_store: PlatformTaskCardStore,
+    status_messages: dict[tuple[str, str], object],
+    status_locks: dict[tuple[str, str], asyncio.Lock],
+    planner_feed_enabled: bool,
+    include_activity: bool,
+    send_new: PlatformStatusMessageSender,
+    edit_existing: PlatformStatusMessageEditor,
+) -> bool:
+    """Prepare, de-dupe, edit, or send a platform-neutral task status card."""
+    update = prepare_platform_task_status_update(
+        target_id=target_id,
+        group_id=group_id,
+        status_kind=status_kind,
+        text=text,
+        activity_id=activity_id,
+        activity_label=activity_label,
+        task_card_store=task_card_store,
+        planner_feed_enabled=planner_feed_enabled,
+        include_activity=include_activity,
+    )
+    if update is None:
+        return False
+    if not update.rendered_text:
+        return True
+    key = update.key
+    lock = status_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        existing = status_messages.get(key)
+        if existing is not None and await edit_existing(existing, update.target_id, update.rendered_text):
+            return True
+        sent = await send_new(update.target_id, update.rendered_text)
+        if sent is None:
+            return False
+        status_messages[key] = sent
+        return True
 
 
 def compact_tool_activity_text(text: str, *, label: str = "") -> str:
@@ -243,8 +343,11 @@ def _render_platform_planner_label(label: str) -> str:
 __all__ = [
     "PlatformActivityCapabilities",
     "PlatformTaskCardStore",
+    "PlatformTaskStatusUpdate",
     "compact_tool_activity_text",
+    "deliver_platform_task_status_update",
     "platform_activity_capabilities",
+    "prepare_platform_task_status_update",
     "render_task_card_text",
     "should_deliver_task_status",
 ]

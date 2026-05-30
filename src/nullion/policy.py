@@ -86,6 +86,10 @@ TOOL_PERMISSION_SCOPE_GLOBAL = "global"
 TOOL_PERMISSION_SCOPE_WORKSPACE = "workspace"
 
 
+def is_end_user_principal(principal_id: str | None) -> bool:
+    return str(principal_id or "").strip().startswith("user:")
+
+
 def permission_scope_principal(principal_id: str | None = None) -> str:
     """Return the global permission owner for a principal.
 
@@ -94,7 +98,6 @@ def permission_scope_principal(principal_id: str | None = None) -> str:
     decisions are global so an approval from one workspace follows the operator
     across web, Telegram, Slack, Discord, delegated workers, and future adapters.
     """
-    del principal_id
     return OPERATOR_PERMISSION_PRINCIPAL
 
 

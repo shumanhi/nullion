@@ -152,6 +152,7 @@ _SCHEDULER_MUTATE_TOOLS = frozenset({
     "set_reminder",
     "update_reminder",
 })
+_DEFAULT_REMINDER_SCOPE_TOOLS = frozenset({"set_reminder", "list_reminders", "delete_reminder", "update_reminder"})
 _SKILL_PACK_TOOLS = frozenset({"skill_pack_read"})
 _SKILL_PACK_CAPABILITY_TAGS = frozenset({"skill_pack"})
 _CONVERSATION_HISTORY_TOOLS = frozenset({"chat_history_search"})
@@ -497,6 +498,21 @@ class ScopedTurnToolRegistry:
         return bool(tags.intersection(_CONNECTOR_CAPABILITY_TAGS))
 
     def _connector_app_id_from_invocation(self, invocation: ToolInvocation) -> str:
+        tool_name = str(getattr(invocation, "tool_name", "") or "").strip()
+        if tool_name in {"email_search", "email_read", "email_send"}:
+            return "google-mail"
+        if tool_name == "calendar_list":
+            return "google-calendar"
+        if tool_name == "connector_request":
+            raw_url = invocation.arguments.get("url") if isinstance(invocation.arguments, dict) else None
+            if isinstance(raw_url, str) and raw_url.strip():
+                try:
+                    from urllib.parse import urlparse
+
+                    first_segment = (urlparse(raw_url.strip()).path or "").strip("/").split("/", 1)[0]
+                    return _normalize_connector_app_id(first_segment)
+                except Exception:
+                    return ""
         return ""
 
     def _is_skill_pack_tool_name(self, tool_name: str) -> bool:
@@ -842,6 +858,20 @@ class ScopedTurnToolRegistry:
             )
         if "connector" in capabilities:
             connector_app_ids = tuple(app_id for app_id in connector_app_ids if app_id in set(active_app_ids)) or active_app_ids
+            connector_structured_tools = _connector_structured_tools_from_context(active_connector_providers)
+            selected_app_ids = set(connector_app_ids)
+            if connector_structured_tools:
+                tool_names = tuple(
+                    tool_name
+                    for tool_name in tool_names
+                    if (
+                        tool_name not in (_CONNECTOR_TYPED_TOOLS | _SKILL_PACK_TOOLS)
+                        or (
+                            tool_name in connector_structured_tools | _SKILL_PACK_TOOLS
+                            and _connector_tool_allowed_for_app_scope(tool_name, selected_app_ids)
+                        )
+                    )
+                )
         existing = self.turn_tool_scope_decision
         scheduler_action = existing.scheduler_action
         if "scheduler_mutate" in capabilities:
@@ -908,7 +938,7 @@ class ScopedTurnToolRegistry:
         if self._is_connector_tool_name(invocation.tool_name) and self.turn_tool_scope_decision.allow_connector_tools:
             app_id = self._connector_app_id_from_invocation(invocation)
             allowed_app_ids = set(self.turn_tool_scope_decision.connector_app_ids)
-            if app_id and allowed_app_ids and app_id not in allowed_app_ids:
+            if allowed_app_ids and app_id not in allowed_app_ids:
                 return ToolResult(
                     invocation_id=invocation.invocation_id,
                     tool_name=invocation.tool_name,
@@ -1282,15 +1312,14 @@ def _active_connector_provider_context() -> list[dict[str, object]]:
         normalized = provider_id.lower()
         if not (normalized.startswith("skill_pack_connector_") or normalized.endswith("_connector_provider")):
             continue
+        permission_mode = str(getattr(connection, "permission_mode", "") or "read")
         entry: dict[str, object] = {
             "provider_id": provider_id,
             "display_name": str(getattr(connection, "display_name", "") or provider_id),
-            "permission_mode": str(getattr(connection, "permission_mode", "") or "read"),
+            "permission_mode": permission_mode,
             "credential_scope": str(getattr(connection, "credential_scope", "") or "workspace"),
-            "structured_tools": ["connector_request", "email_search", "email_read", "calendar_list"],
+            "structured_tools": ["connector_request"],
         }
-        if entry["permission_mode"] == "write":
-            entry["structured_tools"] = ["connector_request", "email_send", "email_search", "email_read", "calendar_list"]
         skill_pack_id = ""
         try:
             installed_packs = list_installed_skill_packs()
@@ -1321,6 +1350,14 @@ def _active_connector_provider_context() -> list[dict[str, object]]:
                             app_ids.append(app_id)
                 if app_ids:
                     entry["active_app_ids"] = app_ids[:500]
+                    structured_tools = ["connector_request"]
+                    if "google-mail" in app_ids:
+                        if permission_mode == "write":
+                            structured_tools.append("email_send")
+                        structured_tools.extend(["email_search", "email_read"])
+                    if "google-calendar" in app_ids:
+                        structured_tools.append("calendar_list")
+                    entry["structured_tools"] = structured_tools
         providers.append(entry)
     return providers[:12]
 
@@ -1351,6 +1388,29 @@ def _active_connector_app_ids_from_context(providers: Iterable[object]) -> tuple
             if isinstance(raw, list):
                 app_ids.extend(raw)
     return _unique_connector_app_ids(app_ids)
+
+
+def _connector_structured_tools_from_context(providers: Iterable[object]) -> set[str]:
+    tools: set[str] = set()
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        structured = provider.get("structured_tools")
+        if isinstance(structured, list):
+            tools.update(str(tool or "").strip() for tool in structured if str(tool or "").strip())
+    return tools
+
+
+def _connector_tool_allowed_for_app_scope(tool_name: str, selected_app_ids: set[str]) -> bool:
+    if not selected_app_ids:
+        return True
+    if tool_name in {"connector_request", "skill_pack_read"}:
+        return True
+    if tool_name in {"email_send", "email_search", "email_read"}:
+        return "google-mail" in selected_app_ids
+    if tool_name == "calendar_list":
+        return "google-calendar" in selected_app_ids
+    return True
 
 
 def _validated_turn_tool_scope_decision(
@@ -1440,13 +1500,7 @@ def _validated_requested_tool_names(
             available_names = {str(definition.get("name") or "") for definition in registry.list_tool_definitions()}
         except Exception:
             available_names = set()
-    connector_structured_tools: set[str] = set()
-    for provider in active_connector_providers:
-        if not isinstance(provider, dict):
-            continue
-        structured = provider.get("structured_tools")
-        if isinstance(structured, list):
-            connector_structured_tools.update(str(tool or "").strip() for tool in structured if str(tool or "").strip())
+    connector_structured_tools = _connector_structured_tools_from_context(active_connector_providers)
     validated: list[str] = []
     for raw_name in requested_tool_names:
         name = str(raw_name or "").strip()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import threading
@@ -36,6 +37,56 @@ def _fail(invocation: ToolInvocation, message: str) -> ToolResult:
         output={},
         error=message,
     )
+
+
+def _resize_browser_screenshot_to_layout_pixels(
+    png_bytes: bytes,
+    *,
+    mode: str,
+    viewport_width: int | None,
+    viewport_height: int | None,
+    document_width: int | None,
+    document_height: int | None,
+) -> tuple[bytes, dict[str, object]]:
+    """Normalize high-DPI browser screenshots to their reported layout size."""
+
+    try:
+        from PIL import Image
+    except Exception:
+        return png_bytes, {}
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as image:
+            actual_width, actual_height = image.size
+            if mode == "full_page":
+                target_width = int(document_width or 0)
+                target_height = int(document_height or 0)
+            else:
+                target_width = int(viewport_width or 0)
+                target_height = int(viewport_height or 0)
+            if target_width <= 0 or target_height <= 0:
+                return png_bytes, {"image_width": actual_width, "image_height": actual_height}
+            width_ratio = actual_width / target_width
+            height_ratio = actual_height / target_height
+            high_dpi = width_ratio > 1.25 and height_ratio > 1.25 and abs(width_ratio - height_ratio) <= 0.25
+            if not high_dpi:
+                return png_bytes, {"image_width": actual_width, "image_height": actual_height}
+            resized = image.convert("RGBA").resize((target_width, target_height), Image.Resampling.LANCZOS)
+            output = io.BytesIO()
+            resized.save(output, format="PNG", optimize=True)
+            return output.getvalue(), {
+                "image_width": target_width,
+                "image_height": target_height,
+                "original_image_width": actual_width,
+                "original_image_height": actual_height,
+                "normalized_device_scale_factor": round((width_ratio + height_ratio) / 2, 3),
+            }
+    except Exception:
+        return png_bytes, {}
+
+
+def _int_metadata_value(metadata: dict[str, object], key: str) -> int | None:
+    value = metadata.get(key)
+    return value if isinstance(value, int) else None
 
 
 _BROWSER_LOOP: asyncio.AbstractEventLoop | None = None
@@ -1401,6 +1452,14 @@ class BrowserTools:
                 }
             if not png_bytes:
                 return _fail(invocation, "Screenshot returned no image data.")
+            png_bytes, image_metadata = _resize_browser_screenshot_to_layout_pixels(
+                png_bytes,
+                mode=str(screenshot_metadata.get("mode") or mode),
+                viewport_width=_int_metadata_value(screenshot_metadata, "viewport_width"),
+                viewport_height=_int_metadata_value(screenshot_metadata, "viewport_height"),
+                document_width=_int_metadata_value(screenshot_metadata, "document_width"),
+                document_height=_int_metadata_value(screenshot_metadata, "document_height"),
+            )
             artifact_path = artifact_path_for_generated_workspace_file(
                 principal_id=invocation.principal_id,
                 suffix=".png",
@@ -1418,6 +1477,7 @@ class BrowserTools:
                     "size_bytes": len(png_bytes),
                     "session_id": session_id,
                     **screenshot_metadata,
+                    **image_metadata,
                     **self._connection_notice_output(),
                 },
             )

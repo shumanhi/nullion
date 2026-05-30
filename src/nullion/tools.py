@@ -90,6 +90,29 @@ _BROWSER_IMAGE_FORMAT_SUFFIXES = {
     "GIF": ".gif",
 }
 _LEGACY_GLOBAL_PERMISSION_PRINCIPALS = ("operator", "workspace:workspace_admin")
+
+
+def _tool_grant_principal_candidates(principal_id: str | None) -> set[str]:
+    principal_text = str(principal_id or "").strip()
+    candidates = {candidate for candidate in {principal_text, permission_scope_principal(principal_text)} if candidate}
+    candidates.update({
+        GLOBAL_PERMISSION_PRINCIPAL,
+        OPERATOR_PERMISSION_PRINCIPAL,
+        *_LEGACY_GLOBAL_PERMISSION_PRINCIPALS,
+    })
+    return candidates
+
+
+def _tool_blocked_for_principal(principal_id: str | None, tool_name: str | None) -> bool:
+    try:
+        from nullion.users import tool_blocked_for_principal
+
+        return tool_blocked_for_principal(principal_id, tool_name)
+    except Exception:
+        logger.debug("Could not load user tool block policy", exc_info=True)
+        return False
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1588,10 +1611,6 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional local artifact/media paths to attach.",
-                },
-                "provider_id": {
-                    "type": "string",
-                    "description": "Optional connector provider id. Defaults to an active Google Mail connector.",
                 },
             },
             "required": ["to", "subject"],
@@ -3124,13 +3143,7 @@ class ToolExecutor:
 
     def _has_active_grant(self, *, principal_id: str, permissions: Iterable[str]) -> bool:
         required = set(permissions)
-        principal_ids = {
-            principal_id,
-            permission_scope_principal(principal_id),
-            GLOBAL_PERMISSION_PRINCIPAL,
-            OPERATOR_PERMISSION_PRINCIPAL,
-            *_LEGACY_GLOBAL_PERMISSION_PRINCIPALS,
-        }
+        principal_ids = _tool_grant_principal_candidates(principal_id)
         for grant in self._store.list_permission_grants():
             if grant.principal_id not in principal_ids:
                 continue
@@ -3142,6 +3155,8 @@ class ToolExecutor:
         return False
 
     def _has_required_tool_grant(self, invocation: ToolInvocation) -> bool:
+        if _tool_blocked_for_principal(invocation.principal_id, invocation.tool_name):
+            return False
         if invocation.tool_name == "email_send":
             return bool(self._matching_email_send_review_grants(invocation))
         return self._has_active_grant(
@@ -3169,11 +3184,7 @@ class ToolExecutor:
         if not matching_approval_ids:
             return []
         grants = []
-        principal_ids = {
-            invocation.principal_id,
-            permission_scope_principal(invocation.principal_id),
-            OPERATOR_PERMISSION_PRINCIPAL,
-        }
+        principal_ids = _tool_grant_principal_candidates(invocation.principal_id)
         for grant in self._store.list_permission_grants():
             if grant.approval_id not in matching_approval_ids:
                 continue
@@ -3562,6 +3573,13 @@ class ToolExecutor:
 
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
         invocation = _with_resolved_virtual_workspace_paths(invocation)
+        if _tool_blocked_for_principal(invocation.principal_id, invocation.tool_name):
+            return self._deny_invocation(
+                invocation,
+                reason="user_tool_blocked",
+                error=f"Tool is blocked for this user: {invocation.tool_name}",
+                output={"reason": "user_tool_blocked", "tool_name": invocation.tool_name},
+            )
         if invocation.tool_name in self._denied_tool_names:
             return self._deny_invocation(
                 invocation,
@@ -7281,11 +7299,14 @@ class _BrowserImageCandidateHTMLParser(HTMLParser):
         tag_name = tag.lower()
         attributes = {str(name).lower(): str(value or "") for name, value in attrs}
         if tag_name == "img":
-            self._append(attributes.get("src"), role="img", attributes=attributes)
-            self._append_srcset(attributes.get("srcset"), role="img_srcset", attributes=attributes)
+            for attr_name in ("src", "data-src", "data-original", "data-lazy-src"):
+                self._append(attributes.get(attr_name), role=f"img_{attr_name}", attributes=attributes)
+            for attr_name in ("srcset", "data-srcset", "data-lazy-srcset"):
+                self._append_srcset(attributes.get(attr_name), role=f"img_{attr_name}", attributes=attributes)
             return
         if tag_name == "source":
-            self._append_srcset(attributes.get("srcset"), role="source_srcset", attributes=attributes)
+            for attr_name in ("srcset", "data-srcset"):
+                self._append_srcset(attributes.get(attr_name), role=f"source_{attr_name}", attributes=attributes)
             return
         if tag_name == "meta":
             key = (attributes.get("property") or attributes.get("name") or "").strip().lower()
@@ -7487,7 +7508,9 @@ def _build_browser_image_collect_handler() -> ToolHandler:
             )
 
         images: list[dict[str, object]] = []
-        for candidate in candidates[:max_images]:
+        for candidate in candidates:
+            if len(images) >= max_images:
+                break
             source_url = str(candidate.get("source_url") or "")
             try:
                 image_payload = (
@@ -8347,86 +8370,6 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
             ),
             _build_connector_request_handler(),
         )
-    try:
-        registry.get_spec("email_search")
-    except KeyError:
-        registry.mark_plugin_installed("connector_plugin")
-        registry.register(
-            ToolSpec(
-                name="email_search",
-                description=(
-                    "Search messages through an active Google Mail connector. Use this for inbox checks, "
-                    "triage, and finding message ids. Search results are metadata-only; call email_read "
-                    "with a returned id before summarizing body content or claiming the message was read."
-                ),
-                risk_level=ToolRiskLevel.LOW,
-                side_effect_class=ToolSideEffectClass.READ,
-                requires_approval=False,
-                timeout_seconds=20,
-                capability_tags=("email", "connector", "account_read"),
-            ),
-            _build_connector_email_search_handler(),
-        )
-    try:
-        registry.get_spec("email_read")
-    except KeyError:
-        registry.mark_plugin_installed("connector_plugin")
-        registry.register(
-            ToolSpec(
-                name="email_read",
-                description=(
-                    "Read one full message through an active Google Mail connector using an id from email_search. "
-                    "Use this whenever the user asks to read, summarize, inspect, or act on message body content."
-                ),
-                risk_level=ToolRiskLevel.LOW,
-                side_effect_class=ToolSideEffectClass.READ,
-                requires_approval=False,
-                timeout_seconds=20,
-                capability_tags=("email", "connector", "account_read"),
-            ),
-            _build_connector_email_read_handler(),
-        )
-    try:
-        registry.get_spec("calendar_list")
-    except KeyError:
-        registry.mark_plugin_installed("connector_plugin")
-        registry.register(
-            ToolSpec(
-                name="calendar_list",
-                description=(
-                    "List calendar events through an active Google Calendar connector for a specific time window. "
-                    "Use this for checking the user's calendar, agenda, schedule, or availability."
-                ),
-                risk_level=ToolRiskLevel.LOW,
-                side_effect_class=ToolSideEffectClass.READ,
-                requires_approval=False,
-                timeout_seconds=20,
-                capability_tags=("calendar", "connector", "account_read"),
-            ),
-            _build_connector_calendar_list_handler(),
-        )
-    try:
-        registry.get_spec("email_send")
-        return
-    except KeyError:
-        pass
-    registry.mark_plugin_installed("connector_plugin")
-    registry.register(
-        ToolSpec(
-            name="email_send",
-            description=(
-                "Send a plain-text email, optionally with local artifact/media attachments, through an active "
-                "write-capable Google Mail connector. Use this for actual email delivery; use connector_request "
-                "only for lower-level connector APIs."
-            ),
-            risk_level=ToolRiskLevel.HIGH,
-            side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
-            requires_approval=True,
-            timeout_seconds=20,
-            capability_tags=("email", "connector"),
-        ),
-        _build_connector_email_send_handler(),
-    )
 
 
 def _connector_connection_for_invocation(invocation: ToolInvocation, provider_id: str):
@@ -8509,235 +8452,12 @@ def _string_list_argument(raw_value: object) -> list[str]:
     return [value] if value else []
 
 
-def _default_email_connector_provider_id(principal_id: str | None, *, require_write: bool = False) -> str:
-    try:
-        from nullion.connections import default_email_connector_provider_id
-
-        try:
-            provider_id = default_email_connector_provider_id(principal_id, require_write=require_write)
-        except TypeError:
-            provider_id = default_email_connector_provider_id(principal_id)
-        if provider_id:
-            return provider_id
-    except Exception:
-        pass
-    raise RuntimeError("No active Google Mail connector is available for this workspace/principal.")
-
-
-def _default_calendar_connector_provider_id(principal_id: str | None) -> str:
-    try:
-        from nullion.connections import connection_for_principal, load_connection_registry
-    except Exception:
-        raise RuntimeError("No active calendar connector is available for this workspace/principal.")
-    fallback_provider_id = ""
-    try:
-        connections = load_connection_registry().connections
-    except Exception:
-        connections = ()
-    for connection in connections:
-        provider_id = str(getattr(connection, "provider_id", "") or "").strip()
-        if not provider_id or not getattr(connection, "active", True):
-            continue
-        lowered_provider = provider_id.lower()
-        if not (lowered_provider.startswith("skill_pack_connector_") or lowered_provider.endswith("_connector_provider")):
-            continue
-        scoped_connection = connection_for_principal(principal_id, provider_id)
-        if scoped_connection is None:
-            continue
-        display_name = str(getattr(scoped_connection, "display_name", "") or "").lower()
-        if "calendar" in lowered_provider or "calendar" in display_name:
-            return provider_id
-        if not fallback_provider_id:
-            fallback_provider_id = provider_id
-    if fallback_provider_id:
-        return fallback_provider_id
-    raise RuntimeError("No active calendar connector is available for this workspace/principal.")
-
-
-def _email_send_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
-    base_urls = _connector_allowed_base_urls(connection, provider_id)
-    for base_url in base_urls:
-        parsed = urlparse(base_url)
-        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
-            return f"{parsed.scheme}://{parsed.netloc}/google-mail/gmail/v1/users/me/messages/send"
-    return "https://api.maton.ai/google-mail/gmail/v1/users/me/messages/send"
-
-
-def _email_messages_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
-    base_urls = _connector_allowed_base_urls(connection, provider_id)
-    for base_url in base_urls:
-        parsed = urlparse(base_url)
-        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
-            return f"{parsed.scheme}://{parsed.netloc}/google-mail/gmail/v1/users/me/messages"
-    return "https://api.maton.ai/google-mail/gmail/v1/users/me/messages"
-
-
-def _maton_api_base_url_for_provider(connection: object | None, provider_id: str) -> str | None:
-    for base_url in _connector_allowed_base_urls(connection, provider_id):
-        parsed = urlparse(base_url)
-        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
-            return f"{parsed.scheme}://{parsed.netloc}"
-    if "maton" in str(provider_id or "").lower():
-        return "https://api.maton.ai"
-    return None
-
-
 def _connector_json_payload_from_response(response) -> dict[str, object]:
     body = response.read(1_000_000).decode("utf-8", "ignore")
     payload = json.loads(body or "{}")
     if not isinstance(payload, dict):
         raise RuntimeError("connector returned non-object JSON")
     return payload
-
-
-def _maton_connection_sort_key(item: dict[str, object]) -> tuple[str, str]:
-    return (
-        str(item.get("last_updated_time") or ""),
-        str(item.get("creation_time") or ""),
-    )
-
-
-def _maton_connection_diagnostics(
-    invocation: ToolInvocation,
-    *,
-    provider_id: str,
-    connection: object | None,
-    app: str,
-) -> dict[str, object] | None:
-    base_url = _maton_api_base_url_for_provider(connection, provider_id)
-    if not base_url:
-        return None
-    request_url = _connector_request_url(f"{base_url}/connections", {"app": app}, connection, provider_id)
-    resolution = _resolve_web_fetch_resolution(request_url)
-    request = urllib.request.Request(
-        request_url,
-        headers=_connector_request_headers(connection, provider_id),
-        method="GET",
-    )
-    opener = _build_web_fetch_opener()
-    with _pinned_web_fetch_resolution(resolution):
-        with opener.open(request, timeout=_connector_request_timeout_seconds()) as response:
-            payload = _connector_json_payload_from_response(response)
-
-    raw_connections = payload.get("connections")
-    connections = raw_connections if isinstance(raw_connections, list) else []
-    app_connections: list[dict[str, object]] = []
-    for item in connections:
-        if not isinstance(item, dict) or str(item.get("app") or "").strip() != app:
-            continue
-        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-        summary: dict[str, object] = {
-            "app": app,
-            "status": str(item.get("status") or "").strip() or "UNKNOWN",
-        }
-        for key in ("connection_id", "creation_time", "last_updated_time", "method"):
-            value = item.get(key)
-            if value not in (None, "", [], {}):
-                summary[key] = value
-        email = metadata.get("email") if isinstance(metadata, dict) else None
-        if isinstance(email, str) and email.strip():
-            summary["email"] = email.strip()
-        connect_url = item.get("url")
-        if isinstance(connect_url, str) and connect_url.strip():
-            summary["connect_url"] = connect_url.strip()
-        app_connections.append(summary)
-
-    if not app_connections:
-        return {
-            "provider_id": provider_id,
-            "app": app,
-            "status": "MISSING",
-            "connections": [],
-        }
-
-    active = [item for item in app_connections if str(item.get("status") or "").upper() == "ACTIVE"]
-    pending = [item for item in app_connections if str(item.get("status") or "").upper() == "PENDING"]
-    # Prefer a usable connection. If none is usable, surface the newest pending
-    # reconnect flow before older failed attempts so the user gets the right next step.
-    if active:
-        primary = max(active, key=_maton_connection_sort_key)
-    elif pending:
-        primary = max(pending, key=_maton_connection_sort_key)
-    else:
-        primary = max(app_connections, key=_maton_connection_sort_key)
-
-    statuses = sorted({str(item.get("status") or "UNKNOWN") for item in app_connections})
-    diagnostics: dict[str, object] = {
-        "provider_id": provider_id,
-        "app": app,
-        "status": "ACTIVE" if active else "RECONNECT_REQUIRED",
-        "connection_statuses": statuses,
-        "connections": app_connections,
-    }
-    for key in ("email", "connect_url", "connection_id", "last_updated_time", "creation_time"):
-        value = primary.get(key)
-        if value not in (None, "", [], {}):
-            diagnostics[key] = value
-    if "email" not in diagnostics:
-        email_sources = [item for item in app_connections if item.get("email")]
-        if email_sources:
-            diagnostics["email"] = max(email_sources, key=_maton_connection_sort_key)["email"]
-    return diagnostics
-
-
-def _account_connection_recovery_result(
-    invocation: ToolInvocation,
-    *,
-    provider_id: str,
-    connection: object | None,
-    app: str,
-) -> ToolResult | None:
-    try:
-        diagnostics = _maton_connection_diagnostics(
-            invocation,
-            provider_id=provider_id,
-            connection=connection,
-            app=app,
-        )
-    except Exception:
-        logger.debug("Connector connection diagnostics failed provider_id=%s app=%s", provider_id, app, exc_info=True)
-        return None
-    if not diagnostics or diagnostics.get("status") == "ACTIVE":
-        return None
-
-    email = str(diagnostics.get("email") or "").strip()
-    target = f" for {email}" if email else ""
-    last_updated = str(diagnostics.get("last_updated_time") or diagnostics.get("creation_time") or "").strip()
-    timestamp = f" Last connection update: {last_updated}." if last_updated else ""
-    result_text = (
-        f"Maton is configured, but its {app} connection is not active{target}."
-        f"{timestamp} Reconnect the account in Settings > Connections, then ask me to try again."
-    )
-    return ToolResult(
-        invocation_id=invocation.invocation_id,
-        tool_name=invocation.tool_name,
-        status="completed",
-        output={
-            "reason": "account_connection_reconnect_required",
-            "terminal_user_action_required": True,
-            "suppress_activity": True,
-            "provider_id": provider_id,
-            "app": app,
-            "connection_state": "pending_or_failed",
-            "connector_app_id": app,
-            "result_text": result_text,
-            "next_step": (
-                "Stop tool use for this turn and tell the user the account connection must be reconnected. "
-                "Do not try browser workarounds or unrelated tools for this connector account."
-            ),
-            "connection_diagnostics": diagnostics,
-        },
-        error=None,
-    )
-
-
-def _calendar_events_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
-    base_urls = _connector_allowed_base_urls(connection, provider_id)
-    for base_url in base_urls:
-        parsed = urlparse(base_url)
-        if parsed.scheme and parsed.netloc and "maton.ai" in parsed.netloc.lower():
-            return f"{parsed.scheme}://{parsed.netloc}/google-calendar/calendar/v3/calendars/primary/events"
-    return "https://api.maton.ai/google-calendar/calendar/v3/calendars/primary/events"
 
 
 def _connector_json_request(
@@ -8782,113 +8502,6 @@ def _connector_request_timeout_seconds() -> int:
     except ValueError:
         raw = 12
     return max(3, min(raw, 30))
-
-
-def _gmail_header_map(message: dict[str, object]) -> dict[str, str]:
-    payload = message.get("payload")
-    if not isinstance(payload, dict):
-        return {}
-    headers = payload.get("headers")
-    if not isinstance(headers, list):
-        return {}
-    wanted = {"from", "to", "cc", "subject", "date"}
-    mapped: dict[str, str] = {}
-    for header in headers:
-        if not isinstance(header, dict):
-            continue
-        name = str(header.get("name") or "").strip().lower()
-        value = str(header.get("value") or "").strip()
-        if name in wanted and value:
-            mapped[name] = value
-    return mapped
-
-
-def _gmail_decode_body_data(data: object) -> str:
-    if not isinstance(data, str) or not data.strip():
-        return ""
-    padded = data + ("=" * ((4 - len(data) % 4) % 4))
-    try:
-        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", "replace")
-    except Exception:
-        return ""
-
-
-def _gmail_message_body_text(message: dict[str, object], *, limit: int = 6000) -> str:
-    payload = message.get("payload")
-    if not isinstance(payload, dict):
-        return ""
-    candidates: list[tuple[str, str]] = []
-
-    def visit(part: object) -> None:
-        if not isinstance(part, dict):
-            return
-        mime_type = str(part.get("mimeType") or "").strip().lower()
-        body = part.get("body")
-        if isinstance(body, dict):
-            text = _gmail_decode_body_data(body.get("data"))
-            if text.strip():
-                candidates.append((mime_type, text))
-        for child in part.get("parts") if isinstance(part.get("parts"), list) else []:
-            visit(child)
-
-    visit(payload)
-    text = next((value for mime, value in candidates if mime == "text/plain"), "")
-    if not text:
-        html = next((value for mime, value in candidates if mime == "text/html"), "")
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = unescape(text)
-    if not text and candidates:
-        text = candidates[0][1]
-    return " ".join(text.split())[:limit]
-
-
-def _compact_gmail_message(message: dict[str, object], *, include_body: bool = False) -> dict[str, object]:
-    compact: dict[str, object] = {
-        "id": message.get("id"),
-        "threadId": message.get("threadId"),
-    }
-    headers = _gmail_header_map(message)
-    if headers:
-        compact["headers"] = headers
-        for key in ("from", "subject", "date"):
-            if key in headers:
-                compact[key] = headers[key]
-    snippet = message.get("snippet")
-    if isinstance(snippet, str) and snippet.strip():
-        compact["snippet"] = snippet.strip()
-    label_ids = message.get("labelIds")
-    if isinstance(label_ids, list):
-        compact["labelIds"] = [str(item) for item in label_ids[:12]]
-    if include_body:
-        body = _gmail_message_body_text(message)
-        if body:
-            compact["body"] = body
-    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
-
-
-def _compact_google_calendar_event(event: dict[str, object]) -> dict[str, object]:
-    compact: dict[str, object] = {
-        "id": event.get("id"),
-        "summary": event.get("summary"),
-        "status": event.get("status"),
-        "start": event.get("start"),
-        "end": event.get("end"),
-        "location": event.get("location"),
-        "description": event.get("description"),
-        "htmlLink": event.get("htmlLink"),
-    }
-    attendees = event.get("attendees")
-    if isinstance(attendees, list):
-        compact["attendees"] = [
-            {
-                key: attendee.get(key)
-                for key in ("email", "displayName", "responseStatus")
-                if isinstance(attendee, dict) and attendee.get(key) not in (None, "", [], {})
-            }
-            for attendee in attendees[:20]
-            if isinstance(attendee, dict)
-        ]
-    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
 
 def _email_message_for_invocation(invocation: ToolInvocation) -> tuple[EmailMessage, list[str]]:
@@ -9215,304 +8828,6 @@ def _build_connector_request_handler() -> ToolHandler:
                 status="failed",
                 output=output,
                 error=error,
-            )
-        except Exception as exc:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={"provider_id": provider_id},
-                error=str(exc),
-            )
-
-    return handler
-
-
-def _build_connector_email_search_handler() -> ToolHandler:
-    def handler(invocation: ToolInvocation) -> ToolResult:
-        raw_query = invocation.arguments.get("query")
-        raw_limit = invocation.arguments.get("limit", 10)
-        if not isinstance(raw_query, str) or not raw_query.strip():
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={},
-                error="Missing required argument: query",
-            )
-        if not isinstance(raw_limit, int) or raw_limit <= 0:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={},
-                error="limit must be a positive integer",
-            )
-        limit = min(raw_limit, 10)
-        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
-        try:
-            if not provider_id:
-                provider_id = _default_email_connector_provider_id(invocation.principal_id)
-            connection = _connector_connection_for_invocation(invocation, provider_id)
-            recovery_result = _account_connection_recovery_result(
-                invocation,
-                provider_id=provider_id,
-                connection=connection,
-                app="google-mail",
-            )
-            if recovery_result is not None:
-                return recovery_result
-            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
-            listing = _connector_json_request(
-                invocation,
-                provider_id=provider_id,
-                url=endpoint,
-                params={"q": raw_query.strip(), "maxResults": limit},
-            )
-            raw_messages = listing.get("messages")
-            messages = raw_messages if isinstance(raw_messages, list) else []
-            results: list[dict[str, object]] = []
-            for item in messages[:limit]:
-                if not isinstance(item, dict):
-                    continue
-                message_id = str(item.get("id") or "").strip()
-                if not message_id:
-                    continue
-                detail = _connector_json_request(
-                    invocation,
-                    provider_id=provider_id,
-                    url=f"{endpoint}/{quote(message_id, safe='')}",
-                    params={"format": "full"},
-                )
-                results.append(_compact_gmail_message(detail, include_body=False))
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="completed",
-                output={
-                    "query": raw_query.strip(),
-                    "provider_id": provider_id,
-                    "resultSizeEstimate": listing.get("resultSizeEstimate"),
-                    "results": results,
-                    "body_included": False,
-                    "next_tool_for_body": "email_read",
-                    "body_requires_tool": "email_read",
-                },
-                error=None,
-            )
-        except Exception as exc:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output=_account_tool_failure_output(invocation.principal_id, query=raw_query),
-                error=str(exc),
-            )
-
-    return handler
-
-
-def _build_connector_email_read_handler() -> ToolHandler:
-    def handler(invocation: ToolInvocation) -> ToolResult:
-        raw_id = invocation.arguments.get("id")
-        if not isinstance(raw_id, str) or not raw_id.strip():
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={},
-                error="Missing required argument: id",
-            )
-        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
-        try:
-            if not provider_id:
-                provider_id = _default_email_connector_provider_id(invocation.principal_id)
-            connection = _connector_connection_for_invocation(invocation, provider_id)
-            recovery_result = _account_connection_recovery_result(
-                invocation,
-                provider_id=provider_id,
-                connection=connection,
-                app="google-mail",
-            )
-            if recovery_result is not None:
-                return recovery_result
-            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
-            message = _connector_json_request(
-                invocation,
-                provider_id=provider_id,
-                url=f"{endpoint}/{quote(raw_id.strip(), safe='')}",
-                params={"format": "full"},
-            )
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="completed",
-                output={
-                    "id": raw_id.strip(),
-                    "provider_id": provider_id,
-                    "message": _compact_gmail_message(message, include_body=True),
-                },
-                error=None,
-            )
-        except Exception as exc:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output=_account_tool_failure_output(invocation.principal_id, message_id=raw_id),
-                error=str(exc),
-            )
-
-    return handler
-
-
-def _build_connector_calendar_list_handler() -> ToolHandler:
-    def handler(invocation: ToolInvocation) -> ToolResult:
-        raw_start = invocation.arguments.get("start")
-        raw_end = invocation.arguments.get("end")
-        raw_max = invocation.arguments.get("max", 10)
-        if not isinstance(raw_start, str) or not raw_start.strip():
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={},
-                error="Missing required argument: start",
-            )
-        if not isinstance(raw_end, str) or not raw_end.strip():
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={},
-                error="Missing required argument: end",
-            )
-        if not isinstance(raw_max, int) or raw_max <= 0:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={},
-                error="max must be a positive integer",
-            )
-        limit = min(raw_max, 50)
-        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
-        try:
-            if not provider_id:
-                provider_id = _default_calendar_connector_provider_id(invocation.principal_id)
-            connection = _connector_connection_for_invocation(invocation, provider_id)
-            endpoint = _calendar_events_endpoint_for_provider(connection, provider_id)
-            listing = _connector_json_request(
-                invocation,
-                provider_id=provider_id,
-                url=endpoint,
-                params={
-                    "timeMin": raw_start.strip(),
-                    "timeMax": raw_end.strip(),
-                    "maxResults": limit,
-                    "singleEvents": "true",
-                    "orderBy": "startTime",
-                },
-            )
-            raw_items = listing.get("items")
-            items = raw_items if isinstance(raw_items, list) else []
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="completed",
-                output={
-                    "provider_id": provider_id,
-                    "start": raw_start.strip(),
-                    "end": raw_end.strip(),
-                    "max": limit,
-                    "result_count": len(items[:limit]),
-                    "results": [
-                        _compact_google_calendar_event(item)
-                        for item in items[:limit]
-                        if isinstance(item, dict)
-                    ],
-                },
-                error=None,
-            )
-        except Exception as exc:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output=_account_tool_failure_output(invocation.principal_id),
-                error=str(exc),
-            )
-
-    return handler
-
-
-def _build_connector_email_send_handler() -> ToolHandler:
-    def handler(invocation: ToolInvocation) -> ToolResult:
-        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
-        try:
-            if not provider_id:
-                provider_id = _default_email_connector_provider_id(invocation.principal_id, require_write=True)
-            connection = _connector_connection_for_invocation(invocation, provider_id)
-            if not _connector_connection_allows_write(connection):
-                return ToolResult(
-                    invocation_id=invocation.invocation_id,
-                    tool_name=invocation.tool_name,
-                    status="failed",
-                    output={"provider_id": provider_id, "permission_mode": "read"},
-                    error=(
-                        f"{provider_id} is configured as read-only for email_send. "
-                        "Change this connection's permission mode to read_write in Settings > Users > Connections "
-                        "before sending email."
-                    ),
-                )
-            recovery_result = _account_connection_recovery_result(
-                invocation,
-                provider_id=provider_id,
-                connection=connection,
-                app="google-mail",
-            )
-            if recovery_result is not None:
-                return recovery_result
-            message, attached_paths = _email_message_for_invocation(invocation)
-            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
-            endpoint = _email_send_endpoint_for_provider(connection, provider_id)
-            url = _connector_request_url(endpoint, None, connection, provider_id)
-            resolution = _resolve_web_fetch_resolution(url)
-            payload = json.dumps({"raw": raw_message}).encode("utf-8")
-            headers = _connector_request_headers(connection, provider_id)
-            headers["Content-Type"] = "application/json"
-            request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-            opener = _build_web_fetch_opener()
-            with _pinned_web_fetch_resolution(resolution):
-                with opener.open(request, timeout=20) as response:
-                    status_code = getattr(response, "status", 200)
-                    content_type = response.headers.get_content_type()
-                    body = response.read(1_000_000).decode("utf-8", "ignore")
-            output: dict[str, object] = {
-                "url": url,
-                "provider_id": provider_id,
-                "method": "POST",
-                "status_code": status_code,
-                "content_type": content_type,
-                "to": _string_list_argument(invocation.arguments.get("to")),
-                "subject": str(invocation.arguments.get("subject") or "").strip(),
-                "attachment_count": len(attached_paths),
-                "attachment_paths": attached_paths,
-            }
-            try:
-                parsed_json = json.loads(body)
-                if isinstance(parsed_json, dict):
-                    output["json"] = parsed_json
-                else:
-                    output["json"] = parsed_json
-            except Exception:
-                output["text"] = body[:20000]
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="completed",
-                output=output,
-                error=None,
             )
         except Exception as exc:
             return ToolResult(
@@ -10126,12 +9441,7 @@ def _build_email_read_handler(
 def _build_email_send_handler(
     email_sender: Callable[[EmailMessage, list[str]], dict[str, object]],
 ) -> ToolHandler:
-    connector_handler = _build_connector_email_send_handler()
-
     def handler(invocation: ToolInvocation) -> ToolResult:
-        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
-        if provider_id and _connector_provider_id_looks_external(provider_id):
-            return connector_handler(invocation)
         try:
             message, attached_paths = _email_message_for_invocation(invocation)
             output = _call_provider_with_principal(

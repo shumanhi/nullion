@@ -89,11 +89,17 @@ def sanitize_user_visible_reply(
     raw = _sanitize_account_tool_transport_details(raw, results)
     raw = _sanitize_internal_tool_state_phrasing(raw, results)
     raw = _sanitize_account_tool_family_drift(raw, results)
+    raw = _repair_collapsed_numbered_list_reply(raw)
+    raw = _renumber_visible_numbered_list_reply(raw)
+    raw = _repair_missing_requested_section_replies(user_message, raw, results)
+    raw = _normalize_requested_section_reply_format(user_message, raw, results)
     raw = _prefix_account_tool_reply(raw, results)
     if action_receipt_reply := _action_receipt_reply_over_drift(raw, results):
         return _sanitize_local_paths(action_receipt_reply)
     if scheduler_action_reply := _scheduler_action_reply_over_read_drift(raw, results):
         return _sanitize_local_paths(scheduler_action_reply)
+    if empty_reminder_cancel_reply := _empty_reminder_cancel_reply(results):
+        return empty_reminder_cancel_reply
     if scheduler_read_reply := _scheduler_read_reply_over_model_reformat(raw, results):
         return _sanitize_local_paths(scheduler_read_reply)
     if numbered_reply := _structured_numbered_choice_reply(results):
@@ -108,6 +114,318 @@ def sanitize_user_visible_reply(
     if not _looks_like_raw_tool_payload(parsed, results):
         return _sanitize_local_paths(raw)
     return safe_raw_tool_payload_replacement(tool_results=results, source=source, parsed_payload=parsed)
+
+
+def _repair_collapsed_numbered_list_reply(text: str) -> str:
+    """Make model-collapsed numbered lists readable without changing content."""
+
+    value = str(text or "")
+    if "\n" in value and not _has_inline_numbered_markers(value):
+        return value
+    paragraphs = re.split(r"(\n{2,})", value)
+    repaired: list[str] = []
+    for paragraph in paragraphs:
+        if paragraph.startswith("\n"):
+            repaired.append(paragraph)
+            continue
+        repaired.append(_repair_collapsed_numbered_list_paragraph(paragraph))
+    return "".join(repaired)
+
+
+def _has_inline_numbered_markers(text: str) -> bool:
+    for line in str(text or "").splitlines():
+        if len(_inline_numbered_marker_matches(line)) >= 2:
+            return True
+    return False
+
+
+def _inline_numbered_marker_matches(text: str) -> list[re.Match[str]]:
+    return list(
+        re.finditer(
+            r"(?<![\w.])(?P<marker>(?:\d{1,2}\.|\(\d{1,2}\))\s+)(?=[A-Z0-9`*_])",
+            str(text or ""),
+        )
+    )
+
+
+def _repair_collapsed_numbered_list_paragraph(paragraph: str) -> str:
+    matches = _inline_numbered_marker_matches(paragraph)
+    if len(matches) < 2:
+        return paragraph
+    pieces: list[str] = []
+    cursor = 0
+    for match in matches:
+        start = match.start("marker")
+        if start > cursor:
+            pieces.append(paragraph[cursor:start].rstrip())
+        if pieces:
+            pieces.append("\n")
+        pieces.append(paragraph[start:match.end("marker")])
+        cursor = match.end("marker")
+    pieces.append(paragraph[cursor:].strip())
+    return "".join(pieces).strip()
+
+
+def _renumber_visible_numbered_list_reply(text: str) -> str:
+    """Keep visible ordered lists from starting at an impossible number."""
+
+    value = str(text or "")
+    matches = list(
+        re.finditer(
+            r"(?m)^(?P<indent>\s*)(?P<marker>(?P<paren>\((?P<pnum>\d{1,2})\))|(?P<dnum>\d{1,2})\.)(?P<space>\s+)",
+            value,
+        )
+    )
+    if not matches:
+        return value
+    first_number = int(matches[0].group("pnum") or matches[0].group("dnum") or "1")
+    if first_number == 1:
+        return value
+    pieces: list[str] = []
+    cursor = 0
+    expected = 1
+    for match in matches:
+        pieces.append(value[cursor:match.start("marker")])
+        replacement = f"({expected})" if match.group("paren") else f"{expected}."
+        pieces.append(replacement)
+        cursor = match.end("marker")
+        expected += 1
+    pieces.append(value[cursor:])
+    return "".join(pieces)
+
+
+def _repair_missing_requested_section_replies(
+    user_message: str | None,
+    reply: str,
+    results: list[ToolResult],
+) -> str:
+    labels = _requested_visible_section_labels(user_message)
+    if len(labels) < 2:
+        return reply
+    existing = _extract_visible_sections(reply, labels)
+    missing = [
+        label
+        for label in labels
+        if _normalized_section_label(label) not in existing
+        and _section_repair_content(label, results)
+    ]
+    if not missing:
+        return reply
+    prefix, suffix = _section_reply_outer_text(reply, labels)
+    repaired_sections: list[str] = []
+    for label in labels:
+        key = _normalized_section_label(label)
+        content = existing.get(key) or _section_repair_content(label, results)
+        if not content:
+            continue
+        repaired_sections.append(f"{label}: {content.strip()}")
+    if not repaired_sections:
+        return reply
+    parts = [part for part in (prefix.strip(), "\n\n".join(repaired_sections).strip(), suffix.strip()) if part]
+    return "\n\n".join(parts)
+
+
+def _normalize_requested_section_reply_format(
+    user_message: str | None,
+    reply: str,
+    results: list[ToolResult],
+) -> str:
+    labels = _requested_visible_section_labels(user_message)
+    if len(labels) < 2:
+        return reply
+    existing = _extract_visible_sections(reply, labels)
+    if len(existing) < 2:
+        return reply
+    prefix, suffix = _section_reply_outer_text(reply, labels)
+    normalized_sections: list[str] = []
+    for label in labels:
+        label_key = _normalized_section_label(label)
+        content = existing.get(label_key)
+        if not content:
+            continue
+        content = _section_display_content(label_key, content, results)
+        normalized_sections.append(f"{label}: {_clean_section_content_for_display(content)}")
+    if not normalized_sections:
+        return reply
+    parts = [part for part in (prefix.strip(), "\n\n".join(normalized_sections).strip(), suffix.strip()) if part]
+    return "\n\n".join(parts)
+
+
+def _section_display_content(label_key: str, content: str, results: list[ToolResult]) -> str:
+    if "artifact" in label_key or "file" in label_key:
+        artifact_summary = _artifact_results_section_summary(results)
+        if artifact_summary and _section_content_is_filename_heavy(content):
+            return artifact_summary
+    return content
+
+
+def _section_content_is_filename_heavy(content: str) -> bool:
+    text = str(content or "")
+    filename_matches = re.findall(r"[\w.-]+\.(?:pdf|xlsx|docx|pptx|png|jpe?g|csv|txt|html?)\b", text, flags=re.IGNORECASE)
+    return len(filename_matches) >= 2 or any(len(match) > 32 for match in filename_matches)
+
+
+def _artifact_results_section_summary(results: list[ToolResult]) -> str | None:
+    suffixes: list[str] = []
+    for result in results:
+        if str(getattr(result, "status", "") or "").strip().casefold() != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        values: list[object] = []
+        for key in ("artifact_path", "path", "output_path"):
+            value = output.get(key)
+            if value:
+                values.append(value)
+        artifact_paths = output.get("artifact_paths")
+        if isinstance(artifact_paths, (list, tuple)):
+            values.extend(artifact_paths)
+        for value in values:
+            suffix = Path(str(value or "")).suffix.lower().lstrip(".")
+            if suffix:
+                suffixes.append(suffix)
+    suffixes = list(dict.fromkeys(suffixes))
+    if not suffixes:
+        return None
+    labels = [_artifact_suffix_label(suffix) for suffix in suffixes]
+    return f"{_join_human_labels(labels)} attached."
+
+
+def _artifact_suffix_label(suffix: str) -> str:
+    return {
+        "pdf": "PDF",
+        "xlsx": "spreadsheet",
+        "xls": "spreadsheet",
+        "csv": "CSV",
+        "docx": "document",
+        "pptx": "presentation",
+        "png": "image",
+        "jpg": "image",
+        "jpeg": "image",
+        "html": "HTML file",
+        "htm": "HTML file",
+        "txt": "text file",
+    }.get(suffix.lower(), f".{suffix.lower()} file")
+
+
+def _join_human_labels(labels: list[str]) -> str:
+    unique = list(dict.fromkeys(label for label in labels if label))
+    if not unique:
+        return "File"
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) == 2:
+        return f"{unique[0]} and {unique[1]}"
+    return f"{', '.join(unique[:-1])}, and {unique[-1]}"
+
+
+def _clean_section_content_for_display(content: str) -> str:
+    value = str(content or "").strip()
+    value = re.sub(r"`([^`\n]{1,160})`", r"\1", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value
+
+
+def _requested_visible_section_labels(user_message: str | None) -> list[str]:
+    text = str(user_message or "")
+    if not re.search(r"\b(sections?|labels?|labeled|labelled)\b", text, flags=re.IGNORECASE):
+        return []
+    matches = list(
+        re.finditer(
+            r"\b(?:sections?|labels?)\b[^:]{0,120}:\s*(?P<labels>[^\n.]+)"
+            r"|\b(?:labeled|labelled)\b\s+(?P<labels_uncolon>[^\n.]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not matches:
+        return []
+    raw_labels = matches[-1].group("labels") or matches[-1].group("labels_uncolon") or ""
+    raw_labels = re.split(r"\b(?:keep it|do not|don't|and keep)\b", raw_labels, flags=re.IGNORECASE)[0]
+    labels: list[str] = []
+    for candidate in re.split(r",|;|\band\b", raw_labels):
+        label = candidate.strip().strip("`'\"* ")
+        label = re.sub(r"\s+", " ", label)
+        if not (2 <= len(label) <= 40):
+            continue
+        if not re.search(r"[A-Za-z]", label):
+            continue
+        if re.search(r"[/\\{}()[\]=]|https?://", label):
+            continue
+        labels.append(label)
+        if len(labels) >= 8:
+            break
+    return list(dict.fromkeys(labels))
+
+
+def _normalized_section_label(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(label or "").casefold()).strip()
+
+
+def _section_heading_pattern(labels: list[str]) -> re.Pattern[str] | None:
+    escaped = [re.escape(label.strip()) for label in labels if label.strip()]
+    if not escaped:
+        return None
+    return re.compile(rf"(?im)^(?P<label>{'|'.join(escaped)})(?:\s*:\s*|\s*$)")
+
+
+def _extract_visible_sections(reply: str, labels: list[str]) -> dict[str, str]:
+    pattern = _section_heading_pattern(labels)
+    if pattern is None:
+        return {}
+    text = str(reply or "")
+    matches = list(pattern.finditer(text))
+    sections: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        content = text[start:end].strip()
+        if content:
+            sections[_normalized_section_label(match.group("label"))] = content
+    return sections
+
+
+def _section_reply_outer_text(reply: str, labels: list[str]) -> tuple[str, str]:
+    pattern = _section_heading_pattern(labels)
+    if pattern is None:
+        return "", ""
+    text = str(reply or "")
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return text, ""
+    return text[: matches[0].start()], ""
+
+
+def _section_repair_content(label: str, results: list[ToolResult]) -> str | None:
+    normalized = _normalized_section_label(label)
+    if "tool" not in normalized:
+        return None
+    return _tool_results_section_summary(results)
+
+
+def _tool_results_section_summary(results: list[ToolResult]) -> str | None:
+    completed: list[str] = []
+    failed: list[str] = []
+    failed_seen: set[str] = set()
+    skipped = {"request_tool_scope"}
+    for result in results:
+        name = str(getattr(result, "tool_name", "") or "").strip()
+        if not name or name in skipped:
+            continue
+        status = str(getattr(result, "status", "") or "").strip().casefold()
+        if status == "completed":
+            completed.append(name)
+        elif status in {"failed", "denied", "timeout", "timed_out"}:
+            failed.append(name)
+            failed_seen.add(name)
+    completed = list(dict.fromkeys(completed))
+    completed_set = set(completed)
+    failed = [name for name in dict.fromkeys(failed) if name not in completed_set]
+    parts: list[str] = []
+    if completed:
+        parts.append(", ".join(f"{name} (retried)" if name in failed_seen else name for name in completed))
+    if failed:
+        parts.append("failed: " + ", ".join(failed))
+    return "; ".join(parts) if parts else None
 
 
 def _has_completed_tool_result(results: Iterable[ToolResult], tool_name: str) -> bool:
@@ -152,6 +470,37 @@ def _cron_list_reply_over_empty_reminder_drift(text: str, results: list[ToolResu
     return None
 
 
+def _empty_reminder_cancel_reply(results: list[ToolResult]) -> str | None:
+    delete_requested = False
+    reminders_empty = False
+    for result in results:
+        if result.status != "completed" or not isinstance(result.output, dict):
+            continue
+        if result.tool_name == "request_tool_scope":
+            required = result.output.get("required_tool_names")
+            available = result.output.get("available_tools")
+            if (
+                isinstance(required, list)
+                and "delete_reminder" in {str(name) for name in required}
+            ) or (
+                isinstance(available, list)
+                and "delete_reminder" in {str(name) for name in available}
+                and "set_reminder" not in {str(name) for name in available}
+            ):
+                delete_requested = True
+            continue
+        if result.tool_name == "delete_reminder":
+            return None
+        if result.tool_name == "list_reminders":
+            reminders = result.output.get("reminders")
+            count = result.output.get("count")
+            if reminders == [] or count == 0:
+                reminders_empty = True
+    if delete_requested and reminders_empty:
+        return "No pending reminders to cancel."
+    return None
+
+
 def _scheduler_read_reply_over_model_reformat(text: str, results: list[ToolResult]) -> str | None:
     if any(
         result.tool_name in _SCHEDULER_ACTION_TOOLS and result.status == "completed"
@@ -172,7 +521,32 @@ def _scheduler_read_reply_over_model_reformat(text: str, results: list[ToolResul
     message = cron_result.output.get("message")
     if not isinstance(message, str) or not message.strip():
         return None
+    crons = cron_result.output.get("crons")
+    if isinstance(crons, list) and crons and not _cron_reply_mentions_multiple_tool_crons(text, crons):
+        return None
     return _compact_cron_list_reply(cron_result)
+
+
+def _cron_reply_mentions_multiple_tool_crons(text: str, crons: list[object]) -> bool:
+    normalized_reply = _normalized_reply_text(text)
+    if not normalized_reply:
+        return False
+    mentioned = 0
+    for cron in crons:
+        if not isinstance(cron, dict):
+            continue
+        names = []
+        for key in ("name", "display_name"):
+            value = cron.get(key)
+            if isinstance(value, str) and value.strip():
+                names.append(value)
+        if not names:
+            continue
+        if any(_normalized_reply_text(name) in normalized_reply for name in names):
+            mentioned += 1
+        if mentioned >= min(2, len(crons)):
+            return True
+    return False
 
 
 def _compact_cron_list_reply(result: ToolResult) -> str | None:

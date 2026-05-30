@@ -20,25 +20,25 @@ from nullion.messaging_adapters import (
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
     MessagingIngress,
-    build_platform_delivery_receipt,
-    delivery_receipt_transport_succeeded,
+    WORKING_ACK_TEXT,
+    execute_platform_reply_delivery,
     handle_messaging_ingress_result,
-    platform_delivery_failure_reply,
-    prepare_reply_for_platform_delivery,
+    platform_plain_format_fallback_text,
     principal_id_for_messaging_identity,
-    record_platform_delivery_receipt,
     require_authorized_ingress,
     retry_messaging_delivery_operation,
     sanitize_external_inline_markup,
     save_messaging_attachment,
+    send_with_plain_text_fallback,
+    should_emit_separate_working_ack,
     split_reply_for_platform,
 )
 from nullion.messaging_runtime import build_messaging_runtime_service_from_settings
 from nullion.operator_commands import is_stop_command_text
 from nullion.platform_activity import (
     PlatformTaskCardStore,
+    deliver_platform_task_status_update,
     platform_activity_capabilities,
-    should_deliver_task_status,
 )
 from nullion.run_activity import activity_trace_enabled
 from nullion.session_stop import stop_session_async, stop_session_reply
@@ -47,7 +47,6 @@ from nullion.users import resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
-_WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
 
 
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
@@ -63,28 +62,6 @@ def _float_env_ms(name: str, *, default: float) -> float:
         return float(str(raw).strip())
     except ValueError:
         return default
-
-
-def _record_discord_delivery_receipt(
-    *,
-    channel_id: str | None,
-    delivery,
-    transport_ok: bool,
-    request_id: str | None = None,
-    message_id: str | None = None,
-    error: str | None = None,
-) -> None:
-    record_platform_delivery_receipt(
-        build_platform_delivery_receipt(
-            channel="discord",
-            target_id=channel_id,
-            delivery=delivery,
-            transport_ok=transport_ok,
-            request_id=request_id,
-            message_id=message_id,
-            error=error,
-        )
-    )
 
 
 def _optional_message_text(value: object) -> str | None:
@@ -171,22 +148,17 @@ def _discord_file_for_path(path: Path):
 
 
 def _discord_plain_format_fallback_text(plain_text: str) -> str:
-    plain_text = sanitize_external_inline_markup(plain_text)
-    return (
-        "Discord could not send the formatted reply, so here is the same text as plain output:\n\n"
-        "```text\n"
-        f"{plain_text}"
-        "\n```"
-    )
+    return platform_plain_format_fallback_text("Discord", plain_text)
 
 
 async def _send_discord_text_with_plain_fallback(channel, text: str) -> None:
     text = sanitize_external_inline_markup(text or "")
-    try:
-        await channel.send(text)
-    except Exception:
-        logger.warning("Discord message delivery failed; retrying as plain text.", exc_info=True)
-        await channel.send(_discord_plain_format_fallback_text(text))
+    await send_with_plain_text_fallback(
+        platform="Discord",
+        formatted_text=text,
+        plain_text=text,
+        send_formatted=channel.send,
+    )
 
 
 async def _edit_discord_message(message, text: str) -> bool:
@@ -263,42 +235,34 @@ async def _deliver_discord_task_status(
     planner_feed_enabled: bool,
     include_activity: bool,
 ) -> bool:
-    target = str(channel_id or "").strip()
-    group = str(group_id or "").strip()
-    if (
-        channel is None
-        or not target
-        or not group
-        or not should_deliver_task_status(
-            status_kind=status_kind,
-            planner_feed_enabled=planner_feed_enabled,
-            include_activity=include_activity,
-        )
-    ):
+    if channel is None:
         return False
-    rendered_status = task_card_store.update(
-        target_id=target,
-        group_id=group,
-        status_kind=status_kind,
-        text=text,
-        activity_id=activity_id,
-        activity_label=activity_label,
-        include_activity=include_activity,
-    )
-    if not rendered_status:
-        return True
-    key = (target, group)
-    lock = status_locks.setdefault(key, asyncio.Lock())
-    async with lock:
-        existing = status_messages.get(key)
-        if existing is not None and await _edit_discord_message(existing, rendered_status):
-            return True
+
+    async def _send_new(_target_id: str, rendered_text: str) -> object | None:
         try:
-            status_messages[key] = await channel.send(sanitize_external_inline_markup(rendered_status))
-            return True
+            return await channel.send(sanitize_external_inline_markup(rendered_text))
         except Exception:
             logger.debug("Discord task card delivery failed", exc_info=True)
-            return False
+            return None
+
+    async def _edit_existing(existing: object, _target_id: str, rendered_text: str) -> bool:
+        return await _edit_discord_message(existing, rendered_text)
+
+    return await deliver_platform_task_status_update(
+        target_id=channel_id,
+        group_id=group_id,
+        text=text,
+        status_kind=status_kind,
+        activity_id=activity_id,
+        activity_label=activity_label,
+        task_card_store=task_card_store,
+        status_messages=status_messages,
+        status_locks=status_locks,
+        planner_feed_enabled=planner_feed_enabled,
+        include_activity=include_activity,
+        send_new=_send_new,
+        edit_existing=_edit_existing,
+    )
 
 
 async def _send_discord_chunks_with_plain_fallback(channel, text: str | None, *, limit: int = 1900) -> None:
@@ -348,17 +312,38 @@ async def send_discord_platform_delivery(
     """Send a platform delivery to Discord over REST, uploading MEDIA artifacts."""
     if not bot_token or not channel_id:
         return False
-    delivery = None
     try:
         import httpx
 
-        delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
         url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
         headers = {"Authorization": f"Bot {bot_token}"}
         async with httpx.AsyncClient(timeout=60.0) as client:
-            if delivery.attachments:
-                for index, attachment_path in enumerate(delivery.attachments):
-                    content = delivery.text if index == 0 else None
+            async def _send_text(reply_text: str) -> bool:
+                async def _send_formatted(text: str):
+                    response = await client.post(url, headers=headers, json={"content": text or ""})
+                    response.raise_for_status()
+
+                async def _send_plain(text: str):
+                    response = await client.post(
+                        url,
+                        headers=headers,
+                        json={"content": text},
+                    )
+                    response.raise_for_status()
+
+                await send_with_plain_text_fallback(
+                    platform="Discord",
+                    formatted_text=reply_text or "",
+                    plain_text=reply_text or "",
+                    send_formatted=_send_formatted,
+                    send_plain=_send_plain,
+                )
+                return True
+
+            async def _send_attachments(initial_text: str | None, paths: tuple[Path, ...]) -> bool:
+                for index, attachment_path in enumerate(paths):
+                    content = initial_text if index == 0 else None
+
                     async def operation(attachment_path=attachment_path, content=content):
                         with attachment_path.open("rb") as file_obj:
                             response = await client.post(
@@ -370,42 +355,19 @@ async def send_discord_platform_delivery(
                         response.raise_for_status()
 
                     await retry_messaging_delivery_operation(operation)
-                receipt = build_platform_delivery_receipt(
-                    channel="discord",
-                    target_id=channel_id,
-                    delivery=delivery,
-                    transport_ok=True,
-                )
-                record_platform_delivery_receipt(receipt)
-                return delivery_receipt_transport_succeeded(receipt)
-            try:
-                response = await client.post(url, headers=headers, json={"content": delivery.text or ""})
-                response.raise_for_status()
-            except Exception:
-                logger.warning("Discord platform text delivery failed; retrying as plain text.", exc_info=True)
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json={"content": _discord_plain_format_fallback_text(delivery.text or "")},
-                )
-                response.raise_for_status()
-            receipt = build_platform_delivery_receipt(
+                return True
+
+            result = await execute_platform_reply_delivery(
+                text,
                 channel="discord",
                 target_id=channel_id,
-                delivery=delivery,
-                transport_ok=True,
+                principal_id=principal_id,
+                send_text=_send_text,
+                send_attachments=_send_attachments,
             )
-            record_platform_delivery_receipt(receipt)
-            return delivery_receipt_transport_succeeded(receipt)
+            return result.ok
     except Exception:
         logger.warning("Discord platform delivery failed", exc_info=True)
-        if delivery is not None:
-            _record_discord_delivery_receipt(
-                channel_id=channel_id,
-                delivery=delivery,
-                transport_ok=False,
-                error="platform_delivery_failed",
-            )
         return False
 
 
@@ -577,18 +539,16 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
 
     def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
         nonlocal tool_working_ack_sent
-        event_id = str(event.get("id") or "")
-        event_tool_name = str(event.get("tool_name") or "")
         if (
             tool_working_ack_sent
             or message.channel is None
-            or not (event_id.startswith("tool-") or event_id == "mini-agents" or event_tool_name)
+            or not should_emit_separate_working_ack(event)
         ):
             return
         tool_working_ack_sent = True
         try:
             asyncio.run_coroutine_threadsafe(
-                _send_discord_text_with_plain_fallback(message.channel, _WORKING_ACK_TEXT),
+                _send_discord_text_with_plain_fallback(message.channel, WORKING_ACK_TEXT),
                 loop,
             )
         except Exception:
@@ -613,56 +573,30 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
             _log_turn_timing(turn_outcome)
             return
         principal_id = principal_id_for_messaging_identity("discord", user_id, settings)
-        delivery = prepare_reply_for_platform_delivery(
+        reply_already_sent = bool(getattr(turn_result, "reply_already_sent", False))
+
+        async def _send_text(reply_text: str) -> bool:
+            await _send_discord_chunks_with_plain_fallback(message.channel, reply_text, limit=1900)
+            return True
+
+        result = await execute_platform_reply_delivery(
             reply,
+            channel="discord",
+            target_id=_optional_message_text(getattr(message.channel, "id", None)),
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
+            request_id=ingress.request_id,
+            message_id=ingress.message_id,
+            reply_already_sent=reply_already_sent,
+            send_text=_send_text,
+            send_attachments=lambda initial_text, paths: _send_discord_reply_files(
+                message.channel,
+                text=initial_text,
+                paths=paths,
+            ),
         )
-        if getattr(turn_result, "reply_already_sent", False) and not delivery.attachments:
+        if reply_already_sent and not result.delivery.attachments:
             await text_streamer.finish(reply)
-            _record_discord_delivery_receipt(
-                channel_id=_optional_message_text(getattr(message.channel, "id", None)),
-                delivery=delivery,
-                transport_ok=True,
-                request_id=ingress.request_id,
-                message_id=ingress.message_id,
-            )
-            _mark_timing("delivery_complete")
-            _log_turn_timing(turn_outcome)
-            return
-        reply_text = delivery.text
-        delivery_receipt_recorded = False
-        if delivery.attachments:
-            if await _send_discord_reply_files(message.channel, text=reply_text, paths=delivery.attachments):
-                _record_discord_delivery_receipt(
-                    channel_id=_optional_message_text(getattr(message.channel, "id", None)),
-                    delivery=delivery,
-                    transport_ok=True,
-                    request_id=ingress.request_id,
-                    message_id=ingress.message_id,
-                )
-                _mark_timing("delivery_complete")
-                _log_turn_timing(turn_outcome)
-                return
-            _record_discord_delivery_receipt(
-                channel_id=_optional_message_text(getattr(message.channel, "id", None)),
-                delivery=delivery,
-                transport_ok=False,
-                request_id=ingress.request_id,
-                message_id=ingress.message_id,
-                error="attachment_upload_failed",
-            )
-            delivery_receipt_recorded = True
-            reply_text = platform_delivery_failure_reply(delivery)
-        await _send_discord_chunks_with_plain_fallback(message.channel, reply_text, limit=1900)
-        if not delivery_receipt_recorded:
-            _record_discord_delivery_receipt(
-                channel_id=_optional_message_text(getattr(message.channel, "id", None)),
-                delivery=delivery,
-                transport_ok=True,
-                request_id=ingress.request_id,
-                message_id=ingress.message_id,
-            )
         _mark_timing("delivery_complete")
         _log_turn_timing(turn_outcome)
     finally:
