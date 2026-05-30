@@ -37,6 +37,7 @@ class NullionUser:
     messaging_user_id: str | None = None
     active: bool = True
     notes: str = ""
+    blocked_tools: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class NullionUser:
             "messaging_user_id": self.messaging_user_id or self.telegram_chat_id,
             "active": self.active,
             "notes": self.notes,
+            "blocked_tools": list(self.blocked_tools),
         }
 
 
@@ -89,6 +91,31 @@ def _normalize_chat_id(chat_id: str | int | None) -> str | None:
 def _normalize_channel(value: object) -> str:
     channel = re.sub(r"[^a-z0-9_]+", "_", str(value or "telegram").strip().lower()).strip("_")
     return channel or "telegram"
+
+
+def _normalize_blocked_tools(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = ()
+    tools: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        tool = str(item or "").strip()
+        if not tool:
+            continue
+        normalized = tool.removeprefix("tool:").removeprefix("tool.")
+        normalized = re.sub(r"[^a-zA-Z0-9_*.-]+", "_", normalized).strip("_")
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tools.append(normalized)
+    return tuple(tools)
 
 
 def _admin_user(settings: NullionSettings | None = None) -> NullionUser:
@@ -134,6 +161,7 @@ def _coerce_user(raw: object) -> NullionUser | None:
         messaging_user_id=messaging_user_id,
         active=bool(raw.get("active", True)),
         notes=str(raw.get("notes") or "").strip(),
+        blocked_tools=_normalize_blocked_tools(raw.get("blocked_tools")),
     )
 
 
@@ -288,6 +316,34 @@ def resolve_messaging_user(
         ):
             return user
     return _admin_user(settings)
+
+
+def tool_blocked_for_principal(
+    principal_id: str | None,
+    tool_name: str | None,
+    *,
+    settings: NullionSettings | None = None,
+) -> bool:
+    """Return whether the user registry explicitly blocks a tool for a member.
+
+    Global operator approvals remain global. This is a higher-priority member
+    deny list so an admin can disable a tool for a specific user without
+    revoking the global grant for everyone else.
+    """
+    principal = str(principal_id or "").strip()
+    if not principal.startswith("user:"):
+        return False
+    user_id = principal.removeprefix("user:").strip()
+    tool = str(tool_name or "").strip()
+    if not user_id or not tool:
+        return False
+    registry = load_user_registry(settings=settings)
+    for user in registry.users:
+        if user.user_id != user_id or user.role != "member":
+            continue
+        blocked = {str(item).strip().lower() for item in user.blocked_tools if str(item).strip()}
+        return "*" in blocked or tool.lower() in blocked
+    return False
 
 
 def workspace_users(
@@ -477,6 +533,7 @@ __all__ = [
     "resolve_messaging_user",
     "resolve_telegram_user",
     "save_user_registry",
+    "tool_blocked_for_principal",
     "workspace_id_for_user",
     "workspace_users",
 ]

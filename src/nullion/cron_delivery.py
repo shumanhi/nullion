@@ -71,6 +71,11 @@ _HTML_SELF_CONTAINED_REMOTE_SRC_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _CRON_INTERNAL_PREVIEW_SCHEMA_RE = re.compile(r'"(?:original_chars|preview)"\s*:', re.IGNORECASE)
+_CRON_INTERNAL_SKILL_PACK_PROMPT_RE = re.compile(r"(?m)^\s*Skill pack:\s+[\w.-]+/[\w.-]+\s*$")
+_CRON_INTERNAL_SKILL_PACK_CONTEXT_RE = re.compile(
+    r"(?:Enabled skill packs are reference instructions|Use skill_pack_read for detailed installed-pack docs|Loaded instructions:)",
+    re.IGNORECASE,
+)
 _CRON_INTERNAL_UUID_TOKEN_RE = re.compile(
     r"\$[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
@@ -1393,6 +1398,10 @@ def _cron_delivery_text_is_malformed_or_internal(text: str | None) -> bool:
     if not stripped:
         return False
     if _CRON_INTERNAL_PREVIEW_SCHEMA_RE.search(stripped):
+        return True
+    if _CRON_INTERNAL_SKILL_PACK_PROMPT_RE.search(stripped):
+        return True
+    if _CRON_INTERNAL_SKILL_PACK_CONTEXT_RE.search(stripped):
         return True
     replacement_count = stripped.count("\ufffd")
     if replacement_count >= 2:

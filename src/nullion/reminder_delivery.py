@@ -5,7 +5,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from functools import lru_cache
+import json
 import logging
+from pathlib import Path
+import sqlite3
+import threading
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -18,6 +22,7 @@ from nullion.users import MessagingDeliveryTarget, messaging_delivery_targets_fo
 
 logger = logging.getLogger(__name__)
 ReminderSend = Callable[[str, str], Awaitable[bool]]
+_REMINDER_DELIVERY_CLAIM_LOCK = threading.Lock()
 
 
 def _settings_for_reminder_delivery(settings: NullionSettings | None) -> NullionSettings | None:
@@ -198,6 +203,7 @@ class _DueReminderDeliveryState(TypedDict, total=False):
     task: Any | None
     reminder: Any | None
     sent: bool
+    claimed: bool
 
 
 def _normalize_due_time(value: datetime | None) -> datetime:
@@ -207,9 +213,136 @@ def _normalize_due_time(value: datetime | None) -> datetime:
     return due_time.astimezone(UTC)
 
 
+def _claim_due_reminder(runtime: Any, task: Any, due_time: datetime):
+    persistent_claim = _claim_due_reminder_persistently(runtime, task, due_time)
+    if persistent_claim is not None:
+        return persistent_claim
+    with _REMINDER_DELIVERY_CLAIM_LOCK:
+        reminder = runtime.store.get_reminder(task.task_id)
+        current_task = (
+            runtime.store.get_scheduled_task(task.task_id)
+            if hasattr(runtime.store, "get_scheduled_task")
+            else task
+        )
+        if reminder is None or reminder.delivered_at is not None:
+            return None, None
+        claimed_task = disable_task(mark_task_ran(current_task or task, due_time))
+        runtime.store.add_reminder(replace(reminder, delivered_at=due_time))
+        runtime.store.add_scheduled_task(claimed_task)
+        runtime.checkpoint()
+        return reminder, current_task or task
+
+
+def _claim_due_reminder_persistently(runtime: Any, task: Any, due_time: datetime):
+    checkpoint_path = Path(getattr(runtime, "checkpoint_path", "") or "")
+    if checkpoint_path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"} or not checkpoint_path.exists():
+        return None
+    task_id = str(getattr(task, "task_id", "") or "")
+    if not task_id:
+        return None
+    try:
+        with sqlite3.connect(str(checkpoint_path), timeout=10, isolation_level=None) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            reminder_row = conn.execute(
+                "SELECT payload FROM reminders_crons WHERE collection = ? AND item_key = ?",
+                ("reminders", task_id),
+            ).fetchone()
+            if reminder_row is None:
+                conn.execute("ROLLBACK")
+                return (None, None)
+            reminder_payload = json.loads(str(reminder_row[0]))
+            if reminder_payload.get("delivered_at"):
+                _sync_claimed_reminder_from_payload(runtime, task, reminder_payload)
+                conn.execute("ROLLBACK")
+                return (None, None)
+            task_row = conn.execute(
+                "SELECT payload FROM reminders_crons WHERE collection = ? AND item_key = ?",
+                ("scheduled_tasks", task_id),
+            ).fetchone()
+            task_payload = json.loads(str(task_row[0])) if task_row is not None else {}
+            now = datetime.now(UTC).isoformat()
+            claimed_reminder_payload = {**reminder_payload, "delivered_at": due_time.isoformat()}
+            claimed_task_payload = {
+                **task_payload,
+                "task_id": task_id,
+                "enabled": False,
+                "last_run_at": due_time.isoformat(),
+            }
+            conn.execute(
+                """UPDATE reminders_crons
+                   SET payload = ?, updated_at = ?
+                   WHERE collection = ? AND item_key = ? AND json_extract(payload, '$.delivered_at') IS NULL""",
+                (json.dumps(claimed_reminder_payload, sort_keys=True), now, "reminders", task_id),
+            )
+            if conn.total_changes < 1:
+                conn.execute("ROLLBACK")
+                return (None, None)
+            if task_row is not None:
+                conn.execute(
+                    """UPDATE reminders_crons
+                       SET payload = ?, updated_at = ?
+                       WHERE collection = ? AND item_key = ?""",
+                    (json.dumps(claimed_task_payload, sort_keys=True), now, "scheduled_tasks", task_id),
+                )
+            conn.execute("COMMIT")
+    except Exception:
+        logger.debug("Persistent reminder claim failed; skipping this delivery attempt", exc_info=True)
+        return (None, None)
+    reminder = runtime.store.get_reminder(task_id)
+    current_task = (
+        runtime.store.get_scheduled_task(task_id)
+        if hasattr(runtime.store, "get_scheduled_task")
+        else task
+    )
+    if reminder is None:
+        return (None, None)
+    claimed_task = disable_task(mark_task_ran(current_task or task, due_time))
+    runtime.store.add_reminder(replace(reminder, delivered_at=due_time))
+    runtime.store.add_scheduled_task(claimed_task)
+    return reminder, current_task or task
+
+
+def _sync_claimed_reminder_from_payload(runtime: Any, task: Any, reminder_payload: dict[str, object]) -> None:
+    task_id = str(reminder_payload.get("task_id") or getattr(task, "task_id", "") or "")
+    if not task_id:
+        return
+    reminder = runtime.store.get_reminder(task_id)
+    delivered_at_raw = reminder_payload.get("delivered_at")
+    if reminder is not None and delivered_at_raw:
+        try:
+            delivered_at = datetime.fromisoformat(str(delivered_at_raw).replace("Z", "+00:00"))
+            if delivered_at.tzinfo is None:
+                delivered_at = delivered_at.replace(tzinfo=UTC)
+            runtime.store.add_reminder(replace(reminder, delivered_at=delivered_at.astimezone(UTC)))
+        except ValueError:
+            pass
+    current_task = (
+        runtime.store.get_scheduled_task(task_id)
+        if hasattr(runtime.store, "get_scheduled_task")
+        else task
+    )
+    if current_task is not None:
+        runtime.store.add_scheduled_task(disable_task(current_task))
+
+
+def _rollback_due_reminder_claim(runtime: Any, task: Any, reminder: Any) -> None:
+    with _REMINDER_DELIVERY_CLAIM_LOCK:
+        current = runtime.store.get_reminder(reminder.task_id)
+        if current is not None and current.delivered_at is None:
+            return
+        runtime.store.add_reminder(replace(reminder, delivered_at=None))
+        runtime.store.add_scheduled_task(task)
+        runtime.checkpoint()
+
+
 async def _due_reminder_load_tasks_node(state: _DueReminderDeliveryState) -> dict[str, object]:
     due_time = _normalize_due_time(state.get("now"))
-    due_tasks = await asyncio.to_thread(state["runtime"].run_due_scheduled_tasks, now=due_time)
+    if hasattr(state["runtime"].store, "list_scheduled_tasks"):
+        from nullion.runtime import run_due_scheduled_tasks
+
+        due_tasks = await asyncio.to_thread(run_due_scheduled_tasks, state["runtime"].store, due_time)
+    else:
+        due_tasks = await asyncio.to_thread(state["runtime"].run_due_scheduled_tasks, now=due_time)
     return {"due_time": due_time, "due_tasks": list(due_tasks or ()), "task_index": 0, "delivered": 0}
 
 
@@ -217,12 +350,15 @@ def _due_reminder_select_task_node(state: _DueReminderDeliveryState) -> dict[str
     due_tasks = list(state.get("due_tasks") or [])
     task_index = int(state.get("task_index") or 0)
     if task_index >= len(due_tasks):
-        return {"task": None, "reminder": None, "sent": False}
+        return {"task": None, "reminder": None, "sent": False, "claimed": False}
     task = due_tasks[task_index]
-    reminder = state["runtime"].store.get_reminder(task.task_id)
-    if reminder is None or reminder.delivered_at is not None:
-        return {"task": task, "reminder": None, "sent": False}
-    return {"task": task, "reminder": reminder, "sent": False}
+    due_time = state.get("due_time")
+    if due_time is None:
+        return {"task": task, "reminder": None, "sent": False, "claimed": False}
+    reminder, original_task = _claim_due_reminder(state["runtime"], task, due_time)
+    if reminder is None or original_task is None:
+        return {"task": task, "reminder": None, "sent": False, "claimed": False}
+    return {"task": original_task, "reminder": reminder, "sent": False, "claimed": True}
 
 
 def _due_reminder_route_selected(state: _DueReminderDeliveryState) -> str:
@@ -248,21 +384,21 @@ async def _due_reminder_deliver_node(state: _DueReminderDeliveryState) -> dict[s
 
 def _due_reminder_mark_delivered_node(state: _DueReminderDeliveryState) -> dict[str, object]:
     if not state.get("sent"):
+        task = state.get("task")
+        reminder = state.get("reminder")
+        if state.get("claimed") and task is not None and reminder is not None:
+            _rollback_due_reminder_claim(state["runtime"], task, reminder)
         return {}
     task = state.get("task")
     reminder = state.get("reminder")
     due_time = state.get("due_time")
     if task is None or reminder is None or due_time is None:
         return {}
-    runtime = state["runtime"]
-    runtime.store.add_reminder(replace(reminder, delivered_at=due_time))
-    runtime.store.add_scheduled_task(disable_task(mark_task_ran(task, due_time)))
-    runtime.checkpoint()
     return {"delivered": int(state.get("delivered") or 0) + 1}
 
 
 def _due_reminder_advance_node(state: _DueReminderDeliveryState) -> dict[str, object]:
-    return {"task_index": int(state.get("task_index") or 0) + 1, "task": None, "reminder": None, "sent": False}
+    return {"task_index": int(state.get("task_index") or 0) + 1, "task": None, "reminder": None, "sent": False, "claimed": False}
 
 
 @lru_cache(maxsize=1)

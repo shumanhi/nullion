@@ -38,7 +38,7 @@ import urllib.request
 from uuid import uuid4
 from urllib.parse import quote, urlencode, urlparse, urlunparse
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterable, TypedDict
+from typing import Any, AsyncIterator, Callable, Iterable, Mapping, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -78,7 +78,11 @@ from nullion.chat_attachments import (
 from nullion.conversation_history_tools import CHAT_HISTORY_SEARCH_TOOL_NAME, with_conversation_history_tool
 from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
 from nullion.approval_context import approval_trigger_flow_label
-from nullion.approval_display import approval_display_from_request, approval_display_from_tool_result
+from nullion.approval_display import (
+    approval_display_from_request,
+    approval_display_from_tool_result,
+    approval_turn_display_from_result,
+)
 from nullion.config import (
     load_settings,
     normalize_reasoning_effort,
@@ -122,17 +126,20 @@ from nullion.memory import (
 )
 from nullion.mini_agent_routing import should_keep_dag_plan_in_direct_turn, should_route_without_mini_agents
 from nullion.messaging_adapters import (
+    WORKING_ACK_TEXT,
     delivery_contract_for_turn,
     list_platform_delivery_receipts,
     messaging_file_allowed_roots,
     messaging_upload_root,
     prepare_reply_for_platform_delivery,
+    should_emit_separate_working_ack,
 )
 from nullion.messaging_delivery_contract import (
     apply_deferred_cron_dispatch_to_payload,
     deferred_cron_dispatch_from_tool_results,
 )
 from nullion.operator_commands import (
+    is_new_command_text,
     is_operator_command_text,
     is_stop_command_text,
     operator_command_suggestions,
@@ -155,6 +162,7 @@ from nullion.response_fulfillment_contract import (
 from nullion.runtime_persistence import load_runtime_store
 from nullion.session_stop import (
     SessionStopResult,
+    reset_conversation_session,
     stop_session_async,
     stop_session_reply,
 )
@@ -13722,6 +13730,8 @@ function renderUsersTab() {
     const role = String(user.role || 'member');
     const channel = String(user.messaging_channel || (user.telegram_chat_id ? 'telegram' : 'messaging'));
     const identity = user.messaging_user_id || user.telegram_chat_id || '';
+    const blockedTools = Array.isArray(user.blocked_tools) ? user.blocked_tools : [];
+    const terminalBlocked = blockedTools.map(tool => String(tool).toLowerCase()).includes('terminal_exec');
     const chat = identity ? `${escHtml(channel)}: ${escHtml(identity)}` : 'No messaging identity';
     const workspace = user.workspace_id ? `Workspace: ${escHtml(user.workspace_id)}` : '';
     const isMember = role === 'member';
@@ -13761,7 +13771,7 @@ function renderUsersTab() {
     const active = user.active !== false;
     const activeControl = role === 'admin'
       ? '<div class="form-hint" style="margin:0">Always active</div>'
-      : `<label class="toggle-switch"><input type="checkbox" ${active ? 'checked' : ''} onchange="setUserActive(${index}, this.checked)"><span class="toggle-slider"></span></label>`;
+      : `<label class="toggle-switch"><input type="checkbox" aria-label="Active member ${escAttr(user.display_name || 'member')}" ${active ? 'checked' : ''} onchange="setUserActive(${index}, this.checked)"><span class="toggle-slider"></span></label>`;
     const removeButton = isMember
       ? `<button class="member-remove-btn" type="button" onclick="removeUserMember(${index})">Remove</button>`
       : '';
@@ -13773,6 +13783,13 @@ function renderUsersTab() {
       <div class="user-meta">${chat}${workspace ? ` · ${workspace}` : ''}</div>
       ${memberEditor}
       ${notesEditor}
+      ${isMember ? `<div class="pref-row compact">
+        <div>
+          <div class="pref-row-title">Block terminal execution</div>
+          <div class="pref-row-desc">Prevents this member from using shell/script execution even when the admin has globally approved it.</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" aria-label="Block terminal execution for ${escAttr(user.display_name || 'member')}" ${terminalBlocked ? 'checked' : ''} onchange="setUserTerminalBlocked(${index}, this.checked)"><span class="toggle-slider"></span></label>
+      </div>` : ''}
       <div class="user-actions">
         <div class="form-hint" style="margin:0">${active ? 'Active' : 'Inactive'}</div>
         <div class="user-action-buttons">${removeButton}${activeControl}</div>
@@ -14305,6 +14322,24 @@ function setUserNotes(index, notes) {
   markSettingsDirty();
 }
 
+function normalizeBlockedToolsInput(value) {
+  return String(value || '')
+    .split(',')
+    .map(item => item.trim().replace(/^tool[:.]/, '').replace(/[^a-zA-Z0-9_*.-]+/g, '_').replace(/^_+|_+$/g, ''))
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.findIndex(other => other.toLowerCase() === item.toLowerCase()) === index);
+}
+
+function setUserTerminalBlocked(index, blocked) {
+  const user = usersRegistry.users && usersRegistry.users[index];
+  if (!user || user.role === 'admin') return;
+  const tools = normalizeBlockedToolsInput((user.blocked_tools || []).join(', '));
+  const withoutTerminal = tools.filter(tool => tool.toLowerCase() !== 'terminal_exec');
+  user.blocked_tools = blocked ? [...withoutTerminal, 'terminal_exec'] : withoutTerminal;
+  markSettingsDirty();
+  renderUsersTab();
+}
+
 async function removeUserMember(index) {
   const user = usersRegistry.users && usersRegistry.users[index];
   if (!user || user.role === 'admin') return;
@@ -14356,6 +14391,7 @@ function addUserMember() {
     messaging_user_id: identity,
     active: true,
     notes: notesEl.value.trim(),
+    blocked_tools: [],
   });
   usersRegistry.multi_user_enabled = true;
   markSettingsDirty();
@@ -14830,6 +14866,7 @@ async function saveUsers() {
       .replace(/^_+|_+$/g, '') || 'telegram';
     user.messaging_user_id = String(user.messaging_user_id || user.telegram_chat_id || '').trim();
     user.telegram_chat_id = user.messaging_channel === 'telegram' ? user.messaging_user_id : null;
+    user.blocked_tools = normalizeBlockedToolsInput(Array.isArray(user.blocked_tools) ? user.blocked_tools.join(',') : user.blocked_tools);
     if (!user.messaging_user_id) throw new Error(`${user.display_name} needs a messaging identity.`);
   });
   let r;
@@ -24118,15 +24155,7 @@ def create_app(runtime, orchestrator, registry):
                     ),
                 )
                 if result.get("suspended_for_approval"):
-                    return JSONResponse({
-                        "type": "approval_required",
-                        "approval_id": result.get("approval_id", ""),
-                        "tool_name": result.get("tool_name", "tool"),
-                        "tool_detail": result.get("tool_detail", ""),
-                        "trigger_flow_label": result.get("trigger_flow_label") or "",
-                        "is_web_request": bool(result.get("is_web_request")),
-                        "web_session_allow_label": _web_session_allow_duration_label(),
-                    })
+                    return JSONResponse(_web_approval_required_payload(result, default_tool_name="tool"))
                 return JSONResponse({
                     "type": "message",
                     "text": _web_http_visible_text(result),
@@ -24167,15 +24196,7 @@ def create_app(runtime, orchestrator, registry):
                 ),
             )
             if result.get("suspended_for_approval"):
-                return JSONResponse({
-                    "type": "approval_required",
-                    "approval_id": result.get("approval_id", ""),
-                    "tool_name": result.get("tool_name", "tool"),
-                    "tool_detail": result.get("tool_detail", ""),
-                    "trigger_flow_label": result.get("trigger_flow_label") or "",
-                    "is_web_request": bool(result.get("is_web_request")),
-                    "web_session_allow_label": _web_session_allow_duration_label(),
-                })
+                return JSONResponse(_web_approval_required_payload(result, default_tool_name="tool"))
             return JSONResponse({
                 "type": "message",
                 "text": _web_http_visible_text(result),
@@ -24319,13 +24340,16 @@ def create_app(runtime, orchestrator, registry):
             def emit_activity_event(event: dict[str, str]) -> None:
                 nonlocal web_working_notice_sent
                 event_id = str(event.get("id") or "")
-                if not web_working_notice_sent and (event_id.startswith("tool-") or event_id == "mini-agents"):
+                if not web_working_notice_sent and should_emit_separate_working_ack(
+                    event,
+                    visible_activity_stream=activity_trace_enabled,
+                ):
                     web_working_notice_sent = True
                     try:
                         asyncio.run_coroutine_threadsafe(
                             send_websocket_event(turn_payload({
                                 "type": "notice",
-                                "text": "⌛ On it! Feel free to send other tasks — I can handle multiple at once.",
+                                "text": WORKING_ACK_TEXT,
                             })),
                             loop,
                         ).result(timeout=2)
@@ -24449,15 +24473,7 @@ def create_app(runtime, orchestrator, registry):
                 if result.get("suspended_for_approval"):
                     await send_thinking_event(result.get("thinking"))
                     await send_activity_event({"id": "approval", "label": "Waiting for approval", "status": "running"})
-                    await send_websocket_event(turn_payload({
-                        "type": "approval_required",
-                        "approval_id": result.get("approval_id", ""),
-                        "tool_name": result.get("tool_name", "perform an action"),
-                        "tool_detail": result.get("tool_detail", ""),
-                        "trigger_flow_label": result.get("trigger_flow_label") or "",
-                        "is_web_request": bool(result.get("is_web_request")),
-                        "web_session_allow_label": _web_session_allow_duration_label(),
-                    }))
+                    await send_websocket_event(turn_payload(_web_approval_required_payload(result)))
                 else:
                     reply = result.get("text", "(no reply)")
                     task_group_id = str(result.get("task_group_id") or "")
@@ -24577,15 +24593,7 @@ def create_app(runtime, orchestrator, registry):
             if result.get("suspended_for_approval"):
                 await send_thinking_event(result.get("thinking"))
                 await send_activity_event({"id": "approval", "label": "Waiting for approval", "status": "running"})
-                await send_websocket_event(turn_payload({
-                    "type": "approval_required",
-                    "approval_id": result.get("approval_id", ""),
-                    "tool_name": result.get("tool_name", "perform an action"),
-                    "tool_detail": result.get("tool_detail", ""),
-                    "trigger_flow_label": result.get("trigger_flow_label") or "",
-                    "is_web_request": bool(result.get("is_web_request")),
-                    "web_session_allow_label": _web_session_allow_duration_label(),
-                }))
+                await send_websocket_event(turn_payload(_web_approval_required_payload(result)))
             else:
                 reply = result.get("text", "(no reply)")
                 task_group_id = str(result.get("task_group_id") or "")
@@ -24764,6 +24772,18 @@ def _text_from_message_content(content: Any) -> str:
     return ""
 
 
+def _web_approval_required_payload(result: Mapping[str, Any], *, default_tool_name: str = "perform an action") -> dict[str, object]:
+    return {
+        "type": "approval_required",
+        "approval_id": result.get("approval_id", ""),
+        "tool_name": result.get("tool_name") or default_tool_name,
+        "tool_detail": result.get("tool_detail", ""),
+        "trigger_flow_label": result.get("trigger_flow_label") or "",
+        "is_web_request": bool(result.get("is_web_request")),
+        "web_session_allow_label": _web_session_allow_duration_label(),
+    }
+
+
 def _last_user_text_from_snapshot(messages: list[dict[str, Any]] | None) -> str | None:
     if not messages:
         return None
@@ -24804,18 +24824,12 @@ def _approval_display_from_request(req: Any) -> tuple[str, str, bool]:
 
 
 def _approval_display_from_turn_result(runtime: Any, result: Any) -> tuple[str, str, str | None, bool]:
-    approval_id = getattr(result, "approval_id", None)
-    store = getattr(runtime, "store", None)
-    req = store.get_approval_request(approval_id) if store is not None and approval_id else None
-    if req is not None:
-        label, detail, is_web_request = _approval_display_from_request(req)
-        return label, detail, _approval_trigger_flow_label_from_request(req), is_web_request
-    tool_results = list(getattr(result, "tool_results", []) or [])
-    if tool_results:
-        display = approval_display_from_tool_result(tool_results[-1], approval_id=approval_id)
-        return display.label, display.detail, None, display.is_web_request
-    label, detail, is_web_request = _approval_display_from_request(None)
-    return label, detail, None, is_web_request
+    display = approval_turn_display_from_result(
+        runtime,
+        result,
+        trigger_label_for_approval=_approval_trigger_flow_label_from_request,
+    )
+    return display.label, display.detail, display.trigger_flow_label, display.is_web_request
 
 
 def _approval_trigger_flow_label_from_request(req: Any) -> str | None:
@@ -24877,31 +24891,11 @@ def _short_error_text(exc: BaseException) -> str:
 
 
 def _is_new_command(text: str) -> bool:
-    head = text.strip().split(maxsplit=1)[0] if text.strip() else ""
-    if "@" in head:
-        command, mention = head.split("@", 1)
-        if not mention:
-            return False
-        head = command
-    return head == "/new"
+    return is_new_command_text(text)
 
 
 def _record_web_conversation_reset(runtime, conversation_id: str) -> None:
-    store = getattr(runtime, "store", None)
-    if store is None:
-        return
-    store.add_conversation_event(
-        {
-            "conversation_id": conversation_id,
-            "event_type": "conversation.session_reset",
-            "created_at": datetime.now(UTC).isoformat(),
-        }
-    )
-    store.set_active_task_frame_id(conversation_id, None)
-    try:
-        runtime.checkpoint()
-    except Exception:
-        logger.debug("Unable to checkpoint after web conversation reset", exc_info=True)
+    reset_conversation_session(runtime, conversation_id)
 
 
 def _parse_history_timestamp(value: object) -> datetime | None:
@@ -27514,13 +27508,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     if screenshot_payload is not None:
         store.remove_suspended_turn(approval_id)
         if screenshot_payload.get("suspended_for_approval"):
-            return {
-                "type": "approval_required",
-                "approval_id": screenshot_payload.get("approval_id"),
-                "tool_name": screenshot_payload.get("tool_name"),
-                "tool_detail": screenshot_payload.get("tool_detail"),
-                "is_web_request": bool(screenshot_payload.get("is_web_request")),
-            }
+            return _web_approval_required_payload(screenshot_payload)
         return {
             "type": "message",
             "text": screenshot_payload.get("text", "(no reply)"),
@@ -27563,14 +27551,13 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
 
     if getattr(result, "suspended_for_approval", False):
         label, detail, trigger_flow_label, is_web_request = _approval_display_from_turn_result(runtime, result)
-        return {
-            "type": "approval_required",
+        return _web_approval_required_payload({
             "approval_id": result.approval_id,
             "tool_name": label,
             "tool_detail": detail,
             "trigger_flow_label": trigger_flow_label,
             "is_web_request": is_web_request,
-        }
+        })
     requested_attachment_extension = plan_attachment_format(
         user_text,
         model_client=getattr(turn_orchestrator, "model_client", None),
@@ -28733,7 +28720,7 @@ def _run_turn_sync(
         required_attachment_extensions,
         tool_results,
     )
-    if required_attachment_extensions and not requested_attachment_extension:
+    if len(required_attachment_extensions) == 1 and not requested_attachment_extension:
         requested_attachment_extension = required_attachment_extensions[0]
     tool_count = len(tool_results)
     _mark_timing("model_tools")
@@ -28882,7 +28869,7 @@ def _run_turn_sync(
                 required_attachment_extensions,
                 tool_results,
             )
-            if required_attachment_extensions and not requested_attachment_extension:
+            if len(required_attachment_extensions) == 1 and not requested_attachment_extension:
                 requested_attachment_extension = required_attachment_extensions[0]
             tool_count = len(tool_results)
             phase_tracker.done(PHASE_RUN_TOOLS, "repair_model_tools", format_tool_activity_detail(repair_tool_results))

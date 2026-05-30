@@ -17,6 +17,14 @@ class ApprovalDisplay:
     is_web_request: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalTurnDisplay:
+    label: str
+    detail: str
+    trigger_flow_label: str | None
+    is_web_request: bool = False
+
+
 _TOOL_LABELS = {
     "allow_boundary": "access an external resource",
     "web_fetch": "fetch a web page",
@@ -352,4 +360,40 @@ def approval_display_from_tool_result(tool_result: Any, *, approval_id: str | No
         title=title,
         copy=copy,
         is_web_request=is_web,
+    )
+
+
+def approval_turn_display_from_result(
+    runtime: Any,
+    result: Any,
+    *,
+    trigger_label_for_approval,
+) -> ApprovalTurnDisplay:
+    approval_id = getattr(result, "approval_id", None)
+    store = getattr(runtime, "store", None)
+    get_approval = getattr(store, "get_approval_request", None)
+    approval = get_approval(approval_id) if callable(get_approval) and approval_id else None
+    if approval is not None:
+        display = approval_display_from_request(approval)
+        return ApprovalTurnDisplay(
+            label=display.label,
+            detail=display.detail,
+            trigger_flow_label=trigger_label_for_approval(approval),
+            is_web_request=display.is_web_request,
+        )
+    tool_results = list(getattr(result, "tool_results", []) or [])
+    if tool_results:
+        display = approval_display_from_tool_result(tool_results[-1], approval_id=approval_id)
+        return ApprovalTurnDisplay(
+            label=display.label,
+            detail=display.detail,
+            trigger_flow_label=None,
+            is_web_request=display.is_web_request,
+        )
+    display = approval_display_from_request(None)
+    return ApprovalTurnDisplay(
+        label=display.label,
+        detail=display.detail,
+        trigger_flow_label=None,
+        is_web_request=display.is_web_request,
     )

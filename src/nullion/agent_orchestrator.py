@@ -1901,6 +1901,212 @@ def _record_agent_tool_timing(
         logger.debug("Tool timing event recording failed", exc_info=True)
 
 
+_RENDERED_IMAGE_URL_EXTRACTION_SCRIPT = """
+(() => {
+  const absoluteUrl = (value) => {
+    try {
+      const url = new URL(String(value || ''), location.href);
+      if (!['http:', 'https:'].includes(url.protocol)) return '';
+      url.hash = '';
+      return url.href;
+    } catch (_) {
+      return '';
+    }
+  };
+  const srcsetUrls = (value) => String(value || '')
+    .split(',')
+    .map((part) => absoluteUrl(part.trim().split(/\\s+/)[0] || ''))
+    .filter(Boolean);
+  const visible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const scored = [];
+  const push = (url, el, role) => {
+    if (!url) return;
+    const rect = el && el.getBoundingClientRect ? el.getBoundingClientRect() : {width: 0, height: 0};
+    scored.push({
+      url,
+      role,
+      alt: el && el.getAttribute ? (el.getAttribute('alt') || '') : '',
+      width: Math.round(rect.width || 0),
+      height: Math.round(rect.height || 0),
+      area: Math.round((rect.width || 0) * (rect.height || 0)),
+      visible: visible(el)
+    });
+  };
+  for (const img of Array.from(document.images || [])) {
+    push(absoluteUrl(img.currentSrc || img.src), img, 'img');
+    for (const attr of ['srcset', 'data-srcset', 'data-lazy-srcset']) {
+      for (const url of srcsetUrls(img.getAttribute(attr))) push(url, img, attr);
+    }
+    for (const attr of ['data-src', 'data-original', 'data-lazy-src']) {
+      push(absoluteUrl(img.getAttribute(attr)), img, attr);
+    }
+  }
+  for (const source of Array.from(document.querySelectorAll('picture source, source[srcset]'))) {
+    for (const attr of ['srcset', 'data-srcset']) {
+      for (const url of srcsetUrls(source.getAttribute(attr))) push(url, source, `source_${attr}`);
+    }
+  }
+  const seen = new Set();
+  return scored
+    .filter((item) => item.url && !seen.has(item.url) && seen.add(item.url))
+    .sort((a, b) => Number(b.visible) - Number(a.visible) || b.area - a.area)
+    .slice(0, 30);
+})()
+"""
+
+
+def _browser_image_collect_needs_rendered_recovery(invocation: ToolInvocation, result: ToolResult) -> bool:
+    if invocation.tool_name != "browser_image_collect" or normalize_tool_status(result.status) != "failed":
+        return False
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("reason") != "image_collection_failed":
+        return False
+    page_url = invocation.arguments.get("page_url")
+    if not isinstance(page_url, str) or not page_url.strip():
+        return False
+    image_urls = invocation.arguments.get("image_urls")
+    return not (isinstance(image_urls, list) and any(isinstance(url, str) and url.strip() for url in image_urls))
+
+
+def _rendered_image_urls_from_browser_result(result: ToolResult) -> list[str]:
+    output = result.output if isinstance(result.output, dict) else {}
+    raw_items = output.get("result")
+    if not isinstance(raw_items, list):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        raw_url = item.get("url")
+        if not isinstance(raw_url, str) or not raw_url.strip() or raw_url in seen:
+            continue
+        seen.add(raw_url)
+        urls.append(raw_url)
+    return urls
+
+
+def _invoke_tool_for_rendered_image_recovery(
+    *,
+    tool_registry: ToolRegistry,
+    runtime_store: object | None,
+    principal_id: str,
+    capsule_id: str | None,
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> tuple[ToolInvocation, ToolResult, float]:
+    invocation = ToolInvocation(
+        invocation_id=f"rendered-image-recovery-{tool_name}-{uuid4().hex}",
+        tool_name=tool_name,
+        arguments=dict(arguments),
+        principal_id=principal_id,
+        capsule_id=capsule_id,
+    )
+    started_at = time.perf_counter()
+    try:
+        if runtime_store is not None:
+            from nullion.runtime import invoke_tool_with_boundary_policy
+
+            result = invoke_tool_with_boundary_policy(runtime_store, invocation, registry=tool_registry)
+        else:
+            result = tool_registry.invoke(invocation)
+    except KeyError as exc:
+        result = ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="failed",
+            output={"reason": "unknown_tool", "requested_tool_name": invocation.tool_name},
+            error=str(exc),
+        )
+    return invocation, result, (time.perf_counter() - started_at) * 1000
+
+
+def _rendered_browser_image_collect_recovery(
+    *,
+    invocation: ToolInvocation,
+    result: ToolResult,
+    tool_registry: ToolRegistry,
+    runtime_store: object | None,
+    principal_id: str,
+    emit_tool_activity: Callable[[ToolResult], None],
+) -> tuple[list[tuple[ToolInvocation, ToolResult, float]], ToolResult | None]:
+    if not _browser_image_collect_needs_rendered_recovery(invocation, result):
+        return [], None
+    for required_tool in ("browser_navigate", "browser_run_js", "browser_image_collect"):
+        try:
+            tool_registry.get_spec(required_tool)
+        except KeyError:
+            return [], None
+
+    page_url = str(invocation.arguments.get("page_url") or "").strip()
+    recovery_results: list[tuple[ToolInvocation, ToolResult, float]] = []
+
+    navigate_invocation, navigate_result, navigate_ms = _invoke_tool_for_rendered_image_recovery(
+        tool_registry=tool_registry,
+        runtime_store=runtime_store,
+        principal_id=principal_id,
+        capsule_id=invocation.capsule_id,
+        tool_name="browser_navigate",
+        arguments={"url": page_url},
+    )
+    recovery_results.append((navigate_invocation, navigate_result, navigate_ms))
+    emit_tool_activity(navigate_result)
+    if normalize_tool_status(navigate_result.status) != "completed":
+        return recovery_results, None
+
+    js_invocation, js_result, js_ms = _invoke_tool_for_rendered_image_recovery(
+        tool_registry=tool_registry,
+        runtime_store=runtime_store,
+        principal_id=principal_id,
+        capsule_id=invocation.capsule_id,
+        tool_name="browser_run_js",
+        arguments={"script": _RENDERED_IMAGE_URL_EXTRACTION_SCRIPT},
+    )
+    recovery_results.append((js_invocation, js_result, js_ms))
+    emit_tool_activity(js_result)
+    if normalize_tool_status(js_result.status) != "completed":
+        return recovery_results, None
+
+    rendered_image_urls = _rendered_image_urls_from_browser_result(js_result)
+    if not rendered_image_urls:
+        return recovery_results, None
+
+    collect_arguments = {
+        "image_urls": rendered_image_urls,
+        "max_images": invocation.arguments.get("max_images"),
+        "output_stem": invocation.arguments.get("output_stem"),
+    }
+    collect_invocation, collect_result, collect_ms = _invoke_tool_for_rendered_image_recovery(
+        tool_registry=tool_registry,
+        runtime_store=runtime_store,
+        principal_id=principal_id,
+        capsule_id=invocation.capsule_id,
+        tool_name="browser_image_collect",
+        arguments={key: value for key, value in collect_arguments.items() if value is not None},
+    )
+    recovery_results.append((collect_invocation, collect_result, collect_ms))
+    emit_tool_activity(collect_result)
+    if normalize_tool_status(collect_result.status) != "completed":
+        return recovery_results, None
+
+    if isinstance(collect_result.output, dict):
+        collect_result.output.setdefault(
+            "rendered_recovery",
+            {
+                "source": "browser_rendered_dom",
+                "page_url": page_url,
+                "rendered_image_url_count": len(rendered_image_urls),
+                "initial_error": result.error,
+            },
+        )
+    return recovery_results, collect_result
+
+
 def _cancelled_agent_turn_update(state: _AgentTurnGraphState) -> dict[str, object]:
     return _complete_agent_turn(state, final_text="Stopped by /stop.")
 
@@ -2103,13 +2309,13 @@ def _execute_agent_turn_tool_uses(
         tool_results.append(result)
         _emit_tool_activity(result)
         has_artifact_delivery_contract = _turn_has_artifact_delivery_contract(state)
-        new_artifacts = _artifact_paths_from_tool_result(
+        original_artifacts = _artifact_paths_from_tool_result(
             result,
             runtime_store=runtime_store,
             include_file_write_path=has_artifact_delivery_contract,
             include_browser_screenshot_path=has_artifact_delivery_contract,
         )
-        artifacts.extend(new_artifacts)
+        artifacts.extend(original_artifacts)
         if runtime_store is not None:
             _record_agent_tool_timing(
                 runtime_store,
@@ -2118,8 +2324,37 @@ def _execute_agent_turn_tool_uses(
                 invocation=invocation,
                 result=result,
                 duration_ms=tool_duration_ms,
-                artifact_count=len(new_artifacts),
+                artifact_count=len(original_artifacts),
             )
+        recovery_records, recovered_result = _rendered_browser_image_collect_recovery(
+            invocation=invocation,
+            result=result,
+            tool_registry=tool_registry,
+            runtime_store=runtime_store,
+            principal_id=principal_id,
+            emit_tool_activity=_emit_tool_activity,
+        )
+        for recovery_invocation, recovery_result, recovery_duration_ms in recovery_records:
+            tool_results.append(recovery_result)
+            recovery_artifacts = _artifact_paths_from_tool_result(
+                recovery_result,
+                runtime_store=runtime_store,
+                include_file_write_path=has_artifact_delivery_contract,
+                include_browser_screenshot_path=has_artifact_delivery_contract,
+            )
+            artifacts.extend(recovery_artifacts)
+            if runtime_store is not None:
+                _record_agent_tool_timing(
+                    runtime_store,
+                    conversation_id=conversation_id,
+                    iteration=int(state.get("iterations") or 0),
+                    invocation=recovery_invocation,
+                    result=recovery_result,
+                    duration_ms=recovery_duration_ms,
+                    artifact_count=len(recovery_artifacts),
+                )
+        if recovered_result is not None:
+            result = recovered_result
         logger.info(
             "agent tool timing conversation_id=%s iteration=%s tool=%s status=%s duration_ms=%.1f artifacts=%s",
             conversation_id,
@@ -2127,7 +2362,7 @@ def _execute_agent_turn_tool_uses(
             tool_name,
             result.status,
             tool_duration_ms,
-            len(new_artifacts),
+            len(original_artifacts),
         )
         if tool_duration_ms >= _latency_threshold_ms("NULLION_SLOW_TOOL_LOG_MS", 2000.0):
             logger.warning(

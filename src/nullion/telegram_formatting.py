@@ -9,6 +9,7 @@ from nullion.messaging_adapters import sanitize_external_inline_markup
 
 
 _BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*")
+_ITALIC_PATTERN = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
 _INLINE_CODE_PATTERN = re.compile(r"`([^`\n]+)`")
 _FENCED_CODE_BLOCK_PATTERN = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 _LANGUAGE_TOKEN_PATTERN = re.compile(r"^[a-z0-9_+-]{1,32}$", re.IGNORECASE)
@@ -65,13 +66,28 @@ def _replace_blockquotes(text: str) -> tuple[str, list[str]]:
     return "\n".join(output), formatted_quotes
 
 
+def _normalize_markdown_bullets(text: str) -> str:
+    lines: list[str] = []
+    for line in str(text).splitlines():
+        match = re.match(r"^(?P<indent>\s*)-\s+(?P<body>\S.*)$", line)
+        if match:
+            lines.append(f"{match.group('indent')}• {match.group('body')}")
+            continue
+        lines.append(line)
+    if str(text).endswith("\n"):
+        return "\n".join(lines) + "\n"
+    return "\n".join(lines)
+
+
 def format_telegram_text(text: str) -> tuple[str, dict[str, str]]:
     text = sanitize_external_inline_markup(text)
+    text = _normalize_markdown_bullets(text)
     text_with_placeholders, formatted_blocks = _replace_fenced_code_blocks(text)
     text_with_placeholders, formatted_quotes = _replace_blockquotes(text_with_placeholders)
     escaped = html.escape(text_with_placeholders)
     formatted = _INLINE_CODE_PATTERN.sub(lambda match: f"<code>{match.group(1)}</code>", escaped)
     formatted = _BOLD_PATTERN.sub(lambda match: f"<b>{match.group(1)}</b>", formatted)
+    formatted = _ITALIC_PATTERN.sub(lambda match: f"<i>{match.group(1)}</i>", formatted)
     for index, block in enumerate(formatted_blocks):
         placeholder = f"{_FENCE_PLACEHOLDER_PREFIX}{index}__"
         formatted = formatted.replace(placeholder, block)

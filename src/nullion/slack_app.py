@@ -20,25 +20,26 @@ from nullion.messaging_adapters import (
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
     MessagingIngress,
-    build_platform_delivery_receipt,
-    delivery_receipt_transport_succeeded,
+    WORKING_ACK_TEXT,
+    execute_platform_reply_delivery,
+    formatted_reply_chunks,
     handle_messaging_ingress_result,
-    platform_delivery_failure_reply,
-    prepare_reply_for_platform_delivery,
+    platform_plain_format_fallback_text,
     principal_id_for_messaging_identity,
-    record_platform_delivery_receipt,
     require_authorized_ingress,
     retry_messaging_delivery_operation,
     sanitize_external_inline_markup,
     save_messaging_attachment,
+    send_with_plain_text_fallback,
+    should_emit_separate_working_ack,
     split_reply_for_platform,
 )
 from nullion.messaging_runtime import build_messaging_runtime_service_from_settings
 from nullion.operator_commands import is_stop_command_text
 from nullion.platform_activity import (
     PlatformTaskCardStore,
+    deliver_platform_task_status_update,
     platform_activity_capabilities,
-    should_deliver_task_status,
 )
 from nullion.run_activity import activity_trace_enabled
 from nullion.session_stop import stop_session_async, stop_session_reply
@@ -47,7 +48,6 @@ from nullion.users import resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
-_WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
 
 
 _DEFAULT_ENV_PATH = Path.home() / ".nullion" / ".env"
@@ -63,28 +63,6 @@ def _float_env_ms(name: str, *, default: float) -> float:
         return float(str(raw).strip())
     except ValueError:
         return default
-
-
-def _record_slack_delivery_receipt(
-    *,
-    channel: str | None,
-    delivery,
-    transport_ok: bool,
-    request_id: str | None = None,
-    message_id: str | None = None,
-    error: str | None = None,
-) -> None:
-    record_platform_delivery_receipt(
-        build_platform_delivery_receipt(
-            channel="slack",
-            target_id=channel,
-            delivery=delivery,
-            transport_ok=transport_ok,
-            request_id=request_id,
-            message_id=message_id,
-            error=error,
-        )
-    )
 
 
 def _optional_event_text(value: object) -> str | None:
@@ -166,33 +144,30 @@ def _slack_reply_chunks(text: str | None, *, limit: int = 39000) -> list[tuple[s
 
 
 def _slack_plain_format_fallback_text(plain_text: str) -> str:
-    plain_text = sanitize_external_inline_markup(plain_text)
-    return (
-        "Slack could not send the formatted reply, so here is the same text as plain output:\n\n"
-        "```text\n"
-        f"{plain_text}"
-        "\n```"
-    )
+    return platform_plain_format_fallback_text("Slack", plain_text)
 
 
 async def _post_slack_message_with_plain_fallback(client, *, channel: str, formatted_text: str, plain_text: str) -> None:
-    try:
-        await client.chat_postMessage(channel=channel, text=formatted_text or "")
-    except Exception:
-        logger.warning("Slack formatted message delivery failed; retrying as plain text.", exc_info=True)
-        await client.chat_postMessage(
+    await send_with_plain_text_fallback(
+        platform="Slack",
+        formatted_text=formatted_text,
+        plain_text=plain_text,
+        send_formatted=lambda text: client.chat_postMessage(channel=channel, text=text),
+        send_plain=lambda text: client.chat_postMessage(
             channel=channel,
-            text=_slack_plain_format_fallback_text(plain_text or ""),
+            text=text,
             mrkdwn=False,
-        )
+        ),
+    )
 
 
 async def _send_slack_callable_with_plain_fallback(sender, *, formatted_text: str, plain_text: str) -> None:
-    try:
-        await sender(formatted_text)
-    except Exception:
-        logger.warning("Slack formatted callback delivery failed; retrying as plain text.", exc_info=True)
-        await sender(_slack_plain_format_fallback_text(plain_text or ""))
+    await send_with_plain_text_fallback(
+        platform="Slack",
+        formatted_text=formatted_text,
+        plain_text=plain_text,
+        send_formatted=sender,
+    )
 
 
 def _slack_response_field(response: object, name: str) -> str | None:
@@ -304,47 +279,41 @@ async def _deliver_slack_task_status(
     planner_feed_enabled: bool,
     include_activity: bool,
 ) -> bool:
-    target = str(channel or "").strip()
-    group = str(group_id or "").strip()
-    if (
-        not target
-        or not group
-        or not should_deliver_task_status(
-            status_kind=status_kind,
-            planner_feed_enabled=planner_feed_enabled,
-            include_activity=include_activity,
-        )
-    ):
-        return False
-    rendered_status = task_card_store.update(
-        target_id=target,
-        group_id=group,
-        status_kind=status_kind,
-        text=text,
-        activity_id=activity_id,
-        activity_label=activity_label,
-        include_activity=include_activity,
-    )
-    if not rendered_status:
-        return True
-    key = (target, group)
-    lock = status_locks.setdefault(key, asyncio.Lock())
-    async with lock:
-        ts = status_messages.get(key)
-        formatted = _format_slack_reply(rendered_status)
-        if ts and await _update_slack_message(client, channel=target, ts=ts, text=formatted):
-            return True
+    async def _send_new(target_id: str, rendered_text: str) -> object | None:
+        formatted = _format_slack_reply(rendered_text)
         try:
-            response = await client.chat_postMessage(channel=target, text=formatted)
+            response = await client.chat_postMessage(channel=target_id, text=formatted)
             if not _slack_response_ok(response):
-                return False
-            sent_ts = _slack_response_field(response, "ts")
-            if sent_ts:
-                status_messages[key] = sent_ts
-            return True
+                return None
+            return _slack_response_field(response, "ts")
         except Exception:
             logger.debug("Slack task card delivery failed", exc_info=True)
-            return False
+            return None
+
+    async def _edit_existing(existing: object, target_id: str, rendered_text: str) -> bool:
+        ts = str(existing or "").strip()
+        return bool(ts) and await _update_slack_message(
+            client,
+            channel=target_id,
+            ts=ts,
+            text=_format_slack_reply(rendered_text),
+        )
+
+    return await deliver_platform_task_status_update(
+        target_id=channel,
+        group_id=group_id,
+        text=text,
+        status_kind=status_kind,
+        activity_id=activity_id,
+        activity_label=activity_label,
+        task_card_store=task_card_store,
+        status_messages=status_messages,
+        status_locks=status_locks,
+        planner_feed_enabled=planner_feed_enabled,
+        include_activity=include_activity,
+        send_new=_send_new,
+        edit_existing=_edit_existing,
+    )
 
 
 async def _upload_slack_reply_files(client, *, channel: str, paths: tuple[Path, ...], initial_comment: str | None) -> bool:
@@ -393,53 +362,36 @@ async def send_slack_platform_delivery(
     """Send a platform delivery to Slack, uploading any MEDIA artifacts."""
     if not bot_token or not channel:
         return False
-    delivery = None
     try:
         from slack_sdk.web.async_client import AsyncWebClient
 
         client = AsyncWebClient(token=bot_token)
-        delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
-        reply_source = delivery.text or ""
-        formatted_reply = _format_slack_reply(reply_source)
-        if delivery.attachments:
-            uploaded = await _upload_slack_reply_files(
+
+        async def _send_text(reply_text: str) -> bool:
+            await _post_slack_message_with_plain_fallback(
                 client,
                 channel=channel,
-                paths=delivery.attachments,
-                initial_comment=formatted_reply or None,
+                formatted_text=_format_slack_reply(reply_text or ""),
+                plain_text=reply_text or "",
             )
-            receipt = build_platform_delivery_receipt(
-                channel="slack",
-                target_id=channel,
-                delivery=delivery,
-                transport_ok=uploaded,
-                error=None if uploaded else "attachment_upload_failed",
-            )
-            record_platform_delivery_receipt(receipt)
-            return delivery_receipt_transport_succeeded(receipt)
-        await _post_slack_message_with_plain_fallback(
-            client,
-            channel=channel,
-            formatted_text=formatted_reply or "",
-            plain_text=delivery.text or "",
-        )
-        receipt = build_platform_delivery_receipt(
+            return True
+
+        result = await execute_platform_reply_delivery(
+            text,
             channel="slack",
             target_id=channel,
-            delivery=delivery,
-            transport_ok=True,
+            principal_id=principal_id,
+            send_text=_send_text,
+            send_attachments=lambda initial_comment, paths: _upload_slack_reply_files(
+                client,
+                channel=channel,
+                paths=paths,
+                initial_comment=_format_slack_reply(initial_comment or "") or None,
+            ),
         )
-        record_platform_delivery_receipt(receipt)
-        return delivery_receipt_transport_succeeded(receipt)
+        return result.ok
     except Exception:
         logger.warning("Slack platform delivery failed", exc_info=True)
-        if delivery is not None:
-            _record_slack_delivery_receipt(
-                channel=channel,
-                delivery=delivery,
-                transport_ok=False,
-                error="platform_delivery_failed",
-            )
         return False
 
 
@@ -619,13 +571,11 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
 
     def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
         nonlocal tool_working_ack_sent, working_ts, working_channel
-        event_id = str(event.get("id") or "")
-        event_tool_name = str(event.get("tool_name") or "")
         if (
             tool_working_ack_sent
             or client is None
             or not working_channel
-            or not (event_id.startswith("tool-") or event_id == "mini-agents" or event_tool_name)
+            or not should_emit_separate_working_ack(event)
         ):
             return
         tool_working_ack_sent = True
@@ -633,7 +583,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         async def _send() -> None:
             nonlocal working_ts, working_channel
             try:
-                response = await say(_WORKING_ACK_TEXT)
+                response = await say(WORKING_ACK_TEXT)
                 working_ts = _slack_response_field(response, "ts")
                 working_channel = _slack_response_field(response, "channel") or working_channel
             except Exception:
@@ -677,67 +627,54 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             turn_outcome = "superseded"
             _log_turn_timing(turn_outcome)
             return
-        reply = turn_result.reply
         principal_id = principal_id_for_messaging_identity("slack", user_id, settings)
-        delivery = prepare_reply_for_platform_delivery(
-            reply,
+        reply_already_sent = bool(getattr(turn_result, "reply_already_sent", False))
+
+        async def _send_text(reply_source: str) -> bool:
+            chunks = _slack_reply_chunks(reply_source, limit=39000)
+            first_formatted = chunks[0][0] if chunks else ""
+            if (
+                working_ts
+                and first_formatted
+                and await _update_slack_message(
+                    client,
+                    channel=working_channel,
+                    ts=working_ts,
+                    text=first_formatted,
+                )
+            ):
+                chunks = chunks[1:]
+            for formatted_chunk, plain_chunk in chunks:
+                await _send_slack_callable_with_plain_fallback(say, formatted_text=formatted_chunk, plain_text=plain_chunk)
+            return True
+
+        result = await execute_platform_reply_delivery(
+            turn_result.reply,
+            channel="slack",
+            target_id=working_channel,
             principal_id=principal_id,
             delivery_contract=turn_result.delivery_contract,
+            request_id=ingress.request_id,
+            message_id=ingress.message_id,
+            reply_already_sent=reply_already_sent,
+            send_text=_send_text,
+            send_attachments=lambda initial_comment, paths: _upload_slack_reply_files(
+                client,
+                channel=working_channel,
+                paths=paths,
+                initial_comment=_format_slack_reply(initial_comment or "") or None,
+            ),
         )
-        if getattr(turn_result, "reply_already_sent", False) and not delivery.attachments:
-            await text_streamer.finish(reply)
-            _record_slack_delivery_receipt(
-                channel=working_channel,
-                delivery=delivery,
-                transport_ok=True,
-                request_id=ingress.request_id,
-                message_id=ingress.message_id,
-            )
-            _mark_timing("delivery_complete")
-            _log_turn_timing(turn_outcome)
-            return
-        reply_source = delivery.text or ""
-        formatted_reply = _format_slack_reply(delivery.text or "")
-        delivery_receipt_recorded = False
-        if delivery.attachments:
-            if await _upload_slack_reply_files(client, channel=working_channel, paths=delivery.attachments, initial_comment=formatted_reply or None):
-                _record_slack_delivery_receipt(
+        if reply_already_sent and not result.delivery.attachments:
+            await text_streamer.finish(turn_result.reply)
+        elif result.attachments_sent:
+            if working_ts:
+                await _update_slack_message(
+                    client,
                     channel=working_channel,
-                    delivery=delivery,
-                    transport_ok=True,
-                    request_id=ingress.request_id,
-                    message_id=ingress.message_id,
+                    ts=working_ts,
+                    text="Attached the requested file.",
                 )
-                delivery_receipt_recorded = True
-                if working_ts:
-                    await _update_slack_message(client, channel=working_channel, ts=working_ts, text="Attached the requested file.")
-                _mark_timing("delivery_complete")
-                _log_turn_timing(turn_outcome)
-                return
-            _record_slack_delivery_receipt(
-                channel=working_channel,
-                delivery=delivery,
-                transport_ok=False,
-                request_id=ingress.request_id,
-                message_id=ingress.message_id,
-                error="attachment_upload_failed",
-            )
-            delivery_receipt_recorded = True
-            reply_source = platform_delivery_failure_reply(delivery)
-        chunks = _slack_reply_chunks(reply_source, limit=39000)
-        first_formatted = chunks[0][0] if chunks else ""
-        if working_ts and first_formatted and await _update_slack_message(client, channel=working_channel, ts=working_ts, text=first_formatted):
-            chunks = chunks[1:]
-        for formatted_chunk, plain_chunk in chunks:
-            await _send_slack_callable_with_plain_fallback(say, formatted_text=formatted_chunk, plain_text=plain_chunk)
-        if not delivery_receipt_recorded:
-            _record_slack_delivery_receipt(
-                channel=working_channel,
-                delivery=delivery,
-                transport_ok=True,
-                request_id=ingress.request_id,
-                message_id=ingress.message_id,
-            )
         _mark_timing("delivery_complete")
         _log_turn_timing(turn_outcome)
     finally:

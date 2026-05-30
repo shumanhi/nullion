@@ -338,7 +338,8 @@ def register_browser_tools(
         _make_spec(
             "browser_screenshot",
             "Capture the browser page as a PNG artifact and return its path. "
-            "Defaults to auto mode, which captures the full page when the document is larger than the viewport.",
+            "Defaults to auto mode. Use viewport for ordinary chat screenshots; use full_page only when "
+            "the user explicitly asks for the whole page.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,

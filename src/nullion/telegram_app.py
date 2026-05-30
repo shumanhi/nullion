@@ -39,6 +39,7 @@ from nullion.config import NullionSettings, web_session_allow_duration_label, we
 from nullion.doctor_playbooks import execute_doctor_playbook_command
 from nullion.messaging_adapters import (
     DeliveryContract,
+    WORKING_ACK_TEXT,
     build_platform_delivery_receipt,
     platform_delivery_failure_reply,
     principal_id_for_messaging_identity,
@@ -47,6 +48,7 @@ from nullion.messaging_adapters import (
     retry_messaging_delivery_operation,
     sanitize_external_inline_markup,
     save_messaging_attachment,
+    should_emit_separate_working_ack,
     split_reply_for_platform_delivery,
 )
 from nullion.messaging_delivery_contract import (
@@ -72,6 +74,7 @@ from nullion.doctor_actions import (
 from nullion.platform_activity import (
     PlatformTaskCardStore,
     platform_activity_capabilities,
+    prepare_platform_task_status_update,
     should_deliver_task_status,
 )
 from nullion.run_activity import RunActivityPhase, classify_run_activity_phase
@@ -3598,15 +3601,17 @@ def _foreground_working_ack_text(
         return None
     if _local_chat_reply_body(prompt) is not None:
         return None
-    return "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
+    return WORKING_ACK_TEXT
+
+
+def _is_admin_telegram_identity(chat_id: str | None, settings: NullionSettings) -> bool:
+    if not _is_authorized_chat(chat_id, settings):
+        return False
+    return resolve_messaging_user("telegram", chat_id, settings).role == "admin"
 
 
 def _telegram_tool_event_should_emit_working_ack(event: dict[str, str]) -> bool:
-    event_id = str(event.get("id") or "")
-    event_tool_name = str(event.get("tool_name") or "")
-    if event_tool_name == "run_cron":
-        return False
-    return event_id.startswith("tool-") or event_id == "mini-agents" or bool(event_tool_name)
+    return should_emit_separate_working_ack(event)
 
 
 class MissingTelegramBotTokenError(ValueError):
@@ -4228,6 +4233,14 @@ class ChatOperatorService:
             message_id_local = message_id_local or _telegram_message_id(message=message, chat_id=chat_id_text)
         self.refresh_live_configuration()
         _mark_timing("config_refreshed")
+        if not _is_authorized_chat(chat_id_text, self.settings):
+            if message is not None:
+                await retry_messaging_delivery_operation(
+                    lambda: message.reply_text("Unauthorized messaging identity.", do_quote=False)
+                )
+            turn_outcome = "unauthorized_ingress"
+            _log_turn_timing(turn_outcome)
+            return
         if isinstance(text_for_ack, str) and (
             not text_for_ack.startswith("/")
             or not is_operator_command_text(text_for_ack)
@@ -4404,7 +4417,10 @@ class ChatOperatorService:
                 tool_working_ack_sent
                 or busy_ack is not None
                 or message is None
-                or not _telegram_tool_event_should_emit_working_ack(event)
+                or not should_emit_separate_working_ack(
+                    event,
+                    visible_activity_stream=activity_streamer is not None,
+                )
             ):
                 return
             working_ack = _foreground_working_ack_text(
@@ -4958,6 +4974,9 @@ class ChatOperatorService:
             await _answer_callback_query_safely(callback_query, "Unknown action", show_alert=False)
             return
         kind, action, record_id = parsed
+        if kind == "approval" and not _is_admin_telegram_identity(from_user_id_text, self.settings):
+            await _answer_callback_query_safely(callback_query, "Admin approval required", show_alert=True)
+            return
 
         # UX-9: suggestion buttons — process the suggestion as a new user message.
         if kind == "suggestion" and action == "send":
@@ -5199,34 +5218,30 @@ class ChatOperatorService:
                     group_id = str(kwargs.get("group_id") or "")
                     status_kind = str(kwargs.get("status_kind") or "task_summary")
                     include_activity = activity_trace_enabled_for_chat(_service_ref.runtime, chat_id=chat_id)
-                    if (
-                        not group_id
-                        or not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id)
-                        or not should_deliver_task_status(
-                            status_kind=status_kind,
-                            planner_feed_enabled=True,
-                            include_activity=include_activity,
-                        )
-                    ):
+                    if not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id):
                         return False
-                    rendered_status = _task_card_store.update(
+                    update = prepare_platform_task_status_update(
                         target_id=chat_id,
                         group_id=group_id,
-                        status_kind=status_kind,
                         text=text,
+                        status_kind=status_kind,
                         activity_id=str(kwargs.get("activity_id") or ""),
                         activity_label=str(kwargs.get("activity_label") or ""),
+                        task_card_store=_task_card_store,
+                        planner_feed_enabled=True,
                         include_activity=include_activity,
                     )
-                    if not rendered_status:
+                    if update is None:
+                        return False
+                    if not update.rendered_text:
                         return True
                     async def _deliver_status(use_loop_bound_state: bool) -> None:
                         await _send_or_edit_telegram_task_status_message(
                             bot_token,
                             _status_messages,
-                            chat_id=chat_id,
-                            group_id=group_id,
-                            text=rendered_status,
+                            chat_id=update.target_id,
+                            group_id=update.group_id,
+                            text=update.rendered_text,
                             runtime=_service_ref.runtime,
                             bot_token=bot_token,
                             status_texts=_status_texts,
