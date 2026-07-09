@@ -24902,8 +24902,6 @@ def _render_chat_turn(
                     tool_results=activity_tool_results,
                     source="agent",
                 )
-            if completed_run_cron_receipt_reply:
-                reply = completed_run_cron_receipt_reply
             if activity_callback is not None:
                 result_detail = format_tool_results_activity_detail(activity_tool_results)
                 activity_callback({
@@ -24983,8 +24981,6 @@ def _render_chat_turn(
                     tool_results=activity_tool_results,
                     source="agent",
                 )
-            if completed_run_cron_receipt_reply:
-                reply = completed_run_cron_receipt_reply
             visible_reply = append_activity_trace_to_reply(
                 reply,
                 tool_results=activity_tool_results,

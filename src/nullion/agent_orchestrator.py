@@ -6821,7 +6821,10 @@ def _execute_agent_turn_tool_uses(
         if completed_artifact_update is not None:
             return completed_artifact_update
 
-        weather_completion_text = _weather_forecast_completion_text(result)
+        allow_direct_data_tool_completion = not _state_is_scheduled_task_run(state)
+        weather_completion_text = (
+            _weather_forecast_completion_text(result) if allow_direct_data_tool_completion else None
+        )
         if weather_completion_text is not None:
             updated_state = dict(state)
             updated_state.update(
@@ -6842,7 +6845,9 @@ def _execute_agent_turn_tool_uses(
                 **_complete_agent_turn(updated_state, final_text=weather_completion_text),
             }
 
-        market_quote_completion_text = _market_quote_completion_text(result)
+        market_quote_completion_text = (
+            _market_quote_completion_text(result) if allow_direct_data_tool_completion else None
+        )
         if market_quote_completion_text is not None:
             updated_state = dict(state)
             updated_state.update(
