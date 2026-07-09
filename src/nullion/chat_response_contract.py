@@ -146,11 +146,12 @@ def build_pending_approval_facts_from_tool_results(
     seen_approval_ids: set[str] = set()
     for result in tool_results:
         normalized_status = normalize_tool_status(result.status)
-        if normalized_status != "denied":
+        if normalized_status not in {"denied", "approval_required", "requires_approval", "suspended"}:
             continue
-        if result.output.get("reason") != "approval_required":
+        output = result.output if isinstance(result.output, Mapping) else {}
+        if output.get("reason") != "approval_required" and output.get("requires_approval") is not True:
             continue
-        approval_id = result.output.get("approval_id")
+        approval_id = output.get("approval_id")
         if not isinstance(approval_id, str) or not approval_id or approval_id in seen_approval_ids:
             continue
         approval = approval_lookup(approval_id)

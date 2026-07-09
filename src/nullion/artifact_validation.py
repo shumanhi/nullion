@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 import gzip
 from html.parser import HTMLParser
@@ -218,6 +219,31 @@ def _validate_text_artifact(path: Path, size: int) -> list[ArtifactValidationIss
     text = path.read_text(encoding="utf-8")
     if not text.strip():
         return [_issue(str(path), "text_artifact_blank", "Text artifact has no visible content.")]
+    if path.suffix.lower() == ".csv":
+        return _validate_csv_artifact(path, text)
+    return []
+
+
+def _validate_csv_artifact(path: Path, text: str) -> list[ArtifactValidationIssue]:
+    try:
+        rows = list(csv.reader(text.splitlines()))
+    except csv.Error as exc:
+        return [_issue(str(path), "csv_parse_failed", f"CSV artifact is invalid: {exc}.")]
+    visible_rows = [row for row in rows if any(str(cell).strip() for cell in row)]
+    if not visible_rows:
+        return [_issue(str(path), "csv_artifact_blank", "CSV artifact has no visible rows.")]
+    expected_width = len(visible_rows[0])
+    if expected_width <= 0:
+        return [_issue(str(path), "csv_header_empty", "CSV artifact has an empty header row.")]
+    for index, row in enumerate(visible_rows[1:], start=2):
+        if len(row) != expected_width:
+            return [
+                _issue(
+                    str(path),
+                    "csv_inconsistent_columns",
+                    f"CSV row {index} has {len(row)} columns; expected {expected_width}.",
+                )
+            ]
     return []
 
 

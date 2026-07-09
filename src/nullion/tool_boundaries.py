@@ -36,6 +36,39 @@ _SHELL_COMMAND_FAMILIES = {
     "bash",
     "zsh",
 }
+_SHELL_CONTROL_TOKENS = {";", "&&", "||", "|"}
+_SHELL_WRAPPER_COMMANDS = {
+    "command",
+    "env",
+    "sudo",
+    "doas",
+    "xargs",
+}
+_TERMINAL_FILESYSTEM_MUTATION_COMMANDS = {
+    "cp": "write",
+    "cp.exe": "write",
+    "install": "write",
+    "ln": "write",
+    "ln.exe": "write",
+    "mkdir": "write",
+    "mkdir.exe": "write",
+    "mv": "write",
+    "mv.exe": "write",
+    "rm": "delete",
+    "rm.exe": "delete",
+    "rmdir": "delete",
+    "rmdir.exe": "delete",
+    "touch": "write",
+    "touch.exe": "write",
+}
+_TERMINAL_FILESYSTEM_METADATA_MUTATION_COMMANDS = {
+    "chflags",
+    "chgrp",
+    "chmod",
+    "chown",
+}
+_TERMINAL_REDIRECT_RE = re.compile(r"^(?:\d+)?>>?$|^&>$")
+_TERMINAL_SAFE_REDIRECT_TARGETS = {"/dev/null"}
 _HTTP_URL_RE = re.compile(r"https?://[^\s'\"<>()\[\]{}]+", re.I)
 _WEB_SEARCH_TARGET = "https://www.bing.com/*"
 _INTERNAL_LARGE_TOOL_RESULT_RE = re.compile(r"^/large_tool_results/call_[A-Za-z0-9_-]+$")
@@ -45,6 +78,11 @@ _ACCOUNT_SCOPED_TOOLS: dict[str, tuple[str, str]] = {
     "email_send":      ("send",  "email"),
     "email_search":    ("read",  "email"),
     "email_read":      ("read",  "email"),
+    "email_attachment_read": ("read", "email"),
+    "calendar_create": ("write", "calendar"),
+    "calendar_update": ("write", "calendar"),
+    "calendar_respond": ("write", "calendar"),
+    "calendar_delete": ("write", "calendar"),
     "calendar_write":  ("write", "calendar"),
     "calendar_read":   ("read",  "calendar"),
     "contacts_read":   ("read",  "contacts"),
@@ -69,6 +107,133 @@ def _command_tokens(command: str) -> list[str]:
         return shlex.split(command, posix=False)
     except ValueError:
         return command.split()
+
+
+def _shell_syntax_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return list(lexer)
+    except Exception:
+        return _command_tokens(command)
+
+
+def _shell_segments(tokens: list[str]) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_CONTROL_TOKENS:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _strip_shell_wrappers(segment: list[str]) -> list[str]:
+    stripped = list(segment)
+    while stripped:
+        command = Path(stripped[0].strip("'\"")).name.lower()
+        if command not in _SHELL_WRAPPER_COMMANDS:
+            break
+        stripped = stripped[1:]
+        if command == "env":
+            while stripped and "=" in stripped[0] and not stripped[0].startswith(("-", "/")):
+                stripped = stripped[1:]
+    return stripped
+
+
+def _shell_operands(tokens: list[str]) -> list[str]:
+    operands: list[str] = []
+    skip_next = False
+    for index, token in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--":
+            operands.extend(tokens[index + 1 :])
+            break
+        if token.startswith("-"):
+            if token in {"-o", "-g", "-m", "-t", "-T"}:
+                skip_next = True
+            continue
+        operands.append(token)
+    return operands
+
+
+def _filesystem_boundary_fact_from_terminal_target(
+    *,
+    tool_name: str,
+    operation: str,
+    raw_path: object,
+    command_family: str,
+) -> BoundaryFact | None:
+    fact = _filesystem_boundary_fact(tool_name=tool_name, operation=operation, raw_path=raw_path)
+    if fact is None:
+        return None
+    return BoundaryFact(
+        kind=fact.kind,
+        tool_name=fact.tool_name,
+        operation=fact.operation,
+        target=fact.target,
+        attributes={**fact.attributes, "command_family": command_family},
+    )
+
+
+def _is_safe_terminal_redirect_target(raw_path: object) -> bool:
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    target = raw_path.strip().strip("'\"")
+    return target in _TERMINAL_SAFE_REDIRECT_TARGETS
+
+
+def _terminal_filesystem_mutation_facts(command: str, *, tool_name: str) -> list[BoundaryFact]:
+    tokens = _shell_syntax_tokens(command)
+    facts: list[BoundaryFact] = []
+    for segment in _shell_segments(tokens):
+        stripped = _strip_shell_wrappers(segment)
+        if not stripped:
+            continue
+        for index, token in enumerate(stripped[:-1]):
+            if _TERMINAL_REDIRECT_RE.fullmatch(token):
+                if _is_safe_terminal_redirect_target(stripped[index + 1]):
+                    continue
+                fact = _filesystem_boundary_fact_from_terminal_target(
+                    tool_name=tool_name,
+                    operation="write",
+                    raw_path=stripped[index + 1],
+                    command_family="redirect",
+                )
+                if fact is not None:
+                    facts.append(fact)
+        command_family = Path(stripped[0].strip("'\"")).name.lower()
+        operands = _shell_operands(stripped[1:])
+        if command_family in _TERMINAL_FILESYSTEM_MUTATION_COMMANDS:
+            operation = _TERMINAL_FILESYSTEM_MUTATION_COMMANDS[command_family]
+            targets = operands if operation == "delete" else operands[-1:]
+            for target in targets:
+                fact = _filesystem_boundary_fact_from_terminal_target(
+                    tool_name=tool_name,
+                    operation=operation,
+                    raw_path=target,
+                    command_family=command_family,
+                )
+                if fact is not None:
+                    facts.append(fact)
+        elif command_family in _TERMINAL_FILESYSTEM_METADATA_MUTATION_COMMANDS:
+            for target in operands[1:] or operands[-1:]:
+                fact = _filesystem_boundary_fact_from_terminal_target(
+                    tool_name=tool_name,
+                    operation="metadata_write",
+                    raw_path=target,
+                    command_family=command_family,
+                )
+                if fact is not None:
+                    facts.append(fact)
+    return facts
 
 
 def _terminal_network_command_family(command: str) -> str | None:
@@ -188,6 +353,15 @@ def _email_read_account_target(invocation: "ToolInvocation") -> str:
     return provider_id or "email:read"
 
 
+def _calendar_account_target(invocation: "ToolInvocation", operation: str) -> str:
+    provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+    calendar_id = str(invocation.arguments.get("calendar_id") or "primary").strip() or "primary"
+    event_id = str(invocation.arguments.get("event_id") or "").strip()
+    prefix = provider_id or "calendar"
+    target = f"{prefix}:{calendar_id}:{operation}"
+    return f"{target}:{event_id}" if event_id else target
+
+
 def _filesystem_boundary_fact(*, tool_name: str, operation: str, raw_path: object) -> BoundaryFact | None:
     if not isinstance(raw_path, str) or not raw_path:
         return None
@@ -212,22 +386,28 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
         stripped = command.strip()
         if not stripped:
             return []
+        facts: list[BoundaryFact] = []
         command_family = _terminal_network_command_family(stripped)
-        if command_family is None:
-            return []
-        target = _extract_http_url(stripped)
-        if target is None:
-            return []
-        return [
-            _network_boundary_fact(
+        if command_family is not None:
+            target = _extract_http_url(stripped)
+            if target is not None:
+                facts.append(
+                    _network_boundary_fact(
+                        tool_name=invocation.tool_name,
+                        operation="http_get",
+                        target=target,
+                        command_family=command_family,
+                    )
+                )
+        facts.extend(
+            _terminal_filesystem_mutation_facts(
+                stripped,
                 tool_name=invocation.tool_name,
-                operation="http_get",
-                target=target,
-                command_family=command_family,
             )
-        ]
+        )
+        return facts
 
-    if invocation.tool_name == "web_fetch":
+    if invocation.tool_name in {"file_download", "web_fetch"}:
         raw_url = invocation.arguments.get("url")
         if not isinstance(raw_url, str) or not raw_url:
             return []
@@ -327,6 +507,62 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
         )
         return [] if fact is None else [fact]
 
+    if invocation.tool_name == "file_download":
+        fact = _filesystem_boundary_fact(
+            tool_name=invocation.tool_name,
+            operation="write",
+            raw_path=invocation.arguments.get("output_path"),
+        )
+        return [] if fact is None else [fact]
+
+    if invocation.tool_name == "archive_extract":
+        facts = []
+        read_fact = _filesystem_boundary_fact(
+            tool_name=invocation.tool_name,
+            operation="read",
+            raw_path=invocation.arguments.get("path"),
+        )
+        if read_fact is not None:
+            facts.append(read_fact)
+        write_fact = _filesystem_boundary_fact(
+            tool_name=invocation.tool_name,
+            operation="write",
+            raw_path=invocation.arguments.get("output_dir"),
+        )
+        if write_fact is not None:
+            facts.append(write_fact)
+        return facts
+
+    if invocation.tool_name == "archive_create":
+        facts = []
+        output_fact = _filesystem_boundary_fact(
+            tool_name=invocation.tool_name,
+            operation="write",
+            raw_path=invocation.arguments.get("output_path"),
+        )
+        if output_fact is not None:
+            facts.append(output_fact)
+        source_dir_fact = _filesystem_boundary_fact(
+            tool_name=invocation.tool_name,
+            operation="read",
+            raw_path=invocation.arguments.get("source_dir"),
+        )
+        if source_dir_fact is not None:
+            facts.append(source_dir_fact)
+        raw_paths = invocation.arguments.get("source_paths")
+        if isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        if isinstance(raw_paths, (list, tuple)):
+            for raw_path in raw_paths:
+                source_fact = _filesystem_boundary_fact(
+                    tool_name=invocation.tool_name,
+                    operation="read",
+                    raw_path=raw_path,
+                )
+                if source_fact is not None:
+                    facts.append(source_fact)
+        return facts
+
     if invocation.tool_name in {"audio_transcribe", "image_extract_text"}:
         fact = _filesystem_boundary_fact(
             tool_name=invocation.tool_name,
@@ -379,7 +615,12 @@ def extract_boundary_facts(invocation: ToolInvocation) -> list[BoundaryFact]:
     # Named account-scoped tools (email, calendar, contacts)
     if invocation.tool_name in _ACCOUNT_SCOPED_TOOLS:
         operation, account_type = _ACCOUNT_SCOPED_TOOLS[invocation.tool_name]
-        target = _email_read_account_target(invocation) if invocation.tool_name in {"email_search", "email_read"} else ""
+        if invocation.tool_name in {"email_search", "email_read", "email_attachment_read"}:
+            target = _email_read_account_target(invocation)
+        elif invocation.tool_name.startswith("calendar_"):
+            target = _calendar_account_target(invocation, operation)
+        else:
+            target = ""
         return [
             _account_boundary_fact(
                 tool_name=invocation.tool_name,

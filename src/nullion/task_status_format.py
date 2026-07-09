@@ -16,6 +16,11 @@ TASK_STATUS_WAITING_INPUT = "▤"
 TASK_STATUS_SUBLIST_PREFIX = ""
 DEFAULT_TASK_STATUS_SUBJECT_LIMIT = 120
 NEXT_REQUEST_HINT = "you can send the next request anytime"
+_DEPENDENCY_WAITING_OVERRIDE_TERMINAL_STATUSES = {
+    TaskStatus.COMPLETE,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+}
 
 
 def compact_task_status_subject(subject: str, *, limit: int = DEFAULT_TASK_STATUS_SUBJECT_LIMIT) -> str:
@@ -81,12 +86,22 @@ def format_task_status_summary(
         header = f"{header} - {NEXT_REQUEST_HINT}"
     lines.append(f"{header}:")
     known_lines = status_lines or {}
+    tasks_by_id = _tasks_by_id(task_list)
     for task in task_list:
-        fallback = format_task_status_line(
+        fallback = _dependency_safe_task_status_line(
             task,
-            status=default_status if default_status is not None else None,
+            tasks_by_id=tasks_by_id,
+            line=format_task_status_line(
+                task,
+                status=default_status if default_status is not None else None,
+            ),
         )
-        lines.append(format_task_status_sublist_line(known_lines.get(task.task_id, fallback)))
+        line = _dependency_safe_task_status_line(
+            task,
+            tasks_by_id=tasks_by_id,
+            line=known_lines.get(task.task_id, fallback),
+        )
+        lines.append(format_task_status_sublist_line(line))
     return "\n".join(lines)
 
 
@@ -101,10 +116,50 @@ def format_task_status_activity_detail(
     status_lines: dict[str, str] | None = None,
 ) -> str:
     known_lines = status_lines or {}
+    task_list = list(tasks)
+    tasks_by_id = _tasks_by_id(task_list)
     return "\n".join(
-        format_task_status_sublist_line(known_lines.get(task.task_id, format_task_status_line(task)))
-        for task in tasks
+        format_task_status_sublist_line(
+            _dependency_safe_task_status_line(
+                task,
+                tasks_by_id=tasks_by_id,
+                line=known_lines.get(task.task_id, format_task_status_line(task)),
+            )
+        )
+        for task in task_list
     )
+
+
+def _tasks_by_id(tasks: Iterable[TaskRecord]) -> dict[str, TaskRecord]:
+    return {
+        str(task.task_id or "").strip(): task
+        for task in tasks
+        if str(task.task_id or "").strip()
+    }
+
+
+def _dependency_safe_task_status_line(
+    task: TaskRecord,
+    *,
+    tasks_by_id: dict[str, TaskRecord],
+    line: str,
+) -> str:
+    if not _has_incomplete_dependency(task, tasks_by_id):
+        return line
+    if task.status in _DEPENDENCY_WAITING_OVERRIDE_TERMINAL_STATUSES:
+        return line
+    return format_task_status_line(task, status=TaskStatus.PENDING)
+
+
+def _has_incomplete_dependency(task: TaskRecord, tasks_by_id: dict[str, TaskRecord]) -> bool:
+    for dep_id in task.dependencies or ():
+        dep_key = str(dep_id or "").strip()
+        if not dep_key:
+            continue
+        dep_task = tasks_by_id.get(dep_key)
+        if dep_task is None or dep_task.status is not TaskStatus.COMPLETE:
+            return True
+    return False
 
 
 __all__ = [

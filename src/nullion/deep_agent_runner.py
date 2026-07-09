@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import suppress
+import csv
+from dataclasses import replace
 import inspect
 import json
 import logging
@@ -11,7 +14,11 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import Any
+from typing import Any, Iterable
+from urllib.parse import urlparse
+from uuid import uuid4
+import zipfile
+import xml.etree.ElementTree as ET
 
 from nullion.artifacts import (
     artifact_descriptor_for_path,
@@ -25,9 +32,14 @@ from nullion.deep_agent_profiles import (
 )
 from nullion.langchain_adapters import nullion_client_as_langchain_chat_model, nullion_tools_as_langchain_tools
 from nullion.response_sanitizer import is_safe_raw_tool_payload_replacement_reply, sanitize_user_visible_reply
-from nullion.response_fulfillment_contract import artifact_paths_from_tool_results
+from nullion.response_fulfillment_contract import (
+    artifact_media_embedding_obligation_outstanding,
+    artifact_paths_from_tool_results,
+)
 from nullion.run_activity import format_tool_activity_line, should_suppress_tool_activity
+from nullion.tools import ToolInvocation
 from nullion.task_queue import TaskResult
+from nullion.workspace_storage import workspace_storage_roots_for_principal
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +55,20 @@ class DeepAgentStalledLoopError(RuntimeError):
     """Raised when Deep Agent tool execution loops without progress."""
 
 
+class DeepAgentInnerTimeoutError(RuntimeError):
+    """Raised when an operation inside a mini-agent times out before the outer budget."""
+
+
 class DeepAgentEvidenceFallbackUnavailable(RuntimeError):
     """Raised when tool evidence is insufficient to recover a final answer."""
+
+
+async def _preserve_inner_timeout(awaitable: Any) -> Any:
+    try:
+        return await awaitable
+    except asyncio.TimeoutError as exc:
+        message = str(exc).strip() or "A mini-agent operation timed out before the outer task budget was reached."
+        raise DeepAgentInnerTimeoutError(message) from exc
 
 
 _DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS_ENV = "NULLION_DEEP_AGENT_EVIDENCE_FALLBACK_TIMEOUT_SECONDS"
@@ -66,6 +90,17 @@ _HTML_ID_ELEMENT_RE = re.compile(
 _HTML_SCRIPT_OR_STYLE_RE = re.compile(r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>", re.IGNORECASE | re.DOTALL)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _HTML_DYNAMIC_PRIMARY_MARKERS = ("map(", "join(", "<article", "<li", "<tr", "<section", "<div", "<table")
+_STRUCTURED_HANDOFF_MAX_FILE_BYTES = 25 * 1024 * 1024
+_STRUCTURED_HANDOFF_SCHEMA = "nullion.context_handoff.structured_records.v1"
+_LEGACY_STRUCTURED_HANDOFF_SCHEMAS = frozenset(
+    {
+        _STRUCTURED_HANDOFF_SCHEMA,
+        "nullion.context_handoff.browser_items.v1",
+    }
+)
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>)\\\]]+")
+_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
+_BROWSER_ITEM_IMAGE_COLLECT_CHUNK_SIZE = 8
 
 
 class DeepAgentMiniAgentRunner:
@@ -90,19 +125,32 @@ class DeepAgentMiniAgentRunner:
             kind="task_started",
             message=task.title,
         )
+        tool_results: list[Any] = []
         try:
-            run_coro = self._run_inner(
+            config = _config_with_resolved_context_in(config, context_bus)
+            artifact_preflight = await _artifact_task_fallback_from_tool_evidence(
                 config,
-                anthropic_client=anthropic_client,
                 tool_registry=tool_registry,
-                policy_store=policy_store,
-                context_bus=context_bus,
+                tool_results=tool_results,
                 progress_queue=progress_queue,
             )
-            if _is_scheduled_background_config(config):
-                result = await run_coro
+            if artifact_preflight is not None:
+                result = artifact_preflight
             else:
-                result = await asyncio.wait_for(run_coro, timeout=config.timeout_s)
+                run_coro = self._run_inner(
+                    config,
+                    anthropic_client=anthropic_client,
+                    tool_registry=tool_registry,
+                    policy_store=policy_store,
+                    context_bus=context_bus,
+                    progress_queue=progress_queue,
+                    tool_results=tool_results,
+                )
+                guarded_run_coro = _preserve_inner_timeout(run_coro)
+                if _is_scheduled_background_config(config):
+                    result = await guarded_run_coro
+                else:
+                    result = await asyncio.wait_for(guarded_run_coro, timeout=config.timeout_s)
         except DeepAgentUserInputRequested as exc:
             await _emit_progress(
                 progress_queue,
@@ -121,18 +169,70 @@ class DeepAgentMiniAgentRunner:
                     payload={"question": exc.question, "options": exc.options},
                 ),
             )
+        except DeepAgentInnerTimeoutError as exc:
+            logger.warning("DeepAgent mini-agent %s inner operation timed out: %s", config.agent_id, exc)
+            artifact_fallback = await _artifact_task_fallback_from_tool_evidence(
+                config,
+                tool_registry=tool_registry,
+                tool_results=tool_results,
+                progress_queue=progress_queue,
+            )
+            if artifact_fallback is not None:
+                result = artifact_fallback
+            else:
+                context_fallback = await _context_task_fallback_from_tool_evidence(
+                    config,
+                    tool_registry=tool_registry,
+                    tool_results=tool_results,
+                    progress_queue=progress_queue,
+                )
+                if context_fallback is not None:
+                    result = context_fallback
+                else:
+                    result = TaskResult(
+                        task_id=task.task_id,
+                        status="failure",
+                        error=str(exc) or "A mini-agent operation timed out before the outer task budget was reached.",
+                    )
         except asyncio.TimeoutError:
             logger.warning("DeepAgent mini-agent %s timed out after %.0fs", config.agent_id, config.timeout_s)
-            result = TaskResult(
-                task_id=task.task_id,
-                status="failure",
-                error=f"Timed out after {config.timeout_s:.0f}s",
+            artifact_fallback = await _artifact_task_fallback_from_tool_evidence(
+                config,
+                tool_registry=tool_registry,
+                tool_results=tool_results,
+                progress_queue=progress_queue,
             )
+            if artifact_fallback is not None:
+                result = artifact_fallback
+            else:
+                context_fallback = await _context_task_fallback_from_tool_evidence(
+                    config,
+                    tool_registry=tool_registry,
+                    tool_results=tool_results,
+                    progress_queue=progress_queue,
+                )
+                if context_fallback is not None:
+                    result = context_fallback
+                else:
+                    result = TaskResult(
+                        task_id=task.task_id,
+                        status="failure",
+                        error=f"Timed out after {config.timeout_s:.0f}s",
+                    )
         except Exception as exc:
             logger.warning("DeepAgent mini-agent %s failed: %s", config.agent_id, exc, exc_info=True)
             result = TaskResult(task_id=task.task_id, status="failure", error=str(exc))
         finally:
             await _run_tool_registry_cleanup(tool_registry, scope_id=task.task_id)
+
+        contract_failure = _artifact_contract_failure_for_task_result(task, result)
+        if contract_failure is not None:
+            result = TaskResult(
+                task_id=task.task_id,
+                status="failure",
+                error=contract_failure,
+                context_out=getattr(result, "context_out", None),
+            )
 
         if result.status == "success" and task.context_key_out and result.context_out is not None:
             context_bus.publish(
@@ -160,6 +260,7 @@ class DeepAgentMiniAgentRunner:
         policy_store: Any,
         context_bus: Any,
         progress_queue: asyncio.Queue,
+        tool_results: list[Any] | None = None,
     ) -> TaskResult:
         try:
             from deepagents import create_deep_agent
@@ -176,7 +277,8 @@ class DeepAgentMiniAgentRunner:
             context_in = context_bus.get(task.context_key_in, group_id=task.group_id)
 
         system_prompt = _system_prompt_for_task(config, context_in=context_in, tool_registry=tool_registry)
-        tool_results: list[Any] = []
+        if tool_results is None:
+            tool_results = []
 
         def record_tool_result(result: Any) -> None:
             tool_results.append(result)
@@ -205,7 +307,7 @@ class DeepAgentMiniAgentRunner:
         if skill_files:
             payload["files"] = skill_files
         try:
-            response = await _invoke_agent(
+            response = await _invoke_agent_with_heartbeat(
                 agent,
                 payload,
                 config=_deep_agent_graph_config(config),
@@ -222,6 +324,22 @@ class DeepAgentMiniAgentRunner:
                 message="Recovering final answer from verified tool evidence.",
                 data={"phase": "graph_limit_recovery"},
             )
+            artifact_fallback = await _artifact_task_fallback_from_tool_evidence(
+                config,
+                tool_registry=tool_registry,
+                tool_results=tool_results,
+                progress_queue=progress_queue,
+            )
+            if artifact_fallback is not None:
+                return artifact_fallback
+            context_fallback = await _context_task_fallback_from_tool_evidence(
+                config,
+                tool_registry=tool_registry,
+                tool_results=tool_results,
+                progress_queue=progress_queue,
+            )
+            if context_fallback is not None:
+                return context_fallback
             fallback_text = await _fallback_answer_from_tool_evidence(
                 config,
                 tool_results=tool_results,
@@ -262,6 +380,12 @@ class DeepAgentMiniAgentRunner:
                     error=str(exc) or output_text,
                     context_out=output_text,
                 )
+        await _persist_context_handoff_from_tool_evidence(
+            config,
+            tool_registry=tool_registry,
+            tool_results=tool_results,
+            progress_queue=progress_queue,
+        )
         artifacts = artifact_paths_from_tool_results(tool_results)
         artifacts = _relocate_external_artifact_paths_for_task(config, artifacts)
         deliverable_artifacts = _deliverable_artifact_paths_for_task(config, artifacts)
@@ -292,11 +416,33 @@ class DeepAgentMiniAgentRunner:
                 ),
             )
         artifact_failure = (
-            _artifact_delivery_failure_for_task(config, artifacts, deliverable_artifacts)
+            _artifact_delivery_failure_for_task(
+                config,
+                artifacts,
+                deliverable_artifacts,
+                tool_results=tool_results,
+                context_in=context_in,
+            )
             if _task_requires_user_file_delivery(task)
             else None
         )
         if artifact_failure:
+            repaired_artifact = await _retry_spreadsheet_after_remote_image_failure(
+                config,
+                tool_registry=tool_registry,
+                tool_results=tool_results,
+                progress_queue=progress_queue,
+            )
+            if repaired_artifact is not None:
+                return repaired_artifact
+            artifact_fallback = await _artifact_task_fallback_from_tool_evidence(
+                config,
+                tool_registry=tool_registry,
+                tool_results=tool_results,
+                progress_queue=progress_queue,
+            )
+            if artifact_fallback is not None:
+                return artifact_fallback
             return TaskResult(
                 task_id=task.task_id,
                 status="failure",
@@ -326,10 +472,18 @@ class DeepAgentMiniAgentRunner:
                 error=artifact_verification_failure,
                 context_out=output_text,
             )
+        verifier_success_output = _artifact_verification_success_output_for_task(
+            config,
+            context_in=context_in,
+        )
+        if verifier_success_output:
+            output_text = verifier_success_output
         context_out = _context_out_for_task(
             config,
             output_text=output_text,
             deliverable_artifacts=deliverable_artifacts,
+            tool_results=tool_results,
+            context_in=context_in,
         )
         completion_decision = await _scheduled_task_completion_decision(
             config,
@@ -378,6 +532,27 @@ class DeepAgentMiniAgentRunner:
             )
 
 
+def _config_with_resolved_context_in(config: Any, context_bus: Any) -> Any:
+    if getattr(config, "context_in", None) is not None:
+        return config
+    task = getattr(config, "task", None)
+    context_key = str(getattr(task, "context_key_in", "") or "").strip()
+    if not context_key or context_bus is None:
+        return config
+    try:
+        context_in = context_bus.get(context_key, group_id=getattr(task, "group_id", None))
+    except Exception:
+        logger.debug("Could not resolve mini-agent context key %s", context_key, exc_info=True)
+        return config
+    if context_in is None:
+        return config
+    try:
+        return replace(config, context_in=context_in)
+    except Exception:
+        logger.debug("Could not attach resolved mini-agent context key %s", context_key, exc_info=True)
+        return config
+
+
 def _is_scheduled_background_config(config: Any) -> bool:
     task = getattr(config, "task", None)
     metadata = getattr(task, "metadata", None)
@@ -403,6 +578,1487 @@ def _should_emit_best_effort_scheduled_result(config: Any, tool_results: list[An
         # context for downstream report/artifact steps.
         return False
     return bool(_completed_tool_results(tool_results))
+
+
+async def _persist_context_handoff_from_tool_evidence(
+    config: Any,
+    *,
+    tool_registry: Any,
+    tool_results: list[Any],
+    progress_queue: asyncio.Queue,
+) -> None:
+    task = getattr(config, "task", None)
+    if not getattr(task, "context_key_out", None):
+        return
+    if "file_write" not in _task_allowed_tool_names(task):
+        return
+    if _tool_results_include_durable_data_handoff(tool_results):
+        return
+    records = _browser_item_handoff_records_from_tool_results(tool_results)
+    if not records:
+        return
+    path = _context_handoff_path_for_task(task)
+    payload = {
+        "schema": _STRUCTURED_HANDOFF_SCHEMA,
+        "task_id": getattr(task, "task_id", None),
+        "group_id": getattr(task, "group_id", None),
+        "source": "browser_tool_results",
+        "record_count": len(records),
+        "records": records,
+    }
+    await _emit_progress(
+        progress_queue,
+        config=config,
+        kind="progress_note",
+        message="Saving structured handoff data for dependent task.",
+        data={"phase": "context_handoff", "record_count": len(records)},
+    )
+    result = await _invoke_tool_registry(
+        tool_registry,
+        ToolInvocation(
+            str(uuid4()),
+            "file_write",
+            task.principal_id,
+            {
+                "path": str(path),
+                "content": json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            },
+            capsule_id=task.task_id,
+        ),
+    )
+    tool_results.append(result)
+    _emit_tool_progress(progress_queue, config=config, result=result)
+    if str(getattr(result, "status", "") or "").strip().lower() not in {"completed", "success", "succeeded"}:
+        logger.warning(
+            "DeepAgent context handoff file_write failed agent_id=%s task_id=%s error=%s",
+            getattr(config, "agent_id", ""),
+            str(getattr(task, "task_id", "") or ""),
+            str(getattr(result, "error", "") or ""),
+        )
+
+
+def _tool_results_include_durable_data_handoff(tool_results: list[Any]) -> bool:
+    for item in _context_workspace_files_from_tool_results(tool_results):
+        if _workspace_file_has_parseable_handoff_records(item.get("path")):
+            return True
+    return False
+
+
+def _workspace_file_has_parseable_handoff_records(value: Any) -> bool:
+    path = _existing_file_path(value)
+    if path is None:
+        return False
+
+    def add_from_value(candidate: Any) -> bool:
+        for item in _browser_item_candidates_from_value(candidate):
+            if _normalized_browser_item_record(item) is not None:
+                return True
+        return False
+
+    return bool(_append_browser_item_records_from_file(path, add_from_value=add_from_value))
+
+
+def _browser_item_handoff_records_from_tool_results(
+    tool_results: list[Any],
+    *,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for result in tool_results or []:
+        status = str(getattr(result, "status", "") or "").strip().lower()
+        if status not in {"completed", "success", "succeeded"}:
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "").strip()
+        if tool_name not in {"browser_extract_items", "browser_extract_text", "browser_run_js"}:
+            continue
+        for item in _browser_item_candidates_from_value(getattr(result, "output", None)):
+            normalized = _normalized_browser_item_record(item)
+            if normalized is None:
+                continue
+            signature = _browser_item_record_signature(normalized)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            record = {"index": len(records) + 1, **normalized}
+            record["source_fields"] = item
+            record["source_tool"] = tool_name
+            records.append(record)
+            if len(records) >= limit:
+                return records
+    return records
+
+
+def _context_handoff_path_for_task(task: Any) -> Path:
+    roots = workspace_storage_roots_for_principal(getattr(task, "principal_id", None))
+    stem = _artifact_fallback_file_stem(task) or "context_handoff"
+    return roots.files / f"{stem}_context_handoff_{uuid4().hex[:12]}.json"
+
+
+async def _artifact_task_fallback_from_tool_evidence(
+    config: Any,
+    *,
+    tool_registry: Any,
+    tool_results: list[Any],
+    progress_queue: asyncio.Queue,
+) -> TaskResult | None:
+    if not _task_requires_user_file_delivery(config.task):
+        return None
+    if not _task_accepts_spreadsheet_artifact(config.task):
+        return None
+    if "spreadsheet_create" not in _task_allowed_tool_names(config.task):
+        return None
+    item_records = _browser_item_records_from_tool_results(tool_results)
+    if not item_records:
+        item_records = _browser_item_records_from_context(getattr(config, "context_in", None))
+    if not item_records:
+        return None
+    required_image_urls = _browser_item_media_urls(item_records)
+    image_paths_by_url: dict[str, str] = {}
+    if required_image_urls and "browser_image_collect" not in _task_allowed_tool_names(config.task):
+        return _artifact_fallback_failure_result(
+            config,
+            "Collected records include media URLs, but no scoped media collection tool is available for this artifact task.",
+            tool_results=tool_results,
+            context_in=getattr(config, "context_in", None),
+        )
+    if "browser_image_collect" in _task_allowed_tool_names(config.task):
+        image_paths_by_url = await _collect_browser_item_images(
+            config,
+            tool_registry=tool_registry,
+            tool_results=tool_results,
+            item_records=item_records,
+            progress_queue=progress_queue,
+        )
+    missing_image_urls = [url for url in required_image_urls if not image_paths_by_url.get(url)]
+    collected_image_urls = [url for url in required_image_urls if image_paths_by_url.get(url)]
+    if missing_image_urls and not collected_image_urls:
+        return _artifact_fallback_failure_result(
+            config,
+            (
+                "Could not materialize local media artifacts for "
+                f"{len(missing_image_urls)} of {len(required_image_urls)} structured media URL(s)."
+            ),
+            tool_results=tool_results,
+            context_in=getattr(config, "context_in", None),
+        )
+    if missing_image_urls:
+        await _emit_progress(
+            progress_queue,
+            config=config,
+            kind="progress_note",
+            message=(
+                "Some structured media could not be collected; continuing with the "
+                "available local media artifacts."
+            ),
+            data={
+                "phase": "artifact_evidence_fallback",
+                "collected_media_count": len(collected_image_urls),
+                "missing_media_count": len(missing_image_urls),
+            },
+        )
+    rows = _spreadsheet_rows_from_browser_item_records(item_records, image_paths_by_url=image_paths_by_url)
+    if not rows:
+        return None
+    columns = _spreadsheet_columns_from_browser_item_rows(rows)
+    output_path = artifact_path_for_generated_workspace_file(
+        principal_id=config.task.principal_id,
+        suffix=".xlsx",
+        stem=_artifact_fallback_file_stem(config.task),
+    )
+    await _emit_progress(
+        progress_queue,
+        config=config,
+        kind="progress_note",
+        message="Creating workbook from verified collected data.",
+        data={"phase": "artifact_evidence_fallback"},
+    )
+    result = await _invoke_tool_registry(
+        tool_registry,
+        ToolInvocation(
+            str(uuid4()),
+            "spreadsheet_create",
+            config.task.principal_id,
+                {
+                    "title": str(getattr(config.task, "title", "") or "Collected items"),
+                    "sheet_name": "Items",
+                    "columns": columns,
+                    "rows": rows,
+                    "expected_rows": len(rows),
+                    "output_path": str(output_path),
+                },
+                capsule_id=config.task.task_id,
+            ),
+    )
+    tool_results.append(result)
+    _emit_tool_progress(progress_queue, config=config, result=result)
+    if str(getattr(result, "status", "") or "").lower() not in {"completed", "success", "succeeded"}:
+        return None
+    artifacts = artifact_paths_from_tool_results([result])
+    artifacts = _relocate_external_artifact_paths_for_task(config, artifacts)
+    deliverable_artifacts = _deliverable_artifact_paths_for_task(config, artifacts)
+    if not deliverable_artifacts:
+        return None
+    media_failure = _artifact_fallback_media_delivery_failure(deliverable_artifacts, collected_image_urls)
+    if media_failure is not None:
+        return _artifact_fallback_failure_result(
+            config,
+            media_failure,
+            tool_results=tool_results,
+            context_in=getattr(config, "context_in", None),
+        )
+    content_obligations = {
+        "item_count": len(rows),
+        "spreadsheet_row_floor": len(rows),
+        "spreadsheet_row_contract": True,
+        "image_count": len(collected_image_urls),
+        "requires_media": bool(required_image_urls and collected_image_urls),
+    }
+    if _artifact_content_delivery_failure_for_obligations(deliverable_artifacts, content_obligations) is not None:
+        return None
+    output_text = _artifact_delivery_success_output_text(deliverable_artifacts)
+    context_out = _context_out_for_task(
+        config,
+        output_text=output_text,
+        deliverable_artifacts=deliverable_artifacts,
+        tool_results=tool_results,
+        context_in=getattr(config, "context_in", None),
+    )
+    return TaskResult(
+        task_id=config.task.task_id,
+        status="success",
+        output=output_text,
+        artifacts=deliverable_artifacts,
+        context_out=context_out,
+    )
+
+
+def _artifact_fallback_failure_result(
+    config: Any,
+    error: str,
+    *,
+    tool_results: list[Any],
+    context_in: Any,
+) -> TaskResult:
+    context_out = _context_out_for_task(
+        config,
+        output_text=error,
+        deliverable_artifacts=[],
+        tool_results=tool_results,
+        context_in=context_in,
+    )
+    return TaskResult(
+        task_id=config.task.task_id,
+        status="failure",
+        error=error,
+        context_out=context_out,
+    )
+
+
+async def _retry_spreadsheet_after_remote_image_failure(
+    config: Any,
+    *,
+    tool_registry: Any,
+    tool_results: list[Any],
+    progress_queue: asyncio.Queue,
+) -> TaskResult | None:
+    if not _task_requires_user_file_delivery(config.task):
+        return None
+    if not _task_accepts_spreadsheet_artifact(config.task):
+        return None
+    if not {"spreadsheet_create", "browser_image_collect"}.issubset(_task_allowed_tool_names(config.task)):
+        return None
+    failed_result = _latest_remote_image_spreadsheet_failure(tool_results)
+    if failed_result is None:
+        return None
+    paths_by_url = await _collect_remote_spreadsheet_images(
+        config,
+        failed_result=failed_result,
+        tool_registry=tool_registry,
+        tool_results=tool_results,
+        progress_queue=progress_queue,
+    )
+    retry_arguments = _spreadsheet_retry_arguments_with_local_images(failed_result, paths_by_url)
+    if retry_arguments is None:
+        return None
+    await _emit_progress(
+        progress_queue,
+        config=config,
+        kind="progress_note",
+        message="Retrying workbook with saved local image artifacts.",
+        data={"phase": "remote_image_materialization"},
+    )
+    retry_result = await _invoke_tool_registry(
+        tool_registry,
+        ToolInvocation(
+            str(uuid4()),
+            "spreadsheet_create",
+            config.task.principal_id,
+            retry_arguments,
+            capsule_id=config.task.task_id,
+        ),
+    )
+    tool_results.append(retry_result)
+    _emit_tool_progress(progress_queue, config=config, result=retry_result)
+    if str(getattr(retry_result, "status", "") or "").lower() not in {"completed", "success", "succeeded"}:
+        return None
+    artifacts = artifact_paths_from_tool_results([retry_result])
+    artifacts = _relocate_external_artifact_paths_for_task(config, artifacts)
+    deliverable_artifacts = _deliverable_artifact_paths_for_task(config, artifacts)
+    if not deliverable_artifacts:
+        return None
+    output_text = _artifact_delivery_success_output_text(deliverable_artifacts)
+    context_out = _context_out_for_task(
+        config,
+        output_text=output_text,
+        deliverable_artifacts=deliverable_artifacts,
+        tool_results=tool_results,
+        context_in=getattr(config, "context_in", None),
+    )
+    return TaskResult(
+        task_id=config.task.task_id,
+        status="success",
+        output=output_text,
+        artifacts=deliverable_artifacts,
+        context_out=context_out,
+    )
+
+
+def _latest_remote_image_spreadsheet_failure(tool_results: list[Any]) -> Any | None:
+    for result in reversed(tool_results or []):
+        if str(getattr(result, "tool_name", "") or "").strip() != "spreadsheet_create":
+            continue
+        status = str(getattr(result, "status", "") or "").strip().lower()
+        if status in {"completed", "success", "succeeded"}:
+            continue
+        output = getattr(result, "output", None)
+        if not isinstance(output, dict):
+            continue
+        if str(output.get("reason") or "").strip() == "remote_image_paths_not_supported":
+            return result
+        remote_urls = output.get("remote_image_urls")
+        if isinstance(remote_urls, (list, tuple)) and any(str(url or "").strip() for url in remote_urls):
+            return result
+    return None
+
+
+async def _collect_remote_spreadsheet_images(
+    config: Any,
+    *,
+    failed_result: Any,
+    tool_registry: Any,
+    tool_results: list[Any],
+    progress_queue: asyncio.Queue,
+) -> dict[str, str]:
+    urls = _remote_spreadsheet_image_urls(failed_result)
+    if not urls:
+        return {}
+    paths_by_url: dict[str, str] = {}
+    for chunk_index, start in enumerate(range(0, len(urls), 20), start=1):
+        chunk = urls[start : start + 20]
+        result = await _invoke_tool_registry(
+            tool_registry,
+            ToolInvocation(
+                str(uuid4()),
+                "browser_image_collect",
+                config.task.principal_id,
+                {
+                    "image_urls": chunk,
+                    "max_images": len(chunk),
+                    "output_stem": f"{_artifact_fallback_file_stem(config.task)}_retry_image_{chunk_index}",
+                    "quality_profile": "content",
+                    "timeout_seconds": 30,
+                },
+                capsule_id=config.task.task_id,
+            ),
+        )
+        tool_results.append(result)
+        _emit_tool_progress(progress_queue, config=config, result=result)
+        output = getattr(result, "output", None)
+        if not isinstance(output, dict):
+            continue
+        for image in output.get("images") or ():
+            if not isinstance(image, dict):
+                continue
+            local_path = str(image.get("local_path") or image.get("artifact_path") or "").strip()
+            if not local_path:
+                continue
+            for key in ("source_url", "final_url", "url"):
+                url = str(image.get(key) or "").strip()
+                if url:
+                    paths_by_url[url] = local_path
+        image_paths = output.get("image_paths")
+        if isinstance(image_paths, (list, tuple)):
+            for url, local_path in zip(chunk, image_paths, strict=False):
+                if isinstance(local_path, str) and local_path.strip():
+                    paths_by_url.setdefault(str(url), local_path.strip())
+    return paths_by_url
+
+
+def _remote_spreadsheet_image_urls(failed_result: Any) -> list[str]:
+    output = getattr(failed_result, "output", None)
+    if not isinstance(output, dict):
+        return []
+    urls: list[str] = []
+    remote_urls = output.get("remote_image_urls")
+    if isinstance(remote_urls, (list, tuple)):
+        urls.extend(str(url).strip() for url in remote_urls if isinstance(url, str) and url.strip())
+    invocation_args = output.get("invocation_arguments")
+    if isinstance(invocation_args, dict):
+        urls.extend(_remote_image_urls_from_spreadsheet_arguments(invocation_args))
+    return list(dict.fromkeys(url for url in urls if url.lower().startswith(("http://", "https://"))))
+
+
+def _spreadsheet_retry_arguments_with_local_images(failed_result: Any, paths_by_url: dict[str, str]) -> dict[str, Any] | None:
+    if not paths_by_url:
+        return None
+    output = getattr(failed_result, "output", None)
+    output = output if isinstance(output, dict) else {}
+    source_args = output.get("invocation_arguments")
+    if not isinstance(source_args, dict):
+        return None
+    arguments = json.loads(json.dumps(source_args, default=str))
+    changed = _replace_remote_image_urls_in_spreadsheet_arguments(arguments, paths_by_url)
+    return arguments if changed else None
+
+
+def _remote_image_urls_from_spreadsheet_arguments(arguments: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    raw_image_paths = arguments.get("image_paths")
+    if isinstance(raw_image_paths, (list, tuple)):
+        urls.extend(str(value).strip() for value in raw_image_paths if _is_remote_url_text(value))
+    rows = arguments.get("rows")
+    if isinstance(rows, (list, tuple)):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in ("image_path", "image_paths", "image"):
+                value = row.get(key)
+                if _is_remote_url_text(value):
+                    urls.append(str(value).strip())
+                elif isinstance(value, (list, tuple)):
+                    urls.extend(str(item).strip() for item in value if _is_remote_url_text(item))
+    return urls
+
+
+def _replace_remote_image_urls_in_spreadsheet_arguments(arguments: dict[str, Any], paths_by_url: dict[str, str]) -> bool:
+    changed = False
+    raw_image_paths = arguments.get("image_paths")
+    if isinstance(raw_image_paths, list):
+        for index, value in enumerate(raw_image_paths):
+            replacement = paths_by_url.get(str(value or "").strip())
+            if replacement:
+                raw_image_paths[index] = replacement
+                changed = True
+    rows = arguments.get("rows")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in ("image_path", "image"):
+                replacement = paths_by_url.get(str(row.get(key) or "").strip())
+                if replacement:
+                    row[key] = replacement
+                    changed = True
+            value = row.get("image_paths")
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    replacement = paths_by_url.get(str(item or "").strip())
+                    if replacement:
+                        value[index] = replacement
+                        changed = True
+            else:
+                replacement = paths_by_url.get(str(value or "").strip())
+                if replacement:
+                    row["image_paths"] = [replacement]
+                    changed = True
+    return changed
+
+
+def _is_remote_url_text(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower().startswith(("http://", "https://"))
+
+
+async def _context_task_fallback_from_tool_evidence(
+    config: Any,
+    *,
+    tool_registry: Any,
+    tool_results: list[Any],
+    progress_queue: asyncio.Queue,
+) -> TaskResult | None:
+    task = getattr(config, "task", None)
+    if _task_requires_user_file_delivery(task):
+        return None
+    if not getattr(task, "context_key_out", None):
+        return None
+    if not _completed_tool_results(tool_results):
+        return None
+    await _persist_context_handoff_from_tool_evidence(
+        config,
+        tool_registry=tool_registry,
+        tool_results=tool_results,
+        progress_queue=progress_queue,
+    )
+    workspace_files = _context_workspace_files_from_tool_results(tool_results)
+    if not workspace_files:
+        return None
+    output_text = _generic_tool_evidence_answer(config, _completed_tool_results(tool_results))
+    context_out = _context_out_for_task(
+        config,
+        output_text=output_text,
+        deliverable_artifacts=[],
+        tool_results=tool_results,
+        context_in=getattr(config, "context_in", None),
+    )
+    return TaskResult(
+        task_id=task.task_id,
+        status="success",
+        output=output_text,
+        context_out=context_out,
+    )
+
+
+def _task_accepts_spreadsheet_artifact(task: Any) -> bool:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    kind = str(metadata.get("required_artifact_kind") or "").strip().lower().removeprefix(".")
+    output = getattr(task, "output", None)
+    output_kind = str(getattr(output, "artifact_kind", "") or "").strip().lower().removeprefix(".")
+    return kind in {"xlsx", "xls", "csv", "tsv", "spreadsheet"} or output_kind in {
+        "xlsx",
+        "xls",
+        "csv",
+        "tsv",
+        "spreadsheet",
+    }
+
+
+def _task_allowed_tool_names(task: Any) -> set[str]:
+    names = {str(tool or "").strip() for tool in (getattr(task, "allowed_tools", ()) or ()) if str(tool or "").strip()}
+    metadata = getattr(task, "metadata", None)
+    if isinstance(metadata, dict):
+        names.update(str(tool or "").strip() for tool in (metadata.get("allowed_tools") or ()) if str(tool or "").strip())
+    return names
+
+
+def _browser_item_records_from_tool_results(tool_results: list[Any], *, limit: int = 250) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for result in tool_results or []:
+        status = str(getattr(result, "status", "") or "").strip().lower()
+        if status not in {"completed", "success", "succeeded"}:
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "").strip()
+        if tool_name not in {"browser_extract_items", "browser_extract_text", "browser_run_js"}:
+            continue
+        for item in _browser_item_candidates_from_value(getattr(result, "output", None)):
+            record = _normalized_browser_item_record(item)
+            if record is None:
+                continue
+            signature = _browser_item_record_signature(record)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            records.append(record)
+            if len(records) >= limit:
+                return records
+    return records
+
+
+def _browser_item_records_from_context(context_in: Any, *, limit: int = 250) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    seen_urls: set[str] = set()
+
+    def add_item(item: dict[str, Any]) -> bool:
+        record = _normalized_browser_item_record(item)
+        if record is None:
+            return False
+        url = str(record.get("url") or "").strip()
+        if url and url in seen_urls:
+            return False
+        signature = _browser_item_record_signature(record)
+        if signature in seen:
+            return False
+        seen.add(signature)
+        if url:
+            seen_urls.add(url)
+        records.append(record)
+        return len(records) >= limit
+
+    def add_from_value(value: Any) -> bool:
+        for item in _browser_item_candidates_from_value(value):
+            if add_item(item):
+                return True
+        return False
+
+    add_from_value(context_in)
+    direct_records = list(records)
+
+    file_record_sets: list[list[dict[str, Any]]] = []
+    for item in _context_workspace_files_from_context(context_in):
+        path = _existing_file_path(item.get("path"))
+        if path is None:
+            continue
+        file_records = _browser_item_records_from_file(path, limit=limit)
+        if file_records:
+            file_record_sets.append(file_records)
+    if file_record_sets:
+        best_file_records = _select_best_browser_item_record_set(file_record_sets)
+        if not direct_records or len(_exportable_browser_item_records(best_file_records)) > len(
+            _exportable_browser_item_records(direct_records)
+        ):
+            records = best_file_records
+        else:
+            records = direct_records
+    else:
+        records = direct_records
+    if records:
+        _enrich_browser_item_records_from_context_workspace_files(records, context_in)
+    return records
+
+
+def _enrich_browser_item_records_from_context_workspace_files(
+    records: list[dict[str, Any]],
+    context_in: Any,
+) -> None:
+    if not records:
+        return
+    records_by_url = {
+        str(record.get("url") or "").strip(): record
+        for record in records
+        if str(record.get("url") or "").strip()
+    }
+    if not records_by_url:
+        return
+    for source_record in _browser_item_records_from_context_workspace_files(context_in):
+        url = str(source_record.get("url") or "").strip()
+        target = records_by_url.get(url)
+        if target is None:
+            continue
+        _merge_browser_item_record_fields(target, source_record)
+
+
+def _browser_item_records_from_context_workspace_files(context_in: Any, *, limit: int = 500) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_item(item: dict[str, Any]) -> bool:
+        record = _normalized_browser_item_record(item)
+        if record is None:
+            return False
+        signature = _browser_item_record_signature(record)
+        if signature in seen:
+            return False
+        seen.add(signature)
+        records.append(record)
+        return len(records) >= limit
+
+    def add_from_value(value: Any) -> bool:
+        for item in _browser_item_candidates_from_value(value):
+            if add_item(item):
+                return True
+        return False
+
+    for item in _context_workspace_files_from_context(context_in):
+        path = _existing_file_path(item.get("path"))
+        if path is None:
+            continue
+        if _append_browser_item_records_from_file(path, add_from_value=add_from_value):
+            break
+    return records
+
+
+def _browser_item_records_from_file(path: Path, *, limit: int = 250) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_item(item: dict[str, Any]) -> bool:
+        record = _normalized_browser_item_record(item)
+        if record is None:
+            return False
+        signature = _browser_item_record_signature(record)
+        if signature in seen:
+            return False
+        seen.add(signature)
+        records.append(record)
+        return len(records) >= limit
+
+    def add_from_value(value: Any) -> bool:
+        for item in _browser_item_candidates_from_value(value):
+            if add_item(item):
+                return True
+        return False
+
+    _append_browser_item_records_from_file(path, add_from_value=add_from_value)
+    return records
+
+
+def _select_best_browser_item_record_set(record_sets: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    if not record_sets:
+        return []
+
+    def score(records: list[dict[str, Any]]) -> tuple[int, int, int, int]:
+        exportable = _exportable_browser_item_records(records)
+        with_url = sum(1 for record in exportable if str(record.get("url") or "").strip())
+        with_image = sum(1 for record in exportable if str(record.get("image_url") or "").strip())
+        return (len(exportable), with_url, with_image, len(records))
+
+    return max(record_sets, key=score)
+
+
+def _merge_browser_item_record_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in ("image_url", "source_text"):
+        if not str(target.get(key) or "").strip() and str(source.get(key) or "").strip():
+            target[key] = source[key]
+    target_extras = target.get("extra_fields")
+    if not isinstance(target_extras, dict):
+        target_extras = {}
+        target["extra_fields"] = target_extras
+    source_extras = source.get("extra_fields")
+    if isinstance(source_extras, dict):
+        for key, value in source_extras.items():
+            if key not in target_extras and str(value or "").strip():
+                target_extras[key] = value
+
+
+def _append_browser_item_records_from_file(path: Path, *, add_from_value) -> bool:  # noqa: ANN001
+    suffix = path.suffix.lower()
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if suffix in {".json", ".txt"}:
+        if size > _STRUCTURED_HANDOFF_MAX_FILE_BYTES:
+            return False
+        try:
+            text = path.read_text(encoding="utf-8")
+            if suffix == ".json":
+                return bool(add_from_value(json.loads(text)))
+            return bool(add_from_value(text))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            logger.debug("Could not read structured text handoff file %s", path, exc_info=True)
+            return False
+    if suffix not in {".csv", ".tsv"}:
+        return False
+    delimiter = "\t" if suffix == ".tsv" else ","
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter=delimiter)
+            for row in reader:
+                if add_from_value(row):
+                    return True
+    except (OSError, UnicodeDecodeError, csv.Error):
+        logger.debug("Could not read structured delimited handoff file %s", path, exc_info=True)
+    return False
+
+
+def _browser_item_candidates_from_value(value: Any, *, depth: int = 0) -> list[dict[str, Any]]:
+    if depth > 5:
+        return []
+    candidates: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        lowered = {str(key).strip().lower(): item for key, item in value.items()}
+        is_item_mapping = _looks_like_browser_item_mapping(lowered)
+        if is_item_mapping:
+            candidates.append(dict(value))
+        for key in (
+            "items",
+            "records",
+            "rows",
+            "data",
+            "output",
+            "result",
+            "summary",
+            "result_summary",
+            "payload",
+            "source_fields",
+            "sourcefields",
+            "fields",
+            "text",
+            "content",
+            "body",
+        ):
+            if is_item_mapping and key in {"source_fields", "sourcefields", "fields", "text", "content", "body"}:
+                continue
+            nested = lowered.get(key)
+            if nested is not None and nested is not value:
+                candidates.extend(_browser_item_candidates_from_value(nested, depth=depth + 1))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            candidates.extend(_browser_item_candidates_from_value(item, depth=depth + 1))
+    elif isinstance(value, str):
+        parsed = _json_like_browser_value_from_text(value)
+        if parsed is not None:
+            candidates.extend(_browser_item_candidates_from_value(parsed, depth=depth + 1))
+        else:
+            candidates.extend(_markdown_table_records_from_text(value))
+    return candidates
+
+
+def _json_like_browser_value_from_text(value: str) -> Any | None:
+    text = value.strip()
+    if not text or len(text.encode("utf-8", errors="ignore")) > _STRUCTURED_HANDOFF_MAX_FILE_BYTES:
+        return None
+    if text.lower().startswith("pretty-print"):
+        text = "\n".join(text.splitlines()[1:]).strip()
+    starts = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+    if starts:
+        text = text[min(starts) :].strip()
+    if not text.startswith(("{", "[")):
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        parsed, _end = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed
+
+
+def _markdown_table_records_from_text(value: str, *, limit: int = 500) -> list[dict[str, Any]]:
+    lines = [line.strip() for line in str(value or "").splitlines()]
+    records: list[dict[str, Any]] = []
+    index = 0
+    while index + 2 < len(lines):
+        header_line = lines[index]
+        separator_line = lines[index + 1]
+        if not _looks_like_markdown_table_separator(separator_line):
+            index += 1
+            continue
+        headers = _markdown_table_cells(header_line)
+        separators = _markdown_table_cells(separator_line)
+        if not headers or len(headers) < 2 or len(separators) < len(headers):
+            index += 1
+            continue
+        row_index = index + 2
+        while row_index < len(lines):
+            row_line = lines[row_index]
+            if not row_line or "|" not in row_line:
+                break
+            cells = _markdown_table_cells(row_line)
+            if not cells:
+                break
+            row: dict[str, Any] = {}
+            for column_index, header in enumerate(headers):
+                cell = cells[column_index] if column_index < len(cells) else ""
+                if header:
+                    row[header] = cell
+            if row:
+                records.append(row)
+                if len(records) >= limit:
+                    return records
+            row_index += 1
+        index = max(row_index, index + 1)
+    return records
+
+
+def _looks_like_markdown_table_separator(line: str) -> bool:
+    cells = _markdown_table_cells(line)
+    return len(cells) >= 2 and all(_MARKDOWN_TABLE_SEPARATOR_RE.match(cell.strip()) for cell in cells if cell.strip())
+
+
+def _markdown_table_cells(line: str) -> list[str]:
+    text = str(line or "").strip()
+    if "|" not in text:
+        return []
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    return [_clean_markdown_table_cell(cell) for cell in text.split("|")]
+
+
+def _clean_markdown_table_cell(cell: str) -> str:
+    text = str(cell or "").strip()
+    link_match = re.fullmatch(r"\[([^\]]+)\]\((https?://[^)]+)\)", text)
+    if link_match:
+        return f"{link_match.group(1).strip()} {link_match.group(2).strip()}".strip()
+    return " ".join(text.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ").split())
+
+
+def _looks_like_browser_item_mapping(mapping: dict[str, Any]) -> bool:
+    markers = {
+        "title",
+        "name",
+        "url",
+        "href",
+        "link",
+        "image",
+        "image_url",
+        "imageurl",
+        "src",
+        "thumbnail",
+        "thumbnail_url",
+        "text",
+        "content",
+        "body",
+    }
+    if len(set(mapping).intersection(markers)) >= 2:
+        return True
+    if _looks_like_record_collection_envelope(mapping):
+        return False
+    return _mapping_has_url_value(mapping) and _mapping_has_non_url_scalar_value(mapping)
+
+
+def _looks_like_record_collection_envelope(mapping: dict[str, Any]) -> bool:
+    container_keys = {
+        "items",
+        "records",
+        "rows",
+        "data",
+        "output",
+        "result",
+        "payload",
+    }
+    for key, value in mapping.items():
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key not in container_keys:
+            continue
+        if isinstance(value, (list, tuple, dict)):
+            return True
+    return False
+
+
+def _mapping_has_url_value(mapping: dict[str, Any]) -> bool:
+    return any(_direct_url_from_structured_field_value(value) for value in mapping.values())
+
+
+def _mapping_has_non_url_scalar_value(mapping: dict[str, Any]) -> bool:
+    for value in mapping.values():
+        text = _direct_text_from_structured_field_value(value)
+        if not text:
+            continue
+        if _URL_IN_TEXT_RE.fullmatch(text.strip()):
+            continue
+        return True
+    return False
+
+
+def _direct_url_from_structured_field_value(value: Any) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower().startswith(("http://", "https://")):
+            return text
+        return ""
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            if isinstance(nested_value, str):
+                text = nested_value.strip()
+                if text.lower().startswith(("http://", "https://")):
+                    return text
+    return ""
+
+
+def _direct_text_from_structured_field_value(value: Any) -> str:
+    if isinstance(value, (str, int, float, bool)):
+        return " ".join(str(value).split())[:1200]
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            if isinstance(nested_value, (str, int, float, bool)):
+                text = " ".join(str(nested_value).split())[:1200]
+                if text:
+                    return text
+    return ""
+
+
+def _browser_item_record_signature(record: dict[str, Any]) -> tuple[str, str, str]:
+    url = str(record.get("url") or "").strip()
+    title_key = _normalized_record_signature_text(record.get("title"))
+    if url:
+        url_key = _normalized_url_signature_key(url)
+        if title_key:
+            tail_key = _normalized_url_tail_signature_key(url)
+            if tail_key:
+                return ("url-tail-title", tail_key, title_key)
+        return ("url", url_key or url, "")
+    return (
+        "record",
+        title_key,
+        str(record.get("image_url") or "").strip(),
+    )
+
+
+def _normalized_record_signature_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _normalized_url_signature_key(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return str(url or "").strip()
+    path = re.sub(r"/+", "/", parsed.path or "/").rstrip("/") or "/"
+    return f"{parsed.scheme.lower()}://{(parsed.netloc or '').lower()}{path}"
+
+
+def _normalized_url_tail_signature_key(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if not parsed.netloc:
+        return ""
+    segments = [segment for segment in re.split(r"/+", parsed.path or "") if segment]
+    if not segments:
+        return ""
+    tail = segments[-1].strip().casefold()
+    if not tail:
+        return ""
+    return f"{(parsed.netloc or '').lower()}/{tail}"
+
+
+def _first_url_from_structured_values(mappings: list[dict[str, Any]], *, image_only: bool) -> str:
+    fallback = ""
+    for mapping in mappings:
+        for value in mapping.values():
+            url = _first_url_from_value(value, image_only=image_only)
+            if not url:
+                continue
+            if image_only or not _looks_like_image_url(url):
+                return url
+            if not fallback:
+                fallback = url
+    return fallback if image_only else ""
+
+
+def _first_url_from_value(value: Any, *, image_only: bool) -> str:
+    if isinstance(value, str):
+        match = _URL_IN_TEXT_RE.search(value.strip())
+        if not match:
+            return ""
+        url = match.group(0).rstrip(".,;:")
+        if image_only and not _looks_like_image_url(url):
+            return ""
+        return url
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            url = _first_url_from_value(nested_value, image_only=image_only)
+            if url:
+                return url
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            url = _first_url_from_value(item, image_only=image_only)
+            if url:
+                return url
+    return ""
+
+
+def _first_non_url_text_from_structured_values(mappings: list[dict[str, Any]]) -> str:
+    fallback = ""
+    for mapping in mappings:
+        for value in mapping.values():
+            text = _extra_text_for_browser_item_field(value)
+            if not text or _URL_IN_TEXT_RE.fullmatch(text.strip()):
+                continue
+            if not fallback:
+                fallback = text
+            if any(character.isalpha() for character in text):
+                return text
+    return fallback
+
+
+def _normalized_browser_item_record(item: dict[str, Any]) -> dict[str, Any] | None:
+    source_mappings = _structured_source_field_mappings(item)
+    title = _first_text_field_from_mappings(
+        [*source_mappings, item],
+        ("title", "name", "label", "heading"),
+    )
+    url = _first_url_field_from_mappings(
+        [item, *source_mappings],
+        (
+            "url",
+            "href",
+            "link",
+            "canonical_url",
+            "canonicalUrl",
+        ),
+    )
+    if not url:
+        url = _first_url_from_structured_values([item, *source_mappings], image_only=False)
+    image_url = _first_url_field(
+        item,
+        ("image_url", "imageUrl", "image", "src", "thumbnail", "thumbnail_url", "thumbnailUrl", "featured_image"),
+        image_only=True,
+    )
+    if not image_url:
+        image_url = _first_url_field_from_mappings(
+            source_mappings,
+            ("image_url", "imageUrl", "image", "src", "thumbnail", "thumbnail_url", "thumbnailUrl", "featured_image"),
+            image_only=True,
+        )
+    if not image_url:
+        image_url = _first_url_from_structured_values([item, *source_mappings], image_only=True)
+    source_text = _first_text_field_from_mappings(
+        [item, *source_mappings],
+        ("text", "content", "body", "summary", "aria_label", "ariaLabel"),
+    )
+    extra_fields = _extra_browser_item_fields(item, source_mappings=source_mappings)
+    if not title:
+        title = _first_non_url_text_from_structured_values([item, *source_mappings])
+    if not any((title, url, image_url, source_text, extra_fields)):
+        return None
+    if not title:
+        title = url or source_text or "Item"
+    record = {
+        "title": title,
+        "url": url,
+        "image_url": image_url,
+        "source_text": source_text,
+    }
+    if extra_fields:
+        record["extra_fields"] = extra_fields
+    return record
+
+
+def _structured_source_field_mappings(item: dict[str, Any]) -> list[dict[str, Any]]:
+    mappings: list[dict[str, Any]] = []
+    for key in ("source_fields", "sourceFields", "fields"):
+        value = _case_insensitive_mapping_value(item, key)
+        if isinstance(value, dict):
+            mappings.append(dict(value))
+    return mappings
+
+
+def _first_text_field_from_mappings(mappings: list[dict[str, Any]], keys: tuple[str, ...]) -> str:
+    for mapping in mappings:
+        text = _first_text_field(mapping, keys)
+        if text:
+            return text
+    return ""
+
+
+def _first_url_field_from_mappings(
+    mappings: list[dict[str, Any]],
+    keys: tuple[str, ...],
+    *,
+    image_only: bool = False,
+) -> str:
+    for mapping in mappings:
+        url = _first_url_field(mapping, keys, image_only=image_only)
+        if url:
+            return url
+    return ""
+
+
+_BROWSER_ITEM_EXPORT_FIELD_KEYS = {
+    "index",
+    "title",
+    "name",
+    "label",
+    "heading",
+    "url",
+    "href",
+    "link",
+    "canonical_url",
+    "canonicalurl",
+    "image",
+    "image_url",
+    "imageurl",
+    "src",
+    "thumbnail",
+    "thumbnail_url",
+    "thumbnailurl",
+    "featured_image",
+    "body",
+    "content",
+    "text",
+    "aria_label",
+    "arialabel",
+    "source_fields",
+    "sourcefields",
+    "fields",
+    "source_tool",
+    "links",
+    "scripts",
+    "html",
+    "htmllen",
+}
+
+
+def _extra_browser_item_fields(item: dict[str, Any], *, source_mappings: list[dict[str, Any]]) -> dict[str, str]:
+    extras: dict[str, str] = {}
+    for mapping in [*source_mappings, item]:
+        for raw_key, value in mapping.items():
+            key = str(raw_key or "").strip()
+            if not key or key.startswith("_"):
+                continue
+            normalized_key = re.sub(r"[^a-z0-9]+", "", key.lower())
+            if normalized_key in _BROWSER_ITEM_EXPORT_FIELD_KEYS:
+                continue
+            text = _extra_text_for_browser_item_field(value)
+            if not text:
+                continue
+            label = _spreadsheet_label_for_structured_field(key)
+            if label and label not in extras:
+                extras[label] = text
+    return extras
+
+
+def _extra_text_for_browser_item_field(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return " ".join(str(value).split())[:1200]
+    if isinstance(value, dict):
+        for key in ("text", "label", "value", "name", "title", "content"):
+            text = _extra_text_for_browser_item_field(_case_insensitive_mapping_value(value, key))
+            if text:
+                return text
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [_extra_text_for_browser_item_field(item) for item in value[:4]]
+        return " ".join(part for part in parts if part)[:1200]
+    return ""
+
+
+def _spreadsheet_label_for_structured_field(key: str) -> str:
+    words = [word for word in re.split(r"[^A-Za-z0-9]+", key) if word]
+    if not words:
+        return ""
+    return " ".join(word[:1].upper() + word[1:] for word in words)[:80]
+
+
+def _first_text_field(mapping: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = _case_insensitive_mapping_value(mapping, key)
+        text = _text_for_browser_item_field(value)
+        if text:
+            return text
+    return ""
+
+
+def _first_url_field(mapping: dict[str, Any], keys: tuple[str, ...], *, image_only: bool = False) -> str:
+    for key in keys:
+        value = _case_insensitive_mapping_value(mapping, key)
+        url = _url_for_browser_item_field(value, image_only=image_only, structured_image_field=image_only)
+        if url:
+            return url
+    return ""
+
+
+def _case_insensitive_mapping_value(mapping: dict[str, Any], key: str) -> Any:
+    if key in mapping:
+        return mapping[key]
+    key_lower = key.lower()
+    for existing_key, value in mapping.items():
+        if str(existing_key).strip().lower() == key_lower:
+            return value
+    return None
+
+
+def _text_for_browser_item_field(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return " ".join(str(value).split())[:1200]
+    if isinstance(value, dict):
+        for key in ("text", "label", "value", "name", "title", "content"):
+            text = _text_for_browser_item_field(_case_insensitive_mapping_value(value, key))
+            if text:
+                return text
+    if isinstance(value, (list, tuple)):
+        parts = [_text_for_browser_item_field(item) for item in value[:4]]
+        return " ".join(part for part in parts if part)[:1200]
+    return ""
+
+
+def _url_for_browser_item_field(value: Any, *, image_only: bool, structured_image_field: bool = False) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.lower().startswith(("http://", "https://")):
+            return ""
+        if image_only and not structured_image_field and not _looks_like_image_url(text):
+            return ""
+        return text
+    if isinstance(value, dict):
+        for key in ("url", "href", "src", "source_url", "final_url"):
+            url = _url_for_browser_item_field(
+                _case_insensitive_mapping_value(value, key),
+                image_only=image_only,
+                structured_image_field=True if image_only else structured_image_field,
+            )
+            if url:
+                return url
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            url = _url_for_browser_item_field(
+                item,
+                image_only=image_only,
+                structured_image_field=structured_image_field,
+            )
+            if url:
+                return url
+    return ""
+
+
+def _looks_like_image_url(url: str) -> bool:
+    lower = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif")) or "/image" in lower or "/img" in lower
+
+
+async def _collect_browser_item_images(
+    config: Any,
+    *,
+    tool_registry: Any,
+    tool_results: list[Any],
+    item_records: list[dict[str, Any]],
+    progress_queue: asyncio.Queue,
+) -> dict[str, str]:
+    image_urls = list(
+        dict.fromkeys(
+            str(record.get("image_url") or "").strip()
+            for record in item_records
+            if str(record.get("image_url") or "").strip()
+        )
+    )
+    if not image_urls:
+        return {}
+    paths_by_url: dict[str, str] = {}
+    for chunk_index, start in enumerate(range(0, len(image_urls), _BROWSER_ITEM_IMAGE_COLLECT_CHUNK_SIZE), start=1):
+        chunk = image_urls[start : start + _BROWSER_ITEM_IMAGE_COLLECT_CHUNK_SIZE]
+        result = await _invoke_tool_registry(
+            tool_registry,
+            ToolInvocation(
+                str(uuid4()),
+                "browser_image_collect",
+                config.task.principal_id,
+                {
+                    "image_urls": chunk,
+                    "max_images": len(chunk),
+                    "output_stem": f"{_artifact_fallback_file_stem(config.task)}_image_{chunk_index}",
+                    "quality_profile": "content",
+                    "timeout_seconds": 30,
+                },
+                capsule_id=config.task.task_id,
+            ),
+        )
+        tool_results.append(result)
+        _emit_tool_progress(progress_queue, config=config, result=result)
+        output = getattr(result, "output", None)
+        if not isinstance(output, dict):
+            continue
+        for image in output.get("images") or ():
+            if not isinstance(image, dict):
+                continue
+            local_path = str(image.get("local_path") or image.get("artifact_path") or "").strip()
+            if not local_path:
+                continue
+            for key in ("source_url", "final_url"):
+                url = str(image.get(key) or "").strip()
+                if url:
+                    paths_by_url[url] = local_path
+        image_paths = [
+            str(path or "").strip()
+            for path in (output.get("image_paths") or output.get("artifact_paths") or ())
+            if str(path or "").strip()
+        ]
+        for url, local_path in zip(chunk, image_paths, strict=False):
+            paths_by_url.setdefault(url, local_path)
+    return paths_by_url
+
+
+def _browser_item_media_urls(item_records: list[dict[str, Any]]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(record.get("image_url") or "").strip()
+            for record in _exportable_browser_item_records(item_records)
+            if str(record.get("image_url") or "").strip()
+        )
+    )
+
+
+def _artifact_fallback_media_delivery_failure(paths: list[str], required_image_urls: list[str]) -> str | None:
+    if not required_image_urls:
+        return None
+    required_count = len(required_image_urls)
+    for raw_path in paths:
+        path = Path(str(raw_path or ""))
+        if path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            continue
+        summary = _xlsx_artifact_content_summary(path)
+        if summary is None:
+            return f"The spreadsheet artifact could not be inspected as a valid workbook: {path.name}."
+        media_count = int(summary.get("nontrivial_media") or summary.get("media") or 0)
+        if media_count < required_count:
+            return (
+                "The spreadsheet artifact is missing embedded media from structured source rows. "
+                f"Expected {required_count} image item(s); found {media_count}."
+            )
+    return None
+
+
+def _spreadsheet_rows_from_browser_item_records(
+    item_records: list[dict[str, Any]],
+    *,
+    image_paths_by_url: dict[str, str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    export_records = _exportable_browser_item_records(item_records)
+    for index, record in enumerate(export_records, start=1):
+        title = str(record.get("title") or "").strip() or f"Item {index}"
+        url = str(record.get("url") or "").strip()
+        row: dict[str, Any] = {
+            "Index": index,
+            "Title": title,
+            "URL": {"label": title, "url": url} if url else "",
+            "Source Text": str(record.get("source_text") or "").strip(),
+        }
+        image_url = str(record.get("image_url") or "").strip()
+        image_path = image_paths_by_url.get(image_url)
+        if image_path:
+            row["image_path"] = image_path
+        extra_fields = record.get("extra_fields")
+        if isinstance(extra_fields, dict):
+            for key, value in extra_fields.items():
+                label = _spreadsheet_label_for_structured_field(str(key))
+                if label and label not in row:
+                    row[label] = str(value or "").strip()
+        rows.append(row)
+    return rows
+
+
+def _exportable_browser_item_records(item_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records = [record for record in item_records if isinstance(record, dict)]
+    rich_records = [record for record in records if _browser_item_record_has_rich_export_value(record)]
+    return rich_records or records
+
+
+def _browser_item_record_has_rich_export_value(record: dict[str, Any]) -> bool:
+    if any(
+        str(record.get(key) or "").strip()
+        for key in ("image_url", "source_text")
+    ):
+        return True
+    extra_fields = record.get("extra_fields")
+    return isinstance(extra_fields, dict) and any(str(value or "").strip() for value in extra_fields.values())
+
+
+def _spreadsheet_columns_from_browser_item_rows(rows: list[dict[str, Any]]) -> list[str]:
+    columns = [
+        "Index",
+        "Title",
+        "URL",
+        "Source Text",
+    ]
+    seen = set(columns)
+    for row in rows:
+        for key in row:
+            if key == "image_path" or key in seen:
+                continue
+            seen.add(key)
+            columns.append(key)
+    return columns
+
+
+async def _invoke_tool_registry(tool_registry: Any, invocation: ToolInvocation) -> Any:
+    invoke = getattr(tool_registry, "invoke")
+    if inspect.iscoroutinefunction(invoke):
+        return await invoke(invocation)
+    return await asyncio.to_thread(invoke, invocation)
+
+
+def _artifact_fallback_file_stem(task: Any) -> str:
+    source = str(getattr(task, "title", "") or getattr(task, "description", "") or "collected_items")
+    source = re.sub(r"[^A-Za-z0-9]+", "_", source).strip("_").lower()
+    return source[:64] or "collected_items"
 
 
 def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = None) -> str:
@@ -469,20 +2125,34 @@ def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = Non
         "- Do not use /tmp, /var/tmp, or arbitrary absolute paths for final files the user asked to receive.\n"
         "- Temporary scratch files must also stay inside the workspace storage area unless a tool explicitly returns "
         "a workspace-safe generated path.\n"
+        "- For CSV or TSV artifacts, use file_write or spreadsheet_create with a .csv/.tsv output path. For linked/non-self-contained HTML, use file_write with inline_local_html_images=false and disallow_html_data_images=true so images remain sibling file references instead of data URIs.\n"
         "- For typed .docx artifact requirements, use document_create with structured paragraphs, sections, "
         "and existing image artifact paths instead of terminal_exec.\n"
         "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, links, and existing "
-        "image artifact paths instead of terminal_exec.\n"
+        "image artifact paths instead of terminal_exec. When formulas are requested, set formulas_required=true and include real Excel formula "
+        "strings beginning with '=' in row values; static calculated numbers or prose about formula assumptions "
+        "do not satisfy a formula request. When charts or conditional formatting are requested, pass "
+        "structured charts or conditional_formats specs.\n"
         "- For document-like deliverables such as PDF, DOCX, PPTX, reports, itineraries, and decks, provide "
         "structured title/sections/slides/text pages so the artifact tool can produce a readable report-quality "
         "layout; do not deliver raw browser screenshots, loose image attachments, or unformatted text dumps as "
         "a substitute for the requested formatted document.\n"
         "- Mention a saved or attached file only after file_write, document_create, pdf_create, or another file-producing tool "
         "returns a path in the workspace artifact directory.\n\n"
+        "Downstream handoff rules:\n"
+        "- When this task produces structured data or source material for a dependent task, make the handoff durable. "
+        "If the output is large or likely to be truncated, use a scoped file-producing or artifact-producing tool "
+        "available to this task and include the returned workspace path in the final answer. Do not rely on oversized "
+        "prose, hidden scratch state, or truncated tool transcripts as the only handoff to downstream tasks.\n"
+        "- Durable structured handoffs must include columns or keys for every attribute the assigned task says it "
+        "collected. Do not claim an attribute was collected unless it is present in the saved handoff or artifact. "
+        "If an attribute cannot be extracted, include an explicit empty/unknown value with available source evidence "
+        "instead of claiming complete data in prose only.\n\n"
         f"Task: {task.description}"
     )
     if context_in is not None:
-        prompt += f"\n\nContext input ({task.context_key_in}):\n{context_in}"
+        context_label = task.context_key_in or "dependency_context"
+        prompt += f"\n\nContext input ({context_label}):\n{context_in}"
     expected_artifacts = _expected_artifact_paths_from_context(config, context_in=context_in)
     if expected_artifacts and _is_artifact_verifier_task(task):
         prompt += (
@@ -550,6 +2220,8 @@ def _deliverable_artifact_paths_for_task(config, artifact_paths: list[str]) -> l
     if not artifact_paths:
         return []
     task = config.task
+    if getattr(task, "context_key_out", None) and not _task_requires_user_file_delivery(task):
+        return []
     try:
         artifact_root = artifact_root_for_principal(task.principal_id)
     except Exception:
@@ -566,7 +2238,69 @@ def _deliverable_artifact_paths_for_task(config, artifact_paths: list[str]) -> l
     return list(dict.fromkeys(deliverable))
 
 
-def _context_out_for_task(config, *, output_text: str, deliverable_artifacts: list[str]) -> object:
+def _required_artifact_extension_for_task(task: Any) -> str | None:
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    raw_value = str(metadata.get("required_artifact_kind") or "").strip().lower()
+    if not raw_value:
+        output = getattr(task, "output", None)
+        raw_value = str(getattr(output, "artifact_kind", "") or "").strip().lower()
+    if not raw_value:
+        return None
+    raw_value = raw_value.removeprefix(".")
+    if raw_value == "spreadsheet":
+        return None
+    return f".{raw_value}"
+
+
+def _artifact_paths_matching_required_extension(paths: Iterable[str], task: Any) -> list[str]:
+    required_extension = _required_artifact_extension_for_task(task)
+    cleaned = [str(path) for path in paths if str(path or "").strip()]
+    if required_extension is None:
+        return list(dict.fromkeys(cleaned))
+    return list(
+        dict.fromkeys(
+            path
+            for path in cleaned
+            if Path(path).suffix.lower() == required_extension
+        )
+    )
+
+
+def _artifact_contract_failure_for_task_result(task: Any, result: TaskResult) -> str | None:
+    if getattr(result, "status", None) != "success":
+        return None
+    if not _task_requires_user_file_delivery(task):
+        return None
+    required_extension = _required_artifact_extension_for_task(task)
+    if required_extension is None:
+        return None
+    candidate_paths: list[str] = []
+    candidate_paths.extend(str(path) for path in (getattr(result, "artifacts", None) or ()) if str(path or "").strip())
+    candidate_paths.extend(_artifact_path_candidates_from_value(getattr(result, "context_out", None)))
+    candidate_paths.extend(_artifact_path_candidates_from_value(getattr(result, "output", None)))
+    try:
+        artifact_root = artifact_root_for_principal(task.principal_id)
+    except Exception:
+        artifact_root = None
+    if artifact_root is not None:
+        candidate_paths = _normalize_artifact_path_candidates(candidate_paths, artifact_root=artifact_root)
+    else:
+        candidate_paths = list(dict.fromkeys(candidate_paths))
+    if _artifact_paths_matching_required_extension(candidate_paths, task):
+        return None
+    observed = ", ".join(Path(path).name for path in candidate_paths[:4]) or "no downloadable artifact"
+    return f"The task did not produce the required {required_extension} artifact. Observed {observed}."
+
+
+def _context_out_for_task(
+    config,
+    *,
+    output_text: str,
+    deliverable_artifacts: list[str],
+    tool_results: list[Any] | None = None,
+    context_in: Any = None,
+) -> object:
     """Publish artifact identity as typed context so dependent tasks stay bound.
 
     Free-form summaries are not enough for multi-step report workflows: a
@@ -575,7 +2309,21 @@ def _context_out_for_task(config, *, output_text: str, deliverable_artifacts: li
     tasks can verify the exact current-run path without parsing prose.
     """
 
+    workspace_files = _dedupe_context_workspace_files(
+        [
+            *_context_workspace_files_from_context(context_in),
+            *_context_workspace_files_from_tool_results(tool_results),
+        ]
+    )
     if not deliverable_artifacts:
+        if workspace_files:
+            return {
+                "output": output_text,
+                "workspace_files": workspace_files,
+                "workspace_file_paths": [str(item.get("path")) for item in workspace_files if item.get("path")],
+                "source_task_id": getattr(config.task, "task_id", None),
+                "source_group_id": getattr(config.task, "group_id", None),
+            }
         return output_text
     task = config.task
     try:
@@ -599,9 +2347,124 @@ def _context_out_for_task(config, *, output_text: str, deliverable_artifacts: li
         "output": output_text,
         "artifact_paths": [str(item.get("path")) for item in descriptors if item.get("path")],
         "artifacts": descriptors,
+        "workspace_files": workspace_files,
+        "workspace_file_paths": [str(item.get("path")) for item in workspace_files if item.get("path")],
         "source_task_id": getattr(task, "task_id", None),
         "source_group_id": getattr(task, "group_id", None),
     }
+
+
+def _context_workspace_files_from_context(context_in: Any) -> list[dict[str, object]]:
+    if not isinstance(context_in, dict):
+        return []
+    files: list[dict[str, object]] = []
+    raw_files = context_in.get("workspace_files")
+    if isinstance(raw_files, list):
+        for item in raw_files:
+            if isinstance(item, dict):
+                path = _existing_file_path(item.get("path"))
+                if path is not None:
+                    files.append({
+                        "path": str(path),
+                        "name": str(item.get("name") or path.name),
+                        "media_type": str(item.get("media_type") or ""),
+                        "bytes": item.get("bytes"),
+                        "source_tool": str(item.get("source_tool") or ""),
+                    })
+    raw_paths = context_in.get("workspace_file_paths")
+    if isinstance(raw_paths, list):
+        for raw_path in raw_paths:
+            path = _existing_file_path(raw_path)
+            if path is not None:
+                files.append({"path": str(path), "name": path.name, "media_type": "", "bytes": path.stat().st_size})
+    return files
+
+
+def _context_workspace_files_from_tool_results(tool_results: list[Any] | None) -> list[dict[str, object]]:
+    files: list[dict[str, object]] = []
+    for result in tool_results or []:
+        status = str(getattr(result, "status", "") or "").strip().lower()
+        if status not in {"completed", "success", "succeeded"}:
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "")
+        output = getattr(result, "output", None)
+        if not isinstance(output, dict):
+            continue
+        entries = output.get("entries")
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                path = _existing_file_path(entry.get("path"))
+                if path is None:
+                    continue
+                files.append({
+                    "path": str(path),
+                    "name": str(entry.get("name") or path.name),
+                    "media_type": str(entry.get("media_type") or ""),
+                    "bytes": entry.get("bytes", path.stat().st_size),
+                    "source_tool": tool_name,
+                })
+        for key in (
+            "path",
+            "artifact_path",
+            "manifest_csv_path",
+            "manifest_json_path",
+            "manifest_xlsx_path",
+        ):
+            path = _existing_file_path(output.get(key))
+            if path is not None:
+                files.append({
+                    "path": str(path),
+                    "name": path.name,
+                    "media_type": "",
+                    "bytes": path.stat().st_size,
+                    "source_tool": tool_name,
+                })
+        for key in ("artifact_paths", "manifest_artifact_paths"):
+            values = output.get(key)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                path = _existing_file_path(value)
+                if path is not None:
+                    files.append({
+                        "path": str(path),
+                        "name": path.name,
+                        "media_type": "",
+                        "bytes": path.stat().st_size,
+                        "source_tool": tool_name,
+                    })
+    return files
+
+
+def _existing_file_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        path = Path(value).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    try:
+        if path.is_file():
+            return path
+    except OSError:
+        return None
+    return None
+
+
+def _dedupe_context_workspace_files(files: list[dict[str, object]], *, limit: int = 200) -> list[dict[str, object]]:
+    deduped: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in files:
+        path = str(item.get("path") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 def _is_artifact_verifier_task(task: Any) -> bool:
@@ -681,12 +2544,35 @@ def _artifact_verification_failure_for_task(
         tool_results=tool_results,
         deliverable_artifacts=deliverable_artifacts,
     )
+    required_extension = _required_artifact_extension_for_task(task)
+    if required_extension is not None:
+        expected_matching_paths = _artifact_paths_matching_required_extension(expected_paths, task)
+        if not expected_matching_paths:
+            observed_expected = ", ".join(Path(path).name for path in expected_paths[:4]) or "no current-run artifact path"
+            return (
+                f"The upstream artifact context did not contain the required {required_extension} artifact. "
+                f"Observed {observed_expected}."
+            )
+        expected_paths = expected_matching_paths
+        observed_paths = _artifact_paths_matching_required_extension(observed_paths, task)
+    if not observed_paths and not _artifact_verifier_has_observation_tools(task):
+        if _html_static_primary_content_required(task):
+            static_delivery_failure = _html_static_delivery_failure_for_paths(expected_paths)
+            if static_delivery_failure is not None:
+                return static_delivery_failure
+        content_failure = _artifact_content_delivery_failure_for_context(expected_paths, context_in)
+        if content_failure is not None:
+            return content_failure
+        return None
     matched_expected_paths = [path for path in expected_paths if path in observed_paths]
     if matched_expected_paths:
         if _html_static_primary_content_required(task):
             static_delivery_failure = _html_static_delivery_failure_for_paths(matched_expected_paths)
             if static_delivery_failure is not None:
                 return static_delivery_failure
+        content_failure = _artifact_content_delivery_failure_for_context(matched_expected_paths, context_in)
+        if content_failure is not None:
+            return content_failure
         return None
     observed_text = ", ".join(Path(path).name for path in observed_paths[:4]) or "no current-run artifact path"
     expected_text = ", ".join(Path(path).name for path in expected_paths[:4])
@@ -694,6 +2580,317 @@ def _artifact_verification_failure_for_task(
         "The verifier did not validate the current-run artifact from dependency context. "
         f"Expected {expected_text}; observed {observed_text}."
     )
+
+
+def _artifact_content_delivery_failure_for_context(paths: list[str], context_in: Any) -> str | None:
+    obligations = _artifact_content_obligations_from_context(context_in)
+    if obligations is None:
+        return None
+    return _artifact_content_delivery_failure_for_obligations(paths, obligations)
+
+
+def _artifact_content_delivery_failure_for_obligations(
+    paths: list[str],
+    obligations: dict[str, int | bool],
+) -> str | None:
+    for raw_path in paths:
+        if not isinstance(raw_path, str):
+            continue
+        path = Path(raw_path)
+        if path.suffix.lower() not in {".docx", ".htm", ".html", ".pdf", ".pptx", ".xlsx", ".xlsm"}:
+            continue
+        summary = _artifact_content_summary_for_path(path)
+        if summary is None:
+            return f"The artifact could not be inspected as a valid {path.suffix.lower()} file: {path.name}."
+        failure = _artifact_content_failure_for_summary(path, summary, obligations)
+        if failure is not None:
+            return failure
+    return None
+
+
+def _artifact_content_obligations_from_context(context_in: Any) -> dict[str, int | bool] | None:
+    item_records = _exportable_browser_item_records(_browser_item_records_from_context(context_in))
+    if not item_records:
+        return None
+    image_count = sum(1 for record in item_records if str(record.get("image_url") or "").strip())
+    row_count_contract = _structured_row_count_contract_from_context(context_in)
+    return {
+        "item_count": len(item_records),
+        "spreadsheet_row_floor": row_count_contract or 1,
+        "spreadsheet_row_contract": bool(row_count_contract),
+        "image_count": image_count,
+        "requires_media": image_count > 0,
+    }
+
+
+def _structured_row_count_contract_from_context(context_in: Any) -> int | None:
+    if not isinstance(context_in, dict):
+        return None
+    for key in (
+        "expected_rows",
+        "expected_row_count",
+        "required_rows",
+        "required_row_count",
+        "artifact_row_count",
+    ):
+        value = context_in.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value > 0:
+            return value
+    artifacts = context_in.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            for key in ("expected_rows", "expected_row_count", "row_count", "data_rows"):
+                value = artifact.get(key)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int) and value > 0:
+                    return value
+    for key in ("output", "result", "summary", "result_summary", "content", "body", "text"):
+        value = context_in.get(key)
+        if not isinstance(value, str):
+            continue
+        count = len(_markdown_table_records_from_text(value))
+        if count > 0:
+            return count
+    return None
+
+
+def _artifact_content_failure_for_summary(
+    path: Path,
+    summary: dict[str, int | bool | str],
+    obligations: dict[str, int | bool],
+) -> str | None:
+    kind = str(summary.get("kind") or path.suffix.lower().lstrip("."))
+    if kind == "spreadsheet":
+        expected_rows_floor = int(obligations.get("spreadsheet_row_floor") or 1)
+        if int(summary.get("data_rows") or 0) < expected_rows_floor:
+            noun = "structured row-count contract" if obligations.get("spreadsheet_row_contract") else "structured records"
+            return (
+                f"The spreadsheet artifact does not contain the {noun} from the collected handoff. "
+                f"Expected at least {expected_rows_floor} populated data row(s); found {summary.get('data_rows') or 0}."
+            )
+    elif kind in {"document", "presentation", "html"}:
+        if int(summary.get("text_units") or 0) <= 0 and int(summary.get("text_chars") or 0) <= 0:
+            return f"The {kind} artifact does not contain visible content from the collected handoff."
+    elif kind == "pdf":
+        if not bool(summary.get("valid_pdf")):
+            return "The PDF artifact is not a valid PDF file."
+        if int(summary.get("bytes") or 0) < 1024:
+            return "The PDF artifact is too small to contain the requested content."
+    if bool(obligations.get("requires_media")):
+        media_count = int(summary.get("nontrivial_media") or summary.get("media_refs") or 0)
+        required_images = max(1, min(int(obligations.get("image_count") or 0), 10))
+        if media_count < required_images:
+            return (
+                f"The {kind} artifact is missing embedded or referenced image media from the collected handoff. "
+                f"Expected at least {required_images} image item(s); found {media_count}."
+            )
+    return None
+
+
+def _artifact_content_summary_for_path(path: Path) -> dict[str, int | bool | str] | None:
+    suffix = path.suffix.lower()
+    if suffix in {".xlsx", ".xlsm"}:
+        return _xlsx_artifact_content_summary(path)
+    if suffix == ".docx":
+        return _docx_artifact_content_summary(path)
+    if suffix == ".pptx":
+        return _pptx_artifact_content_summary(path)
+    if suffix in {".htm", ".html"}:
+        return _html_artifact_content_summary(path)
+    if suffix == ".pdf":
+        return _pdf_artifact_content_summary(path)
+    return None
+
+
+def _xlsx_artifact_content_summary(path: Path) -> dict[str, int | str] | None:
+    try:
+        with zipfile.ZipFile(path) as workbook:
+            names = workbook.namelist()
+            media_sizes = [
+                info.file_size
+                for info in workbook.infolist()
+                if info.filename.startswith("xl/media/") and not info.is_dir()
+            ]
+            worksheet_names = [
+                name
+                for name in names
+                if name.startswith("xl/worksheets/") and name.endswith(".xml")
+            ]
+            data_rows = 0
+            for worksheet_name in worksheet_names:
+                try:
+                    root = ET.fromstring(workbook.read(worksheet_name))
+                except ET.ParseError:
+                    continue
+                for row in root.iter():
+                    if _xml_local_name(row.tag) != "row":
+                        continue
+                    row_index = _positive_int(row.attrib.get("r"))
+                    if row_index == 1:
+                        continue
+                    if _xlsx_row_has_value(row):
+                        data_rows += 1
+            return {
+                "kind": "spreadsheet",
+                "data_rows": data_rows,
+                "text_units": data_rows,
+                "media": len(media_sizes),
+                "nontrivial_media": sum(1 for size in media_sizes if size >= 512),
+            }
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+def _docx_artifact_content_summary(path: Path) -> dict[str, int | str] | None:
+    try:
+        with zipfile.ZipFile(path) as package:
+            text_units, text_chars = _openxml_text_summary(
+                package,
+                [name for name in package.namelist() if name.startswith("word/") and name.endswith(".xml")],
+            )
+            media_sizes = [
+                info.file_size
+                for info in package.infolist()
+                if info.filename.startswith("word/media/") and not info.is_dir()
+            ]
+            return {
+                "kind": "document",
+                "text_units": text_units,
+                "text_chars": text_chars,
+                "media": len(media_sizes),
+                "nontrivial_media": sum(1 for size in media_sizes if size >= 512),
+            }
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+def _pptx_artifact_content_summary(path: Path) -> dict[str, int | str] | None:
+    try:
+        with zipfile.ZipFile(path) as package:
+            slide_names = [
+                name
+                for name in package.namelist()
+                if name.startswith("ppt/slides/") and name.endswith(".xml")
+            ]
+            text_units, text_chars = _openxml_text_summary(package, slide_names)
+            media_sizes = [
+                info.file_size
+                for info in package.infolist()
+                if info.filename.startswith("ppt/media/") and not info.is_dir()
+            ]
+            return {
+                "kind": "presentation",
+                "slides": len(slide_names),
+                "text_units": text_units,
+                "text_chars": text_chars,
+                "media": len(media_sizes),
+                "nontrivial_media": sum(1 for size in media_sizes if size >= 512),
+            }
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+def _openxml_text_summary(package: zipfile.ZipFile, xml_names: list[str]) -> tuple[int, int]:
+    text_units = 0
+    text_chars = 0
+    for xml_name in xml_names:
+        try:
+            root = ET.fromstring(package.read(xml_name))
+        except (KeyError, ET.ParseError):
+            continue
+        for node in root.iter():
+            if _xml_local_name(node.tag) != "t":
+                continue
+            text = (node.text or "").strip()
+            if not text:
+                continue
+            text_units += 1
+            text_chars += len(text)
+    return text_units, text_chars
+
+
+def _html_artifact_content_summary(path: Path) -> dict[str, int | str] | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    body = _HTML_SCRIPT_OR_STYLE_RE.sub(" ", text)
+    body = _HTML_TAG_RE.sub(" ", body)
+    visible_text = " ".join(body.split())
+    image_refs = len(re.findall(r"<img\b", text, flags=re.IGNORECASE))
+    return {
+        "kind": "html",
+        "text_units": 1 if visible_text else 0,
+        "text_chars": len(visible_text),
+        "media_refs": image_refs,
+        "nontrivial_media": image_refs,
+    }
+
+
+def _pdf_artifact_content_summary(path: Path) -> dict[str, int | bool | str] | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    media_refs = data.count(b"/Subtype /Image") + data.count(b"/Image")
+    return {
+        "kind": "pdf",
+        "valid_pdf": data.startswith(b"%PDF"),
+        "bytes": len(data),
+        "media_refs": media_refs,
+        "nontrivial_media": media_refs,
+    }
+
+
+def _xlsx_row_has_value(row: ET.Element) -> bool:
+    for cell in row.iter():
+        tag = _xml_local_name(cell.tag)
+        if tag == "v" and (cell.text or "").strip():
+            return True
+        if tag == "t" and (cell.text or "").strip():
+            return True
+    return False
+
+
+def _xml_local_name(tag: str) -> str:
+    return str(tag).rsplit("}", 1)[-1]
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _artifact_verifier_has_observation_tools(task: Any) -> bool:
+    tools = {
+        str(tool or "").strip()
+        for tool in (getattr(task, "allowed_tools", ()) or ())
+        if str(tool or "").strip()
+    }
+    return bool(tools.intersection({"file_read", "file_search", "workspace_summary"}))
+
+
+def _artifact_verification_success_output_for_task(config, *, context_in: Any) -> str | None:
+    task = getattr(config, "task", None)
+    if not _is_artifact_verifier_task(task) or _artifact_verifier_has_observation_tools(task):
+        return None
+    expected_paths = _expected_artifact_paths_from_context(config, context_in=context_in)
+    if not expected_paths:
+        return None
+    names = [Path(path).name for path in expected_paths if str(path or "").strip()]
+    if len(names) == 1:
+        return f"Verified current-run artifact: {names[0]}"
+    if names:
+        return "Verified current-run artifacts: " + ", ".join(names)
+    return "Verified current-run artifact."
 
 
 def _html_static_delivery_failure_for_paths(paths: list[str]) -> str | None:
@@ -811,7 +3008,10 @@ def _artifact_path_candidates_from_value(value: Any) -> list[str]:
             raw_values = value.get(key)
             if isinstance(raw_values, (list, tuple)):
                 for item in raw_values:
-                    candidates.extend(_artifact_path_candidates_from_value(item))
+                    if isinstance(item, str) and key == "artifact_paths" and item.strip():
+                        candidates.append(item)
+                    else:
+                        candidates.extend(_artifact_path_candidates_from_value(item))
             elif isinstance(raw_values, dict):
                 candidates.extend(_artifact_path_candidates_from_value(raw_values))
         for key in ("output", "summary", "message", "text", "content"):
@@ -890,9 +3090,31 @@ def _relocate_external_artifact_paths_for_task(config, artifact_paths: list[str]
     return list(dict.fromkeys(relocated or artifact_paths))
 
 
-def _artifact_delivery_failure_for_task(config, artifact_paths: list[str], deliverable_artifacts: list[str]) -> str | None:
+def _artifact_delivery_failure_for_task(
+    config,
+    artifact_paths: list[str],
+    deliverable_artifacts: list[str],
+    *,
+    tool_results: list[Any] | None = None,
+    context_in: Any = None,
+) -> str | None:
     task = config.task
+    if deliverable_artifacts and artifact_media_embedding_obligation_outstanding(tool_results):
+        return (
+            "The mini-agent created a downloadable file, but the current tool evidence still requires "
+            "embedded image/screenshot media inside the artifact."
+        )
     if deliverable_artifacts:
+        required_extension = _required_artifact_extension_for_task(task)
+        if required_extension is not None and not _artifact_paths_matching_required_extension(deliverable_artifacts, task):
+            observed = ", ".join(Path(path).name for path in deliverable_artifacts[:4]) or "no downloadable artifact"
+            return (
+                f"The mini-agent created downloadable artifact(s), but none matched the required "
+                f"{required_extension} artifact kind. Observed {observed}."
+            )
+        content_failure = _artifact_content_delivery_failure_for_context(deliverable_artifacts, context_in)
+        if content_failure is not None:
+            return content_failure
         return None
     if not artifact_paths and not _task_requires_user_file_delivery(task):
         return None
@@ -1052,14 +3274,34 @@ def _deep_agent_meta_tools(config, *, progress_queue: asyncio.Queue) -> list[Any
 
 def _deep_agent_graph_config(config) -> dict[str, Any]:
     budget = int(config.max_iterations) * (max(0, int(config.max_continuations)) + 1)
+    task = getattr(config, "task", None)
+    allowed_tools = _task_allowed_tool_names(task)
+    metadata = getattr(task, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    needs_long_graph = bool(
+        getattr(task, "context_key_out", None)
+        or metadata.get("requires_artifact_delivery")
+        or {"browser_extract_items", "browser_extract_text", "browser_run_js", "browser_image_collect"}.intersection(
+            allowed_tools
+        )
+    )
+    recursion_limit = max(25, budget * 3 + 8)
+    if needs_long_graph:
+        recursion_limit = max(recursion_limit, budget * 8 + 32, 128)
     return {
-        "recursion_limit": max(25, budget * 3 + 8),
+        "recursion_limit": recursion_limit,
         "configurable": {"thread_id": _deep_agent_thread_id(config)},
         "metadata": {"nullion_mini_agent_id": config.agent_id, "nullion_task_id": config.task.task_id},
     }
 
 
 def _deep_agent_thread_id(config) -> str:
+    task = getattr(config, "task", None)
+    metadata = getattr(task, "metadata", None)
+    if isinstance(metadata, dict):
+        thread_id = str(metadata.get("deep_agent_thread_id") or "").strip()
+        if thread_id:
+            return thread_id
     return f"nullion:{config.task.group_id}:{config.task.task_id}:{config.agent_id}"
 
 
@@ -1415,6 +3657,66 @@ async def _invoke_agent_with_events(
     if final_output is not None:
         return final_output
     return await agent.ainvoke(payload, config=config)
+
+
+async def _invoke_agent_with_heartbeat(
+    agent: Any,
+    payload: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    progress_queue: asyncio.Queue,
+    mini_agent_config: Any,
+) -> dict[str, Any]:
+    invoke_task = asyncio.create_task(
+        _invoke_agent(
+            agent,
+            payload,
+            config=config,
+            progress_queue=progress_queue,
+            mini_agent_config=mini_agent_config,
+        )
+    )
+    heartbeat_task = asyncio.create_task(
+        _emit_deep_agent_heartbeat(
+            progress_queue,
+            mini_agent_config=mini_agent_config,
+            invoke_task=invoke_task,
+        )
+    )
+    try:
+        return await invoke_task
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+async def _emit_deep_agent_heartbeat(
+    progress_queue: asyncio.Queue,
+    *,
+    mini_agent_config: Any,
+    invoke_task: asyncio.Task,
+) -> None:
+    interval = _deep_agent_heartbeat_seconds()
+    while not invoke_task.done():
+        await asyncio.sleep(interval)
+        if invoke_task.done():
+            return
+        await _emit_progress(
+            progress_queue,
+            config=mini_agent_config,
+            kind="progress_note",
+            message="Still working on this planner step.",
+            data={"phase": "deep_agent_heartbeat"},
+        )
+
+
+def _deep_agent_heartbeat_seconds() -> float:
+    raw = os.environ.get("NULLION_DEEP_AGENT_HEARTBEAT_SECONDS", "45")
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 45.0
 
 
 def _progress_message_from_deep_agent_event(event: dict[str, Any]) -> str | None:

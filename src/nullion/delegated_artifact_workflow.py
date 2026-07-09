@@ -75,7 +75,7 @@ def _compiled_delegated_artifact_graph():
 
 def _plan_requested_artifact(state: DelegatedArtifactState) -> dict[str, object]:
     group = state["group"]
-    extension = plan_attachment_format(group.original_message).extension
+    extension = plan_attachment_format(group.original_message, allow_filename_tokens=True).extension
     should_materialize = extension in _TEXT_ARTIFACT_EXTENSIONS
     return {
         "requested_extension": extension,

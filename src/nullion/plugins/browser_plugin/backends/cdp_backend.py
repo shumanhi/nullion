@@ -38,7 +38,7 @@ except ImportError:
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 _BLANK_PAGE_URLS = frozenset({"", "about:blank", "chrome://newtab/", "brave://newtab/"})
-_TYPE_TEXT_TIMEOUT_MS = 10_000
+_TYPE_TEXT_TIMEOUT_MS = 3_000
 _CLICK_TIMEOUT_MS = 5_000
 
 
@@ -152,6 +152,15 @@ def _dom_type_script(selector: str, text: str) -> str:
         f" const el = document.querySelector({json.dumps(selector)});"
         f" const text = {json.dumps(text)};"
         " if (!el) throw new Error(`selector not found: ${selector}`);"
+        " const style = window.getComputedStyle(el);"
+        " const rect = el.getBoundingClientRect();"
+        " const visible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;"
+        " if (!visible) throw new Error('element not visible');"
+        " if (el.disabled || el.getAttribute('aria-disabled') === 'true') throw new Error('element disabled');"
+        " const tag = (el.tagName || '').toLowerCase();"
+        " const type = (el.getAttribute('type') || '').toLowerCase();"
+        " const editable = el.isContentEditable || tag === 'textarea' || tag === 'select' || el.getAttribute('role') === 'combobox' || el.getAttribute('contenteditable') === 'true' || (tag === 'input' && type !== 'hidden');"
+        " if (!editable) throw new Error('element not editable');"
         " if (typeof el.focus === 'function') el.focus();"
         " const proto = el instanceof HTMLTextAreaElement"
         "   ? HTMLTextAreaElement.prototype"
@@ -170,10 +179,16 @@ def _dom_type_element_function() -> str:
     return (
         "(el, text) => {"
         " if (!el) throw new Error('element not found');"
+        " const style = window.getComputedStyle(el);"
+        " const rect = el.getBoundingClientRect();"
+        " const visible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;"
+        " if (!visible) throw new Error('element not visible');"
+        " if (el.disabled || el.getAttribute('aria-disabled') === 'true') throw new Error('element disabled');"
         " if (typeof el.scrollIntoView === 'function') el.scrollIntoView({block:'center', inline:'center'});"
         " if (typeof el.focus === 'function') el.focus({preventScroll: true});"
         " const tag = (el.tagName || '').toLowerCase();"
-        " const editable = el.isContentEditable || tag === 'textarea' || tag === 'input' || tag === 'select' || el.getAttribute('role') === 'combobox' || el.getAttribute('contenteditable') === 'true';"
+        " const type = (el.getAttribute('type') || '').toLowerCase();"
+        " const editable = el.isContentEditable || tag === 'textarea' || tag === 'select' || el.getAttribute('role') === 'combobox' || el.getAttribute('contenteditable') === 'true' || (tag === 'input' && type !== 'hidden');"
         " if (!editable) {"
         "   const opts = {bubbles: true, cancelable: true, view: window};"
         "   for (const type of ['pointerdown','mousedown','pointerup','mouseup']) el.dispatchEvent(new MouseEvent(type, opts));"
@@ -206,6 +221,51 @@ def _dom_click_script(selector: str) -> str:
         " for (const type of ['pointerdown','mousedown','pointerup','mouseup']) el.dispatchEvent(new MouseEvent(type, opts));"
         " if (typeof el.click === 'function') el.click();"
         " else el.dispatchEvent(new MouseEvent('click', opts));"
+        "})()"
+    )
+
+
+def _dom_click_target_script(target: dict[str, object]) -> str:
+    selector = str(target.get("selector") or "").strip()
+    if selector:
+        return _dom_click_script(selector)
+    expected = [
+        str(target.get(key) or "").strip()
+        for key in ("text", "label", "placeholder", "name")
+        if str(target.get(key) or "").strip()
+    ]
+    role = str(target.get("role") or "").strip()
+    return (
+        "(() => {"
+        f" const expected = {json.dumps(expected)};"
+        f" const role = {json.dumps(role)};"
+        " const normalize = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();"
+        " const wanted = expected.map(normalize).filter(Boolean);"
+        " const visible = (el) => {"
+        "   const style = window.getComputedStyle(el);"
+        "   const rect = el.getBoundingClientRect();"
+        "   return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;"
+        " };"
+        " const textOf = (el) => ["
+        "   el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'),"
+        "   el.getAttribute('title'), 'value' in el ? el.value : '', el.innerText, el.textContent"
+        " ].filter(Boolean).join(' ');"
+        " const compatible = (value) => {"
+        "   const normalized = normalize(value);"
+        "   return normalized && wanted.some((item) => normalized === item || normalized.includes(item) || item.includes(normalized));"
+        " };"
+        " const roleMatches = (el) => !role || normalize(el.getAttribute('role')) === normalize(role) || normalize(el.tagName) === normalize(role);"
+        " const candidates = Array.from(document.querySelectorAll('button,a,input,textarea,select,label,[role],[tabindex],li,div,span')).filter(visible);"
+        " const match = candidates.find((el) => roleMatches(el) && compatible(textOf(el)));"
+        " if (!match) throw new Error('target not found');"
+        " const clickable = match.closest('button,a,[role=\"button\"],[role=\"menuitem\"],input,label,[tabindex]') || match;"
+        " if (typeof clickable.scrollIntoView === 'function') clickable.scrollIntoView({block:'center', inline:'center'});"
+        " if (typeof clickable.focus === 'function') clickable.focus();"
+        " const opts = { bubbles: true, cancelable: true, view: window };"
+        " for (const type of ['pointerdown','mousedown','pointerup','mouseup']) clickable.dispatchEvent(new MouseEvent(type, opts));"
+        " if (typeof clickable.click === 'function') clickable.click();"
+        " else clickable.dispatchEvent(new MouseEvent('click', opts));"
+        " return true;"
         "})()"
     )
 
@@ -311,6 +371,115 @@ def _base_locator_for_target(page: object, target: dict[str, object]):
     return None
 
 
+def _target_locator_variants(target: dict[str, object]) -> list[dict[str, object]]:
+    variants = [target]
+    selector = str(target.get("selector") or "").strip()
+    if not selector:
+        return variants
+    semantic_keys = ("label", "placeholder", "text", "name")
+    existing_semantic = {key: target.get(key) for key in semantic_keys if target.get(key)}
+    if existing_semantic:
+        semantic = {key: value for key, value in target.items() if key != "selector"}
+        variants.append(semantic)
+        return variants
+    for key in semantic_keys:
+        variants.append({key: selector})
+    return variants
+
+
+def _dom_type_field_by_target_function() -> str:
+    return (
+        "(payload) => {"
+        " const target = payload && payload.target ? payload.target : {};"
+        " const text = String(payload && payload.text != null ? payload.text : '');"
+        " const normalize = (value) => String(value || '').toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();"
+        " const generic = new Set(['input','textarea','select','role combobox']);"
+        " const rawTargets = Object.entries(target).flatMap(([key, value]) => {"
+        "   const raw = String(value || '').trim();"
+        "   if (!raw) return [];"
+        "   if (key === 'selector' && /^\\s*(input|textarea|select|\\[role=['\\\"]?combobox['\\\"]?\\])\\s*$/i.test(raw)) return [];"
+        "   return [raw];"
+        " });"
+        " const targets = rawTargets.map(normalize).filter((value) => value && !generic.has(value));"
+        " if (!targets.length) return {ok:false, reason:'no_semantic_target'};"
+        " const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);"
+        " const directText = (el) => Array.from(el.childNodes || []).filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent || '').join(' ').trim();"
+        " const labelText = (el) => {"
+        "   const parts = [];"
+        "   const id = el.getAttribute('id');"
+        "   if (id) document.querySelectorAll(`label[for=\"${CSS.escape(id)}\"]`).forEach((label) => parts.push(label.innerText || label.textContent || ''));"
+        "   const wrapping = el.closest('label');"
+        "   if (wrapping) parts.push(wrapping.innerText || wrapping.textContent || '');"
+        "   const labelledBy = String(el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean);"
+        "   labelledBy.forEach((ref) => { const node = document.getElementById(ref); if (node) parts.push(node.innerText || node.textContent || ''); });"
+        "   const parent = el.parentElement;"
+        "   if (parent) parts.push(directText(parent));"
+        "   const previous = el.previousElementSibling;"
+        "   if (previous) parts.push(previous.innerText || previous.textContent || '');"
+        "   return parts.join(' ');"
+        " };"
+        " const candidates = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable=\"true\"], [role=\"combobox\"]')).filter((el) => visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');"
+        " const score = (haystack, needle) => {"
+        "   if (!haystack || !needle) return 0;"
+        "   if (haystack.includes(needle) || needle.includes(haystack)) return 100 + needle.length;"
+        "   const tokens = needle.split(' ').filter((token) => token.length > 1);"
+        "   if (!tokens.length) return 0;"
+        "   const matched = tokens.filter((token) => haystack.includes(token)).length;"
+        "   if (matched === tokens.length) return 50 + matched;"
+        "   return matched >= Math.min(2, tokens.length) ? matched : 0;"
+        " };"
+        " let best = null;"
+        " for (const el of candidates) {"
+        "   const haystack = normalize(["
+        "     el.getAttribute('placeholder'), el.getAttribute('aria-label'), el.getAttribute('name'),"
+        "     el.getAttribute('id'), el.getAttribute('title'), el.getAttribute('autocomplete'), labelText(el)"
+        "   ].join(' '));"
+        "   const candidateScore = Math.max(...targets.map((needle) => score(haystack, needle)));"
+        "   if (candidateScore > 0 && (!best || candidateScore > best.score)) best = {el, score: candidateScore, haystack};"
+        " }"
+        " if (!best) return {ok:false, reason:'target_not_found'};"
+        " const el = best.el;"
+        " if (typeof el.scrollIntoView === 'function') el.scrollIntoView({block:'center', inline:'center'});"
+        " if (typeof el.focus === 'function') el.focus({preventScroll:true});"
+        " const before = 'value' in el ? String(el.value || '') : String(el.textContent || '');"
+        " const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLInputElement ? HTMLInputElement.prototype : null;"
+        " const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value')?.set;"
+        " if (setter) setter.call(el, text);"
+        " else if ('value' in el) el.value = text;"
+        " else el.textContent = text;"
+        " el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));"
+        " el.dispatchEvent(new Event('change', {bubbles:true}));"
+        " const after = 'value' in el ? String(el.value || '') : String(el.textContent || '');"
+        " return {ok:true, before, after, matched: best.haystack, score: best.score};"
+        "}"
+    )
+
+
+def _selector_visible_editable_function() -> str:
+    return (
+        "(selector) => {"
+        " const el = document.querySelector(String(selector || ''));"
+        " if (!el) return null;"
+        " const style = window.getComputedStyle(el);"
+        " const rect = el.getBoundingClientRect();"
+        " const visible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;"
+        " const tag = (el.tagName || '').toLowerCase();"
+        " const type = (el.getAttribute('type') || '').toLowerCase();"
+        " const editable = el.isContentEditable || tag === 'textarea' || tag === 'select' || el.getAttribute('role') === 'combobox' || el.getAttribute('contenteditable') === 'true' || (tag === 'input' && type !== 'hidden');"
+        " const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';"
+        " return visible && enabled && editable;"
+        "}"
+    )
+
+
+def _is_generic_field_target(target: dict[str, object]) -> bool:
+    semantic_keys = ("label", "placeholder", "role", "name", "text")
+    if any(str(target.get(key) or "").strip() for key in semantic_keys):
+        return False
+    selector = str(target.get("selector") or "").strip().lower()
+    return selector in {"input", "textarea", "select", "[role=combobox]", "[role='combobox']", '[role="combobox"]'}
+
+
 def _locator_for_target(page: object, target: dict[str, object]):
     locator = _base_locator_for_target(page, target)
     return _first_locator(locator) if locator is not None else None
@@ -351,30 +520,40 @@ async def _is_enabled_locator(locator: Any) -> bool:
 
 
 async def _candidate_locators_for_target(page: object, target: dict[str, object]) -> list[Any]:
-    base = _base_locator_for_target(page, target)
-    if base is None:
-        return []
-    count_fn = getattr(base, "count", None)
-    nth_fn = getattr(base, "nth", None)
-    if not callable(count_fn) or not callable(nth_fn):
-        return [_first_locator(base)]
-    try:
-        count = int(await _maybe_await(count_fn()))
-    except Exception:
-        return [_first_locator(base)]
-    if count <= 1:
-        return [_first_locator(base)]
-    candidates = [nth_fn(index) for index in range(min(count, 8))]
-    visible: list[Any] = []
-    hidden: list[Any] = []
-    for candidate in candidates:
-        if not await _is_enabled_locator(candidate):
+    locators: list[Any] = []
+    for variant in _target_locator_variants(target):
+        base = _base_locator_for_target(page, variant)
+        if base is None:
             continue
-        if await _is_visible_locator(candidate):
-            visible.append(candidate)
-        else:
-            hidden.append(candidate)
-    return visible + hidden
+        count_fn = getattr(base, "count", None)
+        nth_fn = getattr(base, "nth", None)
+        if not callable(count_fn) or not callable(nth_fn):
+            locators.append(_first_locator(base))
+            continue
+        try:
+            count = int(await _maybe_await(count_fn()))
+        except Exception:
+            locators.append(_first_locator(base))
+            continue
+        if count == 0:
+            if str(variant.get("selector") or "").strip():
+                locators.append(_first_locator(base))
+            continue
+        if count == 1:
+            locators.append(_first_locator(base))
+            continue
+        candidates = [nth_fn(index) for index in range(min(count, 8))]
+        visible: list[Any] = []
+        hidden: list[Any] = []
+        for candidate in candidates:
+            if not await _is_enabled_locator(candidate):
+                continue
+            if await _is_visible_locator(candidate):
+                visible.append(candidate)
+            else:
+                hidden.append(candidate)
+        locators.extend(visible + hidden)
+    return locators
 
 
 async def _click_with_dom_fallback(page: object, selector: str) -> None:
@@ -436,21 +615,26 @@ async def _click_target_with_fallback(page: object, target: dict[str, object]) -
     if await _click_active_combobox_option(page, target):
         return
     original_error: BaseException | None = None
-    for locator in await _candidate_locators_for_target(page, target):
-        try:
-            result = locator.click(timeout=_CLICK_TIMEOUT_MS)
-            if asyncio.iscoroutine(result):
-                await result
-            return
-        except Exception as exc:
-            original_error = exc
-        try:
-            result = locator.click(force=True, timeout=_CLICK_TIMEOUT_MS)
-            if asyncio.iscoroutine(result):
-                await result
-            return
-        except Exception as exc:
-            original_error = original_error or exc
+    candidates = await _candidate_locators_for_target(page, target)
+    if not candidates and not str(target.get("selector") or "").strip():
+        raise RuntimeError("No matching element found.")
+    for locator in candidates:
+        click = getattr(locator, "click", None)
+        if callable(click):
+            try:
+                result = click(timeout=_CLICK_TIMEOUT_MS)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception as exc:
+                original_error = exc
+            try:
+                result = click(force=True, timeout=_CLICK_TIMEOUT_MS)
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception as exc:
+                original_error = original_error or exc
         dispatch = getattr(locator, "dispatch_event", None)
         if callable(dispatch):
             try:
@@ -461,6 +645,12 @@ async def _click_target_with_fallback(page: object, target: dict[str, object]) -
             except Exception as exc:
                 original_error = original_error or exc
     try:
+        evaluate = getattr(page, "evaluate", None)
+        if callable(evaluate) and not str(target.get("selector") or "").strip():
+            result = evaluate(_dom_click_target_script(target))
+            if asyncio.iscoroutine(result):
+                await result
+            return
         await _click_with_dom_fallback(page, selector)
     except Exception:
         if original_error is not None:
@@ -509,6 +699,9 @@ async def _active_combobox_has_options(page: object) -> bool:
 
 
 async def _type_text_with_dom_fallback(page: object, selector: str, text: str) -> None:
+    visible_editable = await _selector_targets_visible_editable(page, selector)
+    if visible_editable is False:
+        raise RuntimeError("Selector does not point to a visible editable field.")
     original_error: BaseException | None = None
     fill = getattr(page, "fill", None)
     if callable(fill):
@@ -552,12 +745,86 @@ async def _type_text_with_dom_fallback(page: object, selector: str, text: str) -
         raise
 
 
+async def _type_field_with_dom_target(page: object, target: dict[str, object], text: str) -> bool:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return False
+    try:
+        result = evaluate(_dom_type_field_by_target_function(), {"target": target, "text": text})
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception:
+        return False
+    if not isinstance(result, dict) or not result.get("ok"):
+        return False
+    after = str(result.get("after") or "").strip()
+    return bool(after) and (text.strip() in after or after in text.strip())
+
+
+async def _is_editable_locator(locator: Any) -> bool:
+    evaluate = getattr(locator, "evaluate", None)
+    if not callable(evaluate):
+        return True
+    script = """(el) => {
+        if (!el) return false;
+        const tag = (el.tagName || '').toLowerCase();
+        const type = (el.getAttribute('type') || '').toLowerCase();
+        return Boolean(
+            el.isContentEditable ||
+            tag === 'textarea' ||
+            tag === 'select' ||
+            el.getAttribute('role') === 'combobox' ||
+            el.getAttribute('contenteditable') === 'true' ||
+            (tag === 'input' && type !== 'hidden')
+        );
+    }"""
+    try:
+        result = evaluate(script, timeout=500)
+        if asyncio.iscoroutine(result):
+            result = await result
+    except TypeError:
+        try:
+            result = evaluate(script)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except Exception:
+            return True
+    except Exception:
+        return True
+    return bool(result)
+
+
+async def _selector_targets_visible_editable(page: object, selector: str) -> bool | None:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return None
+    try:
+        result = evaluate(_selector_visible_editable_function(), selector)
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception:
+        return None
+    if result is None:
+        return None
+    return bool(result)
+
+
 async def _type_target_with_fallback(page: object, target: dict[str, object], text: str) -> None:
     selector = _semantic_selector_for_target(target)
     original_error: BaseException | None = None
     unverified_success = False
+    allow_unverified_success = not _is_generic_field_target(target)
     for locator in await _candidate_locators_for_target(page, target):
         try:
+            if not await _is_enabled_locator(locator):
+                original_error = original_error or RuntimeError("Matching field is disabled.")
+                continue
+            if not await _is_visible_locator(locator):
+                original_error = original_error or RuntimeError("Matching field is hidden.")
+                continue
+            if not await _is_editable_locator(locator):
+                original_error = original_error or RuntimeError("Matching field is not editable.")
+                continue
             result = locator.fill(text, timeout=_TYPE_TEXT_TIMEOUT_MS)
             if asyncio.iscoroutine(result):
                 await result
@@ -568,7 +835,7 @@ async def _type_target_with_fallback(page: object, target: dict[str, object], te
             matches = await _locator_value_matches(locator, text)
             if matches is True:
                 return
-            if matches is None:
+            if matches is None and allow_unverified_success:
                 unverified_success = True
             continue
         except Exception as exc:
@@ -584,7 +851,7 @@ async def _type_target_with_fallback(page: object, target: dict[str, object], te
             matches = await _locator_value_matches(locator, text)
             if matches is True:
                 return
-            if matches is None:
+            if matches is None and allow_unverified_success:
                 unverified_success = True
             continue
         except Exception as exc:
@@ -602,7 +869,7 @@ async def _type_target_with_fallback(page: object, target: dict[str, object], te
                 matches = await _locator_value_matches(locator, text)
                 if matches is True:
                     return
-                if matches is None:
+                if matches is None and allow_unverified_success:
                     unverified_success = True
             except Exception as exc:
                 original_error = original_error or exc
@@ -623,8 +890,14 @@ async def _type_target_with_fallback(page: object, target: dict[str, object], te
                     original_error = original_error or exc
             except Exception as exc:
                 original_error = original_error or exc
+    if await _type_field_with_dom_target(page, target, text):
+        return
     if unverified_success:
         return
+    if _is_generic_field_target(target):
+        if original_error is not None:
+            raise original_error
+        raise RuntimeError("Typed text did not appear in any matching field.")
     try:
         await _type_text_with_dom_fallback(page, selector, text)
     except Exception:
@@ -697,6 +970,7 @@ class _RawCDPClient:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._event_waiters: dict[str, list[asyncio.Future]] = {}
+        self._event_backlog: dict[str, list[dict[str, object]]] = {}
         self._reader_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
 
@@ -726,10 +1000,17 @@ class _RawCDPClient:
                     continue
                 method = message.get("method") if isinstance(message, dict) else None
                 if isinstance(method, str):
+                    params = message.get("params") if isinstance(message.get("params"), dict) else {}
                     waiters = self._event_waiters.pop(method, [])
+                    delivered = False
                     for future in waiters:
                         if not future.done():
-                            future.set_result(message.get("params") or {})
+                            future.set_result(params)
+                            delivered = True
+                    if not delivered:
+                        backlog = self._event_backlog.setdefault(method, [])
+                        backlog.append(params)
+                        del backlog[:-5]
         except Exception as exc:
             for future in list(self._pending.values()):
                 if not future.done():
@@ -750,6 +1031,9 @@ class _RawCDPClient:
         return await asyncio.wait_for(future, timeout=timeout)
 
     async def wait_event(self, method: str, *, timeout: float) -> dict[str, object]:
+        backlog = self._event_backlog.get(method)
+        if backlog:
+            return backlog.pop(0)
         future = asyncio.get_running_loop().create_future()
         self._event_waiters.setdefault(method, []).append(future)
         return await asyncio.wait_for(future, timeout=timeout)
@@ -829,8 +1113,67 @@ class _RawCDPPage:
             def first(self) -> "_Locator":
                 return self
 
+            async def click(self, **_kwargs: object) -> None:
+                await page.click(selector)
+
+            async def dispatch_event(self, event_name: str, **_kwargs: object) -> None:
+                await page.evaluate(
+                    "(() => {"
+                    f" const el = document.querySelector({json.dumps(selector)});"
+                    " if (!el) throw new Error('selector not found');"
+                    f" el.dispatchEvent(new Event({json.dumps(event_name)}, {{bubbles: true, cancelable: true}}));"
+                    "})()"
+                )
+
+            async def fill(self, text: str, **_kwargs: object) -> None:
+                await page.fill(selector, text)
+
             async def inner_text(self, **_kwargs: object) -> str:
                 return await page.inner_text(selector)
+
+            async def input_value(self, **_kwargs: object) -> str:
+                value = await page.evaluate(
+                    f"(() => {{ const el = document.querySelector({json.dumps(selector)}); return el && 'value' in el ? el.value : ''; }})()"
+                )
+                return str(value or "")
+
+            async def get_attribute(self, name: str, **_kwargs: object) -> str | None:
+                value = await page.evaluate(
+                    "(() => {"
+                    f" const el = document.querySelector({json.dumps(selector)});"
+                    f" return el ? el.getAttribute({json.dumps(name)}) : null;"
+                    "})()"
+                )
+                return str(value) if value is not None else None
+
+            async def is_visible(self, **_kwargs: object) -> bool:
+                return bool(
+                    await page.evaluate(
+                        "(() => {"
+                        f" const el = document.querySelector({json.dumps(selector)});"
+                        " return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));"
+                        "})()"
+                    )
+                )
+
+            async def is_enabled(self, **_kwargs: object) -> bool:
+                return bool(
+                    await page.evaluate(
+                        "(() => {"
+                        f" const el = document.querySelector({json.dumps(selector)});"
+                        " return !!(el && !el.disabled && el.getAttribute('aria-disabled') !== 'true');"
+                        "})()"
+                    )
+                )
+
+            async def evaluate(self, function: str, *args: object, **_kwargs: object) -> object:
+                arg_expression = json.dumps(args[0] if args else None)
+                return await page.evaluate(
+                    "(() => {"
+                    f" const el = document.querySelector({json.dumps(selector)});"
+                    f" return ({function})(el, {arg_expression});"
+                    "})()"
+                )
 
         return _Locator()
 
@@ -982,7 +1325,8 @@ class CDPBackend:
 
     @staticmethod
     def _requires_dedicated_page(session_id: str) -> bool:
-        return session_id.startswith("isolated-")
+        del session_id
+        return False
 
     async def _ensure_raw_browser(self) -> "_RawCDPBrowser":
         browser = _RawCDPBrowser(self._cdp_url)
@@ -1042,8 +1386,13 @@ class CDPBackend:
                                 raise self._new_page_unsupported_error(exc) from exc
                             raise
                 else:
-                    if isinstance(ctx, _RawCDPContext) and pages and not self._requires_dedicated_page(session_id):
-                        self._pages[session_id] = pages[-1]
+                    reusable_pages = [
+                        page
+                        for page in pages
+                        if _page_is_blank(page)
+                    ]
+                    if reusable_pages and not self._requires_dedicated_page(session_id):
+                        self._pages[session_id] = reusable_pages[-1]
                         return self._pages[session_id]
                     try:
                         self._pages[session_id] = await ctx.new_page()

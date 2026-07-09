@@ -945,6 +945,15 @@ class ConversationHistoryToolRegistry:
             )
         return sorted(definitions, key=lambda definition: str(definition.get("name") or ""))
 
+    def can_invoke_tool(self, name: str) -> bool:
+        tool_name = str(name or "").strip()
+        if tool_name == CHAT_HISTORY_SEARCH_TOOL_NAME:
+            return True
+        can_invoke = getattr(self._delegate, "can_invoke_tool", None)
+        if callable(can_invoke):
+            return bool(can_invoke(tool_name))
+        return any(str(getattr(spec, "name", "") or "") == tool_name for spec in self._delegate.list_specs())
+
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
         if invocation.tool_name == CHAT_HISTORY_SEARCH_TOOL_NAME:
             return _chat_history_search_result(
@@ -969,14 +978,7 @@ def with_conversation_history_tool(
     normalized_conversation_id = str(conversation_id or "").strip()
     if registry is None or not normalized_conversation_id or getattr(runtime, "store", None) is None:
         return registry
-    try:
-        existing_names = {str(getattr(spec, "name", "") or "") for spec in registry.list_specs()}
-    except Exception:
-        try:
-            existing_names = {str(definition.get("name") or "") for definition in registry.list_tool_definitions()}
-        except Exception:
-            existing_names = set()
-    if CHAT_HISTORY_SEARCH_TOOL_NAME in existing_names:
+    if isinstance(registry, ConversationHistoryToolRegistry):
         return registry
     return ConversationHistoryToolRegistry(
         registry,

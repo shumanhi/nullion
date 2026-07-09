@@ -1,6 +1,6 @@
 """User preferences — formatting, tone, and behaviour hints injected as system context.
 
-Saved to ~/.nullion/preferences.json.
+Saved to $NULLION_HOME/preferences.json, defaulting to ~/.nullion/preferences.json.
 Use load_preferences() to read and build_preferences_prompt() to get the
 system-prompt snippet that should be prepended to every AI turn.
 """
@@ -13,8 +13,13 @@ from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-_PREFS_PATH = Path.home() / ".nullion" / "preferences.json"
-_PROFILE_PATH = Path.home() / ".nullion" / "profile.json"
+def _state_home() -> Path:
+    return Path(os.environ.get("NULLION_HOME") or (Path.home() / ".nullion")).expanduser()
+
+
+_STATE_HOME = _state_home()
+_PREFS_PATH = _STATE_HOME / "preferences.json"
+_PROFILE_PATH = _STATE_HOME / "profile.json"
 
 _MAX_PERSONA_LEN = 280  # Twitter-length cap
 
@@ -80,7 +85,7 @@ _DEFAULTS: dict = {
     # Personality
     "persona":             "",           # user-written prompt fragment, max 280 chars
     # Formatting
-    "emoji_level":         "standard",   # none | minimal | standard | expressive
+    "emoji_level":         "none",       # none | minimal | standard | expressive
     "response_length":     "balanced",   # concise | balanced | detailed
     "response_structure":  "free",       # free | bullets | numbered | prose
     "markdown_style":      "light",      # plain | light | full
@@ -108,7 +113,7 @@ _DEFAULTS: dict = {
 @dataclass
 class Preferences:
     persona:               str  = ""
-    emoji_level:           str  = "standard"
+    emoji_level:           str  = "none"
     response_length:       str  = "balanced"
     response_structure:    str  = "free"
     markdown_style:        str  = "light"
@@ -279,7 +284,7 @@ def build_preferences_prompt(prefs: Preferences, *, now: datetime | None = None)
 
     lines.append("## Formatting and tone rules:")
 
-    lines.append(_EMOJI_LINES.get(prefs.emoji_level, _EMOJI_LINES["standard"]))
+    lines.append(_EMOJI_LINES.get(prefs.emoji_level, _EMOJI_LINES["none"]))
     lines.append(_LENGTH_LINES.get(prefs.response_length, _LENGTH_LINES["balanced"]))
     lines.append(_STRUCTURE_LINES.get(prefs.response_structure, _STRUCTURE_LINES["free"]))
     lines.append(_MARKDOWN_LINES.get(prefs.markdown_style, _MARKDOWN_LINES["light"]))
@@ -288,7 +293,8 @@ def build_preferences_prompt(prefs: Preferences, *, now: datetime | None = None)
     lines.append(_CODE_LINES.get(prefs.code_examples, _CODE_LINES["relevant"]))
     lines.append(
         "When asking the user to choose from options or provide one of several inputs, "
-        "present numbered options and accept a numeric reply."
+        "present exactly one numbered options list and accept a numeric reply. "
+        "Keep recommendations, evidence, and explanatory steps outside that pick-list as bullets or prose."
     )
 
     if prefs.proactive_suggestions:

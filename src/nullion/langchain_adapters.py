@@ -194,6 +194,7 @@ def _make_langchain_tool_coroutine(
             tool_registry=tool_registry,
             policy_store=policy_store,
         )
+        result = _with_replayable_artifact_arguments(result, invocation.arguments)
         emitted_results = [result]
         if _result_allows_fallback(result):
             for fallback_name in fallback_tools:
@@ -209,6 +210,7 @@ def _make_langchain_tool_coroutine(
                     tool_registry=tool_registry,
                     policy_store=policy_store,
                 )
+                fallback_result = _with_replayable_artifact_arguments(fallback_result, fallback_invocation.arguments)
                 emitted_results.append(fallback_result)
                 if not _result_allows_fallback(fallback_result):
                     result = fallback_result
@@ -222,6 +224,27 @@ def _make_langchain_tool_coroutine(
     _run_nullion_tool.__name__ = f"nullion_{name}"
     _run_nullion_tool.__doc__ = f"Run the Nullion {name} tool through Sentinel policy."
     return _run_nullion_tool
+
+
+def _with_replayable_artifact_arguments(result: ToolResult, arguments: dict[str, Any]) -> ToolResult:
+    output = result.output if isinstance(result.output, dict) else {}
+    if str(getattr(result, "tool_name", "") or "") != "spreadsheet_create":
+        return result
+    if str(getattr(result, "status", "") or "").strip().lower() not in {"failed", "failure", "error"}:
+        return result
+    if str(output.get("reason") or "").strip() != "remote_image_paths_not_supported":
+        return result
+    if "invocation_arguments" in output:
+        return result
+    enriched_output = dict(output)
+    enriched_output["invocation_arguments"] = dict(arguments)
+    return ToolResult(
+        result.invocation_id,
+        result.tool_name,
+        result.status,
+        enriched_output,
+        result.error,
+    )
 
 
 def _invoke_nullion_tool(
@@ -300,7 +323,7 @@ async def _call_nullion_model(
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return await _call_create(create, create_kwargs)
+            return await asyncio.wait_for(_call_create(create, create_kwargs), timeout=_model_call_timeout_seconds())
         except Exception as exc:
             last_exc = exc
             if attempt >= attempts:
@@ -323,6 +346,14 @@ def _model_retry_attempts() -> int:
         return max(1, int(raw))
     except ValueError:
         return 2
+
+
+def _model_call_timeout_seconds() -> float:
+    raw = os.environ.get("NULLION_LANGCHAIN_MODEL_CALL_TIMEOUT_SECONDS", "90")
+    try:
+        return max(0.01, float(raw))
+    except ValueError:
+        return 90.0
 
 
 def _nullion_messages_from_langchain_messages(

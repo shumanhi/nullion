@@ -226,6 +226,28 @@ def _mini_agent_run_merge_value(current: MiniAgentRun, previous: MiniAgentRun) -
     return current
 
 
+_RESOLVED_BUILDER_PROPOSAL_STATUSES = frozenset({"accepted", "rejected", "archived"})
+
+
+def _builder_proposal_record_time(record: BuilderProposalRecord) -> datetime:
+    return record.resolved_at or record.created_at
+
+
+def _builder_proposal_merge_value(
+    current: BuilderProposalRecord,
+    previous: BuilderProposalRecord,
+) -> BuilderProposalRecord:
+    current_status = str(current.status or "").strip().lower()
+    previous_status = str(previous.status or "").strip().lower()
+    if previous_status in _RESOLVED_BUILDER_PROPOSAL_STATUSES and current_status == "pending":
+        return previous
+    if current_status in _RESOLVED_BUILDER_PROPOSAL_STATUSES and previous_status == "pending":
+        return current
+    if _builder_proposal_record_time(previous) > _builder_proposal_record_time(current):
+        return previous
+    return current
+
+
 def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeStore) -> None:
     dict_attrs = (
         "suspended_turns",
@@ -256,6 +278,19 @@ def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeSto
             store.mini_agent_runs[key] = _mini_agent_run_merge_value(current_run, previous_run)
     for attr in ("events", "audit_records", "conversation_events"):
         _merge_list_records(getattr(store, attr), getattr(previous, attr))
+    for key, previous_proposal in getattr(previous, "builder_proposals", {}).items():
+        current_proposal = store.builder_proposals.get(key)
+        if current_proposal is None:
+            store.builder_proposals[key] = previous_proposal
+        else:
+            store.builder_proposals[key] = _builder_proposal_merge_value(
+                current_proposal,
+                previous_proposal,
+            )
+    for key, previous_skill in getattr(previous, "skills", {}).items():
+        current_skill = store.skills.get(key)
+        if current_skill is None or getattr(previous_skill, "revision", 0) > getattr(current_skill, "revision", 0):
+            store.skills[key] = previous_skill
     if getattr(previous, "builder_route_observations", None):
         from nullion.builder_routes import trim_route_observations
 
@@ -1960,7 +1995,9 @@ def _save_runtime_store_sqlite(
                     "events",
                     "audit_records",
                     "conversation_events",
+                    "builder_proposals",
                     "builder_route_observations",
+                    "skills",
                 ),
             )
             _merge_previous_checkpoint_records(store, previous_store)
@@ -2050,6 +2087,62 @@ def _save_runtime_store_sqlite(
             record_count,
             merge_existing,
         )
+    return target
+
+
+def checkpoint_runtime_conversation_events(
+    store: RuntimeStore,
+    path: str | Path,
+    *,
+    limit: int = 128,
+) -> Path:
+    target = Path(path)
+    if not _is_sqlite_runtime_path(target):
+        return save_runtime_store(store, target, merge_existing=True)
+    started_at = perf_counter()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rows = store.list_conversation_events()
+    if limit > 0:
+        rows = rows[-limit:]
+    now = datetime.now(UTC).isoformat()
+    encoded_rows = [
+        (
+            "conversation_events",
+            _sqlite_collection_item_key("conversation_events", index, row),
+            _encode_sqlite_runtime_payload("conversation_events", target, row),
+            now,
+        )
+        for index, row in enumerate(rows)
+    ]
+    with sqlite3.connect(str(target), timeout=10) as conn:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(_sqlite_runtime_ddl())
+        conn.execute(
+            "INSERT OR REPLACE INTO runtime_meta (key, value) VALUES (?, ?)",
+            ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)),
+        )
+        if encoded_rows:
+            existing_rows = {
+                str(item_key): str(row_payload)
+                for item_key, row_payload in conn.execute(
+                    "SELECT item_key, payload FROM conversation_events WHERE collection = ?",
+                    ("conversation_events",),
+                )
+            }
+            changed_rows = [
+                (collection, item_key, row_payload, updated_at)
+                for collection, item_key, row_payload, updated_at in encoded_rows
+                if existing_rows.get(item_key) != row_payload
+            ]
+            if changed_rows:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO conversation_events
+                        (collection, item_key, payload, updated_at)
+                        VALUES (?, ?, ?, ?)""",
+                    changed_rows,
+                )
+    _log_runtime_sqlite_timing("conversation-event-save", started_at, target, records=len(rows))
     return target
 
 

@@ -230,12 +230,26 @@ class TaskDecomposer:
             if dag_plan.can_dispatch or (dag_plan.is_valid and len(dag_plan.tasks) == 1)
             else []
         )
-        if raw_tasks and requires_artifact_delivery:
+        artifact_contract_kind = str(required_artifact_kind or "").strip().lower().removeprefix(".")
+        raw_tool_artifact_kind = _artifact_kind_from_task_tool_scopes(raw_tasks) if raw_tasks else None
+        if (
+            artifact_contract_kind
+            and raw_tool_artifact_kind
+            and raw_tool_artifact_kind != artifact_contract_kind
+            and not _artifact_kind_has_default_tool_scope(raw_tasks, artifact_contract_kind)
+        ):
+            artifact_contract_kind = raw_tool_artifact_kind
+        if not artifact_contract_kind and raw_tasks and _tasks_include_artifact_delivery_contract(raw_tasks):
+            artifact_contract_kind = raw_tool_artifact_kind or ""
+        if raw_tasks and (requires_artifact_delivery or artifact_contract_kind):
+            raw_tasks = _with_artifact_source_dependencies(list(raw_tasks))
+            raw_tasks = _topologically_order_decomposed_tasks(list(raw_tasks))
             raw_tasks = _with_artifact_verification_tasks(
                 list(raw_tasks),
                 available_tools=available_tools,
-                required_artifact_kind=required_artifact_kind,
+                required_artifact_kind=artifact_contract_kind or required_artifact_kind,
             )
+            raw_tasks = _topologically_order_decomposed_tasks(list(raw_tasks))
 
         if not raw_tasks:
             # Fallback: treat the whole message as one task
@@ -794,6 +808,27 @@ _ARTIFACT_PRODUCER_TOOLS = frozenset(
         "spreadsheet_create",
     }
 )
+_ARTIFACT_PRODUCER_DEFAULT_KINDS = {
+    "document_create": "docx",
+    "pdf_create": "pdf",
+    "pdf_edit": "pdf",
+    "presentation_create": "pptx",
+    "spreadsheet_create": "xlsx",
+}
+_ARTIFACT_SOURCE_TOOLS = frozenset(
+    {
+        "archive_extract",
+        "browser_extract_items",
+        "browser_extract_text",
+        "browser_image_collect",
+        "browser_run_js",
+        "file_download",
+        "file_read",
+        "file_search",
+        "web_fetch",
+        "workspace_summary",
+    }
+)
 _UNCHANGED = object()
 _NO_SCRIPT_ATTACHMENT_PLATFORMS = frozenset({"telegram", "slack", "discord", "unknown"})
 
@@ -831,6 +866,42 @@ def _artifact_delivery_contract_metadata(
     }
 
 
+def _tasks_include_artifact_delivery_contract(tasks: list[DecomposedTask]) -> bool:
+    for task in tasks:
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if (
+            metadata.get("artifact_role")
+            or metadata.get("requires_artifact_delivery")
+            or metadata.get("required_artifact_kind")
+        ):
+            return True
+    return False
+
+
+def _artifact_kind_from_task_tool_scopes(tasks: list[DecomposedTask]) -> str | None:
+    kinds = tuple(
+        dict.fromkeys(
+            kind
+            for task in tasks
+            for tool in (task.tool_scope or [])
+            for kind in (_ARTIFACT_PRODUCER_DEFAULT_KINDS.get(str(tool or "").strip().lower()),)
+            if kind
+        )
+    )
+    return kinds[0] if len(kinds) == 1 else None
+
+
+def _artifact_kind_has_default_tool_scope(tasks: list[DecomposedTask], artifact_kind: str | None) -> bool:
+    kind = str(artifact_kind or "").strip().lower().removeprefix(".")
+    if not kind:
+        return False
+    return any(
+        _ARTIFACT_PRODUCER_DEFAULT_KINDS.get(str(tool or "").strip().lower()) == kind
+        for task in tasks
+        for tool in (task.tool_scope or [])
+    )
+
+
 def _with_artifact_verification_tasks(
     tasks: list[DecomposedTask],
     *,
@@ -848,28 +919,32 @@ def _with_artifact_verification_tasks(
         isinstance(task.metadata, dict) and task.metadata.get("artifact_role") in {"verify", "deliver_receipt"}
         for task in tasks
     ):
-        return tasks
-    producer_indices = [
+        return _normalize_artifact_delivery_contract_tasks(
+            tasks,
+            required_artifact_kind=required_artifact_kind,
+        )
+    producer_candidates = [
         index
         for index, task in enumerate(tasks)
         if set(str(tool).lower() for tool in (task.tool_scope or [])) & _ARTIFACT_PRODUCER_TOOLS
     ]
+    producer_indices = _requested_artifact_producer_indices(
+        tasks,
+        producer_candidates=producer_candidates,
+        required_artifact_kind=required_artifact_kind,
+    )
+    if not producer_indices:
+        producer_indices = producer_candidates
     if not producer_indices:
         return tasks
     result = [
         _copy_decomposed_task(
             task,
-            metadata={
-                **dict(task.metadata or {}),
-                **(
-                    {
-                        "requires_artifact_delivery": True,
-                        "required_artifact_kind": required_artifact_kind,
-                    }
-                    if index in producer_indices
-                    else {}
-                ),
-            },
+            metadata=_artifact_delivery_metadata_for_planned_task(
+                task,
+                is_requested_producer=index in producer_indices,
+                required_artifact_kind=required_artifact_kind,
+            ),
         )
         for index, task in enumerate(tasks)
     ]
@@ -931,10 +1006,223 @@ def _with_artifact_verification_tasks(
     return result
 
 
+def _with_artifact_source_dependencies(tasks: list[DecomposedTask]) -> list[DecomposedTask]:
+    if len(tasks) < 2:
+        return tasks
+    changed = False
+    normalized: list[DecomposedTask] = []
+    for index, task in enumerate(tasks):
+        if not _decomposed_task_has_artifact_producer_scope(task):
+            normalized.append(task)
+            continue
+        source_indexes = [
+            source_index
+            for source_index, source_task in enumerate(tasks)
+            if source_index != index
+            if _decomposed_task_has_artifact_source_scope(source_task)
+            and not _decomposed_task_declares_artifact_role(source_task)
+            and not _decomposed_task_has_artifact_producer_scope(source_task)
+            and not _decomposed_task_depends_on_index(source_task, index, tasks)
+        ]
+        if not source_indexes:
+            normalized.append(task)
+            continue
+        dependencies = sorted(
+            {
+                dep
+                for dep in (task.dep_indices or [])
+                if isinstance(dep, int) and 0 <= dep < len(tasks) and dep != index
+            }
+            | set(source_indexes)
+        )
+        if dependencies == list(task.dep_indices or []):
+            normalized.append(task)
+            continue
+        normalized.append(_copy_decomposed_task(task, dep_indices=dependencies))
+        changed = True
+    return normalized if changed else tasks
+
+
+def _topologically_order_decomposed_tasks(tasks: list[DecomposedTask]) -> list[DecomposedTask]:
+    if len(tasks) < 2:
+        return tasks
+    dependencies_by_index: dict[int, set[int]] = {
+        index: {
+            dep
+            for dep in (task.dep_indices or [])
+            if isinstance(dep, int) and 0 <= dep < len(tasks) and dep != index
+        }
+        for index, task in enumerate(tasks)
+    }
+    if _has_cycle([sorted(dependencies_by_index[index]) for index in range(len(tasks))]):
+        return tasks
+
+    remaining = set(range(len(tasks)))
+    ordered_indexes: list[int] = []
+    while remaining:
+        ready = [
+            index
+            for index in sorted(remaining)
+            if not (dependencies_by_index[index] & remaining)
+        ]
+        if not ready:
+            return tasks
+        for index in ready:
+            ordered_indexes.append(index)
+            remaining.remove(index)
+
+    if ordered_indexes == list(range(len(tasks))):
+        return tasks
+
+    remap = {old_index: new_index for new_index, old_index in enumerate(ordered_indexes)}
+    ordered: list[DecomposedTask] = []
+    for old_index in ordered_indexes:
+        remapped_deps = sorted(
+            remap[dep]
+            for dep in dependencies_by_index[old_index]
+            if dep in remap
+        )
+        ordered.append(_copy_decomposed_task(tasks[old_index], dep_indices=remapped_deps))
+    return ordered
+
+
+def _decomposed_task_depends_on_index(
+    task: DecomposedTask,
+    dependency_index: int,
+    tasks: list[DecomposedTask],
+) -> bool:
+    if dependency_index < 0 or dependency_index >= len(tasks):
+        return False
+    task_to_index = {id(candidate): index for index, candidate in enumerate(tasks)}
+    start_index = task_to_index.get(id(task))
+    if start_index is None:
+        return False
+    seen: set[int] = set()
+    pending = [
+        dep
+        for dep in (task.dep_indices or [])
+        if isinstance(dep, int) and 0 <= dep < len(tasks)
+    ]
+    while pending:
+        dep = pending.pop(0)
+        if dep in seen:
+            continue
+        if dep == dependency_index:
+            return True
+        seen.add(dep)
+        pending.extend(
+            parent_dep
+            for parent_dep in (tasks[dep].dep_indices or [])
+            if isinstance(parent_dep, int) and 0 <= parent_dep < len(tasks)
+        )
+    return False
+
+
+def _decomposed_task_has_artifact_producer_scope(task: DecomposedTask) -> bool:
+    return bool(set(str(tool or "").strip().lower() for tool in (task.tool_scope or [])) & _ARTIFACT_PRODUCER_TOOLS)
+
+
+def _decomposed_task_has_artifact_source_scope(task: DecomposedTask) -> bool:
+    return bool(set(str(tool or "").strip().lower() for tool in (task.tool_scope or [])) & _ARTIFACT_SOURCE_TOOLS)
+
+
+def _decomposed_task_declares_artifact_role(task: DecomposedTask) -> bool:
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    return _metadata_declares_artifact_delivery(metadata)
+
+
+def _requested_artifact_producer_indices(
+    tasks: list[DecomposedTask],
+    *,
+    producer_candidates: list[int],
+    required_artifact_kind: str | None,
+) -> list[int]:
+    artifact_kind = str(required_artifact_kind or "").strip().lower().removeprefix(".")
+    if not artifact_kind:
+        return []
+    exact_metadata_matches: list[int] = []
+    default_tool_matches: list[int] = []
+    for index in producer_candidates:
+        task = tasks[index]
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        declared_kind = str(metadata.get("required_artifact_kind") or "").strip().lower().removeprefix(".")
+        artifact_role = str(metadata.get("artifact_role") or "").strip()
+        if declared_kind:
+            if declared_kind == artifact_kind and artifact_role not in {"verify", "deliver_receipt"}:
+                exact_metadata_matches.append(index)
+            continue
+        if artifact_role == "deliverable":
+            exact_metadata_matches.append(index)
+            continue
+        if any(
+            _ARTIFACT_PRODUCER_DEFAULT_KINDS.get(str(tool or "").strip().lower()) == artifact_kind
+            for tool in (task.tool_scope or [])
+        ):
+            default_tool_matches.append(index)
+    return exact_metadata_matches or default_tool_matches
+
+
+def _artifact_delivery_metadata_for_planned_task(
+    task: DecomposedTask,
+    *,
+    is_requested_producer: bool,
+    required_artifact_kind: str | None,
+) -> dict[str, object]:
+    metadata = dict(task.metadata or {})
+    if is_requested_producer:
+        metadata["requires_artifact_delivery"] = True
+        metadata["required_artifact_kind"] = required_artifact_kind
+        return metadata
+    if _metadata_declares_artifact_delivery(metadata):
+        metadata.pop("requires_artifact_delivery", None)
+        metadata.pop("required_artifact_kind", None)
+        metadata.pop("delivery_contract", None)
+        if str(metadata.get("artifact_role") or "").strip() == "deliverable":
+            metadata.pop("artifact_role", None)
+    return metadata
+
+
+def _metadata_declares_artifact_delivery(metadata: dict[str, object]) -> bool:
+    return bool(
+        metadata.get("requires_artifact_delivery")
+        or metadata.get("required_artifact_kind")
+        or str(metadata.get("artifact_role") or "").strip() == "deliverable"
+    )
+
+
+def _normalize_artifact_delivery_contract_tasks(
+    tasks: list[DecomposedTask],
+    *,
+    required_artifact_kind: str | None,
+) -> list[DecomposedTask]:
+    artifact_kind = str(required_artifact_kind or "").strip().lower().removeprefix(".")
+    if not artifact_kind:
+        return tasks
+    normalized: list[DecomposedTask] = []
+    for task in tasks:
+        metadata = dict(task.metadata or {})
+        artifact_role = str(metadata.get("artifact_role") or "").strip()
+        is_artifact_task = bool(
+            artifact_role in {"deliverable", "deliver_receipt", "verify"}
+            or metadata.get("requires_artifact_delivery")
+            or metadata.get("required_artifact_kind")
+            or set(str(tool).lower() for tool in (task.tool_scope or [])) & _ARTIFACT_PRODUCER_TOOLS
+        )
+        if not is_artifact_task:
+            normalized.append(task)
+            continue
+        metadata["requires_artifact_delivery"] = True
+        metadata["required_artifact_kind"] = artifact_kind
+        metadata.pop("delivery_contract", None)
+        normalized.append(_copy_decomposed_task(task, metadata=metadata))
+    return normalized
+
+
 def _copy_decomposed_task(
     task: DecomposedTask,
     *,
     context_key_out: str | None | object = _UNCHANGED,
+    dep_indices: list[int] | tuple[int, ...] | object = _UNCHANGED,
     metadata: dict[str, object] | None = None,
 ) -> DecomposedTask:
     return DecomposedTask(
@@ -942,7 +1230,7 @@ def _copy_decomposed_task(
         description=task.description,
         tool_scope=list(task.tool_scope),
         priority=task.priority,
-        dep_indices=list(task.dep_indices),
+        dep_indices=list(task.dep_indices if dep_indices is _UNCHANGED else dep_indices or []),
         context_key_in=task.context_key_in,
         context_key_out=task.context_key_out if context_key_out is _UNCHANGED else context_key_out,
         required_inputs=list(task.required_inputs or []),

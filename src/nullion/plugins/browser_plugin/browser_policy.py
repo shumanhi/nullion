@@ -93,7 +93,7 @@ class BrowserPolicy:
 
     # ── Public ───────────────────────────────────────────────────────────────
 
-    def check_url(self, url: str) -> None:
+    def check_url(self, url: str, *, allow_private_host: bool = False) -> None:
         """Raise BrowserPolicyViolation if the URL should not be navigated to."""
         parsed = urlparse(url)
 
@@ -106,7 +106,7 @@ class BrowserPolicy:
         if not host:
             raise BrowserPolicyViolation("URL has no host.")
 
-        if self.block_private and _is_private_host(host):
+        if self.block_private and not allow_private_host and _is_private_host(host):
             raise BrowserPolicyViolation(
                 f"Navigation to private/local host blocked by SSRF guard: {host!r}. "
                 "Set NULLION_BROWSER_BLOCK_PRIVATE=false to allow."

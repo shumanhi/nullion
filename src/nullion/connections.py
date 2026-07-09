@@ -51,9 +51,9 @@ def _provider_id_looks_external_connector(provider_id: object) -> bool:
 def _structured_tools_for_connection(connection: "ProviderConnection") -> tuple[str, ...]:
     if not _provider_id_looks_external_connector(connection.provider_id):
         return ()
-    tools = ["connector_request", "email_search", "email_read", "calendar_list"]
+    tools = ["connector_request", "email_search", "email_read", "email_attachment_read", "calendar_list"]
     if connection.permission_mode == "write":
-        tools.append("email_send")
+        tools.extend(["email_send", "calendar_create", "calendar_update", "calendar_respond", "calendar_delete"])
     return tuple(tools)
 
 
@@ -425,6 +425,34 @@ def workspace_id_for_principal(principal_id: str | None) -> str:
     return _ADMIN_WORKSPACE_ID
 
 
+def principal_has_admin_access(principal_id: str | None) -> bool:
+    """Return whether a structured principal is the workspace admin/operator."""
+
+    text = str(principal_id or "").strip()
+    if text in {"operator", "telegram_chat", "web:operator", "web:admin"}:
+        return True
+    if text.startswith("workspace:"):
+        return (text.removeprefix("workspace:") or _ADMIN_WORKSPACE_ID) == _ADMIN_WORKSPACE_ID
+    registry = load_user_registry()
+    if text.startswith("user:"):
+        user_id = text.removeprefix("user:").strip()
+        return any(user.active and user.user_id == user_id and user.role == "admin" for user in registry.users)
+    if ":" in text:
+        channel, identity = text.split(":", 1)
+        if channel in {"telegram", "slack", "discord"} and identity:
+            for user in registry.users:
+                if not user.active or user.role != "admin":
+                    continue
+                if channel == "telegram" and str(user.telegram_chat_id or "").strip() == identity:
+                    return True
+                if (
+                    str(user.messaging_channel or "").strip().lower() == channel
+                    and str(user.messaging_user_id or "").strip() == identity
+                ):
+                    return True
+    return False
+
+
 def multi_user_connections_active() -> bool:
     registry = load_user_registry()
     return registry.multi_user_enabled and any(user.role == "member" for user in registry.users)
@@ -603,6 +631,7 @@ __all__ = [
     "infer_email_plugin_provider",
     "load_connection_registry",
     "multi_user_connections_active",
+    "principal_has_admin_access",
     "require_workspace_connection_for_principal",
     "save_connection_registry",
     "workspace_id_for_principal",

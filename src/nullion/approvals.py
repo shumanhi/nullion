@@ -9,6 +9,10 @@ from uuid import uuid4
 from nullion.policy import BoundaryKind
 
 
+TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND = "terminal_destructive_action"
+TERMINAL_DESTRUCTIVE_PERMISSION_PREFIX = "terminal_destructive:"
+
+
 class ApprovalStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"

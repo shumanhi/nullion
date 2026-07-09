@@ -20,7 +20,6 @@ from nullion.messaging_adapters import (
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
     MessagingIngress,
-    WORKING_ACK_TEXT,
     execute_platform_reply_delivery,
     handle_messaging_ingress_result,
     platform_plain_format_fallback_text,
@@ -30,7 +29,6 @@ from nullion.messaging_adapters import (
     sanitize_external_inline_markup,
     save_messaging_attachment,
     send_with_plain_text_fallback,
-    should_emit_separate_working_ack,
     split_reply_for_platform,
 )
 from nullion.messaging_runtime import build_messaging_runtime_service_from_settings
@@ -43,6 +41,7 @@ from nullion.platform_activity import (
 from nullion.run_activity import activity_trace_enabled
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
+from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.users import resolve_messaging_user
 
 
@@ -531,28 +530,16 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         ingress.text,
         turn_id=ingress.message_id or ingress.request_id,
         model_client=getattr(service, "model_client", None),
+        active_turn_followup_evidence=has_structured_turn_relationship_evidence(
+            ingress.text,
+            attachments=ingress.attachments,
+        ),
     )
     _mark_timing("turn_registered")
     text_streamer = _DiscordTextDeltaStreamer(loop=asyncio.get_running_loop(), channel=message.channel)
-    loop = asyncio.get_running_loop()
-    tool_working_ack_sent = False
 
     def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
-        nonlocal tool_working_ack_sent
-        if (
-            tool_working_ack_sent
-            or message.channel is None
-            or not should_emit_separate_working_ack(event)
-        ):
-            return
-        tool_working_ack_sent = True
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _send_discord_text_with_plain_fallback(message.channel, WORKING_ACK_TEXT),
-                loop,
-            )
-        except Exception:
-            logger.debug("Discord working message scheduling failed", exc_info=True)
+        del event
 
     try:
         await turn_registration.wait_for_dependencies()
@@ -625,6 +612,7 @@ async def run_discord_app(
             registry=getattr(service, "tool_registry", None),
             settings=settings,
             surface="discord",
+            principal_ids=("telegram_chat",),
         )
     except Exception:
         logger.debug("Could not schedule Discord chat startup warmup", exc_info=True)

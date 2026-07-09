@@ -57,6 +57,19 @@ DEFAULT_FINAL_SUMMARY_TIMEOUT_S: float = 12.0
 _FILENAME_TOKEN_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][\w .()@+-]{0,180}\.[A-Za-z0-9]{1,16})(?![\w./-])")
 _ARTIFACT_DELIVERY_ROLES = frozenset({"deliverable", "deliver_receipt", "verify"})
 _ARTIFACT_PRODUCER_TOOLS = frozenset({"file_write", "document_create", "spreadsheet_create", "presentation_create"})
+_ARTIFACT_SOURCE_TOOLS = frozenset(
+    {
+        "archive_extract",
+        "browser_extract_items",
+        "browser_extract_text",
+        "browser_image_collect",
+        "browser_run_js",
+        "file_download",
+        "file_read",
+        "file_search",
+        "workspace_summary",
+    }
+)
 _INTERNAL_ARTIFACT_SUFFIXES = frozenset({".json", ".jsonl", ".db", ".sqlite", ".sqlite3"})
 _RAW_TOOL_PAYLOAD_KEYS = frozenset(
     {
@@ -84,6 +97,7 @@ class GroupState:
     last_progress_time: float = field(default_factory=time.monotonic)
     status_lines: dict[str, str] = field(default_factory=dict)  # task_id → one-line status
     task_summary_visible: bool = False
+    delivered_input_questions: set[str] = field(default_factory=set)
 
 
 # Delivery callback type: (conversation_id, text, *, is_status) -> Awaitable[None] | None
@@ -158,10 +172,25 @@ class ResultAggregator:
             activity_label=f"{label} tools",
         )
 
-    async def _deliver_status(self, gs: GroupState, group: TaskGroup) -> None:
+    async def _deliver_status(
+        self,
+        gs: GroupState,
+        group: TaskGroup,
+        *,
+        status_line_overrides: dict[str, str] | None = None,
+        terminal: bool = False,
+    ) -> None:
         """Emit the current status summary for the group."""
         planner_summary = _planner_summary_from_group(group)
+        overrides = status_line_overrides or {}
+        persistent_overrides: dict[str, str] = {}
+        for task_id, line in overrides.items():
+            if task_id and str(line or "").strip():
+                persistent_overrides[task_id] = str(line).strip()
+                gs.status_lines[task_id] = str(line).strip()
         for task in group.tasks:
+            if task.task_id in overrides:
+                continue
             if task.status in {
                 TaskStatus.RUNNING,
                 TaskStatus.QUEUED,
@@ -172,20 +201,25 @@ class ResultAggregator:
             }:
                 current = gs.status_lines.get(task.task_id)
                 next_line = format_task_status_line(task)
-                if current is None or _task_status_rank(next_line) >= _task_status_rank(current):
+                if _should_replace_task_status_line(current, next_line):
                     gs.status_lines[task.task_id] = next_line
+        display_status_lines = dict(gs.status_lines)
+        display_status_lines.update(persistent_overrides)
+        if not persistent_overrides:
+            display_status_lines.update(artifact_status_line_overrides_for_group(group))
         delivered = await self._deliver(
             gs.conversation_id,
             format_task_status_summary(
                 group.tasks,
                 planner_summary=planner_summary,
                 subject=group.original_message,
-                status_lines=gs.status_lines,
+                status_lines=display_status_lines,
                 default_status=TaskStatus.PENDING,
             ),
             is_status=True,
             group_id=group.group_id,
             status_kind="task_summary",
+            terminal=terminal,
         )
         if delivered:
             gs.task_summary_visible = True
@@ -195,6 +229,7 @@ class ResultAggregator:
         if group.group_id in self._completed_groups:
             return
         self._completed_groups.add(group.group_id)
+        await self._deliver_status(gs, group, terminal=True)
         recovered_artifacts = finalize_delegated_artifacts(group)
         preverified_artifacts = _artifact_paths_for_group_delivery(
             group,
@@ -231,8 +266,18 @@ class ResultAggregator:
         )
 
         # Deliver any artifacts.
+        delivered_artifacts: list[str] = []
         for artifact in deliverable_artifacts:
-            await self._deliver(gs.conversation_id, artifact, is_artifact=True, group_id=gs.group_id)
+            delivered = await self._deliver(gs.conversation_id, artifact, is_artifact=True, group_id=gs.group_id)
+            if delivered:
+                delivered_artifacts.append(artifact)
+        if delivered_artifacts:
+            await self._deliver_status(
+                gs,
+                group,
+                status_line_overrides=_status_lines_for_delivered_artifacts(group, delivered_artifacts),
+                terminal=True,
+            )
 
         # Clean up group state.
         self._group_state.pop(gs.group_id, None)
@@ -447,12 +492,35 @@ def _summary_with_original_request_context(group: TaskGroup, summary: str) -> st
     text = str(summary or "").strip()
     if _is_scheduled_task_request(group.original_message):
         return text
+    if _is_planner_group(group):
+        return _planner_result_summary_text(group, text)
     request = _compact_original_request(group.original_message)
     if not text or not request:
         return text
     if text.lower().startswith("result for "):
         return text
     return f'Result for "{request}":\n{text}'
+
+
+def _is_planner_group(group: TaskGroup) -> bool:
+    metadata = getattr(group, "planner_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    disposition = str(metadata.get("disposition") or "").strip()
+    return bool(disposition) and bool(metadata.get("valid", True))
+
+
+def _planner_result_summary_text(group: TaskGroup, summary: str) -> str:
+    text = str(summary or "").strip()
+    if text.startswith("📊 **PLANNER RESULT**"):
+        return text
+    request = _compact_original_request(group.original_message)
+    header = "📊 **PLANNER RESULT**"
+    if request and text:
+        return f"{header}\n\nFor: {request}\n\n{text}"
+    if request:
+        return f"{header}\n\nFor: {request}"
+    return f"{header}\n\n{text}" if text else header
 
 
 def _final_summary_timeout_seconds() -> float:
@@ -581,8 +649,23 @@ def _artifact_paths_for_group_delivery(
     artifact_task_paths.extend(str(path) for path in (recovered_artifacts or []) if isinstance(path, str) and path.strip())
     roots = _artifact_roots_for_group(group)
     summary_paths = _existing_artifacts_referenced_by_text(str(summary or ""), artifact_roots=roots)
+    requested_extension = _normalize_requested_extension(requested_extension)
     if _group_has_artifact_verifier(group) and not _group_has_successful_artifact_verifier(group):
-        return []
+        trusted_artifact_task_paths = _filter_internal_artifact_paths(artifact_task_paths)
+        if scheduled_group or not trusted_artifact_task_paths:
+            return []
+        if requested_extension:
+            matching = _filter_artifact_paths_by_extension(trusted_artifact_task_paths, requested_extension)
+            if matching:
+                trusted_artifact_task_paths = matching
+            elif _artifact_paths_have_single_extension(trusted_artifact_task_paths):
+                requested_extension = None
+            else:
+                return []
+        artifact_task_paths = trusted_artifact_task_paths
+        explicit_paths = trusted_artifact_task_paths
+        summary_paths = []
+        all_text_paths = []
     for task in group.tasks:
         result = task.result
         if result is None:
@@ -614,7 +697,6 @@ def _artifact_paths_for_group_delivery(
                 artifact_task_paths.extend(found)
             elif scheduled_group and task.task_id not in leaf_task_ids:
                 scheduled_fallback_paths.extend(found)
-    requested_extension = _normalize_requested_extension(requested_extension)
     if scheduled_group and not requested_extension and not _group_has_explicit_artifact_delivery(group):
         return []
     if requested_extension:
@@ -651,7 +733,11 @@ def _artifact_paths_for_group_delivery(
 
 def _requested_attachment_extension_for_group(group: TaskGroup, *, model_client: Any | None) -> str | None:
     try:
-        return plan_attachment_format(group.original_message, model_client=model_client).extension
+        return plan_attachment_format(
+            group.original_message,
+            model_client=model_client,
+            allow_filename_tokens=True,
+        ).extension
     except Exception:
         logger.debug("Could not plan requested attachment extension for group %s", group.group_id, exc_info=True)
         return None
@@ -678,6 +764,15 @@ def _filter_artifact_paths_by_extension(paths: list[str] | tuple[str, ...], exte
 
 def _filter_internal_artifact_paths(paths: list[str] | tuple[str, ...]) -> list[str]:
     return list(dict.fromkeys(path for path in paths if not _is_internal_artifact_path(path)))
+
+
+def _artifact_paths_have_single_extension(paths: list[str] | tuple[str, ...]) -> bool:
+    suffixes = {
+        Path(str(path)).suffix.lower()
+        for path in paths
+        if str(path or "").strip() and Path(str(path)).suffix
+    }
+    return len(suffixes) == 1
 
 
 def _group_has_explicit_artifact_delivery(group: TaskGroup) -> bool:
@@ -760,7 +855,7 @@ def _merge_missing_requested_artifact_summary(
         return missing_note
     if _summary_already_mentions_missing_artifact(text, requested_extension):
         return text
-    if _group_has_failed_or_cancelled_tasks(group) or _summary_looks_like_terminal_failure(text):
+    if _group_has_failed_or_cancelled_tasks(group):
         separator = "" if text.endswith((".", "!", "?")) else "."
         return f"{text}{separator} Also, {missing_note}"
     return missing_note
@@ -780,22 +875,6 @@ def _group_has_failed_or_cancelled_tasks(group: TaskGroup) -> bool:
         task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}
         for task in (group.tasks or ())
     )
-
-
-def _summary_looks_like_terminal_failure(summary: str) -> bool:
-    text = str(summary or "").strip().lower()
-    if not text:
-        return False
-    failure_markers = (
-        "failed",
-        "could not",
-        "couldn't",
-        "unable",
-        "insufficient",
-        "did not",
-        "no html artifact",
-    )
-    return any(marker in text for marker in failure_markers)
 
 
 def _artifact_roots_for_group(group: TaskGroup) -> tuple[Path, ...]:
@@ -823,6 +902,133 @@ def _task_has_artifact_delivery_scope(task: TaskRecord) -> bool:
         return True
     artifact_role = str(metadata.get("artifact_role") or "").strip()
     return artifact_role in _ARTIFACT_DELIVERY_ROLES
+
+
+def _status_lines_for_active_artifact_recovery(group: TaskGroup) -> dict[str, str]:
+    tasks = list(getattr(group, "tasks", ()) or ())
+    if not tasks:
+        return {}
+    producer_indexes = [
+        index
+        for index, task in enumerate(tasks)
+        if _task_has_artifact_producer_scope(task)
+        and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.COMPLETE}
+    ]
+    if not producer_indexes:
+        return {}
+    active_ids = _active_artifact_workflow_task_ids(group, producer_indexes=producer_indexes)
+    if not active_ids:
+        return {}
+    lines: dict[str, str] = {}
+    for task in tasks:
+        if task.task_id not in active_ids:
+            continue
+        if _task_has_artifact_delivery_scope(task) and task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            lines[task.task_id] = format_task_status_line(task, status=TaskStatus.PENDING)
+        elif _task_has_artifact_source_scope(task) and task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            lines[task.task_id] = format_task_status_line(task, status=TaskStatus.COMPLETE)
+    return lines
+
+
+def artifact_status_line_overrides_for_group(group: TaskGroup) -> dict[str, str]:
+    """Return display-only status overrides for active artifact workflows."""
+    return _status_lines_for_active_artifact_recovery(group)
+
+
+def _active_artifact_workflow_task_ids(group: TaskGroup, *, producer_indexes: list[int]) -> set[str]:
+    tasks = list(getattr(group, "tasks", ()) or ())
+    task_by_id = {task.task_id: task for task in tasks}
+    active_ids: set[str] = set()
+    for index in producer_indexes:
+        task = tasks[index]
+        active_ids.add(task.task_id)
+        active_ids.update(_task_dependency_ancestors(task_by_id, task.task_id))
+    for task in tasks:
+        if _task_has_artifact_delivery_scope(task):
+            active_ids.add(task.task_id)
+            active_ids.update(_task_dependency_ancestors(task_by_id, task.task_id))
+    disposition = str((getattr(group, "planner_metadata", None) or {}).get("disposition") or "").strip().lower()
+    if disposition == "sequential_mission":
+        last_producer_index = max(producer_indexes)
+        for task in tasks[: last_producer_index + 1]:
+            if _task_has_artifact_source_scope(task) or _task_has_artifact_producer_scope(task):
+                active_ids.add(task.task_id)
+    return active_ids
+
+
+def _status_lines_for_delivered_artifacts(group: TaskGroup, delivered_artifacts: list[str] | tuple[str, ...]) -> dict[str, str]:
+    if not any(str(path or "").strip() for path in delivered_artifacts or ()):
+        return {}
+    task_ids = _delivered_artifact_workflow_task_ids(group)
+    lines: dict[str, str] = {}
+    for task in getattr(group, "tasks", ()) or ():
+        if task.task_id in task_ids:
+            lines[task.task_id] = format_task_status_line(task, status=TaskStatus.COMPLETE)
+    return lines
+
+
+def _delivered_artifact_workflow_task_ids(group: TaskGroup) -> set[str]:
+    tasks = list(getattr(group, "tasks", ()) or ())
+    if not tasks:
+        return set()
+    task_by_id = {task.task_id: task for task in tasks}
+    artifact_task_ids: set[str] = set()
+    producer_indexes: list[int] = []
+    for index, task in enumerate(tasks):
+        if _task_has_artifact_delivery_scope(task):
+            artifact_task_ids.add(task.task_id)
+        if _task_is_successful_artifact_producer(task):
+            artifact_task_ids.add(task.task_id)
+            producer_indexes.append(index)
+    for task_id in tuple(artifact_task_ids):
+        artifact_task_ids.update(_task_dependency_ancestors(task_by_id, task_id))
+    disposition = str((getattr(group, "planner_metadata", None) or {}).get("disposition") or "").strip().lower()
+    if disposition == "sequential_mission" and producer_indexes:
+        last_producer_index = max(producer_indexes)
+        for task in tasks[: last_producer_index + 1]:
+            if _task_has_artifact_source_scope(task) or task.status in {TaskStatus.COMPLETE, TaskStatus.FAILED}:
+                artifact_task_ids.add(task.task_id)
+    return artifact_task_ids
+
+
+def _task_dependency_ancestors(task_by_id: dict[str, TaskRecord], task_id: str) -> set[str]:
+    ancestors: set[str] = set()
+    pending = list(getattr(task_by_id.get(task_id), "dependencies", None) or ())
+    while pending:
+        dep_id = str(pending.pop() or "").strip()
+        if not dep_id or dep_id in ancestors:
+            continue
+        dep = task_by_id.get(dep_id)
+        if dep is None:
+            continue
+        ancestors.add(dep_id)
+        pending.extend(str(item or "").strip() for item in getattr(dep, "dependencies", None) or ())
+    return ancestors
+
+
+def _task_is_successful_artifact_producer(task: TaskRecord) -> bool:
+    result = getattr(task, "result", None)
+    if getattr(result, "status", None) != "success":
+        return False
+    if _task_allowed_tools(task) & _ARTIFACT_PRODUCER_TOOLS:
+        return True
+    return bool([path for path in (getattr(result, "artifacts", None) or ()) if isinstance(path, str) and path.strip()])
+
+
+def _task_has_artifact_source_scope(task: TaskRecord) -> bool:
+    return bool(_task_allowed_tools(task) & _ARTIFACT_SOURCE_TOOLS)
+
+
+def _task_has_artifact_producer_scope(task: TaskRecord) -> bool:
+    return bool(_task_allowed_tools(task) & _ARTIFACT_PRODUCER_TOOLS)
+
+
+def _task_allowed_tools(task: TaskRecord) -> set[str]:
+    names = set(str(tool or "").strip().lower() for tool in (getattr(task, "allowed_tools", None) or ()))
+    metadata = getattr(task, "metadata", None)
+    if isinstance(metadata, dict):
+        names.update(str(tool or "").strip().lower() for tool in (metadata.get("allowed_tools") or ()))
+    return {name for name in names if name}
 
 
 def _leaf_task_ids(group: TaskGroup) -> set[str]:
@@ -928,13 +1134,27 @@ def _compact_original_request(message: str, *, limit: int = 120) -> str:
 
 def _task_status_rank(line: str | None) -> int:
     text = str(line or "").lstrip()
-    if text.startswith(("☑", "✕", "⊘")):
+    if text.startswith("☑"):
+        return 4
+    if text.startswith(("✕", "⊘")):
         return 3
     if text.startswith(("◐", "▤")):
         return 2
     if text.startswith(("☐", "▣")):
         return 1
     return 0
+
+
+def _should_replace_task_status_line(current: str | None, candidate: str | None) -> bool:
+    if current is None:
+        return bool(str(candidate or "").strip())
+    current_rank = _task_status_rank(current)
+    candidate_rank = _task_status_rank(candidate)
+    if candidate_rank > current_rank:
+        return True
+    if candidate_rank < current_rank:
+        return False
+    return len(str(candidate or "").strip()) > len(str(current or "").strip())
 
 
 class _ResultAggregationState(TypedDict, total=False):
@@ -1067,9 +1287,14 @@ async def _result_aggregation_task_cancelled_node(state: _ResultAggregationState
 async def _result_aggregation_input_needed_node(state: _ResultAggregationState) -> dict[str, object]:
     update = state["update"]
     gs = state["group_state"]
+    message = str(update.message or "Input needed").strip()
+    dedupe_key = f"{update.task_id}:{message}"
+    if dedupe_key in gs.delivered_input_questions:
+        return {}
+    gs.delivered_input_questions.add(dedupe_key)
     await state["aggregator"]._deliver(
         gs.conversation_id,
-        f"? {update.message or 'Input needed'}",
+        f"? {message}",
         is_question=True,
     )
     return {}
@@ -1151,4 +1376,4 @@ def _planner_summary_from_group(group: TaskGroup) -> str:
     return label
 
 
-__all__ = ["ResultAggregator", "GroupState", "DeliverFn"]
+__all__ = ["ResultAggregator", "GroupState", "DeliverFn", "artifact_status_line_overrides_for_group"]

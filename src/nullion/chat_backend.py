@@ -13,6 +13,11 @@ import urllib.request
 from ipaddress import ip_address
 from urllib.parse import quote_plus, urlparse
 
+from nullion.connector_prompt_context import (
+    active_connector_provider_context_snapshot,
+    format_active_connector_provider_context_for_prompt,
+)
+from nullion.approval_markers import ORPHAN_APPROVAL_REQUEST_REPLY, split_tool_approval_marker
 from nullion.mini_agent_routing import should_route_without_mini_agents
 from nullion.task_decomposer import TaskDecomposer
 
@@ -205,7 +210,7 @@ def _read_response(response, max_bytes: int = 65536) -> bytes:
     return response.read(max_bytes)
 
 from nullion.tools import ToolRegistry
-from nullion.turn_context_policy import build_turn_tool_evidence, scoped_turn_tool_registry
+from nullion.turn_context_policy import build_turn_tool_evidence, turn_tool_registry_for_evidence
 
 
 class ChatBackendUnavailableError(RuntimeError):
@@ -369,6 +374,55 @@ def _format_web_search_results(results: list[dict[str, object]]) -> str | None:
 import logging as _logging
 _logger = _logging.getLogger(__name__)
 
+def _approval_store_has_actionable_request(approval_store: object | None, approval_id: str | None) -> bool:
+    if approval_store is None:
+        return True
+    if not approval_id:
+        return False
+    get_approval = getattr(approval_store, "get_approval_request", None)
+    if callable(get_approval):
+        try:
+            approval = get_approval(approval_id)
+        except Exception:
+            approval = None
+        if approval is not None:
+            status = getattr(getattr(approval, "status", None), "value", getattr(approval, "status", None))
+            if str(status or "").strip().lower() == "pending":
+                return True
+    get_suspended_turn = getattr(approval_store, "get_suspended_turn", None)
+    if callable(get_suspended_turn):
+        try:
+            if get_suspended_turn(approval_id) is not None:
+                return True
+        except Exception:
+            return False
+    return False
+
+
+def _record_live_tool_results(recorder: object, results: object) -> None:
+    if not callable(recorder) or not isinstance(results, list):
+        return
+    for result in results:
+        try:
+            recorder(result)
+        except Exception:
+            _logger.debug("Could not record live tool result from chat backend", exc_info=True)
+
+
+def _approval_marker_reply_if_actionable(
+    text: str,
+    *,
+    approval_store: object | None,
+) -> str | None:
+    marker = split_tool_approval_marker(text)
+    if marker is None:
+        return text
+    if _approval_store_has_actionable_request(approval_store, marker.approval_id):
+        return text
+    if marker.remainder:
+        return marker.remainder
+    return ORPHAN_APPROVAL_REQUEST_REPLY
+
 
 def _ddg_html_search(query: str, limit: int) -> list[dict[str, object]]:
     """Scrape DuckDuckGo's no-JS HTML endpoint. Far more bot-friendly than
@@ -511,12 +565,15 @@ def _build_system_prompt(
     *,
     conversation_context: str | None = None,
     memory_context: str | None = None,
+    connector_context: str | None = None,
 ) -> str | None:
     sections: list[str] = []
     if conversation_context:
         sections.append(f"Recent conversation:\n{conversation_context}")
     if memory_context:
         sections.append(f"Known user memory:\n{memory_context}")
+    if connector_context:
+        sections.append(connector_context)
     if not sections:
         return None
     return "\n\n".join(sections)
@@ -526,14 +583,52 @@ def _build_orchestrator_conversation_history(
     *,
     conversation_context: str | None,
     memory_context: str | None,
+    connector_context: str | None = None,
 ) -> list[dict[str, object]]:
     prompt = _build_system_prompt(
         conversation_context=conversation_context,
         memory_context=memory_context,
+        connector_context=connector_context,
     )
     if not prompt:
         return []
     return [{"role": "system", "content": [{"type": "text", "text": prompt}]}]
+
+
+def _registry_has_connector_context_tools(tool_registry: object | None) -> bool:
+    if tool_registry is None:
+        return False
+    try:
+        definitions = tuple(tool_registry.list_tool_definitions())
+    except Exception:
+        return False
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            continue
+        name = str(definition.get("name") or "").strip()
+        if name in {"connector_request", "skill_pack_read"}:
+            return True
+        tags = {
+            str(tag or "").strip().lower()
+            for tag in (definition.get("capability_tags") or ())
+            if str(tag or "").strip()
+        }
+        if tags.intersection({"connector", "skill_pack"}):
+            return True
+    return False
+
+
+def _active_connector_context_for_chat_backend(tool_registry: object | None) -> tuple[dict[str, object], ...]:
+    context = active_connector_provider_context_snapshot()
+    if not _registry_has_connector_context_tools(tool_registry):
+        return context
+    try:
+        from nullion import turn_context_policy
+
+        live_context = tuple(turn_context_policy._active_connector_provider_context() or ())
+    except Exception:
+        return context
+    return live_context or context
 
 
 def _feature_enabled(name: str, *, default: bool = True) -> bool:
@@ -624,7 +719,7 @@ def generate_chat_reply(
     principal_id: str = "telegram_chat",
     allow_mini_agents: bool = False,
 ) -> str:
-    del external_context_fetcher, live_tool_invoker, live_tool_result_recorder, live_information_resolution_recorder
+    del external_context_fetcher, live_tool_invoker, live_information_resolution_recorder
     del internal_context_fetcher
 
     tool_registry = _resolve_active_tool_registry(
@@ -642,27 +737,36 @@ def generate_chat_reply(
     if agent_orchestrator is None:
         raise ChatBackendUnavailableError("No model client configured for chat backend.")
 
+    connector_context = format_active_connector_provider_context_for_prompt(
+        _active_connector_context_for_chat_backend(tool_registry)
+    )
     conversation_history = _build_orchestrator_conversation_history(
         conversation_context=conversation_context,
         memory_context=memory_context,
+        connector_context=connector_context,
     )
     user_content_blocks = None
     if attachments:
-        from nullion.chat_attachments import chat_attachment_content_blocks, normalize_chat_attachments
+        from nullion.chat_attachments import (
+            chat_attachment_content_blocks,
+            has_unavailable_chat_attachments,
+            normalize_chat_attachments,
+        )
 
         normalized_attachments = normalize_chat_attachments(attachments)
-        if normalized_attachments:
-            user_content_blocks = chat_attachment_content_blocks(message, normalized_attachments)
+        if normalized_attachments or has_unavailable_chat_attachments(attachments):
+            user_content_blocks = chat_attachment_content_blocks(message, normalized_attachments, raw_attachments=attachments)
     turn_tool_evidence = build_turn_tool_evidence(
         user_message=message,
         conversation_result=None,
         has_attachments=bool(user_content_blocks),
     )
-    turn_tool_registry = scoped_turn_tool_registry(
+    turn_tool_registry = turn_tool_registry_for_evidence(
         tool_registry or ToolRegistry(),
         evidence=turn_tool_evidence,
         model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
         user_message=message,
+        skip_tool_scope_decision=False,
     )
 
     run_turn = agent_orchestrator.run_turn
@@ -697,14 +801,17 @@ def generate_chat_reply(
         result = run_turn(**turn_kwargs)
     except Exception as exc:
         raise ChatBackendUnavailableError(f"Agent orchestrator error: {exc}") from exc
-    final_text = getattr(result, "final_text", None)
-    if isinstance(final_text, str) and final_text.strip():
-        return final_text.strip()
+    _record_live_tool_results(live_tool_result_recorder, getattr(result, "tool_results", None))
     if getattr(result, "suspended_for_approval", False):
         approval_id = getattr(result, "approval_id", None)
-        if approval_id:
+        if approval_id and _approval_store_has_actionable_request(approval_store, str(approval_id)):
             return f"Tool approval requested: {approval_id}"
-        return "Tool approval requested."
+        return ORPHAN_APPROVAL_REQUEST_REPLY
+    final_text = getattr(result, "final_text", None)
+    if isinstance(final_text, str) and final_text.strip():
+        reply = _approval_marker_reply_if_actionable(final_text.strip(), approval_store=approval_store)
+        if isinstance(reply, str) and reply.strip():
+            return reply.strip()
     raise ChatBackendUnavailableError("Agent orchestrator returned an empty reply.")
 
 

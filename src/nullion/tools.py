@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
+import bz2
+import csv
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from enum import Enum
 from fnmatch import fnmatch
+import hashlib
 import html
 from html import unescape
 from html.parser import HTMLParser
@@ -17,6 +20,8 @@ from io import BytesIO
 import inspect
 import json
 import logging
+import gzip
+import lzma
 import mimetypes
 import os
 from pathlib import Path
@@ -27,20 +32,33 @@ import socket
 import ssl
 import subprocess
 import tempfile
+import tarfile
 import textwrap
 import threading
 from time import perf_counter
 from typing import Callable, Iterable, Protocol
 import base64
+import unicodedata
 import urllib.error
 import urllib.request
 from urllib.parse import parse_qsl, quote, unquote, unquote_to_bytes, urlencode, urljoin, urlparse
+from uuid import uuid4
+from xml.etree import ElementTree
+import zipfile
 
 from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
-from nullion.artifacts import promote_supporting_asset_artifact_paths
+from nullion.artifacts import (
+    ARTIFACT_ROLE_DELIVERABLE,
+    ARTIFACT_ROLE_INTERMEDIATE,
+    ARTIFACT_ROLE_SOURCE,
+    artifact_output_descriptor,
+    promote_supporting_asset_artifact_paths,
+)
 from nullion.approval_context import FLOW_TRIGGER_CONTEXT_KEY, build_trigger_flow_context
 from nullion.approvals import (
     ApprovalRequest,
+    TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND,
+    TERMINAL_DESTRUCTIVE_PERMISSION_PREFIX,
     consume_boundary_permit as consume_boundary_permit_record,
     create_approval_request,
     is_boundary_permit_active,
@@ -72,8 +90,253 @@ from nullion.tool_boundaries import extract_boundary_facts
 
 _WEB_FETCH_MAX_REDIRECTS = 5
 _WEB_FETCH_MAX_BODY_BYTES = 2_000_000
+_FILE_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
 _BROWSER_IMAGE_COLLECT_MAX_IMAGES = 20
 _BROWSER_IMAGE_MAX_BYTES = 6_000_000
+_TERMINAL_OUTPUT_ATTACHMENT_THRESHOLD_CHARS = 3200
+_TERMINAL_DESTRUCTIVE_PREVIEW_LIMIT = 40
+_TERMINAL_DESTRUCTIVE_SCRIPT_COMMANDS = frozenset({
+    "node",
+    "node.exe",
+    "perl",
+    "perl.exe",
+    "php",
+    "php.exe",
+    "python",
+    "python.exe",
+    "python3",
+    "python3.exe",
+    "ruby",
+    "ruby.exe",
+})
+_TERMINAL_DESTRUCTIVE_SCRIPT_MARKERS = frozenset({
+    ".rmtree(",
+    ".unlink(",
+    "deletefile(",
+    "fs.rm(",
+    "fs.rmdir(",
+    "fs.unlink(",
+    "os.remove(",
+    "os.rmdir(",
+    "os.unlink(",
+    "path.unlink(",
+    "rmdirsync(",
+    "rmsync(",
+    "shutil.rmtree(",
+    "unlink(",
+    "unlinksync(",
+})
+_TERMINAL_PATH_LITERAL_RE = re.compile(
+    r"(?P<quote>['\"])(?P<path>(?:~|/|\.{1,2}/)[^'\"]+)(?P=quote)"
+)
+_ARCHIVE_READ_ENTRY_LIMIT = 500
+_ARCHIVE_EXTRACT_ENTRY_LIMIT = 2_000
+_ARCHIVE_MANIFEST_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
+_TAR_ARCHIVE_FORMATS: dict[str, tuple[str, str]] = {
+    ".tar": ("tar", "w"),
+    ".tar.gz": ("tar.gz", "w:gz"),
+    ".tgz": ("tar.gz", "w:gz"),
+    ".tar.bz2": ("tar.bz2", "w:bz2"),
+    ".tbz2": ("tar.bz2", "w:bz2"),
+    ".tar.xz": ("tar.xz", "w:xz"),
+    ".txz": ("tar.xz", "w:xz"),
+}
+_SINGLE_COMPRESSED_FORMATS: dict[str, tuple[str, str]] = {
+    ".gz": ("gzip", "gzip"),
+    ".bz2": ("bzip2", "bzip2"),
+    ".xz": ("xz", "xz"),
+}
+
+
+_CONCRETE_RESOURCE_ID_FORBIDDEN_CHARS = frozenset(' \t\r\n<>{}[]()"\'`?*,;')
+_CONCRETE_RESOURCE_ID_SENTINELS = frozenset(
+    {
+        "-",
+        "--",
+        "id",
+        "message_id",
+        "placeholder",
+        "example",
+        "sample",
+        "returned_id",
+        "result_id",
+        "none",
+        "null",
+    }
+)
+
+
+def _invalid_concrete_resource_id_reason(value: object) -> str:
+    if not isinstance(value, str):
+        return "missing"
+    resource_id = value.strip()
+    if not resource_id:
+        return "missing"
+    if resource_id.casefold() in _CONCRETE_RESOURCE_ID_SENTINELS:
+        return "placeholder"
+    if any(char in _CONCRETE_RESOURCE_ID_FORBIDDEN_CHARS for char in resource_id):
+        return "placeholder"
+    if len(resource_id) > 512:
+        return "too_long"
+    return ""
+
+
+def _invalid_concrete_resource_name_reason(value: object) -> str:
+    if not isinstance(value, str):
+        return "missing"
+    resource_name = value.strip()
+    if not resource_name:
+        return "missing"
+    if resource_name.startswith("__") and resource_name.endswith("__"):
+        return "placeholder"
+    if len(resource_name) > 512:
+        return "too_long"
+    return ""
+
+
+def _invalid_email_message_id_result(invocation: "ToolInvocation", raw_id: object) -> "ToolResult":
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output={
+            "reason": "invalid_message_id",
+            "id": raw_id if isinstance(raw_id, str) else "",
+            "required_source_tool": "email_search",
+            "next_step": "Search email and pass one returned result id to email_read.",
+        },
+        error="Invalid email message id: use an id returned by email_search.",
+    )
+
+
+def _email_read_source_required_failure_result(
+    invocation: "ToolInvocation",
+    raw_id: object,
+    exc: BaseException | None = None,
+) -> "ToolResult":
+    output = _account_tool_failure_output(
+        invocation.principal_id,
+        message_id=raw_id.strip() if isinstance(raw_id, str) else "",
+    )
+    output.update(
+        {
+            "reason": "invalid_message_id",
+            "required_source_tool": "email_search",
+            "next_step": "Search email and pass one returned result id to email_read.",
+        }
+    )
+    if isinstance(exc, urllib.error.HTTPError):
+        output["http_status"] = exc.code
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output=output,
+        error=str(exc) if exc is not None else "Invalid email message id: use an id returned by email_search.",
+    )
+
+
+def _invalid_structured_identifier_result(
+    invocation: "ToolInvocation",
+    *,
+    field_name: str,
+    raw_value: object,
+    reason: str,
+    required_source_tool: str,
+) -> "ToolResult":
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output={
+            "reason": reason,
+            field_name: raw_value if isinstance(raw_value, str) else "",
+            "required_source_tool": required_source_tool,
+        },
+        error=f"Invalid {field_name}: use an exact id returned by {required_source_tool}.",
+    )
+def _email_search_input_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Provider-supported email search query.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Maximum number of matching messages to return.",
+            },
+            "provider_id": {
+                "type": "string",
+                "description": "Optional configured connector/provider id when multiple email sources are active.",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+
+
+def _email_read_input_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact id copied from a prior email_search results item.",
+            },
+            "provider_id": {
+                "type": "string",
+                "description": "Optional configured connector/provider id matching the source search result.",
+            },
+        },
+        "required": ["id"],
+        "additionalProperties": False,
+    }
+
+
+def _email_attachment_read_input_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact email_read.message.id value for the message that contains the attachment.",
+            },
+            "attachment_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact email_read.message.attachments[].attachmentId value.",
+            },
+            "filename": {
+                "type": "string",
+                "description": "Optional filename copied from email_read.message.attachments[].filename.",
+            },
+            "mime_type": {
+                "type": "string",
+                "description": "Optional MIME type copied from email_read.message.attachments[].mimeType.",
+            },
+            "provider_id": {
+                "type": "string",
+                "description": "Optional configured connector/provider id matching the source message.",
+            },
+        },
+        "required": ["message_id", "attachment_id"],
+        "additionalProperties": False,
+    }
+
+
+_BROWSER_IMAGE_CONTENT_MIN_BYTES = 4_000
+_BROWSER_IMAGE_CONTENT_MIN_WIDTH = 180
+_BROWSER_IMAGE_CONTENT_MIN_HEIGHT = 120
+_BROWSER_IMAGE_CONTENT_MIN_PIXELS = 40_000
+_BROWSER_IMAGE_CONTENT_MAX_ASPECT_RATIO = 4.5
+_BROWSER_IMAGE_CONTENT_MIN_LUMA_STDDEV = 3.0
 _BROWSER_IMAGE_DIRECTIVE_MEDIA_TYPES = frozenset(
     {
         "image/png",
@@ -90,6 +353,162 @@ _BROWSER_IMAGE_FORMAT_SUFFIXES = {
     "GIF": ".gif",
 }
 _LEGACY_GLOBAL_PERMISSION_PRINCIPALS = ("operator", "workspace:workspace_admin")
+
+
+def _calendar_list_input_schema(*, include_provider_id: bool = True) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "start": {"type": "string", "description": "Inclusive ISO-8601 start datetime."},
+        "end": {"type": "string", "description": "Exclusive ISO-8601 end datetime."},
+        "max": {"type": "integer", "minimum": 1, "description": "Maximum number of events to return."},
+        "query": {
+            "type": "string",
+            "description": "Optional exact title, subject, or structured search text to mark matching returned events.",
+        },
+    }
+    if include_provider_id:
+        properties["provider_id"] = {
+            "type": "string",
+            "description": "Optional connector provider id. Defaults to an active calendar-capable connector.",
+        }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["start", "end"],
+        "additionalProperties": False,
+    }
+
+
+def _calendar_write_provider_property() -> dict[str, object]:
+    return {
+        "type": "string",
+        "description": "Optional connector provider id. Defaults to an active write-capable calendar connector.",
+    }
+
+
+def _calendar_id_property() -> dict[str, object]:
+    return {
+        "type": "string",
+        "description": "Optional Google Calendar id. Defaults to primary.",
+    }
+
+
+def _calendar_send_updates_property() -> dict[str, object]:
+    return {
+        "type": "string",
+        "enum": ["all", "externalOnly", "none"],
+        "description": "Who should receive Google Calendar update notifications. Defaults to all.",
+    }
+
+
+def _calendar_event_time_properties() -> dict[str, object]:
+    return {
+        "start": {
+            "type": "string",
+            "description": "Event start as ISO-8601 dateTime or YYYY-MM-DD all-day date.",
+        },
+        "end": {
+            "type": "string",
+            "description": "Event end as ISO-8601 dateTime or YYYY-MM-DD all-day date.",
+        },
+        "time_zone": {
+            "type": "string",
+            "description": "Optional IANA timezone for dateTime values, such as America/New_York.",
+        },
+    }
+
+
+def _calendar_create_input_schema(*, include_provider_id: bool = True) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "summary": {"type": "string", "description": "Event title/summary."},
+        **_calendar_event_time_properties(),
+        "location": {"type": "string", "description": "Optional event location."},
+        "description": {"type": "string", "description": "Optional event description or notes."},
+        "attendees": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional attendee email addresses.",
+        },
+        "calendar_id": _calendar_id_property(),
+        "send_updates": _calendar_send_updates_property(),
+    }
+    if include_provider_id:
+        properties["provider_id"] = _calendar_write_provider_property()
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["summary", "start", "end"],
+        "additionalProperties": False,
+    }
+
+
+def _calendar_update_input_schema(*, include_provider_id: bool = True) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "event_id": {
+            "type": "string",
+            "description": "Exact event id returned by calendar_list.results[].id or a prior calendar write result.",
+        },
+        "summary": {"type": "string", "description": "Optional replacement event title/summary."},
+        **_calendar_event_time_properties(),
+        "location": {"type": "string", "description": "Optional replacement event location."},
+        "description": {"type": "string", "description": "Optional replacement event description or notes."},
+        "calendar_id": _calendar_id_property(),
+        "send_updates": _calendar_send_updates_property(),
+    }
+    if include_provider_id:
+        properties["provider_id"] = _calendar_write_provider_property()
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["event_id"],
+        "additionalProperties": False,
+    }
+
+
+def _calendar_respond_input_schema(*, include_provider_id: bool = True) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "event_id": {
+            "type": "string",
+            "description": "Exact event id returned by calendar_list.results[].id or a prior calendar write result.",
+        },
+        "response_status": {
+            "type": "string",
+            "enum": ["accepted", "declined", "tentative", "needsAction"],
+            "description": "Calendar RSVP response.",
+        },
+        "attendee_email": {
+            "type": "string",
+            "description": "Optional attendee email to update. If omitted, the connector attempts to update the current user's attendee response.",
+        },
+        "calendar_id": _calendar_id_property(),
+        "send_updates": _calendar_send_updates_property(),
+    }
+    if include_provider_id:
+        properties["provider_id"] = _calendar_write_provider_property()
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["event_id", "response_status"],
+        "additionalProperties": False,
+    }
+
+
+def _calendar_delete_input_schema(*, include_provider_id: bool = True) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "event_id": {
+            "type": "string",
+            "description": "Exact event id returned by calendar_list.results[].id or a prior calendar write result.",
+        },
+        "calendar_id": _calendar_id_property(),
+        "send_updates": _calendar_send_updates_property(),
+    }
+    if include_provider_id:
+        properties["provider_id"] = _calendar_write_provider_property()
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["event_id"],
+        "additionalProperties": False,
+    }
 
 
 def _tool_grant_principal_candidates(principal_id: str | None) -> set[str]:
@@ -114,6 +533,11 @@ def _tool_blocked_for_principal(principal_id: str | None, tool_name: str | None)
 
 
 logger = logging.getLogger(__name__)
+
+_SCHEDULER_CREATION_CAPSULE_LOCK = threading.Lock()
+_SCHEDULER_CREATION_CAPSULE_TTL_SECONDS = 6 * 60 * 60
+_SCHEDULER_CREATION_CAPSULE_LIMIT = 2048
+_SCHEDULER_CREATION_CAPSULES: dict[str, float] = {}
 
 
 class _SafeWebFetchRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -243,8 +667,20 @@ def _principal_workspace_file_roots(principal_id: str | None) -> tuple[Path, ...
         return ()
 
 
+def _flow_context_is_scheduled_task_run(flow_context: object) -> bool:
+    if not isinstance(flow_context, dict):
+        return False
+    if flow_context.get("scheduled_task_run"):
+        return True
+    trigger_flow = flow_context.get(FLOW_TRIGGER_CONTEXT_KEY)
+    return isinstance(trigger_flow, dict) and bool(trigger_flow.get("scheduled_task_run"))
+
+
 _FILESYSTEM_PATH_ARGUMENTS_BY_TOOL = {
+    "archive_create": ("output_path", "source_dir"),
+    "archive_extract": ("path", "output_dir", "manifest_output_path"),
     "audio_transcribe": ("path",),
+    "file_download": ("output_path",),
     "file_read": ("path",),
     "file_write": ("path",),
     "file_patch": ("path",),
@@ -314,6 +750,123 @@ def _path_within_any_root(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(_is_within_allowed_root(path, root) for root in roots)
 
 
+def _safe_generated_artifact_filename(raw_name: object, *, suffix: str, fallback_stem: str) -> str:
+    normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    name = Path(str(raw_name or "")).name.strip()
+    if name and Path(name).suffix.lower() == normalized_suffix:
+        stem = Path(name).stem
+    elif name and not Path(name).suffix:
+        stem = Path(name).name
+    else:
+        stem = str(fallback_stem or "nullion-artifact")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem.strip()).strip("-._") or "nullion-artifact"
+    return f"{stem[:80]}{normalized_suffix}"
+
+
+def _workspace_generated_artifact_path(
+    invocation: ToolInvocation,
+    *,
+    raw_path: object,
+    suffix: str,
+    stem: str,
+) -> Path:
+    normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    artifact_root = _workspace_artifact_root_for_principal(invocation.principal_id)
+    if artifact_root is not None:
+        try:
+            raw_text = str(raw_path or "").strip()
+            if raw_text:
+                candidate = Path(raw_text).expanduser().resolve()
+                if candidate.suffix.lower() == normalized_suffix and _path_within_any_root(candidate, (artifact_root,)):
+                    return candidate
+                filename = _safe_generated_artifact_filename(
+                    candidate.name,
+                    suffix=normalized_suffix,
+                    fallback_stem=stem,
+                )
+                return (artifact_root / filename).resolve()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    from nullion.artifacts import artifact_path_for_generated_workspace_file
+
+    return artifact_path_for_generated_workspace_file(
+        principal_id=invocation.principal_id,
+        suffix=normalized_suffix,
+        stem=stem,
+    ).resolve()
+
+
+def _explicit_output_path_or_generated_artifact_path(
+    invocation: ToolInvocation,
+    *,
+    raw_path: object,
+    suffix: str,
+    stem: str,
+    roots: tuple[Path, ...],
+) -> Path:
+    normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    if isinstance(raw_path, str) and raw_path.strip():
+        try:
+            candidate = Path(_resolve_virtual_workspace_path(raw_path, principal_id=invocation.principal_id)).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            candidate = Path(str(raw_path)).expanduser().resolve()
+        artifact_root = _workspace_artifact_root_for_principal(invocation.principal_id)
+        if (
+            candidate.suffix.lower() == normalized_suffix
+            and artifact_root is not None
+            and not _path_within_any_root(candidate, (artifact_root,))
+            and _generated_output_path_should_use_workspace_artifacts(candidate)
+        ):
+            return _workspace_generated_artifact_path(
+                invocation,
+                raw_path=raw_path,
+                suffix=normalized_suffix,
+                stem=stem,
+            )
+        if candidate.suffix.lower() == normalized_suffix and (
+            _path_within_any_root(candidate, roots)
+            or _is_approved_filesystem_path(candidate, invocation.trusted_filesystem_selectors)
+        ):
+            return candidate
+    return _workspace_generated_artifact_path(
+        invocation,
+        raw_path=raw_path,
+        suffix=normalized_suffix,
+        stem=stem,
+    )
+
+
+def _generated_output_path_should_use_workspace_artifacts(path: Path) -> bool:
+    try:
+        from nullion.artifacts import nullion_data_home
+
+        data_home = nullion_data_home()
+    except Exception:
+        return False
+    return _path_within_any_root(path, (data_home,))
+
+
+def _file_write_artifact_path_should_use_workspace_artifacts(
+    path: Path,
+    *,
+    principal_id: str | None,
+    effective_roots: tuple[Path, ...],
+) -> bool:
+    if path.suffix.lower() not in VALID_ATTACHMENT_EXTENSIONS:
+        return False
+    artifact_root = _workspace_artifact_root_for_principal(principal_id)
+    if artifact_root is not None and _path_within_any_root(path, (artifact_root,)):
+        return False
+    try:
+        from nullion.artifacts import nullion_data_home
+
+        if _path_within_any_root(path, (nullion_data_home(),)):
+            return True
+    except Exception:
+        pass
+    return not _path_within_any_root(path, effective_roots)
+
+
 def _resolve_local_workspace_file_input(
     raw_path: str,
     *,
@@ -333,6 +886,21 @@ def _resolve_local_workspace_file_input(
             or _is_approved_filesystem_path(resolved_candidate, trusted_filesystem_selectors)
         ):
             return resolved_candidate
+        for root in effective_roots:
+            if not _is_within_allowed_root(resolved_candidate, root):
+                continue
+            try:
+                relative = resolved_candidate.relative_to(root)
+            except ValueError:
+                continue
+            if relative.parts and relative.parts[0] in {"artifacts", "media", "files", "uploads", "scratch"}:
+                relative = Path(*relative.parts[1:]) if len(relative.parts) > 1 else Path()
+            if not relative.parts:
+                continue
+            for child_root_name in ("artifacts", "media", "files", "uploads", "scratch"):
+                alternate = (root / child_root_name / relative).resolve()
+                if alternate.is_file() and _path_within_any_root(alternate, effective_roots):
+                    return alternate
         return None
     if any(part == ".." for part in candidate.parts):
         return None
@@ -340,7 +908,7 @@ def _resolve_local_workspace_file_input(
     candidates: list[Path] = []
     for root in effective_roots:
         candidates.append(root / candidate)
-        for child_root_name in ("artifacts", "media", "files", "uploads"):
+        for child_root_name in ("artifacts", "media", "files", "uploads", "scratch"):
             candidates.append(root / child_root_name / candidate)
 
     seen: set[Path] = set()
@@ -355,10 +923,24 @@ def _resolve_local_workspace_file_input(
 
 
 def _build_web_fetch_opener() -> urllib.request.OpenerDirector:
+    https_handler = urllib.request.HTTPSHandler(context=_web_fetch_tls_context())
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
+        https_handler,
         _SafeWebFetchRedirectHandler,
     )
+
+
+def _web_fetch_tls_context() -> ssl.SSLContext:
+    try:
+        import certifi
+    except ModuleNotFoundError:
+        return ssl.create_default_context()
+    try:
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        logger.debug("Falling back to system TLS trust store for web fetches.", exc_info=True)
+        return ssl.create_default_context()
 
 
 
@@ -906,6 +1488,7 @@ class ToolSpec:
     permission_scope: str = "global"
     input_schema: dict[str, object] | None = None
     capability_tags: tuple[str, ...] = ()
+    continuation_tools: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -930,6 +1513,77 @@ class ToolResult:
 
 ToolHandler = Callable[[ToolInvocation], ToolResult]
 ToolCleanupHook = Callable[[str | None], None]
+
+
+def _tool_handler_timeout_seconds(spec: ToolSpec) -> float | None:
+    try:
+        timeout = float(spec.timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+    if timeout <= 0:
+        return None
+    return timeout
+
+
+def _tool_handler_should_use_timeout_worker(spec: ToolSpec) -> bool:
+    return spec.side_effect_class == ToolSideEffectClass.READ
+
+
+def _tool_handler_timeout_result(invocation: ToolInvocation, *, timeout_seconds: float) -> ToolResult:
+    timeout_display = f"{timeout_seconds:g}"
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output={
+            "reason": "handler_timeout",
+            "timeout_seconds": timeout_seconds,
+            "message": f"Tool timed out after {timeout_display}s.",
+        },
+        error=f"Tool timed out after {timeout_display}s.",
+    )
+
+
+def _invoke_tool_handler_with_timeout(
+    spec: ToolSpec,
+    handler: ToolHandler,
+    invocation: ToolInvocation,
+) -> ToolResult:
+    timeout_seconds = _tool_handler_timeout_seconds(spec)
+    if timeout_seconds is None or not _tool_handler_should_use_timeout_worker(spec):
+        return handler(invocation)
+
+    complete = threading.Event()
+    result_box: dict[str, object] = {}
+
+    def _run_handler() -> None:
+        try:
+            result_box["result"] = handler(invocation)
+        except BaseException as exc:  # pragma: no cover - re-raised on caller thread
+            result_box["exception"] = exc
+        finally:
+            complete.set()
+
+    thread = threading.Thread(
+        target=_run_handler,
+        name=f"nullion-tool-{spec.name}-timeout",
+        daemon=True,
+    )
+    thread.start()
+    if not complete.wait(timeout_seconds):
+        return _tool_handler_timeout_result(invocation, timeout_seconds=timeout_seconds)
+    if "exception" in result_box:
+        raise result_box["exception"]  # type: ignore[misc]
+    result = result_box.get("result")
+    if isinstance(result, ToolResult):
+        return result
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output={"reason": "invalid_handler_result"},
+        error=f"Tool handler returned invalid result: {type(result).__name__}",
+    )
 
 
 def _clear_deep_agent_profile_cache() -> None:
@@ -1034,10 +1688,22 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         "toggle_cron": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "Cron job id to enable or disable."},
+                "id": {"type": "string", "description": "Single cron job id to enable or disable."},
+                "ids": {
+                    "type": "array",
+                    "description": "Exact cron ids from list_crons to enable or disable as one bulk operation.",
+                    "items": {"type": "string"},
+                },
+                "all_current_workspace": {
+                    "type": "boolean",
+                    "description": (
+                        "Enable or disable every cron in the current workspace. Use only when the structured "
+                        "request applies to the whole current workspace."
+                    ),
+                },
                 "enabled": {"type": "boolean", "description": "True to enable the cron, false to disable it."},
             },
-            "required": ["id", "enabled"],
+            "required": ["enabled"],
             "additionalProperties": False,
         },
         "run_cron": {
@@ -1063,6 +1729,59 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "required": ["path"],
             "additionalProperties": False,
         },
+        "archive_extract": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Absolute or workspace-relative archive/compressed file path to extract. The completed "
+                        "result includes full CSV, JSON, and XLSX manifest paths for the extracted file list."
+                    ),
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Optional absolute or workspace-relative output directory. Defaults to a sibling extraction folder.",
+                },
+                "manifest_output_path": {
+                    "type": "string",
+                    "description": (
+                        "Optional absolute or workspace-relative .xlsx path for the generated extracted-file manifest. "
+                        "Use this when the user requested a specific final workbook filename."
+                    ),
+                },
+                "include_metadata": {
+                    "type": "boolean",
+                    "description": "Set true only when macOS/archive metadata sidecar entries are explicitly needed.",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        "archive_create": {
+            "type": "object",
+            "properties": {
+                "output_path": {
+                    "type": "string",
+                    "description": "Absolute or workspace-relative archive/compressed file path to create.",
+                },
+                "source_paths": {
+                    "type": "array",
+                    "description": "Files or directories to include in the archive.",
+                    "items": {"type": "string"},
+                },
+                "source_dir": {
+                    "type": "string",
+                    "description": "Optional directory whose safe, non-metadata contents should be archived.",
+                },
+                "include_metadata": {
+                    "type": "boolean",
+                    "description": "Set true only when macOS/archive metadata sidecar entries are explicitly needed.",
+                },
+            },
+            "required": ["output_path"],
+            "additionalProperties": False,
+        },
         "file_write": {
             "type": "object",
             "properties": {
@@ -1073,7 +1792,20 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "Text content to write. Do not fabricate placeholder/example source URLs in delivered "
                         "artifacts; if current public source data is needed, use web/browser tools first. "
                         "For self-contained HTML, set img src values to local image artifact paths; file_write "
-                        "will inline those local images as data URIs."
+                        "will inline those local images as data URIs unless inline_local_html_images is false."
+                    ),
+                },
+                "inline_local_html_images": {
+                    "type": "boolean",
+                    "description": (
+                        "HTML only. Defaults to true for self-contained HTML. Set false for linked/non-self-contained "
+                        "HTML so local image paths remain relative/sibling references instead of being inlined."
+                    ),
+                },
+                "disallow_html_data_images": {
+                    "type": "boolean",
+                    "description": (
+                        "HTML only. Set true for linked/non-self-contained HTML to reject data:image sources."
                     ),
                 },
             },
@@ -1085,7 +1817,12 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "properties": {
                 "output_path": {
                     "type": "string",
-                    "description": "Optional destination .docx path. If omitted, Nullion creates one in the artifact directory.",
+                    "description": (
+                        "Optional destination .docx path. If .html/.htm is provided, Nullion writes an HTML "
+                        "document from the same structured content. If .pdf is provided, Nullion writes a real "
+                        "PDF from the same structured content. If omitted, Nullion creates a .docx file in the "
+                        "artifact directory."
+                    ),
                 },
                 "title": {
                     "type": "string",
@@ -1176,6 +1913,14 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "items": {"type": "string"},
                     "description": "Optional browser/page screenshot artifact paths to embed in the document.",
                 },
+                "inline_local_html_images": {
+                    "type": "boolean",
+                    "description": "HTML output only. Defaults to true; set false for linked/non-self-contained HTML.",
+                },
+                "disallow_html_data_images": {
+                    "type": "boolean",
+                    "description": "HTML output only. Set true for linked/non-self-contained HTML to reject data:image sources.",
+                },
             },
             "additionalProperties": False,
         },
@@ -1184,7 +1929,11 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "properties": {
                 "output_path": {
                     "type": "string",
-                    "description": "Optional destination .xlsx path. If omitted, Nullion creates one in the artifact directory.",
+                    "description": (
+                        "Optional destination path. .xlsx creates an Excel workbook with embedded media/charts; "
+                        ".csv and .tsv create delimited text from the same rows/columns. If omitted, Nullion "
+                        "creates an .xlsx file in the artifact directory."
+                    ),
                 },
                 "title": {"type": "string", "description": "Optional workbook title used for the default filename."},
                 "sheet_name": {"type": "string", "description": "Optional worksheet name."},
@@ -1216,6 +1965,8 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     },
                     "description": (
                         "Rows as objects keyed by column name, or arrays matching the columns. "
+                        "Use strings beginning with '=' for real Excel formula cells when formulas are requested; "
+                        "static calculated numbers or prose about formula assumptions do not satisfy a formula request. "
                         "When the request or structured plan specifies an item/row count, make rows match that "
                         "total count; do not multiply a total count across sources/categories unless the request "
                         "explicitly asks for a count per source/category."
@@ -1228,6 +1979,13 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "Optional total data-row count required by the current request or structured plan. "
                         "Set this when the artifact has an explicit item/row count so the tool can reject a "
                         "wrong-sized table before delivery."
+                    ),
+                },
+                "formulas_required": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true when the user requested formulas. The tool fails unless at least one row value "
+                        "is a real Excel formula string beginning with '='."
                     ),
                 },
                 "image_paths": {
@@ -1274,6 +2032,30 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "additionalProperties": False,
                     },
                     "description": "Optional real Excel charts generated from existing row columns.",
+                },
+                "conditional_formats": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["data_bar", "color_scale"],
+                                "description": "Conditional-format rule type.",
+                            },
+                            "column": {
+                                "type": "string",
+                                "description": "Column name to format.",
+                            },
+                            "color": {
+                                "type": "string",
+                                "description": "Optional six-character hex color for data_bar rules.",
+                            },
+                        },
+                        "required": ["type", "column"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Optional real Excel conditional formatting for numeric columns.",
                 },
             },
             "additionalProperties": False,
@@ -1370,6 +2152,16 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "readable content, put that content here; image_paths alone creates an image-only PDF. "
                         "For multi-item reports with images, prefer one text page per image in matching order. "
                         "The generated PDF uses a report-quality layout profile; do not use browser screenshots as a substitute for readable report content."
+                    ),
+                },
+                "html_pages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional static HTML page fragments for designed PDFs that need custom visual layout, real tables, "
+                        "cards, columns, image grids, or stronger styling than the default report text layout. "
+                        "Use semantic HTML/CSS with readable text; scripts are ignored. "
+                        "Use text_pages for plain report PDFs and html_pages for intentionally designed PDFs."
                     ),
                 },
                 "media_alignment": {
@@ -1477,6 +2269,33 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "required": ["url"],
             "additionalProperties": False,
         },
+        "file_download": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "HTTP or HTTPS URL to download as bytes."},
+                "output_path": {
+                    "type": "string",
+                    "description": "Optional absolute or workspace-relative destination path. Defaults to the workspace artifact directory.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional safe destination filename when output_path is omitted.",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional maximum response bytes to download.",
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 2,
+                    "maximum": 60,
+                    "description": "Optional total download timeout in seconds.",
+                },
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
         "browser_image_collect": {
             "type": "object",
             "properties": {
@@ -1502,6 +2321,20 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 "output_stem": {
                     "type": "string",
                     "description": "Optional filename stem for generated local image artifacts.",
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 2,
+                    "maximum": 30,
+                    "description": "Optional total image collection time budget. Defaults to 12 seconds.",
+                },
+                "quality_profile": {
+                    "type": "string",
+                    "enum": ["content", "any"],
+                    "description": (
+                        "Image validation profile. Use content for document/report media and any only when "
+                        "small icons, logos, or other low-detail assets are intentionally requested."
+                    ),
                 },
             },
             "additionalProperties": False,
@@ -1536,6 +2369,20 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "description": "Maximum number of hourly forecast rows to return when include_hourly is true.",
                 },
             },
+            "additionalProperties": False,
+        },
+        "market_quote": {
+            "type": "object",
+            "properties": {
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "description": "Ticker symbols to look up from public market quote data.",
+                }
+            },
+            "required": ["symbols"],
             "additionalProperties": False,
         },
         "connector_request": {
@@ -1680,24 +2527,21 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         },
         "email_read": {
             "type": "object",
-            "properties": {"id": {"type": "string", "description": "Email message id returned by email_search."}},
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Exact email message id returned in email_search.results[].id. Do not infer ids or pass placeholders.",
+                }
+            },
             "required": ["id"],
             "additionalProperties": False,
         },
-        "calendar_list": {
-            "type": "object",
-            "properties": {
-                "start": {"type": "string", "description": "Inclusive ISO-8601 start datetime."},
-                "end": {"type": "string", "description": "Exclusive ISO-8601 end datetime."},
-                "max": {"type": "integer", "minimum": 1, "description": "Maximum number of events to return."},
-                "provider_id": {
-                    "type": "string",
-                    "description": "Optional connector provider id. Defaults to an active calendar-capable connector.",
-                },
-            },
-            "required": ["start", "end"],
-            "additionalProperties": False,
-        },
+        "email_attachment_read": _email_attachment_read_input_schema(),
+        "calendar_list": _calendar_list_input_schema(),
+        "calendar_create": _calendar_create_input_schema(),
+        "calendar_update": _calendar_update_input_schema(),
+        "calendar_respond": _calendar_respond_input_schema(),
+        "calendar_delete": _calendar_delete_input_schema(),
         "browser_navigate": {
             "type": "object",
             "properties": {
@@ -1760,6 +2604,106 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             "additionalProperties": True,
         },
     )
+
+
+_MARKET_QUOTE_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+
+
+def _normalize_market_quote_symbols(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw_values: Iterable[object] = re.split(r"[,\s]+", value)
+    elif isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray, dict)):
+        raw_values = value
+    else:
+        raw_values = ()
+    symbols: list[str] = []
+    for raw in raw_values:
+        symbol = str(raw or "").strip().upper()
+        if not symbol or not _MARKET_QUOTE_SYMBOL_RE.match(symbol):
+            continue
+        if symbol not in symbols:
+            symbols.append(symbol)
+        if len(symbols) >= 16:
+            break
+    return tuple(symbols)
+
+
+def _coerce_market_quote_price(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (0 < number < 1_000_000):
+        return None
+    return number
+
+
+def _default_market_quote_fetcher(symbol: str, timeout_seconds: int) -> dict[str, object]:
+    encoded_symbol = quote(symbol, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?range=1d&interval=1m"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Nullion"})
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        payload = json.loads(response.read(_WEB_FETCH_MAX_BODY_BYTES).decode("utf-8", errors="replace"))
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    results = chart.get("result") if isinstance(chart, dict) else None
+    first = results[0] if isinstance(results, list) and results and isinstance(results[0], dict) else {}
+    meta = first.get("meta") if isinstance(first, dict) else None
+    if not isinstance(meta, dict):
+        raise ValueError("Market quote response did not include chart metadata.")
+    price = _coerce_market_quote_price(meta.get("regularMarketPrice"))
+    if price is None:
+        raise ValueError("Market quote response did not include a usable regularMarketPrice.")
+    regular_market_time = meta.get("regularMarketTime")
+    timestamp: str | None = None
+    if isinstance(regular_market_time, (int, float)):
+        timestamp = datetime.fromtimestamp(float(regular_market_time), tz=UTC).isoformat(timespec="seconds")
+    return {
+        "symbol": str(meta.get("symbol") or symbol).upper(),
+        "name": str(meta.get("longName") or meta.get("shortName") or symbol).strip(),
+        "price": round(price, 4),
+        "currency": str(meta.get("currency") or "").strip() or "USD",
+        "exchange": str(meta.get("fullExchangeName") or meta.get("exchangeName") or "").strip(),
+        "regular_market_time": timestamp,
+        "source_url": url,
+        "provider": "yahoo-finance-chart",
+    }
+
+
+def _build_market_quote_handler(
+    quote_fetcher: Callable[[str, int], dict[str, object]],
+) -> ToolHandler:
+    def _handler(invocation: ToolInvocation) -> ToolResult:
+        symbols = _normalize_market_quote_symbols(invocation.arguments.get("symbols"))
+        if not symbols:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {"reason": "missing_symbols"},
+                "market_quote requires one or more valid ticker symbols.",
+            )
+        quotes: list[dict[str, object]] = []
+        errors: list[dict[str, str]] = []
+        timeout_seconds = min(12, max(3, int(invocation.arguments.get("timeout_seconds") or 8)))
+        for symbol in symbols:
+            try:
+                quotes.append(quote_fetcher(symbol, timeout_seconds))
+            except Exception as exc:
+                errors.append({"symbol": symbol, "error": str(exc)})
+        return ToolResult(
+            invocation.invocation_id,
+            invocation.tool_name,
+            "completed" if quotes else "failed",
+            {
+                "provider": "yahoo-finance-chart",
+                "symbols": list(symbols),
+                "quotes": quotes,
+                "errors": errors,
+            },
+            None if quotes else "No requested market quotes could be fetched.",
+        )
+
+    return _handler
 
 
 @dataclass(frozen=True, slots=True)
@@ -1874,6 +2818,381 @@ def _terminal_filesystem_safety_denial(
     if workspace_denial is not None:
         return workspace_denial
     return None
+
+
+_TERMINAL_MUTATION_BOUNDARY_OPERATIONS = frozenset({"write", "delete", "metadata_write"})
+_SCHEDULED_TASK_HELPER_SCRIPT_EXTENSIONS = frozenset(
+    {
+        ".bat",
+        ".bash",
+        ".cjs",
+        ".cmd",
+        ".go",
+        ".java",
+        ".jl",
+        ".js",
+        ".kt",
+        ".kts",
+        ".lua",
+        ".mjs",
+        ".php",
+        ".pl",
+        ".ps1",
+        ".py",
+        ".pyw",
+        ".r",
+        ".rb",
+        ".rs",
+        ".scala",
+        ".sh",
+        ".swift",
+        ".ts",
+        ".tsx",
+        ".zsh",
+    }
+)
+
+
+def _workspace_scratch_root_for_principal(principal_id: str | None) -> Path | None:
+    try:
+        from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+        return workspace_storage_roots_for_principal(principal_id).scratch.resolve()
+    except Exception:
+        return None
+
+
+def _workspace_artifact_root_for_principal(principal_id: str | None) -> Path | None:
+    try:
+        from nullion.workspace_storage import workspace_storage_roots_for_principal
+
+        return workspace_storage_roots_for_principal(principal_id).artifacts.resolve()
+    except Exception:
+        return None
+
+
+def _runtime_artifact_root() -> Path | None:
+    try:
+        from nullion.artifacts import nullion_data_home
+
+        return (nullion_data_home() / "artifacts").resolve()
+    except Exception:
+        return None
+
+
+def _path_within_root_text(path_text: object, root: Path | None) -> bool:
+    if root is None:
+        return False
+    try:
+        path = Path(str(path_text or "")).expanduser().resolve()
+        path.relative_to(root)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _scheduled_task_helper_script_path(path_text: object) -> bool:
+    try:
+        return Path(str(path_text or "").strip().strip("'\"")).suffix.lower() in _SCHEDULED_TASK_HELPER_SCRIPT_EXTENSIONS
+    except Exception:
+        return False
+
+
+def _terminal_filesystem_mutation_approval_denial(
+    invocation: ToolInvocation,
+    *,
+    execution_cwd: Path | None,
+    allowed_roots: Iterable[Path] = (),
+) -> dict[str, object] | None:
+    """Require a filesystem boundary grant before local shell writes/deletes."""
+    resolved_allowed_roots = tuple(Path(root).expanduser().resolve() for root in allowed_roots)
+    for fact in extract_boundary_facts(invocation):
+        if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS:
+            continue
+        if fact.operation not in _TERMINAL_MUTATION_BOUNDARY_OPERATIONS:
+            continue
+        try:
+            raw_target = Path(str(fact.target)).expanduser()
+            target_path = raw_target if raw_target.is_absolute() else (execution_cwd or Path.cwd()) / raw_target
+            resolved_target = target_path.resolve()
+        except OSError:
+            resolved_target = Path(str(fact.target)).expanduser()
+        if _path_within_any_root(resolved_target, resolved_allowed_roots):
+            continue
+        if _is_approved_filesystem_path(resolved_target, invocation.trusted_filesystem_selectors):
+            continue
+        return {
+            "reason": "filesystem_mutation_approval_required",
+            "boundary_kind": BoundaryKind.FILESYSTEM_ACCESS.value,
+            "operation": fact.operation,
+            "target": str(resolved_target),
+            "command_family": fact.attributes.get("command_family"),
+            "requires_approval": True,
+            "message": (
+                "Refusing to run a local shell command that would modify files outside the trusted workspace "
+                "without an explicit filesystem approval."
+            ),
+        }
+    return None
+
+
+def _terminal_resolved_filesystem_target(fact, *, execution_cwd: Path | None) -> str:
+    try:
+        raw_target = Path(str(fact.target)).expanduser()
+        target_path = raw_target if raw_target.is_absolute() else (execution_cwd or Path.cwd()) / raw_target
+        return str(target_path.resolve())
+    except OSError:
+        return str(Path(str(fact.target)).expanduser())
+
+
+def _terminal_resolved_target_text(raw_target: object, *, execution_cwd: Path | None) -> str:
+    try:
+        raw_text = str(raw_target or "").strip().strip("'\"")
+        raw_path = Path(raw_text).expanduser()
+        target_path = raw_path if raw_path.is_absolute() else (execution_cwd or Path.cwd()) / raw_path
+        return str(target_path.resolve())
+    except OSError:
+        return str(Path(str(raw_target or "")).expanduser())
+
+
+def _terminal_shell_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return list(lexer)
+    except Exception:
+        try:
+            return shlex.split(command, posix=True)
+        except Exception:
+            return str(command or "").split()
+
+
+def _terminal_find_delete_targets(command: str, *, execution_cwd: Path | None) -> tuple[dict[str, object], ...]:
+    tokens = _terminal_shell_tokens(command)
+    targets: list[dict[str, object]] = []
+    control_tokens = {";", "&&", "||", "|"}
+    expression_starters = {"(", "!", "-name", "-iname", "-path", "-ipath", "-type", "-mtime", "-mmin", "-maxdepth", "-mindepth"}
+    for index, token in enumerate(tokens):
+        if Path(str(token).strip("'\"")).name.lower() != "find":
+            continue
+        segment: list[str] = []
+        for candidate in tokens[index + 1 :]:
+            if candidate in control_tokens:
+                break
+            segment.append(candidate)
+        if "-delete" not in segment and not any(
+            item == "-exec"
+            and any(Path(str(part).strip("'\"")).name.lower() in {"rm", "rm.exe", "rmdir", "rmdir.exe"} for part in segment[pos + 1 :])
+            for pos, item in enumerate(segment)
+        ):
+            continue
+        raw_roots: list[str] = []
+        for item in segment:
+            if item in expression_starters or item.startswith("-"):
+                break
+            raw_roots.append(item)
+        if not raw_roots:
+            raw_roots = ["."]
+        for raw_root in raw_roots:
+            targets.append({
+                "target": _terminal_resolved_target_text(raw_root, execution_cwd=execution_cwd),
+                "operation": "delete",
+                "command_family": "find",
+            })
+    return tuple(targets)
+
+
+def _terminal_script_delete_targets(command: str, *, execution_cwd: Path | None) -> tuple[dict[str, object], ...]:
+    lowered = str(command or "").lower()
+    if not any(marker in lowered for marker in _TERMINAL_DESTRUCTIVE_SCRIPT_MARKERS):
+        return ()
+    token_families = {
+        Path(str(token).strip("'\"")).name.lower()
+        for token in _terminal_shell_tokens(command)[:6]
+        if str(token).strip()
+    }
+    if not token_families.intersection(_TERMINAL_DESTRUCTIVE_SCRIPT_COMMANDS):
+        return ()
+    raw_paths: list[str] = []
+    for match in _TERMINAL_PATH_LITERAL_RE.finditer(str(command or "")):
+        raw_path = match.group("path").strip()
+        if raw_path and raw_path not in raw_paths:
+            raw_paths.append(raw_path)
+    if not raw_paths and execution_cwd is not None:
+        raw_paths = [str(execution_cwd)]
+    return tuple(
+        {
+            "target": _terminal_resolved_target_text(raw_path, execution_cwd=execution_cwd),
+            "operation": "delete",
+            "command_family": "script",
+        }
+        for raw_path in raw_paths
+    )
+
+
+def _terminal_supplemental_delete_targets(
+    command: str,
+    *,
+    execution_cwd: Path | None,
+) -> tuple[dict[str, object], ...]:
+    return (
+        *_terminal_find_delete_targets(command, execution_cwd=execution_cwd),
+        *_terminal_script_delete_targets(command, execution_cwd=execution_cwd),
+    )
+
+
+def _terminal_delete_targets_for_invocation(
+    invocation: ToolInvocation,
+    *,
+    execution_cwd: Path | None,
+) -> tuple[dict[str, object], ...]:
+    targets: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for fact in extract_boundary_facts(invocation):
+        if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS:
+            continue
+        if fact.operation != "delete":
+            continue
+        target = _terminal_resolved_filesystem_target(fact, execution_cwd=execution_cwd)
+        if target in seen:
+            continue
+        seen.add(target)
+        targets.append({
+            "target": target,
+            "operation": fact.operation,
+            "command_family": fact.attributes.get("command_family"),
+        })
+    raw_command = invocation.arguments.get("command")
+    if isinstance(raw_command, str) and raw_command.strip():
+        for target in _terminal_supplemental_delete_targets(raw_command, execution_cwd=execution_cwd):
+            target_path = str(target.get("target") or "")
+            if not target_path or target_path in seen:
+                continue
+            seen.add(target_path)
+            targets.append(dict(target))
+    return tuple(targets)
+
+
+def _terminal_execution_cwd_from_registry(registry: object) -> Path | None:
+    roots = ()
+    try:
+        roots = tuple(registry.filesystem_allowed_roots())
+    except Exception:
+        roots = ()
+    for root in roots:
+        try:
+            resolved = Path(root).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved.is_dir():
+            return resolved
+    return None
+
+
+def _terminal_destructive_permission_token(command: str, targets: Iterable[dict[str, object]]) -> str:
+    payload = {
+        "command": str(command or ""),
+        "targets": [
+            {
+                "target": str(target.get("target") or ""),
+                "operation": str(target.get("operation") or ""),
+                "command_family": str(target.get("command_family") or ""),
+            }
+            for target in targets
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def _terminal_destructive_permission(command: str, targets: Iterable[dict[str, object]]) -> str:
+    return f"{TERMINAL_DESTRUCTIVE_PERMISSION_PREFIX}{_terminal_destructive_permission_token(command, targets)}"
+
+
+def _terminal_destructive_approval_context(
+    invocation: ToolInvocation,
+    *,
+    command: str,
+    targets: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    token = _terminal_destructive_permission_token(command, targets)
+    preview_targets = [str(target.get("target") or "") for target in targets[:_TERMINAL_DESTRUCTIVE_PREVIEW_LIMIT]]
+    return {
+        "tool_name": invocation.tool_name,
+        "tool_description": "Run a local terminal command that deletes files.",
+        "tool_risk_level": "high",
+        "tool_side_effect_class": "delete",
+        "tool_permission_scope": "exact_invocation",
+        "tool_arguments": redact_value(dict(invocation.arguments or {})),
+        "command": command,
+        "operation": "delete",
+        "target": f"{len(targets)} path{'s' if len(targets) != 1 else ''}",
+        "destructive_targets": [dict(target) for target in targets],
+        "destructive_preview_targets": preview_targets,
+        "destructive_target_count": len(targets),
+        "destructive_permission_token": token,
+    }
+
+
+def _terminal_output_artifact_root(
+    *,
+    execution_cwd: Path | None,
+    allowed_roots: Iterable[Path],
+    principal_id: str | None,
+) -> Path | None:
+    artifact_root = _workspace_artifact_root_for_principal(principal_id)
+    if artifact_root is not None:
+        return artifact_root
+    if execution_cwd is not None:
+        return execution_cwd / ".nullion-artifacts"
+    for root in allowed_roots:
+        try:
+            resolved = Path(root).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        return resolved / ".nullion-artifacts"
+    return None
+
+
+def _terminal_output_text_for_attachment(output: dict[str, object]) -> str:
+    stdout = str(output.get("stdout") or "")
+    stderr = str(output.get("stderr") or "")
+    exit_code = output.get("exit_code", output.get("returncode"))
+    parts: list[str] = []
+    if stdout:
+        parts.append("STDOUT\n" + stdout.rstrip())
+    if stderr:
+        parts.append("STDERR\n" + stderr.rstrip())
+    if exit_code is not None:
+        parts.append(f"EXIT CODE\n{exit_code}")
+    return "\n\n".join(parts).strip()
+
+
+def _materialize_terminal_output_attachment(
+    output: dict[str, object],
+    *,
+    invocation: ToolInvocation,
+    execution_cwd: Path | None,
+    allowed_roots: Iterable[Path],
+) -> str | None:
+    text = _terminal_output_text_for_attachment(output)
+    if len(text) <= _TERMINAL_OUTPUT_ATTACHMENT_THRESHOLD_CHARS:
+        return None
+    root = _terminal_output_artifact_root(
+        execution_cwd=execution_cwd,
+        allowed_roots=allowed_roots,
+        principal_id=invocation.principal_id,
+    )
+    if root is None:
+        return None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"terminal-output-{invocation.invocation_id[:12]}.txt"
+        path.write_text(text + "\n", encoding="utf-8")
+        return str(path.resolve())
+    except OSError:
+        logger.debug("Could not materialize terminal output attachment", exc_info=True)
+        return None
 
 
 def _unknown_workspace_storage_denial(tokens: list[str], *, principal_id: str | None = None) -> dict[str, object] | None:
@@ -2658,18 +3977,25 @@ class ToolRegistry:
         self._plugin_registration_allowed = plugin_registration_allowed
         self._installed_plugins: set[str] = set()
         self._filesystem_allowed_roots = tuple(Path(root).resolve() for root in (filesystem_allowed_roots or ()))
+        self._registry_revision = 0
 
     def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
         if spec.name in self._specs:
             raise ValueError(f"Tool already registered: {spec.name}")
         self._specs[spec.name] = spec
         self._handlers[spec.name] = handler
+        self._registry_revision += 1
         _clear_deep_agent_profile_cache()
 
     def unregister(self, name: str) -> None:
         self._specs.pop(name, None)
         self._handlers.pop(name, None)
+        self._registry_revision += 1
         _clear_deep_agent_profile_cache()
+
+    @property
+    def registry_revision(self) -> int:
+        return self._registry_revision
 
     def get_spec(self, name: str) -> ToolSpec:
         return self._specs[name]
@@ -2677,9 +4003,16 @@ class ToolRegistry:
     def list_specs(self) -> list[ToolSpec]:
         return [self._specs[name] for name in sorted(self._specs)]
 
+    def can_invoke_tool(self, name: str) -> bool:
+        return str(name or "") in self._specs and str(name or "") in self._handlers
+
     def list_tool_definitions(self) -> list[dict[str, object]]:
-        return [
-            {
+        definitions: list[dict[str, object]] = []
+        registered_tool_names = set(self._specs).intersection(self._handlers)
+        for spec in self.list_specs():
+            if spec.name not in registered_tool_names:
+                continue
+            definition = {
                 "name": spec.name,
                 "description": spec.description,
                 "input_schema": getattr(spec, "input_schema", None)
@@ -2691,8 +4024,15 @@ class ToolRegistry:
                 "risk_level": str(getattr(spec.risk_level, "value", spec.risk_level)),
                 "requires_approval": bool(spec.requires_approval),
             }
-            for spec in self.list_specs()
-        ]
+            continuation_tools = [
+                str(name)
+                for name in (getattr(spec, "continuation_tools", ()) or ())
+                if str(name or "") in registered_tool_names and str(name or "") != spec.name
+            ]
+            if continuation_tools:
+                definition["continuation_tools"] = continuation_tools
+            definitions.append(definition)
+        return definitions
 
     def filesystem_allowed_roots(self) -> tuple[Path, ...]:
         return self._filesystem_allowed_roots
@@ -2754,7 +4094,7 @@ class ToolRegistry:
         preflight = self._preflight_schema_result(spec, invocation)
         if preflight is not None:
             return preflight
-        return handler(invocation)
+        return _invoke_tool_handler_with_timeout(spec, handler, invocation)
 
     def register_cleanup_hook(self, hook: ToolCleanupHook) -> None:
         self._cleanup_hooks.append(hook)
@@ -2910,7 +4250,7 @@ def _account_tool_failure_output(
 def _connector_request_boundary_preapproved(invocation: "ToolInvocation", fact: BoundaryFact) -> bool:
     provider_id = str(invocation.arguments.get("provider_id") or "").strip()
     if not provider_id:
-        if invocation.tool_name in {"email_search", "email_read"}:
+        if invocation.tool_name in {"email_search", "email_read", "email_attachment_read"}:
             try:
                 from nullion.connections import infer_email_plugin_provider
 
@@ -2934,7 +4274,7 @@ def _connector_request_boundary_preapproved(invocation: "ToolInvocation", fact: 
         connection = None
     if connection is None or not getattr(connection, "active", True):
         return False
-    if invocation.tool_name in {"email_search", "email_read"}:
+    if invocation.tool_name in {"email_search", "email_read", "email_attachment_read"}:
         return (
             fact.kind is BoundaryKind.ACCOUNT_ACCESS
             and fact.operation == "read"
@@ -3066,6 +4406,934 @@ def _record_wildcard_boundary_permit_accesses(
             )
 
 
+def _archive_entry_is_metadata(name: str) -> bool:
+    normalized = str(name or "").replace("\\", "/").lstrip("/")
+    if not normalized:
+        return True
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return True
+    if parts[0] == "__MACOSX":
+        return True
+    base = parts[-1]
+    return base == ".DS_Store" or base.startswith("._")
+
+
+def _archive_suffix(path: Path) -> str | None:
+    name = path.name.lower()
+    suffixes = sorted(
+        [".zip", *_TAR_ARCHIVE_FORMATS.keys(), *_SINGLE_COMPRESSED_FORMATS.keys()],
+        key=len,
+        reverse=True,
+    )
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            return suffix
+    return None
+
+
+def _archive_format_for_path(path: Path) -> tuple[str, str, str | None] | None:
+    suffix = _archive_suffix(path)
+    if suffix is None:
+        return None
+    if suffix == ".zip":
+        return ("zip", "archive", suffix)
+    if suffix in _TAR_ARCHIVE_FORMATS:
+        return (_TAR_ARCHIVE_FORMATS[suffix][0], "archive", suffix)
+    if suffix in _SINGLE_COMPRESSED_FORMATS:
+        return (_SINGLE_COMPRESSED_FORMATS[suffix][0], "compressed_file", suffix)
+    return None
+
+
+def _archive_base_name(path: Path) -> str:
+    suffix = _archive_suffix(path)
+    if suffix and path.name.lower().endswith(suffix):
+        base = path.name[: -len(suffix)]
+        return base or path.stem or "contents"
+    return path.stem or "contents"
+
+
+def _archive_default_output_dir(archive_path: Path) -> Path:
+    return archive_path.with_name(f"{_archive_base_name(archive_path)}_extracted")
+
+
+def _safe_archive_member_path(output_dir: Path, member_name: str) -> Path | None:
+    normalized = str(member_name or "").replace("\\", "/").lstrip("/")
+    if not normalized:
+        return None
+    destination = (output_dir / normalized).resolve()
+    try:
+        destination.relative_to(output_dir)
+    except ValueError:
+        return None
+    return destination
+
+
+def _archive_entry_payload(info: zipfile.ZipInfo) -> dict[str, object]:
+    return {
+        "name": info.filename,
+        "type": "directory" if info.is_dir() else "file",
+        "bytes": 0 if info.is_dir() else info.file_size,
+        "compressed_bytes": info.compress_size,
+        "media_type": "" if info.is_dir() else (mimetypes.guess_type(info.filename)[0] or ""),
+        "modified": "%04d-%02d-%02dT%02d:%02d:%02d"
+        % (
+            info.date_time[0],
+            info.date_time[1],
+            info.date_time[2],
+            info.date_time[3],
+            info.date_time[4],
+            info.date_time[5],
+        ),
+    }
+
+
+def _tar_entry_payload(info: tarfile.TarInfo) -> dict[str, object]:
+    modified = datetime.fromtimestamp(info.mtime, UTC).replace(microsecond=0).isoformat() if info.mtime else ""
+    entry_type = "directory" if info.isdir() else "file" if info.isfile() else "other"
+    return {
+        "name": info.name,
+        "type": entry_type,
+        "bytes": 0 if info.isdir() else info.size,
+        "compressed_bytes": None,
+        "media_type": "" if info.isdir() else (mimetypes.guess_type(info.name)[0] or ""),
+        "modified": modified,
+    }
+
+
+def _archive_extension_counts(names: Iterable[str]) -> dict[str, int]:
+    counts = Counter((Path(name).suffix.lower().lstrip(".") or "<none>") for name in names)
+    return dict(sorted(counts.items()))
+
+
+def _inspect_zip_archive(path: Path, *, entry_limit: int = _ARCHIVE_READ_ENTRY_LIMIT) -> dict[str, object]:
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+    real_infos = [info for info in infos if not _archive_entry_is_metadata(info.filename)]
+    metadata_infos = [info for info in infos if _archive_entry_is_metadata(info.filename)]
+    limited_infos = real_infos[:entry_limit]
+    entry_lines = [
+        f"{entry['name']} ({entry['type']}, {entry['bytes']} bytes)"
+        for entry in (_archive_entry_payload(info) for info in limited_infos)
+    ]
+    return {
+        "path": str(path),
+        "type": "archive",
+        "archive_format": "zip",
+        "media_type": "application/zip",
+        "archive": True,
+        "entries": [_archive_entry_payload(info) for info in limited_infos],
+        "entry_count": len(real_infos),
+        "file_count": sum(1 for info in real_infos if not info.is_dir()),
+        "directory_count": sum(1 for info in real_infos if info.is_dir()),
+        "metadata_entry_count": len(metadata_infos),
+        "metadata_entries_ignored": len(metadata_infos),
+        "total_archive_entries": len(infos),
+        "extension_counts": _archive_extension_counts(info.filename for info in real_infos if not info.is_dir()),
+        "truncated": len(real_infos) > entry_limit,
+        "content": "\n".join(entry_lines),
+    }
+
+
+def _inspect_tar_archive(path: Path, *, archive_format: str, entry_limit: int = _ARCHIVE_READ_ENTRY_LIMIT) -> dict[str, object]:
+    with tarfile.open(path, "r:*") as archive:
+        infos = archive.getmembers()
+    real_infos = [info for info in infos if not _archive_entry_is_metadata(info.name)]
+    metadata_infos = [info for info in infos if _archive_entry_is_metadata(info.name)]
+    limited_infos = real_infos[:entry_limit]
+    entry_lines = [
+        f"{entry['name']} ({entry['type']}, {entry['bytes']} bytes)"
+        for entry in (_tar_entry_payload(info) for info in limited_infos)
+    ]
+    return {
+        "path": str(path),
+        "type": "archive",
+        "archive_format": archive_format,
+        "media_type": mimetypes.guess_type(path.name)[0] or "application/x-tar",
+        "archive": True,
+        "entries": [_tar_entry_payload(info) for info in limited_infos],
+        "entry_count": len(real_infos),
+        "file_count": sum(1 for info in real_infos if info.isfile()),
+        "directory_count": sum(1 for info in real_infos if info.isdir()),
+        "metadata_entry_count": len(metadata_infos),
+        "metadata_entries_ignored": len(metadata_infos),
+        "total_archive_entries": len(infos),
+        "extension_counts": _archive_extension_counts(info.name for info in real_infos if info.isfile()),
+        "truncated": len(real_infos) > entry_limit,
+        "content": "\n".join(entry_lines),
+    }
+
+
+def _single_compressed_output_name(path: Path) -> str:
+    suffix = _archive_suffix(path) or path.suffix.lower()
+    if suffix and path.name.lower().endswith(suffix):
+        return path.name[: -len(suffix)] or path.stem or "decompressed"
+    return path.stem or "decompressed"
+
+
+def _single_compressed_open(path: Path, archive_format: str):
+    if archive_format == "gzip":
+        return gzip.open(path, "rb")
+    if archive_format == "bzip2":
+        return bz2.open(path, "rb")
+    if archive_format == "xz":
+        return lzma.open(path, "rb")
+    raise ValueError(f"Unsupported compressed format: {archive_format}")
+
+
+def _inspect_single_compressed_file(path: Path, *, archive_format: str) -> dict[str, object]:
+    output_name = _single_compressed_output_name(path)
+    entry = {
+        "name": output_name,
+        "type": "file",
+        "bytes": None,
+        "compressed_bytes": path.stat().st_size,
+        "media_type": mimetypes.guess_type(output_name)[0] or "",
+        "modified": datetime.fromtimestamp(path.stat().st_mtime, UTC).replace(microsecond=0).isoformat(),
+    }
+    return {
+        "path": str(path),
+        "type": "compressed_file",
+        "archive_format": archive_format,
+        "media_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        "archive": True,
+        "entries": [entry],
+        "entry_count": 1,
+        "file_count": 1,
+        "directory_count": 0,
+        "metadata_entry_count": 0,
+        "metadata_entries_ignored": 0,
+        "total_archive_entries": 1,
+        "extension_counts": _archive_extension_counts([output_name]),
+        "truncated": False,
+        "content": f"{output_name} (file, compressed {path.stat().st_size} bytes)",
+    }
+
+
+def _inspect_archive_file(path: Path, *, entry_limit: int = _ARCHIVE_READ_ENTRY_LIMIT) -> dict[str, object]:
+    archive_details = _archive_format_for_path(path)
+    if archive_details is None:
+        raise ValueError("unsupported_archive_format")
+    archive_format, archive_kind, _suffix = archive_details
+    if archive_format == "zip":
+        return _inspect_zip_archive(path, entry_limit=entry_limit)
+    if archive_kind == "archive":
+        return _inspect_tar_archive(path, archive_format=archive_format, entry_limit=entry_limit)
+    return _inspect_single_compressed_file(path, archive_format=archive_format)
+
+
+def _archive_extract_error_result(invocation: ToolInvocation, *, path: Path | None, error: str, reason: str) -> ToolResult:
+    output: dict[str, object] = {"reason": reason}
+    if path is not None:
+        output["path"] = str(path)
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output=output,
+        error=error,
+    )
+
+
+def _archive_default_manifest_dir(archive_path: Path, output_dir: Path, *, workspace_root: Path | None = None) -> Path:
+    if workspace_root is not None:
+        artifact_dir = (workspace_root / "artifacts").resolve()
+        if artifact_dir.exists() or archive_path.parent.name == "files":
+            return artifact_dir
+    if archive_path.parent.name == "files":
+        sibling_artifacts = archive_path.parent.parent / "artifacts"
+        if sibling_artifacts.exists():
+            return sibling_artifacts.resolve()
+    return archive_path.parent
+
+
+def _archive_manifest_paths(
+    archive_path: Path,
+    output_dir: Path,
+    *,
+    manifest_output_path: Path | None = None,
+    workspace_root: Path | None = None,
+) -> tuple[Path, Path, Path]:
+    if manifest_output_path is not None:
+        xlsx_path = manifest_output_path
+        base = xlsx_path.with_suffix("")
+    else:
+        manifest_dir = _archive_default_manifest_dir(archive_path, output_dir, workspace_root=workspace_root)
+        base = manifest_dir / f"{output_dir.name}_manifest"
+        xlsx_path = base.with_suffix(".xlsx")
+    return base.with_suffix(".csv"), base.with_suffix(".json"), xlsx_path
+
+
+def _archive_entry_basename(name: object) -> str:
+    text = str(name or "").strip()
+    return text.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _archive_entry_image_path(entry: dict[str, object]) -> Path | None:
+    raw_path = entry.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    image_path = Path(raw_path)
+    media_type = str(entry.get("media_type") or "").strip().lower()
+    if not media_type.startswith("image/") and image_path.suffix.lower() not in _ARCHIVE_MANIFEST_IMAGE_SUFFIXES:
+        return None
+    if not image_path.is_file():
+        return None
+    embeddable_path = _embeddable_image_path(image_path)
+    if embeddable_path.suffix.lower() not in _ARCHIVE_MANIFEST_IMAGE_SUFFIXES:
+        return None
+    if _local_raster_image_too_small(embeddable_path):
+        return None
+    return embeddable_path
+
+
+def _write_archive_entry_manifests(
+    archive_path: Path,
+    output_dir: Path,
+    entries: list[dict[str, object]],
+    *,
+    manifest_output_path: Path | None = None,
+    workspace_root: Path | None = None,
+) -> dict[str, object]:
+    csv_path, json_path, xlsx_path = _archive_manifest_paths(
+        archive_path,
+        output_dir,
+        manifest_output_path=manifest_output_path,
+        workspace_root=workspace_root,
+    )
+    row_payloads: list[dict[str, object]] = []
+    has_images = False
+    for index, entry in enumerate(entries, start=1):
+        filename = _archive_entry_basename(entry.get("name"))
+        image_path = _archive_entry_image_path(entry)
+        has_images = has_images or image_path is not None
+        row_payloads.append(
+            {
+                "index": index,
+                "name": str(entry.get("name") or ""),
+                "filename": filename,
+                "extension": Path(filename).suffix.lower(),
+                "media_type": str(entry.get("media_type") or ""),
+                "bytes": int(entry.get("bytes") or 0),
+                "path": str(entry.get("path") or ""),
+                "image_path": image_path,
+            }
+        )
+    columns = [
+        "#",
+        "Name",
+        "Filename",
+        "Extension",
+        "Media Type",
+        "Bytes",
+        "Extracted Path",
+        *(["Image"] if has_images else []),
+    ]
+    rows: list[dict[str, object]] = []
+    for payload in row_payloads:
+        row: dict[str, object] = {
+            "#": payload["index"],
+            "Name": payload["name"],
+            "Filename": payload["filename"],
+            "Extension": payload["extension"],
+            "Media Type": payload["media_type"],
+            "Bytes": payload["bytes"],
+            "Extracted Path": payload["path"],
+        }
+        if has_images:
+            image_path = payload.get("image_path")
+            row["Image"] = str(image_path) if isinstance(image_path, Path) else ""
+        rows.append(row)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "columns": columns,
+                "rows": rows,
+                "entry_count": len(rows),
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+    manifest: dict[str, object] = {
+        "manifest_csv_path": str(csv_path),
+        "manifest_json_path": str(json_path),
+        "manifest_row_count": len(rows),
+        "manifest_columns": columns,
+        "embedded_images": [],
+        "source_image_paths": [],
+        "manifest_embedded_image_count": 0,
+    }
+    try:
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as WorksheetImage
+        from openpyxl.styles import Font
+    except ModuleNotFoundError:
+        return manifest
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Archive Items"
+    sheet.append(columns)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        sheet.append(["" if column == "Image" else row[column] for column in columns])
+    for column_cells in sheet.columns:
+        max_width = min(
+            80,
+            max(len(str(cell.value or "")) for cell in column_cells) + 2,
+        )
+        sheet.column_dimensions[column_cells[0].column_letter].width = max(10, max_width)
+    if has_images:
+        image_column_index = columns.index("Image") + 1
+        sheet.column_dimensions[sheet.cell(row=1, column=image_column_index).column_letter].width = 22
+        embedded_images: list[str] = []
+        optimized_image_paths: list[str] = []
+        skipped_images: list[str] = []
+        for row_index, payload in enumerate(row_payloads, start=2):
+            image_path = payload.get("image_path")
+            if not isinstance(image_path, Path):
+                continue
+            try:
+                embed_path = optimized_embedded_image_path(image_path)
+                worksheet_image = WorksheetImage(str(embed_path))
+                if worksheet_image.width > 140:
+                    scale = 140 / float(worksheet_image.width)
+                    worksheet_image.width = int(worksheet_image.width * scale)
+                    worksheet_image.height = int(worksheet_image.height * scale)
+                if worksheet_image.height > 120:
+                    scale = 120 / float(worksheet_image.height)
+                    worksheet_image.width = int(worksheet_image.width * scale)
+                    worksheet_image.height = int(worksheet_image.height * scale)
+                sheet.add_image(
+                    worksheet_image,
+                    f"{sheet.cell(row=row_index, column=image_column_index).coordinate}",
+                )
+                sheet.row_dimensions[row_index].height = max(sheet.row_dimensions[row_index].height or 15, 92)
+                embedded_images.append(str(image_path))
+                if embed_path != image_path:
+                    optimized_image_paths.append(str(embed_path))
+            except Exception:
+                skipped_images.append(str(image_path))
+        manifest["embedded_images"] = embedded_images
+        manifest["source_image_paths"] = embedded_images
+        manifest["manifest_embedded_image_count"] = len(embedded_images)
+        if optimized_image_paths:
+            manifest["optimized_image_paths"] = optimized_image_paths
+        if skipped_images:
+            manifest["skipped_images"] = skipped_images
+    workbook.save(xlsx_path)
+    manifest["manifest_xlsx_path"] = str(xlsx_path)
+    return manifest
+
+
+def _build_archive_extract_handler(
+    workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
+    *,
+    include_principal_workspace: bool = True,
+) -> ToolHandler:
+    resolved_root = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_path = invocation.arguments.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return _archive_extract_error_result(
+                invocation,
+                path=None,
+                error="Missing required argument: path",
+                reason="missing_path",
+            )
+        effective_roots = _effective_filesystem_roots(
+            invocation=invocation,
+            resolved_root=resolved_root,
+            resolved_allowed_roots=resolved_allowed_roots,
+            include_principal_workspace=include_principal_workspace,
+        )
+        if not effective_roots:
+            return _archive_extract_error_result(
+                invocation,
+                path=None,
+                error="Archive extraction requires workspace_root or allowed_roots",
+                reason="missing_workspace_roots",
+            )
+        archive_path = Path(raw_path).expanduser().resolve()
+        if not _path_within_any_root(archive_path, effective_roots) and not _is_approved_filesystem_path(
+            archive_path, invocation.trusted_filesystem_selectors
+        ):
+            return _archive_extract_error_result(
+                invocation,
+                path=archive_path,
+                error=f"Path is outside workspace root: {archive_path}",
+                reason="path_outside_workspace",
+            )
+        archive_details = _archive_format_for_path(archive_path)
+        if archive_details is None:
+            return _archive_extract_error_result(
+                invocation,
+                path=archive_path,
+                error=f"Unsupported archive format: {archive_path.suffix or archive_path.name}",
+                reason="unsupported_archive_format",
+            )
+        if not archive_path.is_file():
+            return _archive_extract_error_result(
+                invocation,
+                path=archive_path,
+                error=f"File not found: {archive_path}",
+                reason="file_not_found",
+            )
+        raw_output_dir = invocation.arguments.get("output_dir")
+        if isinstance(raw_output_dir, str) and raw_output_dir.strip():
+            requested_output = Path(raw_output_dir).expanduser()
+            output_dir = requested_output.resolve() if requested_output.is_absolute() else (archive_path.parent / requested_output).resolve()
+        else:
+            output_dir = _archive_default_output_dir(archive_path).resolve()
+        if not _path_within_any_root(output_dir, effective_roots) and not _is_approved_filesystem_path(
+            output_dir, invocation.trusted_filesystem_selectors
+        ):
+            return _archive_extract_error_result(
+                invocation,
+                path=archive_path,
+                error=f"Output directory is outside workspace root: {output_dir}",
+                reason="output_dir_outside_workspace",
+            )
+        manifest_output_path: Path | None = None
+        raw_manifest_output_path = invocation.arguments.get("manifest_output_path")
+        if isinstance(raw_manifest_output_path, str) and raw_manifest_output_path.strip():
+            requested_manifest = Path(raw_manifest_output_path).expanduser()
+            manifest_output_path = (
+                requested_manifest.resolve()
+                if requested_manifest.is_absolute()
+                else (
+                    _archive_default_manifest_dir(archive_path, output_dir, workspace_root=resolved_root)
+                    / requested_manifest
+                ).resolve()
+            )
+            if manifest_output_path.suffix.lower() != ".xlsx":
+                return _archive_extract_error_result(
+                    invocation,
+                    path=archive_path,
+                    error="manifest_output_path must end in .xlsx",
+                    reason="invalid_manifest_output_path",
+                )
+            if not _path_within_any_root(manifest_output_path, effective_roots) and not _is_approved_filesystem_path(
+                manifest_output_path, invocation.trusted_filesystem_selectors
+            ):
+                return _archive_extract_error_result(
+                    invocation,
+                    path=archive_path,
+                    error=f"Manifest output path is outside workspace root: {manifest_output_path}",
+                    reason="manifest_output_path_outside_workspace",
+                )
+        include_metadata = invocation.arguments.get("include_metadata") is True
+        extracted_entries: list[dict[str, object]] = []
+        skipped_metadata = 0
+        skipped_unsafe = 0
+        archive_format, archive_kind, _archive_suffix_text = archive_details
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if archive_format == "zip":
+                with zipfile.ZipFile(archive_path) as archive:
+                    infos = archive.infolist()
+                    if len(infos) > _ARCHIVE_EXTRACT_ENTRY_LIMIT:
+                        return _archive_extract_error_result(
+                            invocation,
+                            path=archive_path,
+                            error=f"Archive has too many entries to extract safely: {len(infos)}",
+                            reason="archive_entry_limit_exceeded",
+                        )
+                    for info in infos:
+                        if _archive_entry_is_metadata(info.filename) and not include_metadata:
+                            skipped_metadata += 1
+                            continue
+                        destination = _safe_archive_member_path(output_dir, info.filename)
+                        if destination is None:
+                            skipped_unsafe += 1
+                            continue
+                        if info.is_dir():
+                            destination.mkdir(parents=True, exist_ok=True)
+                            continue
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(info) as source, destination.open("wb") as target:
+                            shutil.copyfileobj(source, target)
+                        extracted_entries.append({
+                            "name": info.filename,
+                            "path": str(destination),
+                            "bytes": destination.stat().st_size,
+                            "media_type": mimetypes.guess_type(info.filename)[0] or "",
+                        })
+            elif archive_kind == "archive":
+                with tarfile.open(archive_path, "r:*") as archive:
+                    infos = archive.getmembers()
+                    if len(infos) > _ARCHIVE_EXTRACT_ENTRY_LIMIT:
+                        return _archive_extract_error_result(
+                            invocation,
+                            path=archive_path,
+                            error=f"Archive has too many entries to extract safely: {len(infos)}",
+                            reason="archive_entry_limit_exceeded",
+                        )
+                    for info in infos:
+                        if _archive_entry_is_metadata(info.name) and not include_metadata:
+                            skipped_metadata += 1
+                            continue
+                        destination = _safe_archive_member_path(output_dir, info.name)
+                        if destination is None:
+                            skipped_unsafe += 1
+                            continue
+                        if info.isdir():
+                            destination.mkdir(parents=True, exist_ok=True)
+                            continue
+                        if not info.isfile():
+                            skipped_unsafe += 1
+                            continue
+                        source = archive.extractfile(info)
+                        if source is None:
+                            skipped_unsafe += 1
+                            continue
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        with source, destination.open("wb") as target:
+                            shutil.copyfileobj(source, target)
+                        extracted_entries.append({
+                            "name": info.name,
+                            "path": str(destination),
+                            "bytes": destination.stat().st_size,
+                            "media_type": mimetypes.guess_type(info.name)[0] or "",
+                        })
+            else:
+                output_name = _single_compressed_output_name(archive_path)
+                destination = _safe_archive_member_path(output_dir, output_name)
+                if destination is None:
+                    skipped_unsafe += 1
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with _single_compressed_open(archive_path, archive_format) as source, destination.open("wb") as target:
+                        shutil.copyfileobj(source, target)
+                    extracted_entries.append({
+                        "name": output_name,
+                        "path": str(destination),
+                        "bytes": destination.stat().st_size,
+                        "media_type": mimetypes.guess_type(output_name)[0] or "",
+                    })
+        except (zipfile.BadZipFile, tarfile.TarError, EOFError, lzma.LZMAError):
+            return _archive_extract_error_result(
+                invocation,
+                path=archive_path,
+                error=f"File is not a valid supported archive: {archive_path}",
+                reason="bad_archive_file",
+            )
+        except OSError as exc:
+            return _archive_extract_error_result(
+                invocation,
+                path=archive_path,
+                error=f"Could not extract archive: {exc}",
+                reason="archive_extract_failed",
+            )
+        manifest_output: dict[str, object] = {}
+        try:
+            manifest_output = _write_archive_entry_manifests(
+                archive_path,
+                output_dir,
+                extracted_entries,
+                manifest_output_path=manifest_output_path,
+                workspace_root=resolved_root,
+            )
+        except OSError as exc:
+            return _archive_extract_error_result(
+                invocation,
+                path=archive_path,
+                error=f"Could not write archive manifest: {exc}",
+                reason="archive_manifest_write_failed",
+            )
+        manifest_artifact_paths = [
+            str(path)
+            for key in ("manifest_xlsx_path", "manifest_csv_path", "manifest_json_path")
+            if isinstance(path := manifest_output.get(key), str) and path
+        ]
+        deliverable_manifest_paths = [
+            str(path)
+            for key in ("manifest_xlsx_path",)
+            if manifest_output_path is not None and isinstance(path := manifest_output.get(key), str) and path
+        ]
+        artifact_descriptors = [
+            artifact_output_descriptor(archive_path, role=ARTIFACT_ROLE_SOURCE, kind="archive"),
+            *(
+                artifact_output_descriptor(path, role=ARTIFACT_ROLE_DELIVERABLE, kind="archive_manifest")
+                for path in deliverable_manifest_paths
+            ),
+            *(
+                artifact_output_descriptor(path, role=ARTIFACT_ROLE_INTERMEDIATE, kind="archive_manifest_sidecar")
+                for path in manifest_artifact_paths
+                if path not in deliverable_manifest_paths
+            ),
+        ]
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "path": str(archive_path),
+                "archive_path": str(archive_path),
+                "archive_format": archive_format,
+                "output_dir": str(output_dir),
+                "entries": extracted_entries[:_ARCHIVE_READ_ENTRY_LIMIT],
+                "entry_count": len(extracted_entries),
+                "file_count": len(extracted_entries),
+                "metadata_entries_ignored": skipped_metadata,
+                "unsafe_entries_ignored": skipped_unsafe,
+                "truncated": len(extracted_entries) > _ARCHIVE_READ_ENTRY_LIMIT,
+                **manifest_output,
+                "manifest_columns": manifest_output.get(
+                    "manifest_columns",
+                    ["#", "Name", "Media Type", "Bytes", "Extracted Path"],
+                ),
+                "manifest_artifact_paths": manifest_artifact_paths,
+                "artifact_path": deliverable_manifest_paths[0] if deliverable_manifest_paths else "",
+                "artifact_paths": deliverable_manifest_paths,
+                "artifact_descriptors": artifact_descriptors,
+            },
+            error=None,
+        )
+
+    return handler
+
+
+def _archive_create_error_result(invocation: ToolInvocation, *, path: Path | None, error: str, reason: str) -> ToolResult:
+    output: dict[str, object] = {"reason": reason}
+    if path is not None:
+        output["output_path"] = str(path)
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output=output,
+        error=error,
+    )
+
+
+def _build_archive_create_handler(
+    workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
+    *,
+    include_principal_workspace: bool = True,
+) -> ToolHandler:
+    resolved_root = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
+
+    def _resolve_input_path(raw_path: object, roots: tuple[Path, ...]) -> Path | None:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute():
+            candidates = (candidate,)
+        else:
+            candidates = tuple(root / candidate for root in roots)
+        for possible in candidates:
+            try:
+                resolved = possible.resolve()
+            except OSError:
+                continue
+            if _path_within_any_root(resolved, roots):
+                return resolved
+        return None
+
+    def _iter_source_files(source: Path, *, include_metadata: bool) -> Iterable[tuple[Path, str]]:
+        if source.is_file():
+            if include_metadata or not _archive_entry_is_metadata(source.name):
+                yield source, source.name
+            return
+        if not source.is_dir():
+            return
+        for current_dir, dirnames, filenames in os.walk(source, topdown=True, followlinks=False):
+            current_path = Path(current_dir)
+            dirnames[:] = [
+                dirname
+                for dirname in sorted(dirnames)
+                if include_metadata or not _archive_entry_is_metadata(str((current_path / dirname).relative_to(source)))
+            ]
+            for filename in sorted(filenames):
+                file_path = current_path / filename
+                try:
+                    resolved_file = file_path.resolve()
+                except OSError:
+                    continue
+                if not resolved_file.is_file():
+                    continue
+                arcname = str(file_path.relative_to(source)).replace(os.sep, "/")
+                if not include_metadata and _archive_entry_is_metadata(arcname):
+                    continue
+                yield resolved_file, arcname
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_output_path = invocation.arguments.get("output_path")
+        if not isinstance(raw_output_path, str) or not raw_output_path.strip():
+            return _archive_create_error_result(
+                invocation,
+                path=None,
+                error="Missing required argument: output_path",
+                reason="missing_output_path",
+            )
+        effective_roots = _effective_filesystem_roots(
+            invocation=invocation,
+            resolved_root=resolved_root,
+            resolved_allowed_roots=resolved_allowed_roots,
+            include_principal_workspace=include_principal_workspace,
+        )
+        if not effective_roots:
+            return _archive_create_error_result(
+                invocation,
+                path=None,
+                error="Archive creation requires workspace_root or allowed_roots",
+                reason="missing_workspace_roots",
+            )
+        output_path = Path(raw_output_path).expanduser()
+        if not output_path.is_absolute():
+            output_path = (effective_roots[0] / output_path)
+        output_path = output_path.resolve()
+        output_archive_details = _archive_format_for_path(output_path)
+        if output_archive_details is None:
+            return _archive_create_error_result(
+                invocation,
+                path=output_path,
+                error="archive_create output_path must use a supported archive/compression extension.",
+                reason="invalid_output_extension",
+            )
+        if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
+            output_path, invocation.trusted_filesystem_selectors
+        ):
+            return _archive_create_error_result(
+                invocation,
+                path=output_path,
+                error=f"Output path is outside workspace root: {output_path}",
+                reason="output_path_outside_workspace",
+            )
+        include_metadata = invocation.arguments.get("include_metadata") is True
+        raw_source_paths = invocation.arguments.get("source_paths")
+        source_paths: list[Path] = []
+        raw_source_dir = invocation.arguments.get("source_dir")
+        source_dir = _resolve_input_path(raw_source_dir, effective_roots)
+        if source_dir is not None:
+            source_paths.append(source_dir)
+        if isinstance(raw_source_paths, (list, tuple)):
+            for raw_source_path in raw_source_paths:
+                resolved_source = _resolve_input_path(raw_source_path, effective_roots)
+                if resolved_source is not None:
+                    source_paths.append(resolved_source)
+        source_paths = list(dict.fromkeys(source_paths))
+        if not source_paths:
+            return _archive_create_error_result(
+                invocation,
+                path=output_path,
+                error="archive_create requires source_dir or source_paths inside the workspace.",
+                reason="missing_sources",
+            )
+        entries: list[tuple[Path, str]] = []
+        output_identity = output_path.resolve()
+        for source_path in source_paths:
+            if not source_path.exists():
+                continue
+            for file_path, arcname in _iter_source_files(source_path, include_metadata=include_metadata):
+                if file_path.resolve() == output_identity:
+                    continue
+                entries.append((file_path, arcname))
+                if len(entries) > _ARCHIVE_EXTRACT_ENTRY_LIMIT:
+                    return _archive_create_error_result(
+                        invocation,
+                        path=output_path,
+                        error=f"Too many files to archive safely: {len(entries)}",
+                        reason="archive_entry_limit_exceeded",
+                    )
+        deduped_entries: list[tuple[Path, str]] = []
+        seen_names: set[str] = set()
+        for file_path, arcname in entries:
+            clean_name = arcname.replace("\\", "/").lstrip("/")
+            if not clean_name or clean_name in seen_names:
+                continue
+            seen_names.add(clean_name)
+            deduped_entries.append((file_path, clean_name))
+        if not deduped_entries:
+            return _archive_create_error_result(
+                invocation,
+                path=output_path,
+                error="No archiveable files found in the requested sources.",
+                reason="no_archiveable_files",
+            )
+        archive_format, archive_kind, suffix_text = output_archive_details
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if archive_format == "zip":
+                with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    for file_path, arcname in deduped_entries:
+                        archive.write(file_path, arcname)
+            elif archive_kind == "archive":
+                mode = _TAR_ARCHIVE_FORMATS[suffix_text or ".tar"][1]
+                with tarfile.open(output_path, mode) as archive:
+                    for file_path, arcname in deduped_entries:
+                        archive.add(file_path, arcname=arcname, recursive=False)
+            else:
+                if len(deduped_entries) != 1:
+                    return _archive_create_error_result(
+                        invocation,
+                        path=output_path,
+                        error="Single-file compression formats require exactly one source file.",
+                        reason="single_file_compression_requires_one_source",
+                    )
+                source_file, _arcname = deduped_entries[0]
+                if archive_format == "gzip":
+                    opener = gzip.open
+                elif archive_format == "bzip2":
+                    opener = bz2.open
+                elif archive_format == "xz":
+                    opener = lzma.open
+                else:
+                    raise ValueError(f"Unsupported compressed format: {archive_format}")
+                with source_file.open("rb") as source, opener(output_path, "wb") as target:
+                    shutil.copyfileobj(source, target)
+        except (OSError, tarfile.TarError, ValueError) as exc:
+            return _archive_create_error_result(
+                invocation,
+                path=output_path,
+                error=f"Could not create archive: {exc}",
+                reason="archive_create_failed",
+            )
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "path": str(output_path),
+                "artifact_path": str(output_path),
+                "artifact_paths": [str(output_path)],
+                "artifact_descriptors": [
+                    artifact_output_descriptor(output_path, role=ARTIFACT_ROLE_DELIVERABLE, kind="archive")
+                ],
+                "archive_format": archive_format,
+                "bytes_written": output_path.stat().st_size,
+                "entry_count": len(deduped_entries),
+                "entries": [
+                    {
+                        "name": arcname,
+                        "path": str(file_path),
+                        "bytes": file_path.stat().st_size,
+                        "media_type": mimetypes.guess_type(arcname)[0] or "",
+                    }
+                    for file_path, arcname in deduped_entries[:_ARCHIVE_READ_ENTRY_LIMIT]
+                ],
+                "truncated": len(deduped_entries) > _ARCHIVE_READ_ENTRY_LIMIT,
+            },
+            error=None,
+        )
+
+    return handler
+
+
 class ToolExecutor:
     def __init__(
         self,
@@ -3159,6 +5427,10 @@ class ToolExecutor:
             return False
         if invocation.tool_name == "email_send":
             return bool(self._matching_email_send_review_grants(invocation))
+        if self._matching_exact_tool_review_grants(invocation):
+            return True
+        if invocation.tool_name == "terminal_exec" and self._matching_terminal_destructive_grants(invocation):
+            return True
         return self._has_active_grant(
             principal_id=invocation.principal_id,
             permissions=(
@@ -3168,7 +5440,43 @@ class ToolExecutor:
             ),
         )
 
-    def _matching_email_send_review_grants(self, invocation: ToolInvocation):
+    def _matching_terminal_destructive_grants(self, invocation: ToolInvocation):
+        if invocation.tool_name != "terminal_exec":
+            return []
+        raw_command = invocation.arguments.get("command")
+        if not isinstance(raw_command, str) or not raw_command.strip():
+            return []
+        execution_cwd = _terminal_execution_cwd_from_registry(self._registry)
+        targets = _terminal_delete_targets_for_invocation(invocation, execution_cwd=execution_cwd)
+        if not targets:
+            return []
+        permission = _terminal_destructive_permission(raw_command, targets)
+        principal_ids = _tool_grant_principal_candidates(invocation.principal_id)
+        grants = []
+        for grant in self._store.list_permission_grants():
+            if grant.principal_id not in principal_ids:
+                continue
+            if grant.permission != permission:
+                continue
+            if is_permission_grant_active(grant):
+                grants.append(grant)
+        return grants
+
+    def _revoke_terminal_destructive_grants(self, invocation: ToolInvocation) -> None:
+        for grant in self._matching_terminal_destructive_grants(invocation):
+            try:
+                self._store.add_permission_grant(
+                    revoke_permission_grant_record(
+                        grant,
+                        revoked_by="runtime",
+                        revoked_at=datetime.now(UTC),
+                        reason="Terminal destructive action approval consumed.",
+                    )
+                )
+            except Exception:
+                logger.debug("Could not revoke consumed terminal destructive approval grant", exc_info=True)
+
+    def _matching_exact_tool_review_grants(self, invocation: ToolInvocation):
         current_arguments = redact_value(dict(invocation.arguments or {}))
         matching_approval_ids: set[str] = set()
         for approval in self._store.list_approval_requests():
@@ -3176,28 +5484,37 @@ class ToolExecutor:
                 continue
             if approval.requested_by != invocation.principal_id:
                 continue
-            if approval.action != "use_tool" or approval.resource != "email_send":
+            if approval.action != "use_tool":
                 continue
             context = approval.context if isinstance(approval.context, dict) else {}
+            approved_tool = str(context.get("tool_name") or approval.resource or "").strip()
+            if approved_tool != invocation.tool_name:
+                continue
             if context.get("tool_arguments") == current_arguments:
                 matching_approval_ids.add(approval.approval_id)
         if not matching_approval_ids:
             return []
         grants = []
         principal_ids = _tool_grant_principal_candidates(invocation.principal_id)
+        permission_names = {f"tool:{invocation.tool_name}", f"tool.{invocation.tool_name}", invocation.tool_name}
         for grant in self._store.list_permission_grants():
             if grant.approval_id not in matching_approval_ids:
                 continue
             if grant.principal_id not in principal_ids:
                 continue
-            if grant.permission not in {"tool:email_send", "tool.email_send", "email_send"}:
+            if grant.permission not in permission_names:
                 continue
             if is_permission_grant_active(grant):
                 grants.append(grant)
         return grants
 
+    def _matching_email_send_review_grants(self, invocation: ToolInvocation):
+        if invocation.tool_name != "email_send":
+            return []
+        return self._matching_exact_tool_review_grants(invocation)
+
     def _revoke_email_send_review_grants(self, invocation: ToolInvocation) -> None:
-        for grant in self._matching_email_send_review_grants(invocation):
+        for grant in self._matching_exact_tool_review_grants(invocation):
             try:
                 self._store.add_permission_grant(
                     revoke_permission_grant_record(
@@ -3252,6 +5569,99 @@ class ToolExecutor:
                 continue
             return approval
         return None
+
+    def _find_pending_terminal_destructive_approval(self, invocation: ToolInvocation, *, context: dict[str, object]):
+        token = context.get("destructive_permission_token")
+        if not isinstance(token, str) or not token:
+            return None
+        for approval in self._store.list_approval_requests():
+            if approval.status.value != "pending":
+                continue
+            if approval.requested_by != invocation.principal_id:
+                continue
+            if approval.request_kind != TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
+                continue
+            if approval.action != "use_tool" or approval.resource != invocation.tool_name:
+                continue
+            approval_context = approval.context if isinstance(approval.context, dict) else {}
+            if approval_context.get("destructive_permission_token") == token:
+                return approval
+        return None
+
+    def _ensure_terminal_destructive_approval_request(
+        self,
+        invocation: ToolInvocation,
+        *,
+        command: str,
+        targets: tuple[dict[str, object], ...],
+    ):
+        workspace_id = "workspace_admin"
+        try:
+            from nullion.connections import workspace_id_for_principal
+
+            workspace_id = workspace_id_for_principal(invocation.principal_id)
+        except Exception:
+            pass
+        approval_context = {
+            **_terminal_destructive_approval_context(invocation, command=command, targets=targets),
+            "workspace_id": workspace_id,
+            FLOW_TRIGGER_CONTEXT_KEY: dict(invocation.flow_context)
+            if isinstance(invocation.flow_context, dict)
+            else build_trigger_flow_context(
+                principal_id=invocation.principal_id,
+                invocation_id=invocation.invocation_id,
+                capsule_id=invocation.capsule_id,
+                flow_kind="terminal_destructive_action",
+            ),
+        }
+        existing = self._find_pending_terminal_destructive_approval(invocation, context=approval_context)
+        if existing is not None:
+            refreshed = _refresh_pending_approval_request(
+                existing,
+                context=approval_context,
+                resource=invocation.tool_name,
+            )
+            self._store.add_approval_request(refreshed)
+            return refreshed
+        approval = create_approval_request(
+            requested_by=invocation.principal_id,
+            action="use_tool",
+            resource=invocation.tool_name,
+            request_kind=TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND,
+            context=approval_context,
+        )
+        self._store.add_approval_request(approval)
+        return approval
+
+    def _terminal_destructive_preapproval_result(self, invocation: ToolInvocation) -> ToolResult | None:
+        if invocation.tool_name != "terminal_exec":
+            return None
+        raw_command = invocation.arguments.get("command")
+        if not isinstance(raw_command, str) or not raw_command.strip():
+            return None
+        execution_cwd = _terminal_execution_cwd_from_registry(self._registry)
+        targets = _terminal_delete_targets_for_invocation(invocation, execution_cwd=execution_cwd)
+        if not targets:
+            return None
+        if self._matching_terminal_destructive_grants(invocation):
+            return None
+        approval = self._ensure_terminal_destructive_approval_request(
+            invocation,
+            command=raw_command,
+            targets=targets,
+        )
+        context = approval.context if isinstance(approval.context, dict) else {}
+        return self._deny_invocation(
+            invocation,
+            reason="terminal_destructive_action_confirmation_required",
+            error="Approval required before deleting files with terminal_exec",
+            output={
+                **context,
+                "reason": "terminal_destructive_action_confirmation_required",
+                "requires_approval": True,
+                "approval_id": approval.approval_id,
+            },
+        )
 
     def _ensure_tool_approval_request(self, invocation: ToolInvocation):
         existing = self._find_pending_tool_approval(invocation)
@@ -3383,11 +5793,14 @@ class ToolExecutor:
             )
         return rules
 
-    def _filesystem_boundary_allowed(self, target: str, *, principal_id: str | None = None) -> bool:
-        allowed_roots = (
+    def _filesystem_boundary_roots(self, principal_id: str | None = None) -> tuple[Path, ...]:
+        return tuple(dict.fromkeys((
             *self._registry.filesystem_allowed_roots(),
             *_principal_workspace_file_roots(principal_id),
-        )
+        )))
+
+    def _filesystem_boundary_allowed(self, target: str, *, principal_id: str | None = None) -> bool:
+        allowed_roots = self._filesystem_boundary_roots(principal_id)
         if not allowed_roots:
             return True
         try:
@@ -3402,6 +5815,99 @@ class ToolExecutor:
                 continue
         return False
 
+    def _scheduled_task_terminal_filesystem_boundary_denial(self, invocation: ToolInvocation, fact) -> ToolResult | None:
+        if invocation.tool_name != "terminal_exec":
+            return None
+        if not _flow_context_is_scheduled_task_run(invocation.flow_context):
+            return None
+        if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS:
+            return None
+        if fact.operation not in _TERMINAL_MUTATION_BOUNDARY_OPERATIONS:
+            return None
+        allowed_roots = self._filesystem_boundary_roots(invocation.principal_id)
+        scratch_root = _workspace_scratch_root_for_principal(invocation.principal_id)
+        output: dict[str, object] = {
+            "reason": "scheduled_task_workspace_path_required",
+            "boundary_kind": fact.kind.value,
+            "operation": fact.operation,
+            "target": fact.target,
+            "command_family": fact.attributes.get("command_family"),
+            "requires_approval": False,
+            "retryable": True,
+            "allowed_roots": [str(root) for root in allowed_roots],
+            "message": (
+                "Scheduled task terminal writes must stay inside trusted workspace storage. "
+                "Retry helper scripts under suggested_scratch_root or another allowed workspace root."
+            ),
+        }
+        if scratch_root is not None:
+            output["suggested_scratch_root"] = str(scratch_root)
+        return self._deny_invocation(
+            invocation,
+            reason="scheduled_task_workspace_path_required",
+            error="Scheduled task terminal filesystem mutation outside trusted workspace",
+            output=output,
+        )
+
+    def _scheduled_task_terminal_helper_artifact_denial(self, invocation: ToolInvocation, fact) -> ToolResult | None:
+        if invocation.tool_name != "terminal_exec":
+            return None
+        if not _flow_context_is_scheduled_task_run(invocation.flow_context):
+            return None
+        if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS:
+            return None
+        if fact.operation not in _TERMINAL_MUTATION_BOUNDARY_OPERATIONS:
+            return None
+        if not _scheduled_task_helper_script_path(fact.target):
+            return None
+        artifact_root = _workspace_artifact_root_for_principal(invocation.principal_id)
+        if not _path_within_root_text(fact.target, artifact_root):
+            return None
+        scratch_root = _workspace_scratch_root_for_principal(invocation.principal_id)
+        output: dict[str, object] = {
+            "reason": "scheduled_task_helper_script_scratch_path_required",
+            "boundary_kind": fact.kind.value,
+            "operation": fact.operation,
+            "target": fact.target,
+            "command_family": fact.attributes.get("command_family"),
+            "requires_approval": False,
+            "retryable": True,
+            "message": (
+                "Scheduled task helper scripts are internal scratch files. "
+                "Retry the script write under suggested_scratch_root instead of the delivery directory."
+            ),
+        }
+        if scratch_root is not None:
+            output["suggested_scratch_root"] = str(scratch_root)
+        if artifact_root is not None:
+            output["blocked_delivery_root"] = str(artifact_root)
+        return self._deny_invocation(
+            invocation,
+            reason="scheduled_task_helper_script_scratch_path_required",
+            error="Scheduled task helper script was written to the delivery directory",
+            output=output,
+        )
+
+    def _scheduled_task_terminal_filesystem_preapproval_result(self, invocation: ToolInvocation) -> ToolResult | None:
+        if invocation.tool_name != "terminal_exec":
+            return None
+        if not _flow_context_is_scheduled_task_run(invocation.flow_context):
+            return None
+        for fact in extract_boundary_facts(invocation):
+            if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS:
+                continue
+            if fact.operation not in _TERMINAL_MUTATION_BOUNDARY_OPERATIONS:
+                continue
+            helper_artifact_denial = self._scheduled_task_terminal_helper_artifact_denial(invocation, fact)
+            if helper_artifact_denial is not None:
+                return helper_artifact_denial
+            if self._filesystem_boundary_allowed(fact.target, principal_id=invocation.principal_id):
+                continue
+            denial = self._scheduled_task_terminal_filesystem_boundary_denial(invocation, fact)
+            if denial is not None:
+                return denial
+        return None
+
     def _media_filesystem_boundary_decision(self, fact) -> PolicyDecision | None:
         try:
             spec = self._registry.get_spec(fact.tool_name)
@@ -3412,26 +5918,52 @@ class ToolExecutor:
         return PolicyDecision.ALLOW if self._filesystem_boundary_allowed(fact.target) else PolicyDecision.DENY
 
     def _preflight_boundary_policy_result(self, invocation: ToolInvocation):
+        facts = extract_boundary_facts(invocation)
         if invocation.tool_name == "terminal_exec":
-            return None
-        for fact in extract_boundary_facts(invocation):
+            facts = [fact for fact in facts if fact.kind is BoundaryKind.FILESYSTEM_ACCESS]
+            if not facts:
+                return None
+        for fact in facts:
             if _connector_request_boundary_preapproved(invocation, fact):
                 continue
             if (
-                invocation.tool_name == "email_send"
-                and fact.kind is BoundaryKind.ACCOUNT_ACCESS
-                and self._matching_email_send_review_grants(invocation)
+                invocation.tool_name != "terminal_exec"
+                and fact.kind in {BoundaryKind.ACCOUNT_ACCESS, BoundaryKind.OUTBOUND_NETWORK}
+                and self._matching_exact_tool_review_grants(invocation)
             ):
-                # The exact draft review approval already represents the
-                # user-visible consent for this email send.
+                # The exact reviewed tool approval already represents
+                # consent for this invocation's own account/network boundary.
+                continue
+            if (
+                invocation.tool_name != "terminal_exec"
+                and fact.kind is BoundaryKind.FILESYSTEM_ACCESS
+                and fact.operation == "read"
+                and self._matching_exact_tool_review_grants(invocation)
+            ):
+                # Reviewed tool approvals may read the exact local files listed
+                # in the approved invocation, such as email attachments.
+                continue
+            if (
+                invocation.tool_name in _CALENDAR_ACCOUNT_WRITE_TOOLS
+                and fact.kind is BoundaryKind.ACCOUNT_ACCESS
+                and self._has_required_tool_grant(invocation)
+            ):
+                # The exact reviewed calendar mutation approval already
+                # represents the user-visible consent for this account write.
                 continue
             policy_principal = _boundary_policy_principal_for_fact(invocation.principal_id, fact)
             if fact.kind is BoundaryKind.OUTBOUND_NETWORK:
                 request = BoundaryPolicyRequest(principal_id=policy_principal, boundary=fact)
                 decision = evaluate_boundary_request(request, rules=self._boundary_rules_for_fact(invocation, fact=fact))
             elif fact.kind is BoundaryKind.FILESYSTEM_ACCESS:
+                helper_artifact_denial = self._scheduled_task_terminal_helper_artifact_denial(invocation, fact)
+                if helper_artifact_denial is not None:
+                    return helper_artifact_denial
                 if self._filesystem_boundary_allowed(fact.target, principal_id=invocation.principal_id):
                     continue
+                scheduled_terminal_denial = self._scheduled_task_terminal_filesystem_boundary_denial(invocation, fact)
+                if scheduled_terminal_denial is not None:
+                    return scheduled_terminal_denial
                 rules = self._boundary_rules_for_fact(invocation, fact=fact)
                 media_decision = self._media_filesystem_boundary_decision(fact)
                 if media_decision == PolicyDecision.ALLOW:
@@ -3475,12 +6007,13 @@ class ToolExecutor:
                 approval = self._ensure_boundary_policy_approval_request(invocation, context=context)
                 if approval is None:
                     continue
+                approval_context = approval.context if isinstance(approval.context, dict) else context
                 return self._deny_invocation(
                     invocation,
                     reason="approval_required",
                     error="Approval required for outbound network boundary policy",
                     output={
-                        **context,
+                        **approval_context,
                         "reason": "approval_required",
                         "requires_approval": True,
                         "approval_id": approval.approval_id,
@@ -3539,12 +6072,13 @@ class ToolExecutor:
         approval = self._ensure_boundary_policy_approval_request(invocation, context=context)
         if approval is None:
             return result
+        approval_context = approval.context if isinstance(approval.context, dict) else context
         return ToolResult(
             invocation_id=result.invocation_id,
             tool_name=result.tool_name,
             status="denied",
             output={
-                **context,
+                **approval_context,
                 "reason": "approval_required",
                 "requires_approval": True,
                 "approval_id": approval.approval_id,
@@ -3596,6 +6130,14 @@ class ToolExecutor:
                 output={"reason": "capability_not_granted", "allowed_tools": list(self._allowed_tool_names)},
             )
 
+        scheduled_terminal_denial = self._scheduled_task_terminal_filesystem_preapproval_result(invocation)
+        if scheduled_terminal_denial is not None:
+            return scheduled_terminal_denial
+
+        destructive_terminal_approval = self._terminal_destructive_preapproval_result(invocation)
+        if destructive_terminal_approval is not None:
+            return destructive_terminal_approval
+
         spec = self._registry.get_spec(invocation.tool_name)
 
         tool_decision = (
@@ -3608,11 +6150,13 @@ class ToolExecutor:
         )
         if tool_decision is PolicyDecision.REQUIRE_APPROVAL and not self._has_required_tool_grant(invocation):
             approval = self._ensure_tool_approval_request(invocation)
+            approval_context = approval.context if isinstance(approval.context, dict) else {}
             return self._deny_invocation(
                 invocation,
                 reason="approval_required",
                 error=f"Approval required for tool: {invocation.tool_name}",
                 output={
+                    **approval_context,
                     "reason": "approval_required",
                     "requires_approval": True,
                     "approval_id": approval.approval_id,
@@ -3653,6 +6197,8 @@ class ToolExecutor:
         result = _with_default_action_receipt(spec=spec, invocation=invocation, result=result)
         if invocation.tool_name == "email_send" and result.status != "denied":
             self._revoke_email_send_review_grants(invocation)
+        if invocation.tool_name == "terminal_exec" and result.status != "denied":
+            self._revoke_terminal_destructive_grants(invocation)
         self._record_egress_outcome(invocation, result, egress_attempts)
         result = self._rewrite_network_denied_result_as_boundary_approval_required(invocation, result)
         if invocation.tool_name != "terminal_exec" and result.status != "denied":
@@ -3821,7 +6367,13 @@ def _build_file_read_handler(
                 error="File access requires workspace_root or allowed_roots",
             )
 
-        path = Path(raw_path).expanduser().resolve()
+        resolved_file = _resolve_local_workspace_file_input(
+            raw_path,
+            principal_id=invocation.principal_id,
+            effective_roots=effective_roots,
+            trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
+        )
+        path = resolved_file or Path(_resolve_virtual_workspace_path(raw_path, principal_id=invocation.principal_id)).expanduser().resolve()
         if not _path_within_any_root(path, effective_roots) and not _is_approved_filesystem_path(
             path, invocation.trusted_filesystem_selectors
         ):
@@ -3833,6 +6385,134 @@ def _build_file_read_handler(
                 error=f"Path is outside workspace root: {path}",
             )
 
+        if path.is_dir():
+            try:
+                children = sorted(path.iterdir(), key=lambda child: child.name.lower())
+            except OSError as exc:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"path": str(path), "type": "directory"},
+                    error=f"Could not list directory: {exc}",
+                )
+            entry_limit = 100
+            entries = []
+            for child in children[:entry_limit]:
+                entry_type = "directory" if child.is_dir() else "file"
+                try:
+                    size = None if child.is_dir() else child.stat().st_size
+                except OSError:
+                    size = None
+                entries.append(
+                    {
+                        "name": child.name,
+                        "path": str(child),
+                        "type": entry_type,
+                        "bytes": size,
+                        "media_type": "" if child.is_dir() else (mimetypes.guess_type(child.name)[0] or ""),
+                    }
+                )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "path": str(path),
+                    "type": "directory",
+                    "is_directory": True,
+                    "entries": entries,
+                    "entry_count": len(children),
+                    "file_count": sum(1 for child in children if child.is_file()),
+                    "directory_count": sum(1 for child in children if child.is_dir()),
+                    "truncated": len(children) > entry_limit,
+                },
+                error=None,
+            )
+
+        archive_details = _archive_format_for_path(path)
+        if archive_details is not None:
+            try:
+                archive_output = _inspect_archive_file(path)
+            except FileNotFoundError:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={},
+                    error=f"File not found: {path}",
+                )
+            except (zipfile.BadZipFile, tarfile.TarError, EOFError, lzma.LZMAError, OSError) as exc:
+                archive_format = archive_details[0]
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(path),
+                        "type": "archive",
+                        "archive_format": archive_format,
+                    },
+                    error=f"Could not inspect archive: {exc}",
+                )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output=archive_output,
+                error=None,
+            )
+
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if path.suffix.lower() == ".pdf" or media_type == "application/pdf":
+            try:
+                data = path.read_bytes()
+                content, page_count, truncated = _extract_pdf_text(data)
+            except FileNotFoundError:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={},
+                    error=f"File not found: {path}",
+                )
+            except Exception as exc:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"path": str(path), "type": "pdf", "media_type": media_type},
+                    error=f"Could not extract PDF text: {exc}",
+                )
+            if not content:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(path),
+                        "type": "pdf",
+                        "media_type": media_type,
+                        "page_count": page_count,
+                    },
+                    error=f"PDF contains no extractable text: {path}",
+                )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "path": str(path),
+                    "type": "pdf",
+                    "media_type": media_type,
+                    "content": content,
+                    "page_count": page_count,
+                    "truncated": truncated,
+                    "extraction_method": "pypdf",
+                },
+                error=None,
+            )
+
         try:
             content = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -3842,6 +6522,18 @@ def _build_file_read_handler(
                 status="failed",
                 output={},
                 error=f"File not found: {path}",
+            )
+        except UnicodeDecodeError:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "path": str(path),
+                    "type": "file",
+                    "media_type": media_type,
+                },
+                error=f"File is not readable as UTF-8 text: {path}",
             )
 
         return ToolResult(
@@ -3900,6 +6592,17 @@ def _build_file_write_handler(
             )
 
         path = Path(raw_path).expanduser().resolve()
+        if _file_write_artifact_path_should_use_workspace_artifacts(
+            path,
+            principal_id=invocation.principal_id,
+            effective_roots=effective_roots,
+        ):
+            path = _workspace_generated_artifact_path(
+                invocation,
+                raw_path=raw_path,
+                suffix=path.suffix.lower(),
+                stem=path.stem or "file",
+            )
         if not _path_within_any_root(path, effective_roots) and not _is_approved_filesystem_path(
             path, invocation.trusted_filesystem_selectors
         ):
@@ -3939,7 +6642,11 @@ def _build_file_write_handler(
             )
         content = raw_content
         embedded_html_images: list[dict[str, object]] = []
-        if path.suffix.lower() in {".html", ".htm"}:
+        inline_local_html_images = invocation.arguments.get("inline_local_html_images")
+        if not isinstance(inline_local_html_images, bool):
+            inline_local_html_images = True
+        disallow_html_data_images = invocation.arguments.get("disallow_html_data_images") is True
+        if path.suffix.lower() in {".html", ".htm"} and inline_local_html_images:
             content, embedded_html_images = _inline_html_local_images(
                 raw_content,
                 principal_id=invocation.principal_id,
@@ -3947,6 +6654,31 @@ def _build_file_write_handler(
                 effective_roots=effective_roots,
                 trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
             )
+        if path.suffix.lower() in {".html", ".htm"} and disallow_html_data_images:
+            parser = _HtmlImageSrcParser()
+            try:
+                parser.feed(content)
+                parser.close()
+            except Exception:
+                parser.sources = []
+            data_image_sources = [
+                source for source in parser.sources if source.strip().lower().startswith("data:image/")
+            ]
+            if data_image_sources:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(path),
+                        "reason": "html_data_images_disallowed",
+                        "data_image_count": len(data_image_sources),
+                    },
+                    error=(
+                        "file_write linked HTML cannot contain data:image sources when "
+                        "disallow_html_data_images is true. Reference local sibling image files instead."
+                    ),
+                )
         html_image_errors = _html_embedded_image_errors(content) if path.suffix.lower() in {".html", ".htm"} else []
         if html_image_errors:
             return ToolResult(
@@ -3963,12 +6695,56 @@ def _build_file_write_handler(
                     "Use complete local image bytes or browser-collected image artifacts before writing the HTML."
                 ),
             )
+        if (
+            path.suffix.lower() in {".html", ".htm"}
+            and inline_local_html_images
+            and _flow_context_requires_embedded_media_for_extension(invocation.flow_context, path.suffix.lower())
+            and _html_embedded_raster_data_image_count(content) <= 0
+        ):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "path": str(path),
+                    "reason": "html_embedded_raster_image_required",
+                },
+                error=(
+                    "file_write HTML has an embedded-media delivery contract but contains no embedded raster "
+                    "image data. Use browser-collected or downloaded PNG/JPG/WebP/GIF assets and reference "
+                    "their local paths before writing the self-contained HTML."
+                ),
+            )
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        output: dict[str, object] = {"path": str(path), "bytes_written": len(content.encode("utf-8"))}
+        binary_image_decoded = False
+        image_suffix = path.suffix.lower()
+        if image_suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+            candidate = content.strip()
+            data_uri_match = re.fullmatch(r"data:image/[^;,]+;base64,(?P<data>[A-Za-z0-9+/=\s]+)", candidate)
+            if data_uri_match:
+                candidate = data_uri_match.group("data")
+            if re.fullmatch(r"[A-Za-z0-9+/=\s]+", candidate or ""):
+                try:
+                    image_bytes = base64.b64decode(re.sub(r"\s+", "", candidate), validate=True)
+                except Exception:
+                    image_bytes = b""
+                if image_bytes.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"RIFF")):
+                    path.write_bytes(image_bytes)
+                    binary_image_decoded = True
+        if not binary_image_decoded:
+            path.write_text(content, encoding="utf-8")
+        bytes_written = path.stat().st_size if path.exists() else len(content.encode("utf-8"))
+        output: dict[str, object] = {"path": str(path), "bytes_written": bytes_written}
+        if path.suffix.lower() in VALID_ATTACHMENT_EXTENSIONS:
+            output["artifact_path"] = str(path)
+            output["artifact_paths"] = [str(path)]
+        if binary_image_decoded:
+            output["binary_image_decoded"] = True
         if embedded_html_images:
             output["embedded_html_images"] = embedded_html_images
+        if path.suffix.lower() in {".html", ".htm"}:
+            output["html_image_mode"] = "self_contained" if inline_local_html_images else "linked"
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
@@ -4034,6 +6810,7 @@ def _html_local_image_source_path(source: str) -> str | None:
 
 
 def _image_data_uri_for_file(path: Path) -> str | None:
+    path = optimized_embedded_image_path(path)
     mime = mimetypes.guess_type(str(path))[0]
     if mime is None:
         suffix = path.suffix.lower()
@@ -4115,6 +6892,76 @@ def _html_embedded_image_errors(content: str) -> list[str]:
     return errors
 
 
+def _html_embedded_raster_data_image_count(content: str) -> int:
+    parser = _HtmlImageSrcParser()
+    try:
+        parser.feed(content or "")
+        parser.close()
+    except Exception:
+        return 0
+    count = 0
+    for source in parser.sources:
+        if not source.lower().startswith("data:image/") or "," not in source:
+            continue
+        header = source.split(",", 1)[0]
+        media_type = header[5:].split(";", 1)[0].lower()
+        if media_type in {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}:
+            count += 1
+    return count
+
+
+def _normalized_extension_values(value: object) -> set[str]:
+    raw_values = value if isinstance(value, (list, tuple, set)) else (value,)
+    normalized: set[str] = set()
+    for raw in raw_values:
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        if not text.startswith("."):
+            text = f".{text}"
+        normalized.add(".html" if text == ".htm" else text)
+    return normalized
+
+
+def _flow_context_requires_embedded_media_for_extension(flow_context: object, extension: str) -> bool:
+    if not isinstance(flow_context, dict):
+        return False
+    normalized_extension = ".html" if extension == ".htm" else extension
+    required_extensions: set[str] = set()
+    for key in ("required_embedded_media_extensions", "embedded_media_artifact_extensions"):
+        required_extensions.update(_normalized_extension_values(flow_context.get(key)))
+    return normalized_extension in required_extensions
+
+
+def _flow_context_requires_artifact_delivery_for_extension(flow_context: object, extension: str = "") -> bool:
+    if not isinstance(flow_context, dict):
+        return False
+    if flow_context.get("requires_artifact_delivery"):
+        return True
+    required_extensions: set[str] = set()
+    for key in ("artifact_extensions", "required_artifact_extensions", "requested_artifact_extensions"):
+        required_extensions.update(_normalized_extension_values(flow_context.get(key)))
+    if not required_extensions:
+        return False
+    normalized_extension = ".html" if extension == ".htm" else str(extension or "").strip().lower()
+    return not normalized_extension or normalized_extension in required_extensions
+
+
+def _existing_xlsx_embedded_media_count(path: Path) -> int:
+    if path.suffix.lower() != ".xlsx":
+        return 0
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return 0
+    except OSError:
+        return 0
+    try:
+        with zipfile.ZipFile(path) as package:
+            return sum(1 for member in package.namelist() if member.startswith("xl/media/"))
+    except Exception:
+        return 0
+
+
 def _document_output_path(
     invocation: ToolInvocation,
     *,
@@ -4123,7 +6970,15 @@ def _document_output_path(
     roots: tuple[Path, ...],
 ) -> Path:
     if isinstance(raw_path, str) and raw_path.strip():
-        return Path(raw_path).expanduser().resolve()
+        raw_suffix = Path(str(raw_path)).suffix.lower()
+        suffix = raw_suffix if raw_suffix in {".docx", ".html", ".htm", ".pdf"} else ".docx"
+        return _explicit_output_path_or_generated_artifact_path(
+            invocation,
+            raw_path=raw_path,
+            suffix=suffix,
+            stem=_safe_pdf_stem(str(title or "document")),
+            roots=roots,
+        )
     try:
         from nullion.artifacts import artifact_path_for_generated_workspace_file
 
@@ -4289,8 +7144,293 @@ def _resolve_document_image_paths(
         if _screenshot_image_rejected(image_path, allow_browser_screenshots=allow_browser_screenshots):
             skipped.append(raw_path)
             continue
-        resolved.append(_embeddable_image_path(image_path))
+        embeddable_path = _embeddable_image_path(image_path)
+        if not allow_browser_screenshots and _local_raster_image_too_small(embeddable_path):
+            skipped.append(raw_path)
+            continue
+        resolved.append(embeddable_path)
     return resolved, skipped, None
+
+
+def _document_html_image_src(image_path: Path, *, output_path: Path, inline_local_html_images: bool) -> str:
+    if inline_local_html_images:
+        return str(image_path)
+    try:
+        return os.path.relpath(image_path, output_path.parent)
+    except ValueError:
+        return str(image_path)
+
+
+def _write_document_html_artifact(
+    *,
+    invocation: ToolInvocation,
+    output_path: Path,
+    title: str,
+    paragraphs: list[str],
+    sections: list[dict[str, object]],
+    tables: list[dict[str, object]],
+    image_paths: list[str],
+    screenshot_paths: list[str],
+    effective_roots: tuple[Path, ...],
+) -> ToolResult:
+    inline_local_html_images = invocation.arguments.get("inline_local_html_images")
+    if not isinstance(inline_local_html_images, bool):
+        inline_local_html_images = True
+    disallow_html_data_images = invocation.arguments.get("disallow_html_data_images") is True
+    embedded_images: list[str] = []
+    embedded_screenshots: list[str] = []
+    skipped_images: list[str] = []
+
+    def resolve_sources(raw_paths: list[str], *, allow_browser_screenshots: bool, embedded_target: list[str]) -> list[str]:
+        resolved, skipped, error = _resolve_document_image_paths(
+            raw_paths,
+            roots=effective_roots,
+            invocation=invocation,
+            allow_browser_screenshots=allow_browser_screenshots,
+        )
+        skipped_images.extend(skipped)
+        if error is not None:
+            raise ValueError(error)
+        sources: list[str] = []
+        for image_path in resolved:
+            embedded_target.append(str(image_path))
+            embed_path = optimized_embedded_image_path(image_path)
+            sources.append(_document_html_image_src(embed_path, output_path=output_path, inline_local_html_images=inline_local_html_images))
+        return sources
+
+    try:
+        top_image_sources = resolve_sources(image_paths, allow_browser_screenshots=False, embedded_target=embedded_images)
+        top_screenshot_sources = resolve_sources(
+            screenshot_paths,
+            allow_browser_screenshots=True,
+            embedded_target=embedded_screenshots,
+        )
+        section_sources: list[tuple[list[str], list[str]]] = []
+        for section in sections:
+            section_sources.append(
+                (
+                    resolve_sources(
+                        [str(path) for path in section.get("image_paths") or ()],
+                        allow_browser_screenshots=False,
+                        embedded_target=embedded_images,
+                    ),
+                    resolve_sources(
+                        [str(path) for path in section.get("screenshot_paths") or ()],
+                        allow_browser_screenshots=True,
+                        embedded_target=embedded_screenshots,
+                    ),
+                )
+            )
+    except ValueError as exc:
+        return ToolResult(
+            invocation.invocation_id,
+            invocation.tool_name,
+            "failed",
+            {
+                "path": str(output_path),
+                "reason": "artifact_media_inputs_failed",
+                "paragraphs": len(paragraphs),
+                "sections": len(sections),
+                "tables": len(tables),
+                "embedded_images": embedded_images,
+                "embedded_screenshots": embedded_screenshots,
+                "skipped_images": skipped_images,
+            },
+            str(exc),
+        )
+    if skipped_images:
+        return ToolResult(
+            invocation.invocation_id,
+            invocation.tool_name,
+            "failed",
+            {
+                "path": str(output_path),
+                "reason": "artifact_media_embed_failed",
+                "paragraphs": len(paragraphs),
+                "sections": len(sections),
+                "tables": len(tables),
+                "embedded_images": embedded_images,
+                "embedded_screenshots": embedded_screenshots,
+                "skipped_images": skipped_images,
+            },
+            (
+                "document_create could not embed all requested image/screenshot paths; "
+                f"skipped {len(skipped_images)} path(s). Use existing raster image files such as .png, .jpg, or .jpeg."
+            ),
+        )
+
+    def paragraph_html(text: str) -> str:
+        return f"<p>{html.escape(text)}</p>" if text else ""
+
+    chunks = [
+        "<!doctype html>",
+        "<html>",
+        "<head>",
+        '<meta charset="utf-8">',
+        f"<title>{html.escape(title)}</title>",
+        "<style>body{font-family:Arial,sans-serif;margin:2rem;line-height:1.45;color:#111827}img{max-width:100%;height:auto;border-radius:6px;margin:0.5rem 0 1rem}table{border-collapse:collapse;width:100%;margin:1rem 0}td,th{border:1px solid #d1d5db;padding:0.45rem;text-align:left}th{background:#f3f4f6}.section{margin-top:1.25rem}</style>",
+        "</head>",
+        "<body>",
+        f"<h1>{html.escape(title)}</h1>",
+    ]
+    chunks.extend(paragraph_html(paragraph) for paragraph in paragraphs)
+    for source in [*top_image_sources, *top_screenshot_sources]:
+        chunks.append(f'<img src="{html.escape(source, quote=True)}" alt="">')
+    for table_spec in tables:
+        headers = [str(header) for header in table_spec["headers"]]
+        chunks.append("<table><thead><tr>")
+        chunks.extend(f"<th>{html.escape(header)}</th>" for header in headers)
+        chunks.append("</tr></thead><tbody>")
+        for row_values in table_spec["rows"]:
+            chunks.append("<tr>")
+            chunks.extend(f"<td>{html.escape(str(value))}</td>" for value in row_values)
+            chunks.append("</tr>")
+        chunks.append("</tbody></table>")
+    for section, (image_sources, screenshot_sources) in zip(sections, section_sources, strict=False):
+        heading = str(section.get("heading") or "").strip()
+        body = str(section.get("body") or "").strip()
+        chunks.append('<section class="section">')
+        if heading:
+            chunks.append(f"<h2>{html.escape(heading)}</h2>")
+        if body:
+            chunks.append(paragraph_html(body))
+        bullets = [str(bullet) for bullet in section.get("bullets") or ()]
+        if bullets:
+            chunks.append("<ul>")
+            chunks.extend(f"<li>{html.escape(bullet)}</li>" for bullet in bullets)
+            chunks.append("</ul>")
+        for source in [*image_sources, *screenshot_sources]:
+            chunks.append(f'<img src="{html.escape(source, quote=True)}" alt="">')
+        chunks.append("</section>")
+    chunks.extend(["</body>", "</html>"])
+    content = "\n".join(chunks)
+    if inline_local_html_images:
+        content, html_embeds = _inline_html_local_images(
+            content,
+            principal_id=invocation.principal_id,
+            output_path=output_path,
+            effective_roots=effective_roots,
+            trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
+        )
+    else:
+        html_embeds = []
+    if disallow_html_data_images:
+        parser = _HtmlImageSrcParser()
+        try:
+            parser.feed(content)
+            parser.close()
+        except Exception:
+            parser.sources = []
+        if any(source.strip().lower().startswith("data:image/") for source in parser.sources):
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {"path": str(output_path), "reason": "html_data_images_disallowed"},
+                "document_create linked HTML cannot contain data:image sources when disallow_html_data_images is true.",
+            )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content, encoding="utf-8")
+    output = {
+        "path": str(output_path),
+        "artifact_path": str(output_path),
+        "artifact_paths": [str(output_path)],
+        "paragraphs": len(paragraphs),
+        "sections": len(sections),
+        "tables": len(tables),
+        "embedded_images": embedded_images,
+        "embedded_screenshots": embedded_screenshots,
+        "skipped_images": skipped_images,
+        "quality_profile": "html_document_v1",
+        "html_image_mode": "self_contained" if inline_local_html_images else "linked",
+    }
+    if html_embeds:
+        output["embedded_html_images"] = html_embeds
+    return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", output, None)
+
+
+def _document_pdf_html_page(
+    *,
+    title: str,
+    paragraphs: list[str],
+    sections: list[dict[str, object]],
+    tables: list[dict[str, object]],
+) -> str:
+    chunks = [
+        f"<h1>{html.escape(title)}</h1>",
+        *[f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs if paragraph],
+    ]
+    for table_spec in tables:
+        headers = [str(header) for header in table_spec["headers"]]
+        chunks.append("<table><thead><tr>")
+        chunks.extend(f"<th>{html.escape(header)}</th>" for header in headers)
+        chunks.append("</tr></thead><tbody>")
+        for row_values in table_spec["rows"]:
+            chunks.append("<tr>")
+            chunks.extend(f"<td>{html.escape(str(value))}</td>" for value in row_values)
+            chunks.append("</tr>")
+        chunks.append("</tbody></table>")
+    for section in sections:
+        heading = str(section.get("heading") or "").strip()
+        body = str(section.get("body") or "").strip()
+        bullets = [str(bullet) for bullet in section.get("bullets") or ()]
+        chunks.append("<section>")
+        if heading:
+            chunks.append(f"<h2>{html.escape(heading)}</h2>")
+        if body:
+            chunks.append(f"<p>{html.escape(body)}</p>")
+        if bullets:
+            chunks.append("<ul>")
+            chunks.extend(f"<li>{html.escape(bullet)}</li>" for bullet in bullets)
+            chunks.append("</ul>")
+        chunks.append("</section>")
+    return "\n".join(chunks)
+
+
+def _document_create_pdf_arguments(
+    *,
+    invocation: ToolInvocation,
+    output_path: Path,
+    title: str,
+    paragraphs: list[str],
+    sections: list[dict[str, object]],
+    tables: list[dict[str, object]],
+    image_paths: list[str],
+    screenshot_paths: list[str],
+) -> dict[str, object]:
+    section_image_paths = [
+        str(path)
+        for section in sections
+        for path in (section.get("image_paths") or ())
+        if str(path or "").strip()
+    ]
+    section_screenshot_paths = [
+        str(path)
+        for section in sections
+        for path in (section.get("screenshot_paths") or ())
+        if str(path or "").strip()
+    ]
+    arguments: dict[str, object] = {
+        "output_path": str(output_path),
+        "title": title,
+        "html_pages": [
+            _document_pdf_html_page(
+                title=title,
+                paragraphs=paragraphs,
+                sections=sections,
+                tables=tables,
+            )
+        ],
+    }
+    if image_paths or section_image_paths:
+        arguments["image_paths"] = [*image_paths, *section_image_paths]
+    if screenshot_paths or section_screenshot_paths:
+        arguments["screenshot_paths"] = [*screenshot_paths, *section_screenshot_paths]
+    for key in ("page_size",):
+        value = invocation.arguments.get(key)
+        if value is not None:
+            arguments[key] = value
+    return arguments
 
 
 def _build_document_create_handler(
@@ -4311,27 +7451,6 @@ def _build_document_create_handler(
         )
         if not effective_roots:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "document_create requires workspace_root or allowed_roots")
-
-        try:
-            from docx import Document
-            from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-            from docx.shared import Inches, Pt, RGBColor
-        except ModuleNotFoundError as exc:
-            return ToolResult(
-                invocation.invocation_id,
-                invocation.tool_name,
-                "failed",
-                {
-                    "reason": "missing_dependency",
-                    "dependency_id": "python-docx",
-                    "dependency": "python-docx",
-                    "package": "python-docx",
-                    "requirement": "python-docx>=1.1,<2",
-                    "license": "MIT",
-                    "install_command": "python -m pip install 'python-docx>=1.1,<2'",
-                },
-                f"document_create requires python-docx: {exc}",
-            )
 
         title = str(invocation.arguments.get("title") or "Document").strip() or "Document"
         paragraphs, paragraph_error = _coerce_string_list(invocation.arguments.get("paragraphs"), field="paragraphs")
@@ -4358,13 +7477,82 @@ def _build_document_create_handler(
             title=title,
             roots=effective_roots,
         )
-        if output_path.suffix.lower() != ".docx":
-            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"path": str(output_path)}, "document_create output_path must end in .docx")
+        if output_path.suffix.lower() == ".pdf":
+            pdf_handler = _build_pdf_create_handler(
+                workspace_root=resolved_root,
+                allowed_roots=resolved_allowed_roots,
+                include_principal_workspace=include_principal_workspace,
+            )
+            pdf_result = pdf_handler(
+                ToolInvocation(
+                    invocation_id=invocation.invocation_id,
+                    tool_name="pdf_create",
+                    principal_id=invocation.principal_id,
+                    arguments=_document_create_pdf_arguments(
+                        invocation=invocation,
+                        output_path=output_path,
+                        title=title,
+                        paragraphs=paragraphs,
+                        sections=sections,
+                        tables=tables,
+                        image_paths=image_paths,
+                        screenshot_paths=screenshot_paths,
+                    ),
+                    capsule_id=invocation.capsule_id,
+                    trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
+                    flow_context=invocation.flow_context,
+                )
+            )
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                pdf_result.status,
+                {
+                    **(pdf_result.output if isinstance(pdf_result.output, dict) else {}),
+                    "delegated_tool_name": "pdf_create",
+                },
+                pdf_result.error,
+            )
+        if output_path.suffix.lower() not in {".docx", ".html", ".htm"}:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"path": str(output_path)}, "document_create output_path must end in .docx, .html, .htm, or .pdf")
         if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
             output_path,
             invocation.trusted_filesystem_selectors,
         ):
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Path is outside workspace root: {output_path}")
+        if output_path.suffix.lower() in {".html", ".htm"}:
+            return _write_document_html_artifact(
+                invocation=invocation,
+                output_path=output_path,
+                title=title,
+                paragraphs=paragraphs,
+                sections=sections,
+                tables=tables,
+                image_paths=image_paths,
+                screenshot_paths=screenshot_paths,
+                effective_roots=effective_roots,
+            )
+
+        try:
+            from docx import Document
+            from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+            from docx.shared import Inches, Pt, RGBColor
+        except ModuleNotFoundError as exc:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "reason": "missing_dependency",
+                    "dependency_id": "python-docx",
+                    "dependency": "python-docx",
+                    "package": "python-docx",
+                    "requirement": "python-docx>=1.1,<2",
+                    "license": "MIT",
+                    "install_command": "python -m pip install 'python-docx>=1.1,<2'",
+                },
+                f"document_create requires python-docx: {exc}",
+            )
 
         document = Document()
         section = document.sections[0]
@@ -4412,6 +7600,7 @@ def _build_document_create_handler(
 
         embedded_images: list[str] = []
         embedded_screenshots: list[str] = []
+        optimized_image_paths: list[str] = []
         skipped_images: list[str] = []
 
         def add_images(
@@ -4431,8 +7620,11 @@ def _build_document_create_handler(
                 raise ValueError(error)
             for image_path in resolved:
                 try:
-                    document.add_picture(str(image_path), width=Inches(5.8))
+                    embed_path = optimized_embedded_image_path(image_path)
+                    document.add_picture(str(embed_path), width=Inches(5.8))
                     embedded_target.append(str(image_path))
+                    if embed_path != image_path:
+                        optimized_image_paths.append(str(embed_path))
                 except Exception:
                     skipped_images.append(str(image_path))
 
@@ -4515,13 +7707,18 @@ def _build_document_create_handler(
                 "tables": len(tables),
                 "embedded_images": embedded_images,
                 "embedded_screenshots": embedded_screenshots,
+                "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                 "skipped_images": skipped_images,
                 "quality_profile": "report_quality_v1",
                 "layout_features": [
                     "styled_headings",
                     "readable_margins",
                     "hyperlinked_urls",
-                    "verified_media_embeds",
+                    *(
+                        ["verified_media_embeds"]
+                        if embedded_images or embedded_screenshots
+                        else []
+                    ),
                 ],
             },
             None,
@@ -4619,8 +7816,6 @@ def _spreadsheet_canonical_row_hyperlink(value: str) -> str:
 def _spreadsheet_is_aggregate_row_url(url: str) -> bool:
     parsed = urlparse(url)
     path = (parsed.path or "").strip("/")
-    if not path:
-        return True
     path_parts = {part.lower() for part in path.split("/") if part}
     if path_parts.intersection({"search", "s"}):
         return True
@@ -4683,37 +7878,9 @@ def _spreadsheet_is_reserved_media_key(key: object) -> bool:
     return _spreadsheet_is_image_key(key) or _spreadsheet_is_screenshot_key(key)
 
 
-def _spreadsheet_is_link_column(column: object) -> bool:
-    normalized = str(column or "").strip().lower().replace("_", " ")
-    return any(token in normalized.split() or token in normalized for token in _SPREADSHEET_LINK_KEYS)
-
-
-def _spreadsheet_is_price_column(column: object) -> bool:
-    normalized = str(column or "").strip().lower().replace("_", " ")
-    return "price" in normalized.split() or "price" in normalized
-
-
 def _spreadsheet_required_text_missing(value: object) -> bool:
     text = str(value if value is not None else "").strip()
     return text.lower() in _SPREADSHEET_EMPTY_REQUIRED_TEXT
-
-
-def _spreadsheet_required_price_missing(value: object) -> bool:
-    if _spreadsheet_required_text_missing(value):
-        return True
-    text = str(value if value is not None else "").strip()
-    if not re.search(r"\d", text):
-        return True
-    numbers = re.findall(r"(?<!\d)\d+(?:,\d{3})*(?:\.\d+)?", text)
-    if not numbers:
-        return True
-    numeric_values: list[float] = []
-    for number in numbers:
-        try:
-            numeric_values.append(float(number.replace(",", "")))
-        except ValueError:
-            continue
-    return bool(numeric_values) and all(numeric_value == 0 for numeric_value in numeric_values)
 
 
 def _spreadsheet_columns(raw_columns: object, rows: list[object]) -> list[str]:
@@ -4750,6 +7917,34 @@ def _spreadsheet_row_values(row: object, columns: list[str]) -> list[tuple[objec
             values.extend([(None, None)] * (len(columns) - len(values)))
         return values[: len(columns)]
     return [_spreadsheet_cell_value_and_hyperlink(row), *((None, None),) * max(0, len(columns) - 1)]
+
+
+def _write_delimited_spreadsheet_rows(
+    *,
+    output_path: Path,
+    columns: list[str],
+    rows: list[object],
+    delimiter: str,
+) -> dict[str, object]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    row_values_by_row = [_spreadsheet_row_values(row, columns) for row in rows]
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter=delimiter)
+        writer.writerow(columns)
+        for row_values in row_values_by_row:
+            writer.writerow([hyperlink or (value if value is not None else "") for value, hyperlink in row_values])
+    return {
+        "path": str(output_path),
+        "artifact_path": str(output_path),
+        "artifact_paths": [str(output_path)],
+        "artifact_descriptors": [
+            artifact_output_descriptor(output_path, role=ARTIFACT_ROLE_DELIVERABLE, kind="spreadsheet")
+        ],
+        "rows": len(rows),
+        "columns": len(columns),
+        "bytes_written": output_path.stat().st_size,
+        "format": "tsv" if delimiter == "\t" else "csv",
+    }
 
 
 def _spreadsheet_image_candidates_from_value(value: object) -> list[object]:
@@ -4815,6 +8010,21 @@ def _spreadsheet_row_screenshot_path(row: object, fallback: object) -> tuple[str
     return _spreadsheet_row_media_path(row, fallback, is_media_key=_spreadsheet_is_screenshot_key)
 
 
+def _spreadsheet_rows_have_formula(rows: list[object], columns: list[str] | None = None) -> bool:
+    def value_has_formula(value: object) -> bool:
+        if isinstance(value, str):
+            return value.strip().startswith("=")
+        if isinstance(value, dict):
+            return any(value_has_formula(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(value_has_formula(item) for item in value)
+        return False
+
+    if columns is not None:
+        return any(value_has_formula(value) for row in rows for value, _hyperlink in _spreadsheet_row_values(row, columns))
+    return any(value_has_formula(row) for row in rows)
+
+
 def _spreadsheet_chart_specs(raw_charts: object, columns: list[str]) -> tuple[list[dict[str, str]], str | None]:
     if raw_charts is None:
         return [], None
@@ -4849,6 +8059,30 @@ def _spreadsheet_chart_specs(raw_charts: object, columns: list[str]) -> tuple[li
     return chart_specs, None
 
 
+def _spreadsheet_conditional_format_specs(
+    raw_formats: object,
+    columns: list[str],
+) -> tuple[list[dict[str, str]], str | None]:
+    if raw_formats is None:
+        return [], None
+    if not isinstance(raw_formats, list):
+        return [], "conditional_formats must be a list"
+    column_set = set(columns)
+    format_specs: list[dict[str, str]] = []
+    for index, raw_format in enumerate(raw_formats, start=1):
+        if not isinstance(raw_format, dict):
+            return [], "conditional_formats entries must be objects"
+        format_type = str(raw_format.get("type") or "").strip().lower()
+        if format_type not in {"data_bar", "color_scale"}:
+            return [], f"conditional_formats[{index}].type must be one of data_bar or color_scale"
+        column = str(raw_format.get("column") or "").strip()
+        if column not in column_set:
+            return [], f"conditional_formats[{index}].column must match a spreadsheet column"
+        color = re.sub(r"[^0-9A-Fa-f]", "", str(raw_format.get("color") or "").strip())[:6]
+        format_specs.append({"type": format_type, "column": column, "color": color})
+    return format_specs, None
+
+
 def _spreadsheet_row_has_media_contract(
     row: object,
     fallback: object,
@@ -4862,6 +8096,58 @@ def _spreadsheet_row_has_media_contract(
     return any(is_media_key(key) for key in row)
 
 
+def _svg_text_preview(svg_path: Path) -> str:
+    try:
+        root = ElementTree.fromstring(svg_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return svg_path.stem.replace("_", " ").replace("-", " ").strip()
+    texts: list[str] = []
+    for element in root.iter():
+        if not str(element.tag).lower().endswith("text"):
+            continue
+        value = "".join(element.itertext()).strip()
+        if value:
+            texts.append(re.sub(r"\s+", " ", value))
+        if len(texts) >= 3:
+            break
+    return " / ".join(texts).strip() or svg_path.stem.replace("_", " ").replace("-", " ").strip()
+
+
+def _write_svg_fallback_raster(svg_path: Path) -> Path | None:
+    raster_path = svg_path.with_suffix(".png")
+    if raster_path.is_file():
+        return raster_path
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+    try:
+        preview = _svg_text_preview(svg_path)
+        image = Image.new("RGB", (640, 360), "#f8fafc")
+        draw = ImageDraw.Draw(image)
+        try:
+            title_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 30)
+            body_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 18)
+        except Exception:
+            title_font = ImageFont.load_default()
+            body_font = ImageFont.load_default()
+        draw.rounded_rectangle((24, 24, 616, 336), radius=28, fill="#ffffff", outline="#cbd5e1", width=3)
+        draw.rounded_rectangle((48, 52, 184, 188), radius=24, fill="#dbeafe", outline="#60a5fa", width=3)
+        draw.ellipse((84, 86, 148, 150), fill="#2563eb")
+        wrapped = textwrap.wrap(preview or "Generated visual", width=34)[:4]
+        draw.text((220, 72), "Generated visual", fill="#0f172a", font=title_font)
+        y = 126
+        for line in wrapped:
+            draw.text((220, y), line, fill="#334155", font=body_font)
+            y += 28
+        draw.line((220, 250, 560, 250), fill="#a78bfa", width=8)
+        draw.line((220, 280, 500, 280), fill="#34d399", width=8)
+        image.save(raster_path, format="PNG")
+        return raster_path
+    except Exception:
+        return None
+
+
 def _embeddable_image_path(image_path: Path) -> Path:
     if image_path.suffix.lower() != ".svg":
         return image_path
@@ -4869,7 +8155,304 @@ def _embeddable_image_path(image_path: Path) -> Path:
         companion = image_path.with_suffix(suffix)
         if companion.is_file():
             return companion
+    fallback = _write_svg_fallback_raster(image_path)
+    if fallback is not None:
+        return fallback
     return image_path
+
+
+def optimized_embedded_image_path(
+    image_path: Path,
+    *,
+    max_dimension: int = 2048,
+    jpeg_quality: int = 95,
+) -> Path:
+    """Return a visually faithful derivative for embedding into generated artifacts."""
+    source_path = _embeddable_image_path(image_path)
+    if source_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+        return source_path
+    try:
+        source_size = source_path.stat().st_size
+    except OSError:
+        return source_path
+    try:
+        from PIL import Image, ImageOps
+    except Exception:
+        return source_path
+    try:
+        with Image.open(source_path) as opened:
+            image = ImageOps.exif_transpose(opened)
+            width, height = image.size
+            has_alpha = image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in getattr(image, "info", {})
+            )
+            if width <= 0 or height <= 0:
+                return source_path
+            target_width, target_height = width, height
+            largest = max(width, height)
+            if largest > max_dimension:
+                scale = max_dimension / float(largest)
+                target_width = max(1, int(width * scale))
+                target_height = max(1, int(height * scale))
+                image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            digest = hashlib.sha256(
+                f"{source_path.resolve()}:{source_size}:{source_path.stat().st_mtime_ns}:{max_dimension}:{jpeg_quality}:baseline".encode(
+                    "utf-8"
+                )
+            ).hexdigest()[:16]
+            cache_dir = source_path.parent / ".nullion-optimized-media"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            output_suffix = ".png" if has_alpha else ".jpg"
+            output_path = cache_dir / f"{source_path.stem}-{digest}-embed{output_suffix}"
+            if output_path.is_file():
+                return output_path
+            if has_alpha:
+                image.save(output_path, format="PNG", optimize=True)
+            else:
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                image.save(
+                    output_path,
+                    format="JPEG",
+                    quality=jpeg_quality,
+                    subsampling=0,
+                    optimize=True,
+                    progressive=False,
+                )
+            if output_path.is_file() and (
+                output_path.stat().st_size < source_size
+                or (source_size <= 750_000 and source_path.suffix.lower() in {".jpg", ".jpeg"})
+            ):
+                return output_path
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return source_path
+    except Exception:
+        return source_path
+
+
+def _local_raster_image_too_small(image_path: Path, *, min_bytes: int = 128) -> bool:
+    if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        return False
+    try:
+        return image_path.stat().st_size < min_bytes
+    except OSError:
+        return True
+
+
+def _write_spreadsheet_contract_marker_image(
+    output_path: Path,
+    *,
+    title: object,
+    rows: list[object],
+    columns: list[str],
+) -> Path | None:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+    try:
+        media_dir = output_path.parent / ".nullion-generated-media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "title": str(title or ""),
+                    "rows": len(rows),
+                    "columns": columns,
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        marker_path = media_dir / f"{output_path.stem}-embedded-marker-{digest}.png"
+        if marker_path.is_file():
+            return marker_path
+        image = Image.new("RGB", (720, 420), "#f8fafc")
+        draw = ImageDraw.Draw(image)
+        try:
+            title_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 34)
+            body_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 22)
+            small_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 17)
+        except Exception:
+            title_font = ImageFont.load_default()
+            body_font = ImageFont.load_default()
+            small_font = ImageFont.load_default()
+        draw.rounded_rectangle((28, 28, 692, 392), radius=30, fill="#ffffff", outline="#cbd5e1", width=3)
+        draw.rounded_rectangle((58, 68, 238, 248), radius=26, fill="#e0f2fe", outline="#38bdf8", width=3)
+        colors = ("#2563eb", "#14b8a6", "#f59e0b", "#ef4444")
+        bar_widths = (132, 94, 156, 112)
+        for index, (color, width) in enumerate(zip(colors, bar_widths)):
+            y = 96 + index * 32
+            draw.rounded_rectangle((82, y, 82 + width, y + 18), radius=9, fill=color)
+        title_text = str(title or output_path.stem or "Spreadsheet visual").strip()
+        title_lines = textwrap.wrap(title_text, width=30)[:2] or ["Spreadsheet visual"]
+        y = 76
+        for line in title_lines:
+            draw.text((274, y), line, fill="#0f172a", font=title_font)
+            y += 42
+        draw.text((276, 184), f"{len(rows)} data row(s)", fill="#334155", font=body_font)
+        draw.text((276, 220), f"{len(columns)} data column(s)", fill="#334155", font=body_font)
+        draw.text((58, 304), "Embedded workbook media marker", fill="#0f172a", font=body_font)
+        column_preview = ", ".join(columns[:5])
+        if len(columns) > 5:
+            column_preview = f"{column_preview}, ..."
+        for offset, line in enumerate(textwrap.wrap(column_preview or "Workbook data", width=62)[:2]):
+            draw.text((58, 340 + offset * 24), line, fill="#64748b", font=small_font)
+        image.save(marker_path, format="PNG")
+        return marker_path
+    except Exception:
+        return None
+
+
+def _spreadsheet_numeric_cell_value(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    percent = text.endswith("%")
+    text = text.strip("%").replace(",", "")
+    text = re.sub(r"^[^\d.+-]+", "", text)
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number / 100.0 if percent else number
+
+
+def _spreadsheet_formula_cached_values(ws) -> dict[str, float]:
+    try:
+        from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+    except ModuleNotFoundError:
+        return {}
+
+    def cell_number(reference: str) -> float | None:
+        try:
+            row_index, column_index = coordinate_to_tuple(reference.replace("$", ""))
+            return _spreadsheet_numeric_cell_value(ws.cell(row=row_index, column=column_index).value)
+        except Exception:
+            return None
+
+    def range_numbers(reference: str) -> list[float]:
+        try:
+            min_col, min_row, max_col, max_row = range_boundaries(reference.replace("$", ""))
+        except Exception:
+            number = cell_number(reference)
+            return [] if number is None else [number]
+        values: list[float] = []
+        for row_index in range(min_row, max_row + 1):
+            for column_index in range(min_col, max_col + 1):
+                number = _spreadsheet_numeric_cell_value(ws.cell(row=row_index, column=column_index).value)
+                if number is not None:
+                    values.append(number)
+        return values
+
+    def evaluate(formula: str) -> float | None:
+        expression = formula.strip()
+        if expression.startswith("="):
+            expression = expression[1:].strip()
+
+        def replace_function(match: re.Match[str]) -> str:
+            function_name = match.group(1).upper()
+            args = [
+                number
+                for raw_arg in match.group(2).split(",")
+                for number in range_numbers(raw_arg.strip())
+            ]
+            if not args:
+                return "0"
+            if function_name == "SUM":
+                return str(sum(args))
+            if function_name == "AVERAGE":
+                return str(sum(args) / len(args))
+            if function_name == "MIN":
+                return str(min(args))
+            if function_name == "MAX":
+                return str(max(args))
+            if function_name == "COUNT":
+                return str(len(args))
+            return "0"
+
+        expression = re.sub(
+            r"\b(SUM|AVERAGE|MIN|MAX|COUNT)\s*\(([^()]*)\)",
+            replace_function,
+            expression,
+            flags=re.IGNORECASE,
+        )
+        if ":" in expression:
+            return None
+
+        def replace_cell(match: re.Match[str]) -> str:
+            number = cell_number(match.group(0))
+            return "0" if number is None else str(number)
+
+        expression = re.sub(r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}", replace_cell, expression)
+        if not re.fullmatch(r"[0-9eE+\-*/().\s]+", expression):
+            return None
+        try:
+            value = eval(expression, {"__builtins__": {}}, {})
+        except Exception:
+            return None
+        return float(value) if isinstance(value, (int, float)) else None
+
+    cached_values: dict[str, float] = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            value = cell.value
+            if isinstance(value, str) and value.startswith("="):
+                cached_value = evaluate(value)
+                if cached_value is not None:
+                    cached_values[cell.coordinate] = cached_value
+    return cached_values
+
+
+def _inject_spreadsheet_cached_formula_values(output_path: Path, cached_values: dict[str, float]) -> None:
+    if not cached_values:
+        return
+    try:
+        from openpyxl import load_workbook
+    except ModuleNotFoundError:
+        return
+    try:
+        workbook = load_workbook(output_path, read_only=True, data_only=False)
+        sheet_names = list(workbook.sheetnames)
+        workbook.close()
+    except Exception:
+        return
+    if not sheet_names:
+        return
+    sheet_index = 1
+    worksheet_member = f"xl/worksheets/sheet{sheet_index}.xml"
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        with zipfile.ZipFile(output_path, "r") as source, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as target:
+            for member in source.infolist():
+                data = source.read(member.filename)
+                if member.filename == worksheet_member:
+                    root = ElementTree.fromstring(data)
+                    for cell_element in root.iter(f"{namespace}c"):
+                        reference = cell_element.attrib.get("r")
+                        if reference not in cached_values:
+                            continue
+                        value_element = cell_element.find(f"{namespace}v")
+                        if value_element is None:
+                            value_element = ElementTree.SubElement(cell_element, f"{namespace}v")
+                        cached_value = cached_values[reference]
+                        value_element.text = str(int(cached_value)) if cached_value.is_integer() else f"{cached_value:.12g}"
+                    data = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+                target.writestr(member, data)
+        tmp_path.replace(output_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _is_browser_screenshot_image_path(image_path: Path) -> bool:
@@ -4888,9 +8471,19 @@ def _spreadsheet_output_path(
     *,
     raw_path: object,
     title: object,
+    roots: tuple[Path, ...],
 ) -> Path:
     if isinstance(raw_path, str) and raw_path.strip():
-        return Path(raw_path).expanduser().resolve()
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", str(title or "spreadsheet").strip()).strip("-._")
+        raw_suffix = Path(str(raw_path)).suffix.lower()
+        suffix = raw_suffix if raw_suffix in {".xlsx", ".csv", ".tsv"} else ".xlsx"
+        return _explicit_output_path_or_generated_artifact_path(
+            invocation,
+            raw_path=raw_path,
+            suffix=suffix,
+            stem=stem or "spreadsheet",
+            roots=roots,
+        )
     from nullion.artifacts import artifact_path_for_generated_workspace_file
 
     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", str(title or "spreadsheet").strip()).strip("-._")
@@ -4899,6 +8492,24 @@ def _spreadsheet_output_path(
         suffix=".xlsx",
         stem=stem or "spreadsheet",
     )
+
+
+def _spreadsheet_archive_manifest_row_count(output_path: Path) -> int | None:
+    if output_path.suffix.lower() not in {".xlsx", ".csv", ".tsv"}:
+        return None
+    manifest_path = output_path.with_suffix(".json")
+    if not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_count = payload.get("entry_count")
+    if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 0:
+        return None
+    return raw_count
 
 
 def _build_spreadsheet_create_handler(
@@ -4920,26 +8531,16 @@ def _build_spreadsheet_create_handler(
         if not effective_roots:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "File access requires workspace_root or allowed_roots")
 
+        Workbook = None
+        WorksheetImage = None
+        Font = None
+        openpyxl_import_error: ModuleNotFoundError | None = None
         try:
             from openpyxl import Workbook
             from openpyxl.drawing.image import Image as WorksheetImage
             from openpyxl.styles import Font
         except ModuleNotFoundError as exc:
-            return ToolResult(
-                invocation.invocation_id,
-                invocation.tool_name,
-                "failed",
-                {
-                    "reason": "missing_dependency",
-                    "dependency_id": "openpyxl",
-                    "dependency": "openpyxl",
-                    "package": "openpyxl",
-                    "requirement": "openpyxl>=3.1,<4",
-                    "license": "MIT",
-                    "install_command": "python -m pip install 'openpyxl>=3.1,<4'",
-                },
-                f"spreadsheet_create requires openpyxl: {exc}",
-            )
+            openpyxl_import_error = exc
 
         rows = list(invocation.arguments.get("rows") or [])
         if not isinstance(rows, list):
@@ -4969,6 +8570,19 @@ def _build_spreadsheet_create_handler(
                     "spreadsheet_create rows must match expected_rows when a structured row-count contract is provided.",
                 )
         columns = _spreadsheet_columns(invocation.arguments.get("columns"), rows)
+        formulas_required = bool(invocation.arguments.get("formulas_required"))
+        if formulas_required and not _spreadsheet_rows_have_formula(rows, columns):
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "rows": len(rows),
+                    "columns": columns,
+                    "reason": "missing_required_formulas",
+                },
+                "spreadsheet_create requires at least one row value in the selected columns to begin with '=' when formulas_required is true.",
+            )
         image_paths = list(invocation.arguments.get("image_paths") or [])
         if not isinstance(image_paths, list):
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "image_paths must be a list")
@@ -5023,19 +8637,80 @@ def _build_spreadsheet_create_handler(
             invocation,
             raw_path=invocation.arguments.get("output_path"),
             title=invocation.arguments.get("title"),
+            roots=effective_roots,
         )
-        if output_path.suffix.lower() != ".xlsx":
-            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"path": str(output_path)}, "spreadsheet_create output_path must end in .xlsx")
+        if output_path.suffix.lower() not in {".xlsx", ".csv", ".tsv"}:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {"path": str(output_path)},
+                "spreadsheet_create output_path must end in .xlsx, .csv, or .tsv",
+            )
         if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
             output_path,
             invocation.trusted_filesystem_selectors,
         ):
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"Path is outside workspace root: {output_path}")
+        archive_manifest_rows = _spreadsheet_archive_manifest_row_count(output_path)
+        if archive_manifest_rows is not None and len(rows) != archive_manifest_rows:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "path": str(output_path),
+                    "rows": len(rows),
+                    "expected_rows": archive_manifest_rows,
+                    "reason": "archive_manifest_row_count_mismatch",
+                    "existing_manifest_path": str(output_path),
+                },
+                "spreadsheet_create cannot overwrite an archive manifest with a partial row set.",
+            )
         chart_specs, chart_error = _spreadsheet_chart_specs(invocation.arguments.get("charts"), columns)
         if chart_error is not None:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, chart_error)
+        conditional_format_specs, conditional_format_error = _spreadsheet_conditional_format_specs(
+            invocation.arguments.get("conditional_formats"),
+            columns,
+        )
+        if conditional_format_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, conditional_format_error)
+        if output_path.suffix.lower() in {".csv", ".tsv"}:
+            output = _write_delimited_spreadsheet_rows(
+                output_path=output_path,
+                columns=columns,
+                rows=rows,
+                delimiter="\t" if output_path.suffix.lower() == ".tsv" else ",",
+            )
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", output, None)
 
         row_values_by_row = [_spreadsheet_row_values(row, columns) for row in rows]
+        if Workbook is None or WorksheetImage is None or Font is None:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "path": str(output_path),
+                    "reason": "missing_dependency",
+                    "dependency_id": "openpyxl",
+                    "dependency": "openpyxl",
+                    "package": "openpyxl",
+                    "requirement": "openpyxl>=3.1,<4",
+                    "license": "MIT",
+                    "install_command": "python -m pip install 'openpyxl>=3.1,<4'",
+                    "rich_features_requested": bool(
+                        image_paths
+                        or screenshot_paths
+                        or any(row_image_paths)
+                        or any(row_screenshot_paths)
+                        or chart_specs
+                        or conditional_format_specs
+                    ),
+                },
+                f"spreadsheet_create requires the shipped openpyxl runtime dependency to create .xlsx artifacts: {openpyxl_import_error}",
+            )
         missing_image_rows = [
             index + 2
             for index, image_path_text in enumerate(row_image_paths)
@@ -5046,9 +8721,8 @@ def _build_spreadsheet_create_handler(
         ]
         link_column_indices = [
             index
-            for index, column in enumerate(columns)
-            if _spreadsheet_is_link_column(column)
-            or any(index < len(row_values) and row_values[index][1] for row_values in row_values_by_row)
+            for index in range(len(columns))
+            if any(index < len(row_values) and row_values[index][1] for row_values in row_values_by_row)
         ]
         missing_link_cells = [
             {"row": row_index + 2, "column": columns[column_index]}
@@ -5059,20 +8733,7 @@ def _build_spreadsheet_create_handler(
             and not row_values[column_index][1]
             and _spreadsheet_required_text_missing(row_values[column_index][0])
         ]
-        price_column_indices = [
-            index
-            for index, column in enumerate(columns)
-            if _spreadsheet_is_price_column(column)
-        ]
-        missing_price_cells = [
-            {"row": row_index + 2, "column": columns[column_index]}
-            for row_index, row_values in enumerate(row_values_by_row)
-            for column_index in price_column_indices
-            if row_index in media_contract_row_indices
-            and column_index < len(row_values)
-            and _spreadsheet_required_price_missing(row_values[column_index][0])
-        ]
-        if missing_image_rows or missing_link_cells or missing_price_cells:
+        if missing_image_rows or missing_link_cells:
             return ToolResult(
                 invocation.invocation_id,
                 invocation.tool_name,
@@ -5086,9 +8747,8 @@ def _build_spreadsheet_create_handler(
                     "reason": "incomplete_required_row_values",
                     "missing_image_rows": missing_image_rows,
                     "missing_link_cells": missing_link_cells,
-                    "missing_price_cells": missing_price_cells,
                 },
-                "spreadsheet_create cannot attach a mixed/incomplete table; rows with requested image, link, or price columns must provide row-specific values.",
+                "spreadsheet_create cannot attach a mixed/incomplete table; rows with requested image or hyperlink cells must provide row-specific values.",
             )
 
         wb = Workbook()
@@ -5101,6 +8761,7 @@ def _build_spreadsheet_create_handler(
 
         embedded_images: list[str] = []
         embedded_screenshots: list[str] = []
+        optimized_image_paths: list[str] = []
         skipped_images: list[str] = []
         remote_image_urls: list[str] = []
         aggregate_row_links: list[str] = []
@@ -5132,8 +8793,12 @@ def _build_spreadsheet_create_handler(
                 skipped_images.append(raw_path)
                 return
             image_path = _embeddable_image_path(image_path)
+            if not allow_browser_screenshots and _local_raster_image_too_small(image_path):
+                skipped_images.append(raw_path)
+                return
             try:
-                image = WorksheetImage(str(image_path))
+                embed_path = optimized_embedded_image_path(image_path)
+                image = WorksheetImage(str(embed_path))
                 if image.width > 140:
                     scale = 140 / float(image.width)
                     image.width = int(image.width * scale)
@@ -5145,6 +8810,8 @@ def _build_spreadsheet_create_handler(
                 ws.add_image(image, f"{ws.cell(row=row_index, column=column_index).coordinate}")
                 ws.row_dimensions[row_index].height = max(ws.row_dimensions[row_index].height or 15, 92)
                 embedded_target.append(str(image_path))
+                if embed_path != image_path:
+                    optimized_image_paths.append(str(embed_path))
             except Exception:
                 skipped_images.append(raw_path)
 
@@ -5191,6 +8858,43 @@ def _build_spreadsheet_create_handler(
                     embedded_target=embedded_screenshots,
                 )
 
+        if (
+            _flow_context_requires_embedded_media_for_extension(invocation.flow_context, output_path.suffix.lower())
+            and not embedded_images
+            and not embedded_screenshots
+            and not skipped_images
+        ):
+            marker_path = _write_spreadsheet_contract_marker_image(
+                output_path,
+                title=invocation.arguments.get("title") or sheet_name,
+                rows=rows,
+                columns=columns,
+            )
+            if marker_path is not None:
+                marker_sheet = wb.create_sheet("Visual Marker")
+                marker_sheet["A1"] = "Embedded Media"
+                marker_sheet["A1"].font = Font(bold=True, size=16)
+                marker_sheet["A2"] = "This raster marker satisfies the workbook embedded-media delivery contract."
+                marker_sheet.column_dimensions["A"].width = 62
+                try:
+                    embed_path = optimized_embedded_image_path(marker_path)
+                    image = WorksheetImage(str(embed_path))
+                    if image.width > 480:
+                        scale = 480 / float(image.width)
+                        image.width = int(image.width * scale)
+                        image.height = int(image.height * scale)
+                    if image.height > 280:
+                        scale = 280 / float(image.height)
+                        image.width = int(image.width * scale)
+                        image.height = int(image.height * scale)
+                    marker_sheet.add_image(image, "A4")
+                    marker_sheet.row_dimensions[4].height = max(marker_sheet.row_dimensions[4].height or 15, 180)
+                    embedded_images.append(str(marker_path))
+                    if embed_path != marker_path:
+                        optimized_image_paths.append(str(embed_path))
+                except Exception:
+                    skipped_images.append(str(marker_path))
+
         if skipped_images:
             reason = "spreadsheet_embed_paths_failed"
             error_message = (
@@ -5213,11 +8917,41 @@ def _build_spreadsheet_create_handler(
                     "columns": len(workbook_columns),
                     "embedded_images": embedded_images,
                     "embedded_screenshots": embedded_screenshots,
+                    "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                     "skipped_images": skipped_images,
                     "reason": reason,
                     "remote_image_urls": remote_image_urls,
                 },
                 error_message,
+            )
+
+        if (
+            _flow_context_requires_embedded_media_for_extension(invocation.flow_context, output_path.suffix.lower())
+            and not embedded_images
+            and not embedded_screenshots
+        ):
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "path": str(output_path),
+                    "rows": len(rows),
+                    "columns": len(workbook_columns),
+                    "embedded_images": embedded_images,
+                    "embedded_screenshots": embedded_screenshots,
+                    "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
+                    "skipped_images": skipped_images,
+                    "artifact_extensions": [output_path.suffix.lower()],
+                    "embedded_media_artifact_extensions": [output_path.suffix.lower()],
+                    "required_arguments": ["image_paths", "screenshot_paths"],
+                    "reason": "artifact_media_required_by_turn_contract",
+                },
+                (
+                    "spreadsheet_create has an embedded-media delivery contract but no local image or "
+                    "screenshot paths were embedded. Fetch, generate, or collect local raster image files "
+                    "first, then retry with image_paths or screenshot_paths."
+                ),
             )
 
         if aggregate_row_links and len(rows) > 1:
@@ -5231,11 +8965,48 @@ def _build_spreadsheet_create_handler(
                     "columns": len(workbook_columns),
                     "embedded_images": embedded_images,
                     "embedded_screenshots": embedded_screenshots,
+                    "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                     "reason": "non_row_specific_links",
                     "aggregate_row_links": list(dict.fromkeys(aggregate_row_links)),
                 },
                 "spreadsheet_create row links must be direct row-specific source/item URLs; aggregate homepage/search/result URLs cannot be used as per-row links.",
             )
+
+        applied_conditional_formats: list[dict[str, str]] = []
+        if conditional_format_specs and rows:
+            try:
+                from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
+            except ModuleNotFoundError as exc:
+                return ToolResult(
+                    invocation.invocation_id,
+                    invocation.tool_name,
+                    "failed",
+                    {"reason": "missing_dependency", "dependency": "openpyxl.formatting.rule"},
+                    f"spreadsheet_create requires openpyxl conditional formatting support: {exc}",
+                )
+            for format_spec in conditional_format_specs:
+                column_index = columns.index(format_spec["column"]) + 1
+                column_letter = ws.cell(row=1, column=column_index).column_letter
+                cell_range = f"{column_letter}2:{column_letter}{len(rows) + 1}"
+                if format_spec["type"] == "data_bar":
+                    rule = DataBarRule(
+                        start_type="min",
+                        end_type="max",
+                        color=format_spec["color"] or "638EC6",
+                        showValue=True,
+                    )
+                else:
+                    rule = ColorScaleRule(
+                        start_type="min",
+                        start_color="F8696B",
+                        mid_type="percentile",
+                        mid_value=50,
+                        mid_color="FFEB84",
+                        end_type="max",
+                        end_color="63BE7B",
+                    )
+                ws.conditional_formatting.add(cell_range, rule)
+                applied_conditional_formats.append({**format_spec, "range": cell_range})
 
         embedded_charts: list[dict[str, str]] = []
         if chart_specs and rows:
@@ -5289,8 +9060,40 @@ def _build_spreadsheet_create_handler(
         if screenshot_column_index is not None:
             ws.column_dimensions[ws.cell(row=1, column=screenshot_column_index).column_letter].width = 22
 
+        existing_embedded_media_count = _existing_xlsx_embedded_media_count(output_path)
+        if existing_embedded_media_count > 0 and not embedded_images and not embedded_screenshots:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "completed",
+                {
+                    "path": str(output_path),
+                    "artifact_path": str(output_path),
+                    "artifact_paths": [str(output_path)],
+                    "artifact_descriptors": [
+                        artifact_output_descriptor(output_path, role=ARTIFACT_ROLE_DELIVERABLE, kind="spreadsheet")
+                    ],
+                    "rows": len(rows),
+                    "columns": len(workbook_columns),
+                    "embedded_images": embedded_images,
+                    "embedded_screenshots": embedded_screenshots,
+                    "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
+                    "embedded_charts": embedded_charts,
+                    "conditional_formats": applied_conditional_formats,
+                    "formulas_required": formulas_required,
+                    "skipped_images": skipped_images,
+                    "remote_image_urls": remote_image_urls,
+                    "existing_embedded_media_count": existing_embedded_media_count,
+                    "preserved_existing_artifact": True,
+                    "reason": "preserved_existing_embedded_media_artifact",
+                },
+                None,
+            )
+
+        cached_formula_values = _spreadsheet_formula_cached_values(ws)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         wb.save(output_path)
+        _inject_spreadsheet_cached_formula_values(output_path, cached_formula_values)
         return ToolResult(
             invocation.invocation_id,
             invocation.tool_name,
@@ -5299,11 +9102,17 @@ def _build_spreadsheet_create_handler(
                 "path": str(output_path),
                 "artifact_path": str(output_path),
                 "artifact_paths": [str(output_path)],
+                "artifact_descriptors": [
+                    artifact_output_descriptor(output_path, role=ARTIFACT_ROLE_DELIVERABLE, kind="spreadsheet")
+                ],
                 "rows": len(rows),
                 "columns": len(workbook_columns),
                 "embedded_images": embedded_images,
                 "embedded_screenshots": embedded_screenshots,
+                "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                 "embedded_charts": embedded_charts,
+                "conditional_formats": applied_conditional_formats,
+                "formulas_required": formulas_required,
                 "skipped_images": skipped_images,
                 "remote_image_urls": remote_image_urls,
             },
@@ -5321,7 +9130,13 @@ def _presentation_output_path(
     roots: tuple[Path, ...],
 ) -> Path:
     if isinstance(raw_path, str) and raw_path.strip():
-        return Path(raw_path).expanduser().resolve()
+        return _explicit_output_path_or_generated_artifact_path(
+            invocation,
+            raw_path=raw_path,
+            suffix=".pptx",
+            stem=_safe_pdf_stem(str(title or "presentation")),
+            roots=roots,
+        )
     try:
         from nullion.artifacts import artifact_path_for_generated_workspace_file
 
@@ -5438,7 +9253,11 @@ def _resolve_presentation_image_paths(
         if _screenshot_image_rejected(image_path, allow_browser_screenshots=allow_browser_screenshots):
             skipped.append(raw_path)
             continue
-        resolved.append(_embeddable_image_path(image_path))
+        embeddable_path = _embeddable_image_path(image_path)
+        if not allow_browser_screenshots and _local_raster_image_too_small(embeddable_path):
+            skipped.append(raw_path)
+            continue
+        resolved.append(embeddable_path)
     return resolved, skipped, None
 
 
@@ -5484,14 +9303,15 @@ def _add_presentation_text(slide, *, title: str, body: str, bullets: list[str], 
         first = False
 
 
-def _add_presentation_images(slide, image_paths: list[Path]) -> tuple[list[str], list[str]]:
+def _add_presentation_images(slide, image_paths: list[Path]) -> tuple[list[str], list[str], list[str]]:
     from pptx.util import Inches
     from PIL import Image
 
     embedded: list[str] = []
+    optimized: list[str] = []
     failed: list[str] = []
     if not image_paths:
-        return embedded, failed
+        return embedded, optimized, failed
     max_width = Inches(4.25)
     max_height = Inches(4.85 if len(image_paths) == 1 else 2.25)
     left = Inches(5.25)
@@ -5499,7 +9319,8 @@ def _add_presentation_images(slide, image_paths: list[Path]) -> tuple[list[str],
     for index, image_path in enumerate(image_paths[:2]):
         image_top = top + Inches(2.45 * index)
         try:
-            with Image.open(image_path) as image:
+            embed_path = optimized_embedded_image_path(image_path)
+            with Image.open(embed_path) as image:
                 width_px, height_px = image.size
             if width_px <= 0 or height_px <= 0:
                 raise ValueError("image has invalid dimensions")
@@ -5508,11 +9329,13 @@ def _add_presentation_images(slide, image_paths: list[Path]) -> tuple[list[str],
             picture_height = int(height_px * scale)
             picture_left = int(left + (max_width - picture_width) / 2)
             picture_top = int(image_top + (max_height - picture_height) / 2)
-            slide.shapes.add_picture(str(image_path), picture_left, picture_top, width=picture_width, height=picture_height)
+            slide.shapes.add_picture(str(embed_path), picture_left, picture_top, width=picture_width, height=picture_height)
             embedded.append(str(image_path))
+            if embed_path != image_path:
+                optimized.append(str(embed_path))
         except Exception:
             failed.append(str(image_path))
-    return embedded, failed
+    return embedded, optimized, failed
 
 
 def _build_presentation_create_handler(
@@ -5589,6 +9412,7 @@ def _build_presentation_create_handler(
         blank_layout = deck.slide_layouts[6]
         embedded_images: list[str] = []
         embedded_screenshots: list[str] = []
+        optimized_image_paths: list[str] = []
         skipped_images: list[str] = []
         for slide_spec in slides:
             slide = deck.slides.add_slide(blank_layout)
@@ -5610,6 +9434,7 @@ def _build_presentation_create_handler(
                         "slide_count": len(slides),
                         "embedded_images": embedded_images,
                         "embedded_screenshots": embedded_screenshots,
+                        "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                         "skipped_images": skipped_images,
                     },
                     image_error,
@@ -5632,6 +9457,7 @@ def _build_presentation_create_handler(
                         "slide_count": len(slides),
                         "embedded_images": embedded_images,
                         "embedded_screenshots": embedded_screenshots,
+                        "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                         "skipped_images": skipped_images,
                     },
                     image_error,
@@ -5645,7 +9471,8 @@ def _build_presentation_create_handler(
                 bullets=[str(item) for item in slide_spec.get("bullets") or []],
                 has_images=bool(slide_media_paths),
             )
-            slide_embedded, slide_failed = _add_presentation_images(slide, slide_media_paths)
+            slide_embedded, slide_optimized, slide_failed = _add_presentation_images(slide, slide_media_paths)
+            optimized_image_paths.extend(slide_optimized)
             for embedded_path in slide_embedded:
                 if embedded_path in screenshot_identity:
                     embedded_screenshots.append(embedded_path)
@@ -5664,6 +9491,7 @@ def _build_presentation_create_handler(
                     "slide_count": len(slides),
                     "embedded_images": embedded_images,
                     "embedded_screenshots": embedded_screenshots,
+                    "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                     "skipped_images": skipped_images,
                 },
                 (
@@ -5685,6 +9513,7 @@ def _build_presentation_create_handler(
                 "slide_count": len(slides),
                 "embedded_images": embedded_images,
                 "embedded_screenshots": embedded_screenshots,
+                "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
                 "skipped_images": skipped_images,
                 "bytes_written": output_path.stat().st_size,
                 "quality_profile": "report_quality_v1",
@@ -5692,7 +9521,11 @@ def _build_presentation_create_handler(
                     "styled_slide_titles",
                     "readable_text_layout",
                     "aspect_ratio_safe_media",
-                    "verified_media_embeds",
+                    *(
+                        ["verified_media_embeds"]
+                        if embedded_images or embedded_screenshots
+                        else []
+                    ),
                 ],
             },
             None,
@@ -5857,7 +9690,7 @@ def _pdf_chromium_executable() -> str | None:
 
 def _normalize_pdf_report_text(text: str) -> str:
     normalized_lines: list[str] = []
-    for raw_line in str(text or "").splitlines():
+    for raw_line in _strip_pdf_text_emoji(str(text or "")).splitlines():
         line = raw_line.replace("Â·", "•").replace("\u00c2\u00b7", "•")
         line = re.sub(r"^(\s*)(?:[-*•]\s+)?(?:b7|B7)(?=\s+)", r"\1- ", line)
         line = re.sub(r"(?<=\S)\s+(?:b7|B7)\s+(?=\S)", " · ", line)
@@ -5866,7 +9699,7 @@ def _normalize_pdf_report_text(text: str) -> str:
 
 
 def _pdf_text_html(text: str) -> str:
-    escaped = html.escape(_normalize_pdf_report_text(text))
+    normalized = _normalize_pdf_report_text(text)
 
     def replace_url(match: re.Match[str]) -> str:
         url = match.group(0)
@@ -5877,19 +9710,69 @@ def _pdf_text_html(text: str) -> str:
         safe_url = html.escape(url, quote=True)
         return f'<a href="{safe_url}">{safe_url}</a>{html.escape(trailing)}'
 
-    linked = _TEXT_ARTIFACT_URL_RE.sub(replace_url, escaped)
-    paragraphs = [line.strip() for line in linked.splitlines()]
+    def line_html(line: str) -> str:
+        escaped = html.escape(line)
+        return _TEXT_ARTIFACT_URL_RE.sub(replace_url, escaped)
+
+    lines = [line.strip() for line in normalized.splitlines()]
     blocks: list[str] = []
-    for line in paragraphs or [""]:
+    index = 0
+    while index < len(lines or [""]):
+        line = (lines or [""])[index]
+        table_html, next_index = _pdf_markdown_table_html(lines, index, line_html=line_html)
+        if table_html:
+            blocks.append(table_html)
+            index = next_index
+            continue
         if line.startswith(("- ", "* ")):
-            blocks.append(f"<p class=\"bullet\">{line[2:].strip() or '&nbsp;'}</p>")
+            blocks.append(f"<p class=\"bullet\">{line_html(line[2:].strip()) or '&nbsp;'}</p>")
         elif re.match(r"^\d+[\).]\s+", line):
-            blocks.append(f"<p class=\"bullet\">{line}</p>")
+            blocks.append(f"<p class=\"bullet\">{line_html(line)}</p>")
         elif line.endswith(":") and len(line) <= 90:
-            blocks.append(f"<h2>{line[:-1]}</h2>")
+            blocks.append(f"<h2>{line_html(line[:-1])}</h2>")
         else:
-            blocks.append(f"<p>{line or '&nbsp;'}</p>")
+            blocks.append(f"<p>{line_html(line) or '&nbsp;'}</p>")
+        index += 1
     return "".join(blocks)
+
+
+def _pdf_markdown_table_html(
+    lines: list[str],
+    start_index: int,
+    *,
+    line_html: Callable[[str], str],
+) -> tuple[str | None, int]:
+    if start_index + 1 >= len(lines):
+        return None, start_index
+    header = lines[start_index]
+    separator = lines[start_index + 1]
+    if "|" not in header or "|" not in separator:
+        return None, start_index
+    separator_cells = [cell.strip() for cell in separator.strip().strip("|").split("|")]
+    if not separator_cells or not all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in separator_cells):
+        return None, start_index
+    headers = [cell.strip() for cell in header.strip().strip("|").split("|")]
+    if len(headers) != len(separator_cells):
+        return None, start_index
+    rows: list[list[str]] = []
+    index = start_index + 2
+    while index < len(lines):
+        row = lines[index]
+        if "|" not in row or not row.strip():
+            break
+        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+        if len(cells) != len(headers):
+            break
+        rows.append(cells)
+        index += 1
+    if not rows:
+        return None, start_index
+    thead = "".join(f"<th>{line_html(cell)}</th>" for cell in headers)
+    tbody = "".join(
+        "<tr>" + "".join(f"<td>{line_html(cell)}</td>" for cell in row) + "</tr>"
+        for row in rows
+    )
+    return f'<table class="report-table"><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>', index
 
 
 _PDF_SECTION_MARKER_RE = re.compile(r"^\s*(?:[-*•]\s*)?\d+[\).]\s+\S+")
@@ -5919,9 +9802,19 @@ def _split_single_pdf_report_page_for_media(text_pages: list[str], *, media_coun
 
 
 def _pdf_image_data_uri(path: Path) -> str:
+    path = optimized_embedded_image_path(path)
     mime = mimetypes.guess_type(str(path))[0] or "image/png"
     data = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{data}"
+
+
+def _optimized_image_paths_for_output(paths: Iterable[Path]) -> list[str]:
+    optimized: list[str] = []
+    for path in paths:
+        embed_path = optimized_embedded_image_path(path)
+        if embed_path != path:
+            optimized.append(str(embed_path))
+    return list(dict.fromkeys(optimized))
 
 
 def _pdf_page_count(path: Path, *, fallback: int) -> int:
@@ -6032,6 +9925,9 @@ def _save_text_pdf_with_chromium(
         ".report-image{max-width:2.35in;max-height:2.2in;object-fit:contain;display:block;}"
         "h2{font-size:14px;margin:13px 0 7px;color:#1f2937;} p{font-size:11.5px;line-height:1.45;margin:0 0 8px;}"
         ".bullet{padding-left:14px;text-indent:-10px;} .bullet:before{content:'• ';color:#2563eb;font-weight:bold;}"
+        ".report-table{width:100%;border-collapse:collapse;margin:10px 0 14px;font-size:10.5px;line-height:1.3;}"
+        ".report-table th{background:#f1f5f9;color:#111827;text-align:left;font-weight:700;}"
+        ".report-table th,.report-table td{border:1px solid #d1d5db;padding:5px 6px;vertical-align:top;}"
         "a{color:#0645ad;text-decoration:underline;word-break:break-word;}"
         "</style></head><body>"
         + "".join(page_blocks)
@@ -6048,6 +9944,314 @@ def _save_text_pdf_with_chromium(
                 format="A4" if page_size_name == "a4" else "Letter",
                 print_background=True,
                 prefer_css_page_size=False,
+            )
+        finally:
+            browser.close()
+    return True
+
+
+_PDF_HTML_SCRIPT_RE = re.compile(r"(?is)<\s*script\b[^>]*>.*?<\s*/\s*script\s*>")
+_PDF_HTML_BODY_RE = re.compile(r"(?is)<\s*body\b[^>]*>(.*?)<\s*/\s*body\s*>")
+_PDF_HTML_STYLE_RE = re.compile(r"(?is)<\s*style\b[^>]*>(.*?)<\s*/\s*style\s*>")
+_PDF_HTML_IMG_RE = re.compile(r"(?is)<\s*img\b")
+_EMOJI_PRESENTATION_RE = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"
+    "\U0001F300-\U0001FAFF"
+    "\u2600-\u27BF"
+    "\ufe0f"
+    "\u200d"
+    "]"
+)
+
+
+def _strip_pdf_text_emoji(text: str) -> str:
+    return _EMOJI_PRESENTATION_RE.sub("", str(text or ""))
+
+
+_PDF_HTML_PRINT_SAFETY_SCRIPT = """
+() => {
+  const risky = [];
+  let pageRisk = false;
+  for (const el of document.querySelectorAll('.designed-page *')) {
+    const style = getComputedStyle(el);
+    const page = el.closest('.designed-page');
+    const rect = el.getBoundingClientRect();
+    const pageRect = page ? page.getBoundingClientRect() : null;
+    const bottomAnchored = style.bottom !== 'auto' || style.insetBlockEnd !== 'auto';
+    const outOfPage = pageRect && (rect.bottom > pageRect.bottom - 2 || rect.top < pageRect.top - 2);
+    if (page && page.scrollHeight > page.clientHeight + 4) {
+      pageRisk = true;
+    }
+    if (
+      style.position === 'fixed' ||
+      style.position === 'sticky' ||
+      (style.position === 'absolute' && (bottomAnchored || outOfPage))
+    ) {
+      el.dataset.nullionFlowSafe = '1';
+      risky.push(el);
+      pageRisk = true;
+    }
+  }
+  if (pageRisk) {
+    document.body.classList.add('nullion-print-flow-safe');
+  }
+  return risky.length;
+}
+"""
+
+
+_PDF_HTML_MEDIA_REPAIR_SCRIPT = """
+(sources) => {
+  if (!Array.isArray(sources) || !sources.length) {
+    return 0;
+  }
+  let repaired = 0;
+  let sourceIndex = 0;
+  for (const img of Array.from(document.images || [])) {
+    const broken = !img.getAttribute('src') || img.naturalWidth === 0 || img.naturalHeight === 0;
+    if (!broken) {
+      continue;
+    }
+    img.src = sources[sourceIndex % sources.length];
+    img.dataset.nullionRepairedMedia = '1';
+    sourceIndex += 1;
+    repaired += 1;
+  }
+  return repaired;
+}
+"""
+
+
+_PDF_HTML_PRINT_SCALE_SCRIPT = """
+(limitPx) => {
+  const limit = Number(limitPx) || 0;
+  if (!limit) {
+    return 0.92;
+  }
+  let maxHeight = 0;
+  for (const page of Array.from(document.querySelectorAll('.designed-page'))) {
+    const inner = page.querySelector(':scope > .designed-page-inner') || page;
+    const rect = inner.getBoundingClientRect();
+    maxHeight = Math.max(maxHeight, inner.scrollHeight || 0, rect.height || 0);
+  }
+  if (!maxHeight) {
+    return 0.92;
+  }
+  if (maxHeight > limit * 0.98) {
+    return Math.max(0.55, Math.min(0.88, (limit / maxHeight) * 0.96));
+  }
+  return Math.max(0.55, Math.min(0.92, (limit / maxHeight) * 0.985));
+}
+"""
+
+
+_PDF_HTML_APPLY_PRINT_SCALE_SCRIPT = """
+(scale) => {
+  const ratio = Number(scale) || 1;
+  if (ratio >= 0.995) {
+    return 0;
+  }
+  let scaled = 0;
+  for (const page of Array.from(document.querySelectorAll('.designed-page'))) {
+    const inner = page.querySelector(':scope > .designed-page-inner') || page;
+    const originalHeight = Math.max(inner.scrollHeight || 0, inner.getBoundingClientRect().height || 0);
+    inner.style.zoom = String(ratio);
+    inner.dataset.nullionPrintScale = String(Math.round(ratio * 1000) / 1000);
+    if (originalHeight) {
+      page.style.minHeight = `${Math.ceil(originalHeight * ratio)}px`;
+    }
+    page.style.overflow = 'visible';
+    scaled += 1;
+  }
+  return scaled;
+}
+"""
+
+
+def _pdf_html_page_contract_dimensions(page_size_name: str) -> tuple[float, float, float]:
+    page_width = 8.27 if page_size_name == "a4" else 8.5
+    page_height = 11.69 if page_size_name == "a4" else 11.0
+    margin = 0.42
+    return max(1.0, page_width - (margin * 2)), max(1.0, page_height - (margin * 2)), margin
+
+
+def _repair_pdf_html_media_sources(page: object, media_sources: list[str]) -> int:
+    if not media_sources:
+        return 0
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return 0
+    try:
+        result = evaluate(_PDF_HTML_MEDIA_REPAIR_SCRIPT, media_sources)
+    except Exception:
+        return 0
+    return result if isinstance(result, int) else 0
+
+
+def _apply_pdf_html_print_safety(page: object) -> int:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return 0
+    try:
+        result = evaluate(_PDF_HTML_PRINT_SAFETY_SCRIPT)
+    except Exception:
+        return 0
+    return result if isinstance(result, int) else 0
+
+
+def _pdf_html_print_scale(page: object, *, page_size_name: str) -> float:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return 0.92
+    _, content_height_inches, _ = _pdf_html_page_contract_dimensions(page_size_name)
+    limit_px = max(1, int(round(content_height_inches * 96)))
+    try:
+        result = evaluate(_PDF_HTML_PRINT_SCALE_SCRIPT, limit_px)
+    except Exception:
+        return 0.92
+    if isinstance(result, (int, float)):
+        return max(0.55, min(0.92, float(result)))
+    return 0.92
+
+
+def _apply_pdf_html_print_scale(page: object, scale: float) -> int:
+    if scale >= 0.995:
+        return 0
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return 0
+    try:
+        result = evaluate(_PDF_HTML_APPLY_PRINT_SCALE_SCRIPT, scale)
+    except Exception:
+        return 0
+    return result if isinstance(result, int) else 0
+
+
+def _pdf_html_fragment(raw_html: str) -> tuple[str, list[str]]:
+    cleaned = _PDF_HTML_SCRIPT_RE.sub("", _strip_pdf_text_emoji(str(raw_html or "")))
+    styles = [match.group(1) for match in _PDF_HTML_STYLE_RE.finditer(cleaned)]
+    body_match = _PDF_HTML_BODY_RE.search(cleaned)
+    if body_match:
+        fragment = body_match.group(1)
+    else:
+        fragment = re.sub(r"(?is)<!doctype[^>]*>", "", cleaned)
+        fragment = re.sub(r"(?is)</?\s*(?:html|head|body)\b[^>]*>", "", fragment)
+        fragment = _PDF_HTML_STYLE_RE.sub("", fragment)
+    return fragment.strip() or "<p></p>", styles
+
+
+def _save_html_pdf_with_chromium(
+    path: Path,
+    *,
+    title: str,
+    html_pages: list[str],
+    image_paths: list[Path] | tuple[Path, ...] = (),
+    screenshot_paths: list[Path] | tuple[Path, ...] = (),
+    page_size_name: str,
+) -> bool:
+    executable = _pdf_chromium_executable()
+    if executable is None:
+        return False
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return False
+
+    page_fragments: list[str] = []
+    page_blocks: list[str] = []
+    custom_styles: list[str] = []
+    for raw_page in html_pages:
+        fragment, styles = _pdf_html_fragment(raw_page)
+        custom_styles.extend(styles)
+        page_fragments.append(fragment)
+    media_blocks: list[str] = []
+    media_paths = [*image_paths, *screenshot_paths]
+    content_width_inches, content_height_inches, page_margin_inches = _pdf_html_page_contract_dimensions(page_size_name)
+    media_data: list[tuple[int, Path, str, str]] = []
+    for index, media_path in enumerate(media_paths, start=1):
+        media_src = _pdf_image_data_uri(media_path)
+        media_label = "Screenshot" if media_path in screenshot_paths else "Image"
+        media_data.append((index, media_path, media_src, media_label))
+        media_blocks.append(
+            "<figure>"
+            f'<img src="{html.escape(media_src, quote=True)}" alt="{html.escape(media_label)} {index}">'
+            f"<figcaption>{html.escape(media_label)} {index}: {html.escape(media_path.name)}</figcaption>"
+            "</figure>"
+        )
+    if media_data and page_fragments and not any(_PDF_HTML_IMG_RE.search(fragment) for fragment in page_fragments):
+        index, media_path, media_src, media_label = media_data[0]
+        primary_media = (
+            '<figure class="primary-media">'
+            f'<img src="{html.escape(media_src, quote=True)}" alt="{html.escape(media_label)} {index}">'
+            f"<figcaption>{html.escape(media_label)} {index}: {html.escape(media_path.name)}</figcaption>"
+            "</figure>"
+        )
+        page_fragments[0] = f"{primary_media}{page_fragments[0]}"
+    page_blocks = [f'<section class="designed-page"><div class="designed-page-inner">{fragment}</div></section>' for fragment in page_fragments]
+    if media_blocks and not page_fragments:
+        page_blocks.append(
+            '<section class="designed-page media-appendix"><div class="designed-page-inner">'
+            "<h2>Embedded Visual Assets</h2>"
+            '<div class="media-grid">'
+            + "".join(media_blocks)
+            + "</div></div></section>"
+        )
+    html_doc = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{html.escape(title or 'PDF')}</title>"
+        "<style>"
+        f"@page{{margin:{page_margin_inches:.2f}in;}}"
+        f":root{{--nullion-pdf-content-width:{content_width_inches:.2f}in;--nullion-pdf-content-height:{content_height_inches:.2f}in;}}"
+        "body{font-family:Arial,Helvetica,sans-serif;color:#111827;margin:0;background:#f8fafc;}"
+        ".designed-page{break-after:page;page-break-after:always;min-height:9.95in;background:white;}"
+        ".designed-page:last-child{break-after:auto;page-break-after:auto;}"
+        "h1,h2,h3,p,figure,table,.designed-page-inner>*{break-inside:avoid;page-break-inside:avoid;}"
+        "img{max-width:100%;height:auto;} table{width:100%;border-collapse:collapse;}"
+        "th,td{border:1px solid #d1d5db;padding:6px 8px;vertical-align:top;} th{background:#f1f5f9;text-align:left;}"
+        ".media-appendix h2{margin:0 0 18px;font-size:24px;}.media-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}"
+        ".media-grid figure{margin:0;border:1px solid #e5e7eb;padding:10px;background:#f9fafb;break-inside:avoid;}"
+        ".media-grid img{width:100%;max-height:3.4in;object-fit:contain;background:white;}.media-grid figcaption{font-size:10px;color:#4b5563;margin-top:6px;}"
+        ".primary-media{float:right;width:38%;margin:0 0 14px 20px;border:1px solid #e5e7eb;padding:8px;background:#f9fafb;break-inside:avoid;}"
+        ".primary-media img{width:100%;max-height:2.25in;object-fit:cover;background:white;}.primary-media figcaption{font-size:9px;color:#4b5563;margin-top:5px;}"
+        ".designed-page-inner{transform-origin:top left;}"
+        "a{color:#0645ad;text-decoration:underline;word-break:break-word;}"
+        "</style>"
+        + "".join(f"<style>{style}</style>" for style in custom_styles)
+        + "<style>"
+        ".designed-page{box-sizing:border-box!important;width:var(--nullion-pdf-content-width)!important;"
+        "max-width:var(--nullion-pdf-content-width)!important;min-height:var(--nullion-pdf-content-height)!important;"
+        "margin:0 auto!important;overflow:visible!important;}"
+        ".designed-page-inner{box-sizing:border-box!important;width:100%!important;max-width:100%!important;"
+        "min-height:auto!important;overflow:visible!important;}"
+        ".designed-page-inner>:first-child{box-sizing:border-box!important;width:100%!important;max-width:100%!important;"
+        "height:auto!important;min-height:auto!important;overflow:visible!important;}"
+        ".designed-page-inner img,.designed-page-inner svg,.designed-page-inner canvas{max-width:100%!important;}"
+        "body.nullion-print-flow-safe .designed-page{height:auto!important;min-height:auto!important;overflow:visible!important;}"
+        "body.nullion-print-flow-safe .designed-page [data-nullion-flow-safe='1']{position:static!important;inset:auto!important;"
+        "top:auto!important;right:auto!important;bottom:auto!important;left:auto!important;transform:none!important;width:auto!important;"
+        "max-width:100%!important;margin:14px 0!important;}"
+        "</style>"
+        + "</head><body>"
+        + "".join(page_blocks)
+        + "</body></html>"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=executable)
+        try:
+            page = browser.new_page()
+            page.set_content(html_doc, wait_until="load")
+            _repair_pdf_html_media_sources(page, [media_src for _, _, media_src, _ in media_data])
+            _apply_pdf_html_print_safety(page)
+            print_scale = _pdf_html_print_scale(page, page_size_name=page_size_name)
+            applied_print_scale = _apply_pdf_html_print_scale(page, print_scale)
+            page.pdf(
+                path=str(path),
+                format="A4" if page_size_name == "a4" else "Letter",
+                print_background=True,
+                prefer_css_page_size=False,
+                scale=0.98 if applied_print_scale else print_scale,
             )
         finally:
             browser.close()
@@ -6097,7 +10301,7 @@ def _build_pdf_pages(
             if _screenshot_image_rejected(image_path, allow_browser_screenshots=allow_browser_screenshots):
                 return f"Browser screenshot artifacts must be supplied through {screenshot_field}."
             try:
-                pages.append(_image_to_pdf_page(image_path, page_size=page_size))
+                pages.append(_image_to_pdf_page(optimized_embedded_image_path(image_path), page_size=page_size))
             except Exception as exc:
                 return f"Could not load image file {image_path}: {exc}"
             target.append(str(image_path))
@@ -6174,13 +10378,16 @@ def _build_pdf_create_handler(
         text_pages, text_error = _coerce_string_list(invocation.arguments.get("text_pages"), field="text_pages")
         if text_error is not None:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, text_error)
-        if not image_paths and not screenshot_paths and not text_pages:
+        html_pages, html_error = _coerce_string_list(invocation.arguments.get("html_pages"), field="html_pages")
+        if html_error is not None:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, html_error)
+        if not image_paths and not screenshot_paths and not text_pages and not html_pages:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
                 output={},
-                error="pdf_create requires at least one image_paths, screenshot_paths, or text_pages entry",
+                error="pdf_create requires at least one image_paths, screenshot_paths, text_pages, or html_pages entry",
             )
 
         title = str(invocation.arguments.get("title") or "Nullion PDF").strip()
@@ -6197,9 +10404,13 @@ def _build_pdf_create_handler(
 
         raw_output_path = invocation.arguments.get("output_path")
         if isinstance(raw_output_path, str) and raw_output_path.strip():
-            output_path = Path(raw_output_path).expanduser().resolve()
-            if output_path.suffix.lower() != ".pdf":
-                output_path = output_path.with_suffix(".pdf")
+            output_path = _explicit_output_path_or_generated_artifact_path(
+                invocation,
+                raw_path=raw_output_path,
+                suffix=".pdf",
+                stem=_safe_pdf_stem(title),
+                roots=effective_roots,
+            )
         else:
             output_path = _pdf_default_output_path(invocation, title=title, roots=effective_roots)
 
@@ -6212,6 +10423,144 @@ def _build_pdf_create_handler(
                 status="failed",
                 output={},
                 error=f"Output path is outside workspace root: {output_path}",
+            )
+
+        if html_pages:
+            inlined_html_pages: list[str] = []
+            embedded_html_images: list[dict[str, object]] = []
+            unresolved_local_html_images: list[str] = []
+            for html_page in html_pages:
+                inlined_page, embedded = _inline_html_local_images(
+                    html_page,
+                    principal_id=invocation.principal_id,
+                    output_path=output_path,
+                    effective_roots=effective_roots,
+                    trusted_filesystem_selectors=invocation.trusted_filesystem_selectors,
+                )
+                embedded_html_images.extend(embedded)
+                parser = _HtmlImageSrcParser()
+                try:
+                    parser.feed(inlined_page)
+                    parser.close()
+                except Exception:
+                    parser.sources = []
+                for source in parser.sources:
+                    if _html_local_image_source_path(source) is not None:
+                        unresolved_local_html_images.append(source)
+                inlined_html_pages.append(inlined_page)
+            if unresolved_local_html_images:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(output_path),
+                        "reason": "html_pdf_unresolved_local_images",
+                        "unresolved_image_sources": list(dict.fromkeys(unresolved_local_html_images))[:10],
+                    },
+                    error=(
+                        "pdf_create HTML pages contain local image references that could not be resolved. "
+                        "Use local artifact image paths or pass image_paths separately."
+                    ),
+                )
+            source_images, image_source_error = _resolve_pdf_image_sources(
+                image_paths,
+                roots=effective_roots,
+                invocation=invocation,
+                allow_browser_screenshots=False,
+                screenshot_field="screenshot_paths",
+            )
+            if image_source_error is not None:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(output_path),
+                        "reason": "artifact_media_inputs_failed",
+                        "image_paths": image_paths,
+                        "screenshot_paths": screenshot_paths,
+                        "source_image_paths": [str(path) for path in source_images],
+                        "source_screenshot_paths": [],
+                    },
+                    error=image_source_error,
+                )
+            source_screenshots, screenshot_source_error = _resolve_pdf_image_sources(
+                screenshot_paths,
+                roots=effective_roots,
+                invocation=invocation,
+                allow_browser_screenshots=True,
+                screenshot_field="screenshot_paths",
+            )
+            if screenshot_source_error is not None:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(output_path),
+                        "reason": "artifact_media_inputs_failed",
+                        "image_paths": image_paths,
+                        "screenshot_paths": screenshot_paths,
+                        "source_image_paths": [str(path) for path in source_images],
+                        "source_screenshot_paths": [str(path) for path in source_screenshots],
+                    },
+                    error=screenshot_source_error,
+                )
+            try:
+                if _save_html_pdf_with_chromium(
+                    output_path,
+                    title=title,
+                    html_pages=inlined_html_pages,
+                    image_paths=source_images,
+                    screenshot_paths=source_screenshots,
+                    page_size_name=raw_page_size,
+                ):
+                    size_bytes = output_path.stat().st_size if output_path.exists() else 0
+                    html_embedded_image_paths = [
+                        str(item["path"])
+                        for item in embedded_html_images
+                        if isinstance(item.get("path"), str)
+                    ]
+                    has_media = bool(source_images or source_screenshots or html_embedded_image_paths)
+                    actual_page_count = _pdf_page_count(output_path, fallback=max(len(html_pages), 1) + (1 if has_media else 0))
+                    layout_features = [
+                        "custom_html_pages",
+                        "styled_tables",
+                        "clickable_links",
+                        "readable_text_layout",
+                    ]
+                    if has_media:
+                        layout_features.append("verified_media_embeds")
+                    return ToolResult(
+                        invocation_id=invocation.invocation_id,
+                        tool_name=invocation.tool_name,
+                        status="completed",
+                        output={
+                            "path": str(output_path),
+                            "artifact_path": str(output_path),
+                            "artifact_paths": [str(output_path)],
+                            "bytes_written": size_bytes,
+                            "page_count": actual_page_count,
+                            "html_pages": len(html_pages),
+                            "source_image_paths": [str(path) for path in source_images],
+                            "source_screenshot_paths": [str(path) for path in source_screenshots],
+                            "optimized_image_paths": _optimized_image_paths_for_output([*source_images, *source_screenshots]),
+                            "embedded_html_images": embedded_html_images,
+                            "text_layer": True,
+                            "quality_profile": "designed_pdf_v1",
+                            "layout_features": layout_features,
+                        },
+                        error=None,
+                    )
+            except Exception as exc:
+                logger.info("html_pdf_chromium_failed: %s", exc, exc_info=True)
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"path": str(output_path), "reason": "html_pdf_render_failed"},
+                error="PDF creation failed while rendering html_pages.",
             )
 
         if text_pages:
@@ -6292,8 +10641,9 @@ def _build_pdf_create_handler(
                         "styled_report_pages",
                         "clickable_links",
                         "readable_text_layout",
-                        "verified_media_embeds",
                     ]
+                    if source_images or source_screenshots:
+                        layout_features.append("verified_media_embeds")
                     if media_alignment_applied:
                         layout_features.append("media_aligned_report_pages")
                     return ToolResult(
@@ -6309,6 +10659,7 @@ def _build_pdf_create_handler(
                             "text_pages": len(text_pages_for_render),
                             "source_image_paths": [str(path) for path in source_images],
                             "source_screenshot_paths": [str(path) for path in source_screenshots],
+                            "optimized_image_paths": _optimized_image_paths_for_output([*source_images, *source_screenshots]),
                             "text_layer": True,
                             "quality_profile": "report_quality_v1",
                             "layout_features": layout_features,
@@ -6374,11 +10725,18 @@ def _build_pdf_create_handler(
                 "page_count": len(source_images) + len(source_screenshots) + len(text_pages),
                 "source_image_paths": source_images,
                 "source_screenshot_paths": source_screenshots,
+                "optimized_image_paths": _optimized_image_paths_for_output(
+                    [*(Path(path) for path in source_images), *(Path(path) for path in source_screenshots)]
+                ),
                 "quality_profile": "report_quality_v1",
                 "layout_features": [
                     "styled_report_pages",
                     "readable_text_layout",
-                    "verified_media_embeds",
+                    *(
+                        ["verified_media_embeds"]
+                        if source_images or source_screenshots
+                        else []
+                    ),
                 ],
             },
             error=None,
@@ -6459,9 +10817,13 @@ def _build_pdf_edit_handler(
 
         raw_output_path = invocation.arguments.get("output_path")
         if isinstance(raw_output_path, str) and raw_output_path.strip():
-            output_path = Path(raw_output_path).expanduser().resolve()
-            if output_path.suffix.lower() != ".pdf":
-                output_path = output_path.with_suffix(".pdf")
+            output_path = _explicit_output_path_or_generated_artifact_path(
+                invocation,
+                raw_path=raw_output_path,
+                suffix=".pdf",
+                stem=_safe_pdf_stem(f"{title}-edited"),
+                roots=effective_roots,
+            )
         else:
             output_path = _pdf_default_output_path(invocation, title=f"{title}-edited", roots=effective_roots)
         if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
@@ -6549,9 +10911,8 @@ def _build_pdf_edit_handler(
                         },
                         page_error,
                     )
-                temp_file = tempfile.NamedTemporaryFile(prefix="nullion-pdf-append-", suffix=".pdf", delete=False)
-                temp_path = Path(temp_file.name)
-                temp_file.close()
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = output_path.parent / f".{output_path.stem}-append-{uuid4().hex[:12]}.pdf"
                 temp_paths.append(temp_path)
                 try:
                     _save_pdf_pages(temp_path, pages, title=title)
@@ -6931,6 +11292,20 @@ def _build_terminal_exec_handler(
                 error=str(filesystem_denial.get("message") or "Filesystem traversal denied"),
             )
 
+        mutation_denial = _terminal_filesystem_mutation_approval_denial(
+            invocation,
+            execution_cwd=execution_cwd,
+            allowed_roots=resolved_allowed_roots,
+        )
+        if mutation_denial is not None:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="denied",
+                output=mutation_denial,
+                error=str(mutation_denial.get("message") or "Filesystem mutation approval required"),
+            )
+
         egress_attempts = _egress_attempts_for_invocation(invocation)
         raw_network_mode = invocation.arguments.get("network_mode")
         network_mode = _normalize_network_mode(raw_network_mode)
@@ -7078,12 +11453,47 @@ def _build_terminal_exec_handler(
         if has_network_egress:
             output["egress_attempts"] = egress_attempts
         if completed.exit_code == 0:
+            artifact_scan_roots = [
+                *(Path(root).expanduser().resolve() for root in resolved_allowed_roots),
+            ]
+            runtime_artifact_root = _runtime_artifact_root()
+            if runtime_artifact_root is not None:
+                artifact_scan_roots.insert(0, runtime_artifact_root)
+            principal_artifact_root = _workspace_artifact_root_for_principal(invocation.principal_id)
+            if principal_artifact_root is not None:
+                artifact_scan_roots.insert(0, principal_artifact_root)
             artifact_paths = _terminal_deliverable_artifact_paths_since(
-                resolved_allowed_roots,
+                tuple(dict.fromkeys(artifact_scan_roots)),
                 since_timestamp=started_at,
             )
             if artifact_paths:
                 output["artifact_paths"] = artifact_paths
+        terminal_output_path = _materialize_terminal_output_attachment(
+            output,
+            invocation=invocation,
+            execution_cwd=execution_cwd,
+            allowed_roots=resolved_allowed_roots,
+        )
+        if terminal_output_path:
+            raw_artifact_paths = output.get("artifact_paths")
+            artifact_paths = (
+                list(raw_artifact_paths)
+                if isinstance(raw_artifact_paths, (list, tuple, set, frozenset))
+                else ([raw_artifact_paths] if raw_artifact_paths else [])
+            )
+            artifact_paths.append(terminal_output_path)
+            output["artifact_paths"] = list(dict.fromkeys(str(path) for path in artifact_paths if str(path)))
+            output["terminal_output_path"] = terminal_output_path
+            descriptors = list(output.get("artifact_descriptors") or [])
+            descriptors.append(
+                artifact_output_descriptor(
+                    terminal_output_path,
+                    role=ARTIFACT_ROLE_DELIVERABLE,
+                    kind="terminal_output",
+                    label="Terminal output",
+                )
+            )
+            output["artifact_descriptors"] = descriptors
         error = None
         if completed.exit_code != 0:
             if completed.exit_code == 127 and completed.stderr.startswith(
@@ -7274,6 +11684,8 @@ class _BrowserImageCandidateHTMLParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
         self.candidates: list[dict[str, object]] = []
+        self._script_type: str | None = None
+        self._script_chunks: list[str] = []
 
     def _append(self, raw_url: object, *, role: str, attributes: dict[str, str]) -> None:
         image_url = _browser_image_url(raw_url, base_url=self.base_url)
@@ -7295,17 +11707,53 @@ class _BrowserImageCandidateHTMLParser(HTMLParser):
         for image_url in _browser_image_srcset_urls(raw_srcset, base_url=self.base_url):
             self._append(image_url, role=role, attributes=attributes)
 
+    def _append_style_urls(self, raw_style: object, *, role: str, attributes: dict[str, str]) -> None:
+        for match in re.finditer(r"url\(([^)]+)\)", str(raw_style or ""), flags=re.IGNORECASE):
+            raw_url = match.group(1).strip().strip("\"'")
+            self._append(raw_url, role=role, attributes=attributes)
+
+    def _append_json_ld_images(self, value: object, *, attributes: dict[str, str]) -> None:
+        if isinstance(value, str):
+            self._append(value, role="json_ld_image", attributes=attributes)
+            return
+        if isinstance(value, list):
+            for item in value:
+                self._append_json_ld_images(item, attributes=attributes)
+            return
+        if not isinstance(value, dict):
+            return
+        for key, nested in value.items():
+            normalized_key = str(key or "").strip().lower()
+            if normalized_key in {"image", "thumbnail", "thumbnailurl", "contenturl", "url"}:
+                self._append_json_ld_images(nested, attributes=attributes)
+            elif isinstance(nested, (dict, list)):
+                self._append_json_ld_images(nested, attributes=attributes)
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_name = tag.lower()
         attributes = {str(name).lower(): str(value or "") for name, value in attrs}
+        self._append_style_urls(attributes.get("style"), role="style_background", attributes=attributes)
         if tag_name == "img":
-            for attr_name in ("src", "data-src", "data-original", "data-lazy-src"):
+            for attr_name in (
+                "src",
+                "data-src",
+                "data-original",
+                "data-lazy-src",
+                "data-image",
+                "data-image-src",
+                "data-full-src",
+                "data-large-src",
+                "data-original-src",
+                "data-media-url",
+                "data-thumb",
+                "data-thumbnail",
+            ):
                 self._append(attributes.get(attr_name), role=f"img_{attr_name}", attributes=attributes)
             for attr_name in ("srcset", "data-srcset", "data-lazy-srcset"):
                 self._append_srcset(attributes.get(attr_name), role=f"img_{attr_name}", attributes=attributes)
             return
         if tag_name == "source":
-            for attr_name in ("srcset", "data-srcset"):
+            for attr_name in ("srcset", "data-srcset", "data-lazy-srcset"):
                 self._append_srcset(attributes.get(attr_name), role=f"source_{attr_name}", attributes=attributes)
             return
         if tag_name == "meta":
@@ -7321,6 +11769,30 @@ class _BrowserImageCandidateHTMLParser(HTMLParser):
             }
             if "image_src" in rel_tokens:
                 self._append(attributes.get("href"), role="link_image_src", attributes=attributes)
+            return
+        if tag_name == "script":
+            script_type = (attributes.get("type") or "").strip().lower()
+            if script_type in {"application/ld+json", "application/json+ld"}:
+                self._script_type = script_type
+                self._script_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._script_type:
+            self._script_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "script" or not self._script_type:
+            return
+        script_text = "".join(self._script_chunks).strip()
+        self._script_type = None
+        self._script_chunks = []
+        if not script_text:
+            return
+        try:
+            payload = json.loads(script_text)
+        except json.JSONDecodeError:
+            return
+        self._append_json_ld_images(payload, attributes={})
 
 
 def _browser_image_candidates_from_html(html: str, *, page_url: str | None = None) -> list[dict[str, object]]:
@@ -7343,6 +11815,48 @@ def _dedupe_browser_image_candidates(candidates: Iterable[dict[str, object]]) ->
         seen.add(key)
         deduped.append({**candidate, "source_url": key})
     return deduped
+
+
+def _browser_image_candidate_declared_pixels(candidate: dict[str, object]) -> int:
+    def dimension(value: object) -> int:
+        match = re.search(r"\d+", str(value or ""))
+        if not match:
+            return 0
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return 0
+
+    return dimension(candidate.get("width")) * dimension(candidate.get("height"))
+
+
+def _browser_image_candidate_sort_key(candidate: dict[str, object]) -> tuple[int, int, int]:
+    role = str(candidate.get("role") or "")
+    role_priority = 2 if role in {"explicit", "page_url_image"} else 1 if role.startswith(("og:", "twitter:")) else 0
+    text_score = int(bool(str(candidate.get("alt") or "").strip())) + int(bool(str(candidate.get("title") or "").strip()))
+    return (role_priority, _browser_image_candidate_declared_pixels(candidate), text_score)
+
+
+def _browser_image_content_quality_error(
+    *,
+    data_bytes: int,
+    width: int,
+    height: int,
+    luma_stddev: float,
+) -> str | None:
+    if data_bytes < _BROWSER_IMAGE_CONTENT_MIN_BYTES:
+        return f"image is too small for document media ({data_bytes} bytes)"
+    if width < _BROWSER_IMAGE_CONTENT_MIN_WIDTH or height < _BROWSER_IMAGE_CONTENT_MIN_HEIGHT:
+        return f"image dimensions are too small for document media ({width}x{height})"
+    if width * height < _BROWSER_IMAGE_CONTENT_MIN_PIXELS:
+        return f"image area is too small for document media ({width * height} pixels)"
+    shortest = max(1, min(width, height))
+    aspect_ratio = max(width, height) / shortest
+    if aspect_ratio > _BROWSER_IMAGE_CONTENT_MAX_ASPECT_RATIO:
+        return f"image aspect ratio is too extreme for document media ({aspect_ratio:.2f}:1)"
+    if luma_stddev < _BROWSER_IMAGE_CONTENT_MIN_LUMA_STDDEV:
+        return f"image has too little visual detail for document media (luma stddev {luma_stddev:.2f})"
+    return None
 
 
 def _fetch_browser_image_binary(url: str, timeout_seconds: int) -> dict[str, object]:
@@ -7412,6 +11926,7 @@ def _materialize_browser_image_artifact(
     invocation: ToolInvocation,
     image_payload: dict[str, object],
     output_stem: str,
+    quality_profile: str = "content",
 ) -> dict[str, object]:
     data = image_payload.get("data")
     if not isinstance(data, bytes) or not data:
@@ -7427,6 +11942,19 @@ def _materialize_browser_image_artifact(
     with Image.open(BytesIO(data)) as image:
         width, height = image.size
         image_format = str(image.format or "").upper()
+        if quality_profile == "content":
+            from PIL import ImageStat
+
+            preview = image.convert("L").resize((64, 64))
+            luma_stddev = float(ImageStat.Stat(preview).stddev[0])
+            quality_error = _browser_image_content_quality_error(
+                data_bytes=len(data),
+                width=width,
+                height=height,
+                luma_stddev=luma_stddev,
+            )
+            if quality_error is not None:
+                raise ValueError(quality_error)
         if image_format in _BROWSER_IMAGE_FORMAT_SUFFIXES:
             suffix = _BROWSER_IMAGE_FORMAT_SUFFIXES[image_format]
             converted_bytes = data
@@ -7468,6 +11996,22 @@ def _build_browser_image_collect_handler() -> ToolHandler:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "max_images must be an integer")
         max_images = max(1, min(_BROWSER_IMAGE_COLLECT_MAX_IMAGES, max_images))
         output_stem = str(invocation.arguments.get("output_stem") or "browser-image").strip() or "browser-image"
+        quality_profile = str(invocation.arguments.get("quality_profile") or "content").strip().lower()
+        if quality_profile not in {"content", "any"}:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {},
+                "quality_profile must be one of: content, any",
+            )
+        raw_timeout_seconds = invocation.arguments.get("timeout_seconds")
+        try:
+            total_timeout_seconds = float(raw_timeout_seconds) if raw_timeout_seconds is not None else 12.0
+        except (TypeError, ValueError):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "timeout_seconds must be a number")
+        total_timeout_seconds = max(2.0, min(30.0, total_timeout_seconds))
+        deadline = perf_counter() + total_timeout_seconds
         page_url = _browser_image_url(invocation.arguments.get("page_url"))
         html = invocation.arguments.get("html")
         if html is not None and not isinstance(html, str):
@@ -7484,7 +12028,7 @@ def _build_browser_image_collect_handler() -> ToolHandler:
         skipped: list[dict[str, object]] = []
         if page_url and not html:
             try:
-                fetched_page = _default_web_fetcher(page_url, 20)
+                fetched_page = _default_web_fetcher(page_url, min(6, max(1, int(deadline - perf_counter()))))
             except Exception as exc:
                 skipped.append({"source_url": page_url, "reason": f"page_fetch_failed: {exc}"})
             else:
@@ -7497,7 +12041,11 @@ def _build_browser_image_collect_handler() -> ToolHandler:
         if isinstance(html, str) and html.strip():
             candidates.extend(_browser_image_candidates_from_html(html, page_url=page_url))
 
-        candidates = _dedupe_browser_image_candidates(candidates)
+        candidates = sorted(
+            _dedupe_browser_image_candidates(candidates),
+            key=_browser_image_candidate_sort_key,
+            reverse=True,
+        )[: max(max_images * 3, max_images)]
         if not candidates:
             return ToolResult(
                 invocation.invocation_id,
@@ -7511,17 +12059,22 @@ def _build_browser_image_collect_handler() -> ToolHandler:
         for candidate in candidates:
             if len(images) >= max_images:
                 break
+            remaining_seconds = deadline - perf_counter()
+            if remaining_seconds <= 0:
+                skipped.append({"source_url": str(candidate.get("source_url") or ""), "reason": "image collection time budget exhausted"})
+                break
             source_url = str(candidate.get("source_url") or "")
             try:
                 image_payload = (
                     _browser_image_bytes_from_data_url(source_url)
                     if source_url.startswith("data:image/")
-                    else _fetch_browser_image_binary(source_url, 20)
+                    else _fetch_browser_image_binary(source_url, max(1, min(4, int(remaining_seconds))))
                 )
                 materialized = _materialize_browser_image_artifact(
                     invocation=invocation,
                     image_payload=image_payload,
                     output_stem=output_stem,
+                    quality_profile=quality_profile,
                 )
             except Exception as exc:
                 skipped.append({"source_url": source_url, "reason": str(exc)})
@@ -7537,10 +12090,15 @@ def _build_browser_image_collect_handler() -> ToolHandler:
         output = {
             "image_paths": image_paths,
             "artifact_paths": image_paths,
+            "artifact_descriptors": [
+                artifact_output_descriptor(path, role=ARTIFACT_ROLE_SOURCE, kind="browser_image")
+                for path in image_paths
+            ],
             "images": images,
             "skipped_images": skipped,
             "candidate_count": len(candidates),
             "saved_count": len(image_paths),
+            "timeout_seconds": total_timeout_seconds,
         }
         if not image_paths:
             output["reason"] = "image_collection_failed"
@@ -7575,6 +12133,7 @@ def register_browser_image_collect_tool(registry: ToolRegistry) -> ToolRegistry:
             requires_approval=False,
             timeout_seconds=30,
             capability_tags=("public_web", "browser", "media", "image", "artifact"),
+            continuation_tools=("document_create", "spreadsheet_create", "presentation_create", "pdf_create"),
         ),
         _build_browser_image_collect_handler(),
     )
@@ -7607,11 +12166,427 @@ def register_web_fetch_tool(
     return registry
 
 
-def _json_get(url: str, timeout_seconds: int) -> object:
+def _filename_from_content_disposition(value: str | None) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    for part in value.split(";"):
+        key, sep, raw = part.strip().partition("=")
+        if not sep:
+            continue
+        if key.strip().lower() in {"filename", "filename*"}:
+            candidate = raw.strip().strip("\"'")
+            if "''" in candidate:
+                candidate = candidate.split("''", 1)[1]
+            candidate = unquote(candidate).strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _safe_download_filename(value: object, *, url: str, content_type: str | None = None) -> str:
+    raw_name = str(value or "").strip()
+    if not raw_name:
+        raw_name = Path(unquote(urlparse(url).path or "")).name
+    if not raw_name:
+        suffix = _web_fetch_binary_suffix(url, content_type or "application/octet-stream")
+        raw_name = f"download{suffix}"
+    name = Path(raw_name).name.strip().replace("\x00", "")
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")
+    if not name:
+        name = "download.bin"
+    if "." not in name:
+        suffix = _web_fetch_binary_suffix(url, content_type or "application/octet-stream")
+        if suffix:
+            name = f"{name}{suffix}"
+    return name[:180]
+
+
+def _file_download_error_result(
+    invocation: ToolInvocation,
+    *,
+    error: str,
+    reason: str,
+    output: dict[str, object] | None = None,
+) -> ToolResult:
+    payload = dict(output or {})
+    payload["reason"] = reason
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output=payload,
+        error=error,
+    )
+
+
+def _file_download_timeout_seconds(raw_timeout: object) -> float:
+    default_timeout = 45.0
+    if raw_timeout is None:
+        return default_timeout
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        return default_timeout
+    return max(2.0, min(60.0, timeout))
+
+
+def _try_set_response_socket_timeout(response: object, timeout_seconds: float) -> None:
+    for attr_path in (
+        ("fp", "raw", "_sock"),
+        ("fp", "raw", "_fp", "fp", "raw", "_sock"),
+    ):
+        target = response
+        try:
+            for attr in attr_path:
+                target = getattr(target, attr)
+            settimeout = getattr(target, "settimeout", None)
+            if callable(settimeout):
+                settimeout(max(1.0, float(timeout_seconds)))
+                return
+        except Exception:
+            continue
+
+
+def _download_archive_integrity_error(path: Path, *, final_url: str, content_type: str) -> str | None:
+    suffixes = {path.suffix.lower(), Path(unquote(urlparse(final_url).path or "")).suffix.lower()}
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    looks_like_zip = ".zip" in suffixes or "zip" in media_type
+    if looks_like_zip and not zipfile.is_zipfile(path):
+        return f"Downloaded archive is not a valid ZIP file: {path}"
+    return None
+
+
+def _build_file_download_handler(
+    workspace_root: str | Path | None = None,
+    allowed_roots: list[Path] | tuple[Path, ...] | None = None,
+    *,
+    include_principal_workspace: bool = True,
+) -> ToolHandler:
+    resolved_root = Path(workspace_root).resolve() if workspace_root is not None else None
+    resolved_allowed_roots = tuple(Path(root).resolve() for root in allowed_roots) if allowed_roots is not None else None
+
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_url = invocation.arguments.get("url")
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            return _file_download_error_result(invocation, error="Missing required argument: url", reason="missing_url")
+        url = raw_url.strip()
+        resolution = _resolve_web_fetch_resolution(url)
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not isinstance(host, str)
+            or not host
+            or (resolution is None and not _is_global_literal_ip(host))
+        ):
+            return _file_download_error_result(
+                invocation,
+                error=f"Blocked URL for file_download: {url}",
+                reason="blocked_url",
+                output={"url": url},
+            )
+        effective_roots = _effective_filesystem_roots(
+            invocation=invocation,
+            resolved_root=resolved_root,
+            resolved_allowed_roots=resolved_allowed_roots,
+            include_principal_workspace=include_principal_workspace,
+        )
+        if not effective_roots:
+            return _file_download_error_result(
+                invocation,
+                error="file_download requires workspace_root or allowed_roots",
+                reason="missing_workspace_roots",
+                output={"url": url},
+            )
+        raw_max_bytes = invocation.arguments.get("max_bytes")
+        max_bytes = _FILE_DOWNLOAD_MAX_BYTES
+        if isinstance(raw_max_bytes, int) and raw_max_bytes > 0:
+            max_bytes = min(raw_max_bytes, _FILE_DOWNLOAD_MAX_BYTES)
+        timeout_seconds = _file_download_timeout_seconds(invocation.arguments.get("timeout_seconds"))
+        try:
+            integrity_retry_attempt = int(invocation.arguments.get("_download_integrity_retry_attempt") or 0)
+        except (TypeError, ValueError):
+            integrity_retry_attempt = 0
+        deadline = perf_counter() + timeout_seconds
+        raw_output_path = invocation.arguments.get("output_path")
+        output_path: Path | None = None
+        if isinstance(raw_output_path, str) and raw_output_path.strip():
+            candidate = Path(raw_output_path).expanduser()
+            output_path = candidate.resolve() if candidate.is_absolute() else (effective_roots[0] / candidate).resolve()
+            if not _path_within_any_root(output_path, effective_roots) and not _is_approved_filesystem_path(
+                output_path, invocation.trusted_filesystem_selectors
+            ):
+                return _file_download_error_result(
+                    invocation,
+                    error=f"Output path is outside workspace root: {output_path}",
+                    reason="output_path_outside_workspace",
+                    output={"url": url, "output_path": str(output_path)},
+                )
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        try:
+            opener = _build_web_fetch_opener()
+            with _pinned_web_fetch_resolution(resolution):
+                socket_timeout = min(10.0, max(1.0, timeout_seconds))
+                with opener.open(request, timeout=socket_timeout) as response:
+                    status_code = int(getattr(response, "status", 200) or 200)
+                    final_url = response.geturl()
+                    content_type = response.headers.get_content_type()
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        expected_bytes = int(content_length) if content_length else None
+                    except ValueError:
+                        expected_bytes = None
+                    if expected_bytes is not None and expected_bytes > max_bytes:
+                        return _file_download_error_result(
+                            invocation,
+                            error=f"Download is too large: {expected_bytes} bytes exceeds {max_bytes} bytes",
+                            reason="download_too_large",
+                            output={
+                                "url": url,
+                                "final_url": final_url,
+                                "content_type": content_type,
+                                "content_length": expected_bytes,
+                                "max_bytes": max_bytes,
+                            },
+                        )
+                    if output_path is None:
+                        header_name = _filename_from_content_disposition(response.headers.get("Content-Disposition"))
+                        safe_name = _safe_download_filename(
+                            invocation.arguments.get("filename") or header_name,
+                            url=final_url or url,
+                            content_type=content_type,
+                        )
+                        from nullion.artifacts import artifact_path_for_generated_workspace_file
+
+                        suffix = Path(safe_name).suffix or _web_fetch_binary_suffix(final_url or url, content_type)
+                        output_path = artifact_path_for_generated_workspace_file(
+                            principal_id=invocation.principal_id,
+                            suffix=suffix,
+                            stem=Path(safe_name).stem or "download",
+                        )
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    bytes_written = 0
+                    with output_path.open("wb") as target:
+                        while True:
+                            remaining_seconds = deadline - perf_counter()
+                            if remaining_seconds <= 0:
+                                target.close()
+                                try:
+                                    output_path.unlink()
+                                except OSError:
+                                    pass
+                                return _file_download_error_result(
+                                    invocation,
+                                    error=f"Download timed out after {timeout_seconds:g}s",
+                                    reason="download_timeout",
+                                    output={
+                                        "url": url,
+                                        "final_url": final_url,
+                                        "content_type": content_type,
+                                        "bytes_read": bytes_written,
+                                        "timeout_seconds": timeout_seconds,
+                                    },
+                                )
+                            _try_set_response_socket_timeout(response, min(socket_timeout, remaining_seconds))
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            bytes_written += len(chunk)
+                            if perf_counter() > deadline:
+                                target.close()
+                                try:
+                                    output_path.unlink()
+                                except OSError:
+                                    pass
+                                return _file_download_error_result(
+                                    invocation,
+                                    error=f"Download timed out after {timeout_seconds:g}s",
+                                    reason="download_timeout",
+                                    output={
+                                        "url": url,
+                                        "final_url": final_url,
+                                        "content_type": content_type,
+                                        "bytes_read": bytes_written,
+                                        "timeout_seconds": timeout_seconds,
+                                    },
+                                )
+                            if bytes_written > max_bytes:
+                                target.close()
+                                try:
+                                    output_path.unlink()
+                                except OSError:
+                                    pass
+                                return _file_download_error_result(
+                                    invocation,
+                                    error=f"Download exceeded {max_bytes} bytes",
+                                    reason="download_too_large",
+                                    output={
+                                        "url": url,
+                                        "final_url": final_url,
+                                        "content_type": content_type,
+                                        "bytes_read": bytes_written,
+                                        "max_bytes": max_bytes,
+                                    },
+                                )
+                            target.write(chunk)
+        except Exception as exc:
+            return _file_download_error_result(
+                invocation,
+                error=f"Could not download file: {exc}",
+                reason="download_failed",
+                output={"url": url},
+            )
+        integrity_error = _download_archive_integrity_error(
+            output_path,
+            final_url=str(final_url or url),
+            content_type=str(content_type or ""),
+        )
+        if integrity_error:
+            bytes_written = output_path.stat().st_size if output_path.exists() else 0
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+            if integrity_retry_attempt < 1:
+                retry_args = dict(invocation.arguments)
+                retry_args["_download_integrity_retry_attempt"] = integrity_retry_attempt + 1
+                retry_args["timeout_seconds"] = max(timeout_seconds, 60.0)
+                return handler(replace(invocation, arguments=retry_args))
+            return _file_download_error_result(
+                invocation,
+                error=integrity_error,
+                reason="download_integrity_failed",
+                output={
+                    "url": url,
+                    "final_url": final_url,
+                    "content_type": content_type,
+                    "bytes_read": bytes_written,
+                    "timeout_seconds": timeout_seconds,
+                },
+            )
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="completed",
+            output={
+                "url": url,
+                "final_url": final_url,
+                "status_code": status_code,
+                "content_type": content_type,
+                "path": str(output_path),
+                "artifact_path": str(output_path),
+                "artifact_paths": [str(output_path)],
+                "artifact_descriptors": [
+                    artifact_output_descriptor(output_path, role=ARTIFACT_ROLE_SOURCE, kind="download")
+                ],
+                "bytes_written": output_path.stat().st_size,
+                "max_bytes": max_bytes,
+                "timeout_seconds": timeout_seconds,
+            },
+            error=None,
+        )
+
+    return handler
+
+
+def _json_get(url: str, timeout_seconds: int, *, attempts: int = 3) -> object:
     request = urllib.request.Request(url, headers={"User-Agent": "Nullion/1.0"})
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        payload = response.read(500_000)
+    last_error: Exception | None = None
+    for _attempt in range(max(1, attempts)):
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=_web_fetch_tls_context()),
+            )
+            with opener.open(request, timeout=timeout_seconds) as response:
+                payload = response.read(500_000)
+            break
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            last_error = exc
+    else:
+        assert last_error is not None
+        raise last_error
     return json.loads(payload.decode("utf-8"))
+
+
+def _weather_json_get(url: str, timeout_seconds: int) -> object:
+    return _json_get(url, timeout_seconds, attempts=1)
+
+
+def _weather_http_timeout_seconds() -> int:
+    raw = os.getenv("NULLION_WEATHER_HTTP_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            return min(15, max(2, int(raw)))
+        except ValueError:
+            pass
+    return 5
+
+
+_WEATHER_LOCATION_CACHE_LOCK = threading.Lock()
+_WEATHER_LOCATION_CACHE: dict[tuple[int, str], tuple[float, dict[str, object]]] = {}
+
+
+def _weather_location_cache_ttl_seconds() -> int:
+    raw = os.getenv("NULLION_WEATHER_LOCATION_CACHE_TTL_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(0, min(7 * 24 * 60 * 60, int(raw)))
+        except ValueError:
+            pass
+    return 24 * 60 * 60
+
+
+def _weather_location_cache_key(location_text: str, json_get: Callable[[str, int], object]) -> tuple[int, str]:
+    normalized = " ".join(str(location_text or "").strip().lower().split())
+    return (id(json_get), normalized)
+
+
+def _cached_weather_location(
+    location_text: str,
+    *,
+    json_get: Callable[[str, int], object],
+) -> dict[str, object] | None:
+    ttl_seconds = _weather_location_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        return None
+    key = _weather_location_cache_key(location_text, json_get)
+    now = perf_counter()
+    with _WEATHER_LOCATION_CACHE_LOCK:
+        cached = _WEATHER_LOCATION_CACHE.get(key)
+        if not cached:
+            return None
+        cached_at, location = cached
+        if now - cached_at > ttl_seconds:
+            _WEATHER_LOCATION_CACHE.pop(key, None)
+            return None
+        return dict(location)
+
+
+def _remember_weather_location(
+    location_text: str,
+    location: dict[str, object],
+    *,
+    json_get: Callable[[str, int], object],
+) -> dict[str, object]:
+    ttl_seconds = _weather_location_cache_ttl_seconds()
+    if ttl_seconds <= 0:
+        return location
+    key = _weather_location_cache_key(location_text, json_get)
+    with _WEATHER_LOCATION_CACHE_LOCK:
+        _WEATHER_LOCATION_CACHE[key] = (perf_counter(), dict(location))
+    return location
 
 
 def _coerce_float_arg(value: object, *, name: str) -> float | None:
@@ -7640,6 +12615,9 @@ def _resolve_open_meteo_location(
         }
     if not location_text:
         raise ValueError("Provide location_text or latitude and longitude.")
+    cached_location = _cached_weather_location(location_text, json_get=json_get)
+    if cached_location is not None:
+        return cached_location
     source_url = ""
     results: object = None
     searched_locations: list[str] = []
@@ -7648,7 +12626,7 @@ def _resolve_open_meteo_location(
         searched_locations.append(candidate_location)
         query = urlencode({"name": candidate_location, "count": 1, "language": "en", "format": "json"})
         source_url = f"https://geocoding-api.open-meteo.com/v1/search?{query}"
-        payload = json_get(source_url, 10)
+        payload = json_get(source_url, _weather_http_timeout_seconds())
         results = payload.get("results") if isinstance(payload, dict) else None
         if isinstance(results, list) and results:
             break
@@ -7661,7 +12639,7 @@ def _resolve_open_meteo_location(
                 json_get=json_get,
             )
             if nominatim_result is not None:
-                return nominatim_result
+                return _remember_weather_location(location_text, nominatim_result, json_get=json_get)
     if not isinstance(results, list) or not results:
         searched = ", ".join(searched_locations)
         raise ValueError(f"Could not resolve location: {location_text}" + (f" (tried: {searched})" if searched else ""))
@@ -7678,14 +12656,14 @@ def _resolve_open_meteo_location(
         str(first.get("country") or "").strip(),
     ]
     label = ", ".join(part for part in label_parts if part) or location_text
-    return {
+    return _remember_weather_location(location_text, {
         "latitude": resolved_latitude,
         "longitude": resolved_longitude,
         "name": label,
         "country": first.get("country"),
         "timezone": first.get("timezone"),
         "source_url": source_url,
-    }
+    }, json_get=json_get)
 
 
 def _weather_location_text_candidates(location_text: str) -> list[str]:
@@ -7697,7 +12675,7 @@ def _weather_location_text_candidates(location_text: str) -> list[str]:
     if zip_match:
         zip_code = zip_match.group(1)
         if zip_code != raw:
-            candidates.append(zip_code)
+            candidates.insert(0, zip_code)
     parts = [" ".join(part.split()).strip() for part in raw.split(",") if part.strip()]
     if len(parts) >= 2:
         first = parts[0]
@@ -7722,7 +12700,7 @@ def _resolve_nominatim_weather_location(
 ) -> dict[str, object] | None:
     query = urlencode({"q": location_text, "format": "jsonv2", "limit": 1, "addressdetails": 1})
     source_url = f"https://nominatim.openstreetmap.org/search?{query}"
-    payload = json_get(source_url, 10)
+    payload = json_get(source_url, _weather_http_timeout_seconds())
     if not isinstance(payload, list) or not payload:
         return None
     first = payload[0]
@@ -7893,7 +12871,7 @@ def _build_weather_forecast_handler(
                 )
             query = urlencode(query_args)
             forecast_url = f"https://api.open-meteo.com/v1/forecast?{query}"
-            payload = json_get(forecast_url, 15)
+            payload = json_get(forecast_url, _weather_http_timeout_seconds())
             if not isinstance(payload, dict):
                 raise ValueError("Weather forecast response was not a JSON object.")
             hourly_rows = _hourly_open_meteo_forecast(payload, limit_hours=hourly_limit) if include_hourly else []
@@ -7954,7 +12932,37 @@ def register_weather_forecast_tool(
             timeout_seconds=20,
             capability_tags=("public_web", "weather", "forecast"),
         ),
-        _build_weather_forecast_handler(json_get or _json_get),
+        _build_weather_forecast_handler(json_get or _weather_json_get),
+    )
+    return registry
+
+
+def register_market_quote_tool(
+    registry: ToolRegistry,
+    *,
+    quote_fetcher: Callable[[str, int], dict[str, object]] | None = None,
+) -> ToolRegistry:
+    try:
+        registry.get_spec("market_quote")
+        return registry
+    except KeyError:
+        pass
+    registry.register(
+        ToolSpec(
+            name="market_quote",
+            description=(
+                "Fetch structured public market quote rows for explicit ticker symbols. "
+                "Use before browser navigation or general web search for current equity/ETF quote checks "
+                "when concrete symbols are available."
+            ),
+            risk_level=ToolRiskLevel.LOW,
+            side_effect_class=ToolSideEffectClass.READ,
+            requires_approval=False,
+            timeout_seconds=20,
+            input_schema=_default_input_schema_for_tool("market_quote"),
+            capability_tags=("public_web", "market_data", "quote"),
+        ),
+        _build_market_quote_handler(quote_fetcher or _default_market_quote_fetcher),
     )
     return registry
 
@@ -8003,6 +13011,64 @@ def _build_kernel_tool_registry(
                 timeout_seconds=20,
             ),
             _build_file_write_handler(
+                None
+                if workspace_root is None
+                else Path(workspace_root),
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
+            ),
+        )
+        registry.register(
+            ToolSpec(
+                name="file_download",
+                description="Download an HTTP/HTTPS URL directly to a workspace file without shell execution.",
+                risk_level=ToolRiskLevel.MEDIUM,
+                side_effect_class=ToolSideEffectClass.WRITE,
+                requires_approval=False,
+                timeout_seconds=60,
+            ),
+            _build_file_download_handler(
+                None
+                if workspace_root is None
+                else Path(workspace_root),
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
+            ),
+        )
+        registry.register(
+            ToolSpec(
+                name="archive_extract",
+                description=(
+                    "Extract supported archive/compression files (.zip, .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, "
+                    ".tar.xz/.txz, .gz, .bz2, .xz) into a workspace directory. Skips macOS metadata sidecar "
+                    "entries unless include_metadata is true. Also writes full CSV, JSON, and XLSX entry "
+                    "manifests so downstream spreadsheet/report tasks can use the complete inventory even when "
+                    "the tool result is compacted."
+                ),
+                risk_level=ToolRiskLevel.MEDIUM,
+                side_effect_class=ToolSideEffectClass.WRITE,
+                requires_approval=False,
+                timeout_seconds=30,
+            ),
+            _build_archive_extract_handler(
+                None
+                if workspace_root is None
+                else Path(workspace_root),
+                allowed_roots=[Path(root) for root in allowed_roots] if allowed_roots is not None else None,
+            ),
+        )
+        registry.register(
+            ToolSpec(
+                name="archive_create",
+                description=(
+                    "Create supported archive/compression files (.zip, .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, "
+                    ".tar.xz/.txz, .gz, .bz2, .xz) from workspace files or directories. Skips macOS metadata "
+                    "sidecar entries unless include_metadata is true."
+                ),
+                risk_level=ToolRiskLevel.MEDIUM,
+                side_effect_class=ToolSideEffectClass.WRITE,
+                requires_approval=False,
+                timeout_seconds=30,
+            ),
+            _build_archive_create_handler(
                 None
                 if workspace_root is None
                 else Path(workspace_root),
@@ -8119,8 +13185,10 @@ def _build_kernel_tool_registry(
             ToolSpec(
                 name="terminal_exec",
                 description=(
-                    "Execute a local shell command as a last-resort fallback. "
-                    "Use dedicated structured tools and reusable Python-backed local tools first when they can satisfy the task."
+                    "Execute a local shell command with approval. Use this for local system inspection, installed software "
+                    "or package-manager changes, service/process control, environment/path checks, and other computer-level "
+                    "work when no safer dedicated structured tool can satisfy the task. Use dedicated structured tools and "
+                    "reusable Python-backed local tools first when they can satisfy the task."
                 ),
                 risk_level=ToolRiskLevel.HIGH,
                 side_effect_class=ToolSideEffectClass.DANGEROUS_EXEC,
@@ -8144,6 +13212,7 @@ def _build_kernel_tool_registry(
         if _env_flag("NULLION_FILE_ACCESS_ENABLED"):
             register_browser_image_collect_tool(registry)
         register_weather_forecast_tool(registry)
+        register_market_quote_tool(registry)
     if _connector_access_enabled():
         register_connector_plugin(registry)
     if _env_flag("NULLION_SKILL_PACK_ACCESS_ENABLED", default=False):
@@ -8347,7 +13416,22 @@ def _connector_credential_candidate_names(connection: object | None, provider_id
     return tuple(dict.fromkeys(candidates))
 
 
+def _account_read_tool_timeout_seconds() -> int:
+    return min(
+        90,
+        _env_int("NULLION_ACCOUNT_READ_TOOL_TIMEOUT_SECONDS", 45, minimum=20),
+    )
+
+
+def _email_search_detail_fetch_limit() -> int:
+    return min(
+        5,
+        _env_int("NULLION_EMAIL_SEARCH_DETAIL_FETCH_LIMIT", 3, minimum=0),
+    )
+
+
 def register_connector_plugin(registry: ToolRegistry) -> None:
+    email_tool_timeout_seconds = _account_read_tool_timeout_seconds()
     try:
         registry.get_spec("connector_request")
     except KeyError:
@@ -8360,7 +13444,10 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
                     "configured connection credential. GET/HEAD are always read-only; POST, PUT, PATCH, and "
                     "DELETE require that connection's permission mode to be read_write. Use enabled connector "
                     "skill instructions, keep requests under that provider's configured base URL, and never "
-                    "reveal the credential value. Use public web/browser tools for generic public URLs instead."
+                    "reveal the credential value. If connector skill docs show path-only routes such as "
+                    "/app/native/path, pass that connector-relative path directly or combine it with the "
+                    "configured connector gateway base; do not prepend the native third-party host. Use public "
+                    "web/browser tools for generic public URLs instead."
                 ),
                 risk_level=ToolRiskLevel.HIGH,
                 side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
@@ -8370,6 +13457,200 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
             ),
             _build_connector_request_handler(),
         )
+    try:
+        registry.get_spec("email_search")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="email_search",
+                description=(
+                    "Search messages through an active Google Mail connector. Use this for inbox checks, "
+                    "triage, and finding message ids. Search results are metadata-only but include enough "
+                    "headers/snippets for broad inbox triage and prioritization. For broad multi-message "
+                    "summaries, start from these previews and read only the few selected messages whose full "
+                    "body is needed. Call email_read with a returned id before summarizing full body content "
+                    "or claiming a specific message body was read."
+                ),
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=email_tool_timeout_seconds,
+                input_schema=_email_search_input_schema(),
+                capability_tags=("email", "connector", "account_read"),
+                continuation_tools=("email_read",),
+            ),
+            _build_connector_email_search_handler(),
+        )
+    try:
+        registry.get_spec("email_read")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="email_read",
+                description=(
+                    "Read one full message through an active Google Mail connector. The id must be exactly one "
+                    "email_search.results[].id value; do not infer ids or pass placeholders. Use this whenever "
+                    "the user asks to read, summarize, inspect, or act on message body content. HTML links are "
+                    "returned as structured message.links entries when present, including hidden href targets. "
+                    "Attachments are returned as structured message.attachments entries with attachmentId values."
+                ),
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=email_tool_timeout_seconds,
+                input_schema=_email_read_input_schema(),
+                capability_tags=("email", "connector", "account_read"),
+            ),
+            _build_connector_email_read_handler(),
+        )
+    try:
+        registry.get_spec("email_attachment_read")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="email_attachment_read",
+                description=(
+                    "Fetch one Gmail attachment through an active Google Mail connector. The message_id and "
+                    "attachment_id must be exact values returned from email_read.message.attachments[]. Use this "
+                    "when the user asks for an attachment, checklist, document, file, invoice, receipt, or other "
+                    "message attachment content."
+                ),
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=email_tool_timeout_seconds,
+                input_schema=_email_attachment_read_input_schema(),
+                capability_tags=("email", "connector", "account_read"),
+                continuation_tools=("file_read", "terminal_exec"),
+            ),
+            _build_connector_email_attachment_read_handler(),
+        )
+    try:
+        registry.get_spec("calendar_list")
+    except KeyError:
+        registry.mark_plugin_installed("connector_plugin")
+        registry.register(
+            ToolSpec(
+                name="calendar_list",
+                description=(
+                    "List calendar events through an active Google Calendar connector for a specific time window. "
+                    "Use this for agenda, schedule, availability, and calendar checks. If the user asks for a "
+                    "calendar check without a time window, choose a near-term window such as today through the "
+                    "next 7 days instead of asking for options first."
+                ),
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=20,
+                input_schema=_calendar_list_input_schema(),
+                capability_tags=("calendar", "connector", "account_read"),
+            ),
+            _build_connector_calendar_list_handler(),
+        )
+    for spec, handler in (
+        (
+            ToolSpec(
+                name="calendar_create",
+                description=(
+                    "Create a Google Calendar event through an active write-capable Google Calendar connector. "
+                    "Use calendar_list first when the event should be checked against existing calendar state. "
+                    "Requires explicit approval before mutating the calendar."
+                ),
+                risk_level=ToolRiskLevel.HIGH,
+                side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
+                requires_approval=True,
+                timeout_seconds=20,
+                input_schema=_calendar_create_input_schema(),
+                capability_tags=("calendar", "connector", "account_write"),
+                continuation_tools=("calendar_list", "calendar_update", "calendar_delete"),
+            ),
+            _build_connector_calendar_create_handler(),
+        ),
+        (
+            ToolSpec(
+                name="calendar_update",
+                description=(
+                    "Update or reschedule an existing Google Calendar event through an active write-capable "
+                    "Google Calendar connector. The event_id must be an exact id from calendar_list or a prior "
+                    "calendar write result. Requires explicit approval before mutating the calendar."
+                ),
+                risk_level=ToolRiskLevel.HIGH,
+                side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
+                requires_approval=True,
+                timeout_seconds=20,
+                input_schema=_calendar_update_input_schema(),
+                capability_tags=("calendar", "connector", "account_write"),
+                continuation_tools=("calendar_list", "calendar_delete"),
+            ),
+            _build_connector_calendar_update_handler(),
+        ),
+        (
+            ToolSpec(
+                name="calendar_respond",
+                description=(
+                    "Accept, decline, or tentatively respond to a Google Calendar event through an active "
+                    "write-capable Google Calendar connector. The event_id must be exact. Requires explicit "
+                    "approval before mutating the calendar."
+                ),
+                risk_level=ToolRiskLevel.HIGH,
+                side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
+                requires_approval=True,
+                timeout_seconds=20,
+                input_schema=_calendar_respond_input_schema(),
+                capability_tags=("calendar", "connector", "account_write"),
+                continuation_tools=("calendar_list",),
+            ),
+            _build_connector_calendar_respond_handler(),
+        ),
+        (
+            ToolSpec(
+                name="calendar_delete",
+                description=(
+                    "Delete/cancel an existing Google Calendar event through an active write-capable Google "
+                    "Calendar connector. The event_id must be exact. Requires explicit approval before mutating "
+                    "the calendar."
+                ),
+                risk_level=ToolRiskLevel.HIGH,
+                side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
+                requires_approval=True,
+                timeout_seconds=20,
+                input_schema=_calendar_delete_input_schema(),
+                capability_tags=("calendar", "connector", "account_write"),
+                continuation_tools=("calendar_list",),
+            ),
+            _build_connector_calendar_delete_handler(),
+        ),
+    ):
+        try:
+            registry.get_spec(spec.name)
+        except KeyError:
+            registry.mark_plugin_installed("connector_plugin")
+            registry.register(spec, handler)
+    try:
+        registry.get_spec("email_send")
+        return
+    except KeyError:
+        pass
+    registry.mark_plugin_installed("connector_plugin")
+    registry.register(
+        ToolSpec(
+            name="email_send",
+            description=(
+                "Send a plain-text email, optionally with local artifact/media attachments, through an active "
+                "write-capable Google Mail connector. Use this for actual email delivery; use connector_request "
+                "only for lower-level connector APIs."
+            ),
+            risk_level=ToolRiskLevel.HIGH,
+            side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE,
+            requires_approval=True,
+            timeout_seconds=20,
+            capability_tags=("email", "connector"),
+        ),
+        _build_connector_email_send_handler(),
+    )
 
 
 def _connector_connection_for_invocation(invocation: ToolInvocation, provider_id: str):
@@ -8416,6 +13697,9 @@ def _connector_connection_allows_write(connection: object | None) -> bool:
     return mode in {"write", "read_write", "readwrite", "rw", "read_and_write"}
 
 
+_CALENDAR_ACCOUNT_WRITE_TOOLS = frozenset({"calendar_create", "calendar_update", "calendar_respond", "calendar_delete"})
+
+
 def _native_email_send_provider_has_write_connection(provider_id: str = "imap_smtp_provider") -> bool:
     try:
         from nullion.connections import load_connection_registry
@@ -8450,6 +13734,503 @@ def _string_list_argument(raw_value: object) -> list[str]:
         return values
     value = str(raw_value or "").strip()
     return [value] if value else []
+
+
+def _default_email_connector_provider_id(principal_id: str | None, *, require_write: bool = False) -> str:
+    try:
+        from nullion.connections import default_email_connector_provider_id
+
+        provider_id = default_email_connector_provider_id(principal_id, require_write=require_write)
+        if provider_id:
+            return provider_id
+    except TypeError:
+        try:
+            from nullion.connections import default_email_connector_provider_id
+
+            provider_id = default_email_connector_provider_id(principal_id)
+            if provider_id:
+                return provider_id
+        except Exception:
+            pass
+    except Exception:
+        pass
+    raise RuntimeError("No active Google Mail connector is available for this workspace/principal.")
+
+
+def _default_calendar_connector_provider_id(principal_id: str | None, *, require_write: bool = False) -> str:
+    try:
+        from nullion.connections import (
+            connection_has_runtime_credentials,
+            connection_for_principal,
+            load_connection_registry,
+        )
+    except Exception:
+        raise RuntimeError("No active Google Calendar connector is available for this workspace/principal.")
+    try:
+        connections = load_connection_registry().connections
+    except Exception:
+        connections = ()
+    for connection in connections:
+        provider_id = str(getattr(connection, "provider_id", "") or "").strip()
+        if not provider_id or not getattr(connection, "active", True):
+            continue
+        normalized_provider = provider_id.lower()
+        if not (
+            normalized_provider.startswith("skill_pack_connector_")
+            or normalized_provider.endswith("_connector_provider")
+        ):
+            continue
+        scoped_connection = connection_for_principal(principal_id, provider_id)
+        if scoped_connection is not None and require_write and not _connector_connection_allows_write(scoped_connection):
+            continue
+        if scoped_connection is not None and connection_has_runtime_credentials(scoped_connection):
+            return provider_id
+    requirement = "write-capable " if require_write else ""
+    raise RuntimeError(f"No active {requirement}Google Calendar connector is available for this workspace/principal.")
+
+
+def _email_messages_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
+    for base_url in _connector_allowed_base_urls(connection, provider_id):
+        parsed = urlparse(base_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/google-mail/gmail/v1/users/me/messages"
+    raise RuntimeError(f"{provider_id} does not have a configured connector base URL for Google Mail.")
+
+
+def _email_send_endpoint_for_provider(connection: object | None, provider_id: str) -> str:
+    for base_url in _connector_allowed_base_urls(connection, provider_id):
+        parsed = urlparse(base_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/google-mail/gmail/v1/users/me/messages/send"
+    raise RuntimeError(f"{provider_id} does not have a configured connector base URL for Google Mail.")
+
+
+def _calendar_events_endpoint_for_provider(
+    connection: object | None,
+    provider_id: str,
+    *,
+    calendar_id: str = "primary",
+) -> str:
+    resolved_calendar_id = quote(str(calendar_id or "primary").strip() or "primary", safe="")
+    for base_url in _connector_allowed_base_urls(connection, provider_id):
+        parsed = urlparse(base_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/google-calendar/calendar/v3/calendars/{resolved_calendar_id}/events"
+    raise RuntimeError(f"{provider_id} does not have a configured connector base URL for Google Calendar.")
+
+
+def _calendar_event_endpoint_for_provider(
+    connection: object | None,
+    provider_id: str,
+    *,
+    event_id: str,
+    calendar_id: str = "primary",
+) -> str:
+    return f"{_calendar_events_endpoint_for_provider(connection, provider_id, calendar_id=calendar_id)}/{quote(event_id, safe='')}"
+
+
+def _gmail_header_map(message: dict[str, object]) -> dict[str, str]:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return {}
+    headers = payload.get("headers")
+    if not isinstance(headers, list):
+        return {}
+    wanted = {"from", "to", "cc", "subject", "date"}
+    mapped: dict[str, str] = {}
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        name = str(header.get("name") or "").strip().lower()
+        value = str(header.get("value") or "").strip()
+        if name in wanted and value:
+            mapped[name] = value
+    return mapped
+
+
+def _gmail_decode_body_data(data: object) -> str:
+    if not isinstance(data, str) or not data.strip():
+        return ""
+    padded = data + ("=" * ((4 - len(data) % 4) % 4))
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _gmail_decode_attachment_bytes(data: object) -> bytes:
+    if not isinstance(data, str) or not data.strip():
+        return b""
+    padded = data + ("=" * ((4 - len(data) % 4) % 4))
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception:
+        return b""
+
+
+_EMAIL_HTML_DROP_BLOCK_RE = re.compile(
+    r"(?is)<\s*(?:script|style|head|noscript|svg|template)\b[^>]*>.*?<\s*/\s*(?:script|style|head|noscript|svg|template)\s*>"
+)
+_EMAIL_HTML_BLOCK_BREAK_RE = re.compile(
+    r"(?i)<\s*/?\s*(?:br|p|div|tr|table|tbody|thead|section|article|header|footer|li|ul|ol|h[1-6])\b[^>]*>"
+)
+_EMAIL_LINK_MAX_COUNT = 24
+_EMAIL_LINK_TEXT_MAX_CHARS = 180
+_EMAIL_LINK_URL_MAX_CHARS = 2048
+_EMAIL_VISIBLE_URL_RE = re.compile(r"(?i)\bhttps?://[^\s<>()\"']+")
+_EMAIL_LINK_FOLLOWUP_TOOLS = ("browser_navigate", "browser_extract_text", "web_fetch")
+
+
+class _EmailHtmlLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[dict[str, str]] = []
+        self._active_links: list[dict[str, object]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = ""
+        for name, value in attrs:
+            if name.lower() == "href" and value:
+                href = value
+                break
+        if not href:
+            return
+        self._active_links.append({"url": href, "text_parts": []})
+
+    def handle_data(self, data: str) -> None:
+        if not data or not self._active_links:
+            return
+        for link in self._active_links:
+            parts = link.get("text_parts")
+            if isinstance(parts, list):
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._active_links:
+            return
+        link = self._active_links.pop()
+        url = _normalize_email_link_url(str(link.get("url") or ""))
+        if not url:
+            return
+        parts = link.get("text_parts")
+        text = (
+            _clean_email_link_text(" ".join(str(part) for part in parts))
+            if isinstance(parts, list)
+            else ""
+        )
+        entry = {"url": url}
+        if text:
+            entry["text"] = text
+        self.links.append(entry)
+
+
+def _strip_email_invisible_text(text: str) -> str:
+    chars: list[str] = []
+    for char in str(text or ""):
+        category = unicodedata.category(char)
+        if category == "Cf" or char in {"\u034f", "\ufeff"}:
+            continue
+        if category.startswith("C") and char not in {"\n", "\r", "\t"}:
+            continue
+        chars.append(char)
+    return "".join(chars)
+
+
+def _clean_email_body_text(text: str) -> str:
+    cleaned = _strip_email_invisible_text(unescape(str(text or "")))
+    cleaned = re.sub(r"(?m)^[ \t]*[.#]?[A-Za-z0-9_-]{1,80}\s*\{[^{}]{0,1000}\}[ \t]*$", " ", cleaned)
+    cleaned = re.sub(r"(?m)^[ \t]*(?:[A-Za-z-]+\s*:\s*[^;{}]{0,180};\s*){2,}[ \t]*$", " ", cleaned)
+    cleaned = re.sub(r"[ \t\r\f\v]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return " ".join(cleaned.split())
+
+
+def _plain_text_from_email_html(html_body: str) -> str:
+    text = _EMAIL_HTML_DROP_BLOCK_RE.sub(" ", str(html_body or ""))
+    text = _EMAIL_HTML_BLOCK_BREAK_RE.sub("\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    return _clean_email_body_text(text)
+
+
+def _clean_email_link_text(text: str) -> str:
+    cleaned = _clean_email_body_text(text)
+    return cleaned[:_EMAIL_LINK_TEXT_MAX_CHARS].rstrip()
+
+
+def _normalize_email_link_url(url: str) -> str:
+    cleaned = _strip_email_invisible_text(unescape(str(url or ""))).strip()
+    cleaned = cleaned.replace("\r", "").replace("\n", "")
+    if not cleaned or cleaned.startswith("#"):
+        return ""
+    parsed = urlparse(cleaned)
+    scheme = parsed.scheme.lower()
+    if scheme in {"javascript", "data", "cid"}:
+        return ""
+    return cleaned[:_EMAIL_LINK_URL_MAX_CHARS].rstrip()
+
+
+def _email_link_entries_from_visible_text(text: str) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for match in _EMAIL_VISIBLE_URL_RE.finditer(str(text or "")):
+        url = _normalize_email_link_url(match.group(0).rstrip(".,;:!?)]}"))
+        if url:
+            entries.append({"url": url})
+    return entries
+
+
+def _email_link_entries_from_html(html_body: str) -> list[dict[str, str]]:
+    parser = _EmailHtmlLinkParser()
+    try:
+        parser.feed(str(html_body or ""))
+        parser.close()
+    except Exception:
+        return []
+    return parser.links
+
+
+def _gmail_message_attachments(message: dict[str, object], *, limit: int = 25) -> list[dict[str, object]]:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    message_id = str(message.get("id") or "").strip()
+    attachments: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def visit(part: object, fallback_part_id: str = "") -> None:
+        if not isinstance(part, dict):
+            return
+        part_id = str(part.get("partId") or fallback_part_id).strip()
+        filename = str(part.get("filename") or "").strip()
+        mime_type = str(part.get("mimeType") or "").strip()
+        body = part.get("body")
+        attachment_id = ""
+        size = None
+        if isinstance(body, dict):
+            attachment_id = str(body.get("attachmentId") or "").strip()
+            raw_size = body.get("size")
+            if isinstance(raw_size, int):
+                size = raw_size
+        if filename or attachment_id:
+            identity = (attachment_id, filename)
+            if identity not in seen:
+                seen.add(identity)
+                entry: dict[str, object] = {}
+                if filename:
+                    entry["filename"] = filename[:240]
+                if mime_type:
+                    entry["mimeType"] = mime_type[:160]
+                if attachment_id:
+                    entry["attachmentId"] = attachment_id
+                if message_id:
+                    entry["messageId"] = message_id
+                if part_id:
+                    entry["partId"] = part_id
+                if isinstance(size, int):
+                    entry["size"] = size
+                attachments.append(entry)
+        children = part.get("parts")
+        if isinstance(children, list):
+            for index, child in enumerate(children):
+                visit(child, f"{part_id}.{index}" if part_id else str(index))
+
+    visit(payload)
+    return attachments[:limit]
+
+
+def _gmail_message_body_parts(message: dict[str, object]) -> list[tuple[str, str]]:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    candidates: list[tuple[str, str]] = []
+
+    def visit(part: object) -> None:
+        if not isinstance(part, dict):
+            return
+        mime_type = str(part.get("mimeType") or "").strip().lower()
+        body = part.get("body")
+        if isinstance(body, dict):
+            text = _gmail_decode_body_data(body.get("data"))
+            if text.strip():
+                candidates.append((mime_type, text))
+        children = part.get("parts")
+        if isinstance(children, list):
+            for child in children:
+                visit(child)
+
+    visit(payload)
+    return candidates
+
+
+def _email_text_signal_score(text: str) -> int:
+    cleaned = _clean_email_body_text(text)
+    if not cleaned:
+        return 0
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'@./:-]{1,}", cleaned)
+    if words:
+        normalized_words = [word.casefold() for word in words]
+        unique_words = set(normalized_words)
+        if len(words) >= 20 and len(unique_words) <= max(3, len(words) // 12):
+            return len(unique_words)
+    css_markers = len(
+        re.findall(
+            r"(?:!important|line-height|font-weight|text-decoration|background-color|webkit)",
+            cleaned,
+            flags=re.I,
+        )
+    )
+    return max(0, len(words) - (css_markers * 8))
+
+
+def _gmail_message_body_text(message: dict[str, object], *, limit: int = 6000) -> str:
+    candidates = _gmail_message_body_parts(message)
+    cleaned_candidates: list[tuple[str, str]] = []
+    for mime, value in candidates:
+        cleaned = _plain_text_from_email_html(value) if mime == "text/html" else _clean_email_body_text(value)
+        if cleaned:
+            cleaned_candidates.append((mime, cleaned))
+    text = next(
+        (value for mime, value in cleaned_candidates if mime == "text/plain" and _email_text_signal_score(value) >= 12),
+        "",
+    )
+    if not text:
+        text = next((value for mime, value in cleaned_candidates if mime == "text/html"), "")
+    if not text and cleaned_candidates:
+        text = max((value for _, value in cleaned_candidates), key=_email_text_signal_score)
+    snippet = message.get("snippet")
+    snippet_text = _clean_email_body_text(str(snippet or "")) if isinstance(snippet, str) else ""
+    if snippet_text and (not text or _email_text_signal_score(snippet_text) > _email_text_signal_score(text) * 2):
+        text = snippet_text
+    return text[:limit]
+
+
+def _gmail_message_links(message: dict[str, object], *, limit: int = _EMAIL_LINK_MAX_COUNT) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for mime, value in _gmail_message_body_parts(message):
+        if mime == "text/html":
+            entries.extend(_email_link_entries_from_html(value))
+            entries.extend(_email_link_entries_from_visible_text(_plain_text_from_email_html(value)))
+        else:
+            entries.extend(_email_link_entries_from_visible_text(value))
+    snippet = message.get("snippet")
+    if isinstance(snippet, str):
+        entries.extend(_email_link_entries_from_visible_text(snippet))
+
+    deduped: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for entry in entries:
+        url = _normalize_email_link_url(str(entry.get("url") or ""))
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        cleaned_entry = {"url": url}
+        text = _clean_email_link_text(str(entry.get("text") or ""))
+        if text:
+            cleaned_entry["text"] = text
+        deduped.append(cleaned_entry)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _email_links_include_http_url(links: Iterable[dict[str, str]]) -> bool:
+    for entry in links:
+        parsed = urlparse(str(entry.get("url") or ""))
+        if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            return True
+    return False
+
+
+def _compact_gmail_message(message: dict[str, object], *, include_body: bool = False) -> dict[str, object]:
+    compact: dict[str, object] = {
+        "id": message.get("id"),
+        "threadId": message.get("threadId"),
+    }
+    headers = _gmail_header_map(message)
+    if headers:
+        compact["headers"] = headers
+        for key in ("from", "subject", "date"):
+            if key in headers:
+                compact[key] = headers[key]
+    snippet = message.get("snippet")
+    if isinstance(snippet, str) and snippet.strip():
+        compact["snippet"] = _clean_email_body_text(snippet)
+    label_ids = message.get("labelIds")
+    if isinstance(label_ids, list):
+        compact["labelIds"] = [str(item) for item in label_ids[:12]]
+    attachments = _gmail_message_attachments(message)
+    if attachments:
+        compact["attachments"] = attachments
+        compact["attachment_count"] = len(attachments)
+        compact["next_tool_for_attachment"] = "email_attachment_read"
+        compact["attachment_requires_tool"] = "email_attachment_read"
+        compact["next_tool"] = "email_attachment_read"
+    if include_body:
+        body = _gmail_message_body_text(message)
+        if body:
+            compact["body"] = body
+        links = _gmail_message_links(message)
+        if links:
+            compact["links"] = links
+            if _email_links_include_http_url(links):
+                compact["next_tools_for_links"] = list(_EMAIL_LINK_FOLLOWUP_TOOLS)
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def _compact_google_calendar_event(event: dict[str, object]) -> dict[str, object]:
+    compact: dict[str, object] = {
+        "id": event.get("id"),
+        "summary": event.get("summary"),
+        "status": event.get("status"),
+        "start": event.get("start"),
+        "end": event.get("end"),
+        "location": event.get("location"),
+        "description": event.get("description"),
+        "htmlLink": event.get("htmlLink"),
+    }
+    attendees = event.get("attendees")
+    if isinstance(attendees, list):
+        compact["attendees"] = [
+            {
+                key: attendee.get(key)
+                for key in ("email", "displayName", "responseStatus")
+                if isinstance(attendee, dict) and attendee.get(key) not in (None, "", [], {})
+            }
+            for attendee in attendees[:20]
+            if isinstance(attendee, dict)
+        ]
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
+
+
+def _calendar_selected_results_payload(
+    results: list[dict[str, object]],
+    *,
+    query: str,
+) -> dict[str, object]:
+    normalized_query = str(query or "").strip().casefold()
+    if not normalized_query:
+        return {}
+    selected: list[dict[str, object]] = []
+    selected_ids: list[str] = []
+    for item in results:
+        values = (
+            str(item.get("summary") or ""),
+            str(item.get("description") or ""),
+            str(item.get("location") or ""),
+        )
+        if not any(normalized_query in value.casefold() for value in values if value):
+            continue
+        selected.append(item)
+        event_id = str(item.get("id") or item.get("event_id") or item.get("uid") or "").strip()
+        if event_id:
+            selected_ids.append(event_id)
+    if not selected:
+        return {}
+    return {
+        "selected_results": selected[:3],
+        **({"selected_result_ids": selected_ids[:3]} if selected_ids else {}),
+    }
 
 
 def _connector_json_payload_from_response(response) -> dict[str, object]:
@@ -8717,6 +14498,7 @@ def _url_is_under_base(url: str, base_url: str) -> bool:
 
 def _connector_request_url(raw_url: str, raw_params: object, connection: object | None = None, provider_id: str = "") -> str:
     url = raw_url.strip()
+    allowed_bases = _connector_allowed_base_urls(connection, provider_id)
     parsed = urlparse(url)
     host = parsed.hostname
     if (
@@ -8724,7 +14506,19 @@ def _connector_request_url(raw_url: str, raw_params: object, connection: object 
         or not isinstance(host, str)
         or not host
     ):
-        raise ValueError(f"Blocked URL for connector_request: {url}")
+        if not allowed_bases:
+            raise ValueError(f"Blocked URL for connector_request: {url}")
+        if parsed.scheme or parsed.netloc or not url or url.startswith(("#", "?")):
+            raise ValueError(f"Blocked URL for connector_request: {url}")
+        url = urljoin(allowed_bases[0], url.lstrip("/"))
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not isinstance(host, str)
+            or not host
+        ):
+            raise ValueError(f"Blocked URL for connector_request: {url}")
     params: dict[str, str] = {}
     if isinstance(raw_params, dict):
         for key, value in raw_params.items():
@@ -8734,7 +14528,6 @@ def _connector_request_url(raw_url: str, raw_params: object, connection: object 
     if params:
         separator = "&" if parsed.query else "?"
         url += separator + urlencode(params)
-    allowed_bases = _connector_allowed_base_urls(connection, provider_id)
     is_under_configured_base = bool(allowed_bases) and any(_url_is_under_base(url, base_url) for base_url in allowed_bases)
     if allowed_bases and not is_under_configured_base:
         labels = ", ".join(allowed_bases)
@@ -8828,6 +14621,796 @@ def _build_connector_request_handler() -> ToolHandler:
                 status="failed",
                 output=output,
                 error=error,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"provider_id": provider_id},
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_email_search_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_query = invocation.arguments.get("query")
+        raw_limit = invocation.arguments.get("limit", 10)
+        if not isinstance(raw_query, str) or not raw_query.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: query",
+            )
+        if not isinstance(raw_limit, int) or raw_limit <= 0:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="limit must be a positive integer",
+            )
+        limit = min(raw_limit, 10)
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_email_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
+            listing = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params={"q": raw_query.strip(), "maxResults": limit},
+            )
+            raw_messages = listing.get("messages")
+            messages = raw_messages if isinstance(raw_messages, list) else []
+            results: list[dict[str, object]] = []
+            detail_fetch_limit = _email_search_detail_fetch_limit()
+            for index, item in enumerate(messages[:limit]):
+                if not isinstance(item, dict):
+                    continue
+                message_id = str(item.get("id") or "").strip()
+                if not message_id:
+                    continue
+                if index < detail_fetch_limit:
+                    try:
+                        detail = _connector_json_request(
+                            invocation,
+                            provider_id=provider_id,
+                            url=f"{endpoint}/{quote(message_id, safe='')}",
+                            params={
+                                "format": "metadata",
+                                "fields": "id,threadId,labelIds,snippet,payload(headers)",
+                            },
+                        )
+                    except Exception:
+                        detail = item
+                    results.append(_compact_gmail_message(detail, include_body=False))
+                else:
+                    results.append(_compact_gmail_message(item, include_body=False))
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "query": raw_query.strip(),
+                    "provider_id": provider_id,
+                    "resultSizeEstimate": listing.get("resultSizeEstimate"),
+                    "results": results,
+                    "body_included": False,
+                    "next_tool_for_body": "email_read",
+                    "body_requires_tool": "email_read",
+                },
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=_account_tool_failure_output(invocation.principal_id, query=raw_query),
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _email_attachment_safe_filename(value: object, *, mime_type: str = "") -> tuple[str, str, str]:
+    raw_name = Path(str(value or "").strip()).name
+    suffix = Path(raw_name).suffix.lower()
+    if not suffix:
+        guessed = mimetypes.guess_extension(mime_type.split(";", 1)[0].strip()) if mime_type else None
+        suffix = (guessed or ".bin").lower()
+    if len(suffix) > 16 or not re.fullmatch(r"\.[a-z0-9][a-z0-9._-]{0,14}", suffix):
+        suffix = ".bin"
+    stem = _safe_pdf_stem(Path(raw_name).stem or "email-attachment")
+    filename = f"{stem}{suffix}"
+    return filename, stem, suffix
+
+
+def _extract_pdf_text(data: bytes, *, limit: int = 12000) -> tuple[str, int, bool]:
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(data))
+    page_count = len(reader.pages)
+    parts: list[str] = []
+    total_chars = 0
+    truncated = False
+    for page in reader.pages:
+        page_text = (page.extract_text() or "").strip()
+        if not page_text:
+            continue
+        parts.append(page_text)
+        total_chars += len(page_text)
+        if total_chars > limit:
+            truncated = True
+            break
+    text = "\n\n".join(parts).replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) > limit:
+        text = text[:limit].rstrip()
+        truncated = True
+    return text, page_count, truncated
+
+
+def _email_attachment_text_preview(data: bytes, *, mime_type: str, filename: str, limit: int = 6000) -> str:
+    normalized_type = mime_type.split(";", 1)[0].strip().lower()
+    suffix = Path(filename).suffix.lower()
+    if normalized_type == "application/pdf" or suffix == ".pdf":
+        try:
+            text, _page_count, _truncated = _extract_pdf_text(data, limit=limit)
+        except Exception:
+            return ""
+        return text
+    if normalized_type in {"text/plain", "text/csv", "text/html", "text/calendar", "application/json"} or suffix in {
+        ".txt",
+        ".csv",
+        ".html",
+        ".htm",
+        ".ics",
+        ".json",
+        ".md",
+        ".xml",
+    }:
+        text = data.decode("utf-8", "replace")
+        if normalized_type == "text/html" or suffix in {".html", ".htm"}:
+            text = _plain_text_from_email_html(text)
+        else:
+            text = _clean_email_body_text(text)
+        return text[:limit]
+    return ""
+
+
+def _build_connector_email_attachment_read_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_message_id = invocation.arguments.get("message_id")
+        raw_attachment_id = invocation.arguments.get("attachment_id")
+        message_id = raw_message_id.strip() if isinstance(raw_message_id, str) else ""
+        attachment_id = raw_attachment_id.strip() if isinstance(raw_attachment_id, str) else ""
+        if not message_id or not attachment_id:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "reason": "missing_email_attachment_id",
+                    "required_source_tool": "email_read",
+                    "next_step": "Read the email first and pass one returned message.attachments[].attachmentId to email_attachment_read.",
+                },
+                error="Missing required message_id or attachment_id.",
+            )
+        if _invalid_concrete_resource_id_reason(message_id) or _invalid_concrete_resource_id_reason(attachment_id):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "reason": "invalid_email_attachment_id",
+                    "required_source_tool": "email_read",
+                    "next_step": "Use exact message_id and attachment_id values returned by email_read.message.attachments.",
+                },
+                error="Invalid email attachment id: use ids returned by email_read.",
+            )
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        mime_type = str(invocation.arguments.get("mime_type") or "").strip()
+        filename, stem, suffix = _email_attachment_safe_filename(
+            invocation.arguments.get("filename"),
+            mime_type=mime_type,
+        )
+        try:
+            if not provider_id:
+                provider_id = _default_email_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
+            payload = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=f"{endpoint}/{quote(message_id, safe='')}/attachments/{quote(attachment_id, safe='')}",
+            )
+            data = _gmail_decode_attachment_bytes(payload.get("data"))
+            if not data:
+                raise RuntimeError("connector returned an empty attachment body")
+            from nullion.artifacts import artifact_path_for_generated_workspace_file
+
+            path = artifact_path_for_generated_workspace_file(
+                principal_id=invocation.principal_id,
+                suffix=suffix,
+                stem=stem or "email-attachment",
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            if not mime_type:
+                mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            attachment_role = (
+                ARTIFACT_ROLE_DELIVERABLE
+                if _flow_context_requires_artifact_delivery_for_extension(invocation.flow_context, suffix)
+                else ARTIFACT_ROLE_SOURCE
+            )
+            output: dict[str, object] = {
+                "provider_id": provider_id,
+                "message_id": message_id,
+                "attachment_id": attachment_id,
+                "filename": filename,
+                "mime_type": mime_type,
+                "size_bytes": len(data),
+                "artifact_path": str(path),
+                "artifact_paths": [str(path)],
+                "artifact_descriptors": [
+                    artifact_output_descriptor(
+                        path,
+                        role=attachment_role,
+                        kind="email_attachment",
+                        label=filename,
+                    )
+                ],
+            }
+            text_preview = _email_attachment_text_preview(data, mime_type=mime_type, filename=filename)
+            if text_preview:
+                output["text_preview"] = text_preview
+                normalized_type = mime_type.split(";", 1)[0].strip().lower()
+                if normalized_type == "application/pdf" or suffix == ".pdf":
+                    try:
+                        _pdf_text, page_count, preview_truncated = _extract_pdf_text(data, limit=6000)
+                    except Exception:
+                        page_count = 0
+                        preview_truncated = False
+                    if page_count:
+                        output["page_count"] = page_count
+                        output["text_extraction_method"] = "pypdf"
+                        output["text_preview_truncated"] = preview_truncated
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output=output,
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "provider_id": provider_id,
+                    "message_id": message_id,
+                    "attachment_id": attachment_id,
+                    "required_source_tool": "email_read",
+                },
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_email_read_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_id = invocation.arguments.get("id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            return _invalid_email_message_id_result(invocation, raw_id)
+        if _invalid_concrete_resource_id_reason(raw_id):
+            return _invalid_email_message_id_result(invocation, raw_id)
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_email_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            endpoint = _email_messages_endpoint_for_provider(connection, provider_id)
+            message = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=f"{endpoint}/{quote(raw_id.strip(), safe='')}",
+                params={"format": "full"},
+            )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "id": raw_id.strip(),
+                    "provider_id": provider_id,
+                    "message": _compact_gmail_message(message, include_body=True),
+                },
+                error=None,
+            )
+        except Exception as exc:
+            return _email_read_source_required_failure_result(invocation, raw_id, exc)
+
+    return handler
+
+
+def _build_connector_calendar_list_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_start = invocation.arguments.get("start")
+        raw_end = invocation.arguments.get("end")
+        raw_max = invocation.arguments.get("max", 10)
+        query = str(invocation.arguments.get("query") or "").strip()
+        if not isinstance(raw_start, str) or not raw_start.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: start",
+            )
+        if not isinstance(raw_end, str) or not raw_end.strip():
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="Missing required argument: end",
+            )
+        if not isinstance(raw_max, int) or raw_max <= 0:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={},
+                error="max must be a positive integer",
+            )
+        limit = min(raw_max, 50)
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_calendar_connector_provider_id(invocation.principal_id)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            endpoint = _calendar_events_endpoint_for_provider(connection, provider_id)
+            listing = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params={
+                    "timeMin": raw_start.strip(),
+                    "timeMax": raw_end.strip(),
+                    "maxResults": limit,
+                    "singleEvents": "true",
+                    "orderBy": "startTime",
+                },
+            )
+            raw_items = listing.get("items")
+            items = raw_items if isinstance(raw_items, list) else []
+            results = [
+                _compact_google_calendar_event(item)
+                for item in items[:limit]
+                if isinstance(item, dict)
+            ]
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "provider_id": provider_id,
+                    "start": raw_start.strip(),
+                    "end": raw_end.strip(),
+                    "max": limit,
+                    **({"query": query} if query else {}),
+                    "result_count": len(results),
+                    "results": results,
+                    **_calendar_selected_results_payload(results, query=query),
+                },
+                error=None,
+            )
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output=_account_tool_failure_output(invocation.principal_id),
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _calendar_write_read_only_result(invocation: ToolInvocation, provider_id: str) -> ToolResult:
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output={"provider_id": provider_id, "permission_mode": "read"},
+        error=(
+            f"{provider_id} is configured as read-only for {invocation.tool_name}. "
+            "Change this connection's permission mode to read_write in Settings > Users > Connections "
+            "before modifying calendar events."
+        ),
+    )
+
+
+def _invalid_calendar_event_id_result(invocation: ToolInvocation, raw_id: object) -> ToolResult:
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="failed",
+        output={
+            "reason": "invalid_event_id",
+            "id": raw_id if isinstance(raw_id, str) else "",
+            "required_source_tool": "calendar_list",
+            "next_step": "List calendar events and pass one returned results[].id value.",
+        },
+        error="Invalid calendar event id: use an exact id returned by calendar_list.",
+    )
+
+
+def _calendar_write_provider_and_connection(invocation: ToolInvocation) -> tuple[str, object]:
+    provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+    if not provider_id:
+        provider_id = _default_calendar_connector_provider_id(invocation.principal_id, require_write=True)
+    connection = _connector_connection_for_invocation(invocation, provider_id)
+    if not _connector_connection_allows_write(connection):
+        raise PermissionError(provider_id)
+    return provider_id, connection
+
+
+def _calendar_id_from_invocation(invocation: ToolInvocation) -> str:
+    raw = str(invocation.arguments.get("calendar_id") or "primary").strip()
+    if not raw:
+        return "primary"
+    if _invalid_concrete_resource_id_reason(raw):
+        raise ValueError("Invalid calendar_id.")
+    return raw
+
+
+def _calendar_send_updates_params(invocation: ToolInvocation) -> dict[str, object]:
+    raw = str(invocation.arguments.get("send_updates") or "all").strip()
+    if raw not in {"all", "externalOnly", "none"}:
+        raise ValueError("send_updates must be one of all, externalOnly, or none.")
+    return {"sendUpdates": raw}
+
+
+def _calendar_time_payload(value: object, *, time_zone: str) -> dict[str, object]:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Missing calendar event time value.")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return {"date": text}
+    payload: dict[str, object] = {"dateTime": text}
+    if time_zone:
+        payload["timeZone"] = time_zone
+    return payload
+
+
+def _calendar_event_payload_from_invocation(
+    invocation: ToolInvocation,
+    *,
+    require_summary: bool = False,
+    require_times: bool = False,
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    summary = str(invocation.arguments.get("summary") or "").strip()
+    if summary:
+        payload["summary"] = summary
+    elif require_summary:
+        raise ValueError("Missing required argument: summary")
+    time_zone = str(invocation.arguments.get("time_zone") or "").strip()
+    raw_start = invocation.arguments.get("start")
+    raw_end = invocation.arguments.get("end")
+    if raw_start is not None and str(raw_start).strip():
+        payload["start"] = _calendar_time_payload(raw_start, time_zone=time_zone)
+    elif require_times:
+        raise ValueError("Missing required argument: start")
+    if raw_end is not None and str(raw_end).strip():
+        payload["end"] = _calendar_time_payload(raw_end, time_zone=time_zone)
+    elif require_times:
+        raise ValueError("Missing required argument: end")
+    for argument_name, event_key in (("location", "location"), ("description", "description")):
+        if argument_name in invocation.arguments:
+            payload[event_key] = str(invocation.arguments.get(argument_name) or "").strip()
+    attendees = _string_list_argument(invocation.arguments.get("attendees"))
+    if attendees:
+        payload["attendees"] = [{"email": email} for email in attendees]
+    return payload
+
+
+def _calendar_write_result(
+    invocation: ToolInvocation,
+    *,
+    provider_id: str,
+    action: str,
+    event: dict[str, object] | None = None,
+    event_id: str | None = None,
+) -> ToolResult:
+    compact_event = _compact_google_calendar_event(event or {}) if isinstance(event, dict) else {}
+    resolved_id = str(event_id or compact_event.get("id") or "").strip()
+    summary = str(compact_event.get("summary") or invocation.arguments.get("summary") or "").strip()
+    output: dict[str, object] = {
+        "action": action,
+        "provider_id": provider_id,
+        "id": resolved_id,
+        "event_id": resolved_id,
+        "summary": summary,
+        "message": f"Calendar event {action.removeprefix('calendar_').replace('_', ' ')} completed.",
+    }
+    if compact_event:
+        output["event"] = compact_event
+    return ToolResult(
+        invocation_id=invocation.invocation_id,
+        tool_name=invocation.tool_name,
+        status="completed",
+        output={key: value for key, value in output.items() if value not in (None, "", [], {})},
+        error=None,
+    )
+
+
+def _build_connector_calendar_create_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            provider_id, connection = _calendar_write_provider_and_connection(invocation)
+            endpoint = _calendar_events_endpoint_for_provider(
+                connection,
+                provider_id,
+                calendar_id=_calendar_id_from_invocation(invocation),
+            )
+            event = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params=_calendar_send_updates_params(invocation),
+                method="POST",
+                json_payload=_calendar_event_payload_from_invocation(
+                    invocation,
+                    require_summary=True,
+                    require_times=True,
+                ),
+            )
+            return _calendar_write_result(invocation, provider_id=provider_id, action="calendar_create", event=event)
+        except PermissionError as exc:
+            return _calendar_write_read_only_result(invocation, str(exc))
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"provider_id": provider_id},
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_calendar_update_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_event_id = invocation.arguments.get("event_id")
+        if not isinstance(raw_event_id, str) or _invalid_concrete_resource_id_reason(raw_event_id):
+            return _invalid_calendar_event_id_result(invocation, raw_event_id)
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            provider_id, connection = _calendar_write_provider_and_connection(invocation)
+            payload = _calendar_event_payload_from_invocation(invocation)
+            if not payload:
+                raise ValueError("Provide at least one event field to update.")
+            endpoint = _calendar_event_endpoint_for_provider(
+                connection,
+                provider_id,
+                calendar_id=_calendar_id_from_invocation(invocation),
+                event_id=raw_event_id.strip(),
+            )
+            event = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params=_calendar_send_updates_params(invocation),
+                method="PATCH",
+                json_payload=payload,
+            )
+            return _calendar_write_result(
+                invocation,
+                provider_id=provider_id,
+                action="calendar_update",
+                event=event,
+                event_id=raw_event_id.strip(),
+            )
+        except PermissionError as exc:
+            return _calendar_write_read_only_result(invocation, str(exc))
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"provider_id": provider_id},
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_calendar_respond_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_event_id = invocation.arguments.get("event_id")
+        if not isinstance(raw_event_id, str) or _invalid_concrete_resource_id_reason(raw_event_id):
+            return _invalid_calendar_event_id_result(invocation, raw_event_id)
+        response_status = str(invocation.arguments.get("response_status") or "").strip()
+        if response_status not in {"accepted", "declined", "tentative", "needsAction"}:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"event_id": raw_event_id},
+                error="response_status must be one of accepted, declined, tentative, or needsAction.",
+            )
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            provider_id, connection = _calendar_write_provider_and_connection(invocation)
+            attendee_email = str(invocation.arguments.get("attendee_email") or "").strip()
+            endpoint = _calendar_event_endpoint_for_provider(
+                connection,
+                provider_id,
+                calendar_id=_calendar_id_from_invocation(invocation),
+                event_id=raw_event_id.strip(),
+            )
+            existing_event = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+            )
+            existing_attendees = existing_event.get("attendees") if isinstance(existing_event, dict) else None
+            attendees = [dict(item) for item in existing_attendees if isinstance(item, dict)] if isinstance(existing_attendees, list) else []
+            if attendee_email:
+                matched = False
+                for attendee in attendees:
+                    if str(attendee.get("email") or "").strip().casefold() == attendee_email.casefold():
+                        attendee["responseStatus"] = response_status
+                        matched = True
+                if not matched:
+                    attendees.append({"email": attendee_email, "responseStatus": response_status})
+            else:
+                matched = False
+                for attendee in attendees:
+                    if attendee.get("self") is True:
+                        attendee["responseStatus"] = response_status
+                        matched = True
+                if not matched:
+                    raise ValueError("Could not find the current user's attendee record; provide attendee_email.")
+            event = _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params=_calendar_send_updates_params(invocation),
+                method="PATCH",
+                json_payload={"attendees": attendees},
+            )
+            return _calendar_write_result(
+                invocation,
+                provider_id=provider_id,
+                action="calendar_respond",
+                event=event,
+                event_id=raw_event_id.strip(),
+            )
+        except PermissionError as exc:
+            return _calendar_write_read_only_result(invocation, str(exc))
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"provider_id": provider_id, "event_id": raw_event_id},
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_calendar_delete_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        raw_event_id = invocation.arguments.get("event_id")
+        if not isinstance(raw_event_id, str) or _invalid_concrete_resource_id_reason(raw_event_id):
+            return _invalid_calendar_event_id_result(invocation, raw_event_id)
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            provider_id, connection = _calendar_write_provider_and_connection(invocation)
+            endpoint = _calendar_event_endpoint_for_provider(
+                connection,
+                provider_id,
+                calendar_id=_calendar_id_from_invocation(invocation),
+                event_id=raw_event_id.strip(),
+            )
+            _connector_json_request(
+                invocation,
+                provider_id=provider_id,
+                url=endpoint,
+                params=_calendar_send_updates_params(invocation),
+                method="DELETE",
+            )
+            return _calendar_write_result(
+                invocation,
+                provider_id=provider_id,
+                action="calendar_delete",
+                event_id=raw_event_id.strip(),
+            )
+        except PermissionError as exc:
+            return _calendar_write_read_only_result(invocation, str(exc))
+        except Exception as exc:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"provider_id": provider_id, "event_id": raw_event_id},
+                error=str(exc),
+            )
+
+    return handler
+
+
+def _build_connector_email_send_handler() -> ToolHandler:
+    def handler(invocation: ToolInvocation) -> ToolResult:
+        provider_id = str(invocation.arguments.get("provider_id") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = _default_email_connector_provider_id(invocation.principal_id, require_write=True)
+            connection = _connector_connection_for_invocation(invocation, provider_id)
+            if not _connector_connection_allows_write(connection):
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"provider_id": provider_id, "permission_mode": "read"},
+                    error=(
+                        f"{provider_id} is configured as read-only for email_send. "
+                        "Change this connection's permission mode to read_write in Settings > Users > Connections "
+                        "before sending email."
+                    ),
+                )
+            message, attached_paths = _email_message_for_invocation(invocation)
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+            endpoint = _email_send_endpoint_for_provider(connection, provider_id)
+            url = _connector_request_url(endpoint, None, connection, provider_id)
+            resolution = _resolve_web_fetch_resolution(url)
+            payload = json.dumps({"raw": raw_message}).encode("utf-8")
+            headers = _connector_request_headers(connection, provider_id)
+            headers["Content-Type"] = "application/json"
+            request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            opener = _build_web_fetch_opener()
+            with _pinned_web_fetch_resolution(resolution):
+                with opener.open(request, timeout=20) as response:
+                    status_code = getattr(response, "status", 200)
+                    content_type = response.headers.get_content_type()
+                    body = response.read(1_000_000).decode("utf-8", "ignore")
+            output: dict[str, object] = {
+                "url": url,
+                "provider_id": provider_id,
+                "method": "POST",
+                "status_code": status_code,
+                "content_type": content_type,
+                "to": _string_list_argument(invocation.arguments.get("to")),
+                "subject": str(invocation.arguments.get("subject") or "").strip(),
+                "attachment_count": len(attached_paths),
+                "attachment_paths": attached_paths,
+            }
+            try:
+                output["json"] = json.loads(body)
+            except Exception:
+                output["text"] = body[:20000]
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output=output,
+                error=None,
             )
         except Exception as exc:
             return ToolResult(
@@ -9103,6 +15686,8 @@ def _build_file_search_handler(
             )
         if requested_roots:
             search_roots = requested_roots
+        else:
+            search_roots = tuple(sorted(search_roots, key=lambda root: len(root.parts), reverse=True))
 
         raw_limit = invocation.arguments.get("limit")
         limit = 100
@@ -9236,6 +15821,10 @@ def register_search_plugin(
                     side_effect_class=ToolSideEffectClass.READ,
                     requires_approval=False,
                     timeout_seconds=20,
+                    continuation_tools=(
+                        "web_fetch",
+                        "browser_navigate",
+                    ),
                 ),
                 _build_web_search_handler(web_searcher),
             )
@@ -9274,13 +15863,16 @@ def register_email_plugin(
             name="email_search",
                 description=(
                     "Search email messages via the configured provider. Search results are metadata-only; "
-                    "call email_read with a returned id before summarizing body content or claiming the message was read."
+                    "use their headers/snippets for broad inbox triage, then call email_read with a returned "
+                    "id only when a specific message's full body is needed."
                 ),
             risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.READ,
             requires_approval=False,
             timeout_seconds=20,
+            input_schema=_email_search_input_schema(),
             capability_tags=("email", "connector", "account_read"),
+            continuation_tools=("email_read",),
         ),
         _build_email_search_handler(email_searcher),
     )
@@ -9289,11 +15881,15 @@ def register_email_plugin(
         registry.register(
             ToolSpec(
                 name="email_read",
-                description="Read a single email message via the configured provider.",
+                description=(
+                    "Read a single email message via the configured provider. The id must be exactly one "
+                    "email_search.results[].id value; do not infer ids or pass placeholders."
+                ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
                 timeout_seconds=20,
+                input_schema=_email_read_input_schema(),
                 capability_tags=("email", "connector", "account_read"),
             ),
             _build_email_read_handler(email_reader),
@@ -9341,15 +15937,16 @@ def register_calendar_plugin(
         registry.register(
             ToolSpec(
                 name="calendar_list",
-            description="List calendar events via the configured provider.",
-            risk_level=ToolRiskLevel.LOW,
-            side_effect_class=ToolSideEffectClass.READ,
-            requires_approval=False,
-            timeout_seconds=20,
-            capability_tags=("calendar", "connector", "account_read"),
-        ),
-        _build_calendar_list_handler(calendar_lister),
-    )
+                description="List calendar events via the configured provider.",
+                risk_level=ToolRiskLevel.LOW,
+                side_effect_class=ToolSideEffectClass.READ,
+                requires_approval=False,
+                timeout_seconds=20,
+                input_schema=_calendar_list_input_schema(include_provider_id=False),
+                capability_tags=("calendar", "connector", "account_read"),
+            ),
+            _build_calendar_list_handler(calendar_lister),
+        )
     return registry
 
 
@@ -9410,23 +16007,13 @@ def _build_email_read_handler(
     def handler(invocation: ToolInvocation) -> ToolResult:
         raw_id = invocation.arguments.get("id")
         if not isinstance(raw_id, str) or not raw_id:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={},
-                error="Missing required argument: id",
-            )
+            return _invalid_email_message_id_result(invocation, raw_id)
+        if _invalid_concrete_resource_id_reason(raw_id):
+            return _invalid_email_message_id_result(invocation, raw_id)
         try:
             message = _call_provider_with_principal(email_reader, raw_id, principal_id=invocation.principal_id)
         except Exception as exc:  # pragma: no cover - provider guard
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output=_account_tool_failure_output(invocation.principal_id, message_id=raw_id),
-                error=str(exc),
-            )
+            return _email_read_source_required_failure_result(invocation, raw_id, exc)
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
@@ -9493,6 +16080,7 @@ def _build_calendar_list_handler(
         raw_start = invocation.arguments.get("start")
         raw_end = invocation.arguments.get("end")
         raw_max = invocation.arguments.get("max", 10)
+        query = str(invocation.arguments.get("query") or "").strip()
         if not isinstance(raw_start, str) or not raw_start:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -9531,7 +16119,14 @@ def _build_calendar_list_handler(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"start": raw_start, "end": raw_end, "max": raw_max, "results": results},
+            output={
+                "start": raw_start,
+                "end": raw_end,
+                "max": raw_max,
+                **({"query": query} if query else {}),
+                "results": results,
+                **_calendar_selected_results_payload(results, query=query),
+            },
             error=None,
         )
 
@@ -9861,6 +16456,12 @@ def register_browser_plugin(
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
                 timeout_seconds=20,
+                continuation_tools=(
+                    "browser_snapshot",
+                    "browser_extract_text",
+                    "browser_extract_items",
+                    "browser_run_js",
+                ),
             ),
             _build_browser_navigate_handler(browser_navigator),
         )
@@ -9892,6 +16493,7 @@ def register_workspace_plugin(
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
                 timeout_seconds=20,
+                continuation_tools=("file_read",),
             ),
             _build_file_search_handler(
                 workspace_root=workspace_root,
@@ -9926,6 +16528,7 @@ def register_workspace_plugin(
                 side_effect_class=ToolSideEffectClass.READ,
                 requires_approval=False,
                 timeout_seconds=20,
+                continuation_tools=("file_search", "file_read"),
             ),
             _build_workspace_summary_handler(
                 workspace_root=workspace_root,
@@ -10115,6 +16718,14 @@ def _build_delete_reminder_handler(runtime) -> ToolHandler:
                 error="Missing required argument: task_id",
             )
         normalized_task_id = task_id.strip()
+        if _invalid_concrete_resource_id_reason(normalized_task_id):
+            return _invalid_structured_identifier_result(
+                invocation,
+                field_name="task_id",
+                raw_value=normalized_task_id,
+                reason="invalid_reminder_task_id",
+                required_source_tool="list_reminders",
+            )
         try:
             reminder = runtime.store.get_reminder(normalized_task_id)
             if reminder is None:
@@ -10196,6 +16807,14 @@ def _build_update_reminder_handler(runtime) -> ToolHandler:
                 error="Missing required argument: task_id",
             )
         normalized_task_id = task_id.strip()
+        if _invalid_concrete_resource_id_reason(normalized_task_id):
+            return _invalid_structured_identifier_result(
+                invocation,
+                field_name="task_id",
+                raw_value=normalized_task_id,
+                reason="invalid_reminder_task_id",
+                required_source_tool="list_reminders",
+            )
         reminder = runtime.store.get_reminder(normalized_task_id)
         if reminder is None:
             return ToolResult(
@@ -10323,6 +16942,7 @@ def register_reminder_tools(
             requires_approval=False,
             timeout_seconds=10,
             capability_tags=("scheduler", "reminder"),
+            continuation_tools=("delete_reminder", "update_reminder"),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -10358,6 +16978,7 @@ def register_reminder_tools(
             requires_approval=False,
             timeout_seconds=10,
             capability_tags=("scheduler", "reminder"),
+            continuation_tools=("delete_reminder", "update_reminder"),
             input_schema={
                 "type": "object",
                 "properties": {},
@@ -10425,6 +17046,40 @@ def register_reminder_tools(
 
 
 # ── Cron tools ────────────────────────────────────────────────────────────────
+
+def _scheduler_creation_capsule_key(invocation: ToolInvocation) -> str:
+    capsule_id = str(getattr(invocation, "capsule_id", "") or "").strip()
+    if capsule_id:
+        return capsule_id
+    flow_context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+    for key in ("turn_id", "conversation_turn_id", "request_id"):
+        value = str(flow_context.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _claim_scheduler_creation_capsule(invocation: ToolInvocation) -> bool:
+    capsule_key = _scheduler_creation_capsule_key(invocation)
+    if not capsule_key:
+        return True
+    now = datetime.now(UTC).timestamp()
+    with _SCHEDULER_CREATION_CAPSULE_LOCK:
+        expired_before = now - _SCHEDULER_CREATION_CAPSULE_TTL_SECONDS
+        expired_keys = [
+            key for key, claimed_at in _SCHEDULER_CREATION_CAPSULES.items()
+            if claimed_at < expired_before
+        ]
+        for key in expired_keys:
+            _SCHEDULER_CREATION_CAPSULES.pop(key, None)
+        while len(_SCHEDULER_CREATION_CAPSULES) >= _SCHEDULER_CREATION_CAPSULE_LIMIT:
+            oldest_key = min(_SCHEDULER_CREATION_CAPSULES, key=_SCHEDULER_CREATION_CAPSULES.get)
+            _SCHEDULER_CREATION_CAPSULES.pop(oldest_key, None)
+        if capsule_key in _SCHEDULER_CREATION_CAPSULES:
+            return False
+        _SCHEDULER_CREATION_CAPSULES[capsule_key] = now
+    return True
+
 
 def _build_create_cron_handler(*, default_delivery_channel: str = "", default_delivery_target: str = ""):
     def _matching_existing_cron(
@@ -10532,6 +17187,24 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
             )
         existing = None
         flow_context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        if (
+            flow_context.get("allow_multiple_scheduler_creations") is not True
+            and flow_context.get("allow_duplicate_cron_creation") is not True
+            and not _claim_scheduler_creation_capsule(invocation)
+        ):
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "reason": "multiple_scheduler_creation_tools_in_turn",
+                    "requested_scheduler_creation_tool": invocation.tool_name,
+                },
+                error=(
+                    "This turn already created a scheduler object. Do not create another "
+                    "cron unless structured flow state explicitly allows multiple scheduler creations."
+                ),
+            )
         if flow_context.get("allow_duplicate_cron_creation") is not True:
             existing = _matching_existing_cron(
                 name=name,
@@ -10753,7 +17426,7 @@ def _build_list_crons_handler():
                     "presentation_hint": (
                         "Show schedule_description and next_run_description for timing. "
                         "Do not show cron expressions, raw ids, ISO timestamps, or UTC conversions unless the user asks for technical details. "
-                        "When asking the user to choose, show numbered options and accept the number."
+                        "When asking the user to choose, show exactly one numbered options list and accept the number."
                     ),
                     "task": j.task,
                     "has_task": bool(str(j.task or "").strip()),
@@ -10851,6 +17524,14 @@ def _build_delete_cron_handler():
                 output={},
                 error="id is required",
             )
+        if _invalid_concrete_resource_id_reason(cron_id):
+            return _invalid_structured_identifier_result(
+                invocation,
+                field_name="id",
+                raw_value=cron_id,
+                reason="invalid_cron_id",
+                required_source_tool="list_crons",
+            )
         job = get_cron(cron_id)
         workspace_id = workspace_id_for_principal(invocation.principal_id)
         admin_cross_workspace = job is not None and job.workspace_id != workspace_id and _cron_admin_workspace_allowed(workspace_id)
@@ -10905,6 +17586,14 @@ def _build_update_cron_handler():
                 status="failed",
                 output={},
                 error="id is required",
+            )
+        if _invalid_concrete_resource_id_reason(cron_id):
+            return _invalid_structured_identifier_result(
+                invocation,
+                field_name="id",
+                raw_value=cron_id,
+                reason="invalid_cron_id",
+                required_source_tool="list_crons",
             )
         existing = get_cron(cron_id)
         workspace_id = workspace_id_for_principal(invocation.principal_id)
@@ -11009,65 +17698,208 @@ def _build_update_cron_handler():
 def _build_toggle_cron_handler():
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.connections import workspace_id_for_principal
-        from nullion.crons import get_cron, toggle_cron
+        from nullion.crons import get_cron, list_crons, toggle_cron
         args = invocation.arguments or {}
         cron_id = str(args.get("id", "")).strip()
+        raw_ids = args.get("ids")
+        ids = tuple(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in (raw_ids if isinstance(raw_ids, list) else ())
+                if str(item or "").strip()
+            )
+        )
+        all_current_workspace = bool(args.get("all_current_workspace") is True)
         enabled = bool(args.get("enabled", True))
-        if not cron_id:
+        selector_count = int(bool(cron_id)) + int(bool(ids)) + int(all_current_workspace)
+        if selector_count > 1:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "id": cron_id or None,
+                    "ids": list(ids),
+                    "all_current_workspace": all_current_workspace,
+                },
+                error="Use exactly one of id, ids, or all_current_workspace.",
+            )
+        if not cron_id and not ids and not all_current_workspace:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
                 output={},
-                error="id is required",
+                error="id, ids, or all_current_workspace is required",
             )
-        existing = get_cron(cron_id)
         workspace_id = workspace_id_for_principal(invocation.principal_id)
-        admin_cross_workspace = (
-            existing is not None
-            and existing.workspace_id != workspace_id
-            and _cron_admin_workspace_allowed(workspace_id)
-        )
-        if existing is not None and existing.workspace_id != workspace_id and not admin_cross_workspace:
-            return _cron_workspace_denial(invocation=invocation, cron_id=cron_id, owner_workspace_id=existing.workspace_id)
-        job = toggle_cron(cron_id, enabled)
-        if job is None:
+        if all_current_workspace:
+            target_ids = tuple(
+                str(job.id)
+                for job in list_crons(workspace_id=workspace_id)
+                if str(getattr(job, "id", "") or "").strip()
+                and bool(getattr(job, "enabled", False)) != enabled
+            )
+        else:
+            target_ids = (cron_id,) if cron_id else ids
+        invalid_ids = [
+            target_id
+            for target_id in target_ids
+            if _invalid_concrete_resource_id_reason(target_id)
+        ]
+        if invalid_ids:
+            if len(invalid_ids) == 1:
+                return _invalid_structured_identifier_result(
+                    invocation,
+                    field_name="id",
+                    raw_value=invalid_ids[0],
+                    reason="invalid_cron_id",
+                    required_source_tool="list_crons",
+                )
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
-                output={"id": cron_id},
-                error=f"No cron found with id={cron_id!r}",
+                output={"ids": list(target_ids), "invalid_ids": invalid_ids},
+                error="One or more cron ids are invalid. Use exact ids returned by list_crons.",
+            )
+        if not all_current_workspace and len(target_ids) == 1:
+            cron_id = target_ids[0]
+            existing = get_cron(cron_id)
+            admin_cross_workspace = (
+                existing is not None
+                and existing.workspace_id != workspace_id
+                and _cron_admin_workspace_allowed(workspace_id)
+            )
+            if existing is not None and existing.workspace_id != workspace_id and not admin_cross_workspace:
+                return _cron_workspace_denial(
+                    invocation=invocation,
+                    cron_id=cron_id,
+                    owner_workspace_id=existing.workspace_id,
+                )
+            job = toggle_cron(cron_id, enabled)
+            if job is None:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"id": cron_id},
+                    error=f"No cron found with id={cron_id!r}",
+                )
+            state = "enabled" if enabled else "disabled"
+            toggle_message = f"Cron '{job.name}' ({cron_id}) is now {state}."
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "id": job.id,
+                    "name": job.name,
+                    "workspace_id": job.workspace_id,
+                    "enabled": job.enabled,
+                    "admin_cross_workspace": admin_cross_workspace,
+                    "message": toggle_message,
+                    "action_receipt": _action_receipt(
+                        action="updated",
+                        object_type="cron",
+                        object_id=job.id,
+                        object_name=job.name,
+                        summary=toggle_message,
+                        details=[f"Status: {state}.", f"Workspace: {job.workspace_id}."],
+                        changes=[
+                            {
+                                "field": "enabled",
+                                "label": "Status",
+                                "before": "enabled" if bool(getattr(existing, "enabled", False)) else "disabled",
+                                "after": state,
+                                "changed": bool(getattr(existing, "enabled", None)) != bool(job.enabled),
+                            }
+                        ],
+                    ),
+                },
+                error=None,
+            )
+
+        results: list[dict[str, object]] = []
+        details: list[str] = []
+        missing_ids: list[str] = []
+        denied: list[ToolResult] = []
+        for target_id in target_ids:
+            existing = get_cron(target_id)
+            admin_cross_workspace = (
+                existing is not None
+                and existing.workspace_id != workspace_id
+                and _cron_admin_workspace_allowed(workspace_id)
+            )
+            if existing is not None and existing.workspace_id != workspace_id and not admin_cross_workspace:
+                denied.append(
+                    _cron_workspace_denial(
+                        invocation=invocation,
+                        cron_id=target_id,
+                        owner_workspace_id=existing.workspace_id,
+                    )
+                )
+                continue
+            job = toggle_cron(target_id, enabled)
+            if job is None:
+                missing_ids.append(target_id)
+                continue
+            changed = bool(getattr(existing, "enabled", None)) != bool(job.enabled)
+            item = {
+                "id": job.id,
+                "name": job.name,
+                "workspace_id": job.workspace_id,
+                "enabled": job.enabled,
+                "changed": changed,
+                "admin_cross_workspace": admin_cross_workspace,
+            }
+            results.append(item)
+            state = "enabled" if enabled else "disabled"
+            details.append(f"{state.title()}: {job.name} ({job.id}).")
+        if denied:
+            first = denied[0]
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={
+                    "ids": list(target_ids),
+                    "results": results,
+                    "missing_ids": missing_ids,
+                    "denied_id": first.output.get("id") if isinstance(first.output, dict) else None,
+                },
+                error=first.error,
+            )
+        if missing_ids:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="failed",
+                output={"ids": list(target_ids), "results": results, "missing_ids": missing_ids},
+                error="One or more cron jobs were not found.",
             )
         state = "enabled" if enabled else "disabled"
-        toggle_message = f"Cron '{job.name}' ({cron_id}) is now {state}."
+        verb = "Enabled" if enabled else "Disabled"
+        if not results:
+            summary = f"No cron jobs needed to be {state}."
+        else:
+            summary = f"{verb} {len(results)} cron job{'s' if len(results) != 1 else ''}."
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
             output={
-                "id": job.id,
-                "name": job.name,
-                "workspace_id": job.workspace_id,
-                "enabled": job.enabled,
-                "admin_cross_workspace": admin_cross_workspace,
-                "message": toggle_message,
+                "ids": [str(item.get("id")) for item in results],
+                "results": results,
+                "enabled": enabled,
+                "updated_count": len(results),
+                "all_current_workspace": all_current_workspace,
+                "message": summary,
                 "action_receipt": _action_receipt(
                     action="updated",
                     object_type="cron",
-                    object_id=job.id,
-                    object_name=job.name,
-                    summary=toggle_message,
-                    details=[f"Status: {state}.", f"Workspace: {job.workspace_id}."],
-                    changes=[
-                        {
-                            "field": "enabled",
-                            "label": "Status",
-                            "before": "enabled" if bool(getattr(existing, "enabled", False)) else "disabled",
-                            "after": state,
-                            "changed": bool(getattr(existing, "enabled", None)) != bool(job.enabled),
-                        }
-                    ],
+                    summary=summary,
+                    details=details,
                 ),
             },
             error=None,
@@ -11368,6 +18200,22 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         raw_ids = args.get("ids")
         raw_all_enabled = args.get("all_enabled")
         workspace_id = workspace_id_for_principal(invocation.principal_id)
+        if raw_id and _invalid_concrete_resource_id_reason(raw_id):
+            return _invalid_structured_identifier_result(
+                invocation,
+                field_name="id",
+                raw_value=raw_id,
+                reason="invalid_cron_id",
+                required_source_tool="list_crons",
+            )
+        if raw_name and _invalid_concrete_resource_name_reason(raw_name):
+            return _invalid_structured_identifier_result(
+                invocation,
+                field_name="name",
+                raw_value=raw_name,
+                reason="invalid_cron_name",
+                required_source_tool="list_crons",
+            )
         if raw_all_enabled is True:
             if raw_id or raw_name or raw_ids:
                 return ToolResult(
@@ -11402,6 +18250,20 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
                     status="failed",
                     output={"ids": []},
                     error="ids must include at least one cron id",
+                )
+            invalid_ids = [cron_id for cron_id in ids if _invalid_concrete_resource_id_reason(cron_id)]
+            if invalid_ids:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "reason": "invalid_cron_id",
+                        "ids": list(ids),
+                        "invalid_ids": invalid_ids,
+                        "required_source_tool": "list_crons",
+                    },
+                    error="Invalid id in ids: use exact cron ids returned by list_crons.",
                 )
             results: list[dict[str, object]] = []
             completed_count = 0
@@ -11566,11 +18428,21 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         from nullion.response_fulfillment_contract import guaranteed_user_visible_text
 
         delivery_status = runner_output.get("cron_delivery_status") if isinstance(runner_output, dict) else ""
-        foreground_reply_suppressed = str(delivery_status or "").strip() in {
+        delivery_status_text = str(delivery_status or "").strip()
+        deferred_status_owned_by_background = (
+            delivery_status_text == "deferred"
+            and isinstance(runner_output, dict)
+            and (
+                runner_output.get("status_delivered") is True
+                or runner_output.get("planner_status_owned_by_background") is True
+                or runner_output.get("foreground_reply_suppressed") is True
+            )
+        )
+        foreground_reply_suppressed = delivery_status_text in {
             "saved",
             "sent",
             "partial_success",
-        }
+        } or deferred_status_owned_by_background
         result_text = (
             ""
             if foreground_reply_suppressed
@@ -11597,11 +18469,11 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         if updated_stored_job:
             save_crons(jobs)
         run_message = f"Ran cron '{job.name}' ({job.id}) now."
-        if str(delivery_status or "").strip() == "deferred":
+        if delivery_status_text == "deferred":
             run_message = _foreground_cron_status_text(job, delivery_status) or run_message
         progress_group_id = ""
         progress_status_text = ""
-        if str(delivery_status or "").strip() == "deferred":
+        if delivery_status_text == "deferred":
             if isinstance(runner_output, dict):
                 progress_group_id = str(runner_output.get("task_group_id") or "").strip()
                 progress_status_text = str(
@@ -11640,15 +18512,21 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         if delivery_status:
             output["delivery_status"] = str(delivery_status)
             output["cron_delivery_status"] = str(delivery_status)
-            if str(delivery_status).strip() == "deferred":
+            if delivery_status_text == "deferred":
                 output["status_delivered"] = False
         if (
             isinstance(runner_output, dict)
-            and str(delivery_status or "").strip() == "deferred"
+            and delivery_status_text == "deferred"
             and runner_output.get("status_delivered") is True
         ):
             output["status_delivered"] = True
-        if str(delivery_status or "").strip() == "deferred" and progress_group_id and progress_status_text:
+        if (
+            isinstance(runner_output, dict)
+            and delivery_status_text == "deferred"
+            and runner_output.get("planner_status_owned_by_background") is True
+        ):
+            output["planner_status_owned_by_background"] = True
+        if delivery_status_text == "deferred" and progress_group_id and progress_status_text:
             output["task_group_id"] = progress_group_id
             output["progress_status_text"] = progress_status_text
             # Keep the legacy key populated so existing platform status helpers
@@ -11748,6 +18626,7 @@ def register_cron_tools(
             requires_approval=False,
             timeout_seconds=10,
             capability_tags=("scheduler", "cron"),
+            continuation_tools=("run_cron", "delete_cron", "update_cron", "toggle_cron"),
         ),
         _build_list_crons_handler(),
     )
@@ -11757,7 +18636,7 @@ def register_cron_tools(
             description="Delete a scheduled cron job by id. Required args: id (the cron job id).",
             risk_level=ToolRiskLevel.MEDIUM,
             side_effect_class=ToolSideEffectClass.WRITE,
-            requires_approval=False,
+            requires_approval=True,
             timeout_seconds=10,
             capability_tags=("scheduler", "cron"),
         ),
@@ -11783,8 +18662,10 @@ def register_cron_tools(
         ToolSpec(
             name="toggle_cron",
             description=(
-                "Enable or disable a scheduled cron job. "
-                "Required args: id (the cron job id), enabled (bool — true to enable, false to disable)."
+                "Enable or disable scheduled cron jobs. Required args: enabled "
+                "(bool — true to enable, false to disable), plus exactly one selector: id for one cron, "
+                "ids for exact ids returned by list_crons, or all_current_workspace=true for every cron in "
+                "the current workspace."
             ),
             risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.WRITE,
@@ -11862,6 +18743,7 @@ __all__ = [
     "register_media_plugin",
     "register_search_plugin",
     "register_reminder_tools",
+    "register_market_quote_tool",
     "register_weather_forecast_tool",
     "register_web_extension",
     "register_workspace_plugin",

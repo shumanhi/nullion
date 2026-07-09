@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+import base64
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import html as html_lib
 import inspect
 import json
 import logging
@@ -11,42 +14,67 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import threading
 import time
 from types import SimpleNamespace
 from typing import Callable, Iterable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
-from nullion.approvals import ApprovalStatus
+from nullion.agent_turn_limits import (
+    AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+    AGENT_TURN_LIMIT_EXTENSION_ACTION,
+    build_agent_turn_limit_extension_context,
+    build_agent_turn_limit_resume_token,
+    default_agent_turn_max_iterations,
+    max_iterations_from_resume_token,
+)
+from nullion.approval_markers import ORPHAN_APPROVAL_REQUEST_REPLY
+from nullion.approvals import ApprovalStatus, create_approval_request
 from nullion.artifacts import (
+    ARTIFACT_DELIVERY_ROLES,
     artifact_descriptor_for_path,
     artifact_descriptors_for_paths,
+    artifact_paths_from_output_descriptors,
     artifact_path_for_generated_file,
+    artifact_path_for_generated_workspace_file,
     artifact_root_for_principal,
     artifact_root_for_runtime,
+    is_unrequested_internal_sidecar_artifact,
     is_safe_artifact_path,
     media_candidate_paths_from_text,
+    normalize_artifact_extensions,
     parse_media_directive_line,
     promote_supporting_asset_artifact_paths,
+    output_has_artifact_descriptors,
     split_media_reply_attachments,
 )
-from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
+from nullion.attachment_format_graph import (
+    ATTACHMENT_TOKEN_EXTENSIONS,
+    EMBEDDED_MEDIA_ATTACHMENT_EXTENSIONS,
+    VALID_ATTACHMENT_EXTENSIONS,
+    has_unambiguous_attachment_extension_context,
+    plan_attachment_format,
+)
 from nullion.builder_observer import (
     TurnOutcome,
     TurnSignal,
     detect_patterns,
     extract_turn_signal,
 )
-from nullion.builder import format_builder_proposal_notification
+from nullion.builder import BuilderDecisionType, BuilderProposal, format_builder_proposal_notification
 from nullion.builder_reflector import reflect_on_pattern, reflect_on_turn
 from nullion.chat_attachments import (
     attachment_processing_failure_reply,
     chat_attachment_content_blocks,
+    has_unavailable_chat_attachments,
     is_supported_image_attachment,
     normalize_chat_attachments,
+    unavailable_chat_attachment_count,
+    unavailable_chat_attachment_names,
 )
 from nullion.chat_backend import ChatBackendUnavailableError, generate_chat_reply
 from nullion.chat_response_contract import (
@@ -63,6 +91,12 @@ from nullion.chat_streaming import TELEGRAM_CHAT_CAPABILITIES, streaming_enabled
 from nullion.conversation_history_tools import CHAT_HISTORY_SEARCH_TOOL_NAME, with_conversation_history_tool
 from nullion.config import NullionSettings
 from nullion.config import normalize_reasoning_effort
+from nullion.connector_prompt_context import (
+    active_connector_provider_context_snapshot,
+    cached_active_connector_app_id_providers,
+    format_active_connector_provider_context_for_prompt,
+    mentioned_connector_app_ids,
+)
 from nullion.conversation_runtime import (
     ConversationBranch,
     ConversationBranchStatus,
@@ -135,13 +169,18 @@ from nullion.thinking_display import (
     thinking_display_status_text,
 )
 from nullion.response_fulfillment_contract import (
+    artifact_completed_embedded_media_paths,
+    artifact_media_embedding_obligation_outstanding,
+    artifact_plain_replacement_artifact_paths,
     evaluate_response_execution_outcome,
     evaluate_response_fulfillment,
     artifact_media_plain_replacement_guard_result,
     normalize_artifact_media_required_extensions,
+    scoped_artifact_extensions_from_tool_results,
 )
 from nullion.response_sanitizer import sanitize_user_visible_reply
 from nullion.redaction import redact_value
+from nullion.scheduler_context_compaction import compact_list_crons_output_for_context
 from nullion.screenshot_delivery import ScreenshotDeliveryResult
 from nullion.skill_usage import (
     LEARNED_SKILL_INJECT_MIN_SCORE,
@@ -161,9 +200,17 @@ from nullion.task_frames import (
 )
 from nullion.task_planner import TaskPlanner
 from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
-from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
+from nullion.tools import (
+    ToolInvocation,
+    ToolRegistry,
+    ToolResult,
+    ToolSideEffectClass,
+    normalize_tool_status,
+    optimized_embedded_image_path,
+)
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.turn_context_policy import (
+    PlainNoToolFastPathRegistry,
     ScopedTurnToolRegistry,
     TurnToolScopeDecision,
     build_turn_tool_scope_decision,
@@ -174,7 +221,9 @@ from nullion.turn_context_policy import (
     should_include_prior_turn_messages,
     tool_registry_allows_skill_pack_context,
     tool_registry_allows_skill_pack_prompt_context,
+    turn_tool_registry_for_evidence,
     turn_tool_scope_decision_may_apply,
+    _tool_scope_decision_has_substantive_scope,
     turn_tool_evidence_needs_model_scope_decision,
     turn_is_context_linked,
 )
@@ -188,6 +237,49 @@ from nullion.workspace_storage import format_workspace_storage_for_prompt
 
 
 logger = logging.getLogger(__name__)
+
+_BROWSER_AGENT_TURN_MAX_ITERATIONS_ENV = "NULLION_BROWSER_AGENT_TURN_MAX_ITERATIONS"
+_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 24
+_WEB_OR_BROWSER_TOOL_NAMES = frozenset({"web_fetch", "web_search"})
+
+
+def _is_web_or_browser_tool_name(tool_name: object) -> bool:
+    normalized = str(tool_name or "").strip()
+    return bool(normalized) and (normalized.startswith("browser_") or normalized in _WEB_OR_BROWSER_TOOL_NAMES)
+
+
+def _tool_scope_requests_web_or_browser_work(tool_registry: object | None) -> bool:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    web_action = str(getattr(decision, "web_action", "none") or "none")
+    if web_action in {"open_url", "live_research", "browser_interaction"}:
+        return True
+    for raw_names in (
+        getattr(decision, "requested_tool_names", ()) or (),
+        getattr(decision, "required_tool_names", ()) or (),
+    ):
+        if not isinstance(raw_names, (list, tuple, set, frozenset)):
+            continue
+        if any(_is_web_or_browser_tool_name(name) for name in raw_names):
+            return True
+    return False
+
+
+def _configured_browser_agent_turn_max_iterations(base_limit: int) -> int:
+    raw_value = os.environ.get(_BROWSER_AGENT_TURN_MAX_ITERATIONS_ENV, str(_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS))
+    try:
+        configured = int(raw_value)
+    except (TypeError, ValueError):
+        configured = _BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS
+    return max(base_limit, min(60, max(1, configured)))
+
+
+def _chat_agent_turn_max_iterations(tool_registry: object | None) -> int:
+    base_limit = default_agent_turn_max_iterations()
+    if _tool_scope_requests_web_or_browser_work(tool_registry):
+        return _configured_browser_agent_turn_max_iterations(base_limit)
+    return base_limit
 ActivityCallback = Callable[[dict[str, str]], None]
 TextDeltaCallback = Callable[[str], None]
 
@@ -232,6 +324,24 @@ class StreamedChatReply(str):
     """String reply marker for platform adapters that already streamed it."""
 
     reply_already_sent: bool = True
+
+
+class MetadataChatReply(str):
+    """String reply marker carrying typed delivery metadata."""
+
+
+def _metadata_chat_reply(reply: object, **metadata: object) -> MetadataChatReply:
+    wrapped = MetadataChatReply(str(reply or ""))
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value:
+            continue
+        try:
+            setattr(wrapped, key, value)
+        except Exception:
+            pass
+    return wrapped
 _MAX_CHAT_TURNS = 6
 _MAX_RECENT_TOOL_CONTEXT_TURNS = 16
 _MAX_APPROVAL_PROMPT_TURNS = 20
@@ -241,16 +351,27 @@ _AUTO_HISTORY_CONTEXT_MIN_SCORE = 2
 _AUTO_HISTORY_EVIDENCE_CONTEXT_LIMIT = 6
 _AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT = 2
 _CHAT_STABLE_CONTEXT_CACHE_MAX_ENTRIES = 32
-_CHAT_STABLE_CONTEXT_CACHE_VERSION = "v12"
+_CHAT_STABLE_CONTEXT_CACHE_VERSION = "v17"
 _DIAGNOSTIC_ATTACHMENT_SUFFIXES = frozenset({".log"})
+_EMAIL_TARGET_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 _PRIMARY_RENDERED_ARTIFACT_SUFFIXES = frozenset(
     {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm"}
 )
-_TEXT_SIDECAR_ARTIFACT_SUFFIXES = frozenset({".txt", ".md"})
+_TEXT_SIDECAR_ARTIFACT_SUFFIXES = frozenset({".txt", ".md", ".json", ".log"})
 _PRIMARY_RENDERED_ARTIFACT_STEM_TOKENS = frozenset(
     suffix.removeprefix(".") for suffix in _PRIMARY_RENDERED_ARTIFACT_SUFFIXES
 )
 _IMAGE_ARTIFACT_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"})
+_STRUCTURED_ARTIFACT_PATH_TOOLS = frozenset(
+    {
+        "document_create",
+        "html_create",
+        "pdf_create",
+        "pdf_edit",
+        "presentation_create",
+        "spreadsheet_create",
+    }
+)
 _MODEL_ISSUE_SIGNAL_MAX_AGE_SECONDS = 30 * 60
 _MODEL_ISSUE_RECOVERED_AT_BY_RUNTIME: dict[str, datetime] = {}
 _MODEL_ISSUE_RECOVERY_CHECKED_AT_BY_RUNTIME: dict[str, datetime] = {}
@@ -469,6 +590,150 @@ def _strip_media_directives_from_context(text: str) -> str:
     return "\n".join(lines)
 
 
+def _strip_suppressed_media_directives(text: str, suppressed_paths: set[str]) -> str:
+    if not suppressed_paths:
+        return text
+    suppressed_identities = {
+        identity
+        for path in suppressed_paths
+        for identity in _path_identity_variants(path)
+    }
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        directive = parse_media_directive_line(raw_line)
+        if directive is not None and _path_matches_identity_set(directive.path, suppressed_identities):
+            continue
+        lines.append(raw_line)
+    return "\n".join(lines)
+
+
+def _terminal_exec_json_payload(result: ToolResult) -> object | None:
+    output = result.output if isinstance(result.output, dict) else {}
+    stdout = str(output.get("stdout") or "").strip()
+    if not stdout:
+        return None
+    try:
+        return json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+
+
+def _structured_output_scalar_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            return ""
+        return f"{value:,}" if isinstance(value, int) else f"{value:g}"
+    text = str(value).strip()
+    if len(text) > 140:
+        return text[:137].rstrip() + "..."
+    return text
+
+
+def _structured_output_is_scalar(value: object) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _structured_output_dict_summary(payload: Mapping[str, object], *, title: str) -> str | None:
+    scalar_items = [
+        (str(key).replace("_", " "), _structured_output_scalar_text(value))
+        for key, value in payload.items()
+        if _structured_output_is_scalar(value) and _structured_output_scalar_text(value)
+    ]
+    if not scalar_items:
+        return None
+    priority = {"status": 0, "result": 1, "summary": 2, "message": 3, "name": 4, "path": 5, "count": 6, "size bytes": 7}
+    scalar_items.sort(key=lambda item: (priority.get(item[0].casefold(), 50), item[0].casefold()))
+    lines = [title]
+    for key, value in scalar_items[:8]:
+        lines.append(f"- {key}: {value}")
+    remaining = len(scalar_items) - min(len(scalar_items), 8)
+    if remaining > 0:
+        lines.append(f"- ...and {remaining} more field{'s' if remaining != 1 else ''}.")
+    return "\n".join(lines)
+
+
+def _structured_output_records_summary(records: Iterable[Mapping[str, object]], *, title: str) -> str | None:
+    normalized_records = [dict(record) for record in records]
+    if not normalized_records:
+        return None
+    field_scores: dict[str, int] = {}
+    for record in normalized_records:
+        for key, value in record.items():
+            if not _structured_output_is_scalar(value):
+                continue
+            text = _structured_output_scalar_text(value)
+            if not text:
+                continue
+            field = str(key)
+            field_scores[field] = field_scores.get(field, 0) + 1
+    if not field_scores:
+        return None
+    priority = {
+        "name": 0,
+        "title": 0,
+        "path": 1,
+        "file": 1,
+        "url": 2,
+        "status": 3,
+        "summary": 4,
+        "message": 4,
+        "count": 5,
+        "size_bytes": 6,
+    }
+    fields = sorted(
+        field_scores,
+        key=lambda field: (priority.get(field.casefold(), 50), -field_scores[field], field.casefold()),
+    )[:4]
+    lines = [title]
+    for index, record in enumerate(normalized_records[:8], start=1):
+        parts: list[str] = []
+        for field in fields:
+            if field not in record:
+                continue
+            value = _structured_output_scalar_text(record.get(field))
+            if value:
+                parts.append(f"{field.replace('_', ' ')}: {value}")
+        if parts:
+            lines.append(f"- {index}. " + "; ".join(parts))
+    remaining = len(normalized_records) - min(len(normalized_records), 8)
+    if remaining > 0:
+        lines.append(f"- ...and {remaining} more record{'s' if remaining != 1 else ''}.")
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def _structured_output_summary_from_payload(payload: object, *, tool_name: str) -> str | None:
+    title = f"I got structured output from `{tool_name}`."
+    if isinstance(payload, Mapping):
+        for key in ("records", "items", "results", "data"):
+            nested = payload.get(key)
+            if isinstance(nested, list) and all(isinstance(item, Mapping) for item in nested):
+                return _structured_output_records_summary(nested, title=title)
+        return _structured_output_dict_summary(payload, title=title)
+    if isinstance(payload, list) and all(isinstance(item, Mapping) for item in payload):
+        return _structured_output_records_summary(payload, title=title)
+    return None
+
+
+def _terminal_exec_structured_output_summary(results: Iterable[ToolResult]) -> str | None:
+    filesystem_summary = _terminal_exec_structured_filesystem_summary(results)
+    if filesystem_summary:
+        return filesystem_summary
+    latest_payload: object | None = None
+    latest_tool_name = "terminal_exec"
+    for result in results:
+        payload = _terminal_exec_json_payload(result)
+        if payload is not None:
+            latest_payload = payload
+            latest_tool_name = result.tool_name or "terminal_exec"
+    if latest_payload is None:
+        return None
+    return _structured_output_summary_from_payload(latest_payload, tool_name=latest_tool_name)
+
+
 def _chat_freeze_for_cache(value: object) -> object:
     if isinstance(value, dict):
         return tuple(
@@ -497,6 +762,32 @@ def _chat_runtime_cache_db_path(runtime: object | None) -> str | None:
 
 def _chat_runtime_cache_identity(runtime: object | None) -> str:
     return _chat_runtime_cache_db_path(runtime) or f"runtime:{id(runtime)}"
+
+
+_CHAT_TOOL_REGISTRY_SIGNATURE_CACHE_TTL_SECONDS = 60
+_CHAT_TOOL_REGISTRY_SIGNATURE_CACHE_MAX_ENTRIES = 32
+_CHAT_TOOL_REGISTRY_SIGNATURE_CACHE: dict[tuple[object, ...], tuple[float, object]] = {}
+
+
+def _chat_tool_registry_revision_marker(tool_registry: object) -> object:
+    visited: set[int] = set()
+    current = tool_registry
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        revision = getattr(current, "registry_revision", None)
+        if revision is not None:
+            return revision
+        current = getattr(current, "_delegate", None)
+    return "unversioned"
+
+
+def _chat_tool_registry_signature_cache_key(tool_registry: object) -> tuple[object, ...]:
+    return (
+        type(tool_registry).__module__,
+        type(tool_registry).__qualname__,
+        id(tool_registry),
+        _chat_tool_registry_revision_marker(tool_registry),
+    )
 
 
 def _chat_stable_context_cache_get(cache_key: tuple[object, ...], *, db_path: str | None = None) -> object | None:
@@ -532,6 +823,15 @@ def _chat_stable_context_cache_set(cache_key: tuple[object, ...], value: object 
 
 
 def _chat_tool_registry_signature(tool_registry: object) -> object:
+    cache_key = _chat_tool_registry_signature_cache_key(tool_registry)
+    now = time.monotonic()
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        cached_signature = _CHAT_TOOL_REGISTRY_SIGNATURE_CACHE.get(cache_key)
+        if cached_signature is not None:
+            expires_at, value = cached_signature
+            if now <= expires_at:
+                return value
+            _CHAT_TOOL_REGISTRY_SIGNATURE_CACHE.pop(cache_key, None)
     try:
         definitions = tool_registry.list_tool_definitions()
     except Exception:
@@ -558,7 +858,15 @@ def _chat_tool_registry_signature(tool_registry: object) -> object:
             ]
         except Exception:
             return (type(tool_registry).__name__, "unavailable")
-    return _chat_freeze_for_cache(definitions)
+    signature = _chat_freeze_for_cache(definitions)
+    with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
+        if len(_CHAT_TOOL_REGISTRY_SIGNATURE_CACHE) >= _CHAT_TOOL_REGISTRY_SIGNATURE_CACHE_MAX_ENTRIES:
+            _CHAT_TOOL_REGISTRY_SIGNATURE_CACHE.clear()
+        _CHAT_TOOL_REGISTRY_SIGNATURE_CACHE[cache_key] = (
+            now + _CHAT_TOOL_REGISTRY_SIGNATURE_CACHE_TTL_SECONDS,
+            signature,
+        )
+    return signature
 
 
 def _chat_settings_signature(settings: object | None) -> tuple[object, ...]:
@@ -629,7 +937,7 @@ _TURN_SIGNAL_WINDOW_LOCK = threading.Lock()
 _TURN_SIGNAL_WINDOW_MAX = 100
 # Minimum pattern confidence before we ask the LLM to synthesise a skill.
 # The detector reaches ~0.58 at three matching tool-backed turns, which is
-# enough to catch repeated news/market workflows without firing on a one-off.
+# enough to catch repeated workflows without firing on a one-off.
 _PATTERN_REFLECTION_CONFIDENCE_THRESHOLD = 0.58
 # Tracks newly auto-accepted skills per runtime so we can show a one-shot
 # "✨ Learned: X" notification in the next reply.
@@ -731,16 +1039,159 @@ def _requested_attachment_extension(
     return plan_attachment_format(planning_prompt, model_client=planner_model_client).extension
 
 
+def _requested_embedded_media_extensions(
+    prompt: str,
+    *,
+    model_client: object | None = None,
+    allow_model_planning: bool = False,
+    source_attachment_names: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    if is_slash_prefixed_literal_message(prompt):
+        return ()
+    if len(set(_literal_requested_attachment_extensions(prompt))) > 1:
+        return ()
+    has_format_candidate = _has_attachment_format_candidate(prompt)
+    has_planner = callable(getattr(model_client, "create", None))
+    should_plan = has_planner and (has_format_candidate or allow_model_planning)
+    if not should_plan:
+        return ()
+    if _is_internal_scheduled_task_context(prompt):
+        return ()
+    planning_prompt = str(prompt or "")
+    for raw_name in source_attachment_names or ():
+        name = Path(str(raw_name or "").strip()).name
+        if name:
+            planning_prompt = planning_prompt.replace(name, "attached file")
+    plan = plan_attachment_format(
+        planning_prompt,
+        model_client=model_client,
+        include_media_requirements=True,
+    )
+    if plan.extension is None and plan.embedded_media_extensions:
+        return ()
+    requested_extensions = set(_requested_attachment_extensions(
+        prompt,
+        model_client=None,
+        allow_model_planning=False,
+        source_attachment_names=source_attachment_names,
+    ))
+    if plan.extension:
+        requested_extensions.add(plan.extension)
+    return tuple(
+        extension
+        for extension in plan.embedded_media_extensions
+        if extension in EMBEDDED_MEDIA_ATTACHMENT_EXTENSIONS
+        and (not requested_extensions or extension in requested_extensions)
+    )
+
+
+def _token_has_url_boundary(token: str) -> bool:
+    return "://" in str(token or "")
+
+
 def _literal_requested_attachment_extensions(prompt: str) -> tuple[str, ...]:
+    if is_slash_prefixed_literal_message(prompt):
+        return ()
     extensions: list[str] = []
-    for raw_token in re.split(r"\s+", str(prompt or "")):
+    bare_extensions: list[str] = []
+    emphasized_bare_extensions: list[str] = []
+    raw_tokens = tuple(re.split(r"\s+", str(prompt or "")))
+    mapped_token_counts: dict[str, int] = {}
+    for raw_token in raw_tokens:
+        token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
+        if not token:
+            continue
+        mapped = ATTACHMENT_TOKEN_EXTENSIONS.get(token.lower())
+        if mapped in VALID_ATTACHMENT_EXTENSIONS:
+            mapped_token_counts[mapped] = mapped_token_counts.get(mapped, 0) + 1
+    filename_reference_extensions: set[str] = set()
+    ambiguous_filename_reference_extensions: set[str] = set()
+    for raw_token in raw_tokens:
         token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
         if not token:
             continue
         extension = Path(token).suffix.lower().strip()
-        if extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
+        has_path_boundary = (
+            "/" in token
+            or "\\" in token
+            or token.startswith("~")
+            or _token_has_url_boundary(token)
+        )
+        if extension in VALID_ATTACHMENT_EXTENSIONS and not has_path_boundary:
+            filename_reference_extensions.add(extension)
+            if not has_unambiguous_attachment_extension_context(prompt, token):
+                ambiguous_filename_reference_extensions.add(extension)
+    for raw_token in raw_tokens:
+        token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
+        if not token:
+            continue
+        dotted_token = token.lower()
+        if dotted_token in VALID_ATTACHMENT_EXTENSIONS and dotted_token not in extensions:
+            extensions.append(dotted_token)
+            continue
+        mapped = ATTACHMENT_TOKEN_EXTENSIONS.get(token.lower())
+        if (
+            mapped in VALID_ATTACHMENT_EXTENSIONS
+        ):
+            if ambiguous_filename_reference_extensions:
+                if (
+                    mapped in ambiguous_filename_reference_extensions
+                    and mapped_token_counts.get(mapped, 0) >= 2
+                    and mapped not in extensions
+                ):
+                    extensions.append(mapped)
+                continue
+            if token != token.lower() and mapped not in emphasized_bare_extensions:
+                emphasized_bare_extensions.append(mapped)
+            if mapped not in filename_reference_extensions:
+                bare_extensions.append(mapped)
+        extension = Path(token).suffix.lower().strip()
+        has_path_boundary = (
+            "/" in token
+            or "\\" in token
+            or token.startswith("~")
+            or _token_has_url_boundary(token)
+        )
+        if extension in VALID_ATTACHMENT_EXTENSIONS and not _token_has_url_boundary(token):
+            continue
+    # A filename inside a user message is structured evidence that a file is in
+    # scope, but not by itself proof that the file should be delivered back as a
+    # new attachment. Output contracts must come from dotted/bare format tokens,
+    # structured task state, artifact descriptors, or the model format planner.
+    if len(bare_extensions) > 1:
+        for extension in bare_extensions:
             extensions.append(extension)
+    elif emphasized_bare_extensions:
+        for extension in emphasized_bare_extensions:
+            if extension not in extensions:
+                extensions.append(extension)
     return tuple(extensions)
+
+
+def _has_attachment_format_candidate(prompt: str) -> bool:
+    if is_slash_prefixed_literal_message(prompt):
+        return False
+    if re.search(r"\bscreenshots?\b", str(prompt or ""), re.IGNORECASE):
+        return True
+    for raw_token in re.split(r"\s+", str(prompt or "")):
+        token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
+        if not token:
+            continue
+        if token.lower() == "excel":
+            return True
+        if token.lower() in ATTACHMENT_TOKEN_EXTENSIONS:
+            return True
+        extension = Path(token).suffix.lower().strip()
+        if (
+            extension in VALID_ATTACHMENT_EXTENSIONS
+            and not _token_has_url_boundary(token)
+            and has_unambiguous_attachment_extension_context(prompt, token)
+        ):
+            return True
+        dotted_token = token.lower()
+        if dotted_token in VALID_ATTACHMENT_EXTENSIONS:
+            return True
+    return False
 
 
 def _requested_attachment_extensions(
@@ -750,11 +1201,44 @@ def _requested_attachment_extensions(
     allow_model_planning: bool = False,
     source_attachment_names: Iterable[str] | None = None,
 ) -> tuple[str, ...]:
+    text = str(prompt or "")
     extensions: list[str] = list(_literal_requested_attachment_extensions(prompt))
+    structured_descriptor_extensions: list[str] = []
+    for match in re.finditer(r"(?i)(?:^|\s)(?:artifact|output)=([^\s`'\"<>]+)", text):
+        suffix = Path(match.group(1).strip("`'\"<>(),;:")).suffix.lower()
+        if suffix in VALID_ATTACHMENT_EXTENSIONS and suffix not in structured_descriptor_extensions:
+            structured_descriptor_extensions.append(suffix)
+    if structured_descriptor_extensions:
+        return tuple(structured_descriptor_extensions)
+    output_filename_extensions = _requested_output_filename_extensions(prompt)
+    if output_filename_extensions and re.search(r"(?i)(?:^|\s)(?:artifact|output)=", text):
+        return output_filename_extensions
+    if output_filename_extensions and len(_requested_output_filenames(text)) >= 3:
+        return output_filename_extensions
+    if output_filename_extensions and allow_model_planning:
+        return output_filename_extensions
+    if extensions:
+        return tuple(extensions)
+    if re.search(r"\bscreenshots?\b", text, re.IGNORECASE):
+        return (".png",)
+    has_format_candidate = _has_attachment_format_candidate(prompt)
+    has_planner = callable(getattr(model_client, "create", None))
+    should_plan = has_planner and (has_format_candidate or allow_model_planning)
+    if not should_plan:
+        if has_format_candidate and allow_model_planning:
+            planned = _requested_attachment_extension(
+                prompt,
+                model_client=None,
+                allow_model_planning=False,
+                source_attachment_names=source_attachment_names,
+            )
+            if planned and planned not in extensions:
+                extensions.append(planned)
+        return tuple(extensions)
     planned = _requested_attachment_extension(
         prompt,
         model_client=model_client,
-        allow_model_planning=allow_model_planning,
+        allow_model_planning=should_plan,
         source_attachment_names=source_attachment_names,
     )
     if planned and planned not in extensions:
@@ -762,36 +1246,126 @@ def _requested_attachment_extensions(
     return tuple(extensions)
 
 
+def _merge_current_prompt_attachment_extensions(
+    requested_extensions: Iterable[str] | None,
+    *,
+    prompt: str,
+    effective_prompt: str,
+) -> tuple[str, ...]:
+    extensions = list(requested_extensions or ())
+    if str(prompt or "") == str(effective_prompt or ""):
+        return tuple(extensions)
+    for extension in _literal_requested_attachment_extensions(prompt):
+        if extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
 def _required_attachment_extensions_from_tool_scope(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    explicit_scope_extensions = _explicit_attachment_extensions_from_tool_scope(tool_results)
+    if _tool_scope_declared_attachment_extensions(tool_results):
+        return explicit_scope_extensions
+    return ()
+
+
+def _explicit_attachment_extensions_from_tool_scope(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> tuple[str, ...]:
     extensions: list[str] = []
     for result in tool_results or ():
-        if result.tool_name != "request_tool_scope" or normalize_tool_status(result.status) != "completed":
+        if _tool_result_name(result) != "request_tool_scope" or normalize_tool_status(_tool_result_status(result)) != "completed":
             continue
-        output = result.output if isinstance(result.output, dict) else {}
-        raw_extensions = output.get("artifact_extensions")
-        if not isinstance(raw_extensions, list):
-            continue
-        for raw_extension in raw_extensions:
-            extension = str(raw_extension or "").strip().lower()
-            if not extension:
-                continue
-            if not extension.startswith("."):
-                extension = f".{extension}"
-            if extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
-                extensions.append(extension)
+        raw_output = result.get("output") if isinstance(result, Mapping) else getattr(result, "output", None)
+        output = raw_output if isinstance(raw_output, dict) else {}
+        for key in ("artifact_extensions", "requested_artifact_extensions", "required_artifact_extensions"):
+            for extension in normalize_artifact_extensions(output.get(key)):
+                if extension not in extensions:
+                    extensions.append(extension)
+        for key in ("embedded_media_artifact_extensions", "media_required_artifact_extensions"):
+            for extension in normalize_artifact_media_required_extensions(output.get(key)):
+                if extension not in extensions:
+                    extensions.append(extension)
     return tuple(extensions)
+
+
+def _completed_primary_artifact_extensions_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for raw_path in _artifact_paths_from_tool_results(
+        tool_results,
+        include_search_matches=False,
+        include_file_write=True,
+    ):
+        suffix = Path(str(raw_path or "")).suffix.lower()
+        if suffix in _PRIMARY_RENDERED_ARTIFACT_SUFFIXES and suffix not in extensions:
+            extensions.append(suffix)
+    return tuple(extensions)
+
+
+def _tool_scope_declared_attachment_extensions(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    for result in tool_results or ():
+        if _tool_result_name(result) != "request_tool_scope" or normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        raw_output = result.get("output") if isinstance(result, Mapping) else getattr(result, "output", None)
+        output = raw_output if isinstance(raw_output, dict) else {}
+        if isinstance(output.get("artifact_extensions"), list):
+            return True
+    return False
+
+
+def _tool_scope_declared_no_attachment_extensions(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    return _tool_scope_declared_attachment_extensions(tool_results) and not _required_attachment_extensions_from_tool_scope(tool_results)
 
 
 def _merge_required_attachment_extensions(
     required_attachment_extensions: Iterable[str] | None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> tuple[str, ...]:
+    explicit_extensions = tuple(required_attachment_extensions or ())
+    if explicit_extensions:
+        extensions: list[str] = []
+        for raw_extension in (
+            *explicit_extensions,
+            *_deliverable_artifact_descriptor_extensions(tool_results),
+            *_required_attachment_extensions_from_tool_scope(tool_results),
+        ):
+            extension = str(raw_extension or "").strip().lower()
+            if not extension:
+                continue
+            if not extension.startswith("."):
+                extension = f".{extension}"
+            if (
+                extension in VALID_ATTACHMENT_EXTENSIONS
+                or extension in _DIAGNOSTIC_ATTACHMENT_SUFFIXES
+            ) and extension not in extensions:
+                extensions.append(extension)
+        return tuple(extensions)
+    deliverable_extensions = _deliverable_artifact_descriptor_extensions(tool_results)
+    if deliverable_extensions:
+        return deliverable_extensions
+    scoped_extensions = _required_attachment_extensions_from_tool_scope(tool_results)
+    if not explicit_extensions and _tool_scope_declared_attachment_extensions(tool_results):
+        extensions: list[str] = []
+        for extension in (
+            *scoped_extensions,
+            *_completed_primary_artifact_extensions_from_tool_results(tool_results),
+        ):
+            if extension not in extensions:
+                extensions.append(extension)
+        return tuple(extensions)
+    if not _tool_scope_declared_attachment_extensions(tool_results):
+        return ()
     extensions: list[str] = []
     for raw_extension in (
-        *(required_attachment_extensions or ()),
-        *_required_attachment_extensions_from_tool_scope(tool_results),
+        *scoped_extensions,
+        *_completed_primary_artifact_extensions_from_tool_results(tool_results),
     ):
         extension = str(raw_extension or "").strip().lower()
         if not extension:
@@ -804,6 +1378,39 @@ def _merge_required_attachment_extensions(
         ) and extension not in extensions:
             extensions.append(extension)
     return tuple(extensions)
+
+
+def _deliverable_artifact_descriptor_extensions(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        raw_output = result.get("output") if isinstance(result, Mapping) else getattr(result, "output", None)
+        output = raw_output if isinstance(raw_output, dict) else {}
+        for path in artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES):
+            extension = Path(str(path or "")).suffix.lower()
+            if extension and extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
+                extensions.append(extension)
+    return tuple(extensions)
+
+
+def _completed_scheduler_mutation(tool_results: Iterable[ToolResult] | None) -> bool:
+    scheduler_mutation_tools = {
+        "create_cron",
+        "update_cron",
+        "delete_cron",
+        "toggle_cron",
+        "set_reminder",
+        "update_reminder",
+        "delete_reminder",
+    }
+    return any(
+        result.tool_name in scheduler_mutation_tools
+        and normalize_tool_status(result.status) == "completed"
+        for result in (tool_results or ())
+    )
 
 
 def _required_embedded_media_extensions_from_tool_scope(
@@ -847,11 +1454,27 @@ def _required_embedded_media_extensions_from_tool_registry(registry: object | No
 
 def _tool_flow_context_for_required_media(
     required_embedded_media_extensions: Iterable[str] | None,
+    *,
+    required_artifact_extensions: Iterable[str] | None = None,
 ) -> dict[str, object] | None:
-    extensions = normalize_artifact_media_required_extensions(required_embedded_media_extensions)
-    if not extensions:
-        return None
-    return {"required_embedded_media_extensions": list(extensions)}
+    media_extensions = normalize_artifact_media_required_extensions(required_embedded_media_extensions)
+    artifact_extensions_list: list[str] = []
+    for item in required_artifact_extensions or ():
+        extension = str(item or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension not in artifact_extensions_list:
+            artifact_extensions_list.append(extension)
+    artifact_extensions = tuple(artifact_extensions_list)
+    context: dict[str, object] = {}
+    if media_extensions:
+        context["required_embedded_media_extensions"] = list(media_extensions)
+    if artifact_extensions:
+        context["required_artifact_extensions"] = list(artifact_extensions)
+        context["requires_artifact_delivery"] = True
+    return context or None
 
 
 def _planner_clarification_reply(question: str | None) -> str:
@@ -1113,6 +1736,18 @@ def _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision: o
     }
 
 
+def _messaging_dispatch_is_no_active_independent(turn_dispatch_decision: object | None) -> bool:
+    if turn_dispatch_decision is None:
+        return False
+    if getattr(turn_dispatch_decision, "dependency_turn_ids", None):
+        return False
+    disposition = getattr(turn_dispatch_decision, "disposition", None)
+    disposition_value = str(getattr(disposition, "value", disposition) or "").strip()
+    if disposition_value != ConversationTurnDisposition.INDEPENDENT.value:
+        return False
+    return str(getattr(turn_dispatch_decision, "reason", "") or "").strip() == "no_active_turn"
+
+
 def _messaging_turn_fast_profile_candidate(
     *,
     evidence,
@@ -1126,6 +1761,13 @@ def _messaging_turn_fast_profile_candidate(
         return False
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
+    if (
+        getattr(evidence, "numbered_option_selected", False)
+        and not getattr(evidence, "has_url_target", False)
+        and not getattr(evidence, "has_attachments", False)
+        and not getattr(evidence, "artifact_requested", False)
+    ):
+        return True
     if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
         return not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     return not (
@@ -1139,6 +1781,7 @@ def _messaging_turn_fast_profile_candidate(
 def _messaging_turn_skip_tool_scope_decision(
     *,
     evidence,
+    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -1148,13 +1791,21 @@ def _messaging_turn_skip_tool_scope_decision(
         return False
     if config_action is not None or allow_mini_agents or force_mini_agent_dispatch:
         return False
+    if (
+        getattr(evidence, "numbered_option_selected", False)
+        and not getattr(evidence, "has_url_target", False)
+        and not getattr(evidence, "has_attachments", False)
+        and not getattr(evidence, "artifact_requested", False)
+        and not tuple(getattr(evidence, "prior_tool_scopes", ()) or ())
+    ):
+        return True
     if _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
         return False
     if (
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
-        or turn_tool_scope_decision_may_apply(evidence)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     ):
         return False
     return True
@@ -1169,7 +1820,63 @@ def _turn_tool_scope_requires_special_tools(tool_registry: object) -> bool:
         or getattr(decision, "allow_scheduler_tools", False)
         or getattr(decision, "allow_connector_tools", False)
         or getattr(decision, "allow_skill_pack_tools", False)
+        or bool(getattr(decision, "requested_tool_names", ()) or ())
+        or bool(getattr(decision, "requested_artifact_extensions", ()) or ())
+        or bool(getattr(decision, "required_embedded_media_extensions", ()) or ())
     )
+
+
+_COMPACT_DELIVERY_CONTRACT_TOOL_NAMES = frozenset({
+    "browser_assert_page_state",
+    "browser_click_element",
+    "browser_click_id",
+    "browser_close",
+    "browser_extract_items",
+    "browser_extract_text",
+    "browser_find",
+    "browser_navigate",
+    "browser_open",
+    "browser_run_js",
+    "browser_scroll",
+    "browser_select_combobox",
+    "browser_snapshot",
+    "browser_type_field",
+    "browser_type_id",
+    "browser_wait_for",
+    "file_download",
+    "request_tool_scope",
+    "web_fetch",
+    "web_search",
+})
+
+
+def _turn_tool_scope_uses_compact_delivery_contract(tool_registry: object) -> bool:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return True
+    if (
+        getattr(decision, "scheduler_action", "none") != "none"
+        or getattr(decision, "skill_pack_action", "none") != "none"
+        or getattr(decision, "allow_scheduler_tools", False)
+        or getattr(decision, "allow_connector_tools", False)
+        or getattr(decision, "allow_skill_pack_tools", False)
+        or bool(getattr(decision, "connector_app_ids", ()) or ())
+        or bool(getattr(decision, "connector_source_user_requested", False))
+        or bool(getattr(decision, "requested_artifact_extensions", ()) or ())
+        or bool(getattr(decision, "required_embedded_media_extensions", ()) or ())
+    ):
+        return False
+    requested = {
+        str(name or "").strip()
+        for name in [
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        ]
+        if str(name or "").strip()
+    }
+    if not requested:
+        return True
+    return requested.issubset(_COMPACT_DELIVERY_CONTRACT_TOOL_NAMES)
 
 
 def _orchestrator_with_interactive_fast_profile(orchestrator, *, enabled: bool, tool_registry: object):
@@ -1209,6 +1916,11 @@ def _handle_verbose_command(message: str) -> str | None:
 
 def _session_activity_trace_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
     conversation_id = _conversation_id_for_chat(chat_id)
+    get_session_setting = getattr(runtime.store, "get_conversation_session_setting", None)
+    if callable(get_session_setting):
+        value = get_session_setting(conversation_id, "activity_trace_enabled")
+        if isinstance(value, bool):
+            return value
     events = runtime.store.list_conversation_events(conversation_id)
     for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
@@ -1270,6 +1982,11 @@ def set_verbose_mode_for_chat(runtime: PersistentRuntime | None, *, chat_id: str
 
 def _session_chat_streaming_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
     conversation_id = _conversation_id_for_chat(chat_id)
+    get_session_setting = getattr(runtime.store, "get_conversation_session_setting", None)
+    if callable(get_session_setting):
+        value = get_session_setting(conversation_id, "chat_streaming_enabled")
+        if isinstance(value, bool):
+            return value
     events = runtime.store.list_conversation_events(conversation_id)
     for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
@@ -1282,6 +1999,11 @@ def _session_chat_streaming_setting(runtime: PersistentRuntime, *, chat_id: str 
 
 def _session_thinking_display_setting(runtime: PersistentRuntime, *, chat_id: str | None) -> bool | None:
     conversation_id = _conversation_id_for_chat(chat_id)
+    get_session_setting = getattr(runtime.store, "get_conversation_session_setting", None)
+    if callable(get_session_setting):
+        value = get_session_setting(conversation_id, "thinking_display_enabled")
+        if isinstance(value, bool):
+            return value
     events = runtime.store.list_conversation_events(conversation_id)
     for event in reversed(events):
         if event.get("event_type") != "conversation.session_settings":
@@ -1521,6 +2243,193 @@ def _resume_principal_for_suspended_turn(runtime: PersistentRuntime, suspended_t
     return "telegram_chat"
 
 
+def _approved_pending_tool_invocation_from_suspended_turn(
+    runtime: PersistentRuntime,
+    suspended_turn: SuspendedTurn,
+) -> ToolInvocation | None:
+    approval = runtime.store.get_approval_request(suspended_turn.approval_id)
+    if approval is None:
+        return None
+    if _approval_status_value(getattr(approval, "status", None)) != ApprovalStatus.APPROVED.value:
+        return None
+    if getattr(approval, "action", None) != "use_tool":
+        return None
+    resource = str(getattr(approval, "resource", "") or "").strip()
+    if not resource:
+        return None
+    approval_context = getattr(approval, "context", None)
+    approval_arguments = approval_context.get("tool_arguments") if isinstance(approval_context, Mapping) else None
+    if not isinstance(approval_arguments, Mapping):
+        return None
+    for pending_call in reversed(list(suspended_turn.pending_tool_calls or ())):
+        if not isinstance(pending_call, Mapping):
+            continue
+        tool_name = str(pending_call.get("tool_name") or "").strip()
+        if tool_name != resource:
+            continue
+        status = normalize_tool_status(pending_call.get("status"))
+        if status not in {"denied", "approval_required", "requires_approval", "suspended"}:
+            continue
+        output = pending_call.get("output")
+        if not isinstance(output, Mapping):
+            continue
+        if output.get("reason") != "approval_required" and not bool(output.get("requires_approval")):
+            continue
+        pending_arguments = output.get("tool_arguments")
+        if not isinstance(pending_arguments, Mapping):
+            continue
+        if dict(pending_arguments) != dict(approval_arguments):
+            continue
+        trigger_flow = approval_context.get("trigger_flow") if isinstance(approval_context, Mapping) else None
+        capsule_id = None
+        flow_context = None
+        if isinstance(trigger_flow, Mapping):
+            capsule = trigger_flow.get("capsule_id")
+            if isinstance(capsule, str) and capsule.strip():
+                capsule_id = capsule.strip()
+            flow_context = dict(trigger_flow)
+        invocation_id = str(pending_call.get("invocation_id") or "").strip()
+        if not invocation_id:
+            invocation_id = f"approved-{uuid4().hex}"
+        return ToolInvocation(
+            invocation_id=invocation_id,
+            tool_name=tool_name,
+            principal_id=_resume_principal_for_suspended_turn(runtime, suspended_turn),
+            arguments=dict(pending_arguments),
+            capsule_id=capsule_id,
+            flow_context=flow_context,
+        )
+    return None
+
+
+def execute_approved_pending_tool_call(
+    runtime: PersistentRuntime,
+    suspended_turn: SuspendedTurn,
+    *,
+    tool_registry: ToolRegistry | None = None,
+) -> ToolResult | None:
+    invocation = _approved_pending_tool_invocation_from_suspended_turn(runtime, suspended_turn)
+    if invocation is None:
+        return None
+    try:
+        from nullion.runtime import invoke_tool_with_boundary_policy
+
+        return invoke_tool_with_boundary_policy(
+            runtime.store,
+            invocation,
+            registry=tool_registry or runtime.active_tool_registry or ToolRegistry(),
+        )
+    except Exception:
+        logger.exception(
+            "Approved pending tool resume failed (approval_id=%s, conversation_id=%s, tool=%s)",
+            suspended_turn.approval_id,
+            suspended_turn.conversation_id,
+            invocation.tool_name,
+        )
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="failed",
+            output={},
+            error="Approved tool resume failed.",
+        )
+
+
+def _approved_tool_invocation_from_approval_context(
+    runtime: PersistentRuntime,
+    approval_id: str,
+) -> ToolInvocation | None:
+    approval = runtime.store.get_approval_request(approval_id)
+    if approval is None:
+        return None
+    if _approval_status_value(getattr(approval, "status", None)) != ApprovalStatus.APPROVED.value:
+        return None
+    if getattr(approval, "action", None) != "use_tool":
+        return None
+    approval_context = getattr(approval, "context", None)
+    if not isinstance(approval_context, Mapping):
+        return None
+    tool_name = str(approval_context.get("tool_name") or getattr(approval, "resource", "") or "").strip()
+    if not tool_name:
+        return None
+    tool_arguments = approval_context.get("tool_arguments")
+    if not isinstance(tool_arguments, Mapping):
+        return None
+    trigger_flow = approval_context.get("trigger_flow")
+    capsule_id = None
+    flow_context = None
+    trigger_principal = ""
+    invocation_id = ""
+    if isinstance(trigger_flow, Mapping):
+        capsule = trigger_flow.get("capsule_id")
+        if isinstance(capsule, str) and capsule.strip():
+            capsule_id = capsule.strip()
+        principal = trigger_flow.get("principal_id")
+        if isinstance(principal, str) and principal.strip():
+            trigger_principal = principal.strip()
+        trigger_invocation_id = trigger_flow.get("invocation_id")
+        if isinstance(trigger_invocation_id, str) and trigger_invocation_id.strip():
+            invocation_id = trigger_invocation_id.strip()
+        flow_context = dict(trigger_flow)
+    requested_by = str(getattr(approval, "requested_by", "") or "").strip()
+    if not invocation_id:
+        invocation_id = f"approved-{uuid4().hex}"
+    return ToolInvocation(
+        invocation_id=invocation_id,
+        tool_name=tool_name,
+        principal_id=requested_by or trigger_principal or "telegram_chat",
+        arguments=dict(tool_arguments),
+        capsule_id=capsule_id,
+        flow_context=flow_context,
+    )
+
+
+def execute_approved_tool_call_from_approval_context(
+    runtime: PersistentRuntime,
+    approval_id: str,
+    *,
+    tool_registry: ToolRegistry | None = None,
+) -> ToolResult | None:
+    invocation = _approved_tool_invocation_from_approval_context(runtime, approval_id)
+    if invocation is None:
+        return None
+    try:
+        from nullion.runtime import invoke_tool_with_boundary_policy
+
+        return invoke_tool_with_boundary_policy(
+            runtime.store,
+            invocation,
+            registry=tool_registry or runtime.active_tool_registry or ToolRegistry(),
+        )
+    except Exception:
+        logger.exception(
+            "Approved tool-context resume failed (approval_id=%s, tool=%s)",
+            approval_id,
+            invocation.tool_name,
+        )
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            tool_name=invocation.tool_name,
+            status="failed",
+            output={},
+            error="Approved tool resume failed.",
+        )
+
+
+def _approved_pending_tool_resume_reply(result: ToolResult) -> str:
+    summaries = _completed_email_send_summaries([result])
+    if summaries:
+        return "\n\n".join(summaries)
+    output = result.output if isinstance(result.output, Mapping) else {}
+    for key in ("message", "summary", "result"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if normalize_tool_status(getattr(result, "status", None)) == "completed":
+        return "Done."
+    return f"I could not complete the approved {result.tool_name} action: {result.error or 'unknown error'}"
+
+
 def _auto_approval_command_for_message(runtime: PersistentRuntime, message: str, *, chat_id: str | None = None) -> str | None:
     if not _is_explicit_approval_reply(message):
         return None
@@ -1528,7 +2437,7 @@ def _auto_approval_command_for_message(runtime: PersistentRuntime, message: str,
     pending_tool_approvals = [
         approval
         for approval in runtime.store.list_approval_requests()
-        if approval.status is ApprovalStatus.PENDING
+        if _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
         and approval.requested_by in {"telegram_chat", conversation_principal}
         and approval.action == "use_tool"
     ]
@@ -1622,8 +2531,16 @@ def _resume_turn_from_snapshot(
     )
     if screenshot_reply is not None:
         return screenshot_reply
+    direct_tool_result = execute_approved_pending_tool_call(
+        runtime,
+        suspended_turn,
+        tool_registry=runtime.active_tool_registry or ToolRegistry(),
+    )
+    if direct_tool_result is not None:
+        return _approved_pending_tool_resume_reply(direct_tool_result)
     if agent_orchestrator is None:
         return None
+    resume_max_iterations = max_iterations_from_resume_token(getattr(suspended_turn, "resume_token", None))
     # Use everything before the user message as conversation_history
     # Find the index of the last user message
     history = list(snapshot)
@@ -1697,6 +2614,7 @@ def _resume_turn_from_snapshot(
                 tool_registry=runtime.active_tool_registry or ToolRegistry(),
                 policy_store=runtime.store,
                 approval_store=runtime.store,
+                max_iterations=resume_max_iterations,
             )
         else:
             result = agent_orchestrator.run_turn(
@@ -1707,6 +2625,7 @@ def _resume_turn_from_snapshot(
                 tool_registry=runtime.active_tool_registry or ToolRegistry(),
                 policy_store=runtime.store,
                 approval_store=runtime.store,
+                max_iterations=resume_max_iterations,
             )
     except Exception:
         logger.exception(
@@ -1717,12 +2636,30 @@ def _resume_turn_from_snapshot(
         return None
     if result.suspended_for_approval:
         approval_id = result.approval_id
-        return f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
+        reply, _is_suspended = _approval_marker_reply_if_actionable(runtime, approval_id)
+        return reply
+    if getattr(result, "reached_iteration_limit", False):
+        next_approval_id = _store_agent_turn_limit_extension_suspended_turn(
+            runtime,
+            conversation_id=suspended_turn.conversation_id or "telegram:resume",
+            chat_id=suspended_turn.chat_id,
+            message=suspended_turn.message,
+            request_id=suspended_turn.request_id,
+            message_id=suspended_turn.message_id,
+            messages_snapshot=snapshot,
+            current_max_iterations=resume_max_iterations or default_agent_turn_max_iterations(),
+            tool_results=result.tool_results,
+        )
+        if next_approval_id:
+            reply, _is_suspended = _approval_marker_reply_if_actionable(runtime, next_approval_id)
+            return reply
     resumed_reply = _append_chat_artifacts_to_reply(
         runtime,
         reply=result.final_text or "Done.",
         artifact_paths=result.artifacts,
         prompt=user_msg_content,
+        conversation_id=suspended_turn.conversation_id,
+        principal_id=principal_id,
         tool_results=result.tool_results,
     )
     resumed_reply = _enforce_chat_response_fulfillment(
@@ -1750,16 +2687,27 @@ def resume_approved_telegram_request(
     settings: NullionSettings | None = None,
     request_id: str | None = None,
     message_id: str | None = None,
+    turn_id: str | None = None,
     model_client: object | None = None,
     agent_orchestrator: object | None = None,
 ) -> str | None:
     approval = runtime.store.get_approval_request(approval_id)
     if approval is None or approval.status.value != "approved":
         return None
-    if approval.action not in {"use_tool", "allow_boundary"}:
+    if approval.action not in {"use_tool", "allow_boundary", AGENT_TURN_LIMIT_EXTENSION_ACTION}:
         return None
     suspended_turn = runtime.store.get_suspended_turn(approval_id)
     if suspended_turn is not None:
+        if suspended_turn.task_id:
+            resumed_reply = _resume_delegated_suspended_turn(
+                runtime,
+                suspended_turn=suspended_turn,
+                agent_orchestrator=agent_orchestrator,
+                tool_registry=runtime.active_tool_registry or ToolRegistry(),
+                background=True,
+            )
+            runtime.checkpoint()
+            return resumed_reply
         resumed_reply = _resume_turn_from_snapshot(
             runtime,
             suspended_turn=suspended_turn,
@@ -1800,6 +2748,8 @@ def resume_approved_telegram_request(
             _complete_resumed_task_frame(runtime, suspended_turn=suspended_turn)
         runtime.checkpoint()
         return resumed_reply
+    if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
+        return None
     active_prompt = _active_task_frame_prompt(runtime, chat_id=chat_id)
     if isinstance(active_prompt, str) and active_prompt.strip():
         runtime.store.remove_suspended_turn(approval_id)
@@ -1857,6 +2807,139 @@ def _complete_resumed_task_frame(
     )
     runtime.store.add_task_frame(updated)
     runtime.store.set_active_task_frame_id(conversation_id, None)
+
+
+def _suspended_turn_matches_conversation(
+    suspended_turn: SuspendedTurn,
+    *,
+    conversation_id: str,
+    chat_id: str | None,
+) -> bool:
+    if str(suspended_turn.conversation_id or "") == str(conversation_id or ""):
+        return True
+    if chat_id is not None and str(suspended_turn.chat_id or "") == str(chat_id):
+        return True
+    return False
+
+
+def _delegated_suspended_turn_is_waiting_for_user(
+    runtime: PersistentRuntime,
+    suspended_turn: SuspendedTurn,
+) -> bool:
+    task_id = str(getattr(suspended_turn, "task_id", "") or "").strip()
+    if not task_id:
+        return False
+    resume_token = getattr(suspended_turn, "resume_token", None)
+    if isinstance(resume_token, dict):
+        reason = str(resume_token.get("reason") or "").strip()
+        if reason and reason != "user_input":
+            return False
+    get_run = getattr(runtime.store, "get_mini_agent_run", None)
+    if callable(get_run):
+        run = get_run(task_id)
+        if run is not None:
+            status = getattr(run, "status", None)
+            try:
+                if status is MiniAgentRunStatus.WAITING_INPUT:
+                    return True
+                status = MiniAgentRunStatus(str(status))
+            except Exception:
+                status = str(status or "").strip().lower()
+            if status != MiniAgentRunStatus.WAITING_INPUT and status != "waiting_input":
+                return False
+    return True
+
+
+def _latest_waiting_delegated_suspended_turn(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    chat_id: str | None,
+) -> SuspendedTurn | None:
+    list_suspended_turns = getattr(runtime.store, "list_suspended_turns", None)
+    if not callable(list_suspended_turns):
+        return None
+    candidates: list[SuspendedTurn] = []
+    for suspended_turn in list_suspended_turns() or []:
+        if not _suspended_turn_matches_conversation(
+            suspended_turn,
+            conversation_id=conversation_id,
+            chat_id=chat_id,
+        ):
+            continue
+        if not _delegated_suspended_turn_is_waiting_for_user(runtime, suspended_turn):
+            continue
+        candidates.append(suspended_turn)
+    if not candidates:
+        return None
+    def _created_at_key(turn: SuspendedTurn) -> float:
+        created_at = getattr(turn, "created_at", None)
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            return created_at.timestamp()
+        return 0.0
+
+    return max(candidates, key=_created_at_key)
+
+
+def _resume_delegated_suspended_turn(
+    runtime: PersistentRuntime,
+    *,
+    suspended_turn: SuspendedTurn,
+    agent_orchestrator: object | None,
+    tool_registry: object,
+    user_response: str | None = None,
+    background: bool = False,
+) -> str | None:
+    task_id = str(getattr(suspended_turn, "task_id", "") or "").strip()
+    if not task_id or agent_orchestrator is None:
+        return None
+    resume_method_name = "resume_paused_task_background_sync" if background else "resume_paused_task_sync"
+    resume_task = getattr(agent_orchestrator, resume_method_name, None)
+    if not callable(resume_task):
+        return None
+    try:
+        result = resume_task(
+            task_id=task_id,
+            tool_registry=tool_registry,
+            policy_store=runtime.store,
+            approval_store=runtime.store,
+            user_response=user_response,
+        )
+    except TypeError:
+        if background:
+            return None
+        result = resume_task(
+            task_id=task_id,
+            tool_registry=tool_registry,
+            policy_store=runtime.store,
+            approval_store=runtime.store,
+        )
+    if background:
+        if result:
+            return "Continuing the paused planner task."
+        return None
+    runtime.store.remove_suspended_turn(suspended_turn.approval_id)
+    if result is None:
+        runtime.checkpoint()
+        return "I saved that response, but the paused planner task is no longer active. Please resend the original request."
+    status = getattr(result, "status", None)
+    if status == "partial":
+        return getattr(result, "output", None) or "The planner task paused again."
+    if status == "failure":
+        return getattr(result, "error", None) or "The planner task could not resume."
+    artifacts = list(getattr(result, "artifacts", []) or [])
+    reply = getattr(result, "output", None) or "Done."
+    return _append_chat_artifacts_to_reply(
+        runtime,
+        reply=reply,
+        artifact_paths=artifacts,
+        prompt=suspended_turn.message,
+        conversation_id=suspended_turn.conversation_id,
+        principal_id=suspended_turn.conversation_id,
+        tool_results=(),
+    )
 
 
 
@@ -1927,6 +3010,115 @@ def _reply_context_prompt(reply_context: dict[str, object] | None) -> str | None
     return " ".join(parts) + "."
 
 
+def _reply_context_is_explicit_bot_anchor(reply_context: dict[str, object] | None) -> bool:
+    if not isinstance(reply_context, dict):
+        return False
+    if reply_context.get("reply_to_from_bot") is not True:
+        return False
+    return bool(str(reply_context.get("reply_to_text") or "").strip())
+
+
+def _reply_context_anchor_chat_turns(
+    runtime: PersistentRuntime | None,
+    *,
+    conversation_id: str | None,
+    reply_context_text: str | None,
+) -> list[dict[str, str]]:
+    reply_text = str(reply_context_text or "").strip()
+    if runtime is None or not conversation_id or not reply_text:
+        return []
+    store = getattr(runtime, "store", None)
+    list_events = getattr(store, "list_recent_conversation_events", None)
+    if not callable(list_events):
+        return []
+    try:
+        events = list(
+            list_events(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=50,
+            )
+            or []
+        )
+    except Exception:
+        return []
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        assistant_reply = str(event.get("assistant_reply") or "").strip()
+        if assistant_reply != reply_text:
+            continue
+        user_message = str(event.get("user_message") or "").strip()
+        if not user_message or not assistant_reply:
+            return []
+        return [{"user": user_message, "assistant": assistant_reply}]
+    return []
+
+
+def _reply_context_dependency_turn_ids(
+    *,
+    runtime: PersistentRuntime | None = None,
+    conversation_id: str | None = None,
+    chat_id: str | None,
+    reply_context: dict[str, object] | None,
+) -> tuple[str, ...]:
+    if not isinstance(reply_context, dict):
+        return ()
+    explicit_turn_id = str(reply_context.get("reply_to_turn_id") or "").strip()
+    if explicit_turn_id:
+        return (explicit_turn_id,)
+    if str(reply_context.get("platform") or "").strip().lower() != "telegram":
+        return ()
+    if reply_context.get("reply_to_from_bot") is not True:
+        return ()
+    reply_to_text = str(reply_context.get("reply_to_text") or "").strip()
+    raw_message_id = str(reply_context.get("reply_to_message_id") or "").strip()
+    target_id = str(chat_id or "").strip()
+    if raw_message_id:
+        try:
+            from nullion.messaging_adapters import list_platform_delivery_receipts
+
+            receipts = list_platform_delivery_receipts(limit=500)
+        except Exception:
+            receipts = ()
+        for receipt in receipts:
+            if str(receipt.get("channel") or "").strip().lower() != "telegram":
+                continue
+            if target_id and str(receipt.get("target_id") or "").strip() != target_id:
+                continue
+            if str(receipt.get("message_id") or "").strip() != raw_message_id:
+                continue
+            request_id = str(receipt.get("request_id") or "").strip()
+            if request_id:
+                return (request_id,)
+    if not reply_to_text or runtime is None or not conversation_id:
+        return ()
+    store = getattr(runtime, "store", None)
+    list_events = getattr(store, "list_recent_conversation_events", None)
+    if not callable(list_events):
+        return ()
+    try:
+        events = list(
+            list_events(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=50,
+            )
+            or []
+        )
+    except Exception:
+        return ()
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("assistant_reply") or "").strip() != reply_to_text:
+            continue
+        turn_id = str(event.get("turn_id") or "").strip()
+        if turn_id:
+            return (turn_id,)
+    return ()
+
+
 def _scheduled_task_name_from_reply_context(reply_context: dict[str, object] | None) -> str | None:
     if not isinstance(reply_context, dict):
         return None
@@ -1944,7 +3136,7 @@ def _scheduled_task_name_from_reply_context(reply_context: dict[str, object] | N
     for line in lines[1:4]:
         match = re.match(r"^For:\s*(?P<name>.+?)\s*$", line)
         if match:
-            name = match.group("name").strip(" .:-")
+            name = match.group("name").strip(" .:-*")
             return name or None
     match = re.match(
         r"^(?:[^\w\[]+\s*)?(?:MANUAL\s+)?SCHEDULED\s+TASK(?:\s+RUN)?\s*:\s*(?P<name>.+?)\s*$",
@@ -1952,17 +3144,85 @@ def _scheduled_task_name_from_reply_context(reply_context: dict[str, object] | N
         flags=re.IGNORECASE,
     )
     if match:
-        name = match.group("name").strip(" .:-")
+        name = match.group("name").strip(" .:-*")
         return name or None
     return None
 
 
+def _user_turn_mentions_current_cron_reference(user_message: str, *, principal_id: str | None) -> bool:
+    """Return true when the turn names an existing cron from the caller's workspace."""
+    text = str(user_message or "").strip()
+    if not text:
+        return False
+    text_casefold = text.casefold()
+    try:
+        from nullion.connections import workspace_id_for_principal
+        from nullion.crons import list_crons
+    except Exception:
+        logger.debug("Could not import cron lookup helpers for tool-scope gating", exc_info=True)
+        return False
+    try:
+        workspace_id = workspace_id_for_principal(principal_id)
+        jobs = list_crons(workspace_id=workspace_id, refresh_next_runs=False)
+    except Exception:
+        logger.debug("Could not list crons for tool-scope gating", exc_info=True)
+        return False
+    for job in jobs:
+        name = str(getattr(job, "name", "") or "").strip()
+        if len(name) >= 3 and name.casefold() in text_casefold:
+            return True
+        cron_id = str(getattr(job, "id", "") or "").strip()
+        if len(cron_id) >= 6 and cron_id.casefold() in text_casefold:
+            return True
+    return False
+
+
 def _turn_scope_requests_delete_cron(tool_registry: object) -> bool:
+    return _turn_scope_requests_scheduler_tool(tool_registry, "delete_cron")
+
+
+def _turn_scope_requests_toggle_cron(tool_registry: object) -> bool:
+    return _turn_scope_requests_scheduler_tool(tool_registry, "toggle_cron")
+
+
+def _turn_scope_requests_any_scheduler_action(tool_registry: object) -> bool:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if scheduler_action in {"inspect", "run", "mutate"}:
+        return True
+    selected_tools = {
+        str(tool_name or "").strip()
+        for tool_name in (
+            tuple(getattr(decision, "requested_tool_names", ()) or ())
+            + tuple(getattr(decision, "required_tool_names", ()) or ())
+        )
+        if str(tool_name or "").strip()
+    }
+    return bool(selected_tools.intersection({
+        "create_cron",
+        "delete_cron",
+        "list_crons",
+        "run_cron",
+        "toggle_cron",
+        "update_cron",
+        "list_reminders",
+        "set_reminder",
+        "delete_reminder",
+        "update_reminder",
+    }))
+
+
+def _turn_scope_requests_scheduler_tool(tool_registry: object, tool_name: str) -> bool:
     decision = getattr(tool_registry, "turn_tool_scope_decision", None)
     if decision is None:
         return False
     scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
     if scheduler_action != "mutate":
+        return False
+    target_tool_name = str(tool_name or "").strip()
+    if not target_tool_name:
         return False
     selected_tools = {
         str(tool_name or "").strip()
@@ -1972,7 +3232,15 @@ def _turn_scope_requests_delete_cron(tool_registry: object) -> bool:
         )
         if str(tool_name or "").strip()
     }
-    return "delete_cron" in selected_tools
+    return target_tool_name in selected_tools
+
+
+def _turn_scope_toggle_cron_enabled(tool_registry: object) -> bool | None:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return None
+    value = getattr(decision, "scheduler_toggle_enabled", None)
+    return value if isinstance(value, bool) else None
 
 
 def _delete_cron_reply_from_result(result: ToolResult, cron_name: str) -> str:
@@ -1982,7 +3250,27 @@ def _delete_cron_reply_from_result(result: ToolResult, cron_name: str) -> str:
             output_name = str(result.output.get("name") or "").strip()
         name = output_name or cron_name
         return f"Done - I deleted the **{name}** cron.\n\nIt will no longer run."
+    if normalize_tool_status(result.status) in {"denied", "approval_required"}:
+        output = result.output if isinstance(result.output, dict) else {}
+        approval_id = str(output.get("approval_id") or "").strip()
+        suffix = f"\n\nApproval id: `{approval_id}`" if approval_id else ""
+        return (
+            f"I need your approval before deleting the **{cron_name}** cron."
+            f"{suffix}"
+        )
     return result.error or f"I could not delete the **{cron_name}** cron."
+
+
+def _toggle_cron_reply_from_result(result: ToolResult, cron_name: str, requested_enabled: bool) -> str:
+    if normalize_tool_status(result.status) == "completed":
+        output = result.output if isinstance(result.output, dict) else {}
+        name = str(output.get("name") or "").strip() or cron_name
+        enabled = output.get("enabled")
+        state_enabled = enabled if isinstance(enabled, bool) else requested_enabled
+        action = "enabled" if state_enabled else "disabled"
+        run_line = "It will run on schedule again." if state_enabled else "It will not run until you re-enable it."
+        return f"Done - I {action} the **{name}** cron.\n\n{run_line}"
+    return result.error or f"I could not update the **{cron_name}** cron."
 
 
 def _delete_cron_args_for_quoted_name(principal_id: str, cron_name: str) -> tuple[dict[str, str] | None, str | None]:
@@ -2047,7 +3335,7 @@ def _messaging_channel_and_identity_for_chat(chat_id: str | None) -> tuple[str, 
         return ("telegram", None)
     text = str(chat_id).strip()
     channel, separator, identity = text.partition(":")
-    if separator and channel.lower() in {"slack", "discord"}:
+    if separator and channel.lower() in {"telegram", "slack", "discord", "web"}:
         return (channel.lower(), identity.strip() or None)
     return ("telegram", text or None)
 
@@ -2060,6 +3348,8 @@ def _conversation_id_for_chat(chat_id: str | None) -> str:
 
 def _principal_id_for_chat(chat_id: str | None, settings: NullionSettings | None) -> str:
     channel_name, identity = _messaging_channel_and_identity_for_chat(chat_id)
+    if channel_name == "web":
+        return f"web:{identity or 'default'}"
     user = resolve_messaging_user(channel_name, identity, settings)
     if user.role == "member":
         return f"user:{user.user_id}"
@@ -2070,8 +3360,112 @@ def _pending_approval_ids(runtime: PersistentRuntime) -> frozenset[str]:
     return frozenset(
         approval.approval_id
         for approval in runtime.store.list_approval_requests()
-        if approval.status is ApprovalStatus.PENDING
+        if _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
     )
+
+
+def _approval_status_value(status: object) -> str:
+    return str(getattr(status, "value", status) or "").strip().lower()
+
+
+def _runtime_approval_request_is_actionable(runtime: PersistentRuntime, approval_id: str | None) -> bool:
+    if not approval_id:
+        return False
+    approval = runtime.store.get_approval_request(approval_id)
+    if approval is not None and _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value:
+        return True
+    get_suspended_turn = getattr(runtime.store, "get_suspended_turn", None)
+    if callable(get_suspended_turn):
+        try:
+            return get_suspended_turn(approval_id) is not None
+        except Exception:
+            logger.debug("Unable to verify suspended turn for approval %s", approval_id, exc_info=True)
+    return False
+
+
+def _approval_marker_reply_if_actionable(runtime: PersistentRuntime, approval_id: str | None) -> tuple[str, bool]:
+    if approval_id and _runtime_approval_request_is_actionable(runtime, approval_id):
+        return f"Tool approval requested: {approval_id}", True
+    return ORPHAN_APPROVAL_REQUEST_REPLY, False
+
+
+def _latest_actionable_approval_id_for_conversation(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    chat_id: str | None,
+) -> str | None:
+    list_suspended_turns = getattr(runtime.store, "list_suspended_turns", None)
+    if not callable(list_suspended_turns):
+        return None
+    candidates: list[SuspendedTurn] = []
+    try:
+        suspended_turns = list_suspended_turns() or []
+    except Exception:
+        logger.debug("Unable to list suspended turns while recovering approval marker", exc_info=True)
+        return None
+    for suspended_turn in suspended_turns:
+        if not _suspended_turn_matches_conversation(
+            suspended_turn,
+            conversation_id=conversation_id,
+            chat_id=chat_id,
+        ):
+            continue
+        if not _runtime_approval_request_is_actionable(runtime, suspended_turn.approval_id):
+            continue
+        candidates.append(suspended_turn)
+    if not candidates:
+        return None
+
+    def _created_at_key(turn: SuspendedTurn) -> float:
+        created_at = getattr(turn, "created_at", None)
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            return created_at.timestamp()
+        return 0.0
+
+    return max(candidates, key=_created_at_key).approval_id
+
+
+def _approval_marker_reply_for_turn_result(
+    runtime: PersistentRuntime,
+    turn_result: object,
+    *,
+    conversation_id: str,
+    chat_id: str | None,
+) -> tuple[str, bool]:
+    approval_id = getattr(turn_result, "approval_id", None)
+    reply, live = _approval_marker_reply_if_actionable(runtime, approval_id)
+    if live:
+        return reply, True
+    recovered_approval_id = _latest_actionable_approval_id_for_conversation(
+        runtime,
+        conversation_id=conversation_id,
+        chat_id=chat_id,
+    )
+    if recovered_approval_id and recovered_approval_id != approval_id:
+        return _approval_marker_reply_if_actionable(runtime, recovered_approval_id)
+    return reply, False
+
+
+def _recover_orphan_approval_reply_for_conversation(
+    runtime: PersistentRuntime,
+    reply: str,
+    *,
+    conversation_id: str,
+    chat_id: str | None,
+) -> tuple[str, bool]:
+    if reply != ORPHAN_APPROVAL_REQUEST_REPLY:
+        return reply, False
+    recovered_approval_id = _latest_actionable_approval_id_for_conversation(
+        runtime,
+        conversation_id=conversation_id,
+        chat_id=chat_id,
+    )
+    if not recovered_approval_id:
+        return reply, False
+    return _approval_marker_reply_if_actionable(runtime, recovered_approval_id)
 
 
 def _broadcast_new_workspace_approvals(
@@ -2083,7 +3477,8 @@ def _broadcast_new_workspace_approvals(
 ) -> None:
     try:
         if any(
-            approval.status is ApprovalStatus.PENDING and approval.approval_id not in before_ids
+            _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
+            and approval.approval_id not in before_ids
             for approval in runtime.store.list_approval_requests()
         ):
             runtime.checkpoint()
@@ -2111,6 +3506,7 @@ def _memory_context_for_chat(
     *,
     chat_id: str | None,
     settings: NullionSettings | None = None,
+    reinforce: bool = True,
 ) -> str | None:
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return None
@@ -2127,9 +3523,11 @@ def _memory_context_for_chat(
             if entry.key not in {existing.key for existing in entries}
         )
     try:
-        from nullion.builder_memory import select_memory_entries_for_prompt
+        from nullion.builder_memory import reinforce_memory_entries, select_memory_entries_for_prompt
 
         entries = select_memory_entries_for_prompt(entries)
+        if reinforce and reinforce_memory_entries(runtime.store, entries):
+            runtime.checkpoint()
     except Exception:
         logger.debug("Unable to select chat memory entries", exc_info=True)
     return format_memory_context(entries)
@@ -2203,7 +3601,7 @@ def _schedule_chat_turn_memory_capture(
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return
     try:
-        no_tool_memory_enabled = _feature_enabled("NULLION_MEMORY_NO_TOOL_CAPTURE_ENABLED", default=False)
+        no_tool_memory_enabled = _feature_enabled("NULLION_MEMORY_NO_TOOL_CAPTURE_ENABLED", default=True)
     except TypeError:
         no_tool_memory_enabled = _feature_enabled("NULLION_MEMORY_NO_TOOL_CAPTURE_ENABLED")
     if not no_tool_memory_enabled:
@@ -2291,8 +3689,13 @@ def _registry_has_context_selecting_tools(registry: object | None) -> bool:
         "connector_request",
         "email_search",
         "email_read",
+        "email_attachment_read",
         "email_send",
         "calendar_list",
+        "calendar_create",
+        "calendar_update",
+        "calendar_respond",
+        "calendar_delete",
         "list_crons",
         "run_cron",
         "create_cron",
@@ -2314,6 +3717,44 @@ def _registry_has_context_selecting_tools(registry: object | None) -> bool:
         if name in context_selecting_names or tags.intersection(context_selecting_tags):
             return True
     return False
+
+
+def _registry_has_exact_current_context_tool_scope(registry: object | None) -> bool:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None or getattr(decision, "valid", False) is not True:
+        return False
+    requested = {
+        str(tool_name or "").strip()
+        for tool_name in (
+            tuple(getattr(decision, "requested_tool_names", ()) or ())
+            + tuple(getattr(decision, "required_tool_names", ()) or ())
+        )
+        if str(tool_name or "").strip()
+    }
+    if requested.intersection(
+        {
+            "calendar_list",
+            "calendar_create",
+            "calendar_update",
+            "calendar_respond",
+            "calendar_delete",
+            "create_cron",
+            "delete_cron",
+            "email_read",
+            "email_attachment_read",
+            "email_search",
+            "email_send",
+            "list_crons",
+            "list_reminders",
+            "run_cron",
+            "toggle_cron",
+            "update_cron",
+        }
+    ):
+        return True
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    connector_apps = tuple(getattr(decision, "connector_app_ids", ()) or ())
+    return scheduler_action in {"inspect", "run", "mutate"} or bool(connector_apps)
 
 
 def _should_include_conversation_context(result, thread: list[dict[str, str]], registry: object | None = None) -> bool:
@@ -2351,12 +3792,14 @@ def _automatic_saved_chat_history_prompt(
     conversation_id: str,
     prompt: str,
     visible_turns: list[dict[str, str]],
+    query_turns: list[dict[str, str]] | None = None,
 ) -> str | None:
     query = str(prompt or "").strip()
     if not query or not conversation_id:
         return None
     search_query_parts = [query]
-    for visible_turn in visible_turns[-2:]:
+    context_turns = visible_turns if query_turns is None else query_turns
+    for visible_turn in context_turns[-2:]:
         user_text = str(visible_turn.get("user") or "").strip()
         assistant_text = str(visible_turn.get("assistant") or "").strip()
         if user_text:
@@ -2868,11 +4311,14 @@ def _should_auto_include_saved_chat_history(
     numbered_option_context: str | None,
     requested_extensions: Iterable[str] | None,
 ) -> bool:
+    del requested_extensions
+    if numbered_option_context and not reply_context_prompt:
+        return False
     if turn_is_context_linked(conversation_result):
         return True
-    if reply_context_prompt or numbered_option_context:
+    if reply_context_prompt:
         return True
-    return any(str(extension or "").strip() for extension in (requested_extensions or ()))
+    return False
 
 
 _NUMBERED_CHOICE_LINE_RE = re.compile(r"(?m)^\s*\d{1,2}\.\s+\S")
@@ -2883,6 +4329,13 @@ def _assistant_reply_has_numbered_choice_prompt(reply: object) -> bool:
     if not text:
         return False
     return len(_NUMBERED_CHOICE_LINE_RE.findall(text)) >= 2
+
+
+def _assistant_reply_has_any_numbered_choice(reply: object) -> bool:
+    text = str(reply or "").strip()
+    if not text:
+        return False
+    return bool(_NUMBERED_CHOICE_LINE_RE.search(text))
 
 
 def _conversation_context_boundary_prompt(result) -> str | None:
@@ -2904,6 +4357,143 @@ def _conversation_context_boundary_prompt(result) -> str | None:
         "supplied by the user. If saved-chat candidates are present, use the newest structured candidate "
         "that resolves the current reference instead of asking the user to repeat details. If the referent "
         "is not determined by runtime evidence, ask a brief clarification instead of choosing a previous topic."
+    )
+
+
+def _compact_unstructured_followup_guard_prompt(
+    *,
+    prompt: object,
+    reply_context_prompt: str | None,
+    numbered_option_context: str | None,
+    has_prior_context: bool = True,
+) -> str | None:
+    if not has_prior_context:
+        return None
+    if reply_context_prompt or numbered_option_context:
+        return None
+    if not _chat_message_is_compact_context_reply(prompt):
+        return None
+    return (
+        "Ambiguous compact follow-up guard: the current user message is short and has no structured target "
+        "evidence such as an attachment, URL, file extension, slash/operator command, approval/action state, "
+        "artifact descriptor, task/frame state, numbered-option reply, or direct platform reply anchor. "
+        "Do not choose an older artifact, scheduled task, account object, branch, file, or prior topic from "
+        "history just because it is recent. Ask one brief clarification question to identify the target or set "
+        "the user wants to use."
+    )
+
+
+def _compact_unstructured_target_clarification_reply(
+    *,
+    prompt: object,
+    model_client: object | None,
+) -> str | None:
+    if model_client is None:
+        return None
+    create = getattr(model_client, "create", None)
+    if not callable(create):
+        return None
+    system = (
+        "Decide whether a short user request is actionable by itself or is missing the target/set/object "
+        "needed to answer without guessing. Return only JSON with keys needs_clarification, question, "
+        "and confidence. Use semantic understanding across languages. Do not use prior chat context. "
+        "needs_clarification must be true only when the request asks for an action or selection but does "
+        "not specify what object, target, set, account item, file, task, or domain the action applies to. "
+        "For greetings, thanks, small talk, or complete requests, set needs_clarification false."
+    )
+    user = json.dumps({"current_message": str(prompt or "")}, ensure_ascii=False, sort_keys=True)
+    try:
+        response = create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": user}]}],
+            tools=[],
+            max_tokens=120,
+            system=system,
+        )
+        from nullion.turn_dispatch_graph import _parse_json_object, _text_from_model_response
+
+        payload = _parse_json_object(_text_from_model_response(response))
+    except Exception:
+        logger.debug("Compact follow-up ambiguity classifier failed", exc_info=True)
+        return None
+    if not isinstance(payload, dict) or payload.get("needs_clarification") is not True:
+        return None
+    try:
+        confidence = float(payload.get("confidence", 0))
+    except Exception:
+        confidence = 0.0
+    if confidence < 0.6:
+        return None
+    question = str(payload.get("question") or "").strip()
+    if not question:
+        question = "What should I use for that?"
+    return _trim_context_text(question, 240)
+
+
+def _compact_clarification_followup_history_context(
+    *,
+    prompt: object,
+    previous_assistant_message: object,
+    model_client: object | None,
+) -> str | None:
+    if model_client is None:
+        return None
+    previous_text = str(previous_assistant_message or "").strip()
+    current_text = str(prompt or "").strip()
+    if not previous_text or not _chat_message_is_compact_context_reply(current_text):
+        return None
+    create = getattr(model_client, "create", None)
+    if not callable(create):
+        return None
+    system = (
+        "Decide whether the current short user message is answering the immediately previous assistant "
+        "clarification by asking the assistant to resolve the missing target from saved conversation "
+        "history. Return only JSON with keys answers_previous_clarification, use_saved_history, "
+        "target_summary, and confidence. Use semantic understanding across languages. Do not use "
+        "hardcoded trigger words or assume that every mention of history is enough. "
+        "answers_previous_clarification is true only when the previous assistant asked for missing "
+        "details and the current user message is a plausible answer to that exact request. "
+        "use_saved_history is true only when the current answer instructs the assistant to search or "
+        "use remembered/saved prior chat context for those missing details."
+    )
+    user = json.dumps(
+        {
+            "previous_assistant_message": previous_text,
+            "current_message": current_text,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    try:
+        response = create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": user}]}],
+            tools=[],
+            max_tokens=160,
+            system=system,
+        )
+        from nullion.turn_dispatch_graph import _parse_json_object, _text_from_model_response
+
+        payload = _parse_json_object(_text_from_model_response(response))
+    except Exception:
+        logger.debug("Compact clarification follow-up classifier failed", exc_info=True)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("answers_previous_clarification") is not True or payload.get("use_saved_history") is not True:
+        return None
+    try:
+        confidence = float(payload.get("confidence", 0))
+    except Exception:
+        confidence = 0.0
+    if confidence < 0.65:
+        return None
+    target_summary = _trim_context_text(str(payload.get("target_summary") or "").strip(), 180)
+    target_line = f" Missing target summary: {target_summary}" if target_summary else ""
+    return (
+        "Clarification follow-up context: the current user message answers the immediately previous "
+        "assistant clarification by asking Nullion to use saved conversation history for the missing "
+        f"target. Search saved chat history for evidence that resolves that prior clarification.{target_line} "
+        "If saved history contains matching structured evidence, use it to perform the requested live check. "
+        "If no matching evidence is found, ask one brief clarification about the missing original target."
     )
 
 
@@ -3048,10 +4638,74 @@ def _turn_result_used_history_search(result: object) -> bool:
     )
 
 
+def _tool_result_name(tool_result: object) -> str:
+    if isinstance(tool_result, dict):
+        return str(tool_result.get("tool_name") or "").strip()
+    return str(getattr(tool_result, "tool_name", "") or "").strip()
+
+
+def _tool_result_status(tool_result: object) -> str:
+    if isinstance(tool_result, dict):
+        return str(tool_result.get("status") or "").strip().lower()
+    return str(getattr(tool_result, "status", "") or "").strip().lower()
+
+
+def _tool_result_output(tool_result: object) -> Mapping[str, object]:
+    raw_output = tool_result.get("output") if isinstance(tool_result, Mapping) else getattr(tool_result, "output", None)
+    return raw_output if isinstance(raw_output, Mapping) else {}
+
+
 def _turn_result_has_substantive_tools(result: object) -> bool:
     return any(
-        getattr(tool_result, "tool_name", None) not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+        _tool_result_name(tool_result) not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
         for tool_result in list(getattr(result, "tool_results", None) or [])
+    )
+
+
+_CONNECTOR_SKILL_RETRY_CONTEXT_TOOLS = frozenset({
+    "request_tool_scope",
+    CHAT_HISTORY_SEARCH_TOOL_NAME,
+    "file_search",
+    "file_read",
+    "workspace_summary",
+})
+
+
+def _turn_result_used_only_connector_retry_context_tools(result: object) -> bool:
+    tool_results = [
+        tool_result
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+        if _tool_result_name(tool_result)
+    ]
+    if not tool_results:
+        return False
+    for tool_result in tool_results:
+        name = _tool_result_name(tool_result)
+        if name in _CONNECTOR_SKILL_RETRY_CONTEXT_TOOLS:
+            continue
+        if (
+            name in _BROWSER_ACCOUNT_FALLBACK_TOOLS
+            and normalize_tool_status(_tool_result_status(tool_result)) != "completed"
+        ):
+            continue
+        return False
+    return True
+
+
+def _turn_result_has_substantive_outcome(result: object) -> bool:
+    return (
+        _turn_result_has_substantive_tools(result)
+        or bool(getattr(result, "artifacts", None))
+        or bool(getattr(result, "suspended_for_approval", False))
+    )
+
+
+def _turn_result_has_no_tool_or_artifact_outcome(result: object) -> bool:
+    return not (
+        _turn_result_has_substantive_tools(result)
+        or bool(getattr(result, "artifacts", None))
+        or bool(getattr(result, "suspended_for_approval", False))
+        or bool(getattr(result, "reached_iteration_limit", False))
     )
 
 
@@ -3062,8 +4716,7302 @@ def _turn_result_should_retry_with_saved_history(result: object) -> bool:
         return False
     if getattr(result, "suspended_for_approval", False):
         return False
-    return _turn_result_used_history_search(result) or _assistant_reply_has_numbered_choice_prompt(
-        getattr(result, "final_text", None)
+    return bool(
+        _turn_result_used_history_search(result)
+        or _assistant_reply_has_numbered_choice_prompt(getattr(result, "final_text", None))
+    )
+
+
+_READ_ONLY_ACCOUNT_TOOL_NAMES = frozenset({"email_search", "email_read", "email_attachment_read", "calendar_list"})
+_MODEL_SCOPE_FILE_TOOLS = ("file_search", "file_read", "workspace_summary")
+_MODEL_SCOPE_FILE_WRITE_ARTIFACT_EXTENSIONS = frozenset({
+    ".csv",
+    ".htm",
+    ".html",
+    ".json",
+    ".md",
+    ".svg",
+    ".tsv",
+    ".txt",
+    ".yaml",
+    ".yml",
+})
+_MODEL_SCOPE_SHELL_TOOLS = ("terminal_exec",)
+_MODEL_SCOPE_SCHEDULER_DEFAULT_TOOLS = {
+    "inspect": ("list_crons", "list_reminders"),
+    "run": ("list_crons", "run_cron"),
+    "mutate": (
+        "list_crons",
+        "list_reminders",
+        "create_cron",
+        "update_cron",
+        "delete_cron",
+        "delete_reminder",
+        "toggle_cron",
+        "set_reminder",
+        "update_reminder",
+    ),
+}
+_MODEL_SCOPE_CAPABILITY_ALIASES = {
+    "browser": "web",
+    "file": "local_files",
+    "files": "local_files",
+    "local_file": "local_files",
+    "local_files": "local_files",
+    "workspace_file": "local_files",
+    "workspace_files": "local_files",
+    "shell": "local_shell",
+    "terminal": "local_shell",
+    "exec": "local_shell",
+    "local_exec": "local_shell",
+    "local_shell": "local_shell",
+    "local_system": "local_shell",
+    "finance": "market_data",
+    "market": "market_data",
+    "market_data": "market_data",
+    "quote": "market_data",
+    "quotes": "market_data",
+}
+_CAPABILITY_UNAVAILABLE_RE = re.compile(
+    r"\b(?:approve|approval|can['’]t|cannot|can not|don['’]t|do not|didn['’]t|did not|doesn['’]t|does not|isn['’]t|is not|could not|need|unable|unavailable|not able|not available|not exposed|grant|expose)\b",
+    re.IGNORECASE,
+)
+_CAPABILITY_CONTEXT_RE = re.compile(
+    r"\b(?:access|approval|available|capability|command|connector|cron|crons|diagnostic|exec|exposed|from here|scheduled|scheduler|shell|source|terminal|tool|tools)\b",
+    re.IGNORECASE,
+)
+_LOCAL_SYSTEM_CAPABILITY_CONTEXT_RE = re.compile(
+    r"\b(?:approval|command|diagnostic|exec|executable|local system|path|process|python|service|shell|terminal|version)\b",
+    re.IGNORECASE,
+)
+_ASSISTANT_IMAGE_GENERATION_UNAVAILABLE_RE = re.compile(
+    r"\b(?:image generation|image_generate|generate (?:an? |the )?image|image directly)\b",
+    re.IGNORECASE,
+)
+_ASSISTANT_NO_LIVE_SOURCE_RE = re.compile(
+    r"\bno\s+live\s+source\b",
+    re.IGNORECASE,
+)
+_UNVERIFIED_EMPTY_RESOURCE_CLAIM_RE = re.compile(
+    r"\b(?:no|none|empty|0)\b.{0,100}\b(?:scheduled task|scheduled tasks|scheduler|cron|crons|calendar|event|events|email|emails|message|messages|file|files|document|documents|attachment|attachments|tool|tools)\b"
+    r"|\b(?:currently empty|inventory is empty|inventory.*empty)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_SCHEDULER_SETUP_CLARIFICATION_RE = re.compile(
+    r"\b(?:need|missing|provide|reply with|send me)\b.{0,180}\b(?:schedule|frequency|task detail|source detail|what I should check)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _visible_read_only_account_tool_names(registry: object) -> tuple[str, ...]:
+    return tuple(name for name in sorted(_registry_tool_names(registry)) if name in _READ_ONLY_ACCOUNT_TOOL_NAMES)
+
+
+def _account_read_tool_names_from_scope_decision(
+    decision: object,
+    *,
+    available_tool_names: Iterable[str],
+) -> tuple[str, ...]:
+    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    requested_or_required = tuple(
+        dict.fromkeys([
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        ])
+    )
+    names = [
+        str(name)
+        for name in requested_or_required
+        if str(name) in available and str(name) in _READ_ONLY_ACCOUNT_TOOL_NAMES
+    ]
+    if any(name in names for name in ("email_read", "email_attachment_read")) and "email_search" in available:
+        names.insert(0, "email_search")
+    if "email_attachment_read" in names and "email_read" in available:
+        insert_at = 1 if "email_search" in names else 0
+        names.insert(insert_at, "email_read")
+    return tuple(dict.fromkeys(names))
+
+
+def _turn_result_should_retry_with_visible_account_read_tools(
+    result: object,
+    registry: object,
+    *,
+    numbered_option_selected: bool = False,
+) -> bool:
+    if _turn_result_has_substantive_tools(result):
+        return False
+    if getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    if not numbered_option_selected and not _assistant_reply_has_numbered_choice_prompt(getattr(result, "final_text", None)):
+        return False
+    return bool(_visible_read_only_account_tool_names(registry))
+
+
+_BROWSER_ACCOUNT_FALLBACK_TOOLS = frozenset({
+    "browser_open",
+    "browser_navigate",
+    "browser_extract_text",
+    "browser_extract_items",
+    "browser_find",
+    "browser_snapshot",
+    "browser_scroll",
+    "browser_run_js",
+    "browser_wait_for",
+    "browser_assert_page_state",
+    "web_fetch",
+    "web_search",
+})
+_BROWSER_VERIFICATION_BLOCKER_RE = re.compile(
+    r"\b(?:live-search blocker|verified result records|could not verify|couldn't verify)\b",
+    re.IGNORECASE,
+)
+
+
+def _turn_result_used_only_browser_account_fallback_tools(result: object) -> bool:
+    names = [
+        str(getattr(tool_result, "tool_name", "") or "")
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+        if str(getattr(tool_result, "tool_name", "") or "") not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    return bool(names) and all(name in _BROWSER_ACCOUNT_FALLBACK_TOOLS for name in names)
+
+
+def _turn_result_is_browser_verification_blocker(result: object) -> bool:
+    if getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    if not _turn_result_used_only_browser_account_fallback_tools(result):
+        return False
+    text = str(getattr(result, "final_text", "") or "")
+    return bool(text.strip() and _BROWSER_VERIFICATION_BLOCKER_RE.search(text))
+
+
+def _registry_has_request_tool_scope(registry: object | None) -> bool:
+    return "request_tool_scope" in _registry_tool_names(registry)
+
+
+def _registry_can_expose_request_tool_scope(registry: object | None) -> bool:
+    if _registry_has_request_tool_scope(registry):
+        return True
+    can_invoke = getattr(registry, "can_invoke_tool", None)
+    if callable(can_invoke):
+        try:
+            return bool(can_invoke("request_tool_scope"))
+        except Exception:
+            return False
+    return False
+
+
+def _turn_result_should_retry_missing_tool_scope(result: object, registry: object | None) -> bool:
+    if _turn_result_has_substantive_tools(result):
+        return False
+    if getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    if not _registry_can_expose_request_tool_scope(registry):
+        return False
+    return (
+        _turn_result_used_tool(result, "request_tool_scope")
+        or _turn_result_reports_unfulfilled_capability(result)
+        or _turn_result_reports_scheduler_setup_clarification(result, registry=registry)
+        or _assistant_reply_has_numbered_choice_prompt(getattr(result, "final_text", None))
+        or _turn_result_has_unverified_media_directive(result)
+    )
+
+
+def _turn_result_reports_unfulfilled_capability(result: object) -> bool:
+    text = str(getattr(result, "final_text", "") or "")
+    if not text:
+        return False
+    # This is a recovery signal from the assistant draft, not intent routing from user prose.
+    return bool(_CAPABILITY_UNAVAILABLE_RE.search(text) and _CAPABILITY_CONTEXT_RE.search(text))
+
+
+def _turn_result_reports_local_system_capability_request(result: object) -> bool:
+    text = str(getattr(result, "final_text", "") or "")
+    if not text:
+        return False
+    # Recovery from the assistant draft, not product routing from user wording.
+    return bool(_CAPABILITY_UNAVAILABLE_RE.search(text) and _LOCAL_SYSTEM_CAPABILITY_CONTEXT_RE.search(text))
+
+
+def _turn_result_reports_unavailable_image_generation(result: object) -> bool:
+    text = str(getattr(result, "final_text", "") or "")
+    if not text:
+        return False
+    return bool(
+        _CAPABILITY_UNAVAILABLE_RE.search(text)
+        and _ASSISTANT_IMAGE_GENERATION_UNAVAILABLE_RE.search(text)
+    )
+
+
+def _turn_result_reports_missing_live_source(result: object) -> bool:
+    text = str(getattr(result, "final_text", "") or "")
+    return bool(text and _ASSISTANT_NO_LIVE_SOURCE_RE.search(text))
+
+
+def _turn_result_has_unverified_empty_resource_claim(result: object) -> bool:
+    if getattr(result, "tool_results", None) or getattr(result, "artifacts", None):
+        return False
+    text = str(getattr(result, "final_text", "") or "")
+    if not text:
+        return False
+    return bool(_UNVERIFIED_EMPTY_RESOURCE_CLAIM_RE.search(text))
+
+
+def _turn_result_reports_scheduler_setup_clarification(
+    result: object,
+    *,
+    registry: object | None,
+) -> bool:
+    if getattr(result, "tool_results", None) or getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    if not _registry_tool_names(registry).intersection(_SCHEDULER_MUTATION_RETRY_TOOLS):
+        return False
+    text = str(getattr(result, "final_text", "") or "").strip()
+    if not text:
+        return False
+    # This recovers from an assistant draft that asks for scheduler setup details even though
+    # scheduler tools are available; it is not intent routing from user prose.
+    return bool(
+        _assistant_reply_has_numbered_choice_prompt(text)
+        and _SCHEDULER_SETUP_CLARIFICATION_RE.search(text)
+    )
+
+
+def _image_generation_not_configured_result(result: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        tool_results=list(getattr(result, "tool_results", ()) or ()),
+        artifacts=list(getattr(result, "artifacts", ()) or ()),
+        suspended_for_approval=bool(getattr(result, "suspended_for_approval", False)),
+        approval_id=getattr(result, "approval_id", None),
+        final_text=f"Image generation is not configured.\n\n{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}",
+        reached_iteration_limit=bool(getattr(result, "reached_iteration_limit", False)),
+        thinking_text=getattr(result, "thinking_text", None),
+    )
+
+
+def _turn_result_has_unverified_media_directive(result: object) -> bool:
+    if _turn_result_has_substantive_tools(result):
+        return False
+    return bool(_reply_media_candidate_paths(str(getattr(result, "final_text", "") or "")))
+
+
+def _unverified_media_scope_decision_from_result(
+    result: object,
+    *,
+    registry: object | None,
+) -> TurnToolScopeDecision | None:
+    media_paths = _reply_media_candidate_paths(str(getattr(result, "final_text", "") or ""))
+    if not media_paths or _turn_result_has_substantive_tools(result):
+        return None
+    available_tool_names = _retry_available_tool_names(registry)
+    requested_tool_names = tuple(name for name in _MODEL_SCOPE_FILE_TOOLS if name in available_tool_names)
+    if not requested_tool_names:
+        return None
+    requested_extensions = tuple(
+        dict.fromkeys(
+            suffix
+            for suffix in (path.suffix.lower() for path in media_paths)
+            if suffix in VALID_ATTACHMENT_EXTENSIONS
+        )
+    )
+    return TurnToolScopeDecision(
+        requested_tool_names=requested_tool_names,
+        required_tool_names=requested_tool_names,
+        requested_artifact_extensions=requested_extensions,
+        confidence=1.0,
+        valid=True,
+    )
+
+
+def _local_file_reference_scope_decision_from_message(
+    user_message: str,
+    *,
+    registry: object | None,
+    allow_file_write_artifacts: bool = False,
+) -> TurnToolScopeDecision | None:
+    filenames = _requested_output_filenames_from_texts(user_message)
+    if not filenames:
+        return None
+    available_tool_names = _retry_available_tool_names(registry)
+    requested_extensions = tuple(
+        dict.fromkeys(
+            suffix
+            for suffix in (Path(filename).suffix.lower() for filename in filenames)
+            if suffix in VALID_ATTACHMENT_EXTENSIONS
+        )
+    )
+    file_write_artifact_requested = (
+        allow_file_write_artifacts
+        and bool(set(requested_extensions).intersection(_MODEL_SCOPE_FILE_WRITE_ARTIFACT_EXTENSIONS))
+        and "file_write" in available_tool_names
+    )
+    requested_tool_names = tuple(
+        dict.fromkeys([
+            *(name for name in _MODEL_SCOPE_FILE_TOOLS if name in available_tool_names),
+            *(("file_write",) if file_write_artifact_requested else ()),
+        ])
+    )
+    if not requested_tool_names:
+        return None
+    return TurnToolScopeDecision(
+        requested_tool_names=requested_tool_names,
+        required_tool_names=(("file_write",) if file_write_artifact_requested else requested_tool_names),
+        requested_artifact_extensions=requested_extensions,
+        confidence=1.0,
+        valid=True,
+    )
+
+
+def _missing_tool_scope_retry_prompt(tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        "Scoped tool recovery: the previous answer reported that a needed tool, connector, or capability was "
+        "unavailable while request_tool_scope was registered. A structured scope decision has now exposed "
+        f"these validated tool(s): {names}. If they can answer the same current request, use them before "
+        "finalizing. If they still fail, report the concrete tool failure and the next recovery step."
+    )
+
+
+def _request_tool_scope_retry_prompt() -> str:
+    return (
+        "Scoped tool recovery: the previous assistant draft reported that a needed tool, connector, or capability "
+        "was unavailable or not yet exposed. request_tool_scope is registered in the base runtime. Continue the "
+        "same user request by calling request_tool_scope with the exact structured capability/tool family needed, "
+        "then stop requesting more scope and finalize with a compact handoff for the runtime to continue using the "
+        "newly visible tools. Do not call request_tool_scope more than once in this recovery attempt. Do not ask the "
+        "user to repeat the same request, and do not report unavailability until a scoped tool returns a concrete "
+        "failure or denial."
+    )
+
+
+_MODEL_TOOL_REQUEST_RE = re.compile(
+    r"<(?P<tag>tool_request|tool_call|tool_use|request_tool_scope)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)\s*>"
+    r"|<(?P<self_tag>tool_request|tool_call|tool_use|request_tool_scope)\b(?P<self_attrs>[^<>]*?)/?>",
+    re.IGNORECASE | re.DOTALL,
+)
+_MODEL_TOOL_ALIAS_RE = re.compile(r"<tool:(?P<name>[A-Za-z0-9_:-]+)\s*/?>", re.IGNORECASE)
+_MODEL_TOOL_REQUEST_ATTR_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_:-]*)\s*=\s*(['\"])(.*?)\2")
+_MODEL_TOOL_REQUEST_TAG_START_RE = re.compile(
+    r"<(?P<tag>tool_request|tool_call|tool_use|request_tool_scope)\b",
+    re.IGNORECASE,
+)
+
+
+def _json_mapping_from_model_tool_text(value: object) -> Mapping[str, object] | None:
+    text = html_lib.unescape(str(value or ""))
+    if "{" not in text:
+        return None
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            payload, _ = decoder.raw_decode(text[match.start() :])
+        except Exception:
+            continue
+        if isinstance(payload, Mapping):
+            return payload
+    return None
+
+
+def _model_tool_request_attr_map(attr_text: object) -> dict[str, str]:
+    return {
+        str(attr.group(1) or "").strip().lower().replace("-", "_"): html_lib.unescape(str(attr.group(3) or "")).strip()
+        for attr in _MODEL_TOOL_REQUEST_ATTR_RE.finditer(str(attr_text or ""))
+    }
+
+
+def _iter_model_tool_request_payloads(text: object, *, limit: int = 4000):
+    snippet = str(text or "")[:limit]
+    seen_spans: list[tuple[int, int]] = []
+    for match in _MODEL_TOOL_REQUEST_RE.finditer(snippet):
+        seen_spans.append(match.span())
+        tag_name = str(match.group("tag") or match.group("self_tag") or "").strip().lower().replace("-", "_")
+        attr_text = str(match.group("attrs") or match.group("self_attrs") or "")
+        attrs = _model_tool_request_attr_map(attr_text)
+        if tag_name in {"tool_call", "tool_use"}:
+            direct_tool_name = (
+                str(attrs.pop("tool", "") or attrs.pop("tool_name", "") or attrs.pop("name", ""))
+                .strip()
+                .lower()
+                .replace("-", "_")
+            )
+            if direct_tool_name:
+                attrs["tool_names"] = direct_tool_name
+        body = html_lib.unescape(str(match.group("body") or "")).strip()
+        payload = _json_mapping_from_model_tool_text(body)
+        if payload is None:
+            payload = _json_mapping_from_model_tool_text(attrs.get("arguments"))
+        yield tag_name, attrs, payload, body
+
+    for start_match in _MODEL_TOOL_REQUEST_TAG_START_RE.finditer(snippet):
+        if any(span_start <= start_match.start() < span_end for span_start, span_end in seen_spans):
+            continue
+        tag_name = str(start_match.group("tag") or "").strip().lower().replace("-", "_")
+        close_match = re.search(rf"</\s*{re.escape(tag_name)}\s*>", snippet[start_match.end() :], re.IGNORECASE)
+        if close_match is None:
+            continue
+        inner = snippet[start_match.end() : start_match.end() + close_match.start()]
+        lower_inner = inner.lower()
+        body_markers = [
+            position
+            for position in (
+                inner.find("{"),
+                lower_inner.find("<input"),
+                lower_inner.find("<arg"),
+            )
+            if position >= 0
+        ]
+        body_start = min(body_markers) if body_markers else -1
+        closing_angle = inner.find(">")
+        if closing_angle >= 0 and (body_start < 0 or closing_angle < body_start):
+            attr_text = inner[:closing_angle]
+            body = inner[closing_angle + 1 :]
+        elif body_start >= 0:
+            attr_text = inner[:body_start]
+            body = inner[body_start:]
+        else:
+            attr_text = inner
+            body = ""
+        attrs = _model_tool_request_attr_map(attr_text)
+        if tag_name in {"tool_call", "tool_use"}:
+            direct_tool_name = (
+                str(attrs.pop("tool", "") or attrs.pop("tool_name", "") or attrs.pop("name", ""))
+                .strip()
+                .lower()
+                .replace("-", "_")
+            )
+            if direct_tool_name:
+                attrs["tool_names"] = direct_tool_name
+        payload = _json_mapping_from_model_tool_text(body)
+        if payload is None:
+            payload = _json_mapping_from_model_tool_text(attrs.get("arguments"))
+        yield tag_name, attrs, payload, html_lib.unescape(str(body or "")).strip()
+
+
+def _split_model_tool_request_values(value: object) -> tuple[str, ...]:
+    raw = html_lib.unescape(str(value or "")).strip()
+    if not raw:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            item.strip().lower()
+            for item in re.split(r"[\s,]+", raw)
+            if item.strip()
+        )
+    )
+
+
+def _normalized_model_tool_request_capability(value: object) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if not raw:
+        return ""
+    return _MODEL_SCOPE_CAPABILITY_ALIASES.get(raw, raw)
+
+
+def _normalized_model_tool_request_capabilities(values: Iterable[object]) -> set[str]:
+    capabilities: set[str] = set()
+    for value in values:
+        normalized = _normalized_model_tool_request_capability(value)
+        if normalized:
+            capabilities.add(normalized)
+    return capabilities
+
+
+def _model_tool_request_attributes(text: object) -> dict[str, str] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    alias_match = _MODEL_TOOL_ALIAS_RE.search(raw[:2000])
+    if alias_match is not None:
+        alias_name = str(alias_match.group("name") or "").strip().lower().replace("-", "_")
+        if alias_name in {"scheduler_mutation", "scheduler_mutate"}:
+            return {"scheduler_mutation": "true"}
+        if alias_name == "scheduler_run":
+            return {"scheduler_run": "true"}
+        if alias_name in {"scheduler_read", "scheduler"}:
+            return {"scheduler_read": "true"}
+        if alias_name in {"files", "file", "local_files", "local_file"}:
+            return {"tool_family": "files"}
+        if alias_name in {"terminal_exec", "local_shell", "shell"}:
+            return {"tool_family": "local_shell"}
+    direct_tool_names: list[str] = []
+    direct_attrs: dict[str, str] = {}
+    payload_candidates = list(_iter_model_tool_request_payloads(raw, limit=4000))
+    for _tag_name, attrs, payload, _body in payload_candidates:
+        if not isinstance(payload, Mapping):
+            continue
+        data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+        tool_name = (
+            str(
+                payload.get("tool")
+                or payload.get("tool_name")
+                or payload.get("name")
+                or data.get("tool")
+                or data.get("tool_name")
+                or data.get("name")
+                or attrs.get("tool_names")
+                or attrs.get("tool_name")
+                or attrs.get("name")
+                or ""
+            )
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        if not tool_name or tool_name == "request_tool_scope":
+            continue
+        if tool_name not in direct_tool_names:
+            direct_tool_names.append(tool_name)
+        scope = data.get("tool_scope") or data.get("scope") or data.get("capability")
+        if scope and "scope" not in direct_attrs:
+            direct_attrs["scope"] = str(scope).strip()
+        for key in ("artifact_extensions", "requested_artifact_extensions"):
+            value = data.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                items = [str(item or "").strip() for item in value if str(item or "").strip()]
+            else:
+                items = [item.strip() for item in re.split(r"[\s,]+", str(value or "")) if item.strip()]
+            if items and "artifact_extensions" not in direct_attrs:
+                direct_attrs["artifact_extensions"] = ",".join(items)
+                break
+    if direct_tool_names:
+        direct_attrs["tool_names"] = ",".join(direct_tool_names)
+        return direct_attrs
+    match = _MODEL_TOOL_REQUEST_RE.search(raw[:2000])
+    loose_payload_candidate = next((candidate for candidate in payload_candidates if isinstance(candidate[2], Mapping)), None)
+    if match is None and loose_payload_candidate is None:
+        return None
+    body = html_lib.unescape(str(match.group("body") or "")).strip() if match is not None else ""
+    if body or loose_payload_candidate is not None:
+        payload = _json_mapping_from_model_tool_text(body)
+        loose_attrs: dict[str, str] = {}
+        if payload is None and loose_payload_candidate is not None:
+            _tag_name, loose_attrs, loose_payload, _loose_body = loose_payload_candidate
+            payload = loose_payload
+        if isinstance(payload, Mapping):
+            data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+            tool_name = (
+                str(
+                    payload.get("tool")
+                    or payload.get("tool_name")
+                    or payload.get("name")
+                    or data.get("tool")
+                    or data.get("tool_name")
+                    or data.get("name")
+                    or loose_attrs.get("tool_names")
+                    or loose_attrs.get("tool_name")
+                    or loose_attrs.get("name")
+                    or ""
+                )
+                .strip()
+                .lower()
+                .replace("-", "_")
+            )
+            if tool_name and tool_name != "request_tool_scope":
+                attrs: dict[str, str] = {"tool_names": tool_name}
+                scope = data.get("tool_scope") or data.get("scope") or data.get("capability")
+                if scope:
+                    attrs["scope"] = str(scope).strip()
+                for key in ("artifact_extensions", "requested_artifact_extensions"):
+                    value = data.get(key)
+                    if value is None:
+                        continue
+                    if isinstance(value, (list, tuple)):
+                        items = [str(item or "").strip() for item in value if str(item or "").strip()]
+                    else:
+                        items = [item.strip() for item in re.split(r"[\s,]+", str(value or "")) if item.strip()]
+                    if items:
+                        attrs["artifact_extensions"] = ",".join(items)
+                        break
+                return attrs
+            if not tool_name or tool_name == "request_tool_scope":
+                attrs: dict[str, str] = {}
+
+                def _put_list(key: str, value: object) -> None:
+                    if isinstance(value, (list, tuple)):
+                        items = [str(item or "").strip() for item in value if str(item or "").strip()]
+                    else:
+                        items = [item.strip() for item in re.split(r"[\s,]+", str(value or "")) if item.strip()]
+                    if items:
+                        attrs[key] = ",".join(items)
+
+                def _put_scalar(key: str, value: object) -> None:
+                    if value is None:
+                        return
+                    text_value = str(value).strip()
+                    if text_value:
+                        attrs[key] = text_value
+
+                def _put_bool(key: str, value: object) -> None:
+                    if isinstance(value, bool):
+                        attrs[key] = "true" if value else "false"
+                    elif value is not None:
+                        raw_value = str(value).strip().lower()
+                        if raw_value in {"1", "true", "yes", "on"}:
+                            attrs[key] = "true"
+                        elif raw_value in {"0", "false", "no", "off"}:
+                            attrs[key] = "false"
+
+                scope = data.get("tool_scope") or data.get("scope") or data.get("capability")
+                if scope:
+                    attrs["scope"] = str(scope).strip()
+                capability_values: list[object] = []
+                for key in ("capabilities", "tool_families", "tool_family"):
+                    value = data.get(key)
+                    if isinstance(value, (list, tuple)):
+                        capability_values.extend(value)
+                    elif value is not None:
+                        capability_values.append(value)
+                _put_list("capabilities", capability_values)
+                _put_list("connector_app_ids", data.get("connector_app_ids") or data.get("connector_app_id"))
+                _put_list("tool_names", data.get("tool_names") or data.get("tools"))
+                _put_list("artifact_extensions", data.get("artifact_extensions") or data.get("requested_artifact_extensions"))
+                _put_list(
+                    "embedded_media_artifact_extensions",
+                    data.get("embedded_media_artifact_extensions")
+                    or data.get("required_embedded_media_extensions"),
+                )
+                _put_scalar("web_action", data.get("web_action"))
+                _put_scalar("scheduler_action", data.get("scheduler_action"))
+                _put_scalar("scheduler_selection_policy", data.get("scheduler_selection_policy"))
+                _put_scalar("scheduler_target_scope", data.get("scheduler_target_scope"))
+                _put_bool("scheduler_toggle_enabled", data.get("scheduler_toggle_enabled"))
+                _put_bool("scheduler", data.get("scheduler"))
+                _put_bool("scheduler_read", data.get("scheduler_read"))
+                _put_bool("scheduler_run", data.get("scheduler_run"))
+                _put_bool("scheduler_mutation", data.get("scheduler_mutation") or data.get("scheduler_mutate"))
+                if "source_user_requested" in data:
+                    attrs["source_user_requested"] = "true" if bool(data.get("source_user_requested")) else "false"
+                if "connector_source_user_requested" in data:
+                    attrs["source_user_requested"] = (
+                        "true" if bool(data.get("connector_source_user_requested")) else "false"
+                    )
+                if attrs:
+                    return attrs
+    attr_text = str(match.group("attrs") or match.group("self_attrs") or "") if match is not None else ""
+    attrs = _model_tool_request_attr_map(attr_text)
+    tag_name = str(match.group("tag") or match.group("self_tag") or "").strip().lower().replace("-", "_") if match is not None else ""
+    if not attrs and loose_payload_candidate is not None:
+        tag_name, attrs, _payload, _body = loose_payload_candidate
+    if tag_name in {"tool_call", "tool_use"}:
+        direct_tool_name = (
+            str(attrs.pop("tool", "") or attrs.pop("tool_name", "") or attrs.pop("name", ""))
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        if direct_tool_name:
+            attrs["tool_names"] = direct_tool_name
+    return attrs or None
+
+
+def _model_tool_request_bool(attrs: Mapping[str, str], key: str) -> bool:
+    return str(attrs.get(key) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _model_tool_request_extensions(value: object) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for raw in _split_model_tool_request_values(value):
+        extension = raw if raw.startswith(".") else f".{raw}"
+        if extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+def _model_tool_request_scheduler_action(
+    *,
+    attrs: Mapping[str, str],
+    capabilities: set[str],
+    requested_tool_names: Iterable[str],
+) -> str:
+    action = str(attrs.get("scheduler_action") or "").strip().lower()
+    if action in {"inspect", "run", "mutate"}:
+        return action
+    requested = {str(name or "").strip() for name in requested_tool_names if str(name or "").strip()}
+    if _model_tool_request_bool(attrs, "scheduler_mutation") or "scheduler_mutate" in capabilities:
+        return "mutate"
+    if _model_tool_request_bool(attrs, "scheduler_run") or "scheduler_run" in capabilities:
+        return "run"
+    if (
+        _model_tool_request_bool(attrs, "scheduler")
+        or _model_tool_request_bool(attrs, "scheduler_read")
+        or "scheduler_read" in capabilities
+    ):
+        return "inspect"
+    if requested.intersection({"create_cron", "update_cron", "delete_cron", "delete_reminder", "toggle_cron", "set_reminder", "update_reminder"}):
+        return "mutate"
+    if "run_cron" in requested:
+        return "run"
+    if requested.intersection({"list_crons", "list_reminders"}):
+        return "inspect"
+    return "none"
+
+
+def _model_tool_request_decision_from_attributes(
+    attrs: Mapping[str, str],
+    *,
+    registry: object | None,
+) -> TurnToolScopeDecision | None:
+    available_tool_names = _retry_available_tool_names(registry)
+    capabilities = _normalized_model_tool_request_capabilities(
+        [
+            *_split_model_tool_request_values(attrs.get("capabilities")),
+            *_split_model_tool_request_values(attrs.get("tool_family")),
+            *_split_model_tool_request_values(attrs.get("tool_families")),
+        ]
+    )
+    scope = str(attrs.get("scope") or attrs.get("capability") or "").strip().lower()
+    if scope:
+        capabilities.add(_normalized_model_tool_request_capability(scope))
+    requested_tool_names = tuple(
+        name
+        for name in _split_model_tool_request_values(attrs.get("tool_names") or attrs.get("tools"))
+        if name in available_tool_names and name != "request_tool_scope"
+    )
+    if "weather_forecast" in requested_tool_names:
+        capabilities.add("weather")
+    if "market_quote" in requested_tool_names:
+        capabilities.add("market_data")
+    if "image_generate" in requested_tool_names:
+        capabilities.add("image_generation")
+    if "terminal_exec" in requested_tool_names:
+        capabilities.add("local_shell")
+    scheduler_action = _model_tool_request_scheduler_action(
+        attrs=attrs,
+        capabilities=capabilities,
+        requested_tool_names=requested_tool_names,
+    )
+    web_action = str(attrs.get("web_action") or "").strip().lower()
+    if web_action not in {"open_url", "live_research", "browser_interaction"}:
+        if "web" in capabilities:
+            web_action = (
+                "browser_interaction"
+                if any(name.startswith("browser_") for name in requested_tool_names)
+                else "live_research"
+            )
+        else:
+            web_action = "none"
+    app_ids = _split_model_tool_request_values(attrs.get("connector_app_ids") or attrs.get("connector_app_id"))
+    connector_requested = bool(
+        "connector" in capabilities
+        or app_ids
+        or any(name in _READ_ONLY_ACCOUNT_TOOL_NAMES or name in {"connector_request", "email_send"} for name in requested_tool_names)
+    )
+    if "local_files" in capabilities and not requested_tool_names:
+        requested_tool_names = tuple(name for name in _MODEL_SCOPE_FILE_TOOLS if name in available_tool_names)
+    if "local_shell" in capabilities and not requested_tool_names:
+        requested_tool_names = tuple(name for name in _MODEL_SCOPE_SHELL_TOOLS if name in available_tool_names)
+    if "market_data" in capabilities and not requested_tool_names and "market_quote" in available_tool_names:
+        requested_tool_names = ("market_quote",)
+    if connector_requested and not requested_tool_names and app_ids:
+        requested_tool_names = _read_only_account_tool_names_for_connector_apps(
+            app_ids,
+            available_tool_names=available_tool_names,
+        )
+    if connector_requested and not app_ids:
+        app_ids = _active_connector_app_ids_for_retry()
+    connector_source_user_requested = bool(
+        _model_tool_request_bool(attrs, "source_user_requested")
+        or connector_requested
+        or requested_tool_names
+    )
+    requested_artifact_extensions = _model_tool_request_extensions(
+        attrs.get("artifact_extensions") or attrs.get("requested_artifact_extensions")
+    )
+    required_embedded_media_extensions = _model_tool_request_extensions(
+        attrs.get("embedded_media_artifact_extensions") or attrs.get("required_embedded_media_extensions")
+    )
+    scheduler_selection_policy = str(attrs.get("scheduler_selection_policy") or "none").strip().lower()
+    if scheduler_selection_policy not in {"none", "user_selected", "delegate_one"}:
+        scheduler_selection_policy = "none"
+    scheduler_target_scope = str(attrs.get("scheduler_target_scope") or "none").strip().lower()
+    if scheduler_target_scope not in {"none", "all_current_workspace"}:
+        scheduler_target_scope = "none"
+    scheduler_toggle_enabled = None
+    if "scheduler_toggle_enabled" in attrs:
+        scheduler_toggle_enabled = _model_tool_request_bool(attrs, "scheduler_toggle_enabled")
+    decision = TurnToolScopeDecision(
+        web_action=web_action,
+        scheduler_action=scheduler_action,
+        scheduler_toggle_enabled=scheduler_toggle_enabled,
+        scheduler_selection_policy=scheduler_selection_policy if scheduler_action == "run" else "none",
+        scheduler_target_scope=scheduler_target_scope if scheduler_action == "mutate" else "none",
+        skill_pack_action="connector" if connector_requested else "reference" if "skill_pack" in capabilities else "none",
+        connector_app_ids=app_ids if connector_requested else (),
+        connector_source_user_requested=connector_source_user_requested if connector_requested else False,
+        requested_tool_names=requested_tool_names,
+        required_tool_names=tuple(name for name in requested_tool_names if name != "request_tool_scope"),
+        requested_artifact_extensions=tuple(
+            dict.fromkeys([*requested_artifact_extensions, *required_embedded_media_extensions])
+        ),
+        required_embedded_media_extensions=required_embedded_media_extensions,
+        confidence=1.0,
+        valid=True,
+    )
+    return decision if _tool_scope_decision_has_substantive_scope(decision) else None
+
+
+def _read_only_account_tool_names_for_connector_apps(
+    app_ids: Iterable[object],
+    *,
+    available_tool_names: Iterable[str],
+) -> tuple[str, ...]:
+    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    names: list[str] = []
+    for app_id in app_ids:
+        normalized_app_id = _normalized_connector_app_id(app_id)
+        if not normalized_app_id:
+            continue
+        for name in _active_connector_structured_tools_for_app(normalized_app_id):
+            if name in available and name in _READ_ONLY_ACCOUNT_TOOL_NAMES and name not in names:
+                names.append(name)
+        if normalized_app_id == "google-calendar" and "calendar_list" in available and "calendar_list" not in names:
+            names.append("calendar_list")
+        if normalized_app_id == "google-mail":
+            for name in ("email_search", "email_read", "email_attachment_read"):
+                if name in available and name not in names:
+                    names.append(name)
+    return tuple(names)
+
+
+def _model_tool_request_decision_from_reply(
+    result: object,
+    *,
+    registry: object | None,
+) -> TurnToolScopeDecision | None:
+    attrs = _model_tool_request_attributes(getattr(result, "final_text", None))
+    if not attrs:
+        return None
+    return _model_tool_request_decision_from_attributes(attrs, registry=registry)
+
+
+def _model_tool_request_direct_arguments_from_reply(
+    result: object,
+    *,
+    tool_name: str,
+) -> dict[str, object] | None:
+    raw = str(getattr(result, "final_text", None) or "").strip()
+    if not raw or not tool_name:
+        return None
+    wanted = str(tool_name).strip().lower().replace("-", "_")
+    for _tag_name, attrs, payload, _body in _iter_model_tool_request_payloads(raw, limit=4000):
+        if not isinstance(payload, Mapping):
+            continue
+        data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+        if not isinstance(data, Mapping):
+            continue
+        payload_tool = (
+            str(
+                payload.get("tool")
+                or payload.get("tool_name")
+                or payload.get("name")
+                or data.get("tool")
+                or data.get("tool_name")
+                or data.get("name")
+                or attrs.get("tool_names")
+                or attrs.get("tool_name")
+                or attrs.get("name")
+                or ""
+            )
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        if payload_tool != wanted:
+            continue
+        arguments: dict[str, object] = {}
+        for key, value in data.items():
+            normalized_key = str(key or "").strip()
+            if normalized_key in {"tool", "tool_name", "name", "scope", "tool_scope", "capability"}:
+                continue
+            arguments[normalized_key] = value
+        if wanted == "weather_forecast":
+            if "location_text" not in arguments and "location" in arguments:
+                arguments["location_text"] = arguments.pop("location")
+            if "forecast_days" not in arguments and "days" in arguments:
+                arguments["forecast_days"] = arguments.pop("days")
+        if wanted == "market_quote":
+            if "symbols" not in arguments:
+                for key in ("tickers", "ticker_symbols", "ticker", "symbol"):
+                    if key in arguments:
+                        arguments["symbols"] = arguments[key]
+                        break
+        filtered = _filter_direct_safe_read_arguments(wanted, arguments)
+        if filtered:
+            return filtered
+    return None
+
+
+def _model_tool_request_scheduler_direct_arguments_from_reply(
+    result: object,
+    *,
+    tool_name: str,
+) -> dict[str, object] | None:
+    raw = str(getattr(result, "final_text", None) or "").strip()
+    wanted = str(tool_name or "").strip().lower().replace("-", "_")
+    if not raw or wanted not in {"run_cron", "toggle_cron"}:
+        return None
+    for _tag_name, attrs, payload, _body in _iter_model_tool_request_payloads(raw, limit=4000):
+        if not isinstance(payload, Mapping):
+            continue
+        data = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+        if not isinstance(data, Mapping):
+            continue
+        payload_tool = (
+            str(
+                payload.get("tool")
+                or payload.get("tool_name")
+                or payload.get("name")
+                or data.get("tool")
+                or data.get("tool_name")
+                or data.get("name")
+                or attrs.get("tool_names")
+                or attrs.get("tool_name")
+                or attrs.get("name")
+                or ""
+            )
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        if payload_tool != wanted:
+            continue
+        arguments: dict[str, object] = {}
+        for key, value in data.items():
+            normalized_key = str(key or "").strip()
+            if normalized_key in {"tool", "tool_name", "name", "scope", "tool_scope", "capability"}:
+                if normalized_key == "name" and wanted == "run_cron":
+                    text_value = str(value or "").strip()
+                    if text_value and text_value.strip().lower().replace("-", "_") != wanted:
+                        arguments["name"] = text_value
+                continue
+            if normalized_key in {"id", "cron_id"}:
+                text_value = str(value or "").strip()
+                if text_value:
+                    arguments["id"] = text_value
+            elif normalized_key in {"cron_name"}:
+                text_value = str(value or "").strip()
+                if text_value:
+                    arguments["name"] = text_value
+            elif normalized_key == "all_current_workspace":
+                if isinstance(value, bool):
+                    arguments["all_current_workspace"] = value
+                else:
+                    arguments["all_current_workspace"] = str(value).strip().lower() in {"1", "true", "yes", "on"}
+            elif normalized_key == "enabled":
+                if isinstance(value, bool):
+                    arguments["enabled"] = value
+                else:
+                    text_value = str(value).strip().lower()
+                    if text_value in {"1", "true", "yes", "on"}:
+                        arguments["enabled"] = True
+                    elif text_value in {"0", "false", "no", "off"}:
+                        arguments["enabled"] = False
+        if wanted == "run_cron" and (arguments.get("id") or arguments.get("name")):
+            return arguments
+        if wanted == "toggle_cron" and isinstance(arguments.get("enabled"), bool):
+            if arguments.get("all_current_workspace") is True or arguments.get("id") or arguments.get("name"):
+                return arguments
+    return None
+
+
+def _model_tool_request_retry_prompt(tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        "Structured tool-request recovery: the previous assistant draft emitted a model tool_request directive "
+        f"for these validated tool(s): {names}. Continue the same user request with these tools visible. "
+        "Use the tools before finalizing; do not ask the user to choose the same already-selected source again."
+    )
+
+
+def _model_tool_request_retry_allowed_tool_names(
+    decision: TurnToolScopeDecision,
+    *,
+    available_tool_names: Iterable[str],
+) -> tuple[str, ...]:
+    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    names = [
+        name
+        for name in tuple(getattr(decision, "requested_tool_names", ()) or ())
+        if name in available and name != "request_tool_scope"
+    ]
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if scheduler_action == "run" or "run_cron" in names:
+        if "list_crons" in available and "list_crons" not in names:
+            names.insert(0, "list_crons")
+    if scheduler_action == "mutate" or any(name in _SCHEDULER_MUTATION_RETRY_TOOLS for name in names):
+        cron_mutation_requested = any(name in names for name in _SCHEDULER_CRON_ACTION_TOOLS)
+        reminder_mutation_requested = any(name in names for name in _SCHEDULER_REMINDER_ACTION_TOOLS)
+        if cron_mutation_requested and "list_crons" in available and "list_crons" not in names:
+            names.insert(0, "list_crons")
+        if reminder_mutation_requested and "list_reminders" in available and "list_reminders" not in names:
+            names.insert(0, "list_reminders")
+    return tuple(dict.fromkeys(names))
+
+
+def _scheduler_direct_action_reply(tool_result: ToolResult) -> str:
+    output = tool_result.output if isinstance(tool_result.output, dict) else {}
+    receipt = output.get("action_receipt") if isinstance(output.get("action_receipt"), dict) else {}
+    for value in (
+        receipt.get("summary"),
+        output.get("message"),
+        output.get("result_text"),
+        output.get("text"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if normalize_tool_status(tool_result.status) == "completed":
+        return "Done."
+    return tool_result.error or "I could not complete that scheduler action."
+
+
+def _run_model_tool_request_scheduler_action_directly(
+    *,
+    initial_result: object,
+    retry_decision: TurnToolScopeDecision,
+    retry_tool_registry: object,
+    principal_id: str | None,
+) -> object | None:
+    scheduler_action = str(getattr(retry_decision, "scheduler_action", "") or "").strip().lower()
+    requested_or_required = {
+        str(name or "").strip()
+        for name in [
+            *tuple(getattr(retry_decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(retry_decision, "required_tool_names", ()) or ()),
+        ]
+        if str(name or "").strip()
+    }
+    tool_name = ""
+    arguments: dict[str, object] | None = None
+    if scheduler_action == "run" and "run_cron" in requested_or_required:
+        tool_name = "run_cron"
+        arguments = _model_tool_request_scheduler_direct_arguments_from_reply(
+            initial_result,
+            tool_name=tool_name,
+        )
+    elif scheduler_action == "mutate" and "toggle_cron" in requested_or_required:
+        tool_name = "toggle_cron"
+        arguments = _model_tool_request_scheduler_direct_arguments_from_reply(
+            initial_result,
+            tool_name=tool_name,
+        )
+        target_scope = str(getattr(retry_decision, "scheduler_target_scope", "") or "").strip().lower()
+        if (
+            target_scope == "all_current_workspace"
+            and isinstance(getattr(retry_decision, "scheduler_toggle_enabled", None), bool)
+        ):
+            arguments = {
+                "all_current_workspace": True,
+                "enabled": bool(getattr(retry_decision, "scheduler_toggle_enabled")),
+            }
+    if not tool_name or not arguments:
+        return None
+    action_result = _run_scheduler_action_tool_directly(
+        registry=retry_tool_registry,
+        tool_name=tool_name,
+        principal_id=principal_id,
+        arguments=arguments,
+    )
+    if action_result is None:
+        return None
+    final_text = (
+        _run_cron_numbered_selection_reply(action_result)
+        if tool_name == "run_cron"
+        else _scheduler_direct_action_reply(action_result)
+    )
+    return SimpleNamespace(
+        turn_id=getattr(initial_result, "turn_id", None) or uuid4().hex,
+        final_text=final_text,
+        tool_results=[action_result],
+        artifacts=[],
+        suspended_for_approval=normalize_tool_status(_tool_result_status(action_result))
+        in {"approval_required", "suspended", "denied"},
+        approval_id=(
+            _tool_result_output(action_result).get("approval_id")
+            if isinstance(_tool_result_output(action_result), dict)
+            else None
+        ),
+        thinking_text=None,
+        reached_iteration_limit=False,
+        raw_tool_payload_blocked=False,
+    )
+
+
+def _run_chat_turn_model_tool_request_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    runtime: PersistentRuntime | None = None,
+    model_client: object | None = None,
+    principal_id: str | None = None,
+    user_message: str | None = None,
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+) -> tuple[object, object, bool]:
+    has_scope_directive = _model_tool_request_attributes(getattr(initial_result, "final_text", None)) is not None
+    if _turn_result_has_substantive_outcome(initial_result) and not has_scope_directive:
+        return initial_result, active_tool_registry, False
+    registry_for_lookup = base_tool_registry or active_tool_registry
+    retry_decision = _model_tool_request_decision_from_reply(initial_result, registry=registry_for_lookup)
+    if retry_decision is None:
+        return initial_result, active_tool_registry, False
+    retry_tool_registry = _ToolRegistryWithoutRequestScope(
+        ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+    )
+    exact_requested_tool_names = _model_tool_request_retry_allowed_tool_names(
+        retry_decision,
+        available_tool_names=_retry_available_tool_names(registry_for_lookup),
+    )
+    if exact_requested_tool_names:
+        retry_tool_registry = _ToolRegistryAllowedNames(
+            retry_tool_registry,
+            allowed_tool_names=exact_requested_tool_names,
+            turn_tool_scope_decision=retry_decision,
+        )
+    retry_visible_tool_names = {
+        str(definition.get("name") or "")
+        for definition in retry_tool_registry.list_tool_definitions()
+        if str(definition.get("name") or "").strip()
+    }
+    if not retry_visible_tool_names:
+        return initial_result, active_tool_registry, False
+    scheduler_direct_result = _run_model_tool_request_scheduler_action_directly(
+        initial_result=initial_result,
+        retry_decision=retry_decision,
+        retry_tool_registry=retry_tool_registry,
+        principal_id=principal_id,
+    )
+    if scheduler_direct_result is not None:
+        if mark_retry is not None:
+            mark_retry()
+        return scheduler_direct_result, retry_tool_registry, True
+    direct_tool_name = exact_requested_tool_names[0] if len(exact_requested_tool_names) == 1 else None
+    if direct_tool_name and runtime is not None:
+        direct_result = _run_scoped_safe_read_tool_directly(
+            runtime=runtime,
+            registry=retry_tool_registry,
+            model_client=model_client,
+            principal_id=principal_id,
+            turn_id=getattr(initial_result, "turn_id", None),
+            user_message=user_message or _latest_user_text(base_history),
+            direct_arguments=_model_tool_request_direct_arguments_from_reply(
+                initial_result,
+                tool_name=direct_tool_name,
+            ),
+        )
+        if direct_result is not None:
+            if mark_retry is not None:
+                mark_retry()
+            return direct_result, retry_tool_registry, True
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{
+            "type": "text",
+            "text": _model_tool_request_retry_prompt(
+                getattr(retry_decision, "requested_tool_names", ()) or tuple(sorted(retry_visible_tool_names))
+            ),
+        }],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="model_tool_request_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_context_preserving_retry_text(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+def _no_tool_scope_decision_retry_prompt(tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        "Structured no-tool recovery: the previous assistant draft produced no tool-backed result, but current "
+        f"runtime evidence validates this scoped tool set: {names}. Continue the same user request with these "
+        "tools visible. Use the relevant tool before finalizing; if the scoped tool fails, report that concrete "
+        "failure instead of saying the capability is unavailable."
+    )
+
+
+def _run_chat_turn_no_tool_scope_decision_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    runtime: PersistentRuntime | None = None,
+    model_client: object | None,
+    principal_id: str | None = None,
+    user_message: str,
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = base_tool_registry or active_tool_registry
+    if any(
+        _turn_result_has_completed_requested_artifact(initial_result, registry)
+        for registry in (active_tool_registry, registry_for_lookup)
+        if registry is not None
+    ):
+        return initial_result, active_tool_registry, False
+    if (
+        _turn_result_has_completed_scheduler_read_only_tools(initial_result)
+        and not _turn_result_reports_unfulfilled_capability(initial_result)
+        and _model_tool_request_attributes(getattr(initial_result, "final_text", None)) is None
+        and not any(
+            _scheduler_registry_decision_requests_action(registry)
+            for registry in (active_tool_registry, registry_for_lookup)
+            if registry is not None
+        )
+    ):
+        return initial_result, active_tool_registry, False
+    if _turn_result_is_browser_verification_blocker(initial_result):
+        return initial_result, active_tool_registry, False
+    if _turn_result_completed_account_read_is_sufficient_for_schema_followup(
+        initial_result,
+        active_tool_registry,
+        evidence=evidence,
+    ):
+        return initial_result, active_tool_registry, False
+    second_chance_scope_hint = (
+        _turn_result_has_no_tool_progress(initial_result)
+        and not getattr(initial_result, "artifacts", None)
+        and not getattr(initial_result, "suspended_for_approval", False)
+        and _registry_can_expose_request_tool_scope(registry_for_lookup)
+    )
+    unverified_media_hint = _turn_result_has_unverified_media_directive(initial_result)
+    structured_scope_hint = _model_tool_request_attributes(getattr(initial_result, "final_text", None)) is not None
+    assistant_image_unavailable_hint = _turn_result_reports_unavailable_image_generation(initial_result)
+    assistant_missing_live_source_hint = _turn_result_reports_missing_live_source(initial_result)
+    unverified_empty_resource_hint = _turn_result_has_unverified_empty_resource_claim(initial_result)
+    assistant_recovery_hint = bool(
+        _assistant_reply_has_numbered_choice_prompt(getattr(initial_result, "final_text", None))
+        or _turn_result_reports_unfulfilled_capability(initial_result)
+        or assistant_image_unavailable_hint
+        or assistant_missing_live_source_hint
+        or unverified_empty_resource_hint
+        or unverified_media_hint
+    )
+    if (
+        _turn_result_has_substantive_outcome(initial_result)
+        and not structured_scope_hint
+        and not assistant_recovery_hint
+        and not second_chance_scope_hint
+    ):
+        return initial_result, active_tool_registry, False
+    image_generation_unconfigured = (
+        assistant_image_unavailable_hint
+        and "image_generate" not in _retry_available_tool_names(registry_for_lookup)
+    )
+    decision = (
+        _unverified_media_scope_decision_from_result(initial_result, registry=registry_for_lookup)
+        if unverified_media_hint
+        else None
+    )
+    if decision is None:
+        decision = _local_file_reference_scope_decision_from_message(
+            user_message,
+            registry=registry_for_lookup,
+            allow_file_write_artifacts=assistant_recovery_hint,
+        )
+    if decision is None:
+        if model_client is None:
+            if image_generation_unconfigured:
+                if mark_retry is not None:
+                    mark_retry()
+                return _image_generation_not_configured_result(initial_result), active_tool_registry, True
+            return initial_result, active_tool_registry, False
+        if (
+            not structured_scope_hint
+            and not assistant_recovery_hint
+            and not second_chance_scope_hint
+            and not turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
+        ):
+            return initial_result, active_tool_registry, False
+        try:
+            scope_model_client = (
+                _model_client_with_interactive_fast_profile(model_client)
+                if second_chance_scope_hint
+                else model_client
+            )
+            decision = build_turn_tool_scope_decision(
+                model_client=scope_model_client,
+                user_message=user_message,
+                evidence=evidence,
+                registry=registry_for_lookup,
+                force_model_decision=True,
+                assistant_no_tool_draft=getattr(initial_result, "final_text", None),
+            )
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="no_tool_scope_decision_retry",
+                exc=exc,
+            )
+            return initial_result, active_tool_registry, False
+    if not _tool_scope_decision_has_substantive_scope(decision):
+        if image_generation_unconfigured:
+            if mark_retry is not None:
+                mark_retry()
+            return _image_generation_not_configured_result(initial_result), active_tool_registry, True
+        return initial_result, active_tool_registry, False
+    retry_tool_registry = _ToolRegistryWithoutRequestScope(
+        ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=decision)
+    )
+    retry_visible_tool_names = tuple(
+        definition_name
+        for definition_name in (
+            str(definition.get("name") or "").strip()
+            for definition in retry_tool_registry.list_tool_definitions()
+        )
+        if definition_name
+    )
+    if not retry_visible_tool_names:
+        return initial_result, active_tool_registry, False
+    if len(retry_visible_tool_names) == 1 and runtime is not None:
+        direct_result = _run_scoped_safe_read_tool_directly(
+            runtime=runtime,
+            registry=retry_tool_registry,
+            model_client=model_client,
+            principal_id=principal_id,
+            turn_id=getattr(initial_result, "turn_id", None),
+            user_message=user_message,
+        )
+        if direct_result is not None:
+            if mark_retry is not None:
+                mark_retry()
+            return direct_result, retry_tool_registry, True
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _no_tool_scope_decision_retry_prompt(retry_visible_tool_names)}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="no_tool_scope_decision_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_context_preserving_retry_text(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+def _active_connector_app_ids_for_retry() -> tuple[str, ...]:
+    try:
+        from nullion.turn_context_policy import _active_connector_provider_context
+
+        active_context = _active_connector_provider_context()
+    except Exception:
+        return ()
+    app_ids: list[str] = []
+    for entry in active_context:
+        raw_ids = entry.get("active_app_ids") if isinstance(entry, dict) else None
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        if not isinstance(raw_ids, (list, tuple)):
+            continue
+        for raw_id in raw_ids:
+            app_id = str(raw_id or "").strip()
+            if app_id and app_id not in app_ids:
+                app_ids.append(app_id)
+    return tuple(app_ids)
+
+
+def _active_connector_structured_tools_for_retry(
+    *,
+    allow_runtime_load: bool = True,
+) -> tuple[str, ...]:
+    try:
+        from nullion.connector_prompt_context import active_connector_provider_context_snapshot
+
+        active_context = active_connector_provider_context_snapshot(
+            allow_runtime_load=allow_runtime_load,
+        )
+    except Exception:
+        return ()
+    names: list[str] = []
+    for entry in active_context:
+        raw_tools = entry.get("structured_tools") if isinstance(entry, dict) else None
+        if isinstance(raw_tools, str):
+            raw_tools = [raw_tools]
+        if not isinstance(raw_tools, (list, tuple)):
+            continue
+        for raw_name in raw_tools:
+            name = str(raw_name or "").strip()
+            if name and name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+def _retry_available_tool_names(
+    registry: object | None,
+    *,
+    allow_connector_runtime_load: bool = True,
+) -> frozenset[str]:
+    return frozenset(
+        {
+            *_registry_tool_names(registry),
+            *_active_connector_structured_tools_for_retry(
+                allow_runtime_load=allow_connector_runtime_load,
+            ),
+        }
+    )
+
+
+def _preserve_initial_result_after_retry_backend_failure(
+    *,
+    retry_name: str,
+    exc: ChatBackendUnavailableError,
+) -> None:
+    logger.warning(
+        "Preserving initial chat turn after %s backend failure: %s",
+        retry_name,
+        exc,
+    )
+
+
+def _merge_initial_turn_context_into_retry_result(
+    *,
+    initial_result: object,
+    retry_result: object,
+) -> object:
+    initial_tool_results = list(getattr(initial_result, "tool_results", ()) or ())
+    retry_tool_results = list(getattr(retry_result, "tool_results", ()) or ())
+    if initial_tool_results:
+        merged_tool_results: list[ToolResult] = []
+        seen_tool_ids: set[object] = set()
+        for result in [*initial_tool_results, *retry_tool_results]:
+            key = getattr(result, "invocation_id", None) or id(result)
+            if key in seen_tool_ids:
+                continue
+            seen_tool_ids.add(key)
+            merged_tool_results.append(result)
+        try:
+            retry_result.tool_results = merged_tool_results
+        except Exception:
+            pass
+    initial_artifacts = [str(path) for path in getattr(initial_result, "artifacts", ()) or () if str(path or "").strip()]
+    retry_artifacts = [str(path) for path in getattr(retry_result, "artifacts", ()) or () if str(path or "").strip()]
+    if initial_artifacts and not _turn_result_has_unverified_media_directive(initial_result):
+        try:
+            retry_result.artifacts = list(dict.fromkeys([*initial_artifacts, *retry_artifacts]))
+        except Exception:
+            pass
+    return retry_result
+
+
+def _merge_initial_context_preserving_retry_text(
+    *,
+    initial_result: object,
+    retry_result: object,
+) -> object:
+    """Merge prior tool/artifact context while keeping the retry's answer text."""
+
+    retry_text = str(getattr(retry_result, "final_text", "") or "").strip()
+    merged_result = _merge_initial_turn_context_into_retry_result(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if retry_text:
+        try:
+            merged_result.final_text = retry_text
+        except Exception:
+            pass
+    return merged_result
+
+
+def _turn_scope_decision_from_completed_scope_results(
+    tool_results: Iterable[ToolResult] | None,
+    *,
+    available_tool_names: Iterable[str],
+) -> TurnToolScopeDecision | None:
+    available = {
+        str(name or "").strip()
+        for name in available_tool_names
+        if str(name or "").strip()
+    }
+    for tool_result in reversed(list(tool_results or [])):
+        if (
+            _tool_result_name(tool_result) != "request_tool_scope"
+            or normalize_tool_status(_tool_result_status(tool_result)) != "completed"
+        ):
+            continue
+        output = _tool_result_output(tool_result)
+        if not output.get("scope_requested"):
+            continue
+        raw_tool_names = output.get("available_tools")
+        if not isinstance(raw_tool_names, (list, tuple)):
+            continue
+        requested_tool_names = tuple(
+            name
+            for name in dict.fromkeys(str(item or "").strip() for item in raw_tool_names)
+            if name and name in available and name != "request_tool_scope"
+        )
+        if not requested_tool_names:
+            continue
+        raw_required_tool_names = output.get("required_tool_names")
+        required_tool_names = tuple(
+            name
+            for name in dict.fromkeys(
+                str(item or "").strip()
+                for item in (raw_required_tool_names if isinstance(raw_required_tool_names, (list, tuple)) else ())
+            )
+            if name and name in requested_tool_names
+        )
+        scheduler_action = str(output.get("scheduler_action") or "none").strip().lower()
+        if scheduler_action not in {"none", "inspect", "run", "mutate"}:
+            scheduler_action = "none"
+        scheduler_selection_policy = str(output.get("scheduler_selection_policy") or "none").strip().lower()
+        if scheduler_selection_policy not in {"none", "user_selected", "delegate_one"}:
+            scheduler_selection_policy = "none"
+        scheduler_target_scope = str(output.get("scheduler_target_scope") or "none").strip().lower()
+        if scheduler_target_scope not in {"none", "all_current_workspace"}:
+            scheduler_target_scope = "none"
+        raw_scheduler_toggle_enabled = output.get("scheduler_toggle_enabled")
+        scheduler_toggle_enabled = (
+            raw_scheduler_toggle_enabled
+            if isinstance(raw_scheduler_toggle_enabled, bool)
+            else None
+        )
+        raw_connector_app_ids = output.get("connector_app_ids")
+        connector_app_ids = tuple(
+            str(item or "").strip()
+            for item in (raw_connector_app_ids if isinstance(raw_connector_app_ids, (list, tuple)) else ())
+            if str(item or "").strip()
+        )
+        capabilities = {
+            str(item or "").strip().lower()
+            for item in (output.get("capabilities") if isinstance(output.get("capabilities"), (list, tuple)) else ())
+            if str(item or "").strip()
+        }
+        connector_requested = bool(
+            connector_app_ids
+            or "connector" in capabilities
+            or set(requested_tool_names).intersection(_READ_ONLY_ACCOUNT_TOOL_NAMES)
+        )
+        return TurnToolScopeDecision(
+            scheduler_action=scheduler_action,
+            scheduler_toggle_enabled=scheduler_toggle_enabled if scheduler_action == "mutate" else None,
+            scheduler_selection_policy=scheduler_selection_policy if scheduler_action == "run" else "none",
+            scheduler_target_scope=scheduler_target_scope if scheduler_action == "mutate" else "none",
+            skill_pack_action="connector" if connector_requested else "none",
+            connector_app_ids=connector_app_ids if connector_requested else (),
+            connector_source_user_requested=connector_requested,
+            requested_tool_names=requested_tool_names,
+            required_tool_names=required_tool_names,
+            requested_artifact_extensions=tuple(
+                normalize_artifact_extensions(output.get("artifact_extensions"))
+            ),
+            required_embedded_media_extensions=tuple(
+                normalize_artifact_extensions(output.get("embedded_media_artifact_extensions"))
+            ),
+            confidence=1.0,
+            valid=True,
+        )
+    return None
+
+
+def _scoped_registry_from_completed_scope_results(
+    registry: object,
+    *,
+    evidence,
+    tool_results: Iterable[ToolResult] | None,
+) -> object | None:
+    decision = _turn_scope_decision_from_completed_scope_results(
+        tool_results,
+        available_tool_names=_retry_available_tool_names(registry),
+    )
+    if decision is None:
+        return None
+    requested_tool_names = tuple(
+        name
+        for name in dict.fromkeys(
+            [
+                *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+                *tuple(getattr(decision, "required_tool_names", ()) or ()),
+            ]
+        )
+        if str(name or "").strip() and str(name or "").strip() != "request_tool_scope"
+    )
+    if not requested_tool_names:
+        return None
+    scoped = ScopedTurnToolRegistry(
+        registry,
+        evidence=evidence,
+        tool_scope_decision=decision,
+    )
+    return _ToolRegistryAllowedNames(
+        _ToolRegistryWithoutRequestScope(scoped),
+        allowed_tool_names=requested_tool_names,
+        turn_tool_scope_decision=decision,
+    )
+
+
+def _run_chat_turn_missing_tool_scope_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    model_client: object | None,
+    user_message: str,
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    numbered_option_selected: bool = False,
+    mark_retry: Callable[[], None] | None = None,
+    principal_id: str | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = base_tool_registry or active_tool_registry
+    request_scope_registry_for_retry = registry_for_lookup
+    if (
+        not _registry_can_expose_request_tool_scope(request_scope_registry_for_retry)
+        and isinstance(active_tool_registry, PlainNoToolFastPathRegistry)
+    ):
+        request_scope_registry_for_retry = ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence)
+    if (
+        not _registry_can_expose_request_tool_scope(request_scope_registry_for_retry)
+        and _registry_can_expose_request_tool_scope(active_tool_registry)
+    ):
+        request_scope_registry_for_retry = active_tool_registry
+    if not (
+        _turn_result_should_retry_missing_tool_scope(initial_result, active_tool_registry)
+        or _turn_result_should_retry_missing_tool_scope(initial_result, registry_for_lookup)
+        or _turn_result_should_retry_missing_tool_scope(initial_result, request_scope_registry_for_retry)
+    ):
+        return initial_result, active_tool_registry, False
+    try:
+        decision = build_turn_tool_scope_decision(
+            model_client=model_client,
+            user_message=user_message,
+            evidence=evidence,
+            registry=registry_for_lookup,
+            force_model_decision=True,
+            assistant_no_tool_draft=getattr(initial_result, "final_text", None),
+        )
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="missing_tool_scope_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    available_tool_names = _retry_available_tool_names(registry_for_lookup)
+    requested_tool_names = tuple(
+        name
+        for name in dict.fromkeys(
+            [
+                *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+                *tuple(getattr(decision, "required_tool_names", ()) or ()),
+            ]
+        )
+        if name in available_tool_names and name != "request_tool_scope"
+    )
+    if not requested_tool_names:
+        scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+        requested_tool_names = tuple(
+            name
+            for name in _MODEL_SCOPE_SCHEDULER_DEFAULT_TOOLS.get(scheduler_action, ())
+            if name in available_tool_names
+        )
+    connector_followup_requested = bool(
+        getattr(decision, "connector_source_user_requested", False)
+        or tuple(getattr(decision, "connector_app_ids", ()) or ())
+        or str(getattr(decision, "skill_pack_action", "") or "").strip().lower() == "connector"
+    )
+    if not requested_tool_names and connector_followup_requested:
+        requested_tool_names = tuple(
+            name for name in sorted(available_tool_names) if name in _READ_ONLY_ACCOUNT_TOOL_NAMES
+        )
+    if not requested_tool_names:
+        requested_artifact_extensions = tuple(getattr(decision, "requested_artifact_extensions", ()) or ())
+        required_embedded_media_extensions = tuple(getattr(decision, "required_embedded_media_extensions", ()) or ())
+        if requested_artifact_extensions or required_embedded_media_extensions:
+            requested_tool_names = tuple(name for name in _MODEL_SCOPE_FILE_TOOLS if name in available_tool_names)
+    if not requested_tool_names:
+        fallback_decision = _unverified_media_scope_decision_from_result(
+            initial_result,
+            registry=registry_for_lookup,
+        ) or _local_file_reference_scope_decision_from_message(
+            user_message,
+            registry=registry_for_lookup,
+            allow_file_write_artifacts=_turn_result_has_unverified_media_directive(initial_result),
+        )
+        if fallback_decision is not None:
+            decision = fallback_decision
+            requested_tool_names = tuple(
+                name
+                for name in dict.fromkeys(
+                    [
+                        *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+                        *tuple(getattr(decision, "required_tool_names", ()) or ()),
+                    ]
+                )
+                if name in available_tool_names and name != "request_tool_scope"
+            )
+    if not requested_tool_names:
+        if (
+            _registry_can_expose_request_tool_scope(request_scope_registry_for_retry)
+            and _turn_result_reports_unfulfilled_capability(initial_result)
+        ):
+            retry_tool_registry = _ToolRegistryAllowedNames(
+                request_scope_registry_for_retry,
+                allowed_tool_names=("request_tool_scope",),
+            )
+            retry_history = list(base_history)
+            retry_history.append({
+                "role": "system",
+                "content": [{"type": "text", "text": _request_tool_scope_retry_prompt()}],
+            })
+            try:
+                retry_result = run_turn(retry_history, retry_tool_registry)
+            except ChatBackendUnavailableError as exc:
+                _preserve_initial_result_after_retry_backend_failure(
+                    retry_name="missing_tool_scope_retry",
+                    exc=exc,
+                )
+                return initial_result, active_tool_registry, False
+            if not _turn_result_used_tool(retry_result, "request_tool_scope"):
+                return initial_result, active_tool_registry, False
+            if (
+                not _turn_result_has_substantive_outcome(retry_result)
+                and _turn_result_has_substantive_outcome(initial_result)
+            ):
+                return initial_result, active_tool_registry, False
+            retry_result = _merge_initial_turn_context_into_retry_result(
+                initial_result=initial_result,
+                retry_result=retry_result,
+            )
+            scoped_retry_tool_registry = _scoped_registry_from_completed_scope_results(
+                registry_for_lookup,
+                evidence=evidence,
+                tool_results=getattr(retry_result, "tool_results", None),
+            )
+            return_tool_registry = retry_tool_registry
+            if scoped_retry_tool_registry is not None:
+                scope_decision = getattr(scoped_retry_tool_registry, "turn_tool_scope_decision", None)
+                scheduler_action = str(getattr(scope_decision, "scheduler_action", "") or "").strip().lower()
+                if scheduler_action == "mutate":
+                    mutation_result, mutation_registry, mutation_retried = _run_chat_turn_scheduler_mutation_fallback_retry(
+                        initial_result=retry_result,
+                        base_history=base_history,
+                        active_tool_registry=scoped_retry_tool_registry,
+                        base_tool_registry=registry_for_lookup,
+                        model_client=model_client,
+                        user_message=user_message,
+                        evidence=evidence,
+                        run_turn=run_turn,
+                        mark_retry=None,
+                        principal_id=principal_id,
+                    )
+                    if mutation_retried:
+                        retry_result = mutation_result
+                        return_tool_registry = mutation_registry
+                if scheduler_action == "inspect":
+                    scope_tool_names = tuple(
+                        name
+                        for name in tuple(getattr(scope_decision, "requested_tool_names", ()) or ())
+                        if name in {"list_crons", "list_reminders"}
+                    )
+                    if len(scope_tool_names) == 1:
+                        read_result = _run_scheduler_read_tool_directly(
+                            registry=scoped_retry_tool_registry,
+                            tool_name=scope_tool_names[0],
+                            principal_id=principal_id,
+                        )
+                        if read_result is not None:
+                            _append_tool_result_to_turn_result(retry_result, read_result)
+                            try:
+                                from nullion.agent_orchestrator import _scheduler_read_completion_text
+
+                                completion_text = _scheduler_read_completion_text(
+                                    read_result,
+                                    tool_registry=scoped_retry_tool_registry,
+                                    tool_results=getattr(retry_result, "tool_results", None),
+                                    user_message=user_message,
+                                )
+                            except Exception:
+                                completion_text = None
+                            if completion_text:
+                                try:
+                                    retry_result.final_text = completion_text
+                                except Exception:
+                                    pass
+                            return_tool_registry = scoped_retry_tool_registry
+            if mark_retry is not None:
+                mark_retry()
+            return retry_result, return_tool_registry, True
+        return initial_result, active_tool_registry, False
+    connector_followup_requested = connector_followup_requested or any(
+        name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in requested_tool_names
+    )
+    retry_decision = replace(
+        decision,
+        connector_app_ids=tuple(getattr(decision, "connector_app_ids", ()) or ())
+        or _active_connector_app_ids_for_retry(),
+        connector_source_user_requested=bool(
+            getattr(decision, "connector_source_user_requested", False)
+            or connector_followup_requested
+        ),
+        skill_pack_action="connector" if connector_followup_requested else getattr(decision, "skill_pack_action", None),
+        requested_tool_names=requested_tool_names,
+        required_tool_names=tuple(
+            name
+            for name in tuple(getattr(decision, "required_tool_names", ()) or ())
+            if name in requested_tool_names
+        ),
+    )
+    retry_tool_registry = _ToolRegistryWithoutRequestScope(
+        ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+    )
+    retry_visible_tool_names = {
+        str(definition.get("name") or "")
+        for definition in retry_tool_registry.list_tool_definitions()
+        if str(definition.get("name") or "").strip()
+    }
+    if not retry_visible_tool_names:
+        return initial_result, active_tool_registry, False
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _missing_tool_scope_retry_prompt(requested_tool_names)}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="missing_tool_scope_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if (
+        not _turn_result_has_substantive_outcome(retry_result)
+        and _turn_result_has_substantive_outcome(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_turn_context_into_retry_result(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+def _active_connector_structured_tools_for_app(app_id: object) -> tuple[str, ...]:
+    normalized_app_id = _normalized_connector_app_id(app_id)
+    if not normalized_app_id:
+        return ()
+    try:
+        from nullion.turn_context_policy import _active_connector_provider_context
+
+        active_context = _active_connector_provider_context()
+    except Exception:
+        return ()
+    names: list[str] = []
+    for entry in active_context:
+        if not isinstance(entry, dict):
+            continue
+        raw_app_ids = entry.get("active_app_ids")
+        app_ids = {
+            _normalized_connector_app_id(raw_id)
+            for raw_id in (raw_app_ids if isinstance(raw_app_ids, (list, tuple)) else ())
+            if _normalized_connector_app_id(raw_id)
+        }
+        if normalized_app_id not in app_ids:
+            continue
+        raw_tools = entry.get("structured_tools")
+        for raw_name in raw_tools if isinstance(raw_tools, (list, tuple)) else ():
+            name = str(raw_name or "").strip()
+            if name and name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+def _connector_skill_scope_retry_tool_names(
+    registry: object | None,
+    *,
+    app_id: object,
+) -> tuple[str, ...]:
+    available_tool_names = _retry_available_tool_names(registry)
+    names: list[str] = []
+    for name in (
+        *_active_connector_structured_tools_for_app(app_id),
+        "connector_request",
+        "skill_pack_read",
+    ):
+        if name in available_tool_names and name != "request_tool_scope" and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _connector_skill_scope_retry_prompt(app_label: str, tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        f"Connector skill reuse: an accepted Builder skill exists for {app_label}, and the user asked "
+        f"for that connected source. Use the exposed connector tool(s): {names}. Do not ask the user "
+        "to approve or build the same skill again. If connector docs show path-only routes such as "
+        "/app/native/path, pass that connector-relative path directly or under the configured connector "
+        "gateway base; do not prepend the native third-party host. If connector authorization is missing "
+        "or the tool fails, report that concrete connector failure and the exact next recovery step."
+    )
+
+
+def _run_chat_turn_connector_skill_scope_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    runtime: PersistentRuntime | None = None,
+    evidence=None,
+    user_message: object,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+    skill_reuse_callback: Callable[[Iterable[str]], None] | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = base_tool_registry or active_tool_registry
+    if (
+        _turn_result_has_substantive_tools(initial_result)
+        and not _turn_result_used_only_connector_retry_context_tools(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    if getattr(initial_result, "artifacts", None):
+        return initial_result, active_tool_registry, False
+    if getattr(initial_result, "suspended_for_approval", False):
+        return initial_result, active_tool_registry, False
+    app_ids = _accepted_connector_skill_app_ids_for_message(user_message, runtime=runtime)
+    if not app_ids:
+        return initial_result, active_tool_registry, False
+    app_id = app_ids[0]
+    requested_tool_names = _connector_skill_scope_retry_tool_names(
+        registry_for_lookup,
+        app_id=app_id,
+    )
+    if not requested_tool_names:
+        return initial_result, active_tool_registry, False
+    app_label = _connector_app_label(app_id)
+    retry_decision = TurnToolScopeDecision(
+        skill_pack_action="connector",
+        connector_app_ids=(app_id,),
+        connector_source_user_requested=True,
+        requested_tool_names=requested_tool_names,
+        required_tool_names=(),
+        confidence=1.0,
+        valid=True,
+    )
+    retry_tool_registry = _ToolRegistryWithoutRequestScope(
+        ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+    )
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _connector_skill_scope_retry_prompt(app_label, requested_tool_names)}],
+    })
+    if skill_reuse_callback is not None:
+        titles = _runtime_connector_skill_titles_for_app(runtime, app_id)
+        skill_reuse_callback(titles or (f"{app_label} connector workflow",))
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="connector_skill_scope_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if (
+        not _turn_result_has_substantive_outcome(retry_result)
+        and _turn_result_has_substantive_outcome(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_turn_context_into_retry_result(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+def _scheduler_run_tool_scope_retry_prompt() -> str:
+    return (
+        "Scheduler run recovery: the previous attempt listed scheduled tasks but reported that run_cron was not "
+        "available, even though the registered scheduler run scope can expose it. Continue the same current request "
+        "with list_crons and run_cron visible. If the target is already clear from the current turn, use run_cron; "
+        "otherwise ask for a numbered selection. Do not finish by saying run_cron is unavailable unless the visible "
+        "run_cron call itself fails."
+    )
+
+
+def _turn_result_should_retry_scheduler_run_scope(result: object, registry: object | None) -> bool:
+    registry_tool_names = _registry_tool_names(registry)
+    if "run_cron" not in registry_tool_names:
+        return False
+    if _turn_result_used_tool(result, "run_cron"):
+        return False
+    if getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    required_names = set(getattr(decision, "required_tool_names", ()) or ())
+    requested_names = set(getattr(decision, "requested_tool_names", ()) or ())
+    if decision is None:
+        return _turn_result_used_tool(result, "list_crons")
+    if scheduler_action != "run" and "run_cron" not in required_names:
+        return False
+    return _turn_result_used_tool(result, "list_crons") or "run_cron" in requested_names
+
+
+def _normalized_scheduler_reference(value: object) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _structured_scheduler_run_target_from_list_crons(
+    result: object,
+    *,
+    user_message: str | None,
+) -> dict[str, object] | None:
+    normalized_message = _normalized_scheduler_reference(user_message)
+    if not normalized_message:
+        return None
+    candidates: list[dict[str, object]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "list_crons":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        crons = output.get("crons")
+        if not isinstance(crons, list):
+            continue
+        for item in crons:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("enabled") is False or item.get("has_task") is False:
+                continue
+            cron_id = str(item.get("id") or "").strip()
+            if cron_id and cron_id.casefold() in normalized_message:
+                key = ("id", cron_id)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    candidates.append({"id": cron_id})
+                continue
+            for key_name in ("name", "display_name"):
+                name = str(item.get(key_name) or "").strip()
+                normalized_name = _normalized_scheduler_reference(name)
+                if not normalized_name or normalized_name not in normalized_message:
+                    continue
+                key = ("name", name)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    candidates.append({"name": name})
+                break
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _structured_scheduler_delegate_run_target_from_list_crons(result: object) -> dict[str, object] | None:
+    candidates: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "list_crons":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        crons = output.get("crons")
+        if not isinstance(crons, list):
+            continue
+        for item in crons:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("enabled") is False or item.get("has_task") is False:
+                continue
+            cron_id = str(item.get("id") or "").strip()
+            name = str(item.get("name") or item.get("display_name") or "").strip()
+            if cron_id:
+                key = ("id", cron_id)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append({"id": cron_id})
+                continue
+            if name:
+                key = ("name", name)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append({"name": name})
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _structured_scheduler_toggle_target_from_list_crons(
+    result: object,
+    *,
+    user_message: str | None,
+) -> dict[str, object] | None:
+    normalized_message = _normalized_scheduler_reference(user_message)
+    if not normalized_message:
+        return None
+    candidates: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "list_crons":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        crons = output.get("crons")
+        if not isinstance(crons, list):
+            continue
+        for item in crons:
+            if not isinstance(item, Mapping):
+                continue
+            cron_id = str(item.get("id") or "").strip()
+            if not cron_id:
+                continue
+            matched = cron_id.casefold() in normalized_message
+            if not matched:
+                for key_name in ("name", "display_name"):
+                    name = str(item.get(key_name) or "").strip()
+                    normalized_name = _normalized_scheduler_reference(name)
+                    if normalized_name and normalized_name in normalized_message:
+                        matched = True
+                        break
+            if not matched or cron_id in seen_ids:
+                continue
+            seen_ids.add(cron_id)
+            candidates.append({"id": cron_id})
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _run_chat_turn_scheduler_run_scope_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    model_client: object | None = None,
+    user_message: str = "",
+    evidence=None,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+    principal_id: str | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = _scheduler_retry_registry_with_tools(
+        base_tool_registry or active_tool_registry,
+        required_tool_names=("run_cron",),
+    )
+    retry_decision_override: TurnToolScopeDecision | None = None
+    retry_target_summary = ""
+    structured_run_target = _structured_scheduler_run_target_from_list_crons(
+        initial_result,
+        user_message=user_message,
+    )
+    if not _turn_result_should_retry_scheduler_run_scope(initial_result, active_tool_registry):
+        existing_scheduler_action = str(
+            getattr(
+                getattr(active_tool_registry, "turn_tool_scope_decision", None),
+                "scheduler_action",
+                "",
+            )
+            or ""
+        ).strip().lower()
+        has_structured_run_target = (
+            existing_scheduler_action == "inspect"
+            and structured_run_target is not None
+            and _turn_result_used_tool(initial_result, "list_crons")
+            and not _turn_result_used_tool(initial_result, "run_cron")
+            and "run_cron" in _registry_tool_names(registry_for_lookup)
+        )
+        if (
+            (
+                existing_scheduler_action == "inspect"
+                and not (
+                    _turn_result_used_tool(initial_result, "list_crons")
+                    and not _turn_result_used_tool(initial_result, "run_cron")
+                    and "run_cron" in _registry_tool_names(registry_for_lookup)
+                )
+            )
+            or model_client is None
+            or not _turn_result_used_tool(initial_result, "list_crons")
+            or _turn_result_used_tool(initial_result, "run_cron")
+            or getattr(initial_result, "artifacts", None)
+            or getattr(initial_result, "suspended_for_approval", False)
+            or "run_cron" not in _registry_tool_names(registry_for_lookup)
+        ):
+            return initial_result, active_tool_registry, False
+        assistant_no_tool_draft = getattr(initial_result, "final_text", None)
+        if existing_scheduler_action == "inspect" and structured_run_target is not None:
+            retry_target_summary = ", ".join(f"{key}={value!r}" for key, value in structured_run_target.items())
+            assistant_no_tool_draft = (
+                "The previous scheduler attempt completed only list/read tools. A single eligible cron target "
+                f"was resolved from structured list_crons output ({retry_target_summary}). Decide from the "
+                "current user request whether the remaining action is scheduler_run. Keep scheduler_action=inspect "
+                "when the user only asked to inspect the cron without running it."
+            )
+        try:
+            candidate_decision = build_turn_tool_scope_decision(
+                model_client=model_client,
+                user_message=user_message,
+                evidence=evidence,
+                registry=registry_for_lookup,
+                force_model_decision=True,
+                assistant_no_tool_draft=assistant_no_tool_draft,
+            )
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="scheduler_run_scope_retry",
+                exc=exc,
+            )
+            return initial_result, active_tool_registry, False
+        candidate_requested = set(getattr(candidate_decision, "requested_tool_names", ()) or ())
+        candidate_required = set(getattr(candidate_decision, "required_tool_names", ()) or ())
+        candidate_scheduler_action = str(getattr(candidate_decision, "scheduler_action", "") or "").strip().lower()
+        if candidate_scheduler_action != "run" and "run_cron" not in candidate_requested | candidate_required:
+            if existing_scheduler_action == "inspect" and mark_retry is not None:
+                mark_retry()
+                return initial_result, active_tool_registry, True
+            return initial_result, active_tool_registry, False
+        scheduler_selection_policy = str(
+            getattr(candidate_decision, "scheduler_selection_policy", "") or ""
+        ).strip().lower()
+        if (
+            existing_scheduler_action == "inspect"
+            and structured_run_target is None
+            and scheduler_selection_policy not in {"delegate_one"}
+        ):
+            if mark_retry is not None:
+                mark_retry()
+                return initial_result, active_tool_registry, True
+            return initial_result, active_tool_registry, False
+        if scheduler_selection_policy not in {"user_selected", "delegate_one"}:
+            scheduler_selection_policy = "user_selected"
+        retry_decision_override = replace(
+            candidate_decision,
+            scheduler_action="run",
+            scheduler_selection_policy=scheduler_selection_policy,
+            requested_tool_names=tuple(
+                dict.fromkeys([
+                    *tuple(getattr(candidate_decision, "requested_tool_names", ()) or ()),
+                    "list_crons",
+                    "run_cron",
+                ])
+            ),
+            required_tool_names=tuple(
+                dict.fromkeys([
+                    *tuple(getattr(candidate_decision, "required_tool_names", ()) or ()),
+                    "run_cron",
+                ])
+            ),
+            valid=True,
+        )
+        if not has_structured_run_target:
+            retry_target_summary = ""
+    if retry_decision_override is None and not _turn_result_should_retry_scheduler_run_scope(initial_result, active_tool_registry):
+        return initial_result, active_tool_registry, False
+    existing_decision = retry_decision_override or getattr(active_tool_registry, "turn_tool_scope_decision", None)
+    retry_decision = TurnToolScopeDecision(
+        scheduler_action="run",
+        scheduler_selection_policy=str(
+            getattr(
+                existing_decision,
+                "scheduler_selection_policy",
+                "none",
+            )
+            or "none"
+        ).strip().lower(),
+        requested_tool_names=("run_cron", "list_crons"),
+        required_tool_names=("run_cron",),
+        confidence=1.0,
+        valid=True,
+    )
+    if structured_run_target is None and retry_decision.scheduler_selection_policy == "delegate_one":
+        structured_run_target = _structured_scheduler_delegate_run_target_from_list_crons(initial_result)
+        if structured_run_target is not None:
+            retry_target_summary = ", ".join(
+                f"{key}={value!r}" for key, value in structured_run_target.items()
+            )
+    if (
+        structured_run_target is None
+        and retry_decision.scheduler_selection_policy == "delegate_one"
+        and _turn_result_used_tool(initial_result, "list_crons")
+        and not _turn_result_used_tool(initial_result, "run_cron")
+    ):
+        structured_run_target = _structured_scheduler_delegate_run_target_from_list_crons(initial_result)
+        if structured_run_target is not None:
+            retry_target_summary = ", ".join(
+                f"{key}={value!r}" for key, value in structured_run_target.items()
+            )
+    retry_tool_registry = _ToolRegistryWithoutRequestScope(
+        ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+    )
+    if structured_run_target is not None:
+        direct_run_result = _run_scheduler_action_tool_directly(
+            registry=retry_tool_registry,
+            tool_name="run_cron",
+            principal_id=principal_id,
+            arguments=structured_run_target,
+        )
+        if direct_run_result is not None:
+            retry_result = SimpleNamespace(
+                turn_id=getattr(initial_result, "turn_id", None) or uuid4().hex,
+                final_text=_run_cron_numbered_selection_reply(direct_run_result),
+                tool_results=[direct_run_result],
+                artifacts=[],
+                suspended_for_approval=normalize_tool_status(_tool_result_status(direct_run_result))
+                in {"approval_required", "suspended", "denied"},
+                approval_id=(
+                    _tool_result_output(direct_run_result).get("approval_id")
+                    if isinstance(_tool_result_output(direct_run_result), dict)
+                    else None
+                ),
+                thinking_text=None,
+                reached_iteration_limit=False,
+                raw_tool_payload_blocked=False,
+            )
+            retry_result = _merge_initial_turn_context_into_retry_result(
+                initial_result=initial_result,
+                retry_result=retry_result,
+            )
+            if mark_retry is not None:
+                mark_retry()
+            return retry_result, retry_tool_registry, True
+    retry_history = list(base_history)
+    if structured_run_target is not None:
+        retry_history.append({
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Structured scheduler recovery target selected from the completed list_crons result: "
+                        f"{retry_target_summary or ', '.join(f'{key}={value!r}' for key, value in structured_run_target.items())}."
+                    ),
+                }
+            ],
+        })
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _scheduler_run_tool_scope_retry_prompt()}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="scheduler_run_scope_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+_SCHEDULER_FALLBACK_DISCOVERY_TOOLS = frozenset({
+    *_BROWSER_ACCOUNT_FALLBACK_TOOLS,
+    "file_search",
+    "file_read",
+    "workspace_summary",
+})
+_SCHEDULER_RUN_RETRY_TOOLS = frozenset({"list_crons", "run_cron"})
+_SCHEDULER_MUTATION_RETRY_TOOLS = frozenset({
+    "list_crons",
+    "list_reminders",
+    "create_cron",
+    "update_cron",
+    "delete_cron",
+    "delete_reminder",
+    "toggle_cron",
+    "set_reminder",
+    "update_reminder",
+})
+_SCHEDULER_CRON_ACTION_TOOLS = frozenset({
+    "create_cron",
+    "delete_cron",
+    "run_cron",
+    "toggle_cron",
+    "update_cron",
+})
+_SCHEDULER_REMINDER_ACTION_TOOLS = frozenset({
+    "delete_reminder",
+    "set_reminder",
+    "update_reminder",
+})
+_SCHEDULER_TOOL_NAMES = frozenset({
+    "list_crons",
+    "list_reminders",
+    "run_cron",
+    "create_cron",
+    "update_cron",
+    "delete_cron",
+    "delete_reminder",
+    "toggle_cron",
+    "set_reminder",
+    "update_reminder",
+})
+
+
+def _scheduler_retry_registry_with_tools(
+    registry: object | None,
+    *,
+    required_tool_names: Iterable[str],
+) -> object | None:
+    if registry is None:
+        return None
+    required = {str(name or "").strip() for name in required_tool_names if str(name or "").strip()}
+    if not required:
+        return registry
+
+    candidates: list[object] = []
+    seen: set[int] = set()
+
+    def visit(candidate: object | None) -> None:
+        if candidate is None:
+            return
+        marker = id(candidate)
+        if marker in seen:
+            return
+        seen.add(marker)
+        candidates.append(candidate)
+        for attr_name in ("_registry", "_delegate"):
+            try:
+                nested = getattr(candidate, attr_name)
+            except Exception:
+                nested = None
+            if nested is not None:
+                visit(nested)
+
+    visit(registry)
+    for candidate in candidates:
+        available = _registry_tool_names(candidate)
+        if required.issubset(available):
+            return candidate
+    for candidate in candidates:
+        available = _registry_tool_names(candidate)
+        if required.intersection(available):
+            return candidate
+    return registry
+
+
+def _turn_result_has_no_tool_progress(result: object) -> bool:
+    if _turn_result_has_substantive_tools(result):
+        return False
+    if getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    return bool(str(getattr(result, "final_text", "") or "").strip())
+
+
+def _turn_result_used_only_scheduler_fallback_context_tools(result: object) -> bool:
+    names = [
+        _tool_result_name(tool_result)
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+    ]
+    if not names:
+        return False
+    if any(name in _SCHEDULER_TOOL_NAMES for name in names):
+        return False
+    return all(
+        name in _SCHEDULER_FALLBACK_DISCOVERY_TOOLS
+        or name in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+        for name in names
+    )
+
+
+def _turn_result_used_only_scheduler_read_tools(result: object) -> bool:
+    names = [
+        _tool_result_name(tool_result)
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+        if _tool_result_name(tool_result) not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    if not names:
+        return False
+    return all(name in {"list_crons", "list_reminders"} for name in names)
+
+
+def _turn_result_used_any_scheduler_action_tool(result: object) -> bool:
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        name = _tool_result_name(tool_result)
+        if name not in _SCHEDULER_CRON_ACTION_TOOLS | _SCHEDULER_REMINDER_ACTION_TOOLS:
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) == "completed":
+            return True
+    return False
+
+
+def _turn_result_has_completed_scheduler_read_only_tools(result: object) -> bool:
+    tool_results = [
+        tool_result
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+        if _tool_result_name(tool_result) not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    if not tool_results:
+        return False
+    saw_completed_read = False
+    for tool_result in tool_results:
+        name = _tool_result_name(tool_result)
+        if name not in {"list_crons", "list_reminders"}:
+            return False
+        if normalize_tool_status(_tool_result_status(tool_result)) == "completed":
+            saw_completed_read = True
+        else:
+            return False
+    return saw_completed_read
+
+
+def _turn_result_completed_scheduler_inspect_scope(
+    result: object,
+    registry: object | None,
+    *,
+    base_registry: object | None = None,
+    user_message: str | None = None,
+) -> bool:
+    if getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    if _turn_result_reports_unfulfilled_capability(result):
+        return False
+    if not _turn_result_has_completed_scheduler_read_only_tools(result):
+        return False
+    decision = _turn_scope_decision_from_completed_scope_results(
+        getattr(result, "tool_results", None),
+        available_tool_names=_retry_available_tool_names(registry),
+    )
+    if decision is None:
+        return False
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if scheduler_action != "inspect":
+        return False
+    return True
+
+
+def _scheduler_registry_decision_requests_action(registry: object | None) -> bool:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if scheduler_action in {"run", "mutate"}:
+        return True
+    requested_or_required = {
+        str(name or "").strip()
+        for name in [
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        ]
+        if str(name or "").strip()
+    }
+    return bool(
+        requested_or_required.intersection(_SCHEDULER_CRON_ACTION_TOOLS | _SCHEDULER_REMINDER_ACTION_TOOLS)
+    )
+
+
+def _scheduler_list_crons_result_has_toggleable_rows(result: object) -> bool:
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "list_crons":
+            continue
+        output = _tool_result_output(tool_result)
+        rows = output.get("crons")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if not isinstance(row.get("enabled"), bool):
+                continue
+            if str(row.get("id") or row.get("name") or "").strip():
+                return True
+    return False
+
+
+def _scheduler_read_only_recovery_user_message(
+    user_message: str,
+    result: object,
+    *,
+    available_mutation_tool_names: Iterable[str] = (),
+) -> str:
+    cron_count = 0
+    enabled_count = 0
+    disabled_count = 0
+    reminder_count = 0
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        name = _tool_result_name(tool_result)
+        output = _tool_result_output(tool_result)
+        if name == "list_crons":
+            rows = output.get("crons")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                cron_count += 1
+                if row.get("enabled") is True:
+                    enabled_count += 1
+                elif row.get("enabled") is False:
+                    disabled_count += 1
+        elif name == "list_reminders":
+            rows = output.get("reminders")
+            if isinstance(rows, list):
+                reminder_count += len(rows)
+    facts = (
+        f"Read-only scheduler result: crons={cron_count}, enabled_crons={enabled_count}, "
+        f"disabled_crons={disabled_count}, reminders={reminder_count}."
+    )
+    mutation_tools = tuple(
+        dict.fromkeys(
+            str(name or "").strip()
+            for name in available_mutation_tool_names
+            if str(name or "").strip()
+        )
+    )
+    mutation_facts = (
+        f"Registered scheduler mutation tools: {', '.join(mutation_tools)}."
+        if mutation_tools
+        else "Registered scheduler mutation tools: none."
+    )
+    return (
+        "Scheduler mutation recovery classifier.\n"
+        "The previous attempt completed only scheduler read/list tools and did not mutate any scheduler object.\n"
+        f"{facts}\n"
+        f"{mutation_facts}\n"
+        "Return a structured scheduler mutation decision only if the current user turn requires existing scheduler "
+        "objects to end in a different enabled/disabled/active/inactive state. Otherwise return inspect or none.\n\n"
+        "Current user turn:\n"
+        f"{str(user_message or '').strip()}"
+    )
+
+
+def _schema_scheduler_mutation_retry_tool_names(
+    result: object,
+    *,
+    available_tool_names: Iterable[str],
+) -> tuple[str, ...]:
+    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    tool_names: list[str] = []
+    if "list_crons" in available and _turn_result_used_tool(result, "list_crons"):
+        tool_names.append("list_crons")
+    if "toggle_cron" in available and _scheduler_list_crons_result_has_toggleable_rows(result):
+        tool_names.append("toggle_cron")
+    return tuple(dict.fromkeys(tool_names))
+
+
+def _scheduler_retry_existing_decision(
+    registry: object | None,
+    *,
+    action: str,
+    available_tool_names: Iterable[str],
+) -> object | None:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return None
+    if not bool(getattr(decision, "valid", False)):
+        return None
+    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    requested_or_required = {
+        str(name or "").strip()
+        for name in [
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        ]
+        if str(name or "").strip()
+    }
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if action == "run":
+        if scheduler_action == "run" or "run_cron" in requested_or_required:
+            if "run_cron" in available:
+                return decision
+        return None
+    if action == "mutate":
+        mutation_tools = {
+            name
+            for name in requested_or_required
+            if name in _SCHEDULER_MUTATION_RETRY_TOOLS and name not in {"list_crons", "list_reminders"}
+        }
+        if scheduler_action == "mutate" or mutation_tools:
+            if mutation_tools.intersection(available):
+                return decision
+        return None
+    return None
+
+
+def _scope_retry_visible_context_text(base_history: list[dict[str, object]]) -> str:
+    lines: list[str] = []
+    for message in base_history[-6:]:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        if role not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        parts: list[str] = []
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+        text = _trim_context_text(" ".join(part.strip() for part in parts if part.strip()), 500)
+        if text:
+            lines.append(f"{role}: {text}")
+    return "\n".join(lines[-4:])
+
+
+def _scope_retry_user_message_with_visible_context(
+    user_message: str,
+    base_history: list[dict[str, object]],
+) -> str:
+    current = str(user_message or "").strip()
+    visible_context = _scope_retry_visible_context_text(base_history)
+    if not visible_context:
+        return current
+    return (
+        "Current user turn:\n"
+        f"{current}\n\n"
+        "Recent visible conversation context for resolving short follow-ups:\n"
+        f"{visible_context}"
+    )
+
+
+def _scheduler_run_fallback_retry_prompt(tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        "Scheduler run recovery: the previous attempt did not use the scheduler run tool, but a structured "
+        "scope decision for the same current "
+        f"request exposed scheduler tool(s): {names}. Continue the same "
+        "request using the visible scheduler tools. If the target scheduled task is already clear, use run_cron; "
+        "otherwise use list_crons and ask for exactly one numbered selection. Do not switch to browser, local "
+        "file search, or generic exploration unless the scheduler tool itself returns a concrete failure."
+    )
+
+
+def _run_chat_turn_scheduler_run_fallback_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    model_client: object | None,
+    user_message: str,
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+    principal_id: str | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = _scheduler_retry_registry_with_tools(
+        base_tool_registry or active_tool_registry,
+        required_tool_names=tuple(
+            name
+            for name in _SCHEDULER_MUTATION_RETRY_TOOLS
+            if name not in {"list_crons", "list_reminders"}
+        ),
+    )
+    available_tool_names = _retry_available_tool_names(registry_for_lookup)
+    active_decision = getattr(active_tool_registry, "turn_tool_scope_decision", None)
+    if str(getattr(active_decision, "scheduler_action", "") or "").strip().lower() == "inspect":
+        return initial_result, active_tool_registry, False
+    if "run_cron" not in available_tool_names:
+        return initial_result, active_tool_registry, False
+    if _turn_result_used_tool(initial_result, "run_cron"):
+        return initial_result, active_tool_registry, False
+    if getattr(initial_result, "artifacts", None):
+        return initial_result, active_tool_registry, False
+    if getattr(initial_result, "suspended_for_approval", False):
+        return initial_result, active_tool_registry, False
+    context_only_attempt = _turn_result_used_only_scheduler_fallback_context_tools(initial_result)
+    existing_decision = _scheduler_retry_existing_decision(
+        active_tool_registry,
+        action="run",
+        available_tool_names=available_tool_names,
+    ) or _scheduler_retry_existing_decision(
+        registry_for_lookup,
+        action="run",
+        available_tool_names=available_tool_names,
+    )
+    scheduler_read_only_attempt = (
+        existing_decision is not None
+        and _turn_result_used_only_scheduler_read_tools(initial_result)
+    )
+    scheduler_read_only_scope_candidate = (
+        existing_decision is None
+        and _turn_result_used_only_scheduler_read_tools(initial_result)
+    )
+    scheduler_read_only_unfulfilled_attempt = (
+        scheduler_read_only_scope_candidate
+        and _turn_result_reports_unfulfilled_capability(initial_result)
+    )
+    if not (
+        context_only_attempt
+        or scheduler_read_only_attempt
+        or scheduler_read_only_scope_candidate
+        or scheduler_read_only_unfulfilled_attempt
+        or (existing_decision is not None and _turn_result_has_no_tool_progress(initial_result))
+    ):
+        return initial_result, active_tool_registry, False
+
+    if existing_decision is not None:
+        decision = existing_decision
+    else:
+        assistant_no_tool_draft = getattr(initial_result, "final_text", None)
+        if scheduler_read_only_scope_candidate or scheduler_read_only_unfulfilled_attempt:
+            assistant_no_tool_draft = (
+                "Previous scheduler attempt completed only read/list tools and did not perform a scheduler mutation. "
+                "If the current user request requires an existing scheduler object to end in a different state, "
+                "return scheduler_action=mutate with the registered mutation tool instead of inspect.\n\n"
+                + str(assistant_no_tool_draft or "")
+            )
+        try:
+            decision = build_turn_tool_scope_decision(
+                model_client=model_client,
+                user_message=_scope_retry_user_message_with_visible_context(user_message, base_history),
+                evidence=evidence,
+                registry=registry_for_lookup,
+                force_model_decision=True,
+                assistant_no_tool_draft=assistant_no_tool_draft,
+            )
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="scheduler_run_fallback_retry",
+                exc=exc,
+            )
+            return initial_result, active_tool_registry, False
+
+    requested_or_required = tuple(
+        dict.fromkeys([
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        ])
+    )
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if scheduler_action != "run" and "run_cron" not in requested_or_required:
+        return initial_result, active_tool_registry, False
+
+    requested_tool_names = [
+        name
+        for name in requested_or_required
+        if name in _SCHEDULER_RUN_RETRY_TOOLS and name in available_tool_names
+    ]
+    if "list_crons" in available_tool_names and "list_crons" not in requested_tool_names:
+        requested_tool_names.insert(0, "list_crons")
+    if "run_cron" in available_tool_names and "run_cron" not in requested_tool_names:
+        requested_tool_names.append("run_cron")
+    requested_tool_names = list(dict.fromkeys(requested_tool_names))
+    if "run_cron" not in requested_tool_names:
+        return initial_result, active_tool_registry, False
+
+    retry_decision = replace(
+        decision,
+        scheduler_action="run",
+        requested_tool_names=tuple(requested_tool_names),
+        required_tool_names=("run_cron",),
+        confidence=max(float(getattr(decision, "confidence", 0.0) or 0.0), 1.0),
+        valid=True,
+    )
+    retry_tool_registry = _ToolRegistryAllowedNames(
+        _ToolRegistryWithoutRequestScope(
+            ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+        ),
+        allowed_tool_names=requested_tool_names,
+        turn_tool_scope_decision=retry_decision,
+    )
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _scheduler_run_fallback_retry_prompt(requested_tool_names)}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="scheduler_run_fallback_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if (
+        not _turn_result_has_substantive_outcome(retry_result)
+        and _turn_result_has_substantive_outcome(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_turn_context_into_retry_result(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+def _scheduler_mutation_fallback_retry_prompt(tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        "Scheduler mutation recovery: the previous attempt did not use the scheduler mutation tool, but a "
+        "structured scope decision for the same current request exposed scheduler "
+        f"mutation tool(s): {names}. Continue the same request using the visible scheduler tools. Use list_crons "
+        "to identify affected scheduled tasks when needed, then use the exact mutation tool(s) selected by the "
+        "structured scope decision. Do not switch to browser, local file search, saved-history exploration, or "
+        "generic discovery unless the scheduler tool itself returns a concrete failure."
+    )
+
+
+def _run_chat_turn_scheduler_mutation_fallback_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    model_client: object | None,
+    user_message: str,
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+    principal_id: str | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = _scheduler_retry_registry_with_tools(
+        base_tool_registry or active_tool_registry,
+        required_tool_names=tuple(
+            name
+            for name in _SCHEDULER_MUTATION_RETRY_TOOLS
+            if name not in {"list_crons", "list_reminders"}
+        ),
+    )
+    available_tool_names = _retry_available_tool_names(registry_for_lookup)
+    available_mutation_tool_names = sorted(
+        name for name in available_tool_names if name in _SCHEDULER_MUTATION_RETRY_TOOLS and name != "list_crons"
+    )
+    if not available_mutation_tool_names:
+        return initial_result, active_tool_registry, False
+    scheduler_decision_tool_names = tuple(
+        name
+        for name in sorted(available_tool_names)
+        if name in _SCHEDULER_MUTATION_RETRY_TOOLS
+        or name in {"list_crons", "list_reminders"}
+    )
+    scheduler_decision_registry = _ToolRegistryAllowedNames(
+        _ToolRegistryWithoutRequestScope(registry_for_lookup),
+        allowed_tool_names=scheduler_decision_tool_names,
+    )
+    if any(_turn_result_used_tool(initial_result, name) for name in available_mutation_tool_names):
+        return initial_result, active_tool_registry, False
+    if getattr(initial_result, "artifacts", None):
+        return initial_result, active_tool_registry, False
+    if getattr(initial_result, "suspended_for_approval", False):
+        return initial_result, active_tool_registry, False
+    context_only_attempt = _turn_result_used_only_scheduler_fallback_context_tools(initial_result)
+    existing_decision = _scheduler_retry_existing_decision(
+        active_tool_registry,
+        action="mutate",
+        available_tool_names=available_tool_names,
+    ) or _scheduler_retry_existing_decision(
+        registry_for_lookup,
+        action="mutate",
+        available_tool_names=available_tool_names,
+    )
+    scheduler_read_only_attempt = (
+        existing_decision is not None
+        and _turn_result_used_only_scheduler_read_tools(initial_result)
+    )
+    scheduler_read_only_scope_candidate = (
+        existing_decision is None
+        and _turn_result_used_only_scheduler_read_tools(initial_result)
+    )
+    scheduler_read_only_unfulfilled_attempt = (
+        scheduler_read_only_scope_candidate
+        and _turn_result_reports_unfulfilled_capability(initial_result)
+    )
+    scheduler_setup_clarification_attempt = (
+        _turn_result_has_no_tool_progress(initial_result)
+        and _turn_result_reports_scheduler_setup_clarification(initial_result, registry=registry_for_lookup)
+    )
+    scheduler_no_tool_unfulfilled_attempt = (
+        _turn_result_has_no_tool_progress(initial_result)
+        and _turn_result_reports_unfulfilled_capability(initial_result)
+    )
+    if not (
+        context_only_attempt
+        or scheduler_read_only_attempt
+        or scheduler_read_only_scope_candidate
+        or scheduler_read_only_unfulfilled_attempt
+        or scheduler_setup_clarification_attempt
+        or scheduler_no_tool_unfulfilled_attempt
+        or (existing_decision is not None and _turn_result_has_no_tool_progress(initial_result))
+    ):
+        return initial_result, active_tool_registry, False
+
+    assistant_no_tool_draft = getattr(initial_result, "final_text", None)
+    if existing_decision is not None:
+        decision = existing_decision
+    else:
+        try:
+            decision = build_turn_tool_scope_decision(
+                model_client=model_client,
+                user_message=_scope_retry_user_message_with_visible_context(user_message, base_history),
+                evidence=evidence,
+                registry=scheduler_decision_registry,
+                force_model_decision=True,
+                assistant_no_tool_draft=assistant_no_tool_draft,
+            )
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="scheduler_mutation_fallback_retry",
+                exc=exc,
+            )
+            return initial_result, active_tool_registry, False
+
+    requested_or_required = tuple(
+        dict.fromkeys([
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        ])
+    )
+    requested_mutation_tool_names = [
+        name
+        for name in requested_or_required
+        if name in _SCHEDULER_MUTATION_RETRY_TOOLS and name in available_tool_names and name != "list_crons"
+    ]
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if (
+        scheduler_action != "mutate"
+        and not requested_mutation_tool_names
+        and (
+            scheduler_read_only_scope_candidate
+            or scheduler_read_only_unfulfilled_attempt
+            or scheduler_setup_clarification_attempt
+            or scheduler_no_tool_unfulfilled_attempt
+        )
+    ):
+        recovery_user_message = (
+            _scheduler_read_only_recovery_user_message(
+                user_message,
+                initial_result,
+                available_mutation_tool_names=available_mutation_tool_names,
+            )
+            if scheduler_read_only_scope_candidate or scheduler_read_only_unfulfilled_attempt
+            else (
+                "Scheduler mutation recovery classifier.\n"
+                "The previous assistant draft did not use any scheduler mutation tool.\n"
+                "Return a structured scheduler mutation decision only if the current user turn requires existing "
+                "scheduler objects to end in a different enabled/disabled/active/inactive state. Otherwise return "
+                "inspect or none.\n\n"
+                "Current user turn:\n"
+                f"{str(user_message or '').strip()}"
+            )
+        )
+        try:
+            recovery_decision = build_turn_tool_scope_decision(
+                model_client=model_client,
+                user_message=recovery_user_message,
+                evidence=evidence,
+                registry=scheduler_decision_registry,
+                force_model_decision=True,
+                assistant_no_tool_draft=assistant_no_tool_draft,
+            )
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="scheduler_mutation_recovery_decision",
+                exc=exc,
+            )
+            recovery_decision = None
+        if recovery_decision is not None:
+            recovery_requested_or_required = tuple(
+                dict.fromkeys([
+                    *tuple(getattr(recovery_decision, "requested_tool_names", ()) or ()),
+                    *tuple(getattr(recovery_decision, "required_tool_names", ()) or ()),
+                ])
+            )
+            recovery_scheduler_action = str(
+                getattr(recovery_decision, "scheduler_action", "") or ""
+            ).strip().lower()
+            recovery_mutation_tool_names = [
+                name
+                for name in recovery_requested_or_required
+                if name in _SCHEDULER_MUTATION_RETRY_TOOLS
+                and name in available_tool_names
+                and name != "list_crons"
+            ]
+            if recovery_scheduler_action == "mutate" and recovery_mutation_tool_names:
+                decision = recovery_decision
+                requested_or_required = recovery_requested_or_required
+                requested_mutation_tool_names = recovery_mutation_tool_names
+                scheduler_action = recovery_scheduler_action
+    schema_retry_tool_names = (
+        _schema_scheduler_mutation_retry_tool_names(
+            initial_result,
+            available_tool_names=available_tool_names,
+        )
+        if scheduler_read_only_unfulfilled_attempt
+        else ()
+    )
+    schema_mutation_tool_names = [
+        name
+        for name in schema_retry_tool_names
+        if name in _SCHEDULER_MUTATION_RETRY_TOOLS and name in available_tool_names and name != "list_crons"
+    ]
+    if not requested_mutation_tool_names and schema_mutation_tool_names:
+        requested_mutation_tool_names = schema_mutation_tool_names
+        scheduler_action = "mutate"
+    if scheduler_action != "mutate" and not requested_mutation_tool_names:
+        return initial_result, active_tool_registry, False
+    if not requested_mutation_tool_names:
+        return initial_result, active_tool_registry, False
+
+    requested_tool_names = list(schema_retry_tool_names if schema_mutation_tool_names else requested_mutation_tool_names)
+    if "list_crons" in available_tool_names and "list_crons" not in requested_tool_names:
+        requested_tool_names.insert(0, "list_crons")
+    if "list_reminders" in available_tool_names and any(
+        name in requested_mutation_tool_names for name in {"set_reminder", "update_reminder", "delete_reminder"}
+    ):
+        requested_tool_names.insert(0, "list_reminders")
+    requested_tool_names = [
+        name
+        for name in dict.fromkeys(requested_tool_names)
+        if name in _SCHEDULER_MUTATION_RETRY_TOOLS and name in available_tool_names
+    ]
+    required_tool_names = tuple(
+        name
+        for name in dict.fromkeys(requested_mutation_tool_names)
+        if name in requested_tool_names and name != "list_crons" and name != "list_reminders"
+    )
+    if not required_tool_names:
+        return initial_result, active_tool_registry, False
+
+    retry_decision = replace(
+        decision,
+        scheduler_action="mutate",
+        scheduler_toggle_enabled=(
+            getattr(decision, "scheduler_toggle_enabled", None)
+            if "toggle_cron" in requested_tool_names
+            else None
+        ),
+        scheduler_selection_policy="none",
+        requested_tool_names=tuple(requested_tool_names),
+        required_tool_names=required_tool_names,
+        confidence=max(float(getattr(decision, "confidence", 0.0) or 0.0), 1.0),
+        valid=True,
+    )
+    retry_tool_registry = _ToolRegistryAllowedNames(
+        _ToolRegistryWithoutRequestScope(
+            ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+        ),
+        allowed_tool_names=requested_tool_names,
+        turn_tool_scope_decision=retry_decision,
+    )
+    if (
+        "toggle_cron" in required_tool_names
+        and isinstance(getattr(retry_decision, "scheduler_toggle_enabled", None), bool)
+    ):
+        structured_toggle_target = (
+            _structured_scheduler_toggle_target_from_list_crons(
+                initial_result,
+                user_message=user_message,
+            )
+            if _turn_result_used_tool(initial_result, "list_crons")
+            else None
+        )
+        if structured_toggle_target is not None:
+            toggle_result = _run_scheduler_action_tool_directly(
+                registry=retry_tool_registry,
+                tool_name="toggle_cron",
+                principal_id=principal_id,
+                arguments={
+                    **structured_toggle_target,
+                    "enabled": bool(getattr(retry_decision, "scheduler_toggle_enabled")),
+                },
+            )
+            if toggle_result is not None:
+                _append_tool_result_to_turn_result(initial_result, toggle_result)
+                if normalize_tool_status(toggle_result.status) == "completed":
+                    if mark_retry is not None:
+                        mark_retry()
+                    return initial_result, retry_tool_registry, True
+        elif str(getattr(retry_decision, "scheduler_target_scope", "") or "").strip().lower() == "all_current_workspace":
+            toggle_result = _run_scheduler_action_tool_directly(
+                registry=retry_tool_registry,
+                tool_name="toggle_cron",
+                principal_id=principal_id,
+                arguments={
+                    "all_current_workspace": True,
+                    "enabled": bool(getattr(retry_decision, "scheduler_toggle_enabled")),
+                },
+            )
+            if toggle_result is not None:
+                _append_tool_result_to_turn_result(initial_result, toggle_result)
+                if normalize_tool_status(toggle_result.status) == "completed":
+                    if mark_retry is not None:
+                        mark_retry()
+                    return initial_result, retry_tool_registry, True
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _scheduler_mutation_fallback_retry_prompt(requested_tool_names)}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="scheduler_mutation_fallback_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if "list_crons" in requested_tool_names and not _turn_result_used_tool(retry_result, "list_crons"):
+        read_result = _run_scheduler_read_tool_directly(
+            registry=retry_tool_registry,
+            tool_name="list_crons",
+            principal_id=principal_id,
+        )
+        if read_result is not None:
+            _append_tool_result_to_turn_result(retry_result, read_result)
+    if (
+        not _turn_result_has_substantive_outcome(retry_result)
+        and _turn_result_has_substantive_outcome(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_turn_context_into_retry_result(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+def _account_read_tool_retry_prompt(tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        "Account read retry: the previous attempt asked the user to choose from generic options without using "
+        f"the visible read-only account tool(s): {names}. If one of these tools can answer the current request, "
+        "call it before finalizing. Do not claim the account tool, connector, or provider is unavailable until "
+        "you have called the visible tool and received an error or denial. If a required input such as a time window or search range was omitted, choose "
+        "a conservative near-term/default value from the current runtime context, use the tool, and state that "
+        "chosen value in the answer. Answer the user's actual question first; if the tool records do not prove "
+        "the requested answer, say what remains unproven before summarizing records. Ask a clarification only when no visible read-only account tool can safely "
+        "answer the request."
+    )
+
+
+def _latest_user_text(history: Iterable[Mapping[str, object]]) -> str | None:
+    for message in reversed(list(history or [])):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if not isinstance(content, list):
+            continue
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, Mapping):
+                continue
+            if block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        joined = "\n".join(parts).strip()
+        if joined:
+            return joined
+    return None
+
+
+def _default_account_read_arguments(tool_name: str) -> dict[str, object] | None:
+    if tool_name == "calendar_list":
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo(os.environ.get("NULLION_TIMEZONE") or "America/New_York")
+        start = datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=7)
+        return {"start": start.isoformat(), "end": end.isoformat(), "max": 20}
+    if tool_name == "email_search":
+        return {"query": "newer_than:7d", "limit": 10}
+    return None
+
+
+def _account_read_direct_summary(tool_result: ToolResult, *, user_message: str | None = None) -> str:
+    output = tool_result.output if isinstance(tool_result.output, dict) else {}
+    try:
+        if tool_result.tool_name == "calendar_list":
+            from nullion.response_sanitizer import _calendar_list_summary
+
+            return _calendar_list_summary(output, user_message=user_message)
+        if tool_result.tool_name == "email_search":
+            from nullion.response_sanitizer import _email_search_summary
+
+            return _email_search_summary(output)
+        if tool_result.tool_name == "email_read":
+            from nullion.response_sanitizer import _email_read_summary
+
+            return _email_read_summary(output)
+        if tool_result.tool_name == "email_attachment_read":
+            from nullion.response_sanitizer import _email_attachment_read_summary
+
+            return _email_attachment_read_summary(output)
+    except Exception:
+        logger.debug("Could not summarize direct account read result", exc_info=True)
+    if normalize_tool_status(tool_result.status) == "completed":
+        return f"I checked with {tool_result.tool_name}."
+    return f"I tried {tool_result.tool_name}, but it failed: {tool_result.error or output.get('error') or 'unknown error'}"
+
+
+def _completed_account_read_summary_for_schema_followup(
+    result: object,
+    *,
+    user_message: str | None = None,
+) -> str | None:
+    candidates: list[tuple[int, int, str]] = []
+    for index, raw_tool_result in enumerate(list(getattr(result, "tool_results", None) or [])):
+        tool_name = _tool_result_name(raw_tool_result)
+        if tool_name not in _READ_ONLY_ACCOUNT_TOOL_NAMES:
+            continue
+        if normalize_tool_status(_tool_result_status(raw_tool_result)) != "completed":
+            continue
+        output = _tool_result_output(raw_tool_result)
+        tool_result = (
+            raw_tool_result
+            if isinstance(raw_tool_result, ToolResult)
+            else ToolResult(
+                str(getattr(raw_tool_result, "invocation_id", "") or f"account-read-{index}"),
+                tool_name,
+                "completed",
+                dict(output),
+            )
+        )
+        summary = _account_read_direct_summary(tool_result, user_message=user_message).strip()
+        if not summary:
+            continue
+        score = min(len(summary), 1200)
+        if tool_name == "email_attachment_read":
+            score += 900
+        elif tool_name == "email_read" and isinstance(output.get("message"), Mapping):
+            score += 850
+        elif tool_name == "calendar_list":
+            score += 800
+        elif tool_name == "email_search" and _source_result_records(output):
+            score += 750
+        elif tool_name == "email_read":
+            score += 500
+        candidates.append((score, index, summary))
+    if not candidates:
+        return None
+    _score, _index, summary = max(candidates, key=lambda item: (item[0], item[1]))
+    return summary
+
+
+_DIRECT_SAFE_READ_TOOL_NAMES = frozenset({"calendar_list", "market_quote", "weather_forecast"})
+
+
+def _direct_safe_read_tool_candidates(
+    registry: object,
+    *,
+    allow_connector_runtime_load: bool = True,
+) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for tool_name in sorted(
+        _retry_available_tool_names(
+            registry,
+            allow_connector_runtime_load=allow_connector_runtime_load,
+        ).intersection(_DIRECT_SAFE_READ_TOOL_NAMES)
+    ):
+        if not _tool_spec_allows_direct_read_retry(registry, tool_name):
+            continue
+        candidates.append(tool_name)
+    return tuple(candidates)
+
+
+def _safe_direct_read_scope_preflight_registry(
+    *,
+    base_tool_registry: object,
+    evidence,
+    model_client: object | None,
+    user_message: str,
+) -> object | None:
+    if model_client is None:
+        return None
+    candidates = _direct_safe_read_tool_candidates(
+        base_tool_registry,
+        allow_connector_runtime_load=False,
+    )
+    if len(candidates) != 1:
+        return None
+    try:
+        decision = build_turn_tool_scope_decision(
+            model_client=_model_client_with_interactive_fast_profile(model_client) or model_client,
+            user_message=user_message,
+            evidence=evidence,
+            registry=base_tool_registry,
+            force_model_decision=True,
+        )
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="safe_direct_read_scope_preflight",
+            exc=exc,
+        )
+        return None
+    except Exception:
+        logger.debug("Safe direct read scope preflight failed", exc_info=True)
+        return None
+    requested = tuple(
+        dict.fromkeys(
+            str(name or "").strip()
+            for name in [
+                *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+                *tuple(getattr(decision, "required_tool_names", ()) or ()),
+            ]
+            if str(name or "").strip()
+        )
+    )
+    direct_requested = tuple(name for name in requested if name in candidates)
+    if len(direct_requested) != 1 or len(requested) != 1:
+        return None
+    scoped = ScopedTurnToolRegistry(
+        base_tool_registry,
+        evidence=evidence,
+        tool_scope_decision=decision,
+    )
+    return _ToolRegistryAllowedNames(
+        scoped,
+        allowed_tool_names=direct_requested,
+        turn_tool_scope_decision=decision,
+    )
+
+
+def _single_scoped_safe_direct_read_tool(registry: object) -> str | None:
+    visible = [
+        str(definition.get("name") or "").strip()
+        for definition in registry.list_tool_definitions()
+        if str(definition.get("name") or "").strip()
+    ] if hasattr(registry, "list_tool_definitions") else []
+    substantive = [
+        name
+        for name in visible
+        if name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    if len(substantive) != 1:
+        return None
+    tool_name = substantive[0]
+    if tool_name not in _DIRECT_SAFE_READ_TOOL_NAMES:
+        return None
+    if not _tool_spec_allows_direct_read_retry(registry, tool_name):
+        return None
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    requested = {
+        str(name or "").strip()
+        for name in [
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        ]
+        if str(name or "").strip()
+    } if decision is not None else set()
+    if requested and tool_name not in requested:
+        return None
+    return tool_name
+
+
+def _current_user_timezone_name() -> str:
+    try:
+        from nullion.preferences import detect_system_timezone, load_preferences
+
+        return str(load_preferences().timezone or detect_system_timezone(default="America/New_York") or "America/New_York")
+    except Exception:
+        return os.environ.get("NULLION_TIMEZONE") or "America/New_York"
+
+
+def _profile_default_location_text() -> str:
+    try:
+        from nullion.preferences import load_profile
+
+        profile = load_profile()
+    except Exception:
+        profile = {}
+    address = str(profile.get("address") or "").strip() if isinstance(profile, Mapping) else ""
+    return address
+
+
+def _direct_safe_read_tool_default_arguments(tool_name: str) -> dict[str, object] | None:
+    if tool_name == "calendar_list":
+        return _default_account_read_arguments(tool_name)
+    if tool_name == "weather_forecast":
+        location_text = _profile_default_location_text()
+        if not location_text:
+            return None
+        return {
+            "location_text": location_text,
+            "forecast_days": 3,
+            "timezone": _current_user_timezone_name(),
+            "include_hourly": False,
+        }
+    if tool_name == "market_quote":
+        return None
+    return None
+
+
+def _filter_direct_safe_read_arguments(tool_name: str, arguments: Mapping[str, object]) -> dict[str, object] | None:
+    if tool_name == "calendar_list":
+        start = str(arguments.get("start") or "").strip()
+        end = str(arguments.get("end") or "").strip()
+        if not start or not end:
+            return None
+        filtered: dict[str, object] = {"start": start, "end": end}
+        query = str(arguments.get("query") or "").strip()
+        if query:
+            filtered["query"] = query[:200]
+        try:
+            filtered["max"] = max(1, min(50, int(arguments.get("max") or 20)))
+        except (TypeError, ValueError):
+            filtered["max"] = 20
+        return filtered
+    if tool_name == "weather_forecast":
+        filtered = {}
+        location_text = str(arguments.get("location_text") or "").strip()
+        if location_text:
+            filtered["location_text"] = location_text[:500]
+        latitude = arguments.get("latitude")
+        longitude = arguments.get("longitude")
+        if latitude is not None and longitude is not None:
+            try:
+                filtered["latitude"] = float(latitude)
+                filtered["longitude"] = float(longitude)
+            except (TypeError, ValueError):
+                filtered.pop("latitude", None)
+                filtered.pop("longitude", None)
+        if "location_text" not in filtered and not {"latitude", "longitude"}.issubset(filtered):
+            return None
+        try:
+            filtered["forecast_days"] = max(1, min(7, int(arguments.get("forecast_days") or 3)))
+        except (TypeError, ValueError):
+            filtered["forecast_days"] = 3
+        timezone_name = str(arguments.get("timezone") or _current_user_timezone_name()).strip()
+        if timezone_name:
+            filtered["timezone"] = timezone_name
+        filtered["include_hourly"] = bool(arguments.get("include_hourly") is True)
+        hourly_hours = arguments.get("hourly_hours")
+        if hourly_hours is not None:
+            try:
+                filtered["hourly_hours"] = max(1, min(168, int(hourly_hours)))
+            except (TypeError, ValueError):
+                pass
+        return filtered
+    if tool_name == "market_quote":
+        symbols_value = (
+            arguments.get("symbols")
+            or arguments.get("tickers")
+            or arguments.get("ticker_symbols")
+            or arguments.get("symbol")
+            or arguments.get("ticker")
+        )
+        try:
+            from nullion.tools import _normalize_market_quote_symbols
+
+            symbols = _normalize_market_quote_symbols(symbols_value)
+        except Exception:
+            logger.debug("Could not normalize direct market quote symbols", exc_info=True)
+            return None
+        if not symbols:
+            return None
+        return {"symbols": list(symbols)}
+    return None
+
+
+def _model_planned_direct_safe_read_arguments(
+    *,
+    model_client: object | None,
+    tool_name: str,
+    user_message: str | None,
+    default_arguments: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    create = getattr(model_client, "create", None)
+    if not callable(create):
+        if tool_name == "calendar_list" and default_arguments:
+            return _filter_direct_safe_read_arguments(tool_name, default_arguments)
+        return None
+    payload = {
+        "tool_name": tool_name,
+        "user_message": str(user_message or ""),
+        "current_time": datetime.now(UTC).isoformat(timespec="seconds"),
+        "timezone": _current_user_timezone_name(),
+        "profile_default_location": _profile_default_location_text(),
+        "default_arguments": dict(default_arguments or {}),
+    }
+    system = (
+        "Return JSON only for a single already-selected read-only tool. Schema: "
+        "{\"use_direct\":true|false,\"arguments\":{}}. "
+        "Do not choose a different tool. For calendar_list, provide start, end, max, and optional query; "
+        "resolve relative dates using current_time and timezone. For weather_forecast, provide location_text "
+        "or latitude/longitude plus forecast_days; use profile_default_location only when the user did not provide "
+        "another location. For market_quote, provide symbols as explicit ticker symbols. "
+        "Return use_direct=false if the tool cannot answer safely with concrete arguments."
+    )
+    try:
+        profiled_client = _model_client_with_interactive_fast_profile(model_client) or model_client
+        response = profiled_client.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": json.dumps(payload, sort_keys=True)}]}],
+            tools=[],
+            max_tokens=220,
+            system=system,
+            timeout=2,
+        )
+    except Exception:
+        logger.debug("Direct safe read argument planner failed", exc_info=True)
+        if tool_name in {"calendar_list", "weather_forecast"} and default_arguments:
+            return _filter_direct_safe_read_arguments(tool_name, default_arguments)
+        return None
+    text = _extract_direct_model_text(response)
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except Exception:
+        logger.debug("Direct safe read argument planner returned invalid JSON: %r", text)
+        return None
+    if not isinstance(parsed, Mapping) or parsed.get("use_direct") is not True:
+        return None
+    arguments = parsed.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return None
+    return _filter_direct_safe_read_arguments(tool_name, arguments)
+
+
+def _direct_safe_read_summary(tool_result: ToolResult, *, user_message: str | None = None) -> str:
+    if tool_result.tool_name == "weather_forecast":
+        try:
+            from nullion.agent_orchestrator import _weather_forecast_completion_text
+
+            text = _weather_forecast_completion_text(tool_result)
+            if text:
+                return text
+        except Exception:
+            logger.debug("Could not summarize direct weather result", exc_info=True)
+        output = tool_result.output if isinstance(tool_result.output, dict) else {}
+        if normalize_tool_status(tool_result.status) == "completed":
+            return "I checked the live weather forecast."
+        return f"I tried the live weather forecast, but it failed: {tool_result.error or output.get('reason') or 'unknown error'}"
+    if tool_result.tool_name == "market_quote":
+        try:
+            from nullion.response_sanitizer import _market_quote_summary
+
+            text = _market_quote_summary(tool_result.output if isinstance(tool_result.output, dict) else {})
+            if text:
+                return text
+        except Exception:
+            logger.debug("Could not summarize direct market quote result", exc_info=True)
+        output = tool_result.output if isinstance(tool_result.output, dict) else {}
+        if normalize_tool_status(tool_result.status) == "completed":
+            return "I checked live market quote data."
+        return f"I tried live market quotes, but it failed: {tool_result.error or output.get('reason') or 'unknown error'}"
+    return _account_read_direct_summary(tool_result, user_message=user_message)
+
+
+def _run_scoped_safe_read_tool_directly(
+    *,
+    runtime: PersistentRuntime,
+    registry: object,
+    model_client: object | None,
+    principal_id: str | None,
+    turn_id: str | None,
+    user_message: str | None,
+    direct_arguments: Mapping[str, object] | None = None,
+    tool_result_callback: Callable[[ToolResult], None] | None = None,
+) -> object | None:
+    tool_name = _single_scoped_safe_direct_read_tool(registry)
+    if not tool_name:
+        return None
+    default_arguments = _direct_safe_read_tool_default_arguments(tool_name)
+    arguments = (
+        _filter_direct_safe_read_arguments(tool_name, direct_arguments)
+        if direct_arguments is not None
+        else None
+    )
+    if arguments is None:
+        arguments = _model_planned_direct_safe_read_arguments(
+            model_client=model_client,
+            tool_name=tool_name,
+            user_message=user_message,
+            default_arguments=default_arguments,
+        )
+    if not arguments:
+        return None
+    invocation = ToolInvocation(
+        invocation_id=f"direct-read-{tool_name}-{uuid4().hex[:12]}",
+        tool_name=tool_name,
+        principal_id=str(principal_id or ""),
+        arguments=arguments,
+        capsule_id=None,
+    )
+    result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=registry)
+    if tool_result_callback is not None:
+        tool_result_callback(result)
+    return SimpleNamespace(
+        turn_id=turn_id or uuid4().hex,
+        final_text=_direct_safe_read_summary(result, user_message=user_message),
+        tool_results=[result],
+        suspended_for_approval=normalize_tool_status(result.status) in {"approval_required", "suspended"},
+        approval_id=(result.output or {}).get("approval_id") if isinstance(result.output, dict) else None,
+        artifacts=[],
+        thinking_text=None,
+        reached_iteration_limit=False,
+        raw_tool_payload_blocked=False,
+    )
+
+
+_DIRECT_OPEN_URL_TOOL_NAMES = frozenset({"browser_navigate", "browser_open"})
+_DIRECT_OPEN_URL_VALIDATION_TOOL_NAMES = frozenset({"browser_wait_for", "browser_assert_page_state"})
+_DIRECT_OPEN_URL_SCREENSHOT_TOOL_NAMES = _DIRECT_OPEN_URL_TOOL_NAMES | _DIRECT_OPEN_URL_VALIDATION_TOOL_NAMES | frozenset(
+    {"browser_screenshot"}
+)
+
+
+def _direct_open_url_tool_name(
+    registry: object,
+    decision: object | None,
+    *,
+    allow_screenshot_artifact_contract: bool = False,
+) -> str | None:
+    web_action = str(getattr(decision, "web_action", "none") or "none").strip().lower()
+    requested_tool_names = tuple(
+        str(name or "").strip()
+        for name in tuple(getattr(decision, "requested_tool_names", ()) or ())
+        if str(name or "").strip()
+    )
+    allowed_tool_names = (
+        _DIRECT_OPEN_URL_SCREENSHOT_TOOL_NAMES
+        if allow_screenshot_artifact_contract
+        else _DIRECT_OPEN_URL_TOOL_NAMES | _DIRECT_OPEN_URL_VALIDATION_TOOL_NAMES
+    )
+    if web_action not in {"open_url", "browser_interaction"}:
+        if not requested_tool_names or not set(requested_tool_names).issubset(allowed_tool_names):
+            return None
+    if web_action == "browser_interaction" and not requested_tool_names:
+        return None
+    if (
+        web_action != "open_url"
+        and requested_tool_names
+        and not set(requested_tool_names).issubset(allowed_tool_names)
+    ):
+        return None
+    requested_artifact_extensions = {
+        str(extension or "").strip().lower()
+        for extension in tuple(getattr(decision, "requested_artifact_extensions", ()) or ())
+        if str(extension or "").strip()
+    }
+    if requested_artifact_extensions and not (
+        allow_screenshot_artifact_contract and requested_artifact_extensions.issubset({".png"})
+    ):
+        return None
+    if tuple(getattr(decision, "required_embedded_media_extensions", ()) or ()):
+        return None
+    available = _registry_tool_names(registry)
+    for tool_name in requested_tool_names:
+        if tool_name in _DIRECT_OPEN_URL_TOOL_NAMES and tool_name in available:
+            return tool_name
+    for tool_name in ("browser_navigate", "browser_open"):
+        if tool_name in available:
+            return tool_name
+    return None
+
+
+def _run_open_url_tool_directly(
+    *,
+    runtime: PersistentRuntime,
+    registry: object,
+    base_registry: object | None = None,
+    principal_id: str | None,
+    turn_id: str | None,
+    user_message: str,
+    tool_result_callback: Callable[[ToolResult], None] | None = None,
+) -> object | None:
+    target = extract_url_target(user_message)
+    if target is None or not target.value:
+        return None
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    tool_name = _direct_open_url_tool_name(registry, decision)
+    if not tool_name:
+        return None
+    invocation = ToolInvocation(
+        invocation_id=f"direct-open-url-{tool_name}-{uuid4().hex[:12]}",
+        tool_name=tool_name,
+        principal_id=str(principal_id or ""),
+        arguments={"url": target.value},
+        capsule_id=None,
+    )
+    result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=registry)
+    if tool_result_callback is not None:
+        tool_result_callback(result)
+    output = result.output if isinstance(result.output, dict) else {}
+    tool_results = [result]
+    if normalize_tool_status(result.status) == "completed":
+        opened = str(output.get("url") or output.get("current_url") or output.get("page_url") or target.value).strip()
+        web_action = str(getattr(decision, "web_action", "none") or "none").strip().lower()
+        requested_tool_names = {
+            str(name or "").strip()
+            for name in tuple(getattr(decision, "requested_tool_names", ()) or ())
+            if str(name or "").strip()
+        }
+        read_result = (
+            None
+            if web_action == "open_url" and "browser_extract_text" in requested_tool_names
+            else _run_direct_open_read_continuation(
+                runtime=runtime,
+                open_registry=registry,
+                base_registry=base_registry,
+                open_tool_name=tool_name,
+                principal_id=principal_id,
+                tool_result_callback=tool_result_callback,
+            )
+        )
+        if read_result is not None:
+            tool_results.append(read_result)
+        final_text = _direct_open_read_evidence_reply(
+            user_message=user_message,
+            opened_url=opened,
+            tool_results=tool_results,
+        )
+    else:
+        final_text = f"I tried to open {target.value}, but it failed: {result.error or output.get('error') or 'unknown error'}"
+    return SimpleNamespace(
+        turn_id=turn_id or uuid4().hex,
+        final_text=final_text,
+        tool_results=tool_results,
+        suspended_for_approval=normalize_tool_status(result.status) in {"approval_required", "suspended"},
+        approval_id=output.get("approval_id") if isinstance(output, dict) else None,
+        artifacts=[],
+        thinking_text=None,
+        reached_iteration_limit=False,
+        raw_tool_payload_blocked=False,
+    )
+
+
+def _run_direct_open_read_continuation(
+    *,
+    runtime: PersistentRuntime,
+    open_registry: object,
+    base_registry: object | None,
+    open_tool_name: str,
+    principal_id: str | None,
+    tool_result_callback: Callable[[ToolResult], None] | None = None,
+) -> ToolResult | None:
+    registry_for_lookup = base_registry or open_registry
+    if "browser_extract_text" not in _registry_tool_names(registry_for_lookup):
+        return None
+    try:
+        open_spec = open_registry.get_spec(open_tool_name)
+    except Exception:
+        try:
+            open_spec = registry_for_lookup.get_spec(open_tool_name)
+        except Exception:
+            open_spec = None
+    continuation_tools = {
+        str(name or "").strip()
+        for name in tuple(getattr(open_spec, "continuation_tools", ()) or ())
+        if str(name or "").strip()
+    }
+    if "browser_extract_text" not in continuation_tools:
+        return None
+    read_registry = _ToolRegistryAllowedNames(
+        _ToolRegistryWithoutRequestScope(registry_for_lookup),
+        allowed_tool_names=("browser_extract_text",),
+    )
+    invocation = ToolInvocation(
+        invocation_id=f"direct-open-url-browser_extract_text-{uuid4().hex[:12]}",
+        tool_name="browser_extract_text",
+        principal_id=str(principal_id or ""),
+        arguments={},
+        capsule_id=None,
+    )
+    try:
+        result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=read_registry)
+    except Exception:
+        logger.debug("Direct URL-open read continuation failed", exc_info=True)
+        return None
+    if tool_result_callback is not None:
+        tool_result_callback(result)
+    return result
+
+
+def _direct_open_read_evidence_reply(
+    *,
+    user_message: str,
+    opened_url: str,
+    tool_results: list[ToolResult],
+) -> str:
+    has_completed_extract = any(
+        result.tool_name == "browser_extract_text"
+        and normalize_tool_status(result.status) == "completed"
+        and isinstance(result.output, dict)
+        and str(result.output.get("text") or result.output.get("content") or result.output.get("result") or "").strip()
+        for result in tool_results
+    )
+    if not has_completed_extract:
+        return f"Opened {opened_url}."
+    try:
+        from nullion.response_sanitizer import sanitize_user_visible_reply
+
+        evidence_reply = sanitize_user_visible_reply(
+            user_message=user_message,
+            reply=(
+                "Live-search blocker: the browser/search tools did not produce verified result records "
+                "from this run, so I do not have a reliable final answer for this request yet."
+            ),
+            tool_results=tool_results,
+            source="agent",
+        )
+    except Exception:
+        evidence_reply = None
+    if isinstance(evidence_reply, str) and evidence_reply.strip():
+        return evidence_reply.strip()
+    return f"Opened {opened_url}."
+
+
+def _direct_browser_screenshot_allowed(registry: object) -> bool:
+    if "browser_screenshot" not in _registry_tool_names(registry):
+        return False
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    requested_tool_names = {
+        str(name or "").strip()
+        for name in tuple(getattr(decision, "requested_tool_names", ()) or ())
+        if str(name or "").strip()
+    }
+    required_tool_names = {
+        str(name or "").strip()
+        for name in tuple(getattr(decision, "required_tool_names", ()) or ())
+        if str(name or "").strip()
+    }
+    requested_extensions = {
+        str(extension or "").strip().lower()
+        for extension in tuple(getattr(decision, "requested_artifact_extensions", ()) or ())
+        if str(extension or "").strip()
+    }
+    embedded_extensions = {
+        str(extension or "").strip().lower()
+        for extension in tuple(getattr(decision, "required_embedded_media_extensions", ()) or ())
+        if str(extension or "").strip()
+    }
+    if embedded_extensions:
+        return False
+    if requested_extensions and not requested_extensions.issubset({".png"}):
+        return False
+    return (
+        "browser_screenshot" in required_tool_names
+        or ".png" in requested_extensions
+    )
+
+
+def _run_browser_screenshot_tool_directly(
+    *,
+    runtime: PersistentRuntime,
+    registry: object,
+    principal_id: str | None,
+    turn_id: str | None,
+    user_message: str = "",
+    tool_result_callback: Callable[[ToolResult], None] | None = None,
+) -> object | None:
+    if not _direct_browser_screenshot_allowed(registry):
+        return None
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    tool_results: list[ToolResult] = []
+    target = extract_url_target(user_message)
+    if target is not None and target.value:
+        open_tool_name = _direct_open_url_tool_name(
+            registry,
+            decision,
+            allow_screenshot_artifact_contract=True,
+        )
+        if open_tool_name:
+            open_result = invoke_tool_with_boundary_policy(
+                runtime.store,
+                ToolInvocation(
+                    invocation_id=f"direct-browser-screenshot-open-{open_tool_name}-{uuid4().hex[:12]}",
+                    tool_name=open_tool_name,
+                    principal_id=str(principal_id or ""),
+                    arguments={"url": target.value},
+                    capsule_id=None,
+                ),
+                registry=registry,
+            )
+            if tool_result_callback is not None:
+                tool_result_callback(open_result)
+            tool_results.append(open_result)
+            if normalize_tool_status(open_result.status) != "completed":
+                output = open_result.output if isinstance(open_result.output, dict) else {}
+                return SimpleNamespace(
+                    turn_id=turn_id or uuid4().hex,
+                    final_text=(
+                        f"I tried to open {target.value}, but it failed: "
+                        f"{open_result.error or output.get('error') or 'unknown error'}"
+                    ),
+                    tool_results=tool_results,
+                    suspended_for_approval=normalize_tool_status(open_result.status) in {"approval_required", "suspended"},
+                    approval_id=output.get("approval_id") if isinstance(output, dict) else None,
+                    artifacts=[],
+                    thinking_text=None,
+                    reached_iteration_limit=False,
+                    raw_tool_payload_blocked=False,
+                )
+    invocation = ToolInvocation(
+        invocation_id=f"direct-browser-screenshot-{uuid4().hex[:12]}",
+        tool_name="browser_screenshot",
+        principal_id=str(principal_id or ""),
+        arguments={"mode": "viewport"},
+        capsule_id=None,
+    )
+    result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=registry)
+    if tool_result_callback is not None:
+        tool_result_callback(result)
+    tool_results.append(result)
+    output = result.output if isinstance(result.output, dict) else {}
+    artifacts = sorted(_browser_screenshot_artifact_paths(tool_results))
+    if normalize_tool_status(result.status) == "completed" and artifacts:
+        final_text = "Here’s the screenshot."
+    else:
+        final_text = f"I tried to capture a browser screenshot, but it failed: {result.error or output.get('error') or 'unknown error'}"
+    return SimpleNamespace(
+        turn_id=turn_id or uuid4().hex,
+        final_text=final_text,
+        tool_results=tool_results,
+        suspended_for_approval=normalize_tool_status(result.status) in {"approval_required", "suspended"},
+        approval_id=output.get("approval_id") if isinstance(output, dict) else None,
+        artifacts=artifacts,
+        thinking_text=None,
+        reached_iteration_limit=False,
+        raw_tool_payload_blocked=False,
+    )
+
+
+def _run_single_account_read_tool_directly(
+    *,
+    registry: object,
+    tool_name: str,
+    principal_id: str | None,
+    turn_id: str | None,
+    user_message: str | None = None,
+) -> object | None:
+    args = _default_account_read_arguments(tool_name)
+    if args is None or not hasattr(registry, "invoke"):
+        return None
+    invocation = ToolInvocation(
+        invocation_id=f"account-read-retry-{tool_name}-{uuid4().hex[:12]}",
+        tool_name=tool_name,
+        principal_id=str(principal_id or ""),
+        arguments=args,
+    )
+    try:
+        tool_result = registry.invoke(invocation)
+    except Exception as exc:
+        tool_result = ToolResult(
+            invocation.invocation_id,
+            tool_name,
+            "failed",
+            {"error": str(exc)},
+            error=str(exc),
+        )
+    return SimpleNamespace(
+        turn_id=turn_id or uuid4().hex,
+        final_text=_account_read_direct_summary(tool_result, user_message=user_message),
+        tool_results=[tool_result],
+        suspended_for_approval=False,
+        approval_id=None,
+        artifacts=[],
+        thinking_text=None,
+        reached_iteration_limit=False,
+        raw_tool_payload_blocked=False,
+    )
+
+
+_SOURCE_RESULT_COLLECTION_KEYS = ("results", "items", "records", "data")
+_SOURCE_RESULT_ID_KEYS = ("id", "message_id", "resource_id", "record_id")
+_SOURCE_RESULT_LOW_CONFIDENCE_LABELS = frozenset({"DRAFT", "SPAM", "TRASH", "DELETED"})
+
+
+def _tool_result_object_name(result: object) -> str:
+    return str(result.get("tool_name") if isinstance(result, Mapping) else getattr(result, "tool_name", "") or "").strip()
+
+
+def _tool_result_object_status(result: object) -> str:
+    return normalize_tool_status(result.get("status") if isinstance(result, Mapping) else getattr(result, "status", ""))
+
+
+def _tool_result_object_output(result: object) -> Mapping[str, object]:
+    output = result.get("output") if isinstance(result, Mapping) else getattr(result, "output", None)
+    return output if isinstance(output, Mapping) else {}
+
+
+def _source_result_records(output: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+    for key in _SOURCE_RESULT_COLLECTION_KEYS:
+        value = output.get(key)
+        if isinstance(value, list):
+            records = [item for item in value if isinstance(item, Mapping)]
+            if records:
+                return tuple(records)
+    preview = output.get("preview")
+    if isinstance(preview, str) and preview.strip():
+        try:
+            parsed_preview = json.loads(preview)
+        except Exception:
+            parsed_preview = None
+        if isinstance(parsed_preview, Mapping):
+            records = list(_source_result_records(parsed_preview))
+            provider_id = str(parsed_preview.get("provider_id") or "").strip()
+            if provider_id:
+                enriched: list[Mapping[str, object]] = []
+                for record in records:
+                    if record.get("provider_id"):
+                        enriched.append(record)
+                    else:
+                        enriched.append({**dict(record), "provider_id": provider_id})
+                return tuple(enriched)
+            if records:
+                return tuple(records)
+    return ()
+
+
+def _source_record_id(record: Mapping[str, object]) -> str:
+    for key in _SOURCE_RESULT_ID_KEYS:
+        value = str(record.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _source_record_label_penalty(record: Mapping[str, object]) -> int:
+    labels = record.get("labelIds") or record.get("labels") or ()
+    if isinstance(labels, str):
+        label_values = {labels.upper()}
+    elif isinstance(labels, Iterable):
+        label_values = {str(label or "").upper() for label in labels}
+    else:
+        label_values = set()
+    return 1 if label_values.intersection(_SOURCE_RESULT_LOW_CONFIDENCE_LABELS) else 0
+
+
+def _failed_tool_id_argument_name(tool_name: str, output: Mapping[str, object], registry: object) -> str | None:
+    try:
+        spec = registry.get_spec(tool_name)
+    except Exception:
+        spec = None
+    schema = getattr(spec, "input_schema", None) if spec is not None else None
+    if isinstance(schema, Mapping):
+        properties = schema.get("properties")
+        if isinstance(properties, Mapping):
+            for key in _SOURCE_RESULT_ID_KEYS:
+                if key in properties:
+                    return key
+    for key in _SOURCE_RESULT_ID_KEYS:
+        if key in output:
+            return "id" if key in {"message_id", "resource_id", "record_id"} else key
+    return None
+
+
+def _tool_spec_allows_direct_read_retry(registry: object, tool_name: str) -> bool:
+    try:
+        spec = registry.get_spec(tool_name)
+    except Exception:
+        return False
+    if bool(getattr(spec, "requires_approval", True)):
+        return False
+    side_effect = getattr(spec, "side_effect_class", None)
+    side_effect_value = str(getattr(side_effect, "value", side_effect) or "").lower()
+    return side_effect_value == "read"
+
+
+def _structured_source_tool_names_for_failed_read_tool(
+    *,
+    tool_name: str,
+    output: Mapping[str, object],
+    tool_results: Iterable[object],
+) -> tuple[str, ...]:
+    names: list[str] = []
+    required_source_tool = str(output.get("required_source_tool") or "").strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", required_source_tool):
+        names.append(required_source_tool)
+    for source_tool_name in _READ_TOOL_REQUIRED_SOURCE_TOOLS.get(tool_name, ()):
+        if source_tool_name in names:
+            continue
+        for source_result in tool_results:
+            if _tool_result_object_name(source_result) != source_tool_name:
+                continue
+            if _tool_result_object_status(source_result) != "completed":
+                continue
+            source_output = _tool_result_object_output(source_result)
+            if not _source_result_records(source_output):
+                continue
+            continuation_tool = str(source_output.get("next_tool_for_body") or "").strip()
+            body_required_tool = str(source_output.get("body_requires_tool") or "").strip()
+            if continuation_tool == tool_name or body_required_tool == tool_name:
+                names.append(source_tool_name)
+                break
+            if source_tool_name in _READ_TOOL_REQUIRED_SOURCE_TOOLS.get(tool_name, ()):
+                names.append(source_tool_name)
+                break
+    return tuple(dict.fromkeys(names))
+
+
+def _direct_required_source_resource_retry(
+    *,
+    initial_result: object,
+    registry: object,
+    principal_id: str | None,
+    turn_id: str | None,
+    user_message: str | None = None,
+) -> object | None:
+    if not hasattr(registry, "invoke"):
+        return None
+    tool_results = list(getattr(initial_result, "tool_results", None) or [])
+    for failed_result in tool_results:
+        tool_name = _tool_result_object_name(failed_result)
+        if not tool_name or _tool_result_object_status(failed_result) not in {"failed", "error"}:
+            continue
+        output = _tool_result_object_output(failed_result)
+        reason = str(output.get("reason") or "").strip()
+        if not reason.startswith("invalid_"):
+            continue
+        if not _tool_spec_allows_direct_read_retry(registry, tool_name):
+            continue
+        id_argument = _failed_tool_id_argument_name(tool_name, output, registry)
+        if not id_argument:
+            continue
+        required_source_tools = _structured_source_tool_names_for_failed_read_tool(
+            tool_name=tool_name,
+            output=output,
+            tool_results=tool_results,
+        )
+        if not required_source_tools:
+            continue
+        source_records: list[tuple[int, int, Mapping[str, object], Mapping[str, object]]] = []
+        for source_result in tool_results:
+            if _tool_result_object_name(source_result) not in required_source_tools:
+                continue
+            if _tool_result_object_status(source_result) != "completed":
+                continue
+            source_output = _tool_result_object_output(source_result)
+            for index, record in enumerate(_source_result_records(source_output)):
+                candidate_id = _source_record_id(record)
+                if not candidate_id:
+                    continue
+                try:
+                    from nullion.tools import _invalid_concrete_resource_id_reason
+
+                    if _invalid_concrete_resource_id_reason(candidate_id):
+                        continue
+                except Exception:
+                    pass
+                source_records.append((_source_record_label_penalty(record), index, record, source_output))
+        if not source_records:
+            continue
+        for _penalty, _index, record, source_output in sorted(source_records, key=lambda item: (item[0], item[1]))[:3]:
+            candidate_id = _source_record_id(record)
+            arguments: dict[str, object] = {id_argument: candidate_id}
+            provider_id = str(source_output.get("provider_id") or record.get("provider_id") or "").strip()
+            if provider_id:
+                arguments["provider_id"] = provider_id
+            invocation = ToolInvocation(
+                invocation_id=f"source-retry-{tool_name}-{uuid4().hex[:12]}",
+                tool_name=tool_name,
+                principal_id=str(principal_id or ""),
+                arguments=arguments,
+            )
+            try:
+                retry_result = registry.invoke(invocation)
+            except Exception as exc:
+                retry_result = ToolResult(invocation.invocation_id, tool_name, "failed", {"error": str(exc)}, error=str(exc))
+            if normalize_tool_status(retry_result.status) == "completed":
+                return SimpleNamespace(
+                    turn_id=turn_id or uuid4().hex,
+                    final_text=_account_read_direct_summary(retry_result, user_message=user_message),
+                    tool_results=[retry_result],
+                    suspended_for_approval=False,
+                    approval_id=None,
+                    artifacts=[],
+                    thinking_text=None,
+                    reached_iteration_limit=False,
+                    raw_tool_payload_blocked=False,
+                )
+    return None
+
+
+def _source_recovery_synthesis_prompt(
+    *,
+    tool_results: Iterable[ToolResult],
+    user_message: str | None = None,
+) -> str:
+    summaries: list[str] = []
+    for result in tool_results:
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "").strip()
+        if tool_name not in _READ_ONLY_ACCOUNT_TOOL_NAMES:
+            continue
+        summaries.append(f"{tool_name}: {_account_read_direct_summary(result, user_message=user_message)}")
+    evidence = "\n".join(summaries[-4:]).strip()
+    if not evidence:
+        evidence = "A required source-backed read completed after recovering from an invalid resource id."
+    return (
+        "Source-backed tool recovery completed after an invalid resource id. "
+        "Use the recovered evidence below to answer the user's original request directly. "
+        "Do not dump raw result rows or merely say that a tool ran; synthesize the relevant facts, "
+        "state any uncertainty, and give the requested conclusion or next step.\n\n"
+        f"Recovered evidence:\n{evidence}"
+    )
+
+
+def _turn_result_schema_followup_tool_names(result: object) -> tuple[str, ...]:
+    names: list[str] = []
+
+    def _add(raw_value: object) -> None:
+        if isinstance(raw_value, str):
+            values: Iterable[object] = (raw_value,)
+        elif isinstance(raw_value, (list, tuple, set, frozenset)):
+            values = raw_value
+        else:
+            return
+        for value in values:
+            name = str(value or "").strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", name):
+                continue
+            if name in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}:
+                continue
+            if name not in names:
+                names.append(name)
+
+    def _scan(value: object, *, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(value, Mapping):
+            for key in _STRUCTURED_FOLLOWUP_TOOL_KEYS:
+                if key in value:
+                    _add(value.get(key))
+            for child in value.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    _scan(child, depth=depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for child in value[:20]:
+                if isinstance(child, (Mapping, list, tuple)):
+                    _scan(child, depth=depth + 1)
+
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        output = (
+            tool_result.get("output")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "output", None)
+        )
+        _scan(output)
+    return tuple(names)
+
+
+def _turn_result_structured_account_browser_followup_tool_names(result: object) -> tuple[str, ...]:
+    names: list[str] = []
+    account_browser_followup_keys = frozenset({"next_tools_for_links"})
+
+    def _add(raw_value: object) -> None:
+        if isinstance(raw_value, str):
+            values: Iterable[object] = (raw_value,)
+        elif isinstance(raw_value, (list, tuple, set, frozenset)):
+            values = raw_value
+        else:
+            return
+        for value in values:
+            name = str(value or "").strip()
+            if name not in _ACCOUNT_READ_SCHEMA_BROWSER_PENDING_TOOLS:
+                continue
+            if name not in names:
+                names.append(name)
+
+    def _scan(value: object, *, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(value, Mapping):
+            link_resolution_required = bool(
+                value.get("link_followup_required")
+                or value.get("link_resolution_required")
+                or value.get("requires_link_resolution")
+            )
+            if not link_resolution_required:
+                for child in value.values():
+                    if isinstance(child, (Mapping, list, tuple)):
+                        _scan(child, depth=depth + 1)
+                return
+            for key in account_browser_followup_keys:
+                if key in value:
+                    _add(value.get(key))
+            for child in value.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    _scan(child, depth=depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for child in value[:20]:
+                if isinstance(child, (Mapping, list, tuple)):
+                    _scan(child, depth=depth + 1)
+
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) not in _READ_ONLY_ACCOUNT_TOOL_NAMES:
+            continue
+        output = (
+            tool_result.get("output")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "output", None)
+        )
+        _scan(output)
+    return tuple(names)
+
+
+_READ_TOOL_REQUIRED_SOURCE_TOOLS = {
+    "email_read": ("email_search",),
+    "email_attachment_read": ("email_read",),
+}
+
+
+def _turn_result_required_source_tool_names(result: object) -> tuple[str, ...]:
+    names: list[str] = []
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        tool_name = str(
+            tool_result.get("tool_name")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "tool_name", "")
+        ).strip()
+        output = (
+            tool_result.get("output")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "output", None)
+        )
+        status = str(
+            tool_result.get("status")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "status", "")
+        ).strip().lower()
+        if isinstance(output, dict):
+            required_source = str(output.get("required_source_tool") or "").strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", required_source):
+                if required_source not in names:
+                    names.append(required_source)
+            reason = str(output.get("reason") or "").strip()
+            if tool_name in _READ_TOOL_REQUIRED_SOURCE_TOOLS and reason == "invalid_message_id":
+                for source_tool in _READ_TOOL_REQUIRED_SOURCE_TOOLS[tool_name]:
+                    if source_tool not in names:
+                        names.append(source_tool)
+        if status in {"failed", "error"} and tool_name in _READ_TOOL_REQUIRED_SOURCE_TOOLS:
+            for source_tool in _READ_TOOL_REQUIRED_SOURCE_TOOLS[tool_name]:
+                if source_tool not in names:
+                    names.append(source_tool)
+    return tuple(names)
+
+
+_BROWSER_VISUAL_CAPTURE_FOLLOWUP_TOOLS = frozenset({"browser_image_collect", "browser_screenshot"})
+_EMBEDDED_MEDIA_FOLLOWUP_EXTENSIONS = frozenset({".docx", ".pdf", ".pptx", ".xlsx"})
+_OPEN_URL_READ_FOLLOWUP_TOOLS = frozenset(
+    {
+        "browser_open",
+        "browser_navigate",
+        "browser_extract_text",
+        "browser_extract_items",
+        "browser_assert_page_state",
+        "file_download",
+        "web_fetch",
+    }
+)
+
+
+def _visual_capture_followup_tool_allowed(
+    tool_name: str,
+    *,
+    evidence: object | None,
+    registry: object | None,
+) -> bool:
+    if tool_name not in _BROWSER_VISUAL_CAPTURE_FOLLOWUP_TOOLS:
+        return True
+    evidence_extensions = {
+        str(extension or "").strip().lower()
+        for extension in (getattr(evidence, "requested_extensions", ()) or ())
+    }
+    artifact_requested = bool(getattr(evidence, "artifact_requested", False))
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    decision_valid = bool(getattr(decision, "valid", False))
+    declared_extensions = {
+        str(extension or "").strip().lower()
+        for extension in (getattr(decision, "requested_artifact_extensions", ()) or ())
+    } if artifact_requested or decision_valid else set()
+    embedded_extensions = {
+        str(extension or "").strip().lower()
+        for extension in (getattr(decision, "required_embedded_media_extensions", ()) or ())
+    } if artifact_requested or decision_valid else set()
+    if tool_name == "browser_screenshot":
+        return bool(
+            ".png" in evidence_extensions
+            or ".png" in declared_extensions
+            or embedded_extensions.intersection(_EMBEDDED_MEDIA_FOLLOWUP_EXTENSIONS)
+        )
+    if tool_name == "browser_image_collect":
+        return bool(embedded_extensions.intersection(_EMBEDDED_MEDIA_FOLLOWUP_EXTENSIONS))
+    return True
+
+
+def _scope_followup_tool_allowed(
+    tool_name: str,
+    *,
+    evidence: object | None,
+    registry: object | None,
+) -> bool:
+    if not _visual_capture_followup_tool_allowed(tool_name, evidence=evidence, registry=registry):
+        return False
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if (
+        str(getattr(decision, "web_action", "none") or "none").strip().lower() == "open_url"
+        and not tuple(getattr(decision, "requested_tool_names", ()) or ())
+        and not tuple(getattr(decision, "requested_artifact_extensions", ()) or ())
+        and not tuple(getattr(decision, "required_embedded_media_extensions", ()) or ())
+    ):
+        return tool_name in _OPEN_URL_READ_FOLLOWUP_TOOLS
+    return True
+
+
+def _registry_continuation_tool_names_for_tool_names(
+    registry: object | None,
+    tool_names: Iterable[object],
+) -> tuple[str, ...]:
+    if registry is None:
+        return ()
+    available_tool_names = _registry_tool_names(registry)
+    names: list[str] = []
+
+    def _extend(raw_names: object) -> None:
+        if isinstance(raw_names, str):
+            iterable: Iterable[object] = (raw_names,)
+        elif isinstance(raw_names, (list, tuple, set)):
+            iterable = raw_names
+        else:
+            return
+        for raw_name in iterable:
+            name = str(raw_name or "").strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", name):
+                continue
+            if name not in available_tool_names:
+                continue
+            if name in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}:
+                continue
+            if name not in names:
+                names.append(name)
+
+    for raw_tool_name in tool_names:
+        tool_name = str(raw_tool_name or "").strip()
+        if not tool_name or tool_name in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}:
+            continue
+        try:
+            spec = registry.get_spec(tool_name)
+        except Exception:
+            spec = None
+        if spec is not None:
+            _extend(getattr(spec, "continuation_tools", ()) or ())
+        try:
+            for definition in registry.list_tool_definitions():
+                if str(definition.get("name") or "") == tool_name:
+                    _extend(definition.get("continuation_tools"))
+                    break
+        except Exception:
+            continue
+    return tuple(names)
+
+
+def _tool_definition_with_available_continuations(
+    definition: Mapping[str, object],
+    *,
+    available_tool_names: Iterable[str],
+) -> dict[str, object]:
+    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    sanitized = dict(definition)
+    raw_continuations = sanitized.get("continuation_tools")
+    if isinstance(raw_continuations, str):
+        candidates: Iterable[object] = (raw_continuations,)
+    elif isinstance(raw_continuations, (list, tuple, set)):
+        candidates = raw_continuations
+    else:
+        sanitized.pop("continuation_tools", None)
+        return sanitized
+    tool_name = str(sanitized.get("name") or "").strip()
+    continuations = [
+        name
+        for name in (str(candidate or "").strip() for candidate in candidates)
+        if name and name in available and name != tool_name
+    ]
+    if continuations:
+        sanitized["continuation_tools"] = list(dict.fromkeys(continuations))
+    else:
+        sanitized.pop("continuation_tools", None)
+    return sanitized
+
+
+def _turn_result_spec_continuation_tool_names(result: object, registry: object | None) -> tuple[str, ...]:
+    tool_names = [
+        (
+            tool_result.get("tool_name")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "tool_name", "")
+        )
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+    ]
+    return _registry_continuation_tool_names_for_tool_names(registry, tool_names)
+
+
+def _requested_artifact_extensions_from_registry(registry: object | None) -> tuple[str, ...]:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return ()
+    extensions: list[str] = []
+    for raw_extension in tuple(getattr(decision, "requested_artifact_extensions", ()) or ()):
+        extension = str(raw_extension or "").strip().lower()
+        if extension and not extension.startswith("."):
+            extension = f".{extension}"
+        if extension:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+def _planner_dispatch_artifact_extensions(
+    registry: object | None,
+    requested_attachment_extensions: Iterable[str] | None,
+    *,
+    available_tool_names: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    """Pick final deliverable extensions for planner artifact metadata.
+
+    The attachment-extension list can contain source media suffixes as well as
+    output suffixes.  Planner verifier/receipt metadata must describe the final
+    deliverable, so prefer extensions backed by a visible artifact creation tool.
+    """
+
+    candidates: list[str] = []
+    for raw_extension in (
+        *(requested_attachment_extensions or ()),
+        *_requested_artifact_extensions_from_registry(registry),
+    ):
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension not in candidates:
+            candidates.append(extension)
+    available_tools = {
+        str(name or "").strip()
+        for name in (available_tool_names or ())
+        if str(name or "").strip()
+    }
+    if not available_tools and registry is not None:
+        available_tools = _registry_tool_names(registry)
+    visible_default_extensions = tuple(
+        dict.fromkeys(
+            extension
+            for tool_name, extension in _MEDIA_EMBEDDABLE_ARTIFACT_TOOLS.items()
+            if tool_name in available_tools
+        )
+    )
+    if not candidates:
+        if len(visible_default_extensions) == 1:
+            return visible_default_extensions
+        return ()
+    tool_backed_extensions = [
+        extension
+        for extension in candidates
+        if set(_REPAIR_EXTENSION_TOOL_NAMES.get(extension, ())).intersection(available_tools)
+    ]
+    if not tool_backed_extensions:
+        if len(visible_default_extensions) == 1:
+            return visible_default_extensions
+    return tuple(tool_backed_extensions or candidates)
+
+
+def _turn_result_has_completed_requested_artifact(result: object, registry: object | None) -> bool:
+    tool_results = list(getattr(result, "tool_results", None) or [])
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    registry_media_extensions = (
+        normalize_artifact_media_required_extensions(
+            getattr(decision, "required_embedded_media_extensions", ()) or ()
+        )
+        if decision is not None
+        else ()
+    )
+    requested_extensions = _merge_required_attachment_extensions(
+        (
+            *_requested_artifact_extensions_from_registry(registry),
+            *registry_media_extensions,
+        ),
+        tool_results,
+    )
+    if not requested_extensions:
+        return False
+    if _completed_requested_artifact_paths_from_tool_results(
+        tool_results,
+        requested_extensions=requested_extensions,
+        media_required_suffixes=set(_merge_required_embedded_media_extensions((), tool_results)),
+    ):
+        return True
+    normalized = {
+        extension if extension.startswith(".") else f".{extension}"
+        for extension in (str(item or "").strip().lower() for item in requested_extensions)
+        if extension
+    }
+    media_required_suffixes = set(_merge_required_embedded_media_extensions((), tool_results))
+    completed_media_identities = {
+        identity
+        for path in artifact_completed_embedded_media_paths(tool_results)
+        for identity in _path_identity_variants(path)
+    }
+    for raw_path in tuple(getattr(result, "artifacts", None) or ()):
+        path = Path(str(raw_path or "")).expanduser()
+        suffix = path.suffix.lower()
+        if suffix not in normalized:
+            continue
+        if (
+            suffix in media_required_suffixes
+            and not _path_matches_identity_set(path, completed_media_identities)
+            and _office_artifact_embedded_media_count(path) <= 0
+        ):
+            continue
+        return True
+    return False
+
+
+def _turn_still_needs_scoped_email_send(prompt: str, tool_results: list[ToolResult]) -> bool:
+    email_send_scoped = False
+    email_send_attempted = False
+    email_send_completed = False
+    for result in tool_results:
+        tool_name = _tool_result_name(result)
+        status = normalize_tool_status(_tool_result_status(result))
+        if tool_name == "email_send":
+            email_send_attempted = True
+            if status == "completed":
+                email_send_completed = True
+                break
+        if tool_name != "request_tool_scope" or status != "completed":
+            continue
+        output = _tool_result_output(result)
+        required_tool_names = output.get("required_tool_names")
+        if isinstance(required_tool_names, (list, tuple)) and "email_send" in {str(item) for item in required_tool_names}:
+            email_send_scoped = True
+        available_tool_names = output.get("available_tools")
+        if (
+            isinstance(available_tool_names, (list, tuple))
+            and "email_send" in {str(item) for item in available_tool_names}
+            and _EMAIL_TARGET_RE.search(str(prompt or ""))
+        ):
+            email_send_scoped = True
+    return not email_send_completed and (email_send_scoped or email_send_attempted)
+
+
+def _completed_requested_artifact_paths_for_turn_result(
+    runtime: PersistentRuntime,
+    *,
+    result: object,
+    prompt: str,
+    principal_id: str | None,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None,
+    required_embedded_media_extensions: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    tool_results = list(getattr(result, "tool_results", None) or [])
+    if _turn_still_needs_scoped_email_send(prompt, tool_results):
+        return ()
+    media_required_suffixes = set(
+        _merge_required_embedded_media_extensions(required_embedded_media_extensions, tool_results)
+    )
+    prompt_requested_extensions = _requested_output_filename_extensions_counted(prompt)
+    requested_extensions = (
+        prompt_requested_extensions
+        if prompt_requested_extensions and not required_attachment_extensions
+        else _merge_required_attachment_extensions(
+            required_attachment_extensions,
+            tool_results,
+        )
+    )
+    scoped_extensions = _required_attachment_extensions_from_tool_scope(tool_results)
+    if scoped_extensions and required_attachment_extensions:
+        requested_extensions = scoped_extensions
+    requested_extensions = (*requested_extensions, *media_required_suffixes)
+    requested_extensions = _refine_required_attachment_extensions_for_structured_outputs(
+        prompt=prompt,
+        required_attachment_extensions=requested_extensions,
+        tool_results=tool_results,
+    )
+    if not requested_extensions:
+        return ()
+    artifact_roots = _artifact_roots_for_delivery(runtime, principal_id)
+    completed_paths = list(
+        _completed_requested_artifact_paths_from_tool_results(
+            tool_results,
+            requested_extensions=requested_extensions,
+            media_required_suffixes=media_required_suffixes,
+            artifact_roots=artifact_roots,
+        )
+    )
+    if not completed_paths:
+        normalized_requested_extensions = set(_normalized_requested_extensions(requested_extensions))
+        completed_media_identities = {
+            identity
+            for path in artifact_completed_embedded_media_paths(tool_results)
+            for identity in _path_identity_variants(path)
+        }
+        fallback_paths: list[str] = []
+        for raw_path in getattr(result, "artifacts", None) or ():
+            raw_path_text = str(raw_path or "").strip()
+            if not raw_path_text:
+                continue
+            raw_path_obj = Path(raw_path_text).expanduser()
+            candidates = (
+                (raw_path_obj,)
+                if raw_path_obj.is_absolute()
+                else tuple(root / raw_path_obj for root in artifact_roots)
+            )
+            for candidate in candidates:
+                suffix = candidate.suffix.lower()
+                if suffix not in normalized_requested_extensions:
+                    continue
+                if (
+                    suffix in media_required_suffixes
+                    and not _path_matches_identity_set(candidate, completed_media_identities)
+                    and _office_artifact_embedded_media_count(candidate) <= 0
+                ):
+                    continue
+                try:
+                    if not candidate.is_file() or candidate.stat().st_size <= 0:
+                        continue
+                except OSError:
+                    continue
+                if artifact_roots and not any(
+                    artifact_descriptor_for_path(candidate, artifact_root=root) is not None
+                    for root in artifact_roots
+                ):
+                    continue
+                fallback_paths.append(str(candidate))
+                break
+        completed_paths = fallback_paths
+    if not completed_paths:
+        return ()
+    completed_paths = _filter_paths_to_requested_deliverables_if_present(
+        completed_paths,
+        requested_extensions=tuple(requested_extensions),
+    )
+    prompt_requested_output_names = {
+        name.lower()
+        for name in _requested_output_filenames_from_texts(prompt)
+    }
+    requested_output_names = {
+        name.lower()
+        for name in _requested_output_filenames_from_texts(prompt, getattr(result, "final_text", None))
+    }
+    if requested_output_names:
+        completed_paths = [
+            path
+            for path in completed_paths
+            if Path(str(path)).name.lower() in requested_output_names
+        ]
+        if prompt_requested_output_names and not prompt_requested_output_names.issubset(
+            {Path(str(path)).name.lower() for path in completed_paths}
+        ):
+            return ()
+    else:
+        completed_paths = _filter_paths_to_requested_output_filenames_if_present(
+            prompt,
+            completed_paths,
+            reply=getattr(result, "final_text", None),
+        )
+    if not _artifact_paths_satisfy_required_extension_counts(
+        completed_paths,
+        requested_extensions=requested_extensions,
+    ):
+        return ()
+    return tuple(dict.fromkeys(completed_paths))
+
+
+def _single_account_read_tool_from_scope(
+    tool_names: tuple[str, ...],
+    *registries: object | None,
+) -> str | None:
+    allowed = set(tool_names)
+    matches: list[str] = []
+    for registry in registries:
+        decision = getattr(registry, "turn_tool_scope_decision", None)
+        if decision is None:
+            continue
+        for raw_name in [
+            *tuple(getattr(decision, "required_tool_names", ()) or ()),
+            *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+        ]:
+            name = str(raw_name or "").strip()
+            if name in allowed and name in _READ_ONLY_ACCOUNT_TOOL_NAMES and name not in matches:
+                matches.append(name)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _turn_result_used_tool(result: object, tool_name: str) -> bool:
+    return any(
+        _tool_result_name(tool_result) == tool_name
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+    )
+
+
+_BROWSER_READ_EVIDENCE_TOOLS = frozenset(
+    {
+        "browser_assert_page_state",
+        "browser_extract_items",
+        "browser_extract_text",
+        "browser_snapshot",
+        "web_fetch",
+    }
+)
+
+
+def _turn_result_has_completed_requested_url_open(
+    result: object,
+    *,
+    evidence,
+    registry: object | None,
+    user_message: str | None,
+) -> bool:
+    if not getattr(evidence, "has_url_target", False):
+        return False
+    if getattr(evidence, "artifact_requested", False):
+        return False
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if tuple(getattr(decision, "requested_artifact_extensions", ()) or ()):
+        return False
+    if tuple(getattr(decision, "required_embedded_media_extensions", ()) or ()):
+        return False
+    web_action = str(getattr(decision, "web_action", "") or "").strip().lower()
+    if web_action and web_action not in {"open_url", "browser_interaction"}:
+        return False
+    target = extract_url_target(user_message or "")
+    if target is None or not target.value:
+        return False
+    target_value = str(target.value).strip()
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) not in _DIRECT_OPEN_URL_TOOL_NAMES:
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        candidates = [
+            output.get("url"),
+            output.get("current_url"),
+            output.get("page_url"),
+            output.get("result"),
+        ]
+        if any(target_value in str(candidate or "") for candidate in candidates):
+            return True
+    return False
+
+
+def _turn_result_needs_page_read_after_open(
+    result: object,
+    *,
+    evidence,
+    registry: object | None,
+) -> bool:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    web_action = str(getattr(decision, "web_action", "none") or "none").strip().lower()
+    final_text = str(getattr(result, "final_text", "") or "").casefold()
+    internal_missing_evidence_blocker = (
+        "live-search blocker" in final_text
+        or "verified result records" in final_text
+    )
+    if web_action != "browser_interaction" and not internal_missing_evidence_blocker:
+        return False
+    if not getattr(evidence, "has_url_target", False) and not internal_missing_evidence_blocker:
+        return False
+    if getattr(result, "artifacts", None) or getattr(result, "suspended_for_approval", False):
+        return False
+    if _turn_result_has_completed_tool(result, _BROWSER_READ_EVIDENCE_TOOLS):
+        return False
+    return _turn_result_has_completed_tool(result, _DIRECT_OPEN_URL_TOOL_NAMES)
+
+
+def _turn_result_has_completed_tool(result: object, tool_names: Iterable[str]) -> bool:
+    allowed = {str(name or "").strip() for name in tool_names if str(name or "").strip()}
+    if not allowed:
+        return False
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) not in allowed:
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) == "completed":
+            return True
+    return False
+
+
+def _turn_result_has_textual_or_verified_browser_evidence(result: object) -> bool:
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        tool_name = _tool_result_name(tool_result)
+        output = _tool_result_output(tool_result)
+        if tool_name in {"browser_extract_text", "web_fetch"}:
+            return True
+        if tool_name == "browser_assert_page_state" and bool(output.get("verified")):
+            return True
+    return False
+
+
+_ACCOUNT_READ_SCHEMA_ACCOUNT_PENDING_TOOLS = frozenset({
+    "email_read",
+    "email_attachment_read",
+})
+_ACCOUNT_READ_SCHEMA_BROWSER_PENDING_TOOLS = frozenset({
+    "browser_open",
+    "browser_navigate",
+    "browser_extract_text",
+    "browser_extract_items",
+    "browser_assert_page_state",
+    "browser_image_collect",
+    "browser_screenshot",
+    "file_download",
+    "web_fetch",
+})
+
+
+def _turn_result_has_failed_read_only_account_tool(result: object) -> bool:
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) not in _READ_ONLY_ACCOUNT_TOOL_NAMES:
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) in {"failed", "error"}:
+            return True
+    return False
+
+
+def _tool_scope_decision_requested_tool_names(registry: object | None) -> tuple[str, ...]:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return ()
+    names: list[str] = []
+    for raw_name in [
+        *tuple(getattr(decision, "required_tool_names", ()) or ()),
+        *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+    ]:
+        name = str(raw_name or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _account_read_browser_followup_allowed(evidence: object | None, registry: object | None = None) -> bool:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    requested_artifact_extensions = tuple(getattr(decision, "requested_artifact_extensions", ()) or ())
+    requested_embedded_extensions = tuple(getattr(decision, "required_embedded_media_extensions", ()) or ())
+    return bool(
+        getattr(evidence, "artifact_requested", False)
+        or tuple(getattr(evidence, "requested_extensions", ()) or ())
+        or requested_artifact_extensions
+        or requested_embedded_extensions
+    )
+
+
+def _tool_scope_decision_has_pending_account_continuation(
+    result: object,
+    registry: object | None,
+    *,
+    evidence: object | None = None,
+    account_browser_followup_tool_names: Iterable[str] = (),
+) -> bool:
+    browser_continuation_allowed = _account_read_browser_followup_allowed(evidence, registry)
+    allowed_browser_followups = {
+        str(name or "").strip()
+        for name in account_browser_followup_tool_names
+        if str(name or "").strip()
+    }
+    for name in _tool_scope_decision_requested_tool_names(registry):
+        if name in _ACCOUNT_READ_SCHEMA_ACCOUNT_PENDING_TOOLS:
+            if not _turn_result_used_tool(result, name):
+                return True
+            continue
+        if name not in _ACCOUNT_READ_SCHEMA_BROWSER_PENDING_TOOLS:
+            continue
+        if (
+            _turn_result_has_completed_tool(result, _READ_ONLY_ACCOUNT_TOOL_NAMES)
+            and name not in allowed_browser_followups
+        ):
+            continue
+        if not browser_continuation_allowed and name not in allowed_browser_followups:
+            continue
+        if not _turn_result_used_tool(result, name):
+            return True
+    return False
+
+
+def _turn_result_completed_account_read_is_sufficient_for_schema_followup(
+    result: object,
+    registry: object | None,
+    *,
+    evidence: object | None = None,
+    account_browser_followup_tool_names: Iterable[str] = (),
+) -> bool:
+    if not str(getattr(result, "final_text", "") or "").strip():
+        return False
+    if not _turn_result_has_substantive_outcome(result):
+        return False
+    if _turn_result_has_failed_read_only_account_tool(result):
+        return False
+    if not _turn_result_has_completed_tool(result, _READ_ONLY_ACCOUNT_TOOL_NAMES):
+        return False
+    return not _tool_scope_decision_has_pending_account_continuation(
+        result,
+        registry,
+        evidence=evidence,
+        account_browser_followup_tool_names=account_browser_followup_tool_names,
+    )
+
+
+def _turn_result_has_completed_account_result_records(result: object) -> bool:
+    for raw_tool_result in list(getattr(result, "tool_results", None) or []):
+        tool_name = _tool_result_name(raw_tool_result)
+        if tool_name not in _READ_ONLY_ACCOUNT_TOOL_NAMES:
+            continue
+        if normalize_tool_status(_tool_result_status(raw_tool_result)) != "completed":
+            continue
+        output = _tool_result_output(raw_tool_result)
+        if _source_result_records(output):
+            return True
+        if tool_name == "email_read" and isinstance(output.get("message"), Mapping):
+            return True
+        if tool_name == "email_attachment_read" and str(output.get("text") or output.get("body") or "").strip():
+            return True
+    return False
+
+
+def _explicit_followup_names_require_retry_after_account_read(
+    names: Iterable[str],
+    *,
+    evidence: object | None = None,
+    registry: object | None = None,
+    account_browser_followup_tool_names: Iterable[str] = (),
+) -> bool:
+    del evidence, registry
+    allowed_browser_followups = {
+        str(name or "").strip()
+        for name in account_browser_followup_tool_names
+        if str(name or "").strip()
+    }
+    for raw_name in names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        if name in _READ_ONLY_ACCOUNT_TOOL_NAMES:
+            continue
+        if (
+            name in _ACCOUNT_READ_SCHEMA_BROWSER_PENDING_TOOLS
+            and name not in allowed_browser_followups
+        ):
+            continue
+        return True
+    return False
+
+
+def _run_scheduler_read_tool_directly(
+    *,
+    registry: object,
+    tool_name: str,
+    principal_id: str | None,
+) -> ToolResult | None:
+    if tool_name not in {"list_crons", "list_reminders"} or not hasattr(registry, "invoke"):
+        return None
+    invocation = ToolInvocation(
+        invocation_id=f"scheduler-read-retry-{tool_name}-{uuid4().hex[:12]}",
+        tool_name=tool_name,
+        principal_id=str(principal_id or ""),
+        arguments={},
+    )
+    try:
+        return registry.invoke(invocation)
+    except Exception as exc:
+        return ToolResult(
+            invocation.invocation_id,
+            tool_name,
+            "failed",
+            {"error": str(exc)},
+            error=str(exc),
+        )
+
+
+def _run_scheduler_action_tool_directly(
+    *,
+    registry: object,
+    tool_name: str,
+    principal_id: str | None,
+    arguments: Mapping[str, object],
+) -> ToolResult | None:
+    if tool_name not in (_SCHEDULER_MUTATION_RETRY_TOOLS | {"run_cron"}) or not hasattr(registry, "invoke"):
+        return None
+    if not _registry_can_invoke_tool_name(registry, tool_name):
+        return None
+    invocation = ToolInvocation(
+        invocation_id=f"scheduler-action-retry-{tool_name}-{uuid4().hex[:12]}",
+        tool_name=tool_name,
+        principal_id=str(principal_id or ""),
+        arguments=dict(arguments),
+    )
+    try:
+        return registry.invoke(invocation)
+    except Exception as exc:
+        return ToolResult(
+            invocation.invocation_id,
+            tool_name,
+            "failed",
+            {"error": str(exc)},
+            error=str(exc),
+        )
+
+
+def _registry_can_invoke_tool_name(registry: object | None, tool_name: str) -> bool:
+    if registry is None or not hasattr(registry, "invoke"):
+        return False
+    can_invoke = getattr(registry, "can_invoke_tool", None)
+    if callable(can_invoke):
+        try:
+            return bool(can_invoke(tool_name))
+        except Exception:
+            return False
+    return tool_name in _retry_available_tool_names(registry)
+
+
+def _scheduler_read_registry_for_tool(
+    *,
+    tool_name: str,
+    active_tool_registry: object,
+    base_tool_registry: object | None,
+) -> object | None:
+    for registry in (active_tool_registry, base_tool_registry):
+        if _registry_can_invoke_tool_name(registry, tool_name):
+            return registry
+    return None
+
+
+def _append_scheduler_read_verification_if_missing(
+    result: object,
+    *,
+    active_tool_registry: object,
+    base_tool_registry: object | None,
+    principal_id: str | None,
+) -> bool:
+    tool_results = list(getattr(result, "tool_results", None) or [])
+    completed_tool_names = {
+        _tool_result_name(tool_result)
+        for tool_result in tool_results
+        if normalize_tool_status(_tool_result_status(tool_result)) == "completed"
+    }
+    requested_read_tools: list[str] = []
+    if completed_tool_names.intersection(_SCHEDULER_CRON_ACTION_TOOLS) and "list_crons" not in completed_tool_names:
+        requested_read_tools.append("list_crons")
+    if (
+        completed_tool_names.intersection(_SCHEDULER_REMINDER_ACTION_TOOLS)
+        and "list_reminders" not in completed_tool_names
+    ):
+        requested_read_tools.append("list_reminders")
+
+    appended = False
+    for read_tool_name in requested_read_tools:
+        registry = _scheduler_read_registry_for_tool(
+            tool_name=read_tool_name,
+            active_tool_registry=active_tool_registry,
+            base_tool_registry=base_tool_registry,
+        )
+        if registry is None:
+            continue
+        read_result = _run_scheduler_read_tool_directly(
+            registry=registry,
+            tool_name=read_tool_name,
+            principal_id=principal_id,
+        )
+        if read_result is None:
+            continue
+        _append_tool_result_to_turn_result(result, read_result)
+        appended = True
+    return appended
+
+
+def _append_tool_result_to_turn_result(result: object, tool_result: ToolResult) -> None:
+    try:
+        tool_results = getattr(result, "tool_results", None)
+        if isinstance(tool_results, list):
+            tool_results.append(tool_result)
+            return
+        setattr(result, "tool_results", [*(tool_results or ()), tool_result])
+    except Exception:
+        logger.debug("Could not append retry tool result", exc_info=True)
+
+
+def _turn_result_has_verified_browser_state(result: object) -> bool:
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "browser_assert_page_state":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) == "completed":
+            output = _tool_result_output(tool_result)
+            if output.get("verified") is True:
+                return True
+    return False
+
+
+def _turn_result_used_only_scope_or_history_search(result: object) -> bool:
+    tool_results = list(getattr(result, "tool_results", None) or [])
+    if not tool_results:
+        return False
+    tool_names = {
+        str(
+            tool_result.get("tool_name")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "tool_name", "")
+        )
+        for tool_result in tool_results
+    }
+    return bool(tool_names) and tool_names.issubset({"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME})
+
+
+def _connector_app_label(app_id: object) -> str:
+    parts = [part for part in re.split(r"[^A-Za-z0-9]+", str(app_id or "")) if part]
+    return " ".join(part[:1].upper() + part[1:] for part in parts) if parts else "that source"
+
+
+def _normalized_connector_app_id(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _active_connector_app_id_providers_for_message() -> tuple[dict[str, object], ...]:
+    cached = cached_active_connector_app_id_providers()
+    if cached:
+        return tuple(cached)
+    snapshot = active_connector_provider_context_snapshot()
+    if snapshot:
+        return tuple(snapshot)
+    app_ids = _active_connector_app_ids_for_retry()
+    if not app_ids:
+        return ()
+    return ({"active_app_ids": app_ids},)
+
+
+def _runtime_has_connector_skill_for_app(
+    runtime: PersistentRuntime | None,
+    app_id: object,
+) -> bool:
+    return bool(_runtime_connector_skill_titles_for_app(runtime, app_id))
+
+
+def _runtime_connector_skill_titles_for_app(
+    runtime: PersistentRuntime | None,
+    app_id: object,
+) -> tuple[str, ...]:
+    normalized_app_id = _normalized_connector_app_id(app_id)
+    if runtime is None or not normalized_app_id:
+        return ()
+    try:
+        skills = runtime.list_skills()
+    except Exception:
+        logger.debug("Could not list skills while checking connector app reuse", exc_info=True)
+        return ()
+    exact_tag = f"connector-app:{normalized_app_id}"
+    titles: list[str] = []
+    for skill in skills:
+        tags = {
+            str(tag or "").strip().lower()
+            for tag in (getattr(skill, "tags", None) or ())
+            if str(tag or "").strip()
+        }
+        if exact_tag not in tags and not ("connector" in tags and normalized_app_id in tags):
+            continue
+        title = str(getattr(skill, "title", "") or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+    return tuple(titles)
+
+
+def _accepted_connector_skill_app_ids_for_message(
+    user_message: object,
+    *,
+    runtime: PersistentRuntime | None,
+) -> tuple[str, ...]:
+    providers = _active_connector_app_id_providers_for_message()
+    app_ids = mentioned_connector_app_ids(user_message, providers)
+    return tuple(
+        app_id
+        for app_id in app_ids
+        if _runtime_has_connector_skill_for_app(runtime, app_id)
+    )
+
+
+def _connector_saved_skill_unavailable_text(app_label: str) -> str:
+    return (
+        f"I found the saved {app_label} connector skill, but this turn still did not expose a usable "
+        "connector route. Reconnect or authorize the connector account if the connection expired; once "
+        "the connector is available, I can reuse the saved skill without rebuilding it."
+    )
+
+
+def _connector_builder_proposal(app_id: str, app_label: str) -> BuilderProposal:
+    return BuilderProposal(
+        decision_type=BuilderDecisionType.SKILL_PROPOSAL,
+        title=f"Build {app_label} connector skill",
+        summary=(
+            f"Create a reusable Builder workflow for {app_label} requests that checks connector "
+            "metadata, asks for the required account connection or approval, uses the available "
+            "connector route, and verifies the answer before replying. Permission note: this skill "
+            "may request read access through the connector; it does not grant write access by itself, "
+            "and write/delete actions still require explicit chat confirmation, a write-capable connector, "
+            "and normal approval."
+        ),
+        confidence=0.86,
+        approval_mode="skill",
+        suggested_skill_title=f"{app_label} connector workflow",
+        suggested_trigger=(
+            f"Use when a user asks for {app_label} access but the current turn does not expose a "
+            "native connector tool for it."
+        ),
+        suggested_steps=(
+            f"Inspect the active connector metadata for app id {app_id}.",
+            "Ask the user to connect or approve the required account if the connector is unavailable.",
+            "Use the available connector gateway or typed connector tool to read only the requested data.",
+            "Before modifying, deleting, sending, or writing connector data, ask the user for explicit confirmation in chat.",
+            "Verify the connector response and save the successful route for future similar requests.",
+        ),
+        suggested_tags=("builder", "connector", "workflow", f"connector-app:{app_id}"),
+    )
+
+
+def _store_connector_builder_proposal(
+    runtime: PersistentRuntime | None,
+    *,
+    app_id: str,
+    app_label: str,
+):
+    if runtime is None:
+        return None
+    try:
+        return runtime.store_builder_proposal(
+            _connector_builder_proposal(app_id, app_label),
+            context_key=f"connector-skill:{app_id.strip().lower()}",
+            actor="builder_reflector",
+        )
+    except Exception:
+        logger.debug("Connector Builder proposal store failed", exc_info=True)
+        return None
+
+
+def _connector_builder_fallback_text(app_label: str, *, proposal: object | None = None) -> str:
+    if proposal is not None and getattr(proposal, "status", None) == "pending":
+        return format_builder_proposal_notification(proposal)
+    return (
+        "🛠️ **Builder suggestion**\n\n"
+        f"I can't access {app_label} directly as a native connector in this turn. "
+        f"Builder can create or save a reusable {app_label} connector workflow once you approve or connect "
+        "the needed account. The skill may request read access through that connector; it does not grant "
+        "write access by itself, and write/delete actions still require explicit chat confirmation, a "
+        "write-capable connector, and normal approval."
+    )
+
+
+def _connector_scope_builder_fallback(
+    tool_results: Iterable[object] | None,
+    *,
+    runtime: PersistentRuntime | None = None,
+) -> str | None:
+    for tool_result in tool_results or ():
+        if _tool_result_name(tool_result) != "request_tool_scope":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        raw_capabilities = output.get("capabilities")
+        capabilities = {
+            str(capability or "").strip().lower()
+            for capability in (raw_capabilities if isinstance(raw_capabilities, list) else ())
+            if str(capability or "").strip()
+        }
+        if "connector" not in capabilities:
+            continue
+        raw_app_ids = output.get("connector_app_ids")
+        app_ids = [
+            str(app_id or "").strip()
+            for app_id in (raw_app_ids if isinstance(raw_app_ids, list) else ())
+            if str(app_id or "").strip()
+        ]
+        app_id = app_ids[0] if app_ids else "connector"
+        app_label = _connector_app_label(app_id) if app_ids else "that source"
+        if _runtime_has_connector_skill_for_app(runtime, app_id):
+            return _connector_saved_skill_unavailable_text(app_label)
+        proposal = _store_connector_builder_proposal(
+            runtime,
+            app_id=app_id,
+            app_label=app_label,
+        )
+        return _connector_builder_fallback_text(
+            app_label,
+            proposal=proposal,
+        )
+    return None
+
+
+def _active_connector_mention_builder_fallback(
+    user_message: object,
+    *,
+    tool_registry: object | None = None,
+    runtime: PersistentRuntime | None = None,
+) -> str | None:
+    if tool_registry is not None and not _registry_has_request_tool_scope(tool_registry):
+        return None
+    app_ids = mentioned_connector_app_ids(user_message, _active_connector_app_id_providers_for_message())
+    if not app_ids:
+        return None
+    app_id = app_ids[0]
+    app_label = _connector_app_label(app_id)
+    if _runtime_has_connector_skill_for_app(runtime, app_id):
+        return _connector_saved_skill_unavailable_text(app_label)
+    proposal = _store_connector_builder_proposal(
+        runtime,
+        app_id=app_id,
+        app_label=app_label,
+    )
+    return _connector_builder_fallback_text(
+        app_label,
+        proposal=proposal,
+    )
+
+
+def _compact_unstructured_clarification_fallback(
+    tool_results: Iterable[object] | None = None,
+    *,
+    runtime: PersistentRuntime | None = None,
+) -> str:
+    connector_reply = _connector_scope_builder_fallback(tool_results, runtime=runtime)
+    if connector_reply:
+        return connector_reply
+    return "Which item should I use? Please send the file, title, link, or reply to the message with the artifact."
+
+
+def _account_source_selection_reply(tool_names: Iterable[str]) -> str | None:
+    options = list(dict.fromkeys(_account_source_option_labels(tool_names)))
+    if len(options) < 2:
+        return None
+    numbered = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
+    return f"I can check, but please choose which authorized source you want me to read first.\n\n{numbered}"
+
+
+def _account_source_option_labels(tool_names: Iterable[str]) -> list[str]:
+    names = {str(name or "").strip() for name in tool_names}
+    options: list[str] = []
+    if names.intersection({"email_search", "email_read", "email_attachment_read"}):
+        options.append("Email records")
+    if "calendar_list" in names:
+        options.append("Calendar records")
+    if "connector_request" in names:
+        options.append("Another connected account/source, if available")
+    return options
+
+
+def _account_source_selection_reply_from_scope_results(tool_results: Iterable[object] | None) -> str | None:
+    selection_required = False
+    options: list[str] = []
+    for tool_result in tool_results or ():
+        if _tool_result_name(tool_result) != "request_tool_scope":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        if output.get("source_selection_required") is not True:
+            if selection_required:
+                available_tools = output.get("available_tools")
+                if isinstance(available_tools, list) and set(
+                    str(tool or "").strip() for tool in available_tools
+                ).intersection(_READ_ONLY_ACCOUNT_TOOL_NAMES):
+                    selection_required = False
+                    options = []
+            continue
+        selection_required = True
+        sources = output.get("available_sources")
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            read_tools = source.get("read_tools")
+            labels = _account_source_option_labels(read_tools if isinstance(read_tools, list) else ())
+            display_name = str(source.get("display_name") or "").strip()
+            for label in labels:
+                if display_name and label != "Another connected account/source, if available":
+                    options.append(f"{display_name}: {label}")
+                else:
+                    options.append(label)
+    options = list(dict.fromkeys(options))
+    if not selection_required or len(options) < 2:
+        return None
+    numbered = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
+    return f"I can check, but please choose which authorized source you want me to read first.\n\n{numbered}"
+
+
+def _account_source_selection_scope_retry_context(tool_results: Iterable[object] | None) -> str | None:
+    sources: list[dict[str, object]] = []
+    for tool_result in tool_results or ():
+        if _tool_result_name(tool_result) != "request_tool_scope":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        if output.get("source_selection_required") is not True:
+            continue
+        raw_sources = output.get("available_sources")
+        if not isinstance(raw_sources, list):
+            continue
+        for source in raw_sources:
+            if not isinstance(source, Mapping):
+                continue
+            read_tools = tuple(
+                str(name or "").strip()
+                for name in (source.get("read_tools") if isinstance(source.get("read_tools"), list) else ())
+                if str(name or "").strip() in _READ_ONLY_ACCOUNT_TOOL_NAMES
+            )
+            app_ids = tuple(
+                str(app_id or "").strip()
+                for app_id in (source.get("active_app_ids") if isinstance(source.get("active_app_ids"), list) else ())
+                if str(app_id or "").strip()
+            )
+            if not read_tools and not app_ids:
+                continue
+            sources.append({
+                "display_name": str(source.get("display_name") or "").strip(),
+                "active_app_ids": list(app_ids),
+                "read_tools": list(read_tools),
+                "permission_mode": str(source.get("permission_mode") or "").strip(),
+            })
+    if not sources:
+        return None
+    option_labels: list[str] = []
+    for source in sources:
+        labels = _account_source_option_labels(source.get("read_tools") or ())
+        display_name = str(source.get("display_name") or "").strip()
+        for label in labels:
+            if display_name and label != "Another connected account/source, if available":
+                option_labels.append(f"{display_name}: {label}")
+            else:
+                option_labels.append(label)
+    if len(tuple(dict.fromkeys(option_labels))) < 2:
+        return None
+    return "Structured authorized account sources:\n" + json.dumps(
+        {"available_sources": sources},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _account_read_tool_names_from_source_selection_scope(
+    tool_results: Iterable[object] | None,
+    *,
+    available_tool_names: Iterable[str],
+) -> tuple[str, ...]:
+    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    read_tool_sets: list[tuple[str, ...]] = []
+    for tool_result in tool_results or ():
+        if _tool_result_name(tool_result) != "request_tool_scope":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        if output.get("source_selection_required") is not True:
+            continue
+        raw_sources = output.get("available_sources")
+        if not isinstance(raw_sources, list):
+            continue
+        for source in raw_sources:
+            if not isinstance(source, Mapping):
+                continue
+            raw_read_tools = source.get("read_tools")
+            if not isinstance(raw_read_tools, list):
+                continue
+            names = tuple(
+                dict.fromkeys(
+                    str(name or "").strip()
+                    for name in raw_read_tools
+                    if str(name or "").strip() in available
+                    and str(name or "").strip() in _READ_ONLY_ACCOUNT_TOOL_NAMES
+                )
+            )
+            if names:
+                read_tool_sets.append(names)
+    distinct_sets = tuple(dict.fromkeys(read_tool_sets))
+    if len(distinct_sets) != 1:
+        return ()
+    return distinct_sets[0]
+
+
+def _read_only_account_tool_family(tool_names: Iterable[str]) -> str | None:
+    names = {str(name or "").strip() for name in tool_names if str(name or "").strip()}
+    if not names:
+        return None
+    if names.issubset({"email_search", "email_read", "email_attachment_read"}):
+        return "email"
+    if names.issubset({"calendar_list"}):
+        return "calendar"
+    return None
+
+
+_ACCOUNT_READ_TOOL_DISCOVERY_SIBLINGS = {
+    "email_read": ("email_search",),
+    "email_attachment_read": ("email_read", "email_search"),
+}
+
+
+def _turn_result_saved_history_account_discovery_tool_names(
+    result: object,
+    registry: object,
+) -> tuple[str, ...]:
+    if not _turn_result_used_history_search(result):
+        return ()
+    registry_tool_names = _registry_tool_names(registry)
+    names: list[str] = []
+    for source_tool, sibling_tools in _ACCOUNT_READ_TOOL_DISCOVERY_SIBLINGS.items():
+        if not _turn_result_used_tool(result, source_tool):
+            continue
+        for sibling_tool in sibling_tools:
+            if sibling_tool not in registry_tool_names or _turn_result_used_tool(result, sibling_tool):
+                continue
+            if sibling_tool not in names:
+                names.append(sibling_tool)
+    return tuple(names)
+
+
+def _structured_link_evidence_from_value(value: object, *, limit: int = 8) -> tuple[str, ...]:
+    links: list[str] = []
+
+    def _add_link(entry: Mapping[str, object]) -> None:
+        if len(links) >= limit:
+            return
+        raw_url = str(entry.get("url") or "").strip()
+        parsed = urlparse(raw_url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return
+        text = str(entry.get("text") or "").strip()
+        line = raw_url
+        if text:
+            line = f"{raw_url} ({text[:160]})"
+        if line not in links:
+            links.append(line)
+
+    def _scan(item: object, *, depth: int = 0) -> None:
+        if depth > 5 or len(links) >= limit:
+            return
+        if isinstance(item, Mapping):
+            raw_links = item.get("links")
+            if isinstance(raw_links, list):
+                for raw_entry in raw_links:
+                    if isinstance(raw_entry, Mapping):
+                        _add_link(raw_entry)
+            for child in item.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    _scan(child, depth=depth + 1)
+        elif isinstance(item, (list, tuple)):
+            for child in item[:20]:
+                if isinstance(child, (Mapping, list, tuple)):
+                    _scan(child, depth=depth + 1)
+
+    _scan(value)
+    return tuple(links)
+
+
+def _schema_followup_retry_evidence(result: object) -> str:
+    lines: list[str] = []
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        tool_name = str(
+            tool_result.get("tool_name")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "tool_name", "")
+        ).strip()
+        output = (
+            tool_result.get("output")
+            if isinstance(tool_result, dict)
+            else getattr(tool_result, "output", None)
+        )
+        link_lines = _structured_link_evidence_from_value(output)
+        if not link_lines:
+            continue
+        source = tool_name or "tool"
+        for link_line in link_lines:
+            lines.append(f"- {source}: {link_line}")
+            if len(lines) >= 8:
+                break
+        if len(lines) >= 8:
+            break
+    if not lines:
+        return ""
+    return "Structured link evidence from previous tool output:\n" + "\n".join(lines)
+
+
+def _schema_followup_tool_retry_prompt(tool_names: Iterable[str], *, evidence_text: str | None = None) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    prompt = (
+        "Structured continuation retry: previous tool output or registered tool metadata named follow-up "
+        f"tool(s) that can complete the current target: {names}. Use the matching follow-up/action tool "
+        "before finalizing when it applies. If the resolved target is still ambiguous, ask for a numbered "
+        "selection. Do not repeat a metadata-only, listing-only, or preview-only answer when a matching "
+        "follow-up tool is visible."
+    )
+    evidence = str(evidence_text or "").strip()
+    if evidence:
+        prompt = (
+            f"{prompt}\n\n{evidence}\n\n"
+            "When the evidence includes an HTTP(S) link from an account read, resolve the relevant link with "
+            "the visible web/browser tool before saying the fact cannot be confirmed from the email alone."
+        )
+    return prompt
+
+
+def _run_chat_turn_schema_followup_tool_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    fallback_tool_names: Iterable[str] = (),
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+    principal_id: str | None = None,
+    user_message: str | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = base_tool_registry or active_tool_registry
+    if _turn_result_has_completed_requested_artifact(initial_result, registry_for_lookup):
+        return initial_result, active_tool_registry, False
+    direct_retry_result = _direct_required_source_resource_retry(
+        initial_result=initial_result,
+        registry=active_tool_registry,
+        principal_id=principal_id,
+        turn_id=getattr(initial_result, "turn_id", None),
+        user_message=user_message,
+    )
+    if direct_retry_result is None and base_tool_registry is not None and base_tool_registry is not active_tool_registry:
+        direct_retry_result = _direct_required_source_resource_retry(
+            initial_result=initial_result,
+            registry=base_tool_registry,
+            principal_id=principal_id,
+            turn_id=getattr(initial_result, "turn_id", None),
+            user_message=user_message,
+        )
+    if direct_retry_result is not None:
+        recovered_result = _merge_initial_turn_context_into_retry_result(
+            initial_result=initial_result,
+            retry_result=direct_retry_result,
+        )
+        synthesis_registry = _ToolRegistryAllowedNames(
+            _ToolRegistryWithoutRequestScope(active_tool_registry),
+            allowed_tool_names=(),
+        )
+        synthesis_history = list(base_history)
+        synthesis_history.append({
+            "role": "system",
+            "content": [{"type": "text", "text": _source_recovery_synthesis_prompt(
+                tool_results=list(getattr(recovered_result, "tool_results", None) or []),
+                user_message=user_message,
+            )}],
+        })
+        try:
+            synthesized_result = run_turn(synthesis_history, synthesis_registry)
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="source_recovery_synthesis",
+                exc=exc,
+            )
+        else:
+            if str(getattr(synthesized_result, "final_text", "") or "").strip():
+                recovered_result = _merge_initial_context_preserving_retry_text(
+                    initial_result=recovered_result,
+                    retry_result=synthesized_result,
+                )
+        if mark_retry is not None:
+            mark_retry()
+        return recovered_result, active_tool_registry, True
+    if (
+        _turn_result_has_substantive_outcome(initial_result)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and _turn_result_has_completed_requested_url_open(
+            initial_result,
+            evidence=evidence,
+            registry=active_tool_registry,
+            user_message=user_message,
+        )
+    ):
+        return initial_result, active_tool_registry, False
+    page_read_followup_names = (
+        ("browser_extract_text",)
+        if _turn_result_needs_page_read_after_open(
+            initial_result,
+            evidence=evidence,
+            registry=active_tool_registry,
+        )
+        else ()
+    )
+    explicit_followup_names = tuple(
+        dict.fromkeys(
+            [
+                *_turn_result_schema_followup_tool_names(initial_result),
+                *_turn_result_required_source_tool_names(initial_result),
+                *tuple(fallback_tool_names),
+                *_turn_result_saved_history_account_discovery_tool_names(initial_result, registry_for_lookup),
+                *page_read_followup_names,
+            ]
+        )
+    )
+    metadata_followup_names = _turn_result_spec_continuation_tool_names(initial_result, registry_for_lookup)
+    structured_account_browser_followup_names = _turn_result_structured_account_browser_followup_tool_names(
+        initial_result
+    )
+    if (
+        metadata_followup_names
+        and not explicit_followup_names
+        and all(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in metadata_followup_names)
+        and _turn_result_has_completed_tool(initial_result, _READ_ONLY_ACCOUNT_TOOL_NAMES)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and not _turn_result_has_failed_read_only_account_tool(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    if (
+        explicit_followup_names
+        and all(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in explicit_followup_names)
+        and _turn_result_has_completed_tool(initial_result, _READ_ONLY_ACCOUNT_TOOL_NAMES)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and not _turn_result_has_failed_read_only_account_tool(initial_result)
+        and not any(name in _turn_result_saved_history_account_discovery_tool_names(initial_result, registry_for_lookup) for name in explicit_followup_names)
+        and not _turn_result_required_source_tool_names(initial_result)
+        and _turn_result_has_completed_account_result_records(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    if (
+        explicit_followup_names
+        and all(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in explicit_followup_names)
+        and _turn_result_has_completed_tool(initial_result, _READ_ONLY_ACCOUNT_TOOL_NAMES)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and not _turn_result_has_failed_read_only_account_tool(initial_result)
+        and all(_turn_result_used_tool(initial_result, name) for name in explicit_followup_names)
+    ):
+        return initial_result, active_tool_registry, False
+    browser_followup_allowed = (
+        _account_read_browser_followup_allowed(evidence, active_tool_registry)
+        or bool(structured_account_browser_followup_names)
+    )
+    pending_explicit_account_continuation_names = tuple(
+        name
+        for name in explicit_followup_names
+        if (
+            name in _READ_ONLY_ACCOUNT_TOOL_NAMES
+            or (name in _ACCOUNT_READ_SCHEMA_BROWSER_PENDING_TOOLS and browser_followup_allowed)
+        )
+        and not _turn_result_used_tool(initial_result, name)
+    )
+    account_read_has_no_pending_continuation = (
+        not pending_explicit_account_continuation_names
+        and not _explicit_followup_names_require_retry_after_account_read(
+            explicit_followup_names,
+            evidence=evidence,
+            registry=active_tool_registry,
+            account_browser_followup_tool_names=structured_account_browser_followup_names,
+        )
+        and not _tool_scope_decision_has_pending_account_continuation(
+            initial_result,
+            active_tool_registry,
+            evidence=evidence,
+            account_browser_followup_tool_names=structured_account_browser_followup_names,
+        )
+    )
+    if (
+        account_read_has_no_pending_continuation
+        and _turn_result_completed_account_read_is_sufficient_for_schema_followup(
+            initial_result,
+            active_tool_registry,
+            evidence=evidence,
+            account_browser_followup_tool_names=structured_account_browser_followup_names,
+        )
+    ):
+        return initial_result, active_tool_registry, False
+    if (
+        account_read_has_no_pending_continuation
+        and _turn_result_has_substantive_outcome(initial_result)
+        and _turn_result_has_completed_tool(initial_result, _READ_ONLY_ACCOUNT_TOOL_NAMES)
+        and not str(getattr(initial_result, "final_text", "") or "").strip()
+        and not _turn_result_has_failed_read_only_account_tool(initial_result)
+    ):
+        account_summary = _completed_account_read_summary_for_schema_followup(
+            initial_result,
+            user_message=user_message,
+        )
+        if account_summary:
+            try:
+                setattr(initial_result, "final_text", account_summary)
+            except Exception:
+                initial_result = SimpleNamespace(
+                    turn_id=getattr(initial_result, "turn_id", None) or uuid4().hex,
+                    final_text=account_summary,
+                    tool_results=list(getattr(initial_result, "tool_results", None) or []),
+                    suspended_for_approval=bool(getattr(initial_result, "suspended_for_approval", False)),
+                    approval_id=getattr(initial_result, "approval_id", None),
+                    artifacts=list(getattr(initial_result, "artifacts", None) or []),
+                    thinking_text=getattr(initial_result, "thinking_text", None),
+                    reached_iteration_limit=bool(getattr(initial_result, "reached_iteration_limit", False)),
+                    raw_tool_payload_blocked=bool(getattr(initial_result, "raw_tool_payload_blocked", False)),
+                )
+            return initial_result, active_tool_registry, False
+    if (
+        _turn_result_has_substantive_outcome(initial_result)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and not explicit_followup_names
+        and (not metadata_followup_names or _turn_result_has_textual_or_verified_browser_evidence(initial_result))
+        and _turn_result_has_completed_tool(initial_result, _BROWSER_READ_EVIDENCE_TOOLS)
+    ):
+        return initial_result, active_tool_registry, False
+    if (
+        _turn_result_has_substantive_outcome(initial_result)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and not explicit_followup_names
+        and not metadata_followup_names
+        and _turn_result_has_completed_requested_url_open(
+            initial_result,
+            evidence=evidence,
+            registry=active_tool_registry,
+            user_message=user_message,
+        )
+    ):
+        return initial_result, active_tool_registry, False
+    if (
+        _turn_result_has_substantive_outcome(initial_result)
+        and _turn_result_has_verified_browser_state(initial_result)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and not explicit_followup_names
+    ):
+        return initial_result, active_tool_registry, False
+    candidate_names = tuple(
+        dict.fromkeys(
+            [
+                *explicit_followup_names,
+                *metadata_followup_names,
+            ]
+        )
+    )
+    followup_tool_names = tuple(
+        name
+        for name in candidate_names
+        if name in _registry_tool_names(registry_for_lookup)
+        and not _turn_result_used_tool(initial_result, name)
+        and _scope_followup_tool_allowed(name, evidence=evidence, registry=active_tool_registry)
+    )
+    if not followup_tool_names:
+        return initial_result, active_tool_registry, False
+    connector_followup_requested = any(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in followup_tool_names)
+    decision = TurnToolScopeDecision(
+        skill_pack_action="connector" if connector_followup_requested else None,
+        connector_app_ids=_active_connector_app_ids_for_retry() if connector_followup_requested else (),
+        connector_source_user_requested=connector_followup_requested,
+        requested_tool_names=followup_tool_names,
+        required_tool_names=followup_tool_names,
+        confidence=1.0,
+        valid=True,
+    )
+    retry_tool_registry = _ToolRegistryAllowedNames(
+        _ToolRegistryWithoutRequestScope(registry_for_lookup),
+        allowed_tool_names=followup_tool_names,
+        turn_tool_scope_decision=decision,
+    )
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _schema_followup_tool_retry_prompt(
+            followup_tool_names,
+            evidence_text=_schema_followup_retry_evidence(initial_result),
+        )}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="schema_followup_tool_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if (
+        not _turn_result_has_substantive_outcome(retry_result)
+        and _turn_result_has_substantive_outcome(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_turn_context_into_retry_result(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+def _run_chat_turn_account_read_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    model_client: object | None = None,
+    user_message: str,
+    evidence=None,
+    numbered_option_selected: bool = False,
+    principal_id: str | None = None,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = base_tool_registry or active_tool_registry
+    available_account_tool_names = tuple(
+        name for name in sorted(_retry_available_tool_names(registry_for_lookup)) if name in _READ_ONLY_ACCOUNT_TOOL_NAMES
+    )
+    visible_account_tool_names = _visible_read_only_account_tool_names(active_tool_registry)
+    scoped_account_read_tool = _single_account_read_tool_from_scope(
+        visible_account_tool_names or available_account_tool_names,
+        active_tool_registry,
+        registry_for_lookup,
+    )
+    browser_account_fallback = (
+        _turn_result_used_only_browser_account_fallback_tools(initial_result)
+        and scoped_account_read_tool is not None
+    )
+    visible_account_retry = _turn_result_should_retry_with_visible_account_read_tools(
+        initial_result,
+        active_tool_registry,
+        numbered_option_selected=numbered_option_selected,
+    )
+    no_tool_account_scope_recovery = (
+        not browser_account_fallback
+        and not visible_account_retry
+        and model_client is not None
+        and bool(available_account_tool_names)
+        and _turn_result_has_no_tool_or_artifact_outcome(initial_result)
+    )
+    retry_decision: TurnToolScopeDecision | None = None
+    tool_names = visible_account_tool_names or available_account_tool_names
+    if (
+        not browser_account_fallback
+        and not visible_account_retry
+    ):
+        connector_retry_context = _turn_result_used_only_connector_retry_context_tools(initial_result)
+        source_retry_context = _account_source_selection_scope_retry_context(
+            getattr(initial_result, "tool_results", None)
+        )
+        if source_retry_context and not numbered_option_selected:
+            return initial_result, active_tool_registry, False
+        if (
+            model_client is None
+            or not available_account_tool_names
+            or not (connector_retry_context or source_retry_context or no_tool_account_scope_recovery)
+        ):
+            return initial_result, active_tool_registry, False
+        source_retry_tool_names = (
+            _account_read_tool_names_from_source_selection_scope(
+                getattr(initial_result, "tool_results", None),
+                available_tool_names=available_account_tool_names,
+            )
+            if source_retry_context
+            else ()
+        )
+        try:
+            assistant_no_tool_draft = getattr(initial_result, "final_text", None)
+            if source_retry_context:
+                assistant_no_tool_draft = "\n\n".join(
+                    part
+                    for part in (str(assistant_no_tool_draft or "").strip(), source_retry_context)
+                    if part
+                )
+            retry_user_message = (
+                str(user_message or "")
+                if source_retry_context
+                else _scope_retry_user_message_with_visible_context(user_message, base_history)
+            )
+            decision = build_turn_tool_scope_decision(
+                model_client=model_client,
+                user_message=retry_user_message,
+                evidence=evidence,
+                registry=registry_for_lookup,
+                force_model_decision=True,
+                assistant_no_tool_draft=assistant_no_tool_draft,
+            )
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="account_read_retry",
+                exc=exc,
+            )
+            return initial_result, active_tool_registry, False
+        tool_names = _account_read_tool_names_from_scope_decision(
+            decision,
+            available_tool_names=available_account_tool_names,
+        )
+        if not tool_names and tuple(getattr(decision, "connector_app_ids", ()) or ()):
+            tool_names = _read_only_account_tool_names_for_connector_apps(
+                getattr(decision, "connector_app_ids", ()) or (),
+                available_tool_names=available_account_tool_names,
+            )
+        if source_retry_context and not numbered_option_selected:
+            selected_account_tools = tuple(name for name in tool_names if name in _READ_ONLY_ACCOUNT_TOOL_NAMES)
+            if (
+                selected_account_tools
+                and _read_only_account_tool_family(selected_account_tools) is not None
+                and bool(getattr(decision, "connector_source_user_requested", False))
+            ):
+                tool_names = selected_account_tools
+            elif source_retry_tool_names:
+                tool_names = source_retry_tool_names
+            else:
+                return initial_result, active_tool_registry, False
+        if (
+            source_retry_context
+            and not numbered_option_selected
+            and not tool_names
+            and source_retry_tool_names
+        ):
+            tool_names = source_retry_tool_names
+        if (
+            source_retry_context
+            and not numbered_option_selected
+            and (
+                _read_only_account_tool_family(tool_names) is None
+                or not bool(getattr(decision, "connector_source_user_requested", False))
+            )
+            and not source_retry_tool_names
+        ):
+                return initial_result, active_tool_registry, False
+        if (
+            not tool_names
+            and no_tool_account_scope_recovery
+            and (numbered_option_selected or _assistant_reply_has_numbered_choice_prompt(getattr(initial_result, "final_text", None)))
+            and available_account_tool_names
+        ):
+            tool_names = available_account_tool_names
+        if not bool(getattr(decision, "allow_connector_tools", False)) and not tool_names:
+            return initial_result, active_tool_registry, False
+        if not tool_names:
+            return initial_result, active_tool_registry, False
+        retry_decision = replace(
+            decision,
+            connector_app_ids=tuple(getattr(decision, "connector_app_ids", ()) or ())
+            or _active_connector_app_ids_for_retry(),
+            connector_source_user_requested=True,
+            skill_pack_action="connector",
+            requested_tool_names=tool_names,
+            required_tool_names=tuple(
+                name
+                for name in tuple(getattr(decision, "required_tool_names", ()) or ())
+                if name in tool_names
+            ),
+            confidence=max(float(getattr(decision, "confidence", 0.0) or 0.0), 1.0),
+            valid=True,
+        )
+    retry_tool_registry = active_tool_registry
+    if evidence is not None:
+        if retry_decision is None:
+            retry_decision = TurnToolScopeDecision(
+                skill_pack_action="connector",
+                connector_app_ids=_active_connector_app_ids_for_retry(),
+                connector_source_user_requested=True,
+                requested_tool_names=tool_names,
+                required_tool_names=(),
+                confidence=1.0,
+                valid=True,
+            )
+        retry_tool_registry = _ToolRegistryAllowedNames(
+            _ToolRegistryWithoutRequestScope(
+                ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+            ),
+            allowed_tool_names=tool_names,
+            turn_tool_scope_decision=retry_decision,
+        )
+        retry_visible_tool_names = {
+            str(definition.get("name") or "")
+            for definition in retry_tool_registry.list_tool_definitions()
+            if str(definition.get("name") or "").strip()
+        }
+        if not retry_visible_tool_names:
+            return initial_result, active_tool_registry, False
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _account_read_tool_retry_prompt(tool_names)}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="account_read_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if (
+        not _turn_result_has_substantive_tools(retry_result)
+        and not getattr(retry_result, "artifacts", None)
+        and not getattr(retry_result, "suspended_for_approval", False)
+    ):
+        direct_tool_name = (
+            tool_names[0]
+            if len(tool_names) == 1
+            else scoped_account_read_tool
+            or _single_account_read_tool_from_scope(tool_names, retry_tool_registry, active_tool_registry, registry_for_lookup)
+        )
+        if direct_tool_name is None:
+            for preferred_tool_name in ("email_search", "calendar_list", "email_read", "email_attachment_read"):
+                if preferred_tool_name in tool_names:
+                    direct_tool_name = preferred_tool_name
+                    break
+        if direct_tool_name == "email_read" and "email_search" in tool_names:
+            direct_tool_name = "email_search"
+        direct_principal_id = principal_id or getattr(initial_result, "principal_id", None)
+        structured_direct_read = bool(
+            direct_tool_name
+            and scoped_account_read_tool
+            and direct_tool_name == scoped_account_read_tool
+            and getattr(active_tool_registry, "turn_tool_scope_decision", None) is not None
+        )
+        direct_result = (
+            _run_single_account_read_tool_directly(
+                registry=retry_tool_registry,
+                tool_name=direct_tool_name,
+                principal_id=direct_principal_id,
+                turn_id=getattr(retry_result, "turn_id", None) or getattr(initial_result, "turn_id", None),
+                user_message=_latest_user_text(base_history),
+            )
+            if direct_tool_name and (direct_principal_id or structured_direct_read)
+            else None
+        )
+        if direct_result is not None:
+            retry_result = direct_result
+    if (
+        not _turn_result_has_substantive_outcome(retry_result)
+        and _turn_result_has_substantive_outcome(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    retry_result = _merge_initial_turn_context_into_retry_result(
+        initial_result=initial_result,
+        retry_result=retry_result,
+    )
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+_LOCAL_DISCOVERY_ONLY_TOOLS = frozenset({"file_search", "file_read", "workspace_summary"})
+_LOCAL_SYSTEM_FALLBACK_TOOLS = frozenset({"terminal_exec"})
+
+
+def _turn_result_used_only_local_discovery_tools(result: object) -> bool:
+    tool_names = [
+        _tool_result_name(tool_result)
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+        if _tool_result_name(tool_result) not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    return bool(tool_names) and all(name in _LOCAL_DISCOVERY_ONLY_TOOLS for name in tool_names)
+
+
+def _registry_read_only_tool_names(registry: object) -> frozenset[str]:
+    names: set[str] = set()
+    list_specs = getattr(registry, "list_specs", None)
+    if not callable(list_specs):
+        return frozenset()
+    try:
+        specs = list_specs()
+    except Exception:
+        return frozenset()
+    for spec in specs or ():
+        name = str(getattr(spec, "name", "") or "").strip()
+        side_effect = getattr(spec, "side_effect_class", None)
+        if name and side_effect == ToolSideEffectClass.READ:
+            names.add(name)
+    return frozenset(names)
+
+
+def _turn_result_used_only_read_context_tools(result: object, registry: object) -> bool:
+    read_only_names = _registry_read_only_tool_names(registry)
+    tool_names = [
+        _tool_result_name(tool_result)
+        for tool_result in list(getattr(result, "tool_results", None) or [])
+        if _tool_result_name(tool_result) not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    return bool(tool_names) and all(name in read_only_names or name in _LOCAL_DISCOVERY_ONLY_TOOLS for name in tool_names)
+
+
+def _turn_result_has_local_read_failure(result: object) -> bool:
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "file_read":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) == "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        if output.get("path") or output.get("type") or output.get("media_type"):
+            return True
+    return False
+
+
+def _turn_result_artifacts_are_email_attachment_source_paths(result: object) -> bool:
+    artifacts = {
+        str(Path(str(path or "")).expanduser())
+        for path in tuple(getattr(result, "artifacts", None) or ())
+        if str(path or "").strip()
+    }
+    if not artifacts:
+        return False
+    source_paths = set(_completed_email_attachment_read_paths(getattr(result, "tool_results", None)))
+    return bool(source_paths) and artifacts.issubset(source_paths)
+
+
+def _turn_result_has_material_local_system_output(result: object) -> bool:
+    if getattr(result, "artifacts", None) or getattr(result, "suspended_for_approval", False):
+        return True
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "terminal_exec":
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        if str(output.get("stdout") or "").strip():
+            return True
+        if str(output.get("stderr") or "").strip():
+            return True
+        if str(output.get("terminal_output_path") or "").strip():
+            return True
+        if _string_paths_from_value(output.get("artifact_path")):
+            return True
+        if _string_paths_from_value(output.get("artifact_paths")):
+            return True
+        if _string_paths_from_value(output.get("artifacts")):
+            return True
+    return False
+
+
+def _local_system_fallback_retry_prompt(tool_names: Iterable[str]) -> str:
+    names = ", ".join(tuple(tool_names)[:8])
+    return (
+        "Local-system fallback retry: the previous attempt only used local file/workspace discovery tools "
+        "or could not extract a fetched source document with the dedicated read tool. "
+        f"A structured scope decision has now exposed local-system tool(s): {names}. If the current request "
+        "requires local file/document extraction after a dedicated read tool failed, local system inspection, "
+        "shell diagnostics, installed software/package changes, services, processes, environment, or path checks, "
+        "use the visible local-system tool before finalizing. Use it only for local read-only extraction or local "
+        "system work; do not use it as a fallback for connected-account uploads, downloads, or external writes. If the "
+        "action is mutating or unsafe, request approval instead of pretending a file listing completed the "
+        "request. If the discovered files are actually the answer, say that briefly."
+    )
+
+
+def _run_chat_turn_local_system_fallback_retry(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    model_client: object | None,
+    user_message: str,
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    mark_retry: Callable[[], None] | None = None,
+) -> tuple[object, object, bool]:
+    registry_for_lookup = base_tool_registry or active_tool_registry
+    available_tool_names = _registry_tool_names(registry_for_lookup)
+    if not _LOCAL_SYSTEM_FALLBACK_TOOLS.intersection(available_tool_names):
+        return initial_result, active_tool_registry, False
+    if _turn_result_used_tool(initial_result, "terminal_exec"):
+        return initial_result, active_tool_registry, False
+    local_read_failure = _turn_result_has_local_read_failure(initial_result)
+    if getattr(initial_result, "artifacts", None) and not (
+        local_read_failure and _turn_result_artifacts_are_email_attachment_source_paths(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    if getattr(initial_result, "suspended_for_approval", False):
+        return initial_result, active_tool_registry, False
+    if (
+            _local_discovery_paths_from_tool_results(getattr(initial_result, "tool_results", None))
+        and not local_read_failure
+    ):
+        return initial_result, active_tool_registry, False
+    structured_scope_hint = _model_tool_request_attributes(getattr(initial_result, "final_text", None)) is not None
+    if not (
+        _turn_result_used_only_local_discovery_tools(initial_result)
+        or (
+            local_read_failure
+            and _turn_result_used_only_read_context_tools(initial_result, registry_for_lookup)
+        )
+        or (
+            _turn_result_reports_unfulfilled_capability(initial_result)
+            and not list(getattr(initial_result, "tool_results", None) or [])
+        )
+        or (
+            _turn_result_reports_local_system_capability_request(initial_result)
+            and not list(getattr(initial_result, "tool_results", None) or [])
+        )
+        or structured_scope_hint
+    ):
+        return initial_result, active_tool_registry, False
+
+    if local_read_failure:
+        requested_tool_names = tuple(
+            name for name in ("terminal_exec",) if name in _LOCAL_SYSTEM_FALLBACK_TOOLS and name in available_tool_names
+        )
+        decision = TurnToolScopeDecision(
+            requested_tool_names=requested_tool_names,
+            required_tool_names=requested_tool_names,
+            confidence=1.0,
+            valid=True,
+        )
+    else:
+        try:
+            decision = build_turn_tool_scope_decision(
+                model_client=model_client,
+                user_message=user_message,
+                evidence=evidence,
+                registry=registry_for_lookup,
+                force_model_decision=True,
+                assistant_no_tool_draft=getattr(initial_result, "final_text", None),
+            )
+        except ChatBackendUnavailableError as exc:
+            _preserve_initial_result_after_retry_backend_failure(
+                retry_name="local_system_fallback_retry",
+                exc=exc,
+            )
+            return initial_result, active_tool_registry, False
+        requested_tool_names = tuple(
+            name
+            for name in dict.fromkeys(
+                [
+                    *tuple(getattr(decision, "requested_tool_names", ()) or ()),
+                    *tuple(getattr(decision, "required_tool_names", ()) or ()),
+                ]
+            )
+            if name in _LOCAL_SYSTEM_FALLBACK_TOOLS and name in available_tool_names
+        )
+        if (
+            not requested_tool_names
+            and "terminal_exec" in available_tool_names
+            and _turn_result_reports_local_system_capability_request(initial_result)
+        ):
+            requested_tool_names = ("terminal_exec",)
+            decision = TurnToolScopeDecision(
+                requested_tool_names=requested_tool_names,
+                required_tool_names=requested_tool_names,
+                confidence=1.0,
+                valid=True,
+            )
+    if not requested_tool_names:
+        return initial_result, active_tool_registry, False
+
+    retry_decision = replace(
+        decision,
+        requested_tool_names=requested_tool_names,
+        required_tool_names=tuple(
+            name
+            for name in tuple(getattr(decision, "required_tool_names", ()) or ())
+            if name in requested_tool_names
+        )
+        or requested_tool_names,
+        valid=True,
+    )
+    retry_tool_registry = _ToolRegistryAllowedNames(
+        _ToolRegistryWithoutRequestScope(
+            ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
+        ),
+        allowed_tool_names=requested_tool_names,
+    )
+    retry_history = list(base_history)
+    retry_history.append({
+        "role": "system",
+        "content": [{"type": "text", "text": _local_system_fallback_retry_prompt(requested_tool_names)}],
+    })
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="local_system_fallback_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
+    if (
+        _local_discovery_paths_from_tool_results(getattr(initial_result, "tool_results", None))
+        and _turn_result_has_local_read_failure(initial_result)
+        and _turn_result_used_tool(retry_result, "terminal_exec")
+        and not _turn_result_has_material_local_system_output(retry_result)
+    ):
+        return initial_result, active_tool_registry, False
+    if (
+        not _turn_result_has_substantive_outcome(retry_result)
+        and _turn_result_has_substantive_outcome(initial_result)
+    ):
+        return initial_result, active_tool_registry, False
+    if mark_retry is not None:
+        mark_retry()
+    return retry_result, retry_tool_registry, True
+
+
+@dataclass(frozen=True)
+class ChatTurnCommonRetryResult:
+    result: object
+    tool_registry: object
+    retried_model_tool_request: bool = False
+    retried_no_tool_scope_decision: bool = False
+    retried_missing_tool_scope: bool = False
+    retried_connector_skill_scope: bool = False
+    retried_scheduler_run_scope: bool = False
+    retried_scheduler_run_fallback: bool = False
+    retried_scheduler_mutation_fallback: bool = False
+    retried_account_read: bool = False
+    retried_schema_followup: bool = False
+    retried_local_system_fallback: bool = False
+
+
+def _plain_no_tool_common_retries_may_bypass(result: object, tool_registry: object) -> bool:
+    """Skip recovery probes only after typed runtime state proved this is plain chat."""
+
+    delegate_registry = getattr(tool_registry, "_delegate", None)
+    for registry in (tool_registry, delegate_registry):
+        decision = getattr(registry, "turn_tool_scope_decision", None)
+        scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+        requested_names = set(
+            tuple(getattr(decision, "requested_tool_names", ()) or ())
+            + tuple(getattr(decision, "required_tool_names", ()) or ())
+        )
+        requested_scheduler_names = requested_names.intersection(_SCHEDULER_TOOL_NAMES)
+        if scheduler_action in {"inspect", "run", "mutate"} or requested_scheduler_names:
+            return False
+        skill_pack_action = str(getattr(decision, "skill_pack_action", "") or "").strip().lower()
+        requested_account_names = requested_names.intersection(_READ_ONLY_ACCOUNT_TOOL_NAMES)
+        if (
+            skill_pack_action == "connector"
+            or requested_account_names
+            or bool(getattr(decision, "connector_source_user_requested", False))
+            or bool(tuple(getattr(decision, "connector_app_ids", ()) or ()))
+            or bool(getattr(decision, "allow_connector_tools", False))
+        ):
+            return False
+    if isinstance(tool_registry, PlainNoToolFastPathRegistry):
+        has_visible_tools = False
+    else:
+        list_definitions = getattr(tool_registry, "list_tool_definitions", None)
+        if not callable(list_definitions):
+            return False
+        try:
+            has_visible_tools = bool(list_definitions())
+        except Exception:
+            return False
+    if has_visible_tools:
+        try:
+            visible_names = {
+                str(definition.get("name") or "").strip()
+                for definition in list_definitions()
+                if isinstance(definition, Mapping) and str(definition.get("name") or "").strip()
+            }
+        except Exception:
+            return False
+        substantive_visible_names = visible_names.difference({"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME})
+        if substantive_visible_names:
+            return False
+    if has_visible_tools and not visible_names:
+        return False
+    if getattr(result, "tool_results", None) or getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    final_text = getattr(result, "final_text", None)
+    if not str(final_text or "").strip():
+        return False
+    if _assistant_reply_has_numbered_choice_prompt(final_text):
+        return False
+    if _turn_result_reply_needs_common_recovery(result, registry=tool_registry):
+        return False
+    return True
+
+
+def _turn_result_reply_needs_common_recovery(
+    result: object,
+    *,
+    registry: object | None = None,
+) -> bool:
+    final_text = getattr(result, "final_text", None)
+    if _model_tool_request_attributes(final_text) is not None:
+        return True
+    if (
+        registry is not None
+        and _registry_has_request_tool_scope(registry)
+        and _assistant_reply_has_numbered_choice_prompt(final_text)
+    ):
+        return True
+    if _turn_result_reports_unfulfilled_capability(result):
+        return True
+    if _turn_result_reports_local_system_capability_request(result):
+        return True
+    if _turn_result_reports_unavailable_image_generation(result):
+        return True
+    if _turn_result_reports_missing_live_source(result):
+        return True
+    if _turn_result_has_unverified_empty_resource_claim(result):
+        return True
+    if _turn_result_has_unverified_media_directive(result):
+        return True
+    if _turn_result_reports_scheduler_setup_clarification(result, registry=registry):
+        return True
+    return False
+
+
+def _completed_scheduler_tool_names(result: object) -> set[str]:
+    names: set[str] = set()
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        name = _tool_result_name(tool_result)
+        if name in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}:
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) == "completed":
+            names.add(name)
+    return names
+
+
+def _scheduler_common_retries_may_bypass(
+    result: object,
+    tool_registry: object,
+    *,
+    base_tool_registry: object | None = None,
+    user_message: str | None = None,
+) -> bool:
+    if getattr(result, "artifacts", None):
+        return False
+    if getattr(result, "suspended_for_approval", False):
+        return False
+    if not str(getattr(result, "final_text", "") or "").strip():
+        return False
+    if _turn_result_reply_needs_common_recovery(result, registry=tool_registry):
+        return False
+    completed_names = _completed_scheduler_tool_names(result)
+    if not completed_names:
+        return False
+    if any(name not in _SCHEDULER_TOOL_NAMES for name in completed_names):
+        return False
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if action not in {"inspect", "run", "mutate"}:
+        if completed_names.intersection(_SCHEDULER_CRON_ACTION_TOOLS | _SCHEDULER_REMINDER_ACTION_TOOLS):
+            action = "mutate" if "run_cron" not in completed_names else "run"
+    if action == "mutate":
+        return bool(completed_names.intersection(_SCHEDULER_CRON_ACTION_TOOLS | _SCHEDULER_REMINDER_ACTION_TOOLS))
+    if action == "run":
+        return "run_cron" in completed_names
+    if action == "inspect":
+        return completed_names.issubset({"list_crons", "list_reminders"})
+    return False
+
+
+def _scheduler_common_retries_may_bypass_before_mutation_recovery(
+    result: object,
+    tool_registry: object,
+    *,
+    retry_already_scoped: bool,
+    base_tool_registry: object | None = None,
+    user_message: str | None = None,
+) -> bool:
+    if (
+        retry_already_scoped
+        and _turn_result_used_only_scheduler_read_tools(result)
+        and not _turn_result_used_any_scheduler_action_tool(result)
+    ):
+        decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+        action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+        if action == "inspect":
+            completed_names = _completed_scheduler_tool_names(result)
+            return bool(completed_names) and completed_names.issubset({"list_crons", "list_reminders"})
+    return _scheduler_common_retries_may_bypass(
+        result,
+        tool_registry,
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    )
+
+
+def _run_chat_turn_common_retries(
+    *,
+    initial_result: object,
+    base_history: list[dict[str, object]],
+    active_tool_registry: object,
+    base_tool_registry: object | None = None,
+    runtime: PersistentRuntime | None = None,
+    model_client: object | None = None,
+    user_message: str,
+    schema_user_message: str | None = None,
+    evidence,
+    run_turn: Callable[[list[dict[str, object]], object], object],
+    numbered_option_selected: bool = False,
+    fallback_tool_names: Iterable[str] = (),
+    principal_id: str | None = None,
+    include_local_system_fallback: bool = False,
+    mark_retry: Callable[[str], None] | None = None,
+    skill_reuse_callback: Callable[[Iterable[str]], None] | None = None,
+) -> ChatTurnCommonRetryResult:
+    result = initial_result
+    tool_registry = active_tool_registry
+    had_account_source_selection = bool(
+        _account_source_selection_reply_from_scope_results(getattr(result, "tool_results", None))
+    )
+    retried_model_tool_request = False
+    retried_no_tool_scope_decision = False
+    retried_missing_tool_scope = False
+    retried_connector_skill_scope = False
+    retried_scheduler_run_scope = False
+    retried_scheduler_run_fallback = False
+    retried_scheduler_mutation_fallback = False
+    retried_account_read = False
+    retried_schema_followup = False
+
+    def _mark(name: str) -> Callable[[], None]:
+        return (lambda: mark_retry(name)) if mark_retry is not None else (lambda: None)
+
+    def _completed_requested_artifact_ready() -> bool:
+        return any(
+            _turn_result_has_completed_requested_artifact(result, registry)
+            for registry in (tool_registry, active_tool_registry, base_tool_registry)
+            if registry is not None
+        )
+
+    def _current_retry_result() -> ChatTurnCommonRetryResult:
+        return ChatTurnCommonRetryResult(
+            result=result,
+            tool_registry=tool_registry,
+            retried_model_tool_request=retried_model_tool_request,
+            retried_no_tool_scope_decision=retried_no_tool_scope_decision,
+            retried_missing_tool_scope=retried_missing_tool_scope,
+            retried_connector_skill_scope=retried_connector_skill_scope,
+            retried_scheduler_run_scope=retried_scheduler_run_scope,
+            retried_scheduler_run_fallback=retried_scheduler_run_fallback,
+            retried_scheduler_mutation_fallback=retried_scheduler_mutation_fallback,
+            retried_account_read=bool(retried_account_read or had_account_source_selection),
+            retried_schema_followup=retried_schema_followup,
+            retried_local_system_fallback=False,
+        )
+
+    if had_account_source_selection and not numbered_option_selected:
+        return _current_retry_result()
+    if _deferred_run_cron_receipt_reply(getattr(result, "tool_results", None)):
+        return _current_retry_result()
+    if _plain_no_tool_common_retries_may_bypass(result, tool_registry):
+        return _current_retry_result()
+    scheduler_read_only_result = _turn_result_used_only_scheduler_read_tools(result)
+    if not scheduler_read_only_result and _scheduler_common_retries_may_bypass_before_mutation_recovery(
+        result,
+        tool_registry,
+        retry_already_scoped=False,
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+
+    if scheduler_read_only_result:
+        if (
+            _structured_scheduler_run_target_from_list_crons(result, user_message=user_message) is None
+            and any(
+                _turn_result_completed_scheduler_inspect_scope(
+                    result,
+                    registry,
+                    base_registry=base_tool_registry,
+                    user_message=user_message,
+                )
+                for registry in (tool_registry, base_tool_registry)
+                if registry is not None
+            )
+        ):
+            return _current_retry_result()
+        result, tool_registry, retried_scheduler_run_scope = _run_chat_turn_scheduler_run_scope_retry(
+            initial_result=result,
+            base_history=base_history,
+            active_tool_registry=tool_registry,
+            base_tool_registry=base_tool_registry,
+            model_client=model_client,
+            user_message=user_message,
+            evidence=evidence,
+            run_turn=run_turn,
+            mark_retry=_mark("scheduler_run_scope_retry"),
+            principal_id=principal_id,
+        )
+        if _completed_requested_artifact_ready():
+            return _current_retry_result()
+        if _turn_result_used_any_scheduler_action_tool(result):
+            return _current_retry_result()
+        result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+            initial_result=result,
+            base_history=base_history,
+            active_tool_registry=tool_registry,
+            base_tool_registry=base_tool_registry,
+            model_client=model_client,
+            user_message=user_message,
+            evidence=evidence,
+            run_turn=run_turn,
+            mark_retry=_mark("scheduler_mutation_fallback_retry"),
+            principal_id=principal_id,
+        )
+        if _completed_requested_artifact_ready():
+            return _current_retry_result()
+        if _turn_result_used_any_scheduler_action_tool(result):
+            return _current_retry_result()
+        if _scheduler_common_retries_may_bypass_before_mutation_recovery(
+            result,
+            tool_registry,
+            retry_already_scoped=bool(retried_scheduler_run_scope or retried_scheduler_mutation_fallback),
+            base_tool_registry=base_tool_registry,
+            user_message=user_message,
+        ):
+            return _current_retry_result()
+    if any(
+        _turn_result_completed_scheduler_inspect_scope(
+            result,
+            registry,
+            base_registry=base_tool_registry,
+            user_message=user_message,
+        )
+        for registry in (tool_registry, base_tool_registry)
+        if registry is not None
+    ):
+        return _current_retry_result()
+
+    result, tool_registry, retried_model_tool_request = _run_chat_turn_model_tool_request_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        runtime=runtime,
+        model_client=model_client,
+        principal_id=principal_id,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("model_tool_request_retry"),
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    scheduler_read_only_result = _turn_result_used_only_scheduler_read_tools(result)
+    if not scheduler_read_only_result and _scheduler_common_retries_may_bypass_before_mutation_recovery(
+        result,
+        tool_registry,
+        retry_already_scoped=retried_model_tool_request,
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+    if any(
+        _turn_result_completed_scheduler_inspect_scope(
+            result,
+            registry,
+            base_registry=base_tool_registry,
+            user_message=user_message,
+        )
+        for registry in (tool_registry, base_tool_registry)
+        if registry is not None
+    ):
+        return _current_retry_result()
+    result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("scheduler_mutation_fallback_retry"),
+        principal_id=principal_id,
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if _turn_result_used_any_scheduler_action_tool(result):
+        return _current_retry_result()
+    result, tool_registry, retried_no_tool_scope_decision = _run_chat_turn_no_tool_scope_decision_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        runtime=runtime,
+        model_client=model_client,
+        principal_id=principal_id,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("no_tool_scope_decision_retry"),
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    scheduler_read_only_result = _turn_result_used_only_scheduler_read_tools(result)
+    if not scheduler_read_only_result and _scheduler_common_retries_may_bypass_before_mutation_recovery(
+        result,
+        tool_registry,
+        retry_already_scoped=bool(retried_model_tool_request or retried_no_tool_scope_decision),
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+    if any(
+        _turn_result_completed_scheduler_inspect_scope(
+            result,
+            registry,
+            base_registry=base_tool_registry,
+            user_message=user_message,
+        )
+        for registry in (tool_registry, base_tool_registry)
+        if registry is not None
+    ):
+        return _current_retry_result()
+    result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("scheduler_mutation_fallback_retry"),
+        principal_id=principal_id,
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if _turn_result_used_any_scheduler_action_tool(result):
+        return _current_retry_result()
+    result, tool_registry, retried_missing_tool_scope = _run_chat_turn_missing_tool_scope_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        numbered_option_selected=numbered_option_selected,
+        mark_retry=_mark("missing_tool_scope_retry"),
+        principal_id=principal_id,
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if retried_missing_tool_scope and _turn_result_used_any_scheduler_action_tool(result):
+        retried_scheduler_mutation_fallback = bool(
+            retried_scheduler_mutation_fallback
+            or any(
+                name in (_SCHEDULER_CRON_ACTION_TOOLS | _SCHEDULER_REMINDER_ACTION_TOOLS) - {"run_cron"}
+                for name in _completed_scheduler_tool_names(result)
+            )
+        )
+        retried_scheduler_run_fallback = bool(
+            retried_scheduler_run_fallback
+            or "run_cron" in _completed_scheduler_tool_names(result)
+        )
+    if _scheduler_common_retries_may_bypass_before_mutation_recovery(
+        result,
+        tool_registry,
+        retry_already_scoped=bool(
+            retried_model_tool_request
+            or retried_no_tool_scope_decision
+            or retried_missing_tool_scope
+        ),
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+    result, tool_registry, retried_connector_skill_scope = _run_chat_turn_connector_skill_scope_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        runtime=runtime,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("connector_skill_scope_retry"),
+        skill_reuse_callback=skill_reuse_callback,
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if _scheduler_common_retries_may_bypass_before_mutation_recovery(
+        result,
+        tool_registry,
+        retry_already_scoped=bool(
+            retried_model_tool_request
+            or retried_no_tool_scope_decision
+            or retried_missing_tool_scope
+            or retried_connector_skill_scope
+        ),
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+    result, tool_registry, retried_scheduler_run_scope = _run_chat_turn_scheduler_run_scope_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("scheduler_run_scope_retry"),
+        principal_id=principal_id,
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if _scheduler_common_retries_may_bypass_before_mutation_recovery(
+        result,
+        tool_registry,
+        retry_already_scoped=bool(
+            retried_model_tool_request
+            or retried_no_tool_scope_decision
+            or retried_missing_tool_scope
+            or retried_connector_skill_scope
+            or retried_scheduler_run_scope
+        ),
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+    result, tool_registry, retried_scheduler_run_fallback = _run_chat_turn_scheduler_run_fallback_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("scheduler_run_fallback_retry"),
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if _scheduler_common_retries_may_bypass_before_mutation_recovery(
+        result,
+        tool_registry,
+        retry_already_scoped=bool(
+            retried_model_tool_request
+            or retried_no_tool_scope_decision
+            or retried_missing_tool_scope
+            or retried_connector_skill_scope
+            or retried_scheduler_run_scope
+            or retried_scheduler_run_fallback
+        ),
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+    result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("scheduler_mutation_fallback_retry"),
+        principal_id=principal_id,
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if _scheduler_common_retries_may_bypass(
+        result,
+        tool_registry,
+        base_tool_registry=base_tool_registry,
+        user_message=user_message,
+    ):
+        return _current_retry_result()
+    result, tool_registry, retried_account_read = _run_chat_turn_account_read_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        run_turn=run_turn,
+        numbered_option_selected=numbered_option_selected,
+        principal_id=principal_id,
+        mark_retry=_mark("account_read_retry"),
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    result, tool_registry, retried_schema_followup = _run_chat_turn_schema_followup_tool_retry(
+        initial_result=result,
+        base_history=base_history,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        fallback_tool_names=fallback_tool_names,
+        evidence=evidence,
+        run_turn=run_turn,
+        mark_retry=_mark("schema_followup_tool_retry"),
+        principal_id=principal_id,
+        user_message=schema_user_message or user_message,
+    )
+    if _completed_requested_artifact_ready():
+        return _current_retry_result()
+    if _append_scheduler_read_verification_if_missing(
+        result,
+        active_tool_registry=tool_registry,
+        base_tool_registry=base_tool_registry,
+        principal_id=principal_id,
+    ):
+        _mark("scheduler_read_verification")()
+    if _account_source_selection_reply_from_scope_results(getattr(result, "tool_results", None)):
+        return ChatTurnCommonRetryResult(
+            result=result,
+            tool_registry=tool_registry,
+            retried_model_tool_request=retried_model_tool_request,
+            retried_no_tool_scope_decision=retried_no_tool_scope_decision,
+            retried_missing_tool_scope=retried_missing_tool_scope,
+            retried_connector_skill_scope=retried_connector_skill_scope,
+            retried_scheduler_run_scope=retried_scheduler_run_scope,
+            retried_scheduler_run_fallback=retried_scheduler_run_fallback,
+            retried_scheduler_mutation_fallback=retried_scheduler_mutation_fallback,
+            retried_account_read=True,
+            retried_schema_followup=retried_schema_followup,
+            retried_local_system_fallback=False,
+        )
+    retried_local_system_fallback = False
+    if include_local_system_fallback:
+        result, tool_registry, retried_local_system_fallback = _run_chat_turn_local_system_fallback_retry(
+            initial_result=result,
+            base_history=base_history,
+            active_tool_registry=tool_registry,
+            base_tool_registry=base_tool_registry,
+            model_client=model_client,
+            user_message=user_message,
+            evidence=evidence,
+            run_turn=run_turn,
+            mark_retry=_mark("local_system_fallback_retry"),
+        )
+
+    return ChatTurnCommonRetryResult(
+        result=result,
+        tool_registry=tool_registry,
+        retried_model_tool_request=retried_model_tool_request,
+        retried_no_tool_scope_decision=retried_no_tool_scope_decision,
+        retried_missing_tool_scope=retried_missing_tool_scope,
+        retried_connector_skill_scope=retried_connector_skill_scope,
+        retried_scheduler_run_scope=retried_scheduler_run_scope,
+        retried_scheduler_run_fallback=retried_scheduler_run_fallback,
+        retried_scheduler_mutation_fallback=retried_scheduler_mutation_fallback,
+        retried_account_read=bool(retried_account_read or had_account_source_selection),
+        retried_schema_followup=retried_schema_followup,
+        retried_local_system_fallback=retried_local_system_fallback,
     )
 
 
@@ -3071,6 +12019,7 @@ def _run_chat_turn_saved_history_retry(
     *,
     initial_result: object,
     automatic_history_context: str | None,
+    allow_saved_history_retry: bool,
     build_history_context: Callable[[], str | None],
     base_history: list[dict[str, object]],
     active_tool_registry: object,
@@ -3078,18 +12027,70 @@ def _run_chat_turn_saved_history_retry(
     turn_tool_evidence: object,
     run_turn: Callable[[list[dict[str, object]], object], object],
     mark_retry: Callable[[], None] | None = None,
+    allow_history_search_retry: bool = True,
 ) -> tuple[object, object, bool]:
     if not _turn_result_should_retry_with_saved_history(initial_result):
+        return initial_result, active_tool_registry, False
+    used_history_search = _turn_result_used_history_search(initial_result)
+    if not allow_saved_history_retry:
+        return initial_result, active_tool_registry, False
+    if used_history_search and not allow_history_search_retry:
         return initial_result, active_tool_registry, False
     retry_history_context = automatic_history_context or build_history_context()
     if not retry_history_context:
         return initial_result, active_tool_registry, False
+    numbered_choice_retry = (
+        not used_history_search
+        and _assistant_reply_has_numbered_choice_prompt(getattr(initial_result, "final_text", None))
+    )
+    if numbered_choice_retry:
+        live_tool_names = [
+            name
+            for name in _saved_history_evidence_tool_names(
+                retry_history_context,
+                evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+            )
+            if name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+        ]
+        history_has_url = _saved_history_context_has_structured_url_reference(retry_history_context)
+        if not live_tool_names and not history_has_url:
+            return initial_result, active_tool_registry, False
+        anchored_current_turn = bool(
+            getattr(turn_tool_evidence, "context_linked", False)
+            or getattr(turn_tool_evidence, "slash_prefixed_literal", False)
+            or getattr(turn_tool_evidence, "numbered_option_selected", False)
+        )
+        available_retry_tool_names = _registry_tool_names(active_tool_registry).union(
+            _registry_tool_names(base_tool_registry)
+        )
+        if (
+            not anchored_current_turn
+            and not history_has_url
+            and not set(live_tool_names).intersection(available_retry_tool_names)
+        ):
+            return initial_result, active_tool_registry, False
+    if used_history_search:
+        live_tool_names = [
+            name
+            for name in _saved_history_evidence_tool_names(
+                retry_history_context,
+                evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+            )
+            if name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+        ]
+        if (
+            not live_tool_names
+            and not _saved_history_context_has_structured_url_reference(retry_history_context)
+            and _saved_history_structured_target_fallback_reply(retry_history_context) is None
+        ):
+            return initial_result, active_tool_registry, False
 
     retry_tool_registry = _augment_tool_registry_from_saved_history_context(
         active_tool_registry,
         base_registry=base_tool_registry,
         evidence=turn_tool_evidence,
         history_context=retry_history_context,
+        allow_unlinked_context_scope=True,
     )
     retry_history = list(base_history)
     retry_tool_scope_prompt = _saved_history_tool_scope_prompt(retry_history_context)
@@ -3098,7 +12099,7 @@ def _run_chat_turn_saved_history_retry(
             "role": "system",
             "content": [{"type": "text", "text": retry_tool_scope_prompt}],
         })
-    if _turn_result_used_history_search(initial_result):
+    if used_history_search or numbered_choice_retry:
         retry_live_prompt = _saved_history_live_verification_retry_prompt(retry_history_context)
         if retry_live_prompt:
             retry_history.append({
@@ -3113,10 +12114,18 @@ def _run_chat_turn_saved_history_retry(
     if retry_reference_context_message:
         retry_history.append(retry_reference_context_message)
 
-    retry_result = run_turn(retry_history, retry_tool_registry)
+    try:
+        retry_result = run_turn(retry_history, retry_tool_registry)
+    except ChatBackendUnavailableError as exc:
+        _preserve_initial_result_after_retry_backend_failure(
+            retry_name="saved_history_retry",
+            exc=exc,
+        )
+        return initial_result, active_tool_registry, False
     if mark_retry is not None:
         mark_retry()
-    _apply_saved_history_structured_target_fallback(retry_result, retry_history_context)
+    if used_history_search:
+        _apply_saved_history_structured_target_fallback(retry_result, retry_history_context)
     return retry_result, retry_tool_registry, True
 
 
@@ -3130,7 +12139,11 @@ def _registry_tool_names(registry: object) -> set[str]:
         names.update(str(definition.get("name") or "") for definition in registry.list_tool_definitions())
     except Exception:
         pass
-    return {name for name in names if name}
+    names = {name for name in names if name}
+    can_invoke = getattr(registry, "can_invoke_tool", None)
+    if callable(can_invoke):
+        names = {name for name in names if can_invoke(name)}
+    return names
 
 
 class _ToolRegistryWithoutRequestScope:
@@ -3143,13 +12156,14 @@ class _ToolRegistryWithoutRequestScope:
             definition
             for definition in self._registry.list_tool_definitions()
             if str(definition.get("name") or "") != "request_tool_scope"
+            and self.can_invoke_tool(str(definition.get("name") or ""))
         ]
 
     def list_specs(self):
         return [
             spec
             for spec in self._registry.list_specs()
-            if str(getattr(spec, "name", "") or "") != "request_tool_scope"
+            if self.can_invoke_tool(str(getattr(spec, "name", "") or ""))
         ]
 
     def get_spec(self, name: str):
@@ -3160,6 +12174,129 @@ class _ToolRegistryWithoutRequestScope:
     def invoke(self, invocation):
         if getattr(invocation, "tool_name", None) == "request_tool_scope":
             raise KeyError("request_tool_scope")
+        return self._registry.invoke(invocation)
+
+    def can_invoke_tool(self, name: str) -> bool:
+        tool_name = str(name or "").strip()
+        if not tool_name or tool_name == "request_tool_scope":
+            return False
+        can_invoke = getattr(self._registry, "can_invoke_tool", None)
+        if callable(can_invoke):
+            return bool(can_invoke(tool_name))
+        return tool_name in _registry_tool_names(self._registry)
+
+    def apply_scope_request(self, invocation):
+        if hasattr(self._registry, "apply_scope_request"):
+            return self._registry.apply_scope_request(invocation)
+        raise AttributeError("apply_scope_request")
+
+    def filesystem_allowed_roots(self):
+        if hasattr(self._registry, "filesystem_allowed_roots"):
+            return self._registry.filesystem_allowed_roots()
+        return ()
+
+
+def _retry_tool_definition_from_spec(
+    spec: object,
+    *,
+    available_tool_names: Iterable[str] | None = None,
+) -> dict[str, object]:
+    definition = {
+        "name": str(getattr(spec, "name", "") or ""),
+        "description": str(getattr(spec, "description", "") or ""),
+        "input_schema": getattr(spec, "input_schema", None)
+        or {"type": "object", "properties": {}, "additionalProperties": False},
+        "capability_tags": list(getattr(spec, "capability_tags", ()) or ()),
+        "side_effect_class": str(
+            getattr(getattr(spec, "side_effect_class", ""), "value", getattr(spec, "side_effect_class", ""))
+        ),
+        "risk_level": str(getattr(getattr(spec, "risk_level", ""), "value", getattr(spec, "risk_level", ""))),
+        "requires_approval": bool(getattr(spec, "requires_approval", False)),
+    }
+    continuation_tools = list(getattr(spec, "continuation_tools", ()) or ())
+    available = {str(name or "").strip() for name in (available_tool_names or ()) if str(name or "").strip()}
+    if available:
+        continuation_tools = [
+            str(name)
+            for name in continuation_tools
+            if str(name or "") in available and str(name or "") != definition["name"]
+        ]
+    if continuation_tools:
+        definition["continuation_tools"] = continuation_tools
+    return definition
+
+
+class _ToolRegistryAllowedNames:
+    def __init__(
+        self,
+        registry: object,
+        *,
+        allowed_tool_names: Iterable[str],
+        turn_tool_scope_decision: object | None = None,
+    ) -> None:
+        self._registry = registry
+        self._allowed_tool_names = frozenset(str(name) for name in allowed_tool_names)
+        self.turn_tool_scope_decision = (
+            turn_tool_scope_decision
+            if turn_tool_scope_decision is not None
+            else getattr(registry, "turn_tool_scope_decision", None)
+        )
+
+    def list_tool_definitions(self) -> list[dict[str, object]]:
+        available_tool_names = _registry_tool_names(self._registry).intersection(self._allowed_tool_names)
+        definitions = [
+            _tool_definition_with_available_continuations(definition, available_tool_names=available_tool_names)
+            for definition in self._registry.list_tool_definitions()
+            if str(definition.get("name") or "") in available_tool_names
+        ]
+        if definitions:
+            return definitions
+        spec_definitions = [
+            _retry_tool_definition_from_spec(spec, available_tool_names=available_tool_names)
+            for spec in self.list_specs()
+            if str(getattr(spec, "name", "") or "")
+        ]
+        if spec_definitions:
+            return spec_definitions
+        return [
+            {
+                "name": name,
+                "description": "",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "capability_tags": [],
+                "side_effect_class": "",
+                "risk_level": "",
+                "requires_approval": False,
+            }
+            for name in sorted(self._allowed_tool_names)
+            if self.can_invoke_tool(name)
+        ]
+
+    def list_specs(self):
+        return [
+            spec
+            for spec in self._registry.list_specs()
+            if self.can_invoke_tool(str(getattr(spec, "name", "") or ""))
+        ]
+
+    def get_spec(self, name: str):
+        if name not in self._allowed_tool_names:
+            raise KeyError(name)
+        return self._registry.get_spec(name)
+
+    def can_invoke_tool(self, name: str) -> bool:
+        tool_name = str(name or "").strip()
+        if tool_name not in self._allowed_tool_names:
+            return False
+        can_invoke = getattr(self._registry, "can_invoke_tool", None)
+        if callable(can_invoke):
+            return bool(can_invoke(tool_name))
+        return tool_name in _registry_tool_names(self._registry)
+
+    def invoke(self, invocation):
+        tool_name = str(getattr(invocation, "tool_name", "") or "")
+        if tool_name not in self._allowed_tool_names:
+            raise KeyError(tool_name)
         return self._registry.invoke(invocation)
 
     def filesystem_allowed_roots(self):
@@ -3215,26 +12352,409 @@ def _saved_history_evidence_tool_names(history_context: str | None, *, evidence_
     return tuple(names)
 
 
+def _saved_history_context_has_structured_url_reference(history_context: str | None) -> bool:
+    if not history_context:
+        return False
+    capturing = False
+    for raw_line in str(history_context).splitlines():
+        line = raw_line.strip()
+        if line == "Structured saved reference candidates (ranked by relevance and recency):":
+            capturing = True
+            continue
+        if capturing and line == "Candidate prior turns:":
+            return False
+        if not capturing or not line.startswith("Target "):
+            continue
+        _prefix, _sep, payload_text = line.partition(":")
+        if not payload_text.strip():
+            continue
+        try:
+            payload = json.loads(payload_text.strip())
+        except Exception:
+            continue
+        if isinstance(payload, dict) and extract_url_target(str(payload.get("url") or "")) is not None:
+            return True
+    return False
+
+
+_STRUCTURED_FOLLOWUP_TOOL_KEYS = frozenset({
+    "action_tool",
+    "action_tools",
+    "body_requires_tool",
+    "continuation_tool",
+    "continuation_tools",
+    "followup_tool",
+    "followup_tools",
+    "link_requires_tool",
+    "next_tool",
+    "next_tool_for_body",
+    "next_tool_for_link",
+    "next_tools_for_links",
+    "required_tool",
+    "required_tool_names",
+    "required_tools",
+})
+
+
+def _structured_followup_tool_names_from_context(
+    context: str | None,
+    *,
+    evidence_limit: int,
+) -> tuple[str, ...]:
+    if not context or evidence_limit <= 0:
+        return ()
+    names: list[str] = []
+
+    def _add(value: object) -> None:
+        if len(names) >= evidence_limit:
+            return
+        name = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", name):
+            return
+        if name in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}:
+            return
+        if name not in names:
+            names.append(name)
+
+    def _walk(value: object) -> None:
+        if len(names) >= evidence_limit:
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key) in _STRUCTURED_FOLLOWUP_TOOL_KEYS:
+                    if isinstance(item, list):
+                        for entry in item:
+                            _add(entry)
+                    else:
+                        _add(item)
+                _walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+
+    text = str(context)
+    for key in sorted(_STRUCTURED_FOLLOWUP_TOOL_KEYS):
+        pattern = r'"' + re.escape(key) + r'"\s*:\s*"([^"]+)"'
+        for match in re.finditer(pattern, text):
+            _add(match.group(1))
+    if len(names) >= evidence_limit:
+        return tuple(names)
+
+    # Recent-tool context is a JSON payload after a prose prefix. Saved-history
+    # evidence can also include one JSON object after "Tool evidence:".
+    json_candidates: list[str] = []
+    marker = "\n["
+    marker_index = text.find(marker)
+    if marker_index >= 0:
+        json_candidates.append(text[marker_index + 1 :])
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Tool evidence: "):
+            json_candidates.append(line.removeprefix("Tool evidence: ").strip())
+    for candidate in json_candidates:
+        if len(names) >= evidence_limit:
+            break
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        _walk(parsed)
+    return tuple(names)
+
+
+def _structured_tool_result_names_from_context(
+    context: str | None,
+    *,
+    evidence_limit: int,
+) -> tuple[str, ...]:
+    if not context or evidence_limit <= 0:
+        return ()
+    names: list[str] = []
+
+    def _add(value: object) -> None:
+        if len(names) >= evidence_limit:
+            return
+        name = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,80}", name):
+            return
+        if name not in names:
+            names.append(name)
+
+    def _walk(value: object) -> None:
+        if len(names) >= evidence_limit:
+            return
+        if isinstance(value, dict):
+            if "tool_name" in value:
+                _add(value.get("tool_name"))
+            for item in value.values():
+                _walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+
+    text = str(context)
+    json_candidates: list[str] = []
+    marker = "\n["
+    marker_index = text.find(marker)
+    if marker_index >= 0:
+        json_candidates.append(text[marker_index + 1 :])
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Tool evidence: "):
+            json_candidates.append(line.removeprefix("Tool evidence: ").strip())
+    for candidate in json_candidates:
+        if len(names) >= evidence_limit:
+            break
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        _walk(parsed)
+    return tuple(names)
+
+
+def _scheduler_action_for_context_tool_names(
+    tool_names: Iterable[str],
+    existing_action: str | None,
+) -> str:
+    names = {str(name or "").strip() for name in tool_names if str(name or "").strip()}
+    normalized_existing = str(existing_action or "none").strip().lower() or "none"
+    if not names:
+        return normalized_existing
+    if names.intersection({"create_cron", "update_cron", "delete_cron", "delete_reminder", "toggle_cron", "set_reminder", "update_reminder"}):
+        return "mutate"
+    if "run_cron" in names:
+        return "run"
+    if names.intersection({"list_crons", "list_reminders"}):
+        return "inspect"
+    if names.intersection(_SCHEDULER_TOOL_NAMES):
+        return "inspect"
+    return normalized_existing
+
+
+def _augment_tool_registry_from_structured_tool_context(
+    active_registry: object,
+    *,
+    base_registry: object,
+    evidence,
+    context: str | None,
+) -> object:
+    followup_tool_names = _structured_followup_tool_names_from_context(
+        context,
+        evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+    )
+    context_tool_names = _structured_tool_result_names_from_context(
+        context,
+        evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+    )
+    scheduler_context_tool_names = tuple(
+        name
+        for name in (*followup_tool_names, *context_tool_names)
+        if name in _SCHEDULER_TOOL_NAMES
+    )
+    if not followup_tool_names and not scheduler_context_tool_names:
+        return active_registry
+    available_tool_names = _registry_tool_names(base_registry)
+    allow_account_followup_tools = bool(
+        getattr(evidence, "context_linked", False)
+        or getattr(evidence, "numbered_option_selected", False)
+    )
+    account_context_present = any(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in context_tool_names)
+    account_browser_followup_allowed = bool(
+        getattr(evidence, "has_url_target", False)
+        or getattr(evidence, "artifact_requested", False)
+        or tuple(getattr(evidence, "requested_extensions", ()) or ())
+    )
+
+    def _context_followup_allowed(name: str) -> bool:
+        if (
+            account_context_present
+            and name in _ACCOUNT_READ_SCHEMA_BROWSER_PENDING_TOOLS
+            and not account_browser_followup_allowed
+        ):
+            return False
+        return True
+
+    requested_tool_names = tuple(
+        dict.fromkeys(
+            name
+            for name in followup_tool_names
+            if name in available_tool_names
+            and name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+            and (allow_account_followup_tools or name not in _READ_ONLY_ACCOUNT_TOOL_NAMES)
+            and _context_followup_allowed(name)
+            and _scope_followup_tool_allowed(name, evidence=evidence, registry=active_registry)
+        )
+    )
+    if scheduler_context_tool_names and "list_crons" in available_tool_names:
+        requested_tool_names = tuple(dict.fromkeys((*requested_tool_names, "list_crons")))
+    if not requested_tool_names:
+        return active_registry
+    existing = getattr(active_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
+    scheduler_action = _scheduler_action_for_context_tool_names(
+        (name for name in requested_tool_names if name in _SCHEDULER_TOOL_NAMES),
+        str(getattr(existing, "scheduler_action", "none") or "none"),
+    )
+    # Schema-advertised follow-up tools are the exact continuation path for the
+    # prior tool result. Keep this scope narrow so a preview/search tool from
+    # the first turn does not crowd out the tool that can complete the follow-up.
+    combined_requested = requested_tool_names
+    connector_followup_requested = any(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in combined_requested)
+    decision = TurnToolScopeDecision(
+        web_action=str(getattr(existing, "web_action", "none") or "none"),
+        scheduler_action=scheduler_action,
+        scheduler_toggle_enabled=getattr(existing, "scheduler_toggle_enabled", None),
+        scheduler_selection_policy=str(getattr(existing, "scheduler_selection_policy", "none") or "none"),
+        scheduler_target_scope=str(getattr(existing, "scheduler_target_scope", "none") or "none"),
+        skill_pack_action="connector"
+        if connector_followup_requested
+        else str(getattr(existing, "skill_pack_action", "none") or "none"),
+        connector_app_ids=tuple(getattr(existing, "connector_app_ids", ()) or ()),
+        connector_source_user_requested=bool(
+            connector_followup_requested or getattr(existing, "connector_source_user_requested", False)
+        ),
+        requested_tool_names=combined_requested,
+        required_tool_names=tuple(getattr(existing, "required_tool_names", ()) or ()),
+        requested_artifact_extensions=tuple(getattr(existing, "requested_artifact_extensions", ()) or ()),
+        required_embedded_media_extensions=tuple(
+            getattr(existing, "required_embedded_media_extensions", ()) or ()
+        ),
+        confidence=max(float(getattr(existing, "confidence", 0.0) or 0.0), 1.0),
+        valid=True,
+    )
+    return _ToolRegistryWithoutRequestScope(
+        ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
+    )
+
+
+def _structured_tool_context_scope_prompt(
+    context: str | None,
+    *,
+    tool_names_override: Iterable[str] | None = None,
+) -> str | None:
+    if tool_names_override is None:
+        tool_names = _structured_followup_tool_names_from_context(
+            context,
+            evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+        )
+        context_tool_names = _structured_tool_result_names_from_context(
+            context,
+            evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+        )
+        if any(name in _SCHEDULER_TOOL_NAMES for name in context_tool_names) and "list_crons" not in tool_names:
+            tool_names = tuple(dict.fromkeys((*tool_names, "list_crons")))
+    else:
+        tool_names = tuple(
+            dict.fromkeys(str(name or "").strip() for name in tool_names_override if str(name or "").strip())
+        )
+    live_tool_names = [
+        name
+        for name in tool_names
+        if name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+    ]
+    if not live_tool_names:
+        return None
+    return (
+        "Structured prior tool output names follow-up tool(s) for the resolved target: "
+        + ", ".join(live_tool_names[:12])
+        + ". If the current request asks to continue from that resolved target, use the matching live tool "
+        "before finalizing instead of repeating preview-only saved facts. Ignore prior assistant wording that "
+        "claimed a named follow-up tool was unavailable; this scope message is current for this turn."
+    )
+
+
+def _apply_structured_tool_context_scope(
+    active_registry: object,
+    *,
+    base_registry: object,
+    evidence,
+    context: str | None,
+) -> tuple[object, tuple[str, ...], str | None]:
+    followup_tool_names = _structured_followup_tool_names_from_context(
+        context,
+        evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+    )
+    widened_registry = _augment_tool_registry_from_structured_tool_context(
+        active_registry,
+        base_registry=base_registry,
+        evidence=evidence,
+        context=context,
+    )
+    if widened_registry is active_registry:
+        return active_registry, (), None
+    decision = getattr(widened_registry, "turn_tool_scope_decision", None)
+    requested_tool_names = tuple(getattr(decision, "requested_tool_names", ()) or ())
+    scope_prompt = (
+        _structured_tool_context_scope_prompt(context, tool_names_override=requested_tool_names)
+        if requested_tool_names
+        else None
+    )
+    return widened_registry, requested_tool_names, scope_prompt
+
+
 def _augment_tool_registry_from_saved_history_context(
     active_registry: object,
     *,
     base_registry: object,
     evidence,
     history_context: str | None,
+    allow_unlinked_context_scope: bool = False,
 ) -> object:
-    evidence_tool_names = _saved_history_evidence_tool_names(
-        history_context,
-        evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+    allow_saved_history_tool_scope = bool(
+        getattr(evidence, "context_linked", False)
+        or getattr(evidence, "numbered_option_selected", False)
+        or allow_unlinked_context_scope
+        or _registry_has_exact_current_context_tool_scope(active_registry)
     )
+    if not allow_saved_history_tool_scope:
+        return active_registry
+    structured_followup_tool_names = list(
+        _structured_followup_tool_names_from_context(
+            history_context,
+            evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+        )
+    )
+    evidence_tool_names = (
+        structured_followup_tool_names
+        if structured_followup_tool_names
+        else list(_saved_history_evidence_tool_names(
+            history_context,
+            evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+        ))
+    )
+    if evidence_tool_names:
+        evidence_tool_names.extend(
+            name
+            for name in _registry_continuation_tool_names_for_tool_names(base_registry, evidence_tool_names)
+            if name not in evidence_tool_names
+        )
+    if _saved_history_context_has_structured_url_reference(history_context):
+        evidence_tool_names.extend(
+            name
+            for name in (
+                "browser_navigate",
+                "browser_extract_text",
+                "browser_extract_items",
+                "browser_open",
+                "web_fetch",
+                "web_search",
+            )
+            if name not in evidence_tool_names
+        )
     if not evidence_tool_names:
         return active_registry
     available_tool_names = _registry_tool_names(base_registry)
+    allow_account_followup_tools = bool(
+        getattr(evidence, "context_linked", False)
+        or getattr(evidence, "numbered_option_selected", False)
+    )
     requested_tool_names = tuple(
         dict.fromkeys(
             name
             for name in evidence_tool_names
             if name in available_tool_names
             and name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
+            and (allow_account_followup_tools or name not in _READ_ONLY_ACCOUNT_TOOL_NAMES)
         )
     )
     if not requested_tool_names:
@@ -3242,6 +12762,7 @@ def _augment_tool_registry_from_saved_history_context(
     existing = getattr(active_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
     existing_requested = tuple(getattr(existing, "requested_tool_names", ()) or ())
     combined_requested = tuple(dict.fromkeys([*existing_requested, *requested_tool_names]))
+    connector_followup_requested = any(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in combined_requested)
     web_tool_requested = any(
         name.startswith("browser_") or name in {"web_fetch", "web_search"}
         for name in combined_requested
@@ -3252,8 +12773,16 @@ def _augment_tool_registry_from_saved_history_context(
     decision = TurnToolScopeDecision(
         web_action=web_action,
         scheduler_action=str(getattr(existing, "scheduler_action", "none") or "none"),
-        skill_pack_action=str(getattr(existing, "skill_pack_action", "none") or "none"),
+        scheduler_toggle_enabled=getattr(existing, "scheduler_toggle_enabled", None),
+        scheduler_selection_policy=str(getattr(existing, "scheduler_selection_policy", "none") or "none"),
+        scheduler_target_scope=str(getattr(existing, "scheduler_target_scope", "none") or "none"),
+        skill_pack_action="connector"
+        if connector_followup_requested
+        else str(getattr(existing, "skill_pack_action", "none") or "none"),
         connector_app_ids=tuple(getattr(existing, "connector_app_ids", ()) or ()),
+        connector_source_user_requested=bool(
+            connector_followup_requested or getattr(existing, "connector_source_user_requested", False)
+        ),
         requested_tool_names=combined_requested,
         required_tool_names=tuple(getattr(existing, "required_tool_names", ()) or ()),
         requested_artifact_extensions=tuple(getattr(existing, "requested_artifact_extensions", ()) or ()),
@@ -3269,7 +12798,10 @@ def _augment_tool_registry_from_saved_history_context(
 
 
 def _saved_history_tool_scope_prompt(history_context: str | None) -> str | None:
-    tool_names = _saved_history_evidence_tool_names(
+    tool_names = _structured_followup_tool_names_from_context(
+        history_context,
+        evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
+    ) or _saved_history_evidence_tool_names(
         history_context,
         evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
     )
@@ -3285,7 +12817,8 @@ def _saved_history_tool_scope_prompt(history_context: str | None) -> str | None:
         + ", ".join(live_tool_names[:12])
         + ". If the requested answer depends on current external state for the resolved target, use the matching "
         "live tool before finalizing. Do not ask the user to resend target details already identified by the saved "
-        "runtime evidence."
+        "runtime evidence. Ignore prior assistant wording that claimed a named follow-up tool was unavailable; "
+        "this scope message is current for this turn."
     )
 
 
@@ -3301,13 +12834,13 @@ def _saved_history_live_verification_retry_prompt(history_context: str | None) -
     ]
     if not live_tool_names:
         return (
-            "The previous attempt used saved chat history without a concrete live verification tool. "
+            "the previous attempt used saved chat history without a concrete live verification tool. "
             "Saved history can identify the target, but it is not enough by itself for a current check. "
             "Use the available tool-scope mechanism to request an appropriate live read tool for the resolved "
             "structured target before finalizing when current state is needed."
         )
     return (
-        "The previous attempt used saved chat history without a concrete live verification tool. "
+        "the previous attempt used saved chat history without a concrete live verification tool. "
         "Saved history can identify the target, but it is not enough by itself for a current check "
         "when matching live tools are available. Use one of these matching live tools before finalizing "
         "if the user is asking to check, verify, update, or confirm current state: "
@@ -3316,8 +12849,125 @@ def _saved_history_live_verification_retry_prompt(history_context: str | None) -
     )
 
 
-def _should_include_recent_tool_context(result) -> bool:
-    return should_include_prior_turn_messages(result, has_prior_turns=True)
+def _should_include_recent_tool_context(
+    result,
+    *,
+    structured_followup_evidence: bool = False,
+) -> bool:
+    if structured_followup_evidence:
+        return True
+    turn = getattr(result, "turn", None)
+    disposition = getattr(turn, "disposition", None)
+    if isinstance(disposition, ConversationTurnDisposition):
+        return disposition is not ConversationTurnDisposition.INDEPENDENT
+    disposition_value = str(disposition or "").strip()
+    return bool(disposition_value and disposition_value != ConversationTurnDisposition.INDEPENDENT.value)
+
+
+_NON_TARGET_CONTEXT_TOOL_NAMES = frozenset({"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME})
+
+
+def _tool_registry_has_only_context_discovery_tools(tool_registry: object | None) -> bool:
+    if tool_registry is None:
+        return True
+    if isinstance(tool_registry, PlainNoToolFastPathRegistry):
+        return True
+    list_definitions = getattr(tool_registry, "list_tool_definitions", None)
+    if not callable(list_definitions):
+        return False
+    try:
+        definitions = list(list_definitions() or [])
+    except Exception:
+        return False
+    if not definitions:
+        return True
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            return False
+        name = str(definition.get("name") or "").strip()
+        tags = {
+            str(tag or "").strip()
+            for tag in (definition.get("capability_tags") or ())
+            if str(tag or "").strip()
+        }
+        if name in _NON_TARGET_CONTEXT_TOOL_NAMES or "scope_request" in tags:
+            continue
+        return False
+    return True
+
+
+def _tool_result_has_structured_context_evidence(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    tool_name = str(result.get("tool_name") or "").strip()
+    if not tool_name or tool_name in _NON_TARGET_CONTEXT_TOOL_NAMES:
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    if status and status != "completed":
+        return False
+    output = result.get("output")
+    if isinstance(output, dict):
+        return True
+    return bool(output)
+
+
+def _recent_conversation_has_structured_tool_evidence(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    limit: int = 3,
+) -> bool:
+    store = getattr(runtime, "store", None)
+    if store is None or not conversation_id:
+        return False
+    try:
+        events = (
+            store.list_recent_conversation_events(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=limit,
+            )
+            if hasattr(store, "list_recent_conversation_events")
+            else store.list_conversation_events(conversation_id)[-limit:]
+        )
+    except Exception:
+        return False
+    for event in reversed(list(events or ())):
+        if not isinstance(event, dict):
+            continue
+        tool_results = event.get("tool_results")
+        if not isinstance(tool_results, list):
+            continue
+        if any(_tool_result_has_structured_context_evidence(result) for result in tool_results):
+            return True
+    return False
+
+
+def _compact_turn_has_recent_durable_tool_context(
+    runtime: PersistentRuntime,
+    *,
+    prompt: object,
+    conversation_id: str,
+    turn_dispatch_decision: object | None,
+) -> bool:
+    if not _messaging_dispatch_is_no_active_independent(turn_dispatch_decision):
+        return False
+    if not _chat_message_is_compact_context_reply(prompt):
+        return False
+    return _recent_conversation_has_structured_tool_evidence(
+        runtime,
+        conversation_id=conversation_id,
+        limit=_MAX_CHAT_TURNS,
+    )
+
+
+def _durable_tool_context_query_turns(thread: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        {"user": str(turn.get("user") or ""), "assistant": str(turn.get("assistant") or "")}
+        for turn in thread[-3:]
+        if isinstance(turn, dict)
+        and (str(turn.get("user") or "").strip() or str(turn.get("assistant") or "").strip())
+    ]
 
 
 
@@ -3428,6 +13078,34 @@ def _previous_assistant_message(thread: list[dict[str, str]]) -> str | None:
     return fallback
 
 
+def _previous_numbered_option_turn_id(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    previous_assistant_message: str | None,
+) -> str | None:
+    anchored_reply = str(previous_assistant_message or "").strip()
+    if not anchored_reply or not _assistant_reply_has_numbered_choice_prompt(anchored_reply):
+        return None
+    try:
+        events = runtime.store.list_recent_conversation_events(
+            conversation_id,
+            event_type="conversation.chat_turn",
+            limit=_MAX_CHAT_TURNS,
+        )
+    except Exception:
+        return None
+    for event in reversed(list(events or ())):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("assistant_reply") or "").strip() != anchored_reply:
+            continue
+        turn_id = str(event.get("turn_id") or "").strip()
+        if turn_id:
+            return turn_id
+    return None
+
+
 
 def _assistant_reply_referencable_artifact_reason(reply: str | None) -> str | None:
     """Assistant prose is not structured evidence for follow-up routing."""
@@ -3519,14 +13197,15 @@ def _recent_assistant_turn_has_structured_artifact_evidence(
     for event in reversed(list(events or ())):
         if not isinstance(event, dict):
             continue
+        assistant_reply = str(event.get("assistant_reply") or "")
         if _assistant_message_has_structured_artifact_evidence(
-            str(event.get("assistant_reply") or "")
-        ):
+            assistant_reply
+        ) or _assistant_reply_has_numbered_choice_prompt(assistant_reply):
             return True
     return False
 
 
-def _artifact_extensions_from_tool_result_output(output: object) -> tuple[str, ...]:
+def _artifact_paths_from_tool_result_output(output: object) -> tuple[str, ...]:
     if not isinstance(output, dict):
         return ()
     candidates: list[str] = []
@@ -3544,6 +13223,29 @@ def _artifact_extensions_from_tool_result_output(output: object) -> tuple[str, .
                     path_value = item.get("path")
                     if isinstance(path_value, str) and path_value.strip():
                         candidates.append(path_value.strip())
+    descriptors = output.get("artifact_descriptors")
+    if isinstance(descriptors, (list, tuple)):
+        for item in descriptors:
+            if not isinstance(item, dict):
+                continue
+            for key in ("path", "artifact_path", "name"):
+                path_value = item.get(key)
+                if isinstance(path_value, str) and path_value.strip():
+                    candidates.append(path_value.strip())
+                    break
+    paths: list[str] = []
+    for candidate in candidates:
+        path = str(candidate or "").strip()
+        if not path:
+            continue
+        extension = Path(path).suffix.lower().strip()
+        if extension in VALID_ATTACHMENT_EXTENSIONS and path not in paths:
+            paths.append(path)
+    return tuple(paths)
+
+
+def _artifact_extensions_from_tool_result_output(output: object) -> tuple[str, ...]:
+    candidates = _artifact_paths_from_tool_result_output(output)
     extensions: list[str] = []
     for candidate in candidates:
         extension = Path(candidate).suffix.lower().strip()
@@ -3579,6 +13281,181 @@ def _artifact_extensions_from_conversation_event(event: object) -> tuple[str, ..
     return tuple(extensions)
 
 
+def _artifact_filenames_from_conversation_event(event: object) -> tuple[str, ...]:
+    if not isinstance(event, dict):
+        return ()
+    filenames: list[str] = []
+    assistant_reply = str(event.get("assistant_reply") or "")
+    for path in media_candidate_paths_from_text(assistant_reply):
+        name = Path(path).name.lower()
+        if Path(name).suffix.lower() in VALID_ATTACHMENT_EXTENSIONS and name not in filenames:
+            filenames.append(name)
+    tool_results = event.get("tool_results")
+    if not isinstance(tool_results, list):
+        return tuple(filenames)
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        if str(result.get("status") or "").strip().lower() != "completed":
+            continue
+        if str(result.get("tool_name") or "").strip() == "browser_screenshot":
+            continue
+        for path in _artifact_paths_from_tool_result_output(result.get("output")):
+            name = Path(path).name.lower()
+            if name and name not in filenames:
+                filenames.append(name)
+    return tuple(filenames)
+
+
+def _recent_artifact_filenames(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    limit: int = 6,
+) -> tuple[str, ...]:
+    list_recent_events = getattr(runtime.store, "list_recent_conversation_events", None)
+    if not callable(list_recent_events):
+        return ()
+    try:
+        recent_events = list(
+            list_recent_events(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=limit,
+            )
+            or []
+        )
+    except Exception:
+        return ()
+    filenames: list[str] = []
+    for event in recent_events:
+        for name in _artifact_filenames_from_conversation_event(event):
+            if name not in filenames:
+                filenames.append(name)
+    return tuple(filenames)
+
+
+def _recent_media_complete_artifact_paths(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str | None,
+    principal_id: str | None,
+    requested_extensions: Iterable[str],
+    limit: int = 8,
+) -> tuple[str, ...]:
+    if not conversation_id:
+        return ()
+    requested = {
+        extension
+        for extension in _normalized_requested_extensions(requested_extensions)
+        if extension in {".docx", ".pptx", ".xlsx"}
+    }
+    if not requested:
+        return ()
+    list_recent_events = getattr(runtime.store, "list_recent_conversation_events", None)
+    if not callable(list_recent_events):
+        return ()
+    try:
+        recent_events = list(
+            list_recent_events(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=limit,
+            )
+            or []
+        )
+    except Exception:
+        return ()
+    artifact_roots = tuple(dict.fromkeys(_artifact_roots_for_delivery(runtime, principal_id)))
+    paths: list[str] = []
+
+    def add_path(raw_path: object) -> None:
+        if not str(raw_path or "").strip():
+            return
+        path = Path(str(raw_path)).expanduser()
+        if path.suffix.lower() not in requested:
+            return
+        path_text = str(path)
+        if path_text in paths:
+            return
+        if _office_artifact_embedded_media_count(path) <= 0:
+            return
+        if not any(artifact_descriptor_for_path(path, artifact_root=root) is not None for root in artifact_roots):
+            return
+        paths.append(path_text)
+
+    for event in recent_events:
+        if not isinstance(event, Mapping) or event.get("event_type") != "conversation.chat_turn":
+            continue
+        for path in media_candidate_paths_from_text(str(event.get("assistant_reply") or "")):
+            add_path(str(path))
+        tool_results = event.get("tool_results")
+        if not isinstance(tool_results, list):
+            continue
+        for result in tool_results:
+            if not isinstance(result, Mapping):
+                continue
+            if str(result.get("status") or "").strip().lower() != "completed":
+                continue
+            for path in _artifact_paths_from_tool_result_output(result.get("output")):
+                add_path(path)
+    return tuple(paths)
+
+
+def _new_output_filename_extensions_from_recent_artifacts(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    conversation_result: object | None,
+    prompt: str,
+) -> tuple[str, ...]:
+    requested_filenames = tuple(name for name in _requested_output_filenames(prompt) if name)
+    if not requested_filenames:
+        return ()
+    recent_names = set(_recent_artifact_filenames(runtime, conversation_id=conversation_id))
+    if not recent_names:
+        return ()
+    if not turn_is_context_linked(conversation_result) and not _recent_assistant_turn_has_structured_artifact_evidence(
+        runtime,
+        conversation_id=conversation_id,
+    ):
+        return ()
+    extensions: list[str] = []
+    for filename in requested_filenames:
+        if filename.lower() in recent_names:
+            continue
+        extension = Path(filename).suffix.lower().strip()
+        if extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+def _prefer_new_output_filename_extensions_from_recent_artifacts(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    conversation_result: object | None,
+    prompt: str,
+    requested_extensions: Iterable[str],
+) -> tuple[str, ...]:
+    output_extensions = _new_output_filename_extensions_from_recent_artifacts(
+        runtime,
+        conversation_id=conversation_id,
+        conversation_result=conversation_result,
+        prompt=prompt,
+    )
+    if output_extensions:
+        return output_extensions
+    return tuple(
+        extension
+        for extension in (
+            str(value or "").strip().lower()
+            for value in requested_extensions
+        )
+        if extension.startswith(".")
+    )
+
+
 def _inferred_scope_extensions_from_recent_artifacts(
     runtime: PersistentRuntime,
     *,
@@ -3595,6 +13472,14 @@ def _inferred_scope_extensions_from_recent_artifacts(
         )
         if extension.startswith(".")
     )
+    output_extensions = _new_output_filename_extensions_from_recent_artifacts(
+        runtime,
+        conversation_id=conversation_id,
+        conversation_result=conversation_result,
+        prompt=prompt,
+    )
+    if output_extensions:
+        return output_extensions
     if explicit:
         return explicit
     if not turn_is_context_linked(conversation_result):
@@ -3660,9 +13545,18 @@ def _chat_current_turn_has_structured_followup_evidence(
         return True
     if has_structured_turn_relationship_evidence(prompt):
         return True
+    if (
+        _assistant_message_has_structured_artifact_evidence(previous_assistant_message)
+        and _requested_output_filenames(prompt)
+    ):
+        return True
     if not _chat_message_is_compact_context_reply(prompt):
         return False
+    if _assistant_reply_has_numbered_choice_prompt(previous_assistant_message):
+        return True
     if _assistant_message_has_structured_artifact_evidence(previous_assistant_message):
+        return True
+    if _recent_conversation_has_structured_tool_evidence(runtime, conversation_id=conversation_id, limit=1):
         return True
     return _recent_assistant_turn_has_structured_artifact_evidence(
         runtime,
@@ -3708,6 +13602,7 @@ def _chat_ambiguity_classifier(
     model_client: object | None,
     structured_followup_evidence: bool = False,
     reply_context_text: str | None = None,
+    allow_plain_compact_classification: bool = False,
 ):
     previous_user_message = _previous_user_message(thread)
     reply_anchor_text = reply_context_text.strip() if isinstance(reply_context_text, str) else ""
@@ -3720,8 +13615,13 @@ def _chat_ambiguity_classifier(
         if not getattr(ctx, "active_branch_exists", False):
             return None
         active_turn_text = reply_anchor_text or previous_user_message
-        has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
-        if not has_structured_evidence:
+        has_text_structured_evidence = has_structured_turn_relationship_evidence(text)
+        has_plain_compact_evidence = (
+            structured_followup_evidence
+            and allow_plain_compact_classification
+            and _chat_message_is_compact_context_reply(text)
+        )
+        if not (reply_anchor_text or has_text_structured_evidence or has_plain_compact_evidence):
             return None
         try:
             from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
@@ -3811,6 +13711,245 @@ def _store_suspended_turns_from_contract(
         )
 
 
+def _tool_result_requires_runtime_approval(result: ToolResult) -> bool:
+    status = normalize_tool_status(getattr(result, "status", None))
+    if status not in {"denied", "approval_required", "requires_approval", "suspended"}:
+        return False
+    output = result.output if isinstance(result.output, Mapping) else {}
+    return output.get("reason") == "approval_required" or output.get("requires_approval") is True
+
+
+def _tool_result_approval_id(result: ToolResult) -> str | None:
+    output = result.output if isinstance(result.output, Mapping) else {}
+    approval_id = output.get("approval_id")
+    return approval_id.strip() if isinstance(approval_id, str) and approval_id.strip() else None
+
+
+def _tool_approval_context_from_result(
+    result: ToolResult,
+    *,
+    prompt: str,
+    conversation_id: str,
+    registry: object | None,
+) -> dict[str, object]:
+    output = result.output if isinstance(result.output, Mapping) else {}
+    context: dict[str, object] = {
+        "tool_name": result.tool_name,
+        "conversation_id": conversation_id,
+        "request_text": prompt,
+    }
+    arguments = output.get("tool_arguments") or output.get("arguments") or output.get("args")
+    if isinstance(arguments, Mapping):
+        context["tool_arguments"] = dict(arguments)
+    else:
+        context["tool_description"] = f"Request: {prompt}"
+    get_spec = getattr(registry, "get", None) or getattr(registry, "get_spec", None)
+    spec = None
+    if callable(get_spec):
+        try:
+            spec = get_spec(result.tool_name)
+        except Exception:
+            spec = None
+    if spec is not None:
+        description = getattr(spec, "description", None)
+        if isinstance(description, str) and description.strip():
+            context.setdefault("tool_description", description.strip())
+        risk_level = getattr(spec, "risk_level", None)
+        risk_text = str(getattr(risk_level, "value", risk_level) or "").strip()
+        if risk_text:
+            context["tool_risk_level"] = risk_text
+        side_effect = getattr(spec, "side_effect_class", None)
+        side_effect_text = str(getattr(side_effect, "value", side_effect) or "").strip()
+        if side_effect_text:
+            context["tool_side_effect_class"] = side_effect_text
+    return context
+
+
+def _ensure_suspended_turn_for_tool_approval(
+    runtime: PersistentRuntime,
+    *,
+    approval_id: str,
+    conversation_id: str,
+    chat_id: str | None,
+    prompt: str,
+    request_id: str | None,
+    message_id: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+) -> None:
+    get_suspended_turn = getattr(runtime.store, "get_suspended_turn", None)
+    if callable(get_suspended_turn):
+        try:
+            if get_suspended_turn(approval_id) is not None:
+                return
+        except Exception:
+            logger.debug("Unable to check existing suspended turn for approval %s", approval_id, exc_info=True)
+    pending_tool_calls = [
+        {
+            "invocation_id": result.invocation_id,
+            "tool_name": result.tool_name,
+            "status": result.status,
+            "output": result.output,
+            "error": result.error,
+        }
+        for result in tool_results
+    ]
+    runtime.store.add_suspended_turn(
+        SuspendedTurn(
+            approval_id=approval_id,
+            conversation_id=conversation_id,
+            chat_id=chat_id,
+            message=f"/chat {prompt}",
+            request_id=request_id,
+            message_id=message_id,
+            created_at=datetime.now(UTC),
+            messages_snapshot=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            pending_tool_calls=pending_tool_calls,
+        )
+    )
+
+
+def _materialize_pending_tool_approval_for_chat(
+    runtime: PersistentRuntime,
+    *,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+    conversation_id: str,
+    chat_id: str | None,
+    prompt: str,
+    request_id: str | None,
+    message_id: str | None,
+    principal_id: str | None,
+    registry: object | None,
+) -> str | None:
+    add_approval_request = getattr(runtime.store, "add_approval_request", None)
+    get_approval_request = getattr(runtime.store, "get_approval_request", None)
+    if not callable(add_approval_request) or not callable(get_approval_request):
+        return None
+    for result in reversed(tuple(tool_results or ())):
+        if not _tool_result_requires_runtime_approval(result):
+            continue
+        approval_id = _tool_result_approval_id(result)
+        if not approval_id:
+            continue
+        approval = None
+        try:
+            approval = get_approval_request(approval_id)
+        except Exception:
+            logger.debug("Unable to read approval request %s", approval_id, exc_info=True)
+        if approval is None:
+            context = _tool_approval_context_from_result(
+                result,
+                prompt=prompt,
+                conversation_id=conversation_id,
+                registry=registry,
+            )
+            approval = replace(
+                create_approval_request(
+                    requested_by=principal_id or conversation_id,
+                    action="use_tool",
+                    resource=result.tool_name,
+                    context=context,
+                ),
+                approval_id=approval_id,
+            )
+            try:
+                add_approval_request(approval)
+            except Exception:
+                logger.debug("Unable to materialize approval request %s", approval_id, exc_info=True)
+                continue
+        if _approval_status_value(getattr(approval, "status", None)) != ApprovalStatus.PENDING.value:
+            continue
+        try:
+            _ensure_suspended_turn_for_tool_approval(
+                runtime,
+                approval_id=approval_id,
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                prompt=prompt,
+                request_id=request_id,
+                message_id=message_id,
+                tool_results=tool_results,
+            )
+        except Exception:
+            logger.debug("Unable to store suspended turn for approval %s", approval_id, exc_info=True)
+            continue
+        return approval_id
+    return None
+
+
+def _store_agent_turn_limit_extension_suspended_turn(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    chat_id: str | None,
+    message: str,
+    request_id: str | None,
+    message_id: str | None,
+    messages_snapshot: list[dict[str, object]] | None,
+    current_max_iterations: int | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+    required_attachment_extensions: tuple[str, ...] = (),
+) -> str | None:
+    try:
+        approval = create_approval_request(
+            requested_by=conversation_id,
+            action=AGENT_TURN_LIMIT_EXTENSION_ACTION,
+            resource=conversation_id,
+            request_kind=AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+            context=build_agent_turn_limit_extension_context(
+                current_max_iterations=current_max_iterations,
+                tool_result_count=len(tool_results),
+                conversation_id=conversation_id,
+                requested_extensions=required_attachment_extensions,
+            ),
+        )
+        runtime.store.add_approval_request(approval)
+        runtime.store.add_suspended_turn(
+            SuspendedTurn(
+                approval_id=approval.approval_id,
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                message=message,
+                request_id=request_id,
+                message_id=message_id,
+                created_at=datetime.now(UTC),
+                messages_snapshot=messages_snapshot
+                or [{"role": "user", "content": [{"type": "text", "text": message.removeprefix("/chat ").strip() or message}]}],
+                pending_tool_calls=[],
+                resume_token=build_agent_turn_limit_resume_token(current_max_iterations=current_max_iterations),
+            )
+        )
+        return approval.approval_id
+    except Exception:
+        logger.debug("Unable to store agent turn limit extension approval", exc_info=True)
+        return None
+
+
+def _turn_limit_evidence_reply(
+    *,
+    user_message: str | None,
+    final_text: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+) -> str | None:
+    sanitized = sanitize_user_visible_reply(
+        user_message=user_message,
+        reply=final_text or "",
+        tool_results=tool_results,
+        source="agent",
+    )
+    text = str(sanitized or "").strip()
+    if not text:
+        return None
+    normalized = re.sub(r"\s+", " ", text.casefold()).strip()
+    generic_limit_markers = (
+        "i could not complete the request before the tool loop limit",
+        "tool budget was reached before the request could finish",
+        "doctor recommends more tool budget",
+    )
+    if any(marker in normalized for marker in generic_limit_markers):
+        return None
+    return text
+
+
 def _latest_completed_tool_result(
     tool_results: list[ToolResult] | tuple[ToolResult, ...],
     *,
@@ -3852,7 +13991,10 @@ def _maybe_materialize_requested_fetch_attachment(
     if _reply_has_deliverable_media(runtime, reply, principal_id=principal_id):
         return reply
     has_media_marker = bool(_reply_media_candidate_paths(reply))
-    extension = _requested_attachment_extension(prompt)
+    extension = plan_attachment_format(
+        prompt,
+        allow_filename_tokens=True,
+    ).extension
     if extension is None:
         return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
     if runtime.active_tool_registry is None:
@@ -3880,7 +14022,7 @@ def _clean_undeliverable_media_reply(
     *,
     principal_id: str | None = None,
 ) -> str:
-    artifact_roots = (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))
+    artifact_roots = _artifact_roots_for_delivery(runtime, principal_id)
     caption, _attachments = split_media_reply_attachments(
         reply,
         is_safe_attachment_path=lambda path: any(
@@ -3888,6 +14030,33 @@ def _clean_undeliverable_media_reply(
         ) or is_safe_artifact_path(path),
     )
     return caption or ""
+
+
+def _artifact_roots_for_delivery(runtime: PersistentRuntime, principal_id: str | None) -> tuple[Path, ...]:
+    roots: list[Path] = [artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)]
+    checkpoint_path = getattr(runtime, "checkpoint_path", None)
+    if checkpoint_path is not None:
+        try:
+            from nullion.connections import workspace_id_for_principal
+            from nullion.workspace_storage import sanitize_workspace_id
+
+            workspace_id = sanitize_workspace_id(workspace_id_for_principal(principal_id))
+            roots.append(Path(checkpoint_path).expanduser().resolve().parent / "workspaces" / workspace_id / "artifacts")
+        except Exception:
+            logger.debug("Could not resolve runtime workspace artifact root", exc_info=True)
+    resolved: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            path = Path(root).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            path = Path(root).expanduser()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append(path)
+    return tuple(resolved)
 
 
 def _artifact_delivery_label(
@@ -3928,13 +14097,15 @@ def _should_preserve_artifact_reply_caption(
     text = str(reply or "").strip()
     if not text:
         return False
-    if screenshot_is_primary_delivery or reply_is_browser_text_dump:
+    if reply_is_browser_text_dump:
         return False
     non_media_lines = [line.strip() for line in text.splitlines() if not line.strip().startswith("MEDIA:")]
     visible_lines = [line for line in non_media_lines if line]
     visible_text = "\n".join(visible_lines).strip()
     if not visible_text:
         return False
+    if screenshot_is_primary_delivery:
+        return len(visible_lines) >= 2 or "artifacts/" in visible_text
     if any(marker in visible_text for marker in ("?", "？")):
         return True
     if len(visible_lines) >= 2:
@@ -3952,6 +14123,15 @@ def _filter_artifact_descriptors_for_requested_format(
     requested_extension: str | None = None,
 ):
     del prompt
+    requested_extensions = normalize_artifact_extensions((requested_extension,) if requested_extension else ())
+    descriptors = [
+        descriptor
+        for descriptor in descriptors
+        if not is_unrequested_internal_sidecar_artifact(
+            str(getattr(descriptor, "path", "") or getattr(descriptor, "name", "")),
+            requested_extensions=requested_extensions,
+        )
+    ]
     if requested_extension is None:
         # Mixed-format turns often include one primary document/report plus
         # many generated image assets. Without an explicit image requirement we
@@ -3966,6 +14146,21 @@ def _filter_artifact_descriptors_for_requested_format(
                 image_descriptors.append(descriptor)
             else:
                 non_image_descriptors.append(descriptor)
+        if image_descriptors and non_image_descriptors:
+            substantive_non_image_descriptors = []
+            for descriptor in non_image_descriptors:
+                path = Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+                suffix = path.suffix.lower()
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = None
+                if suffix in _TEXT_SIDECAR_ARTIFACT_SUFFIXES and size is not None and size <= 8:
+                    continue
+                substantive_non_image_descriptors.append(descriptor)
+            if not substantive_non_image_descriptors:
+                return image_descriptors
+            non_image_descriptors = substantive_non_image_descriptors
         if non_image_descriptors and image_descriptors:
             return non_image_descriptors
         return descriptors
@@ -4013,6 +14208,54 @@ def _filter_text_sidecar_artifact_descriptors(
     return filtered
 
 
+def _is_visual_helper_html_artifact_path(path: object) -> bool:
+    path_obj = Path(str(path or ""))
+    if path_obj.suffix.lower() not in {".html", ".htm"}:
+        return False
+    stem = path_obj.stem.casefold()
+    return stem.endswith("_visual") or stem.endswith("-visual") or stem.endswith(".visual")
+
+
+def _filter_visual_helper_html_artifact_descriptors(
+    descriptors,
+    *,
+    requested_extensions: tuple[str, ...] | list[str] | None,
+):
+    html_descriptors = [
+        descriptor
+        for descriptor in descriptors
+        if Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower()
+        in {".html", ".htm"}
+    ]
+    if len(html_descriptors) < 2:
+        return descriptors
+    normalized_requested = normalize_artifact_extensions(requested_extensions)
+    if sum(1 for extension in normalized_requested if extension in {".html", ".htm"}) > 1:
+        return descriptors
+    non_helper_html_identities = {
+        identity
+        for descriptor in html_descriptors
+        for descriptor_path in [
+            Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+        ]
+        if not _is_visual_helper_html_artifact_path(descriptor_path)
+        for identity in _path_identity_variants(descriptor_path)
+    }
+    if not non_helper_html_identities:
+        return descriptors
+    return [
+        descriptor
+        for descriptor in descriptors
+        for descriptor_path in [
+            Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+        ]
+        if (
+            not _is_visual_helper_html_artifact_path(descriptor_path)
+            or _path_matches_identity_set(descriptor_path, non_helper_html_identities)
+        )
+    ]
+
+
 def _text_sidecar_stem_mentions_primary_artifact(path: Path) -> bool:
     if path.suffix.lower() not in _TEXT_SIDECAR_ARTIFACT_SUFFIXES:
         return False
@@ -4026,6 +14269,8 @@ def _text_sidecar_stem_mentions_primary_artifact(path: Path) -> bool:
 
 def _is_unrequested_diagnostic_attachment(path: Path, *, requested_extension: str | None) -> bool:
     suffix = path.suffix.lower()
+    if path.stem.lower() in {"_noop", "noop"}:
+        return True
     if _text_sidecar_stem_mentions_primary_artifact(path):
         return suffix != str(requested_extension or "").lower()
     if not suffix or suffix not in _DIAGNOSTIC_ATTACHMENT_SUFFIXES:
@@ -4043,7 +14288,7 @@ def _suppress_unrequested_diagnostic_media_reply(
 ) -> str:
     if not isinstance(reply, str) or not reply.strip():
         return reply
-    artifact_roots = (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))
+    artifact_roots = _artifact_roots_for_delivery(runtime, principal_id)
     suppressed = {str(Path(path).expanduser()) for path in suppress_paths or () if str(path or "").strip()}
 
     def resolve(path: Path) -> Path:
@@ -4088,11 +14333,78 @@ def _suppress_unrequested_diagnostic_media_reply(
     return "\n".join(kept).strip()
 
 
-def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: str | None = None) -> str:
+def _nullion_local_web_port_for_prompt() -> int:
+    for value in (
+        os.environ.get("NULLION_WEB_PORT"),
+        getattr(_load_settings_if_available(), "web_port", None),
+        "8742",
+    ):
+        try:
+            port = int(str(value).strip())
+        except Exception:
+            continue
+        if 0 < port < 65536:
+            return port
+    return 8742
+
+
+def _admin_local_app_targets_prompt(*, principal_id: str | None = None) -> str | None:
+    try:
+        from nullion.connections import principal_has_admin_access
+
+        if not principal_has_admin_access(principal_id):
+            return None
+    except Exception:
+        return None
+    port = _nullion_local_web_port_for_prompt()
+    return (
+        "Admin local app targets:\n"
+        f"- Nullion web app: http://127.0.0.1:{port}/\n"
+        "- For admin/operator principals, browser tools may navigate to that local app target when the user asks "
+        "to inspect or manage Nullion's own web UI and no explicit URL was supplied. Do not expose or use this "
+        "private local target for non-admin principals.\n"
+        "- If an admin/operator asks to change Nullion itself and no dedicated config-write tool is visible, "
+        "do not claim the change is impossible and do not provide only manual setup steps. Tell the user you can "
+        "open the Nullion Web UI and make the change there, then ask for explicit permission before any "
+        "browser/UI mutation.\n"
+        "- For short follow-ups on a Nullion runtime/config topic, use the active task or conversation context to "
+        "resolve the target before asking for missing details; do not demote the Web UI path behind manual file or "
+        "setup instructions.\n"
+        "- Preserve the exact setting target across the permission prompt and follow-up. Before acting, identify "
+        "the UI control and runtime config field that correspond to the requested setting. Do not conflate adjacent "
+        "settings such as the web search provider and the browser preference. Do not report success unless the "
+        "verified visible state or runtime config field matches that exact requested target.\n"
+        "- After the user confirms, request browser/web scope if needed, navigate to the local app target, make "
+        "the requested UI change, and verify the visible or runtime configuration before saying it is done."
+    )
+
+
+def _compact_message_only_delivery_contract_prompt() -> str:
+    return (
+        "Chat delivery contract (message-only turn):\n"
+        "- Reply directly in user-facing chat text. Answer the user's actual question first.\n"
+        "- Prefer compact prose or tight short-line summaries; use bullets only when they improve scanning.\n"
+        "- Keep internal tool names, raw payloads, files, paths, and implementation details out unless the user asked for them.\n"
+        "- If you ask the user to choose from options, include exactly one numbered choice list so numeric replies map clearly.\n"
+        "- Never answer only 'Done', 'OK', or 'Completed'. Include the requested answer or concrete result."
+    )
+
+
+def _chat_delivery_contract_prompt(
+    runtime: PersistentRuntime,
+    *,
+    principal_id: str | None = None,
+    compact_message_only: bool = False,
+) -> str:
+    if compact_message_only:
+        return _compact_message_only_delivery_contract_prompt()
+    admin_local_app_targets_text = _admin_local_app_targets_prompt(principal_id=principal_id)
     cache_key = (
         _chat_runtime_cache_identity(runtime),
         str(principal_id or ""),
         _chat_settings_signature(_load_settings_if_available()),
+        admin_local_app_targets_text or "",
+        "full",
     )
     with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
         if cache_key in _CHAT_STABLE_CONTEXT_CACHE:
@@ -4117,22 +14429,37 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         f"- Legacy artifact directory still supported for older turns: {legacy_artifact_root}\n"
         "- Use pdf_create only when the requested final/output artifact is a PDF, or use pdf_edit when changing an existing PDF. Do not use PDF tools just because PDFs are the source files, search target, or subject of the request.\n"
         "- When deriving artifact rows from web/browser pages, prefer browser_extract_items over browser_snapshot/page dumps. Collect compact per-item row objects from the rendered page, including the row title/text, direct row URL, numeric/text value fields, and image URL when needed. Do not substitute aggregate search, category, navigation, or repeated result-page URLs for row-specific links; continue collecting row data or report the limitation.\n"
-        "- When a typed artifact must embed remote image URLs or page image assets, use browser_image_collect when visible to save local image artifact files first, then pass those local paths to the artifact tool. If direct page collection cannot see rendered image assets, use browser_extract_items first, or browser_run_js on the open browser page to extract compact per-item image URLs, then pass those URLs to browser_image_collect. Do not use terminal_exec for normal web-image materialization.\n"
+        "- When a typed artifact must embed remote image URLs or page image assets, use browser_image_collect when visible to save local image artifact files first, then pass those local paths to the artifact tool. Its default quality_profile=content is for report/document media and rejects tiny icons, placeholders, low-detail assets, and extreme banners; use quality_profile=any only when the structured artifact requirement is intentionally a small logo/icon/low-detail asset. If direct page collection cannot see rendered image assets, use browser_extract_items first, or browser_run_js on the open browser page to extract compact per-item image URLs, then pass those URLs to browser_image_collect. Do not use terminal_exec for normal web-image materialization.\n"
+        "- Do not infer or guess direct remote image asset URLs. For web media, navigate/fetch the source page or use structured page extraction first, then collect image URLs returned by that verified page/tool evidence.\n"
+        "- When a visual PDF, poster, flyer, booklet, playbook, deck, workbook, or HTML artifact needs original visual art and no source image is available, use image_generate when visible and pass the resulting local raster image path into the artifact tool. Otherwise collect a relevant source image with browser/image collection tools when the user asked for research or public-source media. Do not use file_search to reuse unrelated old workspace images as substitute artwork. For Office-style embedded media outputs such as DOCX, PPTX, and XLSX, provide existing local .png, .jpg, or .jpeg image paths that are relevant to the current request or produced in the current turn; do not pass SVG, PPM, HTML, or other vector/text assets as embedded media for those formats. SVG visual assets created with file_write are acceptable for PDF/HTML/vector-friendly outputs, or as separate supporting assets, but not as embedded Office media unless a raster version also exists. If no compatible relevant media path is possible, create a complete text-first layout without empty image frames; do not leave blank placeholder boxes, unlabeled empty bordered panels, or broken image slots. Drawing or writing boxes are acceptable only when clearly labeled as user activity areas.\n"
+        "- For CSV or TSV artifacts, use file_write or spreadsheet_create with a .csv/.tsv output path. For linked/non-self-contained HTML, use file_write with inline_local_html_images=false and disallow_html_data_images=true so images remain sibling file references instead of data URIs.\n"
+        "- For remote files, use file_download to save the URL bytes into the workspace before reading, extracting, or transforming them. For local PDF source files, fetched email attachments, and other source documents, use file_read to extract text before comparing, summarizing, or transforming their contents. If the dedicated read tool cannot extract a local source document and terminal_exec is visible, use terminal_exec as the last-resort local extraction fallback instead of stopping at the downloaded source file. For archives and compressed files, use file_read for inspection, archive_extract for extraction, and archive_create for creating compressed deliverables. archive_extract returns structured extracted-file records plus raw manifest paths; when the user asks for a custom workbook layout, derived filename fields, renamed/reordered columns, formulas, summaries, formatting, or embedded row media, create the final workbook with spreadsheet_create from those structured archive records and local image paths instead of delivering the raw archive manifest. If the archive entries are truncated in tool context, read manifest_json_path before building the final workbook. Do not use terminal_exec for normal download, archive listing, archive extraction, or archive creation when these dedicated tools are visible.\n"
+        "- For external cloud upload destinations, use a matching configured connector/upload tool only. If no matching upload-capable connector is exposed, say there is no direct native connector/access yet and suggest setup, offer Builder to create or save a reusable skill/connector workflow when an associated connector skill can cover the source, or offer the agent-browser login path. Do not use terminal_exec or a generic connector as a fallback for cloud upload.\n"
         "- For typed .docx artifact requirements, use document_create with structured paragraphs, sections, and existing image artifact paths. Do not use terminal_exec for normal document creation.\n"
-        "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, direct row-specific source links, and row-aligned local image artifact paths. Do not use terminal_exec for normal spreadsheet creation.\n"
+        "- For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, direct row-specific source links, and row-aligned local image artifact paths. When the user asks for formulas, set formulas_required=true and include real Excel formula strings beginning with '=' in row values; static calculated numbers or prose about formula assumptions do not satisfy a formula request. When the user asks for charts or conditional formatting, pass structured charts or conditional_formats specs. Do not use terminal_exec for normal spreadsheet creation.\n"
         "- For typed .pptx or slide deck artifact requirements, use presentation_create with structured slides and existing image artifact paths. Do not use terminal_exec for normal presentation creation.\n"
         "- For document-like deliverables such as PDF, DOCX, PPTX, reports, itineraries, and decks, provide structured title/sections/slides/text pages so the artifact tool can produce a readable report-quality layout. Do not deliver raw browser screenshots, loose image attachments, or unformatted text dumps as a substitute for the requested formatted document.\n"
-        "- For all user-facing replies, prefer a clear structured answer over raw notes, tool dumps, or transcript-style output: start with the outcome, group evidence and next steps under short labels, and keep internal tool names/details out unless they are directly useful or the user asked for them.\n"
+        "- When the current request or your structured plan contains multiple separate final deliverables, create every separate deliverable before finalizing. Do not collapse separately named outputs into one file, skip later deliverables, or say the requested files are attached until each planned final artifact exists and is included.\n"
+        "- For all user-facing replies, prefer a clear answer over raw notes, tool dumps, or transcript-style output: start with the outcome, then choose the layout from the content shape. Use compact prose or tight short-line summaries for a few facts; use separated grouped records or short sections for larger result sets; use bullets only when each bullet is a standalone point that improves scanning. Do not force every reply into bullets, and do not use Markdown tables on narrow chat surfaces when grouped records are more readable. When a section heading improves readability, start it with a relevant emoji, wrap the heading text in **bold**, and leave an empty line after the heading. Use platform-friendly **bold** for important labels, names, statuses, and final answers without over-boldening whole paragraphs. Keep internal tool names/details out unless they are directly useful or the user asked for them. Do not begin final chat replies with tool execution status; activity cards already show tool progress.\n"
+        "- When tools return records for a user question, answer the user's actual question first. If the records are relevant evidence but do not prove the requested answer, say that directly before listing or summarizing records. Do not substitute a list of matching messages, events, files, search results, or connector rows for the answer.\n"
+        "- If you ask the user to choose from options, include exactly one numbered choice list in the reply. Recommendations, explanatory steps, and evidence may still be included, but format them as bullets or prose so numeric replies always map to one clear selectable list.\n"
+        "- Instruction precedence for user-facing behavior: follow the user's current-turn request first; when it does not conflict, durable user preferences and Known user memory override generic defaults, profile hints, and examples. Do not let stale memory or prior chat context override a clear current request.\n"
         "- User preferences and explicit requested formats override the default reply style. If the user asks for raw output, terse output, JSON, a table, prose, or another specific style, follow that format while still protecting secrets and internal-only state.\n"
         "- For ordinary saved files, use this user's workspace file folder.\n"
         f"{workspace_storage_text}\n"
         + (f"{workspace_registry_text}\n" if workspace_registry_text else "")
+        + (f"{admin_local_app_targets_text}\n" if admin_local_app_targets_text else "")
         + (
         "- Do not write deliverable files under arbitrary folders.\n"
         "- Do not create helper scripts, diagnostic scripts, or source-code files unless the user explicitly asks you to create code.\n"
         "- For read-only diagnostics, inspect with read-only commands and return the findings in chat instead of writing helper files.\n"
         "- When inspecting local files, search the narrowest concrete folder available; do not recursively scan the system root or the user's home folder.\n"
+        "- Do not treat workspace file search as a substitute for local computer actions. If the user asks to inspect or change installed software, packages, services, processes, shells, environment variables, or PATH-level state, use the safest exact local-system capability available, usually terminal_exec with approval when no narrower tool exists.\n"
+        "- If a tool only finds candidates, previews, or metadata, continue with its registered continuation tool or the next safe structured capability before finalizing. Search/list is not enough when the user asked to open, read, update, run, send, attach, schedule, or otherwise act on the target.\n"
+        "- Do not end a turn by saying a registered tool is unavailable while request_tool_scope is visible. Request the matching scope, use the resulting tool ladder, and only report unavailability after the scoped tool itself returns a concrete failure or denial.\n"
+        "- If a repeatable workflow required local shell fallback or connector setup, Builder may propose or save a reusable skill/workflow for future turns. A saved skill is a reusable procedure, not write/delete permission; modifying or deleting user data still requires explicit confirmation or an approval flow.\n"
         "- When the needed detail may be in earlier turns of this same conversation but is not visible in the prompt context, request conversation_history scope and use chat_history_search before asking the user to resend it.\n"
+        "- For browser shopping or cart work, treat prior screenshot, attachment, or conversation-derived merchant and item names as target evidence. Reuse the active browser session when available, search or open pages using those exact known names, and continue through reasonable page-discovery attempts before asking the user for a direct link. Adding requested items to a cart is allowed; do not submit checkout, payment, purchase, booking, or order placement without explicit approval.\n"
         "- Do not say the chat platform cannot attach files. Nullion will attach completed artifact files after your turn.\n"
         "- Use scheduler tools for scheduled-task listing, updates, and manual runs. Do not inspect or mutate the cron database with terminal_exec to perform scheduler operations.\n"
         "- Never answer only 'Done', 'OK', or 'Completed'. Always include the requested answer, file status, or concrete result.\n"
@@ -4141,6 +14468,112 @@ def _chat_delivery_contract_prompt(runtime: PersistentRuntime, *, principal_id: 
         )
     _chat_stable_context_cache_set(cache_key, caps_text, db_path=_chat_runtime_cache_db_path(runtime))
     return caps_text
+
+
+def _extract_direct_model_text(response: object) -> str:
+    try:
+        from nullion.turn_dispatch_graph import _text_from_model_response
+
+        text = str(_text_from_model_response(response) or "").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    if not isinstance(response, dict):
+        return ""
+    content = response.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+    return ""
+
+
+def _plain_no_tool_direct_model_reply(
+    *,
+    model_client: object | None,
+    prompt: str,
+    memory_context: str | None,
+    conversation_context: str | None,
+    capability_context: str | None = None,
+) -> str | None:
+    if model_client is None:
+        return None
+    create = getattr(model_client, "create", None)
+    if not callable(create):
+        return None
+    system_parts = [
+        _compact_message_only_delivery_contract_prompt(),
+        (
+            "No tools are available for this first-pass reply. Answer directly when the current message can be "
+            "handled as ordinary chat. If the current message requires a hidden scoped capability described in "
+            "the structured inventory below, emit the inventory's structured tool_request directive before any "
+            "user-facing explanation so the runtime can retry with the scoped tools. If no matching capability "
+            "exists and the turn requires live account data, browser/web state, files, scheduler state, "
+            "attachments, generated media, live changing facts, or a local system action, say what is missing in "
+            "one short sentence; the runtime may retry with scoped tools."
+        ),
+    ]
+    if capability_context:
+        system_parts.append(f"Structured capability inventory:\n{_trim_context_text(capability_context, 3500)}")
+    if memory_context:
+        system_parts.append(f"Known user memory:\n{_trim_context_text(memory_context, 2000)}")
+    if conversation_context:
+        system_parts.append(f"Recent conversation:\n{_trim_context_text(conversation_context, 2000)}")
+    try:
+        profiled_client = _model_client_with_interactive_fast_profile(model_client) or model_client
+        response = profiled_client.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            tools=[],
+            max_tokens=450,
+            system="\n\n".join(system_parts),
+            timeout=12,
+        )
+    except Exception:
+        logger.debug("Plain no-tool direct model reply failed; falling back to orchestrator", exc_info=True)
+        return None
+    text = _extract_direct_model_text(response)
+    return text or None
+
+
+def _should_use_plain_no_tool_direct_model_reply(
+    *,
+    fast_profile_candidate: bool,
+    active_tool_registry: object,
+    allow_mini_agents: bool,
+    planner_requested: bool,
+    normalized_attachments: Iterable[object],
+    requested_attachment_extensions: Iterable[str],
+    required_embedded_media_extensions: Iterable[str],
+    reply_context_prompt: str | None,
+    numbered_option_context: str | None,
+    recent_tool_context: str | None,
+    automatic_history_context: str | None,
+    compact_followup_guard: str | None,
+) -> bool:
+    if not _messaging_feature_enabled("NULLION_MESSAGING_PLAIN_DIRECT_MODEL_ENABLED", default=False):
+        return False
+    if not fast_profile_candidate or allow_mini_agents or planner_requested:
+        return False
+    if (
+        tuple(normalized_attachments)
+        or tuple(requested_attachment_extensions)
+        or tuple(required_embedded_media_extensions)
+        or reply_context_prompt
+        or numbered_option_context
+        or recent_tool_context
+        or automatic_history_context
+        or compact_followup_guard
+    ):
+        return False
+    try:
+        return not bool(active_tool_registry.list_tool_definitions())
+    except Exception:
+        return False
 
 
 def _load_settings_if_available() -> object | None:
@@ -4159,11 +14592,21 @@ def _chat_capability_inventory_prompt(
 ) -> str | None:
     if tool_registry is None:
         tool_registry = getattr(runtime, "active_tool_registry", None)
+    active_connector_context = active_connector_provider_context_snapshot()
+    try:
+        from nullion import turn_context_policy as _turn_context_policy
+
+        live_connector_context = tuple(_turn_context_policy._active_connector_provider_context() or ())
+    except Exception:
+        live_connector_context = ()
+    if live_connector_context:
+        active_connector_context = live_connector_context
     cache_key = (
         _chat_runtime_cache_identity(runtime),
         _chat_tool_registry_signature(tool_registry),
         _chat_settings_signature(_load_settings_if_available()),
         _chat_installed_dependency_signature(runtime),
+        _chat_freeze_for_cache(active_connector_context),
     )
     with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
         if cache_key in _CHAT_STABLE_CONTEXT_CACHE:
@@ -4188,6 +14631,9 @@ def _chat_capability_inventory_prompt(
         dependency_text = format_installed_dependency_context(runtime)
         if dependency_text:
             caps_text = (caps_text + "\n\n" + dependency_text).strip() if caps_text else dependency_text
+        active_connector_text = format_active_connector_provider_context_for_prompt(active_connector_context)
+        if active_connector_text:
+            caps_text = (caps_text + "\n\n" + active_connector_text).strip() if caps_text else active_connector_text
     except Exception:
         logger.debug("Could not build chat capability inventory prompt", exc_info=True)
         return None
@@ -4197,18 +14643,50 @@ def _chat_capability_inventory_prompt(
         "Live capability inventory:\n"
         "Use only the tools registered in this turn. When request_tool_scope is visible and the exact "
         "tool family needed for the user's request is not yet visible, call request_tool_scope first, then "
-        "continue with the newly registered tools. Do not tell the user you cannot use a browser, shell, "
+        "continue with the newly registered tools. When no tools are visible in this first pass but this "
+        "inventory shows that the needed live capability exists behind scoped tools, emit exactly one structured "
+        'directive before any user-facing explanation: <tool_request>{"tool":"request_tool_scope","data":{'
+        '"capabilities":["<scope-capability>"],"source_user_requested":true,'
+        '"connector_app_ids":["<active-app-id>"],"tool_names":["<registered-tool-name>"]}}</tool_request>. '
+        "For scheduler work use scheduler_read, scheduler_run, or scheduler_mutate as the capability and include "
+        "registered scheduler tool names such as list_crons, run_cron, toggle_cron, create_cron, update_cron, or delete_cron. "
+        "For local system work use local_shell with terminal_exec when registered. For account sources use connector "
+        "with active app ids and typed read tools from the inventory. Omit connector_app_ids when the scope is not a connector. "
+        "Replace placeholder values with matching structured runtime facts from this inventory; use JSON lists, not prose. The runtime will "
+        "retry with those tools visible, so do not finalize with an unavailability answer first. Do not tell the user you cannot use a browser, shell, "
         "scheduler, calendar, email, connector, weather, image, or file capability merely because the exact "
         "tool is not currently visible; request the matching scope first. Use the strongest safe ladder for "
+        "live, changing facts such as weather, public site state, account records, calendars, scheduler state, "
+        "or generated media. Profile/default-location memory may supply parameters such as location, but it is "
+        "not evidence for live conditions; request and use the matching live tool before answering. Use the strongest safe ladder for "
         "the job. When set_reminder, list_reminders, delete_reminder, or update_reminder is registered in "
         "the current turn, use those tools for one-off reminder creation, inspection, cancellation, or changes; "
         "do not say reminders are unavailable while those tools are callable. Use list_reminders before "
         "delete_reminder or update_reminder when the task_id is not already known. Use current reminder tool "
-        "results as the source of truth over saved chat-history references. Use the strongest safe ladder for "
+        "results as the source of truth over saved chat-history references. For requests to configure, create, "
+        "change, cancel, or otherwise set up recurring or future scheduled work, request scheduler mutation scope "
+        "and use the scheduler tools first. Treat any web, research, document, spreadsheet, presentation, PDF, "
+        "HTML, image, or other artifact production described for that future scheduled job as job instructions, "
+        "not work to perform during setup. Do not request browser, local file, shell, or artifact tools only "
+        "because the future scheduled job will need them. Use the strongest safe ladder for "
         "the job: configured provider or connector when it has the needed auth, then dedicated structured tools, "
         "then reusable Python-backed local tools/helpers, then registered local shell execution when no external auth is required, and only then setup "
         "guidance. If a capability-specific tool is unavailable or fails after scope request, fall back to "
-        "registered core tools when they can still complete the task locally. Browser tools may be used when "
+        "registered core tools when they can still complete the task locally. Use terminal_exec as the final "
+        "fallback only for local machine/file/document extraction or local system work that does not require "
+        "external account authorization; do not use it to bypass scheduler/account tools, connected-cloud writes, "
+        "or approval boundaries. If the local fallback is repeatable, Builder may create or reuse a skill/workflow, "
+        "but write/delete operations still require explicit user confirmation. For account-evidence requests where "
+        "the exact source is not already known, request connector scope to discover active authorized sources; if "
+        "the result says source_selection_required, ask the user to choose from numbered source options before "
+        "reading account data. Do not pick email, calendar, a generic connector, or another account source only "
+        "from a vague objective. State which source types are available or unavailable. When a read-only external account "
+        "tool is already visible, use it for the account check before asking the user to choose generic options; "
+        "if the tool needs a time window and the user did not provide one, choose a conservative near-term default "
+        "window and state the window in the answer. When a final artifact must contain images, screenshots, generated visuals, "
+        "or other media inside the file itself, request embedded_media_artifact_extensions through request_tool_scope for "
+        "the matching final suffix; artifact_extensions alone only means that file type is required. Answer the user's actual question first; do not substitute "
+        "a list of matching messages, events, files, search results, or connector rows for the answer. Browser tools may be used when "
         "the user can log in or the target is public; "
         "if the needed answer may already be in this same conversation but is outside the visible history, "
         "request conversation_history and use chat_history_search before asking the user to repeat details; "
@@ -4216,7 +14694,8 @@ def _chat_capability_inventory_prompt(
         "rough estimate or saying live checking is unavailable. "
         "terminal tools may be used for local command-line paths when registered and approved. If every "
         "tool path is blocked, suggest concrete next steps such as connecting the provider, installing or "
-        "enabling the matching skill, logging in through the agent browser, or providing a public target. "
+        "enabling the matching skill, asking Builder to create or save a reusable skill/workflow, logging in "
+        "through the agent browser, or providing a public target. "
         "If a browser fallback reaches a sign-in page, explicitly offer the agent-browser login path "
         "instead of only asking for more identifiers. External account connections are references, not raw "
         "credentials.\n\n"
@@ -4232,62 +14711,292 @@ def _artifact_paths_from_tool_results(
     *,
     include_search_matches: bool = False,
     include_file_write: bool = True,
+    requested_extensions: Iterable[str] | None = None,
 ) -> list[str]:
+    completed_results = [
+        result
+        for result in tool_results or ()
+        if normalize_tool_status(_tool_result_status(result)) == "completed"
+    ]
+    has_deliverable_descriptors = any(
+        artifact_paths_from_output_descriptors(
+            dict(_tool_result_output(result)),
+            roles=ARTIFACT_DELIVERY_ROLES,
+        )
+        for result in completed_results
+    )
+    scoped_required_extensions = (
+        set(_required_attachment_extensions_from_tool_scope(completed_results))
+        if _tool_scope_declared_attachment_extensions(completed_results)
+        else set()
+    )
+    sidecar_requested_extensions = {
+        *scoped_required_extensions,
+        *_normalized_requested_extensions(requested_extensions),
+    }
+    consumed_file_write_paths = _consumed_file_write_artifact_paths(completed_results)
     paths: list[str] = []
     search_match_paths: list[str] = []
     completed_email_attachment_paths = {
         str(Path(path).expanduser())
         for result in tool_results or ()
-        if result.tool_name == "email_send" and normalize_tool_status(result.status) == "completed"
-        for path in _string_paths_from_value((result.output if isinstance(result.output, dict) else {}).get("attachment_paths"))
+        if _tool_result_name(result) == "email_send" and normalize_tool_status(_tool_result_status(result)) == "completed"
+        for path in _string_paths_from_value(_tool_result_output(result).get("attachment_paths"))
     }
-    for result in tool_results or ():
-        if normalize_tool_status(result.status) != "completed":
+    for result in completed_results:
+        output = _tool_result_output(result)
+        tool_name = _tool_result_name(result)
+        if tool_name == "browser_screenshot":
             continue
-        output = result.output if isinstance(result.output, dict) else {}
-        if result.tool_name == "browser_screenshot":
+        if tool_name == "terminal_exec" and _terminal_artifact_paths_are_stdout_discovery(output):
             continue
-        if result.tool_name == "email_send":
+        if _last_mile_spreadsheet_result_is_partial(result, completed_results):
+            continue
+        if output_has_artifact_descriptors(output):
+            paths.extend(artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES))
+            continue
+        if has_deliverable_descriptors and tool_name not in _STRUCTURED_ARTIFACT_PATH_TOOLS:
+            if not (tool_name == "file_write" and scoped_required_extensions):
+                continue
+        if has_deliverable_descriptors and tool_name == "file_write" and not scoped_required_extensions:
+            continue
+        if tool_name == "email_send":
             for path in _string_paths_from_value(output.get("attachment_paths")):
                 paths.append(path)
-        if result.tool_name == "file_write" and include_file_write:
+        if tool_name == "file_write" and include_file_write:
             path = output.get("path")
             if isinstance(path, str) and path.strip():
+                if _path_matches_identity_set(path, consumed_file_write_paths):
+                    continue
                 if completed_email_attachment_paths and _is_email_delivery_confirmation_artifact(path):
                     continue
+                if (
+                    scoped_required_extensions
+                    and Path(path).suffix.lower() not in scoped_required_extensions
+                ):
+                    continue
                 paths.append(path)
-        if result.tool_name == "image_generate":
+        if tool_name == "image_generate":
             for key in ("path", "output_path"):
                 path = output.get(key)
                 if isinstance(path, str) and path.strip():
                     paths.append(path)
-        if result.tool_name == "file_search":
-            matches = output.get("matches")
-            if isinstance(matches, (list, tuple)):
-                for match in matches:
-                    if isinstance(match, str) and match.strip():
-                        search_match_paths.append(match)
-                        continue
-                    if isinstance(match, dict):
-                        candidate = match.get("path")
-                        if isinstance(candidate, str) and candidate.strip():
-                            search_match_paths.append(candidate)
-        if result.tool_name == "terminal_exec" and _terminal_artifact_paths_are_stdout_discovery(output):
+        if tool_name in _STRUCTURED_ARTIFACT_PATH_TOOLS:
+            for key in ("path", "output_path"):
+                path = output.get(key)
+                if not isinstance(path, str) or not path.strip():
+                    continue
+                if Path(path).suffix.lower() in VALID_ATTACHMENT_EXTENSIONS:
+                    paths.append(path)
+        if tool_name == "file_search":
+            search_match_paths.extend(_file_search_match_paths_from_output(output))
+        if tool_name == "terminal_exec" and _terminal_artifact_paths_are_stdout_discovery(output):
             continue
         for key in ("artifact_path",):
             value = output.get(key)
             if isinstance(value, str) and value.strip():
+                if (
+                    tool_name == "file_write"
+                    and _path_matches_identity_set(value, consumed_file_write_paths)
+                ):
+                    continue
+                if (
+                    tool_name == "file_write"
+                    and scoped_required_extensions
+                    and Path(value).suffix.lower() not in scoped_required_extensions
+                ):
+                    continue
                 paths.append(value)
         for key in ("artifact_paths", "artifacts"):
             values = output.get(key)
             if isinstance(values, (list, tuple)):
-                paths.extend(value for value in values if isinstance(value, str) and value.strip())
-    if include_search_matches and not paths and search_match_paths:
+                paths.extend(
+                    value
+                    for value in values
+                    if isinstance(value, str)
+                    and value.strip()
+                    and not (
+                        tool_name == "file_write"
+                        and _path_matches_identity_set(value, consumed_file_write_paths)
+                    )
+                )
+    if scoped_required_extensions and search_match_paths:
+        paths.extend(
+            path
+            for path in search_match_paths
+            if Path(str(path or "")).suffix.lower() in scoped_required_extensions
+        )
+    elif include_search_matches and not paths and search_match_paths:
         paths.extend(search_match_paths)
+    if paths:
+        paths = [
+            path
+            for path in paths
+            if not is_unrequested_internal_sidecar_artifact(
+                path,
+                requested_extensions=sidecar_requested_extensions,
+            )
+        ]
     return list(dict.fromkeys(paths))
 
 
-def _pathlike_lines_from_text(text: object) -> tuple[str, ...]:
+def _iter_nested_string_values(value: object, *, limit: int = 200) -> tuple[str, ...]:
+    strings: list[str] = []
+
+    def visit(item: object) -> None:
+        if len(strings) >= limit:
+            return
+        if isinstance(item, str):
+            if item.strip():
+                strings.append(item.strip())
+            return
+        if isinstance(item, Mapping):
+            for nested in item.values():
+                visit(nested)
+                if len(strings) >= limit:
+                    return
+            return
+        if isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+                if len(strings) >= limit:
+                    return
+
+    visit(value)
+    return tuple(strings)
+
+
+def _path_reference_identity_variants(value: object) -> tuple[str, ...]:
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    candidates: list[str] = []
+    try:
+        parsed = urlparse(text)
+        if parsed.scheme == "file" and parsed.path:
+            candidates.append(unquote(parsed.path))
+    except Exception:
+        pass
+    candidates.append(text)
+    variants: list[str] = []
+    for candidate in candidates:
+        variants.extend(_path_identity_variants(candidate))
+    return tuple(dict.fromkeys(variants))
+
+
+def _consumed_file_write_artifact_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    results = list(tool_results or ())
+    consumed: set[str] = set()
+    for index, result in enumerate(results):
+        if _tool_result_name(result) != "file_write":
+            continue
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        path = output.get("path") or output.get("artifact_path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        identities = set(_path_identity_variants(path))
+        if not identities:
+            continue
+        for later in results[index + 1 :]:
+            if normalize_tool_status(_tool_result_status(later)) != "completed":
+                continue
+            if _tool_result_name(later) not in {"browser_navigate", "browser_open"}:
+                continue
+            references = {
+                identity
+                for value in _iter_nested_string_values(_tool_result_output(later))
+                for identity in _path_reference_identity_variants(value)
+            }
+            if identities & references:
+                consumed.update(identities)
+                break
+    return consumed
+
+
+def _non_deliverable_artifact_descriptor_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    paths: set[str] = set()
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        descriptors = output.get("artifact_descriptors")
+        if not isinstance(descriptors, (list, tuple)):
+            continue
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                continue
+            role = descriptor.get("role")
+            if isinstance(role, str) and role in ARTIFACT_DELIVERY_ROLES:
+                continue
+            path = descriptor.get("path")
+            if isinstance(path, str) and path.strip():
+                paths.add(str(Path(path).expanduser()))
+    return paths
+
+
+_FILE_SEARCH_PREVIEW_PATH_RE = re.compile(r'"path"\s*:\s*"((?:\\.|[^"\\])*)"')
+_BARE_FILENAME_LISTING_RE = re.compile(r"^[^\s/\\\x00]{1,255}\.[A-Za-z0-9]{1,16}$")
+_RELATIVE_PATH_LISTING_RE = re.compile(r"^(?![A-Za-z][A-Za-z0-9+.-]*:)[^\s\x00]{1,512}\.[A-Za-z0-9]{1,16}$")
+_TERMINAL_STDOUT_ATTACHMENT_PATH_RE = re.compile(
+    r"(?<![\w./~-])(?P<path>(?:~|/)[^\s`'\"<>]+?\.[A-Za-z0-9]{1,16})(?![\w/-])"
+)
+
+
+def _file_search_match_paths_from_output(output: dict[str, object]) -> tuple[str, ...]:
+    paths: list[str] = []
+
+    def collect_from_payload(payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        matches = payload.get("matches")
+        if isinstance(matches, (list, tuple)):
+            for match in matches:
+                if isinstance(match, str) and match.strip():
+                    paths.append(match)
+                    continue
+                if isinstance(match, dict):
+                    candidate = match.get("path")
+                    if isinstance(candidate, str) and candidate.strip():
+                        paths.append(candidate)
+        match_details = payload.get("match_details")
+        if isinstance(match_details, (list, tuple)):
+            for match in match_details:
+                if not isinstance(match, dict):
+                    continue
+                candidate = match.get("path")
+                if isinstance(candidate, str) and candidate.strip():
+                    paths.append(candidate)
+
+    collect_from_payload(output)
+    preview = output.get("preview")
+    if isinstance(preview, str) and preview.strip():
+        try:
+            parsed_preview = json.loads(preview)
+        except Exception:
+            parsed_preview = None
+        collect_from_payload(parsed_preview)
+        for match in _FILE_SEARCH_PREVIEW_PATH_RE.finditer(preview):
+            encoded = match.group(1)
+            try:
+                decoded = json.loads(f'"{encoded}"')
+            except Exception:
+                decoded = encoded
+            if isinstance(decoded, str) and decoded.strip():
+                paths.append(decoded)
+    return tuple(dict.fromkeys(paths))
+
+
+def _pathlike_lines_from_text(
+    text: object,
+    *,
+    allow_bare_filenames: bool = False,
+) -> tuple[str, ...]:
     paths: list[str] = []
     for raw_line in str(text or "").splitlines():
         candidate = raw_line.strip().strip("`'\"<>")
@@ -4298,7 +15007,27 @@ def _pathlike_lines_from_text(text: object) -> tuple[str, ...]:
         expanded = Path(candidate).expanduser()
         if candidate.startswith(("~", "/", "file:")) or expanded.is_absolute():
             paths.append(candidate.removeprefix("file:"))
+        elif allow_bare_filenames and _BARE_FILENAME_LISTING_RE.match(candidate):
+            paths.append(candidate)
+        elif (
+            allow_bare_filenames
+            and ("/" in candidate or "\\" in candidate)
+            and _RELATIVE_PATH_LISTING_RE.match(candidate)
+        ):
+            paths.append(candidate)
     return tuple(dict.fromkeys(paths))
+
+
+def _terminal_stdout_is_path_listing(output: dict[str, object]) -> bool:
+    stdout = str(output.get("stdout") or "")
+    stderr = str(output.get("stderr") or "").strip()
+    if stderr:
+        return False
+    lines = [line.strip().strip("`'\"<>") for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return False
+    path_lines = _pathlike_lines_from_text(stdout, allow_bare_filenames=True)
+    return len(path_lines) == len(lines)
 
 
 def _terminal_artifact_paths_are_stdout_discovery(output: dict[str, object]) -> bool:
@@ -4325,21 +15054,51 @@ def _local_discovery_paths_from_tool_results(
 ) -> tuple[str, ...]:
     paths: list[str] = []
     for result in tool_results or ():
-        if normalize_tool_status(result.status) != "completed":
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
             continue
-        output = result.output if isinstance(result.output, dict) else {}
-        if result.tool_name == "file_search":
-            matches = output.get("matches")
-            if isinstance(matches, (list, tuple)):
-                for match in matches:
-                    if isinstance(match, str) and match.strip():
-                        paths.append(match)
-                    elif isinstance(match, dict):
-                        candidate = match.get("path")
-                        if isinstance(candidate, str) and candidate.strip():
-                            paths.append(candidate)
-        elif result.tool_name == "terminal_exec":
-            paths.extend(_pathlike_lines_from_text(output.get("stdout")))
+        output = _tool_result_output(result)
+        tool_name = _tool_result_name(result)
+        if tool_name == "file_search":
+            paths.extend(_file_search_match_paths_from_output(output))
+        elif tool_name == "terminal_exec" and _terminal_stdout_is_path_listing(output):
+            paths.extend(_pathlike_lines_from_text(output.get("stdout"), allow_bare_filenames=True))
+    return tuple(dict.fromkeys(paths))
+
+
+def _generated_local_discovery_alias_cleanup_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    discovery_paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not discovery_paths:
+        return ()
+    discovery_identities = {
+        identity
+        for path in discovery_paths
+        for identity in _path_identity_variants(path)
+    }
+    paths: list[str] = []
+    for result in tool_results or ():
+        if _tool_result_name(result) != "file_write":
+            continue
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        if output.get("requested_filename_alias") is not True:
+            continue
+        source_paths = tuple(
+            dict.fromkeys(
+                _string_paths_from_value(output.get("source_path"))
+                + _string_paths_from_value(output.get("source_paths"))
+            )
+        )
+        if not source_paths:
+            continue
+        if all(_path_matches_identity_set(path, discovery_identities) for path in source_paths):
+            continue
+        paths.extend(source_paths)
+        for key in ("path", "artifact_path", "artifact_paths", "artifacts"):
+            paths.extend(_string_paths_from_value(output.get(key)))
     return tuple(dict.fromkeys(paths))
 
 
@@ -4356,14 +15115,518 @@ def _terminal_stdout_discovery_paths_from_tool_results(
     return tuple(dict.fromkeys(paths))
 
 
+def _normalized_requested_extensions(
+    requested_extensions: Iterable[str] | None,
+) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for raw_extension in requested_extensions or ():
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+def _terminal_stdout_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    requested_extensions: tuple[str, ...] | list[str] | None,
+    requested_filenames: Iterable[str] = (),
+    artifact_roots: tuple[Path, ...],
+) -> tuple[str, ...]:
+    normalized_extensions = set(_normalized_requested_extensions(requested_extensions))
+    normalized_requested_filenames = {
+        str(name or "").strip().lower()
+        for name in requested_filenames
+        if str(name or "").strip()
+    }
+    resolved_roots: list[Path] = []
+    for root in artifact_roots:
+        try:
+            resolved_roots.append(Path(root).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+    if not resolved_roots:
+        return ()
+    paths: list[str] = []
+    for result in tool_results or ():
+        if _tool_result_name(result) != "terminal_exec" or normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        stdout = output.get("stdout")
+        if not isinstance(stdout, str) or not stdout.strip():
+            continue
+        if _terminal_stdout_is_path_listing(output) and not normalized_requested_filenames:
+            continue
+        for match in _TERMINAL_STDOUT_ATTACHMENT_PATH_RE.finditer(stdout):
+            raw_path = match.group("path").strip().rstrip(".,;:)]}")
+            if not raw_path:
+                continue
+            path = Path(raw_path).expanduser()
+            suffix = path.suffix.lower()
+            if suffix not in VALID_ATTACHMENT_EXTENSIONS:
+                continue
+            if normalized_requested_filenames and path.name.lower() not in normalized_requested_filenames:
+                continue
+            if normalized_extensions and suffix not in normalized_extensions:
+                continue
+            try:
+                resolved_path = path.resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if not any(resolved_path.is_relative_to(root) for root in resolved_roots):
+                continue
+            try:
+                if not resolved_path.is_file() or resolved_path.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            paths.append(str(resolved_path))
+    return tuple(dict.fromkeys(paths))
+
+
+def _last_mile_materialized_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        if output.get("last_mile_materialized") is not True:
+            continue
+        for key in ("artifact_path", "artifact_paths", "artifacts"):
+            paths.extend(_string_paths_from_value(output.get(key)))
+    return tuple(dict.fromkeys(paths))
+
+
 def _has_local_discovery_tool_results(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> bool:
     return any(
         normalize_tool_status(result.status) == "completed"
-        and result.tool_name in {"file_search", "file_read", "workspace_summary", "terminal_exec"}
+        and result.tool_name in {"file_search", "file_read", "workspace_summary"}
         for result in tool_results or ()
     )
+
+
+_LOCAL_DISCOVERY_SUMMARY_TOOLS = frozenset({"file_search", "file_read", "workspace_summary", "request_tool_scope"})
+
+
+def _completed_tools_are_only_local_discovery(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    saw_completed = False
+    for result in tool_results or ():
+        if normalize_tool_status(result.status) != "completed":
+            continue
+        saw_completed = True
+        if result.tool_name in _LOCAL_DISCOVERY_SUMMARY_TOOLS:
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name == "terminal_exec" and _terminal_stdout_is_path_listing(output):
+            continue
+        return False
+    return saw_completed
+
+
+def _completed_tools_are_only_local_discovery_or_file_write(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    saw_completed = False
+    for result in tool_results or ():
+        if normalize_tool_status(result.status) != "completed":
+            continue
+        saw_completed = True
+        if result.tool_name in {"file_write", "file_patch"}:
+            continue
+        if result.tool_name in _LOCAL_DISCOVERY_SUMMARY_TOOLS:
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name == "terminal_exec" and _terminal_stdout_is_path_listing(output):
+            continue
+        return False
+    return saw_completed
+
+
+def _completed_terminal_exec_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[ToolResult, ...]:
+    return tuple(
+        result
+        for result in tool_results or ()
+        if result.tool_name == "terminal_exec" and normalize_tool_status(result.status) == "completed"
+    )
+
+
+def _terminal_exec_has_substantive_output(result: ToolResult) -> bool:
+    output = result.output if isinstance(result.output, dict) else {}
+    if _terminal_stdout_is_path_listing(output):
+        return False
+    stdout = str(output.get("stdout") or "").strip()
+    stderr = str(output.get("stderr") or "").strip()
+    if stdout or stderr:
+        return True
+    return "exit_code" in output or "returncode" in output
+
+
+def _substantive_terminal_exec_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[ToolResult, ...]:
+    return tuple(result for result in _completed_terminal_exec_results(tool_results) if _terminal_exec_has_substantive_output(result))
+
+
+def _compact_terminal_exec_output_text(
+    result: ToolResult,
+    *,
+    max_chars: int = 3200,
+) -> str:
+    output = result.output if isinstance(result.output, dict) else {}
+    stdout = str(output.get("stdout") or "").strip()
+    stderr = str(output.get("stderr") or "").strip()
+    exit_code = output.get("exit_code", output.get("returncode"))
+    parts: list[str] = []
+    if stdout:
+        parts.append(stdout)
+    if stderr:
+        parts.append(f"stderr:\n{stderr}")
+    if not parts and exit_code is not None:
+        parts.append(f"Command completed with exit code {exit_code}.")
+    text = "\n\n".join(parts).strip()
+    text = _format_terminal_exec_output_for_chat(text)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n..."
+
+
+def _format_terminal_exec_output_for_chat(text: str) -> str:
+    lines = [line.rstrip() for line in str(text or "").splitlines()]
+    meaningful = [line for line in lines if line.strip()]
+    if len(meaningful) <= 1:
+        return str(text or "").strip()
+    if text.lstrip().startswith(("{", "[")):
+        return str(text or "").strip()
+    return "\n".join(f"- {line.strip()};" for line in meaningful)
+
+
+def _format_terminal_size_bytes(value: object) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "unknown size"
+    if not math.isfinite(size) or size < 0:
+        return "unknown size"
+    units = ("bytes", "KB", "MB", "GB", "TB")
+    unit_index = 0
+    while size >= 1000 and unit_index < len(units) - 1:
+        size /= 1000
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} bytes"
+    if size >= 10:
+        return f"{size:.0f} {units[unit_index]}"
+    return f"{size:.1f} {units[unit_index]}"
+
+
+def _terminal_filesystem_record_path(record: Mapping[str, object]) -> str:
+    for key in ("path", "directory", "dir", "folder", "file_path"):
+        value = record.get(key)
+        if value is None:
+            continue
+        path = str(value).strip()
+        if path:
+            return path
+    return ""
+
+
+def _terminal_filesystem_record_numeric_value(record: Mapping[str, object], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        if key not in record:
+            continue
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number) or number < 0:
+            continue
+        return int(number)
+    return None
+
+
+def _terminal_exec_filesystem_records(result: ToolResult) -> tuple[dict[str, object], ...]:
+    output = result.output if isinstance(result.output, dict) else {}
+    stdout = str(output.get("stdout") or "").strip()
+    if not stdout:
+        return ()
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, ValueError):
+        return ()
+
+    records: list[dict[str, object]] = []
+
+    def _collect(value: object, *, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, dict):
+            path_value = _terminal_filesystem_record_path(value)
+            size_value = _terminal_filesystem_record_numeric_value(
+                value,
+                ("size_bytes", "total_bytes", "bytes", "byte_count"),
+            )
+            count_value = _terminal_filesystem_record_numeric_value(
+                value,
+                ("count", "item_count", "items", "entries", "file_count"),
+            )
+            if path_value and (size_value is not None or count_value is not None):
+                normalized: dict[str, object] = dict(value)
+                normalized["path"] = path_value
+                if size_value is not None:
+                    normalized["size_bytes"] = size_value
+                if count_value is not None:
+                    normalized["count"] = count_value
+                records.append(normalized)
+                return
+            for nested in value.values():
+                if isinstance(nested, (dict, list, tuple)):
+                    _collect(nested, depth=depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _collect(item, depth=depth + 1)
+
+    _collect(payload)
+    return tuple(records)
+
+
+def _terminal_filesystem_record_sort_size(record: Mapping[str, object]) -> int:
+    return _terminal_filesystem_record_numeric_value(
+        record,
+        ("size_bytes", "total_bytes", "bytes", "byte_count"),
+    ) or 0
+
+
+def _terminal_filesystem_record_item_count(record: Mapping[str, object]) -> int | None:
+    return _terminal_filesystem_record_numeric_value(
+        record,
+        ("count", "item_count", "items", "entries", "file_count"),
+    )
+
+
+def _terminal_filesystem_path_parts(path: object) -> tuple[str, ...]:
+    normalized = str(path or "").replace("\\", "/").casefold()
+    return tuple(part for part in normalized.split("/") if part)
+
+
+def _terminal_filesystem_path_contains_cache(parts: tuple[str, ...]) -> bool:
+    if any("cache" in part for part in parts):
+        return True
+    cache_tool_dirs = {
+        ".npm",
+        ".pnpm",
+        ".yarn",
+        ".gradle",
+        ".m2",
+        ".cargo",
+        ".rustup",
+        ".nuget",
+        "node-gyp",
+        "codex-runtimes",
+        "huggingface",
+    }
+    return any(part in cache_tool_dirs for part in parts)
+
+
+def _terminal_filesystem_record_bucket(path: object) -> str:
+    parts = _terminal_filesystem_path_parts(path)
+    if not parts:
+        return "review"
+    if any(part in {".trash", "trash"} for part in parts):
+        return "trash"
+    if _terminal_filesystem_path_contains_cache(parts):
+        return "cache"
+    if any(part in {"logs", "log", "crashreporter", "crash reports"} for part in parts):
+        return "logs"
+    if any(part in {"tmp", "temp", "temporaryitems", "temporary items"} for part in parts):
+        return "temp"
+    return "review"
+
+
+def _terminal_filesystem_record_note(path: object, *, bucket: str) -> str:
+    parts = _terminal_filesystem_path_parts(path)
+    if bucket == "trash":
+        return "trash contents; empty only if you no longer need them"
+    if bucket == "logs":
+        return "logs or crash reports; usually disposable after review"
+    if bucket == "temp":
+        return "temporary files; usually disposable after apps are closed"
+    if any(part in {".npm", ".pnpm", ".yarn", "node-gyp"} for part in parts):
+        return "package-manager cache; rebuildable"
+    if any(part in {".gradle", ".m2", ".cargo", ".rustup", ".nuget"} for part in parts):
+        return "developer dependency cache; rebuildable"
+    if "codex-runtimes" in parts:
+        return "tool/runtime cache; rebuildable"
+    if "huggingface" in parts:
+        return "model/download cache; re-fetchable"
+    if bucket == "cache":
+        return "cache data; generally rebuildable"
+    if "downloads" in parts:
+        return "user downloads; review manually"
+    normalized = "/".join(parts)
+    if "library/application support" in normalized:
+        return "app data; do not blanket-delete"
+    return "review before deleting"
+
+
+def _terminal_filesystem_display_path(path: object) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        expanded = Path(raw).expanduser()
+        home = Path.home().expanduser()
+        if expanded == home:
+            return "~"
+        try:
+            relative = expanded.relative_to(home)
+        except ValueError:
+            return _terminal_filesystem_compact_user_home_path(raw)
+        return f"~/{relative.as_posix()}"
+    except (RuntimeError, ValueError, OSError):
+        return _terminal_filesystem_compact_user_home_path(raw)
+
+
+def _terminal_filesystem_compact_user_home_path(path: str) -> str:
+    value = str(path or "").strip()
+    match = re.match(r"^/(?:Users|home)/[^/]+(?P<rest>/.*)?$", value)
+    if not match:
+        return value
+    rest = str(match.group("rest") or "")
+    return f"~{rest}" if rest else "~"
+
+
+def _terminal_exec_structured_filesystem_summary(results: Iterable[ToolResult]) -> str | None:
+    by_path: dict[str, dict[str, object]] = {}
+    for result in results:
+        for record in _terminal_exec_filesystem_records(result):
+            path_value = _terminal_filesystem_record_path(record)
+            if not path_value:
+                continue
+            try:
+                key = str(Path(path_value).expanduser())
+            except (RuntimeError, ValueError, OSError):
+                key = path_value
+            existing = by_path.get(key)
+            if existing is None:
+                by_path[key] = dict(record)
+                by_path[key]["path"] = path_value
+                continue
+            existing_score = (
+                _terminal_filesystem_record_sort_size(existing),
+                _terminal_filesystem_record_item_count(existing) or 0,
+            )
+            record_score = (
+                _terminal_filesystem_record_sort_size(record),
+                _terminal_filesystem_record_item_count(record) or 0,
+            )
+            if record_score >= existing_score:
+                by_path[key] = dict(record)
+                by_path[key]["path"] = path_value
+
+    records = [
+        record
+        for record in by_path.values()
+        if _terminal_filesystem_record_sort_size(record) > 0
+        or (_terminal_filesystem_record_item_count(record) or 0) > 0
+    ]
+    if not records:
+        return None
+
+    cache_records = sorted(
+        [record for record in records if _terminal_filesystem_record_bucket(record.get("path")) == "cache"],
+        key=_terminal_filesystem_record_sort_size,
+        reverse=True,
+    )
+    other_low_risk_records = sorted(
+        [
+            record
+            for record in records
+            if _terminal_filesystem_record_bucket(record.get("path")) in {"trash", "logs", "temp"}
+        ],
+        key=_terminal_filesystem_record_sort_size,
+        reverse=True,
+    )
+    review_records = sorted(
+        [
+            record
+            for record in records
+            if _terminal_filesystem_record_bucket(record.get("path")) not in {"cache", "trash", "logs", "temp"}
+        ],
+        key=_terminal_filesystem_record_sort_size,
+        reverse=True,
+    )
+
+    def _record_line(record: Mapping[str, object]) -> str:
+        path = _terminal_filesystem_display_path(record.get("path"))
+        size = _format_terminal_size_bytes(record.get("size_bytes"))
+        count = _terminal_filesystem_record_item_count(record)
+        count_text = f", {count:,} item{'s' if count != 1 else ''}" if count is not None else ""
+        bucket = _terminal_filesystem_record_bucket(record.get("path"))
+        note = _terminal_filesystem_record_note(record.get("path"), bucket=bucket)
+        return f"- `{path}` — {size}{count_text}. {note}."
+
+    lines = [
+        "I found concrete cleanup candidates. No files were deleted.",
+    ]
+    if cache_records:
+        lines.extend(["", "**Best low-risk cache folders**"])
+        lines.extend(_record_line(record) for record in cache_records[:8])
+    if other_low_risk_records:
+        lines.extend(["", "**Other low-risk cleanup areas**"])
+        lines.extend(_record_line(record) for record in other_low_risk_records[:6])
+    if review_records:
+        lines.extend(["", "**Review before deleting**"])
+        lines.extend(_record_line(record) for record in review_records[:6])
+        lines.append("Do not blanket-delete review entries; inspect their contents first.")
+
+    shown = min(len(cache_records), 8) + min(len(other_low_risk_records), 6) + min(len(review_records), 6)
+    remaining = len(records) - shown
+    if remaining > 0:
+        lines.append(f"- ...and {remaining} more candidate{'s' if remaining != 1 else ''}.")
+    return "\n".join(lines)
+
+def _terminal_exec_outcome_reply(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
+    terminal_results = _substantive_terminal_exec_results(tool_results)
+    if not terminal_results:
+        return None
+    latest = terminal_results[-1]
+    structured_summary = _terminal_exec_structured_output_summary(terminal_results)
+    if structured_summary:
+        return structured_summary
+    output = latest.output if isinstance(latest.output, dict) else {}
+    exit_code = output.get("exit_code", output.get("returncode"))
+    prefix = "I ran the local command"
+    if exit_code not in (None, 0, "0"):
+        prefix += f" and it exited with code {exit_code}"
+    prefix += "."
+    terminal_output_path = str(output.get("terminal_output_path") or "").strip()
+    if terminal_output_path:
+        return (
+            f"{prefix} The output was too long for chat, so I saved the full output as a text file."
+            f"\n\nMEDIA:{terminal_output_path}"
+        )
+    details = _compact_terminal_exec_output_text(latest)
+    if not details:
+        return prefix
+    return f"{prefix}\n\n```text\n{details}\n```"
 
 
 def _file_write_artifact_paths_from_tool_results(
@@ -4414,6 +15677,64 @@ def _file_read_artifact_paths_from_tool_results(
     return tuple(dict.fromkeys(paths))
 
 
+def _failed_file_read_requested_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    requested_extensions: tuple[str, ...],
+    artifact_roots: tuple[Path, ...],
+) -> tuple[str, ...]:
+    normalized_extensions = set(_normalized_requested_extensions(requested_extensions))
+    if not normalized_extensions:
+        return ()
+    scoped_extensions = set(_required_attachment_extensions_from_tool_scope(tool_results)).union(
+        set(_required_embedded_media_extensions_from_tool_scope(tool_results))
+    )
+    if not scoped_extensions:
+        return ()
+    paths: list[str] = []
+    for result in tool_results or ():
+        if result.tool_name != "file_read":
+            continue
+        if normalize_tool_status(result.status) == "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        resolved = _resolve_artifact_path_from_roots(output.get("path"), artifact_roots=artifact_roots)
+        if resolved is None:
+            continue
+        suffix = resolved.suffix.lower()
+        if suffix not in normalized_extensions or suffix not in scoped_extensions:
+            continue
+        if suffix in _TEXT_SIDECAR_ARTIFACT_SUFFIXES:
+            continue
+        try:
+            if resolved.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        paths.append(str(resolved))
+    return tuple(dict.fromkeys(paths))
+
+
+def _file_read_artifact_results_are_identity_only(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    saw_file_read = False
+    for result in tool_results or ():
+        if result.tool_name != "file_read" or normalize_tool_status(result.status) != "completed":
+            continue
+        saw_file_read = True
+        output = result.output if isinstance(result.output, dict) else {}
+        content = str(output.get("content") or "").lstrip()
+        if not content:
+            continue
+        if content.startswith(("%PDF-", "\x89PNG", "\xff\xd8\xff", "PK\x03\x04")):
+            continue
+        if output.get("error") or output.get("read_error"):
+            continue
+        return False
+    return saw_file_read
+
+
 def _normalize_path_identity(path: object) -> str:
     return str(Path(str(path or "")).expanduser())
 
@@ -4424,6 +15745,12 @@ def _path_identity_variants(path: object) -> tuple[str, ...]:
         return ()
     path_obj = Path(raw_path).expanduser()
     variants = [str(path_obj)]
+    for marker in ("workspaces", "artifacts"):
+        if marker not in path_obj.parts:
+            continue
+        marker_index = path_obj.parts.index(marker)
+        if marker_index < len(path_obj.parts) - 1:
+            variants.append(str(Path(*path_obj.parts[marker_index:])))
     try:
         variants.append(str(path_obj.resolve()))
     except OSError:
@@ -4433,6 +15760,280 @@ def _path_identity_variants(path: object) -> tuple[str, ...]:
 
 def _path_matches_identity_set(path: object, identities: set[str]) -> bool:
     return any(identity in identities for identity in _path_identity_variants(path))
+
+
+def _artifact_descriptor_path(descriptor: object) -> Path:
+    return Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+
+
+def _extension_count_map(extensions: tuple[str, ...] | list[str] | None) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for extension in _normalized_requested_extensions(extensions):
+        counts[extension] = counts.get(extension, 0) + 1
+    return counts
+
+
+def _superseded_artifact_delivery_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = list(artifact_plain_replacement_artifact_paths(tool_results))
+    current_turn_media_paths = _preferred_current_turn_source_media_paths(tool_results)
+    if current_turn_media_paths:
+        paths.extend(
+            _completed_artifact_paths_without_current_media(
+                tool_results,
+                required_image_paths=current_turn_media_paths,
+            )
+        )
+    return tuple(dict.fromkeys(str(Path(path).expanduser()) for path in paths if str(path or "").strip()))
+
+
+def _artifact_replacement_delivery_mode(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    return bool(
+        artifact_plain_replacement_artifact_paths(tool_results)
+        or _preferred_current_turn_source_media_paths(tool_results)
+        or _last_mile_materialized_artifact_paths_from_tool_results(tool_results)
+    )
+
+
+def _filter_artifact_descriptors_for_required_extension_counts(
+    descriptors: list[object],
+    *,
+    requested_extensions: tuple[str, ...],
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    protected_identities: set[str] | frozenset[str] | None = None,
+) -> list[object]:
+    requested_counts = _extension_count_map(requested_extensions)
+    protected_identities = set(protected_identities or ())
+    superseded_identities = {
+        identity
+        for path in _superseded_artifact_delivery_paths_from_tool_results(tool_results)
+        for identity in _path_identity_variants(path)
+    }
+    filtered = [
+        descriptor
+        for descriptor in descriptors
+        if not superseded_identities
+        or _path_matches_identity_set(_artifact_descriptor_path(descriptor), protected_identities)
+        or not _path_matches_identity_set(_artifact_descriptor_path(descriptor), superseded_identities)
+    ]
+    replacement_mode = _artifact_replacement_delivery_mode(tool_results)
+    if replacement_mode and any(_artifact_descriptor_path(descriptor).suffix.lower() in _PRIMARY_RENDERED_ARTIFACT_SUFFIXES for descriptor in filtered):
+        filtered = [
+            descriptor
+            for descriptor in filtered
+            if not is_unrequested_internal_sidecar_artifact(
+                _artifact_descriptor_path(descriptor),
+                requested_extensions=(),
+            )
+        ]
+    if not requested_counts or not replacement_mode:
+        return filtered
+
+    kept: list[object] = []
+    kept_counts: dict[str, int] = {}
+    for descriptor in reversed(filtered):
+        descriptor_path = _artifact_descriptor_path(descriptor)
+        suffix = descriptor_path.suffix.lower()
+        limit = requested_counts.get(suffix)
+        if limit is not None:
+            current = kept_counts.get(suffix, 0)
+            if current >= limit:
+                if protected_identities and _path_matches_identity_set(descriptor_path, protected_identities):
+                    kept.append(descriptor)
+                continue
+            kept_counts[suffix] = current + 1
+        kept.append(descriptor)
+    return list(reversed(kept))
+
+
+
+def _filter_paths_for_required_extension_counts(
+    paths: list[str] | tuple[str, ...],
+    *,
+    requested_extensions: tuple[str, ...],
+) -> list[str]:
+    if not requested_extensions:
+        return list(paths)
+    required_counts: dict[str, int] = {}
+    for extension in requested_extensions:
+        normalized = str(extension or "").strip().lower()
+        if not normalized:
+            continue
+        if not normalized.startswith("."):
+            normalized = f".{normalized}"
+        required_counts[normalized] = required_counts.get(normalized, 0) + 1
+    kept_counts: dict[str, int] = {}
+    filtered: list[str] = []
+    for path in paths:
+        suffix = Path(str(path or "")).suffix.lower()
+        limit = required_counts.get(suffix)
+        if limit is not None:
+            current = kept_counts.get(suffix, 0)
+            if current >= limit:
+                continue
+            kept_counts[suffix] = current + 1
+        filtered.append(path)
+    return filtered
+
+
+def _artifact_paths_satisfy_required_extension_counts(
+    paths: list[str] | tuple[str, ...],
+    *,
+    requested_extensions: tuple[str, ...] | list[str] | None,
+) -> bool:
+    required_counts: dict[str, int] = {}
+    for extension in _normalized_requested_extensions(requested_extensions):
+        required_counts[extension] = required_counts.get(extension, 0) + 1
+    if not required_counts:
+        return True
+    actual_counts: dict[str, int] = {}
+    for path in paths:
+        suffix = Path(str(path or "")).suffix.lower()
+        if suffix:
+            actual_counts[suffix] = actual_counts.get(suffix, 0) + 1
+    return all(
+        actual_counts.get(extension, 0) >= count
+        for extension, count in required_counts.items()
+    )
+
+
+def _filter_paths_to_requested_deliverables_if_present(
+    paths: list[str] | tuple[str, ...],
+    *,
+    requested_extensions: tuple[str, ...],
+) -> list[str]:
+    if not requested_extensions:
+        return list(paths)
+    normalized_extensions = tuple(
+        dict.fromkeys(
+            extension
+            for raw_extension in requested_extensions
+            for extension in (
+                str(raw_extension or "").strip().lower(),
+            )
+            if extension
+        )
+    )
+    required_extensions = tuple(
+        extension if extension.startswith(".") else f".{extension}"
+        for extension in normalized_extensions
+    )
+    if not required_extensions:
+        return list(paths)
+    matching_paths = [
+        path
+        for path in paths
+        if Path(str(path or "")).suffix.lower() in required_extensions
+    ]
+    if not matching_paths:
+        return list(paths)
+    return list(dict.fromkeys(matching_paths))
+
+
+def _output_artifact_paths(output: Mapping[str, object]) -> tuple[str, ...]:
+    paths: list[str] = []
+    for key in ("path", "artifact_path"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+    for key in ("artifact_paths", "artifacts"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    paths.append(item.strip())
+                elif isinstance(item, Mapping):
+                    nested_path = item.get("path") or item.get("artifact_path")
+                    if isinstance(nested_path, str) and nested_path.strip():
+                        paths.append(nested_path.strip())
+    return tuple(dict.fromkeys(paths))
+
+
+def _output_embedded_media_paths(output: Mapping[str, object]) -> tuple[str, ...]:
+    paths: list[str] = []
+    for key in ("embedded_images", "source_image_paths", "image_paths"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+        elif isinstance(value, (list, tuple)):
+            paths.extend(str(item).strip() for item in value if isinstance(item, str) and item.strip())
+    html_images = output.get("embedded_html_images")
+    if isinstance(html_images, (list, tuple)):
+        for item in html_images:
+            if isinstance(item, str) and item.strip():
+                paths.append(item.strip())
+            elif isinstance(item, Mapping):
+                value = item.get("path")
+                if isinstance(value, str) and value.strip():
+                    paths.append(value.strip())
+    return tuple(dict.fromkeys(paths))
+
+
+def _artifact_path_identities_embedding_current_media(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    current_media_identities = {
+        identity
+        for path in _current_turn_collected_media_paths(tool_results)
+        for identity in _path_identity_variants(path)
+    }
+    if not current_media_identities:
+        return set()
+    artifact_identities: set[str] = set()
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, Mapping) else {}
+        embedded_media = _output_embedded_media_paths(output)
+        if not any(_path_matches_identity_set(path, current_media_identities) for path in embedded_media):
+            continue
+        for artifact_path in _output_artifact_paths(output):
+            artifact_identities.update(_path_identity_variants(artifact_path))
+    return artifact_identities
+
+
+def _prefer_current_media_artifact_paths(
+    paths: list[str] | tuple[str, ...],
+    *,
+    requested_extensions: tuple[str, ...],
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> list[str]:
+    if not requested_extensions:
+        return list(paths)
+    required_extensions: list[str] = []
+    for raw_extension in requested_extensions:
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension not in required_extensions:
+            required_extensions.append(extension)
+    if not required_extensions:
+        return list(paths)
+    media_artifact_identities = _artifact_path_identities_embedding_current_media(tool_results)
+    selected: list[str] = []
+    for extension in required_extensions:
+        extension_paths = [
+            path
+            for path in paths
+            if Path(str(path or "")).suffix.lower() == extension
+        ]
+        if not extension_paths:
+            continue
+        preferred = [
+            path
+            for path in extension_paths
+            if _path_matches_identity_set(path, media_artifact_identities)
+        ]
+        ordered = [*preferred, *[path for path in extension_paths if path not in preferred]]
+        selected.extend(ordered)
+    return list(dict.fromkeys(selected))
 
 
 def _reply_visible_text_references_artifact_path(
@@ -4456,6 +16057,22 @@ def _reply_visible_text_references_artifact_path(
     return any(candidate and candidate in visible_text for candidate in candidates)
 
 
+def _reply_delivery_references_artifact_path(
+    reply: str,
+    path: object,
+    *,
+    artifact_roots: tuple[Path, ...],
+) -> bool:
+    if _reply_visible_text_references_artifact_path(reply, path, artifact_roots=artifact_roots):
+        return True
+    media_identities = {
+        identity
+        for media_path in _reply_media_candidate_paths(reply)
+        for identity in _path_identity_variants(media_path)
+    }
+    return _path_matches_identity_set(path, media_identities)
+
+
 def _reply_visible_text_references_all_artifact_paths(
     reply: str,
     paths: tuple[str, ...],
@@ -4477,7 +16094,42 @@ def _current_turn_artifact_count(
     turn_result: object | None,
 ) -> int:
     explicit_count = len(getattr(turn_result, "artifacts", []) or [])
-    return max(explicit_count, _reply_media_directive_count(reply))
+    reply_count = _reply_media_directive_count(reply)
+    return reply_count if reply_count else explicit_count
+
+
+def _should_force_checkpoint_after_chat_turn(
+    *,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    artifact_count: int,
+    suspended_for_approval: bool,
+) -> bool:
+    if os.getenv("NULLION_CHAT_FORCE_CHECKPOINT_ON_EVERY_TURN", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if suspended_for_approval or artifact_count > 0:
+        return True
+    return False
+
+
+def _checkpoint_conversation_events_after_chat_turn(runtime: PersistentRuntime) -> None:
+    checkpoint_events = getattr(runtime, "checkpoint_conversation_events", None)
+    if callable(checkpoint_events):
+        checkpoint_events()
+        return
+    runtime.checkpoint(force=True)
+
+
+def _should_checkpoint_conversation_events_after_chat_turn(
+    *,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    artifact_count: int,
+    suspended_for_approval: bool,
+) -> bool:
+    return _should_force_checkpoint_after_chat_turn(
+        tool_results=tool_results,
+        artifact_count=artifact_count,
+        suspended_for_approval=suspended_for_approval,
+    )
 
 
 def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
@@ -4557,8 +16209,136 @@ def _reply_media_paths_are_local_discovery_results(
 ) -> bool:
     if not reply_media_paths or not discovery_paths:
         return False
-    discovered = {_normalize_path_identity(path) for path in discovery_paths}
-    return all(_normalize_path_identity(path) in discovered for path in reply_media_paths)
+    discovered = {
+        identity
+        for path in discovery_paths
+        for identity in _path_identity_variants(path)
+    }
+    return all(_path_matches_identity_set(path, discovered) for path in reply_media_paths)
+
+
+def _requested_file_search_delivery_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    prompt: str | None,
+    reply: str | None,
+    allow_prompt_filename_matches: bool = False,
+    requested_extensions: Iterable[str] | None = None,
+    artifact_roots: Iterable[Path] | None = None,
+) -> tuple[str, ...]:
+    normalized_extensions = set(_normalized_requested_extensions(requested_extensions))
+    prompt_requested_names = {
+        name.lower()
+        for name in _requested_output_filenames_from_texts(prompt)
+    }
+    requested_names = {
+        name.lower()
+        for name in prompt_requested_names
+    } if allow_prompt_filename_matches else set()
+    requested_names.update(
+        name.lower()
+        for name in _single_filename_delivery_descriptor_from_reply(reply)
+    )
+    if normalized_extensions and prompt_requested_names and not requested_names:
+        verified_names = _successful_terminal_verified_filename_references(
+            tool_results,
+            prompt_requested_names=prompt_requested_names,
+        )
+        requested_names.update(verified_names)
+    if not requested_names:
+        return ()
+    resolved_roots: list[Path] = []
+    for root in artifact_roots or ():
+        try:
+            resolved_roots.append(Path(root).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+    selected: list[str] = []
+
+    def maybe_add_path(path: object, *, require_artifact_root: bool) -> None:
+        path_obj = Path(str(path or "")).expanduser()
+        if path_obj.name.lower() not in requested_names:
+            return
+        suffix = path_obj.suffix.lower()
+        if suffix not in _AUTO_ATTACH_FILENAME_SUFFIXES:
+            return
+        if normalized_extensions and suffix not in normalized_extensions:
+            return
+        try:
+            resolved_path = path_obj.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return
+        if require_artifact_root:
+            if not resolved_roots:
+                return
+            if not any(resolved_path.is_relative_to(root) for root in resolved_roots):
+                return
+        try:
+            if not resolved_path.is_file() or resolved_path.stat().st_size <= 0:
+                return
+        except OSError:
+            return
+        selected.append(str(resolved_path))
+
+    for result in tool_results or ():
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        tool_name = _tool_result_name(result)
+        if tool_name == "file_search":
+            for path in _file_search_match_paths_from_output(output):
+                maybe_add_path(path, require_artifact_root=False)
+        elif tool_name == "terminal_exec":
+            stdout = output.get("stdout")
+            if not isinstance(stdout, str) or not stdout.strip():
+                continue
+            candidates = [
+                *_pathlike_lines_from_text(stdout),
+                *(match.group("path").strip().rstrip(".,;:)]}") for match in _TERMINAL_STDOUT_ATTACHMENT_PATH_RE.finditer(stdout)),
+            ]
+            for path in dict.fromkeys(candidates):
+                maybe_add_path(path, require_artifact_root=True)
+    return tuple(dict.fromkeys(selected))
+
+
+def _successful_terminal_verified_filename_references(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    prompt_requested_names: set[str],
+) -> set[str]:
+    if not prompt_requested_names:
+        return set()
+    verified: set[str] = set()
+    for result in tool_results or ():
+        if _tool_result_name(result) != "terminal_exec":
+            continue
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        exit_code = output.get("exit_code", output.get("returncode"))
+        if exit_code not in (None, 0, "0"):
+            continue
+        stdout = str(output.get("stdout") or "")
+        if not stdout:
+            continue
+        stdout_lower = stdout.lower()
+        for name in prompt_requested_names:
+            if name in stdout_lower:
+                verified.add(name)
+    return verified
+
+
+def _single_filename_delivery_descriptor_from_reply(reply: str | None) -> tuple[str, ...]:
+    text = str(reply or "").strip()
+    if not text or "\n" in text:
+        return ()
+    filenames = _requested_output_filenames(text)
+    if len(filenames) != 1:
+        return ()
+    filename = filenames[0]
+    if text.strip("`'\"<> ") != filename:
+        return ()
+    return (filename,)
 
 
 def _filter_local_discovery_candidate_paths(
@@ -4579,7 +16359,7 @@ def _local_discovery_results_reply(reply: str, paths: tuple[str, ...]) -> str:
     del reply
     count = len(paths)
     heading = f"I found {count} file{'s' if count != 1 else ''}:"
-    return "\n".join([heading, *(f"- {path}" for path in paths)]).strip()
+    return "\n".join([heading, *(f"- {Path(path).name or path}" for path in paths)]).strip()
 
 
 def _completed_email_attachment_paths(
@@ -4593,6 +16373,143 @@ def _completed_email_attachment_paths(
             for path in _string_paths_from_value((result.output if isinstance(result.output, dict) else {}).get("attachment_paths"))
         )
     )
+
+
+def _completed_email_attachment_read_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if result.tool_name != "email_attachment_read" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for key in ("artifact_path", "artifact_paths"):
+            paths.extend(_string_paths_from_value(output.get(key)))
+        descriptors = output.get("artifact_descriptors")
+        if isinstance(descriptors, (list, tuple)):
+            for descriptor in descriptors:
+                if not isinstance(descriptor, dict):
+                    continue
+                path = descriptor.get("path")
+                if isinstance(path, str) and path.strip():
+                    paths.append(path.strip())
+    return tuple(dict.fromkeys(str(Path(path).expanduser()) for path in paths if str(path or "").strip()))
+
+
+def _email_attachment_read_paths_are_requested_delivery(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    requested_extensions: tuple[str, ...] | list[str] | None,
+) -> bool:
+    attachment_paths = _completed_email_attachment_read_paths(tool_results)
+    if not attachment_paths:
+        return False
+    requested_suffixes = set(_normalized_requested_extensions(requested_extensions))
+    for result in tool_results or ():
+        if _tool_result_name(result) != "request_tool_scope" or normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        requested_suffixes.update(_normalized_requested_extensions(output.get("artifact_extensions")))
+    if requested_suffixes and any(Path(path).suffix.lower() in requested_suffixes for path in attachment_paths):
+        return True
+    completed_tool_names = [
+        _tool_result_name(result)
+        for result in tool_results or ()
+        if normalize_tool_status(_tool_result_status(result)) == "completed"
+    ]
+    completed_tool_names = [name for name in completed_tool_names if name and name not in {"request_tool_scope", "skill_pack_read"}]
+    return bool(completed_tool_names) and set(completed_tool_names) <= {"email_attachment_read"}
+
+
+def _email_read_attachment_filenames(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    filenames: list[str] = []
+    for result in tool_results or ():
+        if _tool_result_name(result) != "email_read" or normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        message = output.get("message")
+        if not isinstance(message, Mapping):
+            continue
+        attachments = message.get("attachments")
+        if not isinstance(attachments, (list, tuple)):
+            continue
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping):
+                continue
+            filename = Path(str(attachment.get("filename") or "").strip()).name
+            if filename:
+                filenames.append(filename)
+    return tuple(dict.fromkeys(filenames))
+
+
+def _latest_completed_email_read_summary(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
+    for result in reversed(tuple(tool_results or ())):
+        if _tool_result_name(result) != "email_read" or normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        if not output:
+            continue
+        try:
+            from nullion.response_sanitizer import _email_read_summary
+
+            return _email_read_summary(output)
+        except Exception:
+            logger.debug("Could not summarize email_read result after suppressing source attachment", exc_info=True)
+            return None
+    return None
+
+
+def _is_internal_artifact_delivery_receipt(reply: str) -> bool:
+    text = re.sub(r"\s+", " ", str(reply or "")).strip()
+    return text.startswith("Done — attached the requested ") or text.startswith("Done -- attached the requested ")
+
+
+_EMAIL_ATTACHMENT_READ_SOURCE_BENIGN_TOOLS = frozenset(
+    {
+        "request_tool_scope",
+        "email_search",
+        "email_read",
+        "email_attachment_read",
+        "skill_pack_read",
+    }
+)
+
+
+def _email_attachment_read_source_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    attachment_paths = _completed_email_attachment_read_paths(tool_results)
+    if not attachment_paths:
+        return ()
+    saw_attachment_read = False
+    for result in tool_results or ():
+        tool_name = str(getattr(result, "tool_name", "") or "")
+        if tool_name == "email_attachment_read" and normalize_tool_status(getattr(result, "status", None)) == "completed":
+            output = result.output if isinstance(result.output, dict) else {}
+            descriptor_paths = [
+                descriptor.get("path")
+                for descriptor in output.get("artifact_descriptors", ())
+                if isinstance(descriptor, dict) and isinstance(descriptor.get("path"), str)
+            ]
+            if (
+                _string_paths_from_value(output.get("artifact_path"))
+                or _string_paths_from_value(output.get("artifact_paths"))
+                or _string_paths_from_value(descriptor_paths)
+            ):
+                saw_attachment_read = True
+            continue
+        if not saw_attachment_read:
+            continue
+        if tool_name in _EMAIL_ATTACHMENT_READ_SOURCE_BENIGN_TOOLS:
+            continue
+        if not tool_name:
+            continue
+        return attachment_paths
+    return ()
 
 
 def _browser_screenshot_artifact_paths(
@@ -4660,6 +16577,259 @@ def _source_attachment_paths(attachments: Iterable[object] | None) -> set[str]:
     return paths
 
 
+def _existing_named_workspace_artifact_paths(
+    runtime: PersistentRuntime,
+    *,
+    prompt: str | None,
+    principal_id: str | None,
+) -> tuple[str, ...]:
+    filenames = tuple(dict.fromkeys(_requested_output_filenames_from_texts(prompt)))
+    if not filenames:
+        return ()
+    artifact_roots = _artifact_roots_for_delivery(runtime, principal_id)
+    if not artifact_roots:
+        return ()
+    resolved_paths: list[str] = []
+    for filename in filenames:
+        safe_name = Path(str(filename or "")).name
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in VALID_ATTACHMENT_EXTENSIONS:
+            return ()
+        matched = False
+        for artifact_root in artifact_roots:
+            candidate = artifact_root / safe_name
+            try:
+                descriptor = artifact_descriptor_for_path(candidate, artifact_root=artifact_root)
+            except (OSError, RuntimeError, ValueError):
+                descriptor = None
+            if descriptor is None:
+                continue
+            descriptor_path = Path(str(getattr(descriptor, "path", "") or candidate)).expanduser()
+            try:
+                if not descriptor_path.is_file() or descriptor_path.stat().st_size <= 0:
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            matched = True
+            path_text = str(descriptor_path)
+            if path_text not in resolved_paths:
+                resolved_paths.append(path_text)
+            break
+        if not matched:
+            return ()
+    return tuple(resolved_paths)
+
+
+def _existing_named_workspace_artifact_extensions(
+    runtime: PersistentRuntime,
+    *,
+    prompt: str | None,
+    principal_id: str | None,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            suffix
+            for suffix in (
+                Path(path).suffix.lower()
+                for path in _existing_named_workspace_artifact_paths(
+                    runtime,
+                    prompt=prompt,
+                    principal_id=principal_id,
+                )
+            )
+            if suffix in VALID_ATTACHMENT_EXTENSIONS
+        )
+    )
+
+
+def _should_direct_deliver_existing_named_workspace_artifacts(
+    *,
+    existing_named_artifact_paths: Iterable[str] | None,
+    effective_prompt: str | None,
+    attachment_context_present: bool,
+    saved_history_available: bool = False,
+    conversation_result: object | None,
+    numbered_option_context: str | None,
+    reply_context_prompt: str | None,
+    planner_requested: bool,
+    model_client: object | None = None,
+    structured_context_available: bool = False,
+) -> bool:
+    return _direct_existing_named_workspace_artifact_action(
+        existing_named_artifact_paths=existing_named_artifact_paths,
+        effective_prompt=effective_prompt,
+        attachment_context_present=attachment_context_present,
+        saved_history_available=saved_history_available,
+        conversation_result=conversation_result,
+        numbered_option_context=numbered_option_context,
+        reply_context_prompt=reply_context_prompt,
+        planner_requested=planner_requested,
+        model_client=model_client,
+        structured_context_available=structured_context_available,
+    ) == "deliver"
+
+
+def _direct_existing_named_workspace_artifact_action(
+    *,
+    existing_named_artifact_paths: Iterable[str] | None,
+    effective_prompt: str | None,
+    attachment_context_present: bool,
+    saved_history_available: bool = False,
+    conversation_result: object | None,
+    numbered_option_context: str | None,
+    reply_context_prompt: str | None,
+    planner_requested: bool,
+    model_client: object | None = None,
+    structured_context_available: bool = False,
+) -> str:
+    """Directly attach exact existing artifacts only for self-contained file turns."""
+    paths = tuple(str(path or "").strip() for path in (existing_named_artifact_paths or ()) if str(path or "").strip())
+    if not paths:
+        return "use_tools"
+    if (
+        attachment_context_present
+        or planner_requested
+        or extract_url_target(effective_prompt) is not None
+    ):
+        return "use_tools"
+    for path_text in paths:
+        path = Path(path_text).expanduser()
+        if path.suffix.lower() not in VALID_ATTACHMENT_EXTENSIONS:
+            return "use_tools"
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                return "use_tools"
+        except (OSError, RuntimeError, ValueError):
+            return "use_tools"
+    action = _model_classifies_existing_named_artifact_action(
+        model_client=model_client,
+        user_message=effective_prompt,
+        artifact_names=tuple(Path(path).name for path in paths),
+    )
+    return action
+
+
+def _model_classifies_existing_named_artifact_action(
+    *,
+    model_client: object | None,
+    user_message: str | None,
+    artifact_names: Iterable[str],
+) -> str:
+    create = getattr(model_client, "create", None)
+    if not callable(create):
+        return "use_tools"
+    names = tuple(str(name or "").strip() for name in artifact_names if str(name or "").strip())
+    if not names:
+        return "use_tools"
+    system = (
+        "Classify the user's requested outcome for exact existing workspace artifact file(s). Use only the user's "
+        "message and the verified artifact filenames. Return JSON only with this schema: "
+        "{\"action\":\"deliver|list|use_tools\",\"requires_new_or_modified_content\":false}. "
+        "The user message can be in any language; classify the semantic intent, not particular English words. "
+        "Use deliver only when the final answer should attach/send/provide the named file(s) as downloadable files. "
+        "Use list when the final answer should only confirm, identify, or list the matching filename(s), without "
+        "opening, reading, summarizing, comparing, transforming, uploading, or attaching them. "
+        "Use use_tools when the request requires file contents, inspection, summary, comparison, transformation, "
+        "creation of new file contents, changing rows, adding data, regenerating output, or any other operation beyond "
+        "delivering or listing the verified exact filenames. Set requires_new_or_modified_content true whenever the "
+        "requested outcome depends on new/generated/modified file contents; in that case action must be use_tools. "
+        "Do not infer delivery from a filename extension alone."
+    )
+    prompt = json.dumps(
+        {
+            "user_message": str(user_message or ""),
+            "verified_existing_artifact_names": list(names),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    try:
+        profiled_client = _model_client_with_interactive_fast_profile(model_client) or model_client
+        response = profiled_client.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            tools=[],
+            max_tokens=80,
+            system=system,
+            timeout=12,
+        )
+    except Exception:
+        logger.debug("Existing artifact action classifier failed", exc_info=True)
+        return "use_tools"
+    text = _extract_direct_model_text(response)
+    if not text:
+        return "use_tools"
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        return "use_tools"
+    try:
+        payload = json.loads(text[start : end + 1])
+    except Exception:
+        logger.debug("Existing artifact action classifier returned invalid JSON: %r", text)
+        return "use_tools"
+    if payload.get("requires_new_or_modified_content") is True:
+        return "use_tools"
+    action = str(payload.get("action") or "").strip().lower()
+    if action in {"deliver", "list", "use_tools"}:
+        return action
+    if payload.get("direct_delivery") is True:
+        return "deliver"
+    return "use_tools"
+
+
+def _existing_named_workspace_artifact_listing_reply(paths: Iterable[str]) -> str:
+    names = tuple(Path(str(path or "")).name for path in paths if str(path or "").strip())
+    if not names:
+        return "I did not find a matching file."
+    if len(names) == 1:
+        return f"I found 1 file:\n- {names[0]}"
+    lines = "\n".join(f"- {name}" for name in names)
+    return f"I found {len(names)} files:\n{lines}"
+
+
+def _direct_existing_named_workspace_artifact_tool_result(paths: Iterable[str], *, action: str) -> ToolResult | None:
+    matches: list[dict[str, object]] = []
+    for path_text in paths:
+        path = Path(str(path_text or "")).expanduser()
+        if not str(path_text or "").strip():
+            continue
+        matches.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "extension": path.suffix.lower(),
+                "artifact": True,
+            }
+        )
+    if not matches:
+        return None
+    return ToolResult(
+        f"direct-existing-artifact-{uuid4().hex[:12]}",
+        "file_search",
+        "completed",
+        {
+            "matches": matches,
+            "count": len(matches),
+            "action": action,
+            "direct_existing_artifact": True,
+        },
+    )
+
+
+def _tool_results_include_direct_existing_artifact_delivery(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    for result in tool_results or ():
+        if _tool_result_name(result) != "file_search":
+            continue
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        if output.get("direct_existing_artifact") is True and str(output.get("action") or "") == "deliver":
+            return True
+    return False
+
+
 def _latest_browser_extract_text_excerpt(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
     *,
@@ -4710,6 +16880,251 @@ def _reply_is_browser_extract_text_dump(
     )
 
 
+def _browser_file_like_label(value: object) -> str | None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().strip("`'\"<>")
+    if not text or "\x00" in text:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        basename = Path(parsed.path).name
+        suffix = Path(basename).suffix.lower()
+        return basename if basename and suffix in VALID_ATTACHMENT_EXTENSIONS else None
+    if len(text) > 320:
+        return None
+    suffix = Path(text).suffix.lower()
+    if suffix not in VALID_ATTACHMENT_EXTENSIONS:
+        return None
+    return Path(text).name or text
+
+
+def _iter_browser_structured_payloads(value: object, *, depth: int = 0) -> Iterable[Mapping[str, object]]:
+    if depth > 4:
+        return
+    if isinstance(value, Mapping):
+        yield value
+        nested = value.get("result")
+        if isinstance(nested, Mapping):
+            yield from _iter_browser_structured_payloads(nested, depth=depth + 1)
+        elif isinstance(nested, (list, tuple)):
+            yield from _iter_browser_structured_payloads(nested, depth=depth + 1)
+        preview = value.get("preview")
+        if isinstance(preview, str) and preview.strip():
+            try:
+                parsed_preview = json.loads(preview)
+            except Exception:
+                parsed_preview = None
+            if isinstance(parsed_preview, Mapping):
+                yield from _iter_browser_structured_payloads(parsed_preview, depth=depth + 1)
+            elif isinstance(parsed_preview, (list, tuple)):
+                yield from _iter_browser_structured_payloads(parsed_preview, depth=depth + 1)
+        for key in ("items", "results", "images", "files", "entries"):
+            nested_list = value.get(key)
+            if isinstance(nested_list, (list, tuple)):
+                yield from _iter_browser_structured_payloads(nested_list, depth=depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value[:50]:
+            yield from _iter_browser_structured_payloads(item, depth=depth + 1)
+
+
+def _browser_page_file_like_items(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    limit: int = 8,
+) -> tuple[str, ...]:
+    items: list[str] = []
+
+    def add_label(value: object) -> None:
+        label = _browser_file_like_label(value)
+        if label and label not in items:
+            items.append(label)
+
+    for result in tool_results or ():
+        if not str(getattr(result, "tool_name", "") or "").startswith("browser_"):
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name == "browser_extract_text":
+            for line in str(output.get("text") or "").splitlines():
+                add_label(line)
+                if len(items) >= limit:
+                    return tuple(items)
+            continue
+        for payload in _iter_browser_structured_payloads(output):
+            for key in ("filename", "file_name", "name", "title", "alt", "text", "url", "src", "href"):
+                add_label(payload.get(key))
+                if len(items) >= limit:
+                    return tuple(items)
+            for key in ("items", "results", "imgs", "images", "files"):
+                nested = payload.get(key)
+                if isinstance(nested, (list, tuple)):
+                    for nested_payload in _iter_browser_structured_payloads(nested):
+                        for nested_key in (
+                            "filename",
+                            "file_name",
+                            "name",
+                            "title",
+                            "alt",
+                            "text",
+                            "url",
+                            "src",
+                            "href",
+                        ):
+                            add_label(nested_payload.get(nested_key))
+                            if len(items) >= limit:
+                                return tuple(items)
+    return tuple(items)
+
+
+def _browser_extract_text_dump_fallback_reply(
+    reply: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    requested_extensions: tuple[str, ...],
+) -> str | None:
+    if not _reply_is_browser_extract_text_dump(reply, tool_results):
+        return None
+    collected_media_count = len(_current_turn_collected_media_paths(tool_results))
+    file_like_items = _browser_page_file_like_items(tool_results)
+    requested = ", ".join(dict.fromkeys(requested_extensions))
+    if requested:
+        first = f"I couldn't create the requested {requested} attachment from the browser page in this run."
+    else:
+        source_label = None
+        verified_state_reply = None
+        raw_extract_reply = None
+        try:
+            from nullion.response_sanitizer import (
+                _browser_raw_extract_dump_replacement,
+                _browser_source_label,
+                _browser_verified_state_reply,
+                _latest_completed_browser_extract_text,
+            )
+
+            result_list = list(tool_results or ())
+            source_label = _browser_source_label(result_list)
+            verified_state_reply = _browser_verified_state_reply(result_list)
+            raw_extract_reply = _browser_raw_extract_dump_replacement(
+                result_list,
+                extracted_text=_latest_completed_browser_extract_text(result_list),
+            )
+        except Exception:
+            source_label = None
+            verified_state_reply = None
+            raw_extract_reply = None
+        if verified_state_reply:
+            first = verified_state_reply
+        elif raw_extract_reply:
+            first = raw_extract_reply
+        else:
+            source_text = f" from {source_label}" if source_label else ""
+            first = (
+                f"I opened the browser page{source_text}, but the result came back as raw page text "
+                "instead of a clean answer, so I withheld it. Please ask me to retry or summarize the page."
+            )
+    parts = [first]
+    if file_like_items:
+        parts.append(
+            "Visible file-like page items found:\n"
+            + "\n".join(f"- {item}" for item in file_like_items)
+        )
+    if collected_media_count:
+        parts.append(
+            f"I collected {collected_media_count} page image asset"
+            f"{'' if collected_media_count == 1 else 's'}, but no final requested file was produced."
+        )
+    return "\n\n".join(parts)
+
+
+def _completed_requested_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    requested_extensions: tuple[str, ...],
+    media_required_suffixes: set[str] | frozenset[str] = frozenset(),
+    artifact_roots: tuple[Path, ...] = (),
+) -> tuple[str, ...]:
+    normalized_extensions = set(_normalized_requested_extensions(requested_extensions))
+    if not normalized_extensions:
+        return ()
+    selected: list[str] = []
+    current_media_paths = _preferred_current_turn_source_media_paths(tool_results)
+    missing_current_media_paths = _completed_artifact_paths_without_current_media(
+        tool_results,
+        required_image_paths=current_media_paths,
+    )
+    missing_current_media_identities = {
+        identity
+        for path in missing_current_media_paths
+        for identity in _path_identity_variants(path)
+    }
+    completed_media_identities = {
+        identity
+        for path in artifact_completed_embedded_media_paths(tool_results)
+        for identity in _path_identity_variants(path)
+    }
+    candidate_paths = [
+        *_artifact_paths_from_tool_results(
+            tool_results,
+            include_search_matches=False,
+            include_file_write=True,
+            requested_extensions=requested_extensions,
+        ),
+        *_failed_file_read_requested_artifact_paths_from_tool_results(
+            tool_results,
+            requested_extensions=tuple(normalized_extensions),
+            artifact_roots=artifact_roots,
+        ),
+    ]
+    for raw_path in candidate_paths:
+        path = Path(str(raw_path or "")).expanduser()
+        suffix = path.suffix.lower()
+        if suffix not in normalized_extensions:
+            continue
+        if missing_current_media_identities and _path_matches_identity_set(path, missing_current_media_identities):
+            continue
+        if (
+            suffix in media_required_suffixes
+            and not _path_matches_identity_set(path, completed_media_identities)
+            and _office_artifact_embedded_media_count(path) <= 0
+        ):
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        path_text = str(path)
+        if path_text not in selected:
+            selected.append(path_text)
+    if selected and not _artifact_paths_satisfy_required_extension_counts(
+        selected,
+        requested_extensions=requested_extensions,
+    ):
+        return ()
+    return tuple(selected)
+
+
+def _completed_requested_artifact_reply(
+    paths: tuple[str, ...],
+    *,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+) -> str:
+    if len(paths) == 1:
+        screenshot_identities = {
+            identity
+            for path in _browser_screenshot_artifact_paths(tool_results)
+            for identity in _path_identity_variants(path)
+        }
+        path = Path(paths[0])
+        label = (
+            "screenshot"
+            if screenshot_identities and _path_matches_identity_set(path, screenshot_identities)
+            else _ATTACHMENT_EXTENSION_LABELS.get(path.suffix.lower(), "file")
+        )
+    else:
+        label = "files"
+    media_lines = "\n".join(f"MEDIA:{path}" for path in paths)
+    return f"Done — attached the requested {label}.\n\n{media_lines}"
+
+
 def _string_paths_from_value(value: object) -> tuple[str, ...]:
     if isinstance(value, str) and value.strip():
         return (value.strip(),)
@@ -4735,6 +17150,7 @@ def _filter_email_confirmation_paths(
 
 
 _REPLY_FILENAME_CANDIDATE_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][A-Za-z0-9._ -]{0,120}\.[A-Za-z0-9]{1,16})(?![\w/-])")
+_PROMPT_FILENAME_CANDIDATE_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][A-Za-z0-9._-]{0,120}\.[A-Za-z0-9]{1,16})(?![\w/-])")
 _AUTO_ATTACH_FILENAME_SUFFIXES = _PRIMARY_RENDERED_ARTIFACT_SUFFIXES - _TEXT_SIDECAR_ARTIFACT_SUFFIXES - _DIAGNOSTIC_ATTACHMENT_SUFFIXES
 
 
@@ -4744,7 +17160,7 @@ def _artifact_candidate_paths_from_reply(
     principal_id: str | None,
     runtime: PersistentRuntime,
 ) -> tuple[Path, ...]:
-    roots = tuple(dict.fromkeys((artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))))
+    roots = tuple(dict.fromkeys(_artifact_roots_for_delivery(runtime, principal_id)))
     candidates: list[Path] = []
     for path in _reply_media_candidate_paths(reply):
         if path.is_absolute():
@@ -4795,6 +17211,39 @@ def _completed_email_send_summaries(
     return tuple(dict.fromkeys(summaries))
 
 
+def _email_send_transport_values(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    values: list[str] = []
+
+    def add_value(value: object, *, min_length: int = 1) -> None:
+        text = str(value or "").strip()
+        if len(text) >= min_length and text not in values:
+            values.append(text)
+
+    for result in tool_results or ():
+        if _tool_result_name(result) != "email_send" or normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = result.get("output") if isinstance(result, Mapping) else getattr(result, "output", None)
+        if not isinstance(output, Mapping):
+            continue
+        for key in ("id", "message_id", "thread_id", "status_code"):
+            add_value(output.get(key), min_length=3 if key == "status_code" else 6)
+        nested_json = output.get("json")
+        if isinstance(nested_json, Mapping):
+            for key in ("id", "message_id", "threadId", "thread_id", "status_code"):
+                add_value(nested_json.get(key), min_length=3 if key == "status_code" else 6)
+    return tuple(values)
+
+
+def _reply_contains_email_transport_values(
+    reply: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    reply_text = str(reply or "")
+    return any(value in reply_text for value in _email_send_transport_values(tool_results))
+
+
 def _prepend_completed_email_send_summaries(
     reply: str,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
@@ -4803,17 +17252,9 @@ def _prepend_completed_email_send_summaries(
     if not summaries:
         return reply
     reply_text = str(reply or "")
-    lowered_reply = reply_text.lower()
     if any(summary in reply_text for summary in summaries):
         return reply_text
-    if (
-        "email sent" in lowered_reply
-        or "email was sent" in lowered_reply
-        or "sent the email" in lowered_reply
-        or "i sent the email" in lowered_reply
-        or "message id" in lowered_reply
-        or "status 200" in lowered_reply
-    ) and "did not send" not in lowered_reply:
+    if _reply_contains_email_transport_values(reply_text, tool_results):
         return "\n\n".join(summaries).strip()
     return "\n\n".join([*summaries, reply_text]).strip()
 
@@ -4824,45 +17265,258 @@ def _append_chat_artifacts_to_reply(
     reply: str,
     artifact_paths: list[str] | tuple[str, ...] | None,
     prompt: str,
+    conversation_id: str | None = None,
     principal_id: str | None = None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> str:
+    can_resolve_reply_named_artifacts = bool(required_attachment_extensions or source_attachment_paths or principal_id)
+    reply_named_artifact_paths = (
+        ()
+        if _reply_media_candidate_paths(reply) or not can_resolve_reply_named_artifacts
+        else _existing_named_workspace_artifact_paths(
+            runtime,
+            prompt=reply,
+            principal_id=principal_id,
+        )
+    )
+    if reply_named_artifact_paths and not artifact_paths:
+        artifact_paths = list(reply_named_artifact_paths)
+    if (
+        not artifact_paths
+        and not tool_results
+        and not required_attachment_extensions
+        and not source_attachment_paths
+        and not _reply_media_candidate_paths(reply)
+    ):
+        return reply
+    if (
+        _tool_scope_declared_no_attachment_extensions(tool_results)
+        and _completed_tools_are_only_local_discovery(tool_results)
+    ):
+        required_attachment_extensions = ()
+    explicit_attachment_request_extensions = tuple(required_attachment_extensions or ())
     required_attachment_extensions = _merge_required_attachment_extensions(
         required_attachment_extensions,
         tool_results,
     )
+    required_attachment_extensions = _refine_required_attachment_extensions_for_structured_outputs(
+        prompt=prompt,
+        required_attachment_extensions=required_attachment_extensions,
+        tool_results=tool_results,
+    )
+    scoped_attachment_extensions = _required_attachment_extensions_from_tool_scope(tool_results)
+    if scoped_attachment_extensions:
+        required_attachment_extensions = scoped_attachment_extensions
+    elif explicit_attachment_request_extensions:
+        required_attachment_extensions = tuple(
+            extension if str(extension).startswith(".") else f".{extension}"
+            for extension in (
+                str(item or "").strip().lower()
+                for item in explicit_attachment_request_extensions
+            )
+            if extension
+        )
     requested_extensions = tuple(required_attachment_extensions or ())
+    if not requested_extensions:
+        requested_extension_from_prompt = _requested_attachment_extension(prompt)
+        if requested_extension_from_prompt:
+            requested_extensions = (requested_extension_from_prompt,)
+    requested_extension_suffixes = {
+        extension if str(extension).startswith(".") else f".{extension}"
+        for extension in (str(item or "").strip().lower() for item in requested_extensions)
+        if extension
+    }
+    suppress_unrequested_image_delivery = bool(
+        requested_extension_suffixes
+        and not requested_extension_suffixes.intersection(_IMAGE_ARTIFACT_SUFFIXES)
+    )
     requested_extension = requested_extensions[0] if len(requested_extensions) == 1 else None
-    artifact_roots = tuple(dict.fromkeys((artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))))
+    artifact_roots = tuple(dict.fromkeys(_artifact_roots_for_delivery(runtime, principal_id)))
     email_attachment_paths = _completed_email_attachment_paths(tool_results)
+    if email_attachment_paths and requested_extension_suffixes:
+        email_attachment_suffixes = {
+            Path(str(path or "")).suffix.lower()
+            for path in email_attachment_paths
+            if str(path or "").strip()
+        }
+        if email_attachment_suffixes and not email_attachment_suffixes.intersection(requested_extension_suffixes):
+            requested_extensions = ()
+            requested_extension_suffixes = set()
+            suppress_unrequested_image_delivery = False
+            requested_extension = None
     browser_screenshot_paths = _browser_screenshot_artifact_paths(tool_results)
     unverified_browser_screenshot_paths = _browser_screenshot_paths_with_unverified_state(tool_results)
     verified_browser_screenshot_paths = browser_screenshot_paths - unverified_browser_screenshot_paths
+    if (
+        requested_extension is None
+        and any(
+            getattr(result, "tool_name", None) == "browser_screenshot"
+            and normalize_tool_status(getattr(result, "status", None)) == "completed"
+            for result in tool_results or ()
+        )
+        and _reply_media_candidate_paths(reply)
+    ):
+        try:
+            from nullion.response_sanitizer import _latest_completed_browser_extract_text
+
+            extracted_text = _latest_completed_browser_extract_text(list(tool_results or ()))
+            if extracted_text and len(extracted_text) <= 1000:
+                return extracted_text
+        except Exception:
+            pass
     source_paths = {str(Path(path).expanduser()) for path in source_attachment_paths or () if str(path or "").strip()}
+    non_deliverable_descriptor_paths = _non_deliverable_artifact_descriptor_paths(tool_results)
+    email_attachment_source_paths = set(_email_attachment_read_source_paths(tool_results))
+    email_attachment_read_paths = set(_completed_email_attachment_read_paths(tool_results))
+    email_attachment_read_requested_delivery = _email_attachment_read_paths_are_requested_delivery(
+        tool_results,
+        requested_extensions=explicit_attachment_request_extensions,
+    )
+    partial_last_mile_paths = _partial_last_mile_spreadsheet_artifact_paths(tool_results)
+    consumed_file_write_paths = _consumed_file_write_artifact_paths(tool_results)
+    superseded_artifact_paths = {
+        path
+        for path in set(_superseded_artifact_delivery_paths_from_tool_results(tool_results))
+        if not _reply_visible_text_references_artifact_path(
+            reply,
+            path,
+            artifact_roots=artifact_roots,
+        )
+    }
+    suppressed_non_delivery_paths = {
+        *source_paths,
+        *non_deliverable_descriptor_paths,
+        *email_attachment_source_paths,
+        *partial_last_mile_paths,
+        *consumed_file_write_paths,
+        *superseded_artifact_paths,
+    }
+    email_attachment_artifacts_suppressed = False
+    if email_attachment_read_paths and not email_attachment_read_requested_delivery:
+        suppressed_non_delivery_paths = {
+            *suppressed_non_delivery_paths,
+            *email_attachment_read_paths,
+        }
+        email_attachment_artifacts_suppressed = True
+    reply_before_suppressed_media = reply
+    reply = _strip_suppressed_media_directives(reply, suppressed_non_delivery_paths)
+    suppressed_media_directive_removed = (
+        reply != reply_before_suppressed_media
+        and bool(_reply_media_candidate_paths(reply_before_suppressed_media))
+    )
     suppressed_screenshot_paths: set[str] = set()
-    initial_reply_candidate_paths = _artifact_candidate_paths_from_reply(
+    raw_initial_reply_candidate_paths = _artifact_candidate_paths_from_reply(
         reply,
         principal_id=principal_id,
         runtime=runtime,
     )
+    if not email_attachment_read_requested_delivery:
+        email_read_attachment_filenames = set(_email_read_attachment_filenames(tool_results))
+        suppressed_email_filename_paths = {
+            str(path.expanduser())
+            for path in raw_initial_reply_candidate_paths
+            if path.name in email_read_attachment_filenames
+        }
+        if suppressed_email_filename_paths:
+            suppressed_non_delivery_paths = {
+                *suppressed_non_delivery_paths,
+                *suppressed_email_filename_paths,
+            }
+            email_attachment_artifacts_suppressed = True
+            reply = _strip_suppressed_media_directives(reply, suppressed_non_delivery_paths)
+            raw_initial_reply_candidate_paths = _artifact_candidate_paths_from_reply(
+                reply,
+                principal_id=principal_id,
+                runtime=runtime,
+            )
+    if email_attachment_artifacts_suppressed and _is_internal_artifact_delivery_receipt(reply):
+        email_summary = _latest_completed_email_read_summary(tool_results)
+        if email_summary:
+            return email_summary
     initial_reply_candidate_paths = _filter_email_confirmation_paths(
-        initial_reply_candidate_paths,
+        raw_initial_reply_candidate_paths,
         email_attachment_paths=email_attachment_paths,
     )
     discovery_paths = _local_discovery_paths_from_tool_results(tool_results)
+    requested_file_search_delivery_paths = (
+        _requested_file_search_delivery_paths(
+            tool_results,
+            prompt=prompt,
+            reply=reply,
+            allow_prompt_filename_matches=bool(requested_extensions),
+            requested_extensions=requested_extensions,
+            artifact_roots=artifact_roots,
+        )
+    )
+    if (
+        not requested_file_search_delivery_paths
+        and requested_extensions
+        and _requested_output_filenames_from_texts(prompt)
+    ):
+        terminal_tool_results = tuple(
+            result
+            for result in tool_results or ()
+            if _tool_result_name(result) == "terminal_exec"
+        )
+        requested_file_search_delivery_paths = _requested_file_search_delivery_paths(
+            terminal_tool_results,
+            prompt=prompt,
+            reply=reply,
+            allow_prompt_filename_matches=True,
+            requested_extensions=(),
+            artifact_roots=artifact_roots,
+        )
+    requested_file_search_delivery_identities = {
+        identity
+        for path in requested_file_search_delivery_paths
+        for identity in _path_identity_variants(path)
+    }
+    if requested_file_search_delivery_paths:
+        discovery_paths = tuple(
+            path
+            for path in discovery_paths
+            if not _path_matches_identity_set(path, requested_file_search_delivery_identities)
+        )
     terminal_stdout_discovery_paths = _terminal_stdout_discovery_paths_from_tool_results(tool_results)
+    terminal_outcome_reply = _terminal_exec_outcome_reply(tool_results)
+    if (
+        terminal_outcome_reply
+        and discovery_paths
+        and not requested_file_search_delivery_paths
+        and not _merge_required_attachment_extensions(required_attachment_extensions, tool_results)
+    ):
+        return terminal_outcome_reply
+    local_discovery_only = _completed_tools_are_only_local_discovery(tool_results)
+    local_discovery_candidate_filter_paths = terminal_stdout_discovery_paths
+    if not requested_extensions and local_discovery_only:
+        local_discovery_candidate_filter_paths = tuple(
+            dict.fromkeys((*local_discovery_candidate_filter_paths, *discovery_paths))
+        )
     reply_has_media_directives = bool(_reply_media_candidate_paths(reply))
     if not reply_has_media_directives:
         initial_reply_candidate_paths = _filter_local_discovery_candidate_paths(
             initial_reply_candidate_paths,
-            terminal_stdout_discovery_paths,
+            local_discovery_candidate_filter_paths,
         )
     initial_reply_candidate_paths = tuple(
-        path for path in initial_reply_candidate_paths if str(path.expanduser()) not in source_paths
+        path
+        for path in initial_reply_candidate_paths
+        if str(path.expanduser()) not in suppressed_non_delivery_paths
     )
     file_write_paths = _file_write_artifact_paths_from_tool_results(tool_results)
+    generated_local_cleanup_paths = ()
+    if discovery_paths and not requested_file_search_delivery_paths:
+        generated_local_cleanup_paths = _generated_local_discovery_alias_cleanup_paths(
+            tool_results,
+            discovery_paths=discovery_paths,
+        )
+        if generated_local_cleanup_paths:
+            suppressed_non_delivery_paths = {
+                *suppressed_non_delivery_paths,
+                *generated_local_cleanup_paths,
+            }
     include_file_write_artifacts = bool(
         tuple(required_attachment_extensions or ())
         or _required_embedded_media_extensions_from_tool_scope(tool_results)
@@ -4871,20 +17525,151 @@ def _append_chat_artifacts_to_reply(
         tool_results,
         include_search_matches=False,
         include_file_write=include_file_write_artifacts,
+        requested_extensions=requested_extensions,
     )
+    terminal_stdout_artifact_paths = _terminal_stdout_artifact_paths_from_tool_results(
+        tool_results,
+        requested_extensions=requested_extensions,
+        requested_filenames=_requested_output_filenames_from_texts(prompt),
+        artifact_roots=artifact_roots,
+    )
+    if terminal_stdout_artifact_paths:
+        last_mile_materialized_identities = {
+            identity
+            for path in _last_mile_materialized_artifact_paths_from_tool_results(tool_results)
+            for identity in _path_identity_variants(path)
+        }
+        if last_mile_materialized_identities:
+            tool_result_artifact_paths = tuple(
+                path
+                for path in tool_result_artifact_paths
+                if not _path_matches_identity_set(path, last_mile_materialized_identities)
+            )
+    deliverable_artifact_descriptor_paths = tuple(
+        path
+        for result in tool_results or ()
+        if normalize_tool_status(result.status) == "completed"
+        for path in artifact_paths_from_output_descriptors(
+            result.output if isinstance(result.output, dict) else {},
+            roles=ARTIFACT_DELIVERY_ROLES,
+        )
+    )
+    has_deliverable_artifact_descriptors = bool(deliverable_artifact_descriptor_paths)
+    descriptor_only_delivery = (
+        has_deliverable_artifact_descriptors
+        and not _tool_scope_declared_attachment_extensions(tool_results)
+    )
+    descriptor_delivery_identities = {
+        identity
+        for path in deliverable_artifact_descriptor_paths
+        for identity in _path_identity_variants(path)
+    }
     explicit_artifact_paths = tuple(
         path
         for path in (
             *(artifact_paths or ()),
+            *requested_file_search_delivery_paths,
+            *terminal_stdout_artifact_paths,
             *tool_result_artifact_paths,
         )
         if str(path or "").strip()
     )
+    if descriptor_only_delivery and descriptor_delivery_identities:
+        explicit_artifact_paths = tuple(
+            path
+            for path in explicit_artifact_paths
+            if _path_matches_identity_set(path, descriptor_delivery_identities)
+        )
+    if partial_last_mile_paths:
+        partial_last_mile_identities = {
+            identity
+            for path in partial_last_mile_paths
+            for identity in _path_identity_variants(path)
+        }
+        explicit_artifact_paths = tuple(
+            path
+            for path in explicit_artifact_paths
+            if not _path_matches_identity_set(path, partial_last_mile_identities)
+        )
+    if suppressed_non_delivery_paths:
+        suppressed_non_delivery_identities = {
+            identity
+            for path in suppressed_non_delivery_paths
+            for identity in _path_identity_variants(path)
+        }
+        explicit_artifact_paths = tuple(
+            path
+            for path in explicit_artifact_paths
+            if not _path_matches_identity_set(path, suppressed_non_delivery_identities)
+        )
+    if requested_extensions and suppressed_media_directive_removed and not explicit_artifact_paths:
+        return "I couldn't attach the requested file. The task is still open."
+    if suppress_unrequested_image_delivery:
+        explicit_artifact_paths = tuple(
+            path
+            for path in explicit_artifact_paths
+            if Path(str(path or "")).suffix.lower() not in _IMAGE_ARTIFACT_SUFFIXES
+        )
+    if (
+        reply_has_media_directives
+        and raw_initial_reply_candidate_paths
+        and not initial_reply_candidate_paths
+        and not explicit_artifact_paths
+        and suppressed_non_delivery_paths
+    ):
+        if requested_extensions:
+            return "I couldn't attach the requested file. The task is still open."
+        reply = _strip_media_directives_from_context(reply).strip() or reply
+        reply_has_media_directives = False
     initial_reply_media_paths = tuple(str(path) for path in initial_reply_candidate_paths)
+    initial_reply_media_paths_are_requested_delivery = bool(
+        initial_reply_media_paths
+        and requested_file_search_delivery_identities
+        and all(
+            _path_matches_identity_set(path, requested_file_search_delivery_identities)
+            for path in initial_reply_media_paths
+        )
+    )
     file_read_artifact_paths = _file_read_artifact_paths_from_tool_results(
         tool_results,
         artifact_roots=artifact_roots,
     )
+    if suppressed_non_delivery_paths:
+        suppressed_non_delivery_identities = {
+            identity
+            for path in suppressed_non_delivery_paths
+            for identity in _path_identity_variants(path)
+        }
+        file_read_artifact_paths = tuple(
+            path
+            for path in file_read_artifact_paths
+            if not _path_matches_identity_set(path, suppressed_non_delivery_identities)
+        )
+    if (
+        reply_has_media_directives
+        and initial_reply_media_paths
+        and file_read_artifact_paths
+        and not has_deliverable_artifact_descriptors
+    ):
+        read_path_identities = {
+            identity
+            for path in file_read_artifact_paths
+            for identity in _path_identity_variants(path)
+        }
+        if all(_path_matches_identity_set(path, read_path_identities) for path in initial_reply_media_paths):
+            # A file_read result is inspected evidence. It is not a new
+            # deliverable unless a tool returns a structured deliverable
+            # descriptor for it.
+            return _local_discovery_results_reply(reply, file_read_artifact_paths)
+    if (
+        not reply_has_media_directives
+        and file_read_artifact_paths
+        and not has_deliverable_artifact_descriptors
+        and local_discovery_only
+        and _file_read_artifact_results_are_identity_only(tool_results)
+        and not any(Path(path).name and Path(path).name in str(reply or "") for path in file_read_artifact_paths)
+    ):
+        return _local_discovery_results_reply(reply, file_read_artifact_paths)
     if (
         reply_has_media_directives
         and initial_reply_media_paths
@@ -4909,20 +17694,29 @@ def _append_chat_artifacts_to_reply(
         reply_has_media_directives
         and initial_reply_media_paths
         and not explicit_artifact_paths
+        and not initial_reply_media_paths_are_requested_delivery
         and _reply_media_paths_are_local_discovery_results(initial_reply_media_paths, discovery_paths)
     ):
+        if terminal_outcome_reply:
+            return terminal_outcome_reply
+        if not local_discovery_only:
+            return _strip_media_directives_from_context(reply).strip() or reply
         return _local_discovery_results_reply(reply, initial_reply_media_paths)
     if (
         reply_has_media_directives
         and initial_reply_media_paths
         and not explicit_artifact_paths
-        and not tuple(required_attachment_extensions or ())
+        and not initial_reply_media_paths_are_requested_delivery
         and _has_local_discovery_tool_results(tool_results)
     ):
         # Existing files discovered by local search/read tools are facts to
         # report, not artifacts the runtime produced for delivery. Keep this
         # guard structural so the model cannot turn arbitrary local paths into
         # chat attachments by emitting MEDIA directives.
+        if terminal_outcome_reply:
+            return terminal_outcome_reply
+        if not local_discovery_only:
+            return _strip_media_directives_from_context(reply).strip() or reply
         return _local_discovery_results_reply(reply, initial_reply_media_paths)
     if (
         discovery_paths
@@ -4930,33 +17724,88 @@ def _append_chat_artifacts_to_reply(
         and _all_paths_are_file_write_text_sidecars(
             tuple(explicit_artifact_paths),
             file_write_paths=file_write_paths,
-            requested_extensions=tuple(required_attachment_extensions or ()),
+            requested_extensions=explicit_attachment_request_extensions,
         )
         and not _reply_visible_text_references_all_artifact_paths(
-            reply,
+            _strip_media_directives_from_context(reply),
             tuple(explicit_artifact_paths),
             artifact_roots=artifact_roots,
         )
+        and _completed_tools_are_only_local_discovery_or_file_write(tool_results)
     ):
+        if terminal_outcome_reply:
+            return terminal_outcome_reply
+        return _local_discovery_results_reply(reply, discovery_paths)
+    if (
+        discovery_paths
+        and not explicit_artifact_paths
+        and not reply_has_media_directives
+        and not _reply_visible_text_references_all_artifact_paths(
+            reply,
+            discovery_paths,
+            artifact_roots=artifact_roots,
+        )
+        and local_discovery_only
+    ):
+        if terminal_outcome_reply:
+            return terminal_outcome_reply
         return _local_discovery_results_reply(reply, discovery_paths)
     if (
         reply_has_media_directives
         and initial_reply_media_paths
+        and not tuple(artifact_paths or ())
         and not include_file_write_artifacts
         and _all_paths_match_file_write_paths(initial_reply_media_paths, file_write_paths=file_write_paths)
         and (
             not explicit_artifact_paths
             or _all_paths_match_file_write_paths(tuple(explicit_artifact_paths), file_write_paths=file_write_paths)
         )
+        and not any(Path(str(path or "")).suffix.lower() in _IMAGE_ARTIFACT_SUFFIXES for path in explicit_artifact_paths)
     ):
         return "Done."
+    initially_referenced_browser_screenshot_paths = {
+        path
+        for path in verified_browser_screenshot_paths
+        if _reply_delivery_references_artifact_path(reply, path, artifact_roots=artifact_roots)
+    }
+    reply_before_diagnostic_suppression = reply
     reply = _suppress_unrequested_diagnostic_media_reply(
         runtime,
         reply=reply,
         requested_extension=requested_extension,
         principal_id=principal_id,
-        suppress_paths=set(),
+        suppress_paths={
+            *suppressed_non_delivery_paths,
+            *(
+                set(browser_screenshot_paths) - initially_referenced_browser_screenshot_paths
+                if requested_extension != ".png"
+                else set()
+            ),
+        },
     )
+    if reply != reply_before_diagnostic_suppression:
+        reply_has_media_directives = bool(_reply_media_candidate_paths(reply))
+        if not reply_has_media_directives:
+            initial_reply_candidate_paths = ()
+            initial_reply_media_paths = ()
+        if requested_extension is None and not requested_extensions and not tuple(artifact_paths or ()) and browser_screenshot_paths:
+            try:
+                from nullion.response_sanitizer import (
+                    _browser_raw_extract_dump_replacement,
+                    _latest_completed_browser_extract_text,
+                )
+
+                result_list = list(tool_results or ())
+                extracted_text = _latest_completed_browser_extract_text(result_list)
+                if extracted_text and len(extracted_text) <= 1000:
+                    return extracted_text
+                replacement = _browser_raw_extract_dump_replacement(result_list, extracted_text=extracted_text)
+                if replacement:
+                    return replacement
+                if extracted_text:
+                    return extracted_text
+            except Exception:
+                pass
     reply_candidate_paths = _artifact_candidate_paths_from_reply(
         reply,
         principal_id=principal_id,
@@ -4971,32 +17820,74 @@ def _append_chat_artifacts_to_reply(
     if not reply_has_media_directives:
         reply_candidate_paths = _filter_local_discovery_candidate_paths(
             reply_candidate_paths,
-            terminal_stdout_discovery_paths,
+            local_discovery_candidate_filter_paths,
         )
-    reply_candidate_paths = tuple(path for path in reply_candidate_paths if str(path.expanduser()) not in source_paths)
+    reply_candidate_paths = tuple(
+        path
+        for path in reply_candidate_paths
+        if str(path.expanduser()) not in suppressed_non_delivery_paths
+    )
+    if suppress_unrequested_image_delivery:
+        reply_candidate_paths = tuple(
+            path
+            for path in reply_candidate_paths
+            if path.suffix.lower() not in _IMAGE_ARTIFACT_SUFFIXES
+        )
     reply_media_paths = tuple(str(path) for path in reply_candidate_paths)
-    base_candidate_paths = list(reply_media_paths) or list(explicit_artifact_paths)
+    if reply_media_paths and not (has_deliverable_artifact_descriptors and explicit_artifact_paths):
+        base_candidate_paths = list(dict.fromkeys([*reply_media_paths, *explicit_artifact_paths]))
+    else:
+        base_candidate_paths = list(explicit_artifact_paths)
+    if requested_extension and base_candidate_paths and not (reply_media_paths or email_attachment_paths):
+        matching_candidate_paths = [
+            path
+            for path in base_candidate_paths
+            if Path(str(path or "")).suffix.lower() == requested_extension
+        ]
+        if matching_candidate_paths:
+            base_candidate_paths = matching_candidate_paths
     if not base_candidate_paths:
         base_candidate_paths = _artifact_paths_from_tool_results(
             tool_results,
             include_search_matches=bool(requested_extension),
             include_file_write=include_file_write_artifacts,
+            requested_extensions=requested_extensions,
         )
+    base_candidate_paths = _prefer_current_media_artifact_paths(
+        base_candidate_paths,
+        requested_extensions=() if (reply_media_paths or email_attachment_paths) else requested_extensions,
+        tool_results=tool_results,
+    )
     non_screenshot_candidate_paths = _filter_suppressed_artifact_paths(
         base_candidate_paths,
-        suppress_paths={*browser_screenshot_paths, *source_paths},
+        suppress_paths={*browser_screenshot_paths, *suppressed_non_delivery_paths},
     )
     reply_is_browser_text_dump = _reply_is_browser_extract_text_dump(reply, tool_results)
     referenced_browser_screenshot_paths = {
         path
         for path in verified_browser_screenshot_paths
-        if _reply_visible_text_references_artifact_path(reply, path, artifact_roots=artifact_roots)
+        if _reply_delivery_references_artifact_path(reply, path, artifact_roots=artifact_roots)
+    }
+    explicit_artifact_identities = {
+        identity
+        for path in explicit_artifact_paths
+        for identity in _path_identity_variants(path)
+    }
+    explicit_verified_browser_screenshot_paths = {
+        path
+        for path in verified_browser_screenshot_paths
+        if _path_matches_identity_set(path, explicit_artifact_identities)
     }
     screenshot_is_primary_delivery = bool(verified_browser_screenshot_paths) and (
         requested_extension == ".png"
         or (
             requested_extension is None
             and bool(referenced_browser_screenshot_paths)
+            and not non_screenshot_candidate_paths
+        )
+        or (
+            requested_extension is None
+            and bool(explicit_verified_browser_screenshot_paths)
             and not non_screenshot_candidate_paths
         )
         or (
@@ -5021,17 +17912,60 @@ def _append_chat_artifacts_to_reply(
         else set(browser_screenshot_paths)
     )
     candidate_paths = list(base_candidate_paths)
+    if terminal_stdout_discovery_paths and not requested_extensions:
+        terminal_stdout_discovery_identities = {
+            identity
+            for path in terminal_stdout_discovery_paths
+            for identity in _path_identity_variants(path)
+        }
+        candidate_paths = [
+            path
+            for path in candidate_paths
+            if not _path_matches_identity_set(path, terminal_stdout_discovery_identities)
+        ]
     if screenshot_is_primary_delivery and not candidate_paths:
-        candidate_paths = sorted(referenced_browser_screenshot_paths or verified_browser_screenshot_paths)
+        candidate_paths = sorted(
+            referenced_browser_screenshot_paths
+            or explicit_verified_browser_screenshot_paths
+            or verified_browser_screenshot_paths
+        )
     candidate_paths = _filter_suppressed_artifact_paths(
         candidate_paths,
-        suppress_paths={*suppressed_screenshot_paths, *source_paths},
+        suppress_paths={*suppressed_screenshot_paths, *suppressed_non_delivery_paths},
     )
+    candidate_paths_before_filename_filter = list(candidate_paths)
+    candidate_paths = _filter_paths_to_requested_output_filenames_if_present(prompt, candidate_paths, reply=reply)
+    if requested_extensions:
+        requested_suffixes = {
+            extension if str(extension).startswith(".") else f".{extension}"
+            for extension in (str(item or "").strip().lower() for item in requested_extensions)
+            if extension
+        }
+        present_suffixes = {
+            Path(str(path or "")).suffix.lower()
+            for path in candidate_paths
+            if str(path or "").strip()
+        }
+        missing_suffixes = requested_suffixes - present_suffixes
+        for path in candidate_paths_before_filename_filter:
+            if not missing_suffixes:
+                break
+            suffix = Path(str(path or "")).suffix.lower()
+            if suffix not in missing_suffixes or path in candidate_paths:
+                continue
+            candidate_paths.append(path)
+            missing_suffixes.discard(suffix)
+    if suppress_unrequested_image_delivery:
+        candidate_paths = [
+            path
+            for path in candidate_paths
+            if Path(str(path or "")).suffix.lower() not in _IMAGE_ARTIFACT_SUFFIXES
+        ]
     promoted_candidate_paths = promote_supporting_asset_artifact_paths(candidate_paths, artifact_roots=artifact_roots)
     supporting_assets_promoted = promoted_candidate_paths != candidate_paths
     candidate_paths = _filter_suppressed_artifact_paths(
         promoted_candidate_paths,
-        suppress_paths={*suppressed_screenshot_paths, *source_paths},
+        suppress_paths={*suppressed_screenshot_paths, *suppressed_non_delivery_paths},
     )
     descriptors = []
     seen_ids: set[str] = set()
@@ -5041,20 +17975,139 @@ def _append_chat_artifacts_to_reply(
                 continue
             seen_ids.add(descriptor.artifact_id)
             descriptors.append(descriptor)
+    descriptor_requested_extension = None
+    prompt_requested_output_filenames = _requested_output_filenames_from_texts(prompt)
+    single_requested_extension = requested_extension or (
+        requested_extensions[0] if len(requested_extensions) == 1 else None
+    )
+    if not (
+        (
+            reply_media_paths
+            and not prompt_requested_output_filenames
+            and single_requested_extension not in _DIAGNOSTIC_ATTACHMENT_SUFFIXES
+        )
+        or email_attachment_paths
+        or supporting_assets_promoted
+        or len(requested_extensions) > 1
+    ):
+        descriptor_requested_extension = (
+            single_requested_extension
+            if single_requested_extension and len(requested_extensions) == 1
+            else _requested_attachment_extension(prompt)
+        )
     descriptors = _filter_artifact_descriptors_for_requested_format(
         prompt,
         descriptors,
-        requested_extension=requested_extension
-        or (
-            None
-            if reply_media_paths or supporting_assets_promoted or len(requested_extensions) > 1
-            else _requested_attachment_extension(prompt)
-        ),
+        requested_extension=descriptor_requested_extension
+        or (requested_extensions[0] if len(requested_extensions) == 1 else None),
     )
     descriptors = _filter_text_sidecar_artifact_descriptors(
         descriptors,
         requested_extension=requested_extension,
     )
+    if requested_extensions:
+        requested_suffixes = {
+            extension if str(extension).startswith(".") else f".{extension}"
+            for extension in (str(item or "").strip().lower() for item in requested_extensions)
+            if extension
+        }
+        requested_descriptors = [
+            descriptor
+            for descriptor in descriptors
+            if Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower()
+            in requested_suffixes
+        ]
+        if requested_descriptors:
+            descriptors = requested_descriptors
+        elif reply_has_media_directives:
+            descriptors = []
+    media_required_suffixes = set(_merge_required_embedded_media_extensions((), tool_results))
+    current_turn_media_paths = _preferred_current_turn_source_media_paths(tool_results)
+    missing_current_media_identities: set[str] = set()
+    if current_turn_media_paths:
+        missing_current_media_paths = _completed_artifact_paths_without_current_media(
+            tool_results,
+            required_image_paths=current_turn_media_paths,
+        )
+        if missing_current_media_paths:
+            missing_current_media_identities = {
+                identity
+                for path in missing_current_media_paths
+                for identity in _path_identity_variants(path)
+            }
+            descriptors = [
+                descriptor
+                for descriptor in descriptors
+                if (
+                    not _path_matches_identity_set(
+                        Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser(),
+                        missing_current_media_identities,
+                    )
+                    or _reply_visible_text_references_artifact_path(
+                        reply,
+                        str(getattr(descriptor, "path", "") or getattr(descriptor, "name", "")),
+                        artifact_roots=artifact_roots,
+                    )
+                )
+            ]
+    if media_required_suffixes:
+        descriptors = [
+            descriptor
+            for descriptor in descriptors
+            if Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower()
+            not in {".docx", ".pptx", ".xlsx"}.intersection(media_required_suffixes)
+            or _office_artifact_embedded_media_count(
+                Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+            )
+            > 0
+        ]
+    replaced_plain_office_identities: set[str] = set()
+    if email_attachment_paths and conversation_id:
+        plain_office_suffixes = {
+            Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower()
+            for descriptor in descriptors
+            if Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower()
+            in {".docx", ".pptx", ".xlsx"}
+            and _office_artifact_embedded_media_count(
+                Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+            )
+            <= 0
+        }
+        if plain_office_suffixes:
+            recent_media_paths = _recent_media_complete_artifact_paths(
+                runtime,
+                conversation_id=conversation_id,
+                principal_id=principal_id,
+                requested_extensions=plain_office_suffixes,
+            )
+            replacement_by_suffix: dict[str, str] = {}
+            for recent_path in recent_media_paths:
+                suffix = Path(recent_path).suffix.lower()
+                if suffix in plain_office_suffixes and suffix not in replacement_by_suffix:
+                    replacement_by_suffix[suffix] = recent_path
+            if replacement_by_suffix:
+                replacement_candidate_paths: list[str] = []
+                for descriptor in descriptors:
+                    descriptor_path = Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+                    suffix = descriptor_path.suffix.lower()
+                    if suffix in replacement_by_suffix and _office_artifact_embedded_media_count(descriptor_path) <= 0:
+                        replaced_plain_office_identities.update(_path_identity_variants(descriptor_path))
+                        replacement_candidate_paths.append(replacement_by_suffix[suffix])
+                    else:
+                        replacement_candidate_paths.append(str(descriptor_path))
+                replacement_descriptors = []
+                replacement_seen_ids: set[str] = set()
+                for artifact_root in artifact_roots:
+                    for descriptor in artifact_descriptors_for_paths(
+                        list(dict.fromkeys(replacement_candidate_paths)),
+                        artifact_root=artifact_root,
+                    ):
+                        if descriptor.artifact_id in replacement_seen_ids:
+                            continue
+                        replacement_seen_ids.add(descriptor.artifact_id)
+                        replacement_descriptors.append(descriptor)
+                if replacement_descriptors:
+                    descriptors = replacement_descriptors
     completed_file_write_paths = {
         identity
         for path in file_write_paths
@@ -5094,7 +18147,117 @@ def _append_chat_artifacts_to_reply(
         for descriptor in descriptors
         if should_keep_descriptor(descriptor)
     ]
+    if requested_extensions and explicit_artifact_paths:
+        requested_suffixes = {
+            extension if str(extension).startswith(".") else f".{extension}"
+            for extension in (str(item or "").strip().lower() for item in requested_extensions)
+            if extension
+        }
+        descriptor_paths = {
+            str(Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser())
+            for descriptor in descriptors
+        }
+        for artifact_root in artifact_roots:
+            for descriptor in artifact_descriptors_for_paths(explicit_artifact_paths, artifact_root=artifact_root):
+                descriptor_path = Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+                if descriptor_path.suffix.lower() not in requested_suffixes:
+                    continue
+                descriptor_path_text = str(descriptor_path)
+                if descriptor_path_text in descriptor_paths:
+                    continue
+                if missing_current_media_identities and _path_matches_identity_set(
+                    descriptor_path,
+                    missing_current_media_identities,
+                ):
+                    continue
+                if (
+                    descriptor_path.suffix.lower() in {".docx", ".pptx", ".xlsx"}.intersection(media_required_suffixes)
+                    and _office_artifact_embedded_media_count(descriptor_path) <= 0
+                ):
+                    continue
+                if replaced_plain_office_identities and _path_matches_identity_set(
+                    descriptor_path,
+                    replaced_plain_office_identities,
+                ):
+                    continue
+                descriptors.append(descriptor)
+                descriptor_paths.add(descriptor_path_text)
+    descriptors_before_filename_filter = list(descriptors)
+    descriptors = _filter_descriptors_to_requested_output_filenames_if_present(prompt, descriptors, reply=reply)
+    if requested_extensions:
+        requested_suffixes = {
+            extension if str(extension).startswith(".") else f".{extension}"
+            for extension in (str(item or "").strip().lower() for item in requested_extensions)
+            if extension
+        }
+        present_suffixes = {
+            Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).suffix.lower()
+            for descriptor in descriptors
+        }
+        missing_suffixes = requested_suffixes - present_suffixes
+        seen_descriptor_paths = {
+            str(Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser())
+            for descriptor in descriptors
+        }
+        for descriptor in descriptors_before_filename_filter:
+            if not missing_suffixes:
+                break
+            descriptor_path = Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+            suffix = descriptor_path.suffix.lower()
+            descriptor_path_text = str(descriptor_path)
+            if suffix not in missing_suffixes or descriptor_path_text in seen_descriptor_paths:
+                continue
+            descriptors.append(descriptor)
+            seen_descriptor_paths.add(descriptor_path_text)
+            missing_suffixes.discard(suffix)
+    descriptors = _filter_artifact_descriptors_for_required_extension_counts(
+        descriptors,
+        requested_extensions=requested_extensions,
+        tool_results=tool_results,
+        protected_identities={
+            *visible_explicit_artifact_paths,
+            *(
+                identity
+                for path in reply_media_paths
+                for identity in _path_identity_variants(path)
+                if not _tool_scope_declared_attachment_extensions(tool_results)
+            ),
+        },
+    )
+    if requested_extensions:
+        requested_suffixes = {
+            extension if str(extension).startswith(".") else f".{extension}"
+            for extension in (str(item or "").strip().lower() for item in requested_extensions)
+            if extension
+        }
+        requested_output_filenames = _requested_output_filenames_from_texts(prompt, reply)
+        descriptors = [
+            descriptor
+            for descriptor in descriptors
+            for descriptor_path in [
+                Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+            ]
+            if descriptor_path.suffix.lower() in requested_suffixes
+            or descriptor_path.name.lower() in requested_output_filenames
+        ]
+    descriptors = _filter_visual_helper_html_artifact_descriptors(
+        descriptors,
+        requested_extensions=requested_extensions,
+    )
     if not descriptors:
+        if requested_extensions and reply_has_media_directives:
+            return "I couldn't attach the requested file. The task is still open."
+        if requested_extensions and partial_last_mile_paths:
+            return "I couldn't attach the requested file. The task is still open."
+        if reply_is_browser_text_dump:
+            completed_requested_paths = _completed_requested_artifact_paths_from_tool_results(
+                tool_results,
+                requested_extensions=requested_extensions,
+                media_required_suffixes=media_required_suffixes,
+                artifact_roots=artifact_roots,
+            )
+            if completed_requested_paths:
+                return _completed_requested_artifact_reply(completed_requested_paths, tool_results=tool_results)
         if (
             requested_extension == ".png"
             and browser_screenshot_paths
@@ -5104,20 +18267,140 @@ def _append_chat_artifacts_to_reply(
                 "I couldn't attach a verified browser screenshot. "
                 "The browser was not on a loaded page when the screenshot was captured."
             )
-        if suppressed_screenshot_paths:
-            extracted_text = _latest_browser_extract_text_excerpt(tool_results)
-            if extracted_text:
-                return extracted_text
+        if requested_extension is None and browser_screenshot_paths:
+            try:
+                from nullion.response_sanitizer import _latest_completed_browser_extract_text
+
+                extracted_text = _latest_completed_browser_extract_text(list(tool_results or ()))
+                if extracted_text and len(extracted_text) <= 1000:
+                    return extracted_text
+            except Exception:
+                pass
+        browser_text_dump_reply = _browser_extract_text_dump_fallback_reply(
+            reply,
+            tool_results,
+            requested_extensions=requested_extensions,
+        )
+        if requested_extensions and browser_text_dump_reply:
+            return browser_text_dump_reply
+        if browser_text_dump_reply:
+            return browser_text_dump_reply
         return reply
+    if requested_extensions and reply_has_media_directives and reply_media_paths:
+        required_suffixes = {
+            extension if str(extension).startswith(".") else f".{extension}"
+            for extension in (str(item or "").strip().lower() for item in requested_extensions)
+            if extension
+        }
+        reply_suffixes = {
+            Path(str(path or "")).suffix.lower()
+            for path in reply_media_paths
+            if str(path or "").strip()
+        }
+        if required_suffixes and not required_suffixes.issubset(reply_suffixes):
+            selected_required_paths = []
+            selected_required_suffixes: set[str] = set()
+            for descriptor in descriptors:
+                descriptor_path = Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+                suffix = descriptor_path.suffix.lower()
+                if suffix not in required_suffixes:
+                    continue
+                selected_required_paths.append(str(descriptor_path))
+                selected_required_suffixes.add(suffix)
+            if not required_suffixes.issubset(selected_required_suffixes):
+                for raw_path in explicit_artifact_paths:
+                    descriptor_path = Path(str(raw_path or "")).expanduser()
+                    suffix = descriptor_path.suffix.lower()
+                    if suffix not in required_suffixes or not descriptor_path.is_file():
+                        continue
+                    if missing_current_media_identities and _path_matches_identity_set(
+                        descriptor_path,
+                        missing_current_media_identities,
+                    ):
+                        continue
+                    selected_required_paths.append(str(descriptor_path))
+                    selected_required_suffixes.add(suffix)
+            if required_suffixes.issubset(selected_required_suffixes):
+                requested_reply_media_paths = [
+                    path
+                    for path in reply_media_paths
+                    if Path(str(path or "")).suffix.lower() in required_suffixes
+                ]
+                if not prompt_requested_output_filenames:
+                    selected_required_identities = {
+                        identity
+                        for path in selected_required_paths
+                        for identity in _path_identity_variants(path)
+                    }
+                    explicit_artifact_identities_for_reply_media = {
+                        identity
+                        for path in explicit_artifact_paths
+                        for identity in _path_identity_variants(path)
+                    }
+                    requested_reply_media_paths.extend(
+                        path
+                        for path in reply_media_paths
+                        if _path_matches_identity_set(path, explicit_artifact_identities_for_reply_media)
+                        and not _path_matches_identity_set(path, selected_required_identities)
+                    )
+                media_lines = [
+                    f"MEDIA:{path}"
+                    for path in dict.fromkeys([*requested_reply_media_paths, *selected_required_paths])
+                ]
+                attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
+                visible_reply = _prepend_completed_email_send_summaries(
+                    f"Done — attached the requested {attachment_label}.",
+                    tool_results,
+                )
+                return "\n\n".join([visible_reply, "\n".join(media_lines)])
     if reply_has_media_directives and reply_media_paths:
         selected_paths = tuple(str(getattr(descriptor, "path", "") or "") for descriptor in descriptors)
-        if selected_paths == reply_media_paths:
+        raw_reply_media_paths = tuple(str(path) for path in _reply_media_candidate_paths(reply))
+        if selected_paths == reply_media_paths and raw_reply_media_paths == reply_media_paths:
             return reply
+        preserve_reply_caption = False
+    elif has_deliverable_artifact_descriptors or requested_file_search_delivery_paths or terminal_stdout_artifact_paths:
         preserve_reply_caption = False
     else:
         preserve_reply_caption = True
     media_lines = [f"MEDIA:{descriptor.path}" for descriptor in descriptors]
-    if preserve_reply_caption and _should_preserve_artifact_reply_caption(
+    selected_descriptor_paths = tuple(str(getattr(descriptor, "path", "") or "") for descriptor in descriptors)
+    selected_descriptor_identities = {
+        identity
+        for path in selected_descriptor_paths
+        for identity in _path_identity_variants(path)
+    }
+    reply_names_selected_artifacts = _reply_visible_text_references_all_artifact_paths(
+        reply,
+        selected_descriptor_paths,
+        artifact_roots=artifact_roots,
+    )
+    reply_names_suppressed_artifacts = any(
+        _reply_visible_text_references_artifact_path(
+            reply,
+            path,
+            artifact_roots=artifact_roots,
+        )
+        for path in suppressed_non_delivery_paths
+    )
+    reply_names_suppressed_artifacts = reply_names_suppressed_artifacts or any(
+        not _path_matches_identity_set(path, selected_descriptor_identities)
+        and _reply_visible_text_references_artifact_path(
+            reply,
+            path,
+            artifact_roots=artifact_roots,
+        )
+        for path in file_write_paths
+    )
+    if (
+        preserve_reply_caption
+        or (
+            reply_names_selected_artifacts
+            and not reply_names_suppressed_artifacts
+            and not terminal_stdout_artifact_paths
+            and not requested_file_search_delivery_paths
+        )
+    ) and _should_preserve_artifact_reply_caption(
         reply,
         screenshot_is_primary_delivery=screenshot_is_primary_delivery,
         reply_is_browser_text_dump=reply_is_browser_text_dump,
@@ -5131,13 +18414,32 @@ def _append_chat_artifacts_to_reply(
         return "\n\n".join([visible_reply, "\n".join(media_lines)])
     attachment_label = _artifact_delivery_label(descriptors, tool_results=tool_results)
     visible_reply = f"Done — attached the requested {attachment_label}."
-    if _image_generation_setup_failed(tool_results):
+    if _image_generation_setup_failed(tool_results) or _local_image_fallback_artifact_used(descriptors, tool_results):
         visible_reply += (
             "\n\nI created the images with a local fallback because API image generation is not configured.\n\n"
             f"{format_setup_tip(IMAGE_GENERATION_SETUP_TIP)}"
         )
     visible_reply = _prepend_completed_email_send_summaries(visible_reply, tool_results)
     return "\n\n".join([visible_reply, "\n".join(media_lines)])
+
+
+def _local_image_fallback_artifact_used(descriptors, tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
+    if any(result.tool_name == "image_generate" for result in tool_results or ()):
+        return False
+    descriptor_paths = [
+        Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).expanduser()
+        for descriptor in descriptors
+    ]
+    if not any(path.suffix.lower() in _IMAGE_ARTIFACT_SUFFIXES for path in descriptor_paths):
+        return False
+    file_write_identities = {
+        identity
+        for result in tool_results or ()
+        if result.tool_name == "file_write" and normalize_tool_status(result.status) == "completed"
+        for path in _string_paths_from_value((result.output if isinstance(result.output, dict) else {}).get("path"))
+        for identity in _path_identity_variants(path)
+    }
+    return any(_path_matches_identity_set(path, file_write_identities) for path in descriptor_paths)
 
 
 def _image_generation_setup_failed(
@@ -5171,7 +18473,7 @@ def _reply_has_deliverable_media(
     *,
     principal_id: str | None = None,
 ) -> bool:
-    artifact_roots = (artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime))
+    artifact_roots = _artifact_roots_for_delivery(runtime, principal_id)
     return any(
         artifact_descriptor_for_path(path, artifact_root=artifact_root) is not None
         for path in _reply_media_candidate_paths(reply)
@@ -5199,6 +18501,120 @@ def _incomplete_artifact_delivery_reply(
     return f"I couldn't attach the requested {label}. The task is still open."
 
 
+_ARTIFACT_FULFILLMENT_FAILURE_REPLIES = frozenset(
+    {
+        "I couldn't attach the requested file. The task is still open.",
+        "I couldn't attach all of the requested files. The task is still open.",
+    }
+)
+
+
+def _reply_has_requested_artifact_delivery(
+    runtime: PersistentRuntime,
+    reply: str,
+    *,
+    principal_id: str | None,
+    requested_extensions: tuple[str, ...],
+) -> bool:
+    normalized_extensions = set(_normalized_requested_extensions(requested_extensions))
+    if not normalized_extensions:
+        return False
+    artifact_roots = tuple(dict.fromkeys(_artifact_roots_for_delivery(runtime, principal_id)))
+    for raw_path in media_candidate_paths_from_text(str(reply or "")):
+        path = Path(str(raw_path or "")).expanduser()
+        if path.suffix.lower() not in normalized_extensions:
+            continue
+        for artifact_root in artifact_roots:
+            if artifact_descriptor_for_path(path, artifact_root=artifact_root) is not None:
+                return True
+    return False
+
+
+def _prior_turn_delivered_requested_artifact(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    prompt: str,
+    principal_id: str | None,
+    requested_extensions: tuple[str, ...],
+    parent_turn_id: str | None,
+) -> bool:
+    if not requested_extensions or not parent_turn_id:
+        return False
+    list_events = getattr(runtime.store, "list_conversation_events", None)
+    if not callable(list_events):
+        return False
+    try:
+        events = list_events(conversation_id)
+    except Exception:
+        return False
+    for event in reversed(list(events or ())):
+        if not isinstance(event, dict) or event.get("event_type") != "conversation.chat_turn":
+            continue
+        event_turn_id = str(event.get("turn_id") or "").strip()
+        if event_turn_id != parent_turn_id:
+            continue
+        if str(event.get("user_message") or "") != str(prompt or ""):
+            continue
+        if _reply_has_requested_artifact_delivery(
+            runtime,
+            str(event.get("assistant_reply") or ""),
+            principal_id=principal_id,
+            requested_extensions=requested_extensions,
+        ):
+            return True
+        return False
+    return False
+
+
+def _should_suppress_stale_artifact_failure_reply(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str,
+    prompt: str,
+    reply: str,
+    principal_id: str | None,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None,
+    parent_turn_id: str | None,
+) -> bool:
+    if str(reply or "").strip() not in _ARTIFACT_FULFILLMENT_FAILURE_REPLIES:
+        return False
+    requested_extensions = tuple(_normalized_requested_extensions(required_attachment_extensions or ()))
+    if not requested_extensions:
+        return False
+    return _prior_turn_delivered_requested_artifact(
+        runtime,
+        conversation_id=conversation_id,
+        prompt=prompt,
+        principal_id=principal_id,
+        requested_extensions=requested_extensions,
+        parent_turn_id=parent_turn_id,
+    )
+
+
+_COMPLETED_SCHEDULER_MUTATION_TOOLS = frozenset(
+    {
+        "create_cron",
+        "delete_cron",
+        "delete_reminder",
+        "set_reminder",
+        "toggle_cron",
+        "update_cron",
+        "update_reminder",
+    }
+)
+
+
+def _completed_scheduler_mutation_tool_present(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    return any(
+        result.tool_name in _COMPLETED_SCHEDULER_MUTATION_TOOLS
+        and normalize_tool_status(result.status) == "completed"
+        for result in (tool_results or ())
+    )
+
+
 def _enforce_chat_response_fulfillment(
     runtime: PersistentRuntime,
     *,
@@ -5213,13 +18629,62 @@ def _enforce_chat_response_fulfillment(
     required_tool_names: tuple[str, ...] | list[str] | None = None,
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> str:
+    if (
+        not tool_results
+        and not artifact_paths
+        and not required_attachment_extensions
+        and not required_embedded_media_extensions
+        and not required_tool_names
+        and not source_attachment_paths
+    ):
+        return reply
     required_attachment_extensions = _merge_required_attachment_extensions(
         required_attachment_extensions,
         tool_results,
     )
+    required_attachment_extensions = _refine_required_attachment_extensions_for_structured_outputs(
+        prompt=prompt,
+        required_attachment_extensions=required_attachment_extensions,
+        tool_results=tool_results,
+    )
     required_embedded_media_extensions = _merge_required_embedded_media_extensions(
         required_embedded_media_extensions,
         tool_results,
+    )
+    if _completed_scheduler_mutation_tool_present(tool_results):
+        required_attachment_extensions = ()
+        required_embedded_media_extensions = ()
+    excluded_artifact_paths = {
+        str(Path(path).expanduser())
+        for path in (source_attachment_paths or ())
+        if str(path or "").strip()
+    }
+    excluded_artifact_paths.update(
+        str(Path(path).expanduser())
+        for path in _local_discovery_paths_from_tool_results(tool_results)
+        if str(path or "").strip()
+        and not _path_matches_identity_set(
+            path,
+            {
+                identity
+                for requested_path in (
+                    _requested_file_search_delivery_paths(
+                        tool_results,
+                        prompt=prompt,
+                        reply=reply,
+                        allow_prompt_filename_matches=bool(required_attachment_extensions),
+                        requested_extensions=required_attachment_extensions,
+                        artifact_roots=_artifact_roots_for_delivery(runtime, principal_id),
+                    )
+                )
+                for identity in _path_identity_variants(requested_path)
+            },
+        )
+    )
+    excluded_artifact_paths.update(
+        str(Path(path).expanduser())
+        for path in _partial_last_mile_spreadsheet_artifact_paths(tool_results)
+        if str(path or "").strip()
     )
     evaluation = evaluate_response_execution_outcome(
         store=runtime.store,
@@ -5228,13 +18693,102 @@ def _enforce_chat_response_fulfillment(
         reply=reply,
         tool_results=tool_results,
         artifact_paths=artifact_paths,
-        artifact_roots=(artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)),
+        artifact_roots=_artifact_roots_for_delivery(runtime, principal_id),
         required_attachment_extensions=required_attachment_extensions,
         required_embedded_media_extensions=required_embedded_media_extensions,
         required_tool_names=required_tool_names,
-        excluded_artifact_paths=source_attachment_paths,
+        excluded_artifact_paths=excluded_artifact_paths,
     )
-    return evaluation.reply
+    rendered_reply = evaluation.reply
+    if (
+        evaluation.satisfied
+        and required_attachment_extensions
+        and not media_candidate_paths_from_text(rendered_reply)
+    ):
+        rendered_reply = _append_chat_artifacts_to_reply(
+            runtime,
+            reply=rendered_reply,
+            artifact_paths=artifact_paths,
+            prompt=prompt,
+            conversation_id=conversation_id,
+            principal_id=principal_id,
+            tool_results=tool_results,
+            required_attachment_extensions=required_attachment_extensions,
+            source_attachment_paths=source_attachment_paths,
+        )
+    return rendered_reply
+
+
+_MEDIA_ARTIFACT_PRODUCER_TOOLS = frozenset(
+    {
+        "document_create",
+        "pdf_create",
+        "pdf_edit",
+        "presentation_create",
+        "spreadsheet_create",
+    }
+)
+_MEDIA_ARTIFACT_SCOPE_KEYS = (
+    "artifact_extensions",
+    "embedded_media_artifact_extensions",
+    "media_required_artifact_extensions",
+    "required_embedded_media_extensions",
+)
+
+
+def _media_artifact_failure_extensions(result: ToolResult) -> tuple[str, ...]:
+    if result.tool_name not in _MEDIA_ARTIFACT_PRODUCER_TOOLS:
+        return ()
+    if normalize_tool_status(result.status) == "completed":
+        return ()
+    output = result.output if isinstance(result.output, dict) else {}
+    extensions: list[str] = []
+    for key in _MEDIA_ARTIFACT_SCOPE_KEYS:
+        for extension in normalize_artifact_media_required_extensions(output.get(key)):
+            if extension not in extensions:
+                extensions.append(extension)
+    return tuple(extensions)
+
+
+def _repair_reply_should_defer_to_completed_media_artifact(
+    *,
+    repair_tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    combined_tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    completed_paths = artifact_completed_embedded_media_paths(repair_tool_results)
+    if not completed_paths:
+        return False
+    if artifact_media_embedding_obligation_outstanding(combined_tool_results):
+        return False
+    completed_extensions = {
+        Path(path).suffix.lower()
+        for path in completed_paths
+        if str(path or "").strip() and Path(path).suffix
+    }
+    if not completed_extensions:
+        return False
+    failed_extensions = {
+        extension
+        for result in repair_tool_results or ()
+        for extension in _media_artifact_failure_extensions(result)
+    }
+    return bool(failed_extensions & completed_extensions)
+
+
+def _repair_final_text_for_completed_media_artifact(
+    *,
+    repair_reply: str | None,
+    repair_tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    combined_tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, bool]:
+    if not _repair_reply_should_defer_to_completed_media_artifact(
+        repair_tool_results=repair_tool_results,
+        combined_tool_results=combined_tool_results,
+    ):
+        return str(repair_reply or ""), False
+    # A later repair artifact satisfied the structured media contract. Drop any
+    # stale repair prose so the attachment renderer emits the completed file.
+    return "", True
 
 
 def _needs_required_attachment_repair(
@@ -5250,6 +18804,8 @@ def _needs_required_attachment_repair(
     required_embedded_media_extensions: tuple[str, ...] | list[str] | None = None,
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> bool:
+    if _completed_scheduler_mutation_tool_present(tool_results):
+        return False
     required_attachment_extensions = _merge_required_attachment_extensions(
         required_attachment_extensions,
         tool_results,
@@ -5260,6 +18816,16 @@ def _needs_required_attachment_repair(
     )
     if not required_attachment_extensions and not required_embedded_media_extensions:
         return False
+    excluded_artifact_paths = {
+        str(Path(path).expanduser())
+        for path in (source_attachment_paths or ())
+        if str(path or "").strip()
+    }
+    excluded_artifact_paths.update(
+        str(Path(path).expanduser())
+        for path in _local_discovery_paths_from_tool_results(tool_results)
+        if str(path or "").strip()
+    )
     decision = evaluate_response_fulfillment(
         store=runtime.store,
         conversation_id=conversation_id,
@@ -5267,25 +18833,1798 @@ def _needs_required_attachment_repair(
         reply=reply,
         tool_results=tool_results,
         artifact_paths=artifact_paths,
-        artifact_roots=(artifact_root_for_principal(principal_id), artifact_root_for_runtime(runtime)),
+        artifact_roots=_artifact_roots_for_delivery(runtime, principal_id),
         required_attachment_extensions=required_attachment_extensions,
         required_embedded_media_extensions=required_embedded_media_extensions,
-        excluded_artifact_paths=source_attachment_paths,
+        excluded_artifact_paths=excluded_artifact_paths,
     )
     return (
         not decision.satisfied
-        and any("attachment" in requirement for requirement in decision.missing_requirements)
+        and any(
+            requirement.startswith(("attachment:", "attachment_with_embedded_media:"))
+            for requirement in decision.missing_requirements
+        )
     )
 
 
-def _required_attachment_repair_prompt(required_attachment_extensions: tuple[str, ...] | list[str]) -> str:
+_REPAIR_EXTENSION_TOOL_NAMES = {
+    ".csv": ("file_write", "spreadsheet_create"),
+    ".doc": ("document_create",),
+    ".docx": ("document_create",),
+    ".htm": ("file_write", "document_create"),
+    ".html": ("file_write", "document_create"),
+    ".pdf": ("pdf_create",),
+    ".ppt": ("presentation_create",),
+    ".pptx": ("presentation_create",),
+    ".svg": ("file_write",),
+    ".tsv": ("file_write", "spreadsheet_create"),
+    ".xls": ("spreadsheet_create",),
+    ".xlsx": ("spreadsheet_create",),
+}
+
+
+def _existing_attachment_extensions_for_repair(
+    *,
+    runtime: PersistentRuntime,
+    principal_id: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    artifact_paths: list[str] | tuple[str, ...] | None,
+    source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
+) -> set[str]:
+    roots = _artifact_roots_for_delivery(runtime, principal_id)
+    excluded = {
+        str(Path(path).expanduser())
+        for path in (source_attachment_paths or ())
+        if str(path or "").strip()
+    }
+    existing: set[str] = set()
+    for raw_path in [*(artifact_paths or ()), *_artifact_paths_from_tool_results(tool_results)]:
+        if not str(raw_path or "").strip():
+            continue
+        path = Path(str(raw_path)).expanduser()
+        if str(path) in excluded:
+            continue
+        if not any(path.is_absolute() and path.is_relative_to(root) for root in roots):
+            continue
+        if path.exists() and path.suffix.lower() in VALID_ATTACHMENT_EXTENSIONS:
+            existing.add(path.suffix.lower())
+    return existing
+
+
+def _existing_attachment_extension_counts_for_repair(
+    *,
+    runtime: PersistentRuntime,
+    principal_id: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    artifact_paths: list[str] | tuple[str, ...] | None,
+    source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
+) -> dict[str, int]:
+    roots = _artifact_roots_for_delivery(runtime, principal_id)
+    excluded = {
+        str(Path(path).expanduser())
+        for path in (source_attachment_paths or ())
+        if str(path or "").strip()
+    }
+    counts: dict[str, int] = {}
+    seen_paths: set[str] = set()
+    for raw_path in [*(artifact_paths or ()), *_artifact_paths_from_tool_results(tool_results)]:
+        if not str(raw_path or "").strip():
+            continue
+        path = Path(str(raw_path)).expanduser()
+        path_text = str(path)
+        if path_text in seen_paths or path_text in excluded:
+            continue
+        seen_paths.add(path_text)
+        if not any(path.is_absolute() and path.is_relative_to(root) for root in roots):
+            continue
+        suffix = path.suffix.lower()
+        if path.exists() and suffix in VALID_ATTACHMENT_EXTENSIONS:
+            counts[suffix] = counts.get(suffix, 0) + 1
+    return counts
+
+
+def _office_artifact_embedded_media_count(path: Path) -> int:
+    if path.suffix.lower() not in {".docx", ".pptx", ".xlsx"}:
+        return 0
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(path) as package:
+            return sum(
+                1
+                for member in package.namelist()
+                if member.startswith(("word/media/", "ppt/media/", "xl/media/"))
+            )
+    except Exception:
+        return 0
+
+def _existing_embedded_media_attachment_extensions_for_repair(
+    *,
+    runtime: PersistentRuntime,
+    principal_id: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    roots = _artifact_roots_for_delivery(runtime, principal_id)
+    existing: set[str] = set()
+    for raw_path in artifact_completed_embedded_media_paths(tool_results):
+        if not str(raw_path or "").strip():
+            continue
+        path = Path(str(raw_path)).expanduser()
+        if not any(path.is_absolute() and path.is_relative_to(root) for root in roots):
+            continue
+        if path.exists() and path.suffix.lower() in VALID_ATTACHMENT_EXTENSIONS:
+            existing.add(path.suffix.lower())
+    return existing
+
+
+_MEDIA_EMBEDDABLE_ARTIFACT_TOOLS = {
+    "document_create": ".docx",
+    "pdf_create": ".pdf",
+    "pdf_edit": ".pdf",
+    "presentation_create": ".pptx",
+    "spreadsheet_create": ".xlsx",
+}
+
+
+def _current_turn_collected_media_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "")
+        output = result.output if isinstance(result.output, dict) else {}
+        keys: tuple[str, ...]
+        if tool_name in {"browser_image_collect", "image_generate", "browser_screenshot"}:
+            keys = ("image_paths", "artifact_paths", "path", "artifact_path")
+        elif tool_name in _MEDIA_EMBEDDABLE_ARTIFACT_TOOLS or tool_name == "file_write":
+            keys = (
+                "embedded_images",
+                "source_image_paths",
+                "image_paths",
+                "optimized_image_paths",
+                "embedded_screenshots",
+                "source_screenshot_paths",
+                "screenshot_paths",
+            )
+        elif tool_name == "archive_extract":
+            entries = output.get("entries")
+            if isinstance(entries, (list, tuple)):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    raw_path = entry.get("path")
+                    if not isinstance(raw_path, str) or not raw_path.strip():
+                        continue
+                    path = Path(raw_path).expanduser()
+                    media_type = str(entry.get("media_type") or "").strip().lower()
+                    if media_type.startswith("image/") or path.suffix.lower() in _IMAGE_ARTIFACT_SUFFIXES:
+                        paths.append(str(path))
+            continue
+        else:
+            continue
+        for key in keys:
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.append(value.strip())
+            elif isinstance(value, (list, tuple)):
+                paths.extend(str(item).strip() for item in value if isinstance(item, str) and item.strip())
+    return tuple(dict.fromkeys(paths))
+
+
+def _current_turn_collected_source_media_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "")
+        if tool_name not in {"browser_image_collect", "image_generate"}:
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for key in ("image_paths", "artifact_paths", "path", "artifact_path"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.append(value.strip())
+            elif isinstance(value, (list, tuple)):
+                paths.extend(str(item).strip() for item in value if isinstance(item, str) and item.strip())
+    return tuple(dict.fromkeys(paths))
+
+
+def _preferred_current_turn_collected_media_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths = _current_turn_collected_media_paths(tool_results)
+    if len(paths) <= 1:
+        return paths
+
+    def media_score(indexed_path: tuple[int, str]) -> tuple[int, int, int]:
+        index, raw_path = indexed_path
+        path = Path(str(raw_path)).expanduser()
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        pixels = 0
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                pixels = int(image.width) * int(image.height)
+        except Exception:
+            pixels = 0
+        return pixels, size, index
+
+    _index, preferred_path = max(enumerate(paths), key=media_score)
+    return (preferred_path,)
+
+
+def _preferred_current_turn_source_media_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths = _current_turn_collected_source_media_paths(tool_results)
+    if len(paths) <= 1:
+        return paths
+
+    def media_score(indexed_path: tuple[int, str]) -> tuple[int, int, int]:
+        index, raw_path = indexed_path
+        path = Path(str(raw_path)).expanduser()
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        pixels = 0
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                pixels = int(image.width) * int(image.height)
+        except Exception:
+            pixels = 0
+        return pixels, size, index
+
+    _index, preferred_path = max(enumerate(paths), key=media_score)
+    return (preferred_path,)
+
+
+def _completed_artifact_extensions_without_embedded_media(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    required_image_paths: tuple[str, ...] = (),
+) -> set[str]:
+    missing_media: set[str] = set()
+    required_image_identities = {
+        identity
+        for path in required_image_paths
+        for identity in _path_identity_variants(path)
+    }
+    for result in tool_results or ():
+        tool_extension = _MEDIA_EMBEDDABLE_ARTIFACT_TOOLS.get(str(getattr(result, "tool_name", "") or ""))
+        output = result.output if isinstance(result.output, dict) else {}
+        extension = tool_extension
+        for key in ("path", "artifact_path"):
+            value = output.get(key)
+            if isinstance(value, str) and Path(value).suffix:
+                extension = Path(value).suffix.lower()
+                break
+        if not extension or normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        has_artifact = any(
+            isinstance(output.get(key), str) and str(output.get(key) or "").strip()
+            for key in ("path", "artifact_path")
+        ) or any(
+            isinstance(output.get(key), (list, tuple)) and output.get(key)
+            for key in ("artifact_paths", "artifacts")
+        )
+        if not has_artifact:
+            continue
+        embedded_images: list[str] = []
+        for key in ("embedded_images", "source_image_paths", "image_paths"):
+            values = output.get(key)
+            if isinstance(values, str) and values.strip():
+                embedded_images.append(values.strip())
+            elif isinstance(values, (list, tuple)):
+                embedded_images.extend(str(item).strip() for item in values if isinstance(item, str) and item.strip())
+        html_images = output.get("embedded_html_images")
+        if isinstance(html_images, (list, tuple)):
+            for item in html_images:
+                if isinstance(item, dict):
+                    value = item.get("path")
+                    if isinstance(value, str) and value.strip():
+                        embedded_images.append(value.strip())
+                elif isinstance(item, str) and item.strip():
+                    embedded_images.append(item.strip())
+        if required_image_identities:
+            if not any(
+                _path_matches_identity_set(Path(image_path), required_image_identities)
+                for image_path in embedded_images
+            ):
+                missing_media.add(extension)
+            continue
+        embedded_screenshots: list[str] = []
+        for key in ("embedded_screenshots", "source_screenshot_paths", "screenshot_paths"):
+            values = output.get(key)
+            if isinstance(values, str) and values.strip():
+                embedded_screenshots.append(values.strip())
+            elif isinstance(values, (list, tuple)):
+                embedded_screenshots.extend(str(item).strip() for item in values if isinstance(item, str) and item.strip())
+        if not embedded_images and not embedded_screenshots:
+            missing_media.add(extension)
+    return missing_media
+
+
+def _completed_artifact_paths_without_current_media(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    required_image_paths: tuple[str, ...] = (),
+) -> set[str]:
+    if not required_image_paths:
+        return set()
+    required_image_identities = {
+        identity
+        for path in required_image_paths
+        for identity in _path_identity_variants(path)
+    }
+    missing_paths: set[str] = set()
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        if str(getattr(result, "tool_name", "") or "") not in _MEDIA_EMBEDDABLE_ARTIFACT_TOOLS and str(
+            getattr(result, "tool_name", "") or ""
+        ) != "file_write":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        artifact_paths: list[str] = []
+        for key in ("path", "artifact_path"):
+            value = output.get(key)
+            if (
+                isinstance(value, str)
+                and value.strip()
+                and Path(value).suffix.lower() in {".docx", ".htm", ".html", ".pdf", ".pptx", ".xlsx"}
+            ):
+                artifact_paths.append(value.strip())
+        for key in ("artifact_paths", "artifacts"):
+            value = output.get(key)
+            if isinstance(value, (list, tuple)):
+                artifact_paths.extend(
+                    str(item).strip()
+                    for item in value
+                    if isinstance(item, str)
+                    and item.strip()
+                    and Path(str(item)).suffix.lower() in {".docx", ".htm", ".html", ".pdf", ".pptx", ".xlsx"}
+                )
+        if not artifact_paths:
+            continue
+        embedded_paths: list[str] = []
+        for key in ("embedded_images", "source_image_paths", "image_paths", "embedded_screenshots", "source_screenshot_paths", "screenshot_paths"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                embedded_paths.append(value.strip())
+            elif isinstance(value, (list, tuple)):
+                embedded_paths.extend(str(item).strip() for item in value if isinstance(item, str) and item.strip())
+        html_images = output.get("embedded_html_images")
+        if isinstance(html_images, (list, tuple)):
+            for item in html_images:
+                if isinstance(item, dict):
+                    value = item.get("path")
+                    if isinstance(value, str) and value.strip():
+                        embedded_paths.append(value.strip())
+                elif isinstance(item, str) and item.strip():
+                    embedded_paths.append(item.strip())
+        if any(_path_matches_identity_set(Path(path), required_image_identities) for path in embedded_paths):
+            continue
+        missing_paths.update(str(Path(path).expanduser()) for path in artifact_paths)
+    return missing_paths
+
+
+def _missing_required_attachment_extensions_for_repair(
+    runtime: PersistentRuntime,
+    *,
+    prompt: str | None = None,
+    principal_id: str | None,
+    required_attachment_extensions: tuple[str, ...] | list[str] | None,
+    required_embedded_media_extensions: tuple[str, ...] | list[str] | None = None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    artifact_paths: list[str] | tuple[str, ...] | None,
+    source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, ...]:
+    media_required = set(normalize_artifact_media_required_extensions(required_embedded_media_extensions))
+    prompt_requested_extensions = _requested_output_filename_extensions_counted(prompt)
+    explicit_required_extensions: list[str] = []
+    for raw_extension in required_attachment_extensions or ():
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension in VALID_ATTACHMENT_EXTENSIONS or extension in _DIAGNOSTIC_ATTACHMENT_SUFFIXES:
+            explicit_required_extensions.append(extension)
+    required = (
+        prompt_requested_extensions
+        if prompt_requested_extensions and not explicit_required_extensions
+        else (
+            tuple(
+                [
+                    *explicit_required_extensions,
+                    *(
+                        extension
+                        for extension in _merge_required_attachment_extensions((), tool_results)
+                        if extension not in explicit_required_extensions
+                    ),
+                ]
+            )
+            if explicit_required_extensions
+            else _merge_required_attachment_extensions(required_attachment_extensions, tool_results)
+        )
+    )
+    required = tuple(required)
+    required = (
+        *required,
+        *(extension for extension in media_required if extension not in required),
+    )
+    required = _refine_required_attachment_extensions_for_structured_outputs(
+        prompt=prompt,
+        required_attachment_extensions=required,
+        tool_results=tool_results,
+    )
+    if not required:
+        return ()
+    if _completed_tools_are_only_local_discovery(tool_results):
+        return ()
+    existing = _existing_attachment_extensions_for_repair(
+        runtime=runtime,
+        principal_id=principal_id,
+        tool_results=tool_results,
+        artifact_paths=artifact_paths,
+        source_attachment_paths=source_attachment_paths,
+    )
+    existing_counts = _existing_attachment_extension_counts_for_repair(
+        runtime=runtime,
+        principal_id=principal_id,
+        tool_results=tool_results,
+        artifact_paths=artifact_paths,
+        source_attachment_paths=source_attachment_paths,
+    )
+    existing_with_embedded_media = _existing_embedded_media_attachment_extensions_for_repair(
+        runtime=runtime,
+        principal_id=principal_id,
+        tool_results=tool_results,
+    )
+    current_turn_media_paths = _preferred_current_turn_source_media_paths(tool_results)
+    if media_required:
+        missing_embedded_media_extensions = _completed_artifact_extensions_without_embedded_media(tool_results)
+        existing_with_embedded_media.difference_update(
+            extension
+            for extension in missing_embedded_media_extensions
+            if extension in media_required
+        )
+        for extension in missing_embedded_media_extensions:
+            if extension in media_required:
+                existing_counts[extension] = 0
+    if current_turn_media_paths:
+        missing_current_media_extensions = _completed_artifact_extensions_without_embedded_media(
+            tool_results,
+            required_image_paths=current_turn_media_paths,
+        )
+        existing.difference_update(extension for extension in missing_current_media_extensions if extension in required)
+        for extension in missing_current_media_extensions:
+            if extension in required:
+                existing_counts[extension] = 0
+        if media_required:
+            existing_with_embedded_media.difference_update(
+                extension
+                for extension in missing_current_media_extensions
+                if extension in media_required
+            )
+    missing: list[str] = []
+    required_counts: dict[str, int] = {}
+    for extension in required:
+        required_counts[extension] = required_counts.get(extension, 0) + 1
+    seen_required_counts: dict[str, int] = {}
+    for extension in required:
+        seen_required_counts[extension] = seen_required_counts.get(extension, 0) + 1
+        if existing_counts.get(extension, 0) < seen_required_counts[extension]:
+            missing.append(extension)
+            continue
+        if extension in media_required and extension not in existing_with_embedded_media:
+            missing.append(extension)
+    return tuple(missing)
+
+
+def _repair_tool_registry_for_missing_attachment_extensions(
+    *,
+    base_registry: object,
+    active_registry: object,
+    missing_extensions: tuple[str, ...],
+    existing_registry_decision: TurnToolScopeDecision | None = None,
+) -> object:
+    if not missing_extensions:
+        return active_registry
+    available = _registry_tool_names(base_registry)
+    requested_tools = tuple(
+        dict.fromkeys(
+            tool_name
+            for extension in missing_extensions
+            for tool_name in _REPAIR_EXTENSION_TOOL_NAMES.get(extension, ())
+            if tool_name in available
+        )
+    )
+    if not requested_tools:
+        return active_registry
+    existing = existing_registry_decision or getattr(active_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
+    return ScopedTurnToolRegistry(
+        base_registry,
+        evidence=build_turn_tool_evidence(
+            user_message="structured missing attachment repair",
+            conversation_result=None,
+            requested_extensions=missing_extensions,
+        ),
+            tool_scope_decision=TurnToolScopeDecision(
+                web_action=getattr(existing, "web_action", "none"),
+                scheduler_action=getattr(existing, "scheduler_action", "none"),
+                scheduler_toggle_enabled=getattr(existing, "scheduler_toggle_enabled", None),
+                scheduler_selection_policy=getattr(existing, "scheduler_selection_policy", "none"),
+                scheduler_target_scope=getattr(existing, "scheduler_target_scope", "none"),
+                skill_pack_action=getattr(existing, "skill_pack_action", "none"),
+            connector_app_ids=tuple(getattr(existing, "connector_app_ids", ()) or ()),
+            requested_tool_names=requested_tools,
+            required_tool_names=tuple(getattr(existing, "required_tool_names", ()) or ()),
+            requested_artifact_extensions=missing_extensions,
+            required_embedded_media_extensions=tuple(
+                extension
+                for extension in tuple(getattr(existing, "required_embedded_media_extensions", ()) or ())
+                if extension in missing_extensions
+            ),
+            confidence=1.0,
+            valid=True,
+        ),
+    )
+
+
+def _required_attachment_repair_prompt(
+    required_attachment_extensions: tuple[str, ...] | list[str],
+    *,
+    collected_media_paths: tuple[str, ...] | list[str] = (),
+) -> str:
     required = ", ".join(required_attachment_extensions) or "the requested attachment"
+    media_paths = tuple(path for path in collected_media_paths if str(path or "").strip())
+    media_instruction = (
+        " Reuse these current-turn local raster paths for any missing embedded-media artifact: "
+        + ", ".join(media_paths)
+        + ". Do not use unrelated old workspace files as substitute media."
+        if media_paths
+        else ""
+    )
     return (
         f"Your previous response did not create the required {required} attachment. "
         "Continue the same user request now. Use the available tools to create and save the real requested "
         "artifact in the workspace artifact directory, then finish with the artifact attached. "
+        "Create exactly the missing requested format or formats; do not create fallback artifacts in different formats."
+        f"{media_instruction} "
         "Do not switch models. Do not ask a clarification unless the artifact is impossible without the missing detail."
     )
+
+
+_LAST_MILE_TEXT_ARTIFACT_EXTENSIONS = frozenset({".csv", ".html", ".htm", ".md", ".tsv", ".txt"})
+_LAST_MILE_DOCUMENT_EXTENSIONS = frozenset({".docx"})
+_LAST_MILE_PDF_EXTENSIONS = frozenset({".pdf"})
+_LAST_MILE_PRESENTATION_EXTENSIONS = frozenset({".pptx"})
+_LAST_MILE_SPREADSHEET_EXTENSIONS = frozenset({".xlsx"})
+_LAST_MILE_SPREADSHEET_MAX_ROWS = 40
+_LAST_MILE_SPREADSHEET_RETRYABLE_MEDIA_FAILURE_REASONS = frozenset(
+    {
+        "artifact_media_required_by_turn_contract",
+        "artifact_media_required_by_prior_collection",
+        "artifact_media_required_by_prior_failure",
+        "spreadsheet_embed_paths_failed",
+        "spreadsheet_media_required_by_prior_failure",
+        "remote_image_paths_not_supported",
+    }
+)
+
+
+def _last_mile_text_artifact_stem(prompt: str, extension: str) -> str:
+    request_id = uuid4().hex[:12]
+    return f"requested_artifact_{request_id}_{extension.strip('.').lower()}"
+
+
+def _image_data_uri(path: Path) -> str | None:
+    path = optimized_embedded_image_path(path)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    suffix = path.suffix.lower()
+    media_type = {
+        ".gif": "image/gif",
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+        ".webp": "image/webp",
+    }.get(suffix, "image/png")
+    return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _last_mile_html_media_markup(media_paths: Iterable[str]) -> str:
+    image_markup: list[str] = []
+    for raw_path in media_paths:
+        if not str(raw_path or "").strip():
+            continue
+        path = Path(str(raw_path)).expanduser()
+        data_uri = _image_data_uri(path)
+        if not data_uri:
+            continue
+        image_markup.append(
+            "<figure>"
+            f"<img src=\"{data_uri}\" alt=\"\" style=\"max-width:100%;height:auto;\" />"
+            f"<figcaption>{html_lib.escape(path.name)}</figcaption>"
+            "</figure>"
+        )
+    return "\n".join(image_markup)
+
+
+def _last_mile_text_artifact_body(
+    *,
+    extension: str,
+    prompt: str,
+    reply: str,
+    artifact_paths: Iterable[str],
+    collected_media_paths: Iterable[str] = (),
+) -> str:
+    visible_reply = _strip_media_directives_from_context(str(reply or "")).strip()
+    safe_prompt = str(prompt or "").strip()
+    paths = [Path(str(path)).name for path in artifact_paths if str(path or "").strip()]
+    if extension in {".csv", ".tsv"}:
+        delimiter = "\t" if extension == ".tsv" else ","
+
+        def cell(value: object) -> str:
+            text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+            if delimiter in text or '"' in text:
+                text = '"' + text.replace('"', '""') + '"'
+            return text
+
+        rows = [
+            ("Field", "Value"),
+            ("Request", safe_prompt),
+        ]
+        if visible_reply:
+            rows.append(("Summary", visible_reply))
+        for index, name in enumerate(dict.fromkeys(paths), start=1):
+            rows.append((f"Included file {index}", name))
+        return "\n".join(delimiter.join(cell(value) for value in row) for row in rows) + "\n"
+    if extension in {".html", ".htm"}:
+        path_items = "\n".join(f"<li>{html_lib.escape(name)}</li>" for name in dict.fromkeys(paths))
+        media_markup = _last_mile_html_media_markup(collected_media_paths)
+        return (
+            "<!doctype html>\n"
+            "<html><head><meta charset=\"utf-8\"><title>Requested Artifact</title></head>\n"
+            "<body>\n"
+            "<main>\n"
+            "<h1>Requested Artifact</h1>\n"
+            + (f"<p>{html_lib.escape(visible_reply)}</p>\n" if visible_reply else "")
+            + (f"<section>{media_markup}</section>\n" if media_markup else "")
+            + (f"<h2>Included files</h2><ul>{path_items}</ul>\n" if path_items else "")
+            + "</main>\n"
+            "</body></html>\n"
+        )
+    lines = ["Requested artifact", "", safe_prompt]
+    if visible_reply:
+        lines.extend(["", visible_reply])
+    if paths:
+        lines.extend(["", "Included files:", *[f"- {name}" for name in dict.fromkeys(paths)]])
+    return "\n".join(lines).strip() + "\n"
+
+
+def _materialize_last_mile_text_artifacts(
+    *,
+    principal_id: str | None,
+    prompt: str,
+    reply: str,
+    missing_extensions: Iterable[str],
+    artifact_paths: Iterable[str],
+    collected_media_paths: Iterable[str] = (),
+) -> tuple[list[ToolResult], list[str]]:
+    results: list[ToolResult] = []
+    paths: list[str] = []
+    existing_suffixes = {
+        Path(str(path)).suffix.lower()
+        for path in artifact_paths
+        if str(path or "").strip()
+    }
+    for raw_extension in missing_extensions:
+        extension = str(raw_extension or "").strip().lower()
+        if extension == ".htm":
+            extension = ".html"
+        if extension not in _LAST_MILE_TEXT_ARTIFACT_EXTENSIONS or extension in existing_suffixes:
+            continue
+        path = artifact_path_for_generated_workspace_file(
+            principal_id=principal_id,
+            suffix=extension,
+            stem=_last_mile_text_artifact_stem(prompt, extension),
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            _last_mile_text_artifact_body(
+                extension=extension,
+                prompt=prompt,
+                reply=reply,
+                artifact_paths=artifact_paths,
+                collected_media_paths=collected_media_paths,
+            ),
+            encoding="utf-8",
+        )
+        path_text = str(path)
+        embedded_images = (
+            list(dict.fromkeys(str(item) for item in collected_media_paths if str(item or "").strip()))
+            if extension in {".html", ".htm"}
+            else []
+        )
+        paths.append(path_text)
+        output = {
+            "path": path_text,
+            "artifact_path": path_text,
+            "artifact_paths": [path_text],
+            "format": extension.lstrip("."),
+            "last_mile_materialized": True,
+        }
+        if embedded_images:
+            output["embedded_images"] = embedded_images
+            output["embedded_html_images"] = embedded_images
+        results.append(ToolResult(f"last-mile-text-artifact-{uuid4().hex}", "file_write", "completed", output))
+    return results, paths
+
+
+def _requested_output_filenames(prompt: str) -> tuple[str, ...]:
+    filenames: list[str] = []
+    for match in _PROMPT_FILENAME_CANDIDATE_RE.finditer(str(prompt or "")):
+        filename = Path(match.group(1).strip("`'\"<>")).name
+        suffix = Path(filename).suffix.lower()
+        if suffix in VALID_ATTACHMENT_EXTENSIONS and filename not in filenames:
+            filenames.append(filename)
+    return tuple(filenames)
+
+
+def _requested_output_filenames_from_texts(*texts: str | None) -> tuple[str, ...]:
+    filenames: list[str] = []
+    for text in texts:
+        for filename in _requested_output_filenames(str(text or "")):
+            lowered = filename.lower()
+            if lowered not in {existing.lower() for existing in filenames}:
+                filenames.append(filename)
+    return tuple(filenames)
+
+
+def _requested_output_filename_extensions(prompt: str | None) -> tuple[str, ...]:
+    text = str(prompt or "")
+    extensions: list[str] = []
+    filenames = _requested_output_filenames(text)
+    multiple_requested_outputs = len(filenames) > 1
+    for filename in filenames:
+        if not multiple_requested_outputs and not has_unambiguous_attachment_extension_context(text, filename):
+            continue
+        suffix = Path(filename).suffix.lower()
+        if suffix and suffix not in extensions:
+            extensions.append(suffix)
+    return tuple(extensions)
+
+
+def _requested_output_filename_extensions_counted(prompt: str | None) -> tuple[str, ...]:
+    text = str(prompt or "")
+    extensions: list[str] = []
+    for filename in _requested_output_filenames(text):
+        suffix = Path(filename).suffix.lower()
+        if suffix in VALID_ATTACHMENT_EXTENSIONS:
+            extensions.append(suffix)
+    return tuple(extensions)
+
+
+def _refine_required_attachment_extensions_for_structured_outputs(
+    *,
+    prompt: str | None,
+    required_attachment_extensions: Iterable[str] | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    required: list[str] = []
+    for raw_extension in required_attachment_extensions or ():
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        required.append(extension)
+    if (
+        required
+        and _has_local_discovery_tool_results(tool_results)
+        and _completed_tools_are_only_local_discovery_or_file_write(tool_results)
+        and not _deliverable_artifact_descriptor_extensions(tool_results)
+    ):
+        if _local_discovery_prompt_excludes_attachment_delivery(prompt):
+            return ()
+        requested_output_extensions = {
+            Path(filename).suffix.lower()
+            for filename in _requested_output_filenames(str(prompt or ""))
+            if Path(filename).suffix.lower()
+        }
+        if not set(required).intersection(requested_output_extensions):
+            return ()
+    prompt_requested_extensions = _requested_attachment_extensions(
+        str(prompt or ""),
+        model_client=None,
+        allow_model_planning=False,
+    )
+    if prompt_requested_extensions:
+        structured_extensions = tuple(
+            dict.fromkeys(
+                (
+                    *prompt_requested_extensions,
+                    *_required_attachment_extensions_from_tool_scope(tool_results),
+                    *_deliverable_artifact_descriptor_extensions(tool_results),
+                    *_completed_primary_artifact_extensions_from_tool_results(tool_results),
+                )
+            )
+        )
+        refined = [extension for extension in required if extension in structured_extensions]
+        if refined:
+            return tuple(refined)
+    output_filename_extensions = _requested_output_filename_extensions(prompt)
+    if not output_filename_extensions:
+        return tuple(required)
+    structured_extensions = tuple(
+        dict.fromkeys(
+            (
+                *_required_attachment_extensions_from_tool_scope(tool_results),
+                *_deliverable_artifact_descriptor_extensions(tool_results),
+                *_completed_primary_artifact_extensions_from_tool_results(tool_results),
+            )
+        )
+    )
+    if not structured_extensions:
+        return tuple(required)
+    allowed = {*output_filename_extensions, *structured_extensions}
+    refined = [extension for extension in required if extension in allowed]
+    for extension in output_filename_extensions:
+        if extension not in refined:
+            refined.append(extension)
+    return tuple(refined or required)
+
+
+_LOCAL_DISCOVERY_NO_ATTACHMENT_DELIVERY_RE = re.compile(
+    r"\b(?:do\s+not|don't|without)\s+(?:attach|upload|send|deliver)\b|\bfilename-only\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _local_discovery_prompt_excludes_attachment_delivery(prompt: str | None) -> bool:
+    return bool(_LOCAL_DISCOVERY_NO_ATTACHMENT_DELIVERY_RE.search(str(prompt or "")))
+
+
+def _filter_paths_to_requested_output_filenames_if_present(
+    prompt: str | None,
+    paths: Iterable[str],
+    *,
+    reply: str | None = None,
+) -> list[str]:
+    prompt_requested_names = {name.lower() for name in _requested_output_filenames_from_texts(prompt)}
+    requested_names = prompt_requested_names or {
+        name.lower() for name in _requested_output_filenames_from_texts(prompt, reply)
+    }
+    candidate_paths = [str(path) for path in paths if str(path or "").strip()]
+    if not requested_names:
+        return candidate_paths
+    requested_paths = [
+        path
+        for path in candidate_paths
+        if Path(str(path)).name.lower() in requested_names
+    ]
+    return list(dict.fromkeys(requested_paths or candidate_paths))
+
+
+def _filter_descriptors_to_requested_output_filenames_if_present(
+    prompt: str | None,
+    descriptors: Iterable[object],
+    *,
+    reply: str | None = None,
+) -> list[object]:
+    descriptor_list = list(descriptors)
+    prompt_requested_names = {name.lower() for name in _requested_output_filenames_from_texts(prompt)}
+    requested_names = prompt_requested_names or {
+        name.lower() for name in _requested_output_filenames_from_texts(prompt, reply)
+    }
+    if not requested_names:
+        return descriptor_list
+    requested_descriptors = [
+        descriptor
+        for descriptor in descriptor_list
+        if Path(str(getattr(descriptor, "path", "") or getattr(descriptor, "name", ""))).name.lower()
+        in requested_names
+    ]
+    return requested_descriptors or descriptor_list
+
+
+def _materialize_requested_filename_aliases(
+    *,
+    principal_id: str | None,
+    prompt: str,
+    artifact_paths: Iterable[str],
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+) -> tuple[list[ToolResult], list[str]]:
+    requested = _requested_output_filenames(prompt)
+    if not requested:
+        return [], []
+    aliasable_paths = _last_mile_alias_source_paths(tool_results)
+    if tool_results and not aliasable_paths:
+        return [], []
+    existing_paths = [
+        Path(str(path)).expanduser()
+        for path in artifact_paths
+        if str(path or "").strip()
+        and Path(str(path)).expanduser().is_file()
+        and (not aliasable_paths or str(Path(str(path)).expanduser()) in aliasable_paths)
+    ]
+    existing_by_name = {path.name for path in existing_paths}
+    results: list[ToolResult] = []
+    paths: list[str] = []
+    for filename in requested:
+        if filename in existing_by_name:
+            continue
+        suffix = Path(filename).suffix.lower()
+        source = next((path for path in existing_paths if path.suffix.lower() == suffix), None)
+        if source is None:
+            continue
+        target = artifact_path_for_generated_workspace_file(
+            principal_id=principal_id,
+            suffix=suffix,
+            stem=Path(filename).stem,
+        )
+        if target.name != filename:
+            target = target.with_name(filename)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copyfile(source, target)
+        except OSError:
+            continue
+        path_text = str(target)
+        paths.append(path_text)
+        results.append(
+            ToolResult(
+                f"requested-filename-alias-{uuid4().hex}",
+                "file_write",
+                "completed",
+                {
+                    "path": path_text,
+                    "artifact_path": path_text,
+                    "artifact_paths": [path_text],
+                    "source_path": str(source),
+                    "requested_filename_alias": True,
+                },
+            )
+        )
+    return results, paths
+
+
+def _last_mile_alias_source_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    paths: set[str] = set()
+    for result in tool_results or ():
+        output = result.output if isinstance(result.output, dict) else {}
+        if output.get("last_mile_materialized") is not True:
+            continue
+        for key in ("path", "artifact_path", "artifact_paths"):
+            for path_text in _string_paths_from_value(output.get(key)):
+                paths.add(str(Path(path_text).expanduser()))
+    return paths
+
+
+def _materialize_last_mile_pdf_artifacts(
+    *,
+    principal_id: str | None,
+    missing_extensions: Iterable[str],
+    collected_media_paths: Iterable[str],
+) -> tuple[list[ToolResult], list[str]]:
+    missing_pdf_count = sum(
+        1
+        for extension in missing_extensions
+        if str(extension or "").strip().lower() in _LAST_MILE_PDF_EXTENSIONS
+    )
+    if missing_pdf_count <= 0:
+        return [], []
+    media_paths = [
+        str(Path(str(path)).expanduser())
+        for path in collected_media_paths
+        if str(path or "").strip() and Path(str(path)).expanduser().exists()
+    ]
+    if not media_paths:
+        return [], []
+    try:
+        from PIL import Image, ImageOps
+    except ModuleNotFoundError:
+        return [], []
+
+    results: list[ToolResult] = []
+    paths: list[str] = []
+    for _index in range(missing_pdf_count):
+        path = artifact_path_for_generated_workspace_file(
+            principal_id=principal_id,
+            suffix=".pdf",
+            stem=f"requested_artifact_{uuid4().hex[:12]}_pdf",
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pages = []
+        embedded_images: list[str] = []
+        optimized_image_paths: list[str] = []
+        skipped_images: list[str] = []
+        try:
+            for raw_path in media_paths[:4]:
+                image_path = Path(raw_path)
+                try:
+                    embed_path = optimized_embedded_image_path(image_path)
+                    with Image.open(embed_path) as image:
+                        page = ImageOps.exif_transpose(image).convert("RGB").copy()
+                    pages.append(page)
+                    embedded_images.append(str(image_path))
+                    if embed_path != image_path:
+                        optimized_image_paths.append(str(embed_path))
+                except Exception:
+                    skipped_images.append(str(image_path))
+            if not pages:
+                return results, paths
+            first, rest = pages[0], pages[1:]
+            first.save(path, "PDF", resolution=150.0, save_all=bool(rest), append_images=rest)
+        finally:
+            for page in pages:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+        path_text = str(path)
+        paths.append(path_text)
+        results.append(
+            ToolResult(
+                f"last-mile-pdf-artifact-{uuid4().hex}",
+                "pdf_create",
+                "completed",
+                {
+                    "path": path_text,
+                    "artifact_path": path_text,
+                    "artifact_paths": [path_text],
+                    "page_count": len(embedded_images),
+                    "source_image_paths": embedded_images,
+                    "source_screenshot_paths": [],
+                    "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
+                    "bytes_written": path.stat().st_size,
+                    "quality_profile": "last_mile_media_v1",
+                    "layout_features": ["verified_media_embeds"],
+                    "last_mile_materialized": True,
+                },
+            )
+        )
+    return results, paths
+
+
+def _materialize_last_mile_document_artifacts(
+    *,
+    principal_id: str | None,
+    prompt: str,
+    reply: str,
+    missing_extensions: Iterable[str],
+    collected_media_paths: Iterable[str],
+) -> tuple[list[ToolResult], list[str]]:
+    normalized_missing = {str(extension or "").strip().lower() for extension in missing_extensions}
+    if not normalized_missing.intersection(_LAST_MILE_DOCUMENT_EXTENSIONS):
+        return [], []
+    media_paths = [
+        str(Path(str(path)).expanduser())
+        for path in collected_media_paths
+        if str(path or "").strip() and Path(str(path)).expanduser().exists()
+    ]
+    if not media_paths:
+        return [], []
+    try:
+        from docx import Document
+        from docx.shared import Inches
+    except ModuleNotFoundError:
+        return [], []
+
+    path = artifact_path_for_generated_workspace_file(
+        principal_id=principal_id,
+        suffix=".docx",
+        stem=f"requested_artifact_{uuid4().hex[:12]}_docx",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = Document()
+    document.add_heading("Requested Artifact", level=1)
+    visible_reply = _strip_media_directives_from_context(str(reply or "")).strip()
+    summary = visible_reply or str(prompt or "").strip()
+    if summary:
+        document.add_paragraph(summary[:1200])
+    embedded_images: list[str] = []
+    optimized_image_paths: list[str] = []
+    skipped_images: list[str] = []
+    for raw_path in media_paths[:4]:
+        image_path = Path(raw_path)
+        try:
+            embed_path = optimized_embedded_image_path(image_path)
+            document.add_picture(str(embed_path), width=Inches(5.8))
+            embedded_images.append(str(image_path))
+            if embed_path != image_path:
+                optimized_image_paths.append(str(embed_path))
+        except Exception:
+            skipped_images.append(str(image_path))
+    if skipped_images or not embedded_images:
+        return [], []
+    document.save(path)
+    path_text = str(path)
+    return [
+        ToolResult(
+            f"last-mile-document-artifact-{uuid4().hex}",
+            "document_create",
+            "completed",
+            {
+                "path": path_text,
+                "artifact_path": path_text,
+                "artifact_paths": [path_text],
+                "format": "docx",
+                "embedded_images": embedded_images,
+                "embedded_screenshots": [],
+                "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
+                "skipped_images": [],
+                "bytes_written": path.stat().st_size,
+                "quality_profile": "last_mile_media_v1",
+                "last_mile_materialized": True,
+            },
+        )
+    ], [path_text]
+
+
+def _materialize_last_mile_presentation_artifacts(
+    *,
+    principal_id: str | None,
+    prompt: str,
+    reply: str,
+    missing_extensions: Iterable[str],
+    collected_media_paths: Iterable[str],
+) -> tuple[list[ToolResult], list[str]]:
+    normalized_missing = {str(extension or "").strip().lower() for extension in missing_extensions}
+    if not normalized_missing.intersection(_LAST_MILE_PRESENTATION_EXTENSIONS):
+        return [], []
+    media_paths = [
+        str(Path(str(path)).expanduser())
+        for path in collected_media_paths
+        if str(path or "").strip() and Path(str(path)).expanduser().exists()
+    ]
+    if not media_paths:
+        return [], []
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+    except ModuleNotFoundError:
+        return [], []
+    path = artifact_path_for_generated_workspace_file(
+        principal_id=principal_id,
+        suffix=".pptx",
+        stem=f"requested_artifact_{uuid4().hex[:12]}_pptx",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.35), Inches(9), Inches(0.6))
+    title_frame = title_box.text_frame
+    title_frame.text = "Requested Artifact"
+    title_frame.paragraphs[0].font.size = Pt(28)
+    visible_reply = _strip_media_directives_from_context(str(reply or "")).strip()
+    body = visible_reply or str(prompt or "").strip()
+    body_box = slide.shapes.add_textbox(Inches(0.5), Inches(1.0), Inches(4.4), Inches(1.6))
+    body_frame = body_box.text_frame
+    body_frame.word_wrap = True
+    body_frame.text = body[:500]
+    body_frame.paragraphs[0].font.size = Pt(14)
+    embedded_images: list[str] = []
+    optimized_image_paths: list[str] = []
+    skipped_images: list[str] = []
+    for index, raw_path in enumerate(media_paths[:2]):
+        image_path = Path(raw_path)
+        try:
+            embed_path = optimized_embedded_image_path(image_path)
+            slide.shapes.add_picture(str(embed_path), Inches(5.1), Inches(1.0 + index * 2.7), width=Inches(4.0))
+            embedded_images.append(str(image_path))
+            if embed_path != image_path:
+                optimized_image_paths.append(str(embed_path))
+        except Exception:
+            skipped_images.append(str(image_path))
+    if skipped_images or not embedded_images:
+        return [], []
+    deck.save(path)
+    path_text = str(path)
+    return [
+        ToolResult(
+            f"last-mile-presentation-artifact-{uuid4().hex}",
+            "presentation_create",
+            "completed",
+            {
+                "path": path_text,
+                "artifact_path": path_text,
+                "artifact_paths": [path_text],
+                "slide_count": 1,
+                "embedded_images": embedded_images,
+                "embedded_screenshots": [],
+                "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
+                "skipped_images": [],
+                "bytes_written": path.stat().st_size,
+                "quality_profile": "last_mile_media_v1",
+                "last_mile_materialized": True,
+            },
+        )
+    ], [path_text]
+
+
+def _first_nonempty_text(payload: Mapping[str, object], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _last_mile_spreadsheet_url_key(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    return parsed._replace(fragment="").geturl()
+
+
+def _filename_from_browser_payload(payload: Mapping[str, object]) -> str:
+    for key in ("filename", "file_name", "title", "link_text", "image_alt", "alt", "name", "text", "url", "href"):
+        label = _browser_file_like_label(payload.get(key))
+        if label:
+            return label
+    return ""
+
+
+def _browser_collected_image_records(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[dict[str, str], ...]:
+    records: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "browser_image_collect":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for payload in _iter_browser_structured_payloads(output):
+            raw_path = _first_nonempty_text(payload, ("local_path", "artifact_path", "path"))
+            if not raw_path:
+                continue
+            image_path = Path(raw_path).expanduser()
+            if not image_path.is_file():
+                continue
+            path_text = str(image_path)
+            if path_text in seen_paths:
+                continue
+            seen_paths.add(path_text)
+            source_url = _first_nonempty_text(payload, ("source_url", "final_url", "url", "src", "image_url"))
+            records.append(
+                {
+                    "path": path_text,
+                    "source_url": source_url,
+                    "source_key": _last_mile_spreadsheet_url_key(source_url),
+                }
+            )
+        for raw_path in _string_paths_from_value(output.get("image_paths")) + _string_paths_from_value(output.get("artifact_paths")):
+            image_path = Path(raw_path).expanduser()
+            if not image_path.is_file():
+                continue
+            path_text = str(image_path)
+            if path_text in seen_paths:
+                continue
+            seen_paths.add(path_text)
+            records.append({"path": path_text, "source_url": "", "source_key": ""})
+    return tuple(records)
+
+
+def _browser_file_item_records(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[dict[str, str], ...]:
+    records: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for result in tool_results or ():
+        tool_name = str(getattr(result, "tool_name", "") or "")
+        if not tool_name.startswith("browser_"):
+            continue
+        if tool_name == "browser_image_collect":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for payload in _iter_browser_structured_payloads(output):
+            filename = _filename_from_browser_payload(payload)
+            image_url = _first_nonempty_text(payload, ("image_url", "src", "source_url", "final_url"))
+            source_url = _first_nonempty_text(payload, ("url", "href", "source_url", "final_url"))
+            if not filename and not image_url and not source_url:
+                continue
+            identity = (filename, _last_mile_spreadsheet_url_key(source_url), _last_mile_spreadsheet_url_key(image_url))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            records.append(
+                {
+                    "filename": filename,
+                    "source_url": source_url,
+                    "image_url": image_url,
+                    "image_key": _last_mile_spreadsheet_url_key(image_url),
+                }
+            )
+            if len(records) >= _LAST_MILE_SPREADSHEET_MAX_ROWS:
+                return tuple(records)
+    return tuple(records)
+
+
+_BROWSER_ITEM_COUNT_PREVIEW_RE = re.compile(r'"item_count"\s*:\s*(\d{1,6})')
+
+
+def _positive_int_from_value(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float) and value.is_integer():
+        integer_value = int(value)
+        return integer_value if integer_value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            integer_value = int(text)
+            return integer_value if integer_value > 0 else None
+    return None
+
+
+def _browser_extract_item_count_from_preview(preview: object) -> int | None:
+    if not isinstance(preview, str) or not preview.strip():
+        return None
+    try:
+        parsed_preview = json.loads(preview)
+    except Exception:
+        parsed_preview = None
+    if isinstance(parsed_preview, Mapping):
+        count = _positive_int_from_value(parsed_preview.get("item_count"))
+        if count is not None:
+            return count
+        items = parsed_preview.get("items")
+        if isinstance(items, (list, tuple)) and items:
+            return len(items)
+    match = _BROWSER_ITEM_COUNT_PREVIEW_RE.search(preview)
+    if match:
+        return _positive_int_from_value(match.group(1))
+    return None
+
+
+def _browser_extract_item_count_hints(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[int, ...]:
+    counts: list[int] = []
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "browser_extract_items":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for payload in _iter_browser_structured_payloads(output):
+            count = _positive_int_from_value(payload.get("item_count"))
+            if count is not None:
+                counts.append(count)
+            items = payload.get("items")
+            if isinstance(items, (list, tuple)) and items:
+                counts.append(len(items))
+        preview_count = _browser_extract_item_count_from_preview(output.get("preview"))
+        if preview_count is not None:
+            counts.append(preview_count)
+    return tuple(counts)
+
+
+def _last_mile_spreadsheet_expected_row_count(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> int | None:
+    counts = [
+        *_browser_extract_item_count_hints(tool_results),
+        len(_browser_file_item_records(tool_results)),
+    ]
+    return max((count for count in counts if count > 0), default=None)
+
+
+def _last_mile_spreadsheet_result_is_partial(
+    result: ToolResult,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    if str(getattr(result, "tool_name", "") or "") != "spreadsheet_create":
+        return False
+    if normalize_tool_status(getattr(result, "status", None)) != "completed":
+        return False
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("last_mile_materialized") is not True:
+        return False
+    if str(output.get("format") or "").strip().lower() not in {"", "xlsx", ".xlsx"}:
+        return False
+    expected_rows = _last_mile_spreadsheet_expected_row_count(tool_results)
+    if expected_rows is None:
+        return False
+    produced_rows = _positive_int_from_value(output.get("rows"))
+    if produced_rows is None:
+        produced_rows = len(_string_paths_from_value(output.get("embedded_images")))
+    return produced_rows < expected_rows
+
+
+def _partial_last_mile_spreadsheet_artifact_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if not _last_mile_spreadsheet_result_is_partial(result, tool_results):
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for key in ("path", "artifact_path", "artifact_paths", "artifacts"):
+            paths.extend(_string_paths_from_value(output.get(key)))
+    return tuple(dict.fromkeys(paths))
+
+
+def _last_mile_structured_spreadsheet_rows(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    media_paths: list[str],
+) -> tuple[list[dict[str, str]], list[str]]:
+    image_records = list(_browser_collected_image_records(tool_results))
+    if not image_records:
+        image_records = [{"path": path, "source_url": "", "source_key": ""} for path in media_paths]
+    images_by_url = {
+        record["source_key"]: record["path"]
+        for record in image_records
+        if record.get("source_key") and record.get("path")
+    }
+    source_by_path = {
+        record["path"]: record.get("source_url", "")
+        for record in image_records
+        if record.get("path")
+    }
+    item_records = list(_browser_file_item_records(tool_results))
+    rows: list[dict[str, str]] = []
+    used_paths: set[str] = set()
+    for index, item in enumerate(item_records):
+        image_path = images_by_url.get(item.get("image_key", ""))
+        if not image_path and index < len(image_records):
+            image_path = image_records[index].get("path")
+        if not image_path or not Path(image_path).is_file():
+            continue
+        filename = item.get("filename", "") or Path(image_path).name
+        filename_path = Path(filename)
+        stem = filename_path.stem
+        extension = filename_path.suffix.lower()
+        try:
+            byte_count = str(Path(image_path).stat().st_size)
+        except OSError:
+            byte_count = ""
+        rows.append(
+            {
+                "filename": filename,
+                "stem": stem,
+                "extension": extension,
+                "uppercase_extension": extension.upper().lstrip("."),
+                "reversed_stem": stem[::-1],
+                "stem_characters": " ".join(stem),
+                "byte_count": byte_count,
+                "source_url": item.get("source_url", ""),
+                "image_source_url": item.get("image_url", "") or source_by_path.get(image_path, ""),
+                "image_path": image_path,
+            }
+        )
+        used_paths.add(image_path)
+        if len(rows) >= _LAST_MILE_SPREADSHEET_MAX_ROWS:
+            break
+    if rows:
+        return rows, [row["image_path"] for row in rows]
+    fallback_rows: list[dict[str, str]] = []
+    for path in media_paths[:_LAST_MILE_SPREADSHEET_MAX_ROWS]:
+        image_path = str(Path(path).expanduser())
+        if not Path(image_path).is_file():
+            continue
+        filename = Path(image_path).name
+        stem = Path(image_path).stem
+        extension = Path(image_path).suffix.lower()
+        try:
+            byte_count = str(Path(image_path).stat().st_size)
+        except OSError:
+            byte_count = ""
+        fallback_rows.append(
+            {
+                "filename": filename,
+                "stem": stem,
+                "extension": extension,
+                "uppercase_extension": extension.upper().lstrip("."),
+                "reversed_stem": stem[::-1],
+                "stem_characters": " ".join(stem),
+                "byte_count": byte_count,
+                "source_url": "",
+                "image_source_url": source_by_path.get(image_path, ""),
+                "image_path": image_path,
+            }
+        )
+    return fallback_rows, [row["image_path"] for row in fallback_rows]
+
+
+def _spreadsheet_result_artifact_paths(result: ToolResult) -> tuple[Path, ...]:
+    output = result.output if isinstance(result.output, dict) else {}
+    raw_paths: list[str] = []
+    for key in ("artifact_path", "path"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            raw_paths.append(value.strip())
+    artifact_paths = output.get("artifact_paths")
+    if isinstance(artifact_paths, (list, tuple)):
+        raw_paths.extend(str(item).strip() for item in artifact_paths if isinstance(item, str) and item.strip())
+    paths: list[Path] = []
+    for raw_path in raw_paths:
+        path = Path(raw_path).expanduser()
+        if path.suffix.lower() in _LAST_MILE_SPREADSHEET_EXTENSIONS and path.exists():
+            paths.append(path)
+    return tuple(dict.fromkeys(paths))
+
+
+def _spreadsheet_workbook_file_has_rich_content(path: Path) -> bool:
+    if path.suffix.lower() not in _LAST_MILE_SPREADSHEET_EXTENSIONS or not path.exists():
+        return False
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(path) as package:
+            names = package.namelist()
+            if any(name.startswith(("xl/charts/", "xl/media/")) for name in names):
+                return True
+            for name in names:
+                if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"):
+                    data = package.read(name)
+                    if b"<f" in data or b"conditionalFormatting" in data:
+                        return True
+    except Exception:
+        pass
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(path, data_only=False, read_only=False)
+        try:
+            for worksheet in workbook.worksheets:
+                for row in worksheet.iter_rows():
+                    for cell in row:
+                        value = cell.value
+                        if isinstance(value, str) and value.startswith("="):
+                            return True
+        finally:
+            workbook.close()
+    except Exception:
+        return False
+    return False
+
+
+def _spreadsheet_result_has_rich_workbook_evidence(result: ToolResult) -> bool:
+    output = result.output if isinstance(result.output, dict) else {}
+    if output.get("formulas_required") or output.get("embedded_charts") or output.get("conditional_formats"):
+        return True
+    return any(_spreadsheet_workbook_file_has_rich_content(path) for path in _spreadsheet_result_artifact_paths(result))
+
+
+def _normalized_extension_values(value: object) -> set[str]:
+    if isinstance(value, str):
+        values: tuple[object, ...] = (value,)
+    elif isinstance(value, (list, tuple, set)):
+        values = tuple(value)
+    else:
+        values = ()
+    return {str(extension or "").strip().lower() for extension in values if str(extension or "").strip()}
+
+
+def _spreadsheet_media_retry_should_precede_last_mile_fallback(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    retryable_failure = False
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "spreadsheet_create":
+            continue
+        status = normalize_tool_status(getattr(result, "status", None))
+        output = result.output if isinstance(result.output, dict) else {}
+        if status == "completed":
+            if _spreadsheet_result_artifact_paths(result) and not output.get("last_mile_materialized"):
+                return False
+            continue
+        reason = str(output.get("reason") or "").strip()
+        artifact_extensions = _normalized_extension_values(output.get("artifact_extensions"))
+        embedded_extensions = _normalized_extension_values(output.get("embedded_media_artifact_extensions"))
+        if reason in _LAST_MILE_SPREADSHEET_RETRYABLE_MEDIA_FAILURE_REASONS and (
+            ".xlsx" in artifact_extensions or ".xlsx" in embedded_extensions or not artifact_extensions
+        ):
+            retryable_failure = True
+    return retryable_failure
+
+
+def _materialize_last_mile_spreadsheet_artifacts(
+    *,
+    principal_id: str | None,
+    prompt: str,
+    reply: str,
+    missing_extensions: Iterable[str],
+    collected_media_paths: Iterable[str],
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+) -> tuple[list[ToolResult], list[str]]:
+    normalized_missing = {str(extension or "").strip().lower() for extension in missing_extensions}
+    if not normalized_missing.intersection(_LAST_MILE_SPREADSHEET_EXTENSIONS):
+        return [], []
+    if _spreadsheet_media_retry_should_precede_last_mile_fallback(tool_results):
+        return [], []
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "spreadsheet_create":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        if _spreadsheet_result_has_rich_workbook_evidence(result):
+            return [], []
+    media_paths = [
+        str(Path(str(path)).expanduser())
+        for path in collected_media_paths
+        if str(path or "").strip() and Path(str(path)).expanduser().exists()
+    ]
+    if not media_paths:
+        return [], []
+    try:
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as WorksheetImage
+        from openpyxl.styles import Font
+    except ModuleNotFoundError:
+        return [], []
+    path = artifact_path_for_generated_workspace_file(
+        principal_id=principal_id,
+        suffix=".xlsx",
+        stem=f"requested_artifact_{uuid4().hex[:12]}_xlsx",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    embedded_images: list[str] = []
+    optimized_image_paths: list[str] = []
+    skipped_images: list[str] = []
+    structured_rows, structured_image_paths = _last_mile_structured_spreadsheet_rows(tool_results, media_paths)
+    expected_rows = _last_mile_spreadsheet_expected_row_count(tool_results)
+    candidate_row_count = (
+        len(structured_rows)
+        if structured_rows
+        else len(media_paths[:_LAST_MILE_SPREADSHEET_MAX_ROWS])
+    )
+    if expected_rows is not None and candidate_row_count < expected_rows:
+        return [], []
+    if structured_rows:
+        sheet.title = "Manifest"
+        columns = [
+            "Original filename",
+            "Uppercase extension",
+            "Reversed stem",
+            "Source URL",
+            "Image source URL",
+            "Image",
+        ]
+        sheet.append(columns)
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        image_column = len(columns)
+        source_column = columns.index("Source URL") + 1
+        image_source_column = columns.index("Image source URL") + 1
+        for row_index, row in enumerate(structured_rows, start=2):
+            original_filename = str(row["filename"])
+            sheet.append(
+                [
+                    original_filename,
+                    Path(original_filename).suffix.lstrip(".").upper(),
+                    Path(original_filename).stem[::-1],
+                    row.get("source_url", ""),
+                    row.get("image_source_url", ""),
+                    "",
+                ]
+            )
+            for col_index in (source_column, image_source_column):
+                cell = sheet.cell(row=row_index, column=col_index)
+                if str(cell.value or "").startswith(("http://", "https://")):
+                    cell.hyperlink = str(cell.value)
+                    cell.font = Font(color="0563C1", underline="single")
+            image_path = Path(row["image_path"]).expanduser()
+            try:
+                embed_path = optimized_embedded_image_path(image_path)
+                image = WorksheetImage(str(embed_path))
+                if image.width > 140:
+                    scale = 140 / float(image.width)
+                    image.width = int(image.width * scale)
+                    image.height = int(image.height * scale)
+                if image.height > 120:
+                    scale = 120 / float(image.height)
+                    image.width = int(image.width * scale)
+                    image.height = int(image.height * scale)
+                sheet.add_image(image, sheet.cell(row=row_index, column=image_column).coordinate)
+                sheet.row_dimensions[row_index].height = max(sheet.row_dimensions[row_index].height or 15, 92)
+                embedded_images.append(str(image_path))
+                if embed_path != image_path:
+                    optimized_image_paths.append(str(embed_path))
+            except Exception:
+                skipped_images.append(str(image_path))
+        for column_cells in sheet.columns:
+            header = str(column_cells[0].value or "")
+            max_length = max(len(str(cell.value or "")) for cell in column_cells[:100])
+            sheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, len(header) + 2, 12), 52)
+        sheet.column_dimensions[sheet.cell(row=1, column=image_column).column_letter].width = 22
+    else:
+        sheet.title = "Artifact"
+        sheet["A1"] = "Requested Artifact"
+        sheet["A1"].font = Font(bold=True, size=16)
+        sheet["A3"] = str(prompt or "").strip()
+        visible_reply = _strip_media_directives_from_context(str(reply or "")).strip()
+        if visible_reply:
+            sheet["A5"] = visible_reply[:1000]
+        sheet.column_dimensions["A"].width = 72
+        row = 7
+        for raw_path in media_paths[:_LAST_MILE_SPREADSHEET_MAX_ROWS]:
+            image_path = Path(raw_path)
+            try:
+                embed_path = optimized_embedded_image_path(image_path)
+                image = WorksheetImage(str(embed_path))
+                image.width = min(float(getattr(image, "width", 320) or 320), 420.0)
+                image.height = min(float(getattr(image, "height", 240) or 240), 280.0)
+                sheet.add_image(image, f"A{row}")
+                embedded_images.append(str(image_path))
+                if embed_path != image_path:
+                    optimized_image_paths.append(str(embed_path))
+                row += 16
+            except Exception:
+                skipped_images.append(str(image_path))
+    if structured_rows:
+        required_paths = structured_image_paths
+    else:
+        required_paths = media_paths[:_LAST_MILE_SPREADSHEET_MAX_ROWS]
+    if len(embedded_images) < len(required_paths):
+        missing = {str(path) for path in required_paths} - {str(path) for path in embedded_images}
+        skipped_images.extend(path for path in missing if path not in skipped_images)
+    if skipped_images or not embedded_images:
+        return [], []
+    workbook.save(path)
+    path_text = str(path)
+    output = {
+        "path": path_text,
+        "artifact_path": path_text,
+        "artifact_paths": [path_text],
+        "format": "xlsx",
+        "embedded_images": embedded_images,
+        "embedded_screenshots": [],
+        "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
+        "skipped_images": [],
+        "bytes_written": path.stat().st_size,
+        "quality_profile": "last_mile_media_v1",
+        "last_mile_materialized": True,
+    }
+    if structured_rows:
+        output.update(
+            {
+                "rows": len(structured_rows),
+                "columns": sheet.max_column,
+                "source_image_paths": embedded_images,
+            }
+        )
+    return [
+        ToolResult(
+            f"last-mile-spreadsheet-artifact-{uuid4().hex}",
+            "spreadsheet_create",
+            "completed",
+            output,
+        )
+    ], [path_text]
 
 
 def _sanitize_chat_reply(
@@ -5295,12 +20634,64 @@ def _sanitize_chat_reply(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     source: str = "agent",
 ) -> str:
-    return sanitize_user_visible_reply(
+    direct_existing_artifact_delivery = _tool_results_include_direct_existing_artifact_delivery(tool_results)
+    if _reply_media_candidate_paths(reply):
+        discovery_paths = _local_discovery_paths_from_tool_results(tool_results)
+        generated_cleanup_paths = _generated_local_discovery_alias_cleanup_paths(
+            tool_results,
+            discovery_paths=discovery_paths,
+        )
+        if (
+            discovery_paths
+            and not direct_existing_artifact_delivery
+            and (generated_cleanup_paths or not _merge_required_attachment_extensions((), tool_results))
+            and (
+                _completed_tools_are_only_local_discovery_or_file_write(tool_results)
+                or generated_cleanup_paths
+            )
+        ):
+            return _local_discovery_results_reply(reply, discovery_paths)
+        return reply
+    sanitized = sanitize_user_visible_reply(
         user_message=prompt,
         reply=reply,
         tool_results=tool_results,
         source=source,
     ) or reply
+    terminal_outcome_reply = _terminal_exec_outcome_reply(tool_results)
+    discovery_paths = _local_discovery_paths_from_tool_results(tool_results)
+    requested_file_search_delivery_identities = {
+        identity
+        for requested_path in _requested_file_search_delivery_paths(
+            tool_results,
+            prompt=prompt,
+            reply=sanitized,
+            allow_prompt_filename_matches=bool(_merge_required_attachment_extensions((), tool_results)),
+            requested_extensions=_merge_required_attachment_extensions((), tool_results),
+            artifact_roots=(),
+        )
+        for identity in _path_identity_variants(requested_path)
+    }
+    if requested_file_search_delivery_identities:
+        discovery_paths = tuple(
+            path
+            for path in discovery_paths
+            if not _path_matches_identity_set(path, requested_file_search_delivery_identities)
+        )
+    if (
+        terminal_outcome_reply
+        and (discovery_paths or _completed_terminal_exec_results(tool_results))
+        and not _merge_required_attachment_extensions((), tool_results)
+    ):
+        return terminal_outcome_reply
+    if (
+        discovery_paths
+        and not direct_existing_artifact_delivery
+        and not _merge_required_attachment_extensions((), tool_results)
+        and _completed_tools_are_only_local_discovery(tool_results)
+    ):
+        return _local_discovery_results_reply(sanitized, discovery_paths)
+    return sanitized
 
 
 def _telegram_screenshot_reply(url: str) -> str:
@@ -5371,13 +20762,15 @@ def _telegram_screenshot_reply_if_requested(
             request_id=request_id,
             message_id=message_id,
         )
-        return f"Tool approval requested: {result.approval_id}"
+        reply, _is_suspended = _approval_marker_reply_if_actionable(runtime, result.approval_id)
+        return reply
     if result.completed:
         return _append_chat_artifacts_to_reply(
             runtime,
             reply=_telegram_screenshot_reply(screenshot_result.url),
             artifact_paths=result.artifact_paths,
             prompt=prompt,
+            conversation_id=conversation_id,
             principal_id=principal_id,
             tool_results=getattr(result, "tool_results", None),
         )
@@ -5403,13 +20796,15 @@ def _remember_chat_turn(
     assistant_reply: str,
     conversation_turn_id: str | None = None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    artifact_paths: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     conversation_id = conversation_id or _conversation_id_for_chat(chat_id)
-    thread = _get_chat_thread(runtime, chat_id)
-    thread.append({"user": user_message, "assistant": assistant_reply})
-    if len(thread) > _MAX_CHAT_TURNS:
-        del thread[:-_MAX_CHAT_TURNS]
-
+    assistant_reply = _sanitize_chat_reply(
+        prompt=user_message,
+        reply=assistant_reply,
+        tool_results=tool_results,
+        source="agent",
+    )
     try:
         from nullion.connections import workspace_id_for_principal
 
@@ -5479,25 +20874,33 @@ def _remember_chat_turn(
             active_branch_id=branch_id or f"branch-{turn_id}",
             active_turn_id=turn_id,
         )
-    runtime.store.add_conversation_event(
-        {
-            "conversation_id": conversation_id,
-            "workspace_id": workspace_id,
-            "event_type": "conversation.chat_turn",
-            "created_at": now.isoformat(),
-            "chat_id": chat_id,
-            "turn_id": turn_id,
-            "parent_turn_id": parent_turn_id,
-            "branch_id": branch_id,
-            "user_message": user_message,
-            "assistant_reply": assistant_reply,
-            "tool_results": _compact_tool_results_for_context(tool_results),
-        }
-    )
+    stored_artifact_paths = [
+        str(path)
+        for path in (artifact_paths or ())
+        if str(path or "").strip()
+    ]
+    event = {
+        "conversation_id": conversation_id,
+        "workspace_id": workspace_id,
+        "event_type": "conversation.chat_turn",
+        "created_at": now.isoformat(),
+        "chat_id": chat_id,
+        "turn_id": turn_id,
+        "parent_turn_id": parent_turn_id,
+        "branch_id": branch_id,
+        "user_message": user_message,
+        "assistant_reply": assistant_reply,
+        "tool_results": _compact_tool_results_for_context(tool_results, user_message=user_message),
+    }
+    if stored_artifact_paths:
+        event["artifact_paths"] = stored_artifact_paths
+    runtime.store.add_conversation_event(event)
 
 
 def _compact_tool_results_for_context(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    user_message: str | None = None,
 ) -> list[dict[str, object]]:
     compact: list[dict[str, object]] = []
     for result in tool_results or ():
@@ -5506,15 +20909,26 @@ def _compact_tool_results_for_context(
             {
                 "tool_name": result.tool_name,
                 "status": result.status,
-                "output": _compact_tool_output_for_context(result.tool_name, output),
+                "output": _compact_tool_output_for_context(
+                    result.tool_name,
+                    output,
+                    user_message=user_message,
+                ),
                 **({"error": result.error} if result.error else {}),
             }
         )
     return compact
 
 
-def _compact_tool_output_for_context(tool_name: str, output: object) -> object:
+def _compact_tool_output_for_context(
+    tool_name: str,
+    output: object,
+    *,
+    user_message: str | None = None,
+) -> object:
     redacted = redact_value(output)
+    if tool_name == "list_crons" and isinstance(redacted, dict):
+        return compact_list_crons_output_for_context(redacted, user_message=user_message, message_limit=600)
     if tool_name == "connector_request" and isinstance(redacted, dict):
         method = str(redacted.get("method") or "").upper()
         url = str(redacted.get("url") or "")
@@ -5560,17 +20974,118 @@ def _compact_tool_output_for_context(tool_name: str, output: object) -> object:
                 "sample_files": sample_files[:50],
                 "sample_files_truncated": {"shown": 50, "total": len(sample_files)},
             }
+    if tool_name == "archive_extract" and isinstance(redacted, dict):
+        deliverable_descriptor_paths = {
+            str(descriptor.get("path") or "").strip()
+            for descriptor in (redacted.get("artifact_descriptors") or ())
+            if isinstance(descriptor, Mapping)
+            and str(descriptor.get("role") or "").strip().lower() == "deliverable"
+            and str(descriptor.get("path") or "").strip()
+        }
+        manifest_artifact_paths = {
+            str(path)
+            for path in (redacted.get("manifest_artifact_paths") or [])
+            if isinstance(path, str) and path.strip()
+        }
+        manifest_artifact_paths.update(
+            str(path)
+            for key in ("manifest_xlsx_path", "manifest_csv_path", "manifest_json_path")
+            if isinstance(path := redacted.get(key), str) and path.strip()
+        )
+        manifest_xlsx_path = (
+            str(redacted.get("manifest_xlsx_path")).strip()
+            if isinstance(redacted.get("manifest_xlsx_path"), str)
+            else ""
+        )
+        if manifest_xlsx_path and manifest_xlsx_path in deliverable_descriptor_paths:
+            manifest_artifact_paths.discard(manifest_xlsx_path)
+        artifact_paths = [
+            str(path)
+            for path in (redacted.get("artifact_paths") or [])
+            if isinstance(path, str) and path.strip()
+            and str(path) not in manifest_artifact_paths
+        ]
+        deliverable_ready = bool(artifact_paths)
+        compact_archive: dict[str, object] = {
+            key: redacted.get(key)
+            for key in (
+                "archive_path",
+                "archive_format",
+                "entry_count",
+                "file_count",
+                "metadata_entries_ignored",
+                "unsafe_entries_ignored",
+                "truncated",
+                "manifest_row_count",
+                "manifest_columns",
+                "manifest_embedded_image_count",
+            )
+            if redacted.get(key) is not None
+        }
+        if deliverable_ready:
+            compact_archive["deliverable_ready"] = True
+            compact_archive["artifact_paths"] = artifact_paths
+            if artifact_paths:
+                compact_archive["artifact_path"] = artifact_paths[0]
+            if manifest_xlsx_path and manifest_xlsx_path in artifact_paths:
+                compact_archive["manifest_xlsx_path"] = manifest_xlsx_path
+            if deliverable_descriptor_paths and isinstance(redacted.get("artifact_descriptors"), list):
+                compact_archive["artifact_descriptors"] = redacted.get("artifact_descriptors")
+        elif redacted.get("manifest_json_path") and redacted.get("truncated"):
+            compact_archive["manifest_json_path"] = redacted.get("manifest_json_path")
+            compact_archive["manifest_artifact_paths"] = redacted.get("manifest_artifact_paths")
+        entries = redacted.get("entries")
+        if isinstance(entries, list):
+            if len(entries) > 20:
+                sample_entries = [*entries[:12], *entries[-8:]]
+                compact_archive["entries_sample_truncated"] = {"shown": 20, "head": 12, "tail": 8, "total": len(entries)}
+            else:
+                sample_entries = entries
+            compact_archive["entries_sample"] = [
+                {
+                    key: entry.get(key)
+                    for key in ("name", "bytes", "media_type", *(() if deliverable_ready else ("path",)))
+                    if isinstance(entry, dict) and entry.get(key) is not None
+                }
+                for entry in sample_entries
+                if isinstance(entry, dict)
+            ]
+        return compact_archive
     try:
         encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
     except TypeError:
         encoded = str(redacted)
     if len(encoded) <= _MAX_STORED_TOOL_OUTPUT_CHARS:
         return redacted
-    return {
+    compact: dict[str, object] = {
         "truncated": True,
         "original_chars": len(encoded),
         "preview": encoded[:_MAX_STORED_TOOL_OUTPUT_CHARS],
     }
+    if isinstance(redacted, dict):
+        for key in (
+            "path",
+            "artifact_path",
+            "artifact_paths",
+            "artifact_descriptors",
+            "manifest_xlsx_path",
+            "manifest_csv_path",
+            "manifest_json_path",
+            "manifest_artifact_paths",
+            "manifest_row_count",
+            "manifest_columns",
+            "archive_path",
+            "archive_format",
+            "output_dir",
+            "entry_count",
+            "file_count",
+            "metadata_entries_ignored",
+            "unsafe_entries_ignored",
+        ):
+            value = redacted.get(key)
+            if value is not None:
+                compact[key] = value
+    return compact
 
 
 def _recent_tool_context_prompt(runtime: PersistentRuntime, conversation_id: str) -> str | None:
@@ -5716,6 +21231,37 @@ def _run_cron_numbered_selection_reply(result: ToolResult) -> str:
     return "Manual scheduled task run started."
 
 
+def _deferred_run_cron_receipt_reply(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
+    for result in reversed(tuple(tool_results or ())):
+        if result.tool_name != "run_cron" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        delivery_status = str(output.get("delivery_status") or output.get("cron_delivery_status") or "").strip()
+        if delivery_status != "deferred":
+            continue
+        for key in ("result_text", "message", "text", "final_text"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        cron_name = str(output.get("name") or output.get("cron_name") or "").strip()
+        if cron_name:
+            return f"Manual scheduled task run started: {cron_name}. The result will be delivered to this chat when ready."
+        return "Manual scheduled task run started. The result will be delivered to this chat when ready."
+    return None
+
+
+def _completed_run_cron_receipt_reply(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
+    for result in reversed(tuple(tool_results or ())):
+        if result.tool_name != "run_cron" or normalize_tool_status(result.status) != "completed":
+            continue
+        return _run_cron_numbered_selection_reply(result)
+    return None
+
+
 def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id: str) -> tuple[str, ...]:
     try:
         events = runtime.store.list_recent_conversation_events(
@@ -5736,13 +21282,24 @@ def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id:
             if not isinstance(result, dict):
                 continue
             tool_name = str(result.get("tool_name") or "").strip()
-            if tool_name in {"connector_request", "email_send"}:
+            if tool_name in {
+                "connector_request",
+                "email_search",
+                "email_read",
+                "email_attachment_read",
+                "email_send",
+                "calendar_list",
+                "calendar_create",
+                "calendar_update",
+                "calendar_respond",
+                "calendar_delete",
+            }:
                 scopes.append("connector")
             elif tool_name == "skill_pack_read":
                 scopes.append("skill_pack")
             elif tool_name == CHAT_HISTORY_SEARCH_TOOL_NAME:
                 scopes.append("conversation_history")
-            elif tool_name in {"list_crons", "run_cron", "create_cron", "update_cron", "delete_cron", "delete_reminder", "update_reminder"}:
+            elif tool_name in _SCHEDULER_TOOL_NAMES:
                 scopes.append("scheduler")
             elif tool_name.startswith("browser_") or tool_name in {"web_fetch", "web_search"}:
                 scopes.append("web")
@@ -5907,6 +21464,26 @@ def _execute_compound_chat_turn(
 
     combined_reply = "\n\n".join(replies)
     requested_attachment_extensions = _requested_attachment_extensions(prompt, model_client=model_client)
+    turn_conversation_id = _conversation_id_for_chat(chat_id)
+    _materialize_pending_tool_approval_for_chat(
+        runtime,
+        tool_results=tool_results,
+        conversation_id=turn_conversation_id,
+        chat_id=chat_id,
+        prompt=prompt,
+        request_id=None,
+        message_id=None,
+        principal_id=principal_id,
+        registry=active_tool_registry,
+    )
+    reply, _recovered_approval_live = _recover_orphan_approval_reply_for_conversation(
+        runtime,
+        combined_reply,
+        conversation_id=turn_conversation_id,
+        chat_id=chat_id,
+    )
+    if _recovered_approval_live:
+        combined_reply = reply
     contract = _build_chat_response_contract(
         runtime,
         prompt=prompt,
@@ -5916,6 +21493,7 @@ def _execute_compound_chat_turn(
         tool_results=tool_results,
         live_information_resolutions=live_information_resolutions,
     )
+    pending_approval = bool(contract.state.pending_approval_ids)
     _store_suspended_turns_from_contract(
         runtime,
         contract=contract,
@@ -5925,33 +21503,35 @@ def _execute_compound_chat_turn(
         message_id=None,
     )
     combined_reply = render_chat_response_for_telegram(contract)
-    combined_reply = _append_chat_artifacts_to_reply(
-        runtime,
-        reply=combined_reply,
-        artifact_paths=(),
-        prompt=prompt,
-        principal_id=principal_id,
-        tool_results=tool_results,
-        required_attachment_extensions=requested_attachment_extensions,
-    )
-    combined_reply = _enforce_chat_response_fulfillment(
-        runtime,
-        conversation_id=_conversation_id_for_chat(chat_id),
-        prompt=prompt,
-        reply=combined_reply,
-        tool_results=tool_results,
-        principal_id=principal_id,
-        required_attachment_extensions=requested_attachment_extensions,
-    )
-    combined_reply = _sanitize_chat_reply(
-        prompt=prompt,
-        reply=combined_reply,
-        tool_results=tool_results,
-        source="agent",
-    )
+    if not pending_approval:
+        combined_reply = _append_chat_artifacts_to_reply(
+            runtime,
+            reply=combined_reply,
+            artifact_paths=(),
+            prompt=prompt,
+            conversation_id=turn_conversation_id,
+            principal_id=principal_id,
+            tool_results=tool_results,
+            required_attachment_extensions=requested_attachment_extensions,
+        )
+        combined_reply = _enforce_chat_response_fulfillment(
+            runtime,
+            conversation_id=turn_conversation_id,
+            prompt=prompt,
+            reply=combined_reply,
+            tool_results=tool_results,
+            principal_id=principal_id,
+            required_attachment_extensions=requested_attachment_extensions,
+        )
+        combined_reply = _sanitize_chat_reply(
+            prompt=prompt,
+            reply=combined_reply,
+            tool_results=tool_results,
+            source="agent",
+        )
     update_active_task_frame_from_outcomes(
         runtime.store,
-        conversation_id=_conversation_id_for_chat(chat_id),
+        conversation_id=turn_conversation_id,
         tool_results=tool_results,
         rendered_reply=combined_reply,
         completion_turn_id=conversation_result.turn.turn_id,
@@ -6087,9 +21667,104 @@ def _append_runtime_nudges(
     reply: str,
     conversation_id: str | None = None,
 ) -> str:
-    del prompt
+    reply = _last_mile_artifact_fulfillment_reply(
+        runtime,
+        prompt=prompt,
+        reply=reply,
+        conversation_id=conversation_id,
+    )
     _pop_learned_skills_notification(runtime, conversation_id=conversation_id)
     return reply
+
+
+def _tool_results_from_compact_event(
+    compact_results: object,
+) -> tuple[ToolResult, ...]:
+    if not isinstance(compact_results, list):
+        return ()
+    results: list[ToolResult] = []
+    for index, item in enumerate(compact_results):
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool_name") or "").strip()
+        status = str(item.get("status") or "").strip()
+        output = item.get("output") if isinstance(item.get("output"), dict) else {}
+        if not tool_name or not status:
+            continue
+        results.append(
+            ToolResult(
+                invocation_id=str(item.get("invocation_id") or f"last-mile-{index}"),
+                tool_name=tool_name,
+                status=status,
+                output=output,
+                error=str(item.get("error")) if item.get("error") is not None else None,
+            )
+        )
+    return tuple(results)
+
+
+def _latest_chat_turn_artifact_tool_results(
+    runtime: PersistentRuntime,
+    *,
+    conversation_id: str | None,
+    prompt: str,
+) -> tuple[ToolResult, ...]:
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        return ()
+    try:
+        events = runtime.store.list_conversation_events(conversation_id)
+    except Exception:
+        logger.debug("Could not read conversation events for last-mile artifact fulfillment", exc_info=True)
+        return ()
+    prompt_text = str(prompt or "").strip()
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("event_type") != "conversation.chat_turn":
+            continue
+        if prompt_text and str(event.get("user_message") or "").strip() != prompt_text:
+            continue
+        return _tool_results_from_compact_event(event.get("tool_results"))
+    return ()
+
+
+def _last_mile_artifact_fulfillment_reply(
+    runtime: PersistentRuntime,
+    *,
+    prompt: str,
+    reply: str,
+    conversation_id: str | None,
+) -> str:
+    if not isinstance(reply, str) or reply.startswith("Tool approval requested"):
+        return reply
+    tool_results = _latest_chat_turn_artifact_tool_results(
+        runtime,
+        conversation_id=conversation_id,
+        prompt=prompt,
+    )
+    if not tool_results:
+        return reply
+    explicit_extensions = _literal_requested_attachment_extensions(prompt)
+    if not explicit_extensions and not _merge_required_attachment_extensions((), tool_results):
+        return reply
+    principal_id = conversation_id or None
+    fulfilled_reply = _append_chat_artifacts_to_reply(
+        runtime,
+        reply=reply,
+        artifact_paths=(),
+        prompt=prompt,
+        conversation_id=conversation_id,
+        principal_id=principal_id,
+        tool_results=tool_results,
+        required_attachment_extensions=explicit_extensions,
+    )
+    return _enforce_chat_response_fulfillment(
+        runtime,
+        conversation_id=conversation_id or "",
+        prompt=prompt,
+        reply=fulfilled_reply,
+        tool_results=tool_results,
+        principal_id=principal_id,
+        required_attachment_extensions=explicit_extensions,
+    )
 
 
 
@@ -6462,6 +22137,7 @@ def _render_chat_turn(
     settings: NullionSettings | None = None,
     request_id: str | None = None,
     message_id: str | None = None,
+    turn_id: str | None = None,
     model_client: object | None = None,
     agent_orchestrator: object | None = None,
     activity_callback: ActivityCallback | None = None,
@@ -6477,6 +22153,8 @@ def _render_chat_turn(
     prompt = _chat_prompt_for_message(message)
     if prompt is None:
         return "Usage: /chat <message>"
+    message_parts = str(message or "").strip().split()
+    explicit_chat_command = bool(message_parts and _normalize_command_head(message_parts[0]) == "/chat")
     timing_started_at = time.perf_counter()
     timing_last_at = timing_started_at
     timing_marks: list[dict[str, object]] = []
@@ -6484,13 +22162,13 @@ def _render_chat_turn(
         activity_callback=activity_callback,
         surface="messaging",
         conversation_id=_conversation_id_for_chat(chat_id),
-        turn_id=message_id or request_id,
+        turn_id=turn_id or message_id or request_id,
         logger=logger,
     )
     turn_latency = TurnLatencyRecorder(
         surface="messaging",
         conversation_id=_conversation_id_for_chat(chat_id),
-        turn_id=message_id or request_id,
+        turn_id=turn_id or message_id or request_id,
         feed_visible=bool(activity_callback),
         logger=logger,
     )
@@ -6556,6 +22234,7 @@ def _render_chat_turn(
             tool_count=tool_count,
             scoped_tool_count=scoped_tool_count,
             artifact_count=artifact_count,
+            phase_timings=list(timing_marks),
         )
     planner_requested = parse_planner_command(message).requested
     principal_id = _principal_id_for_chat(chat_id, settings)
@@ -6586,8 +22265,31 @@ def _render_chat_turn(
         _finish_latency("local_reply")
         return reply
 
+    model_issue_reply = _chat_model_issue_reply(
+        runtime,
+        message=prompt,
+        model_client=model_client or getattr(agent_orchestrator, "model_client", None),
+    )
+    if model_issue_reply is not None:
+        if activity_callback is not None:
+            activity_callback({
+                "id": "known_model_health_issue",
+                "label": "Known model health issue",
+                "status": "blocked",
+            })
+        _remember_chat_turn(runtime, chat_id=chat_id, user_message=prompt, assistant_reply=model_issue_reply)
+        try:
+            runtime.checkpoint()
+        except Exception:
+            logger.debug("Unable to checkpoint model health fast-fail reply", exc_info=True)
+        _mark_timing("known_model_health_issue")
+        _log_timing_if_slow("known_model_health_issue", conversation_id_value=_conversation_id_for_chat(chat_id))
+        _finish_latency("known_model_health_issue")
+        return model_issue_reply
+
     thread = _get_chat_thread(runtime, chat_id)
     reply_context_prompt = _reply_context_prompt(reply_context)
+    explicit_reply_anchor = _reply_context_is_explicit_bot_anchor(reply_context)
     reply_context_text = (
         str(reply_context.get("reply_to_text") or "").strip()
         if isinstance(reply_context, dict)
@@ -6606,26 +22308,85 @@ def _render_chat_turn(
         if unanchored_numeric_reply
         else _chat_thread_has_structured_relationship_evidence(thread, recent_turn_limit=1)
     )
-    structured_followup_evidence = _chat_current_turn_has_structured_followup_evidence(
+    durable_tool_context_recovery = _compact_turn_has_recent_durable_tool_context(
         runtime,
         prompt=prompt,
         conversation_id=conversation_id,
-        attachments=attachments,
-        previous_assistant_message=previous_assistant_message,
-        ambiguity_fallback_reason=ambiguity_fallback_reason,
-    ) or bool(reply_context_prompt) or bool(numbered_option_context) or thread_structured_relationship_evidence
+        turn_dispatch_decision=turn_dispatch_decision,
+    )
+    structured_followup_evidence = (
+        _chat_current_turn_has_structured_followup_evidence(
+            runtime,
+            prompt=prompt,
+            conversation_id=conversation_id,
+            attachments=attachments,
+            previous_assistant_message=previous_assistant_message,
+            ambiguity_fallback_reason=ambiguity_fallback_reason,
+        )
+        or bool(reply_context_prompt)
+        or bool(numbered_option_context)
+        or thread_structured_relationship_evidence
+        or durable_tool_context_recovery
+    )
+    allow_plain_compact_classification = (
+        bool(reply_context_prompt)
+        or bool(numbered_option_context)
+        or (structured_followup_evidence and thread_structured_relationship_evidence)
+        or (
+            structured_followup_evidence
+            and _assistant_reply_has_numbered_choice_prompt(previous_assistant_message)
+        )
+        or _chat_has_open_task_frame(runtime, conversation_id=conversation_id)
+    )
     ambiguity_classifier, ambiguity_classifier_reason = _chat_ambiguity_classifier(
         thread,
         model_client=model_client,
         structured_followup_evidence=structured_followup_evidence,
         reply_context_text=reply_context_text,
+        allow_plain_compact_classification=allow_plain_compact_classification,
     )
+    dispatch_kwargs = _conversation_dispatch_kwargs(turn_dispatch_decision)
+    reply_dependency_turn_ids = _reply_context_dependency_turn_ids(
+        runtime=runtime,
+        conversation_id=conversation_id,
+        chat_id=chat_id,
+        reply_context=reply_context,
+    )
+    if reply_dependency_turn_ids and not dispatch_kwargs:
+        dispatch_kwargs = {
+            "dispatch_disposition": ConversationTurnDisposition.CONTINUE,
+            "dispatch_dependency_turn_ids": reply_dependency_turn_ids,
+            "dispatch_reason": "explicit_reply_context",
+        }
+    dispatch_has_dependency = bool(tuple(dispatch_kwargs.get("dispatch_dependency_turn_ids", ()) or ()))
+    dispatch_disposition = dispatch_kwargs.get("dispatch_disposition")
+    dispatch_is_bare_independent = (
+        not dispatch_kwargs
+        or (
+            not dispatch_has_dependency
+            and str(getattr(dispatch_disposition, "value", dispatch_disposition) or "").strip()
+            == ConversationTurnDisposition.INDEPENDENT.value
+        )
+    )
+    if numbered_option_context and dispatch_is_bare_independent:
+        numbered_option_parent_turn_id = _previous_numbered_option_turn_id(
+            runtime,
+            conversation_id=conversation_id,
+            previous_assistant_message=previous_assistant_message,
+        )
+        if numbered_option_parent_turn_id:
+            dispatch_kwargs = {
+                "dispatch_disposition": ConversationTurnDisposition.CONTINUE,
+                "dispatch_dependency_turn_ids": (numbered_option_parent_turn_id,),
+                "dispatch_reason": "numbered_option_reply",
+            }
     conversation_result = runtime.process_conversation_message(
         conversation_id=conversation_id,
         chat_id=chat_id,
         user_message=prompt,
         request_id=request_id,
         message_id=message_id,
+        turn_id=turn_id,
         reply_context=reply_context,
         previous_assistant_message=previous_assistant_message,
         ambiguity_fallback=ambiguity_fallback,
@@ -6633,7 +22394,7 @@ def _render_chat_turn(
         ambiguity_classifier=ambiguity_classifier,
         ambiguity_classifier_reason=ambiguity_classifier_reason,
         checkpoint=False,
-        **_conversation_dispatch_kwargs(turn_dispatch_decision),
+        **dispatch_kwargs,
     )
     _mark_timing("turn_record")
 
@@ -6677,13 +22438,28 @@ def _render_chat_turn(
         )
     conversation_context = None
     if not planner_requested:
-        conversation_context_turns = _conversation_context_turns(conversation_result, thread)
+        conversation_context_turns = (
+            _reply_context_anchor_chat_turns(
+                runtime,
+                conversation_id=conversation_id,
+                reply_context_text=reply_context_text,
+            )
+            if explicit_reply_anchor
+            else _conversation_context_turns(conversation_result, thread)
+        )
         conversation_context = _build_conversation_context(conversation_context_turns)
     if reply_context_prompt:
         conversation_context = "\n\n".join(part for part in (conversation_context, reply_context_prompt) if part)
     if numbered_option_context:
         conversation_context = "\n\n".join(part for part in (conversation_context, numbered_option_context) if part)
-    memory_context = _memory_context_for_chat(runtime, chat_id=chat_id, settings=settings)
+    _mark_timing("conversation_context")
+    memory_context = _memory_context_for_chat(
+        runtime,
+        chat_id=chat_id,
+        settings=settings,
+        reinforce=False,
+    )
+    _mark_timing("memory_context")
     prior_user_message = _previous_user_message(thread)
     task_frame_prompt = _effective_prompt_from_task_frame(
         runtime,
@@ -6692,45 +22468,164 @@ def _render_chat_turn(
     )
     deferred_prompt = _deferred_runtime_follow_up_source_prompt(thread, prompt)
     effective_prompt = planner_continuation_prompt or task_frame_prompt or deferred_prompt or numbered_option_context or prompt
+    _mark_timing("effective_prompt")
     phase_tracker.emit(PHASE_CHECK_ATTACHMENTS, "running")
     normalized_attachments = normalize_chat_attachments(attachments or [])
-    phase_tracker.done(PHASE_CHECK_ATTACHMENTS, "attachments", f"{len(normalized_attachments)} attachment{'s' if len(normalized_attachments) != 1 else ''}")
+    unavailable_attachment_count = unavailable_chat_attachment_count(attachments or [])
+    attachment_context_present = bool(normalized_attachments) or has_unavailable_chat_attachments(attachments or [])
+    if unavailable_attachment_count:
+        attachment_summary = (
+            f"{len(normalized_attachments)} saved, {unavailable_attachment_count} unavailable"
+        )
+    else:
+        attachment_summary = f"{len(normalized_attachments)} attachment{'s' if len(normalized_attachments) != 1 else ''}"
+    phase_tracker.done(PHASE_CHECK_ATTACHMENTS, "attachments", attachment_summary)
+    _mark_timing("attachment_scan")
+    source_attachment_names = tuple(
+        [attachment.name for attachment in normalized_attachments] + unavailable_chat_attachment_names(attachments or [])
+    )
+    prompt_attachment_format_candidate = _has_attachment_format_candidate(effective_prompt)
+    allow_attachment_model_planning = (
+        planner_requested
+        or attachment_context_present
+        or extract_url_target(effective_prompt) is not None
+        or prompt_attachment_format_candidate
+    )
     requested_attachment_extensions = _requested_attachment_extensions(
         effective_prompt,
-        model_client=model_client,
-        allow_model_planning=(
-            planner_requested
-            or bool(numbered_option_context)
-            or bool(normalized_attachments)
-            or extract_url_target(effective_prompt) is not None
-        ),
-        source_attachment_names=(attachment.name for attachment in normalized_attachments),
+        model_client=model_client if allow_attachment_model_planning else None,
+        allow_model_planning=allow_attachment_model_planning,
+        source_attachment_names=source_attachment_names,
     )
-    scope_requested_extensions = _inferred_scope_extensions_from_recent_artifacts(
-        runtime,
-        conversation_id=conversation_id,
-        conversation_result=conversation_result,
-        prompt=effective_prompt,
-        explicit_requested_extensions=requested_attachment_extensions,
+    requested_attachment_extensions = _merge_current_prompt_attachment_extensions(
+        requested_attachment_extensions,
+        prompt=prompt,
+        effective_prompt=effective_prompt,
     )
+    attachment_extension_signal = bool(
+        requested_attachment_extensions
+        or attachment_context_present
+        or prompt_attachment_format_candidate
+    )
+    if attachment_extension_signal:
+        requested_attachment_extensions = _prefer_new_output_filename_extensions_from_recent_artifacts(
+            runtime,
+            conversation_id=conversation_id,
+            conversation_result=conversation_result,
+            prompt=effective_prompt,
+            requested_extensions=requested_attachment_extensions,
+        )
+        planned_embedded_media_extensions = _requested_embedded_media_extensions(
+            effective_prompt,
+            model_client=model_client if allow_attachment_model_planning else None,
+            allow_model_planning=allow_attachment_model_planning,
+            source_attachment_names=source_attachment_names,
+        )
+        scope_requested_extensions = _inferred_scope_extensions_from_recent_artifacts(
+            runtime,
+            conversation_id=conversation_id,
+            conversation_result=conversation_result,
+            prompt=effective_prompt,
+            explicit_requested_extensions=requested_attachment_extensions,
+        )
+    else:
+        planned_embedded_media_extensions = ()
+        scope_requested_extensions = ()
     source_attachment_paths = _source_attachment_paths(normalized_attachments)
+    existing_named_artifact_paths = _existing_named_workspace_artifact_paths(
+        runtime,
+        prompt=effective_prompt,
+        principal_id=principal_id,
+    )
+    existing_named_artifact_extensions = tuple(
+        dict.fromkeys(
+            suffix
+            for suffix in (Path(path).suffix.lower() for path in existing_named_artifact_paths)
+            if suffix in VALID_ATTACHMENT_EXTENSIONS
+        )
+    )
     _mark_timing("attachment_extension")
     user_content_blocks = (
-        chat_attachment_content_blocks(effective_prompt, normalized_attachments)
-        if normalized_attachments
+        chat_attachment_content_blocks(effective_prompt, normalized_attachments, raw_attachments=attachments or [])
+        if attachment_context_present
         else None
     )
+    saved_history_available = _saved_conversation_history_available(runtime, conversation_id)
     turn_tool_evidence = build_turn_tool_evidence(
         user_message=effective_prompt,
         conversation_result=conversation_result,
-        has_attachments=bool(normalized_attachments),
+        has_attachments=attachment_context_present,
         requested_extensions=scope_requested_extensions,
-        saved_history_available=_saved_conversation_history_available(runtime, conversation_id),
+        existing_named_artifact_extensions=existing_named_artifact_extensions,
+        saved_history_available=saved_history_available,
+        numbered_option_selected=bool(numbered_option_context),
         prior_tool_scopes=_recent_tool_scopes_for_context(runtime, conversation_id),
     )
+    if activity_callback is not None and (
+        getattr(turn_tool_evidence, "has_url_target", False)
+        or getattr(turn_tool_evidence, "has_attachments", False)
+        or getattr(turn_tool_evidence, "artifact_requested", False)
+    ):
+        activity_callback({"id": "foreground-working-ack", "label": "Preparing work", "status": "running"})
+    existing_named_artifact_action = _direct_existing_named_workspace_artifact_action(
+        existing_named_artifact_paths=existing_named_artifact_paths,
+        effective_prompt=effective_prompt,
+        attachment_context_present=attachment_context_present,
+        saved_history_available=saved_history_available,
+        conversation_result=conversation_result,
+        numbered_option_context=numbered_option_context,
+        reply_context_prompt=reply_context_prompt,
+        planner_requested=planner_requested,
+        model_client=model_client,
+        structured_context_available=structured_followup_evidence,
+    )
+    if existing_named_artifact_action in {"deliver", "list"}:
+        direct_artifact_tool_result = _direct_existing_named_workspace_artifact_tool_result(
+            existing_named_artifact_paths,
+            action=existing_named_artifact_action,
+        )
+        direct_artifact_tool_results = (
+            [direct_artifact_tool_result]
+            if direct_artifact_tool_result is not None
+            else []
+        )
+        reply = (
+            _completed_requested_artifact_reply(tuple(existing_named_artifact_paths))
+            if existing_named_artifact_action == "deliver"
+            else _existing_named_workspace_artifact_listing_reply(existing_named_artifact_paths)
+        )
+        _remember_chat_turn(
+            runtime,
+            chat_id=chat_id,
+            user_message=prompt,
+            assistant_reply=reply,
+            conversation_turn_id=conversation_result.turn.turn_id,
+            tool_results=direct_artifact_tool_results,
+        )
+        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        runtime.checkpoint()
+        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing(f"direct_existing_artifact_{existing_named_artifact_action}")
+        _log_timing_if_slow(
+            f"direct_existing_artifact_{existing_named_artifact_action}",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+            tool_count=len(direct_artifact_tool_results),
+            artifact_count=len(existing_named_artifact_paths),
+        )
+        _finish_latency(
+            f"direct_existing_artifact_{existing_named_artifact_action}",
+            tool_count=len(direct_artifact_tool_results),
+            artifact_count=len(existing_named_artifact_paths),
+        )
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
     quoted_cron_name = _scheduled_task_name_from_reply_context(reply_context)
     tool_scope_user_message = "\n\n".join(
         part for part in (effective_prompt, reply_context_prompt if quoted_cron_name else None) if part
+    )
+    mentions_current_cron_reference = _user_turn_mentions_current_cron_reference(
+        tool_scope_user_message,
+        principal_id=principal_id,
     )
     fast_profile_candidate = _messaging_turn_fast_profile_candidate(
         evidence=turn_tool_evidence,
@@ -6744,12 +22639,13 @@ def _render_chat_turn(
     _mark_timing("tool_scope_decision_check_start")
     skip_tool_scope_decision = _messaging_turn_skip_tool_scope_decision(
         evidence=turn_tool_evidence,
+        user_message=tool_scope_user_message,
         config_action=None,
         allow_mini_agents=allow_mini_agents,
         force_mini_agent_dispatch=False,
         turn_dispatch_decision=turn_dispatch_decision,
     )
-    if quoted_cron_name:
+    if quoted_cron_name or mentions_current_cron_reference:
         skip_tool_scope_decision = False
     phase_tracker.emit(PHASE_SELECT_TOOLS, "running")
     base_tool_registry = with_conversation_history_tool(
@@ -6757,12 +22653,60 @@ def _render_chat_turn(
         runtime=runtime,
         conversation_id=conversation_id,
     )
-    if skip_tool_scope_decision:
-        active_turn_tool_registry = scoped_turn_tool_registry(
+    waiting_delegated_turn = _latest_waiting_delegated_suspended_turn(
+        runtime,
+        conversation_id=conversation_id,
+        chat_id=chat_id,
+    )
+    if waiting_delegated_turn is not None:
+        resume_reply = _resume_delegated_suspended_turn(
+            runtime,
+            suspended_turn=waiting_delegated_turn,
+            agent_orchestrator=agent_orchestrator,
+            tool_registry=base_tool_registry,
+            user_response=prompt,
+            background=True,
+        )
+        if resume_reply is not None:
+            phase_tracker.done(PHASE_SELECT_TOOLS, "resume_delegated_task", "Resuming paused planner task")
+            _remember_chat_turn(
+                runtime,
+                chat_id=chat_id,
+                user_message=prompt,
+                assistant_reply=resume_reply,
+                conversation_turn_id=conversation_result.turn.turn_id,
+            )
+            _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+            runtime.checkpoint()
+            _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+            _mark_timing("resume_delegated_task")
+            _log_timing_if_slow(
+                "resume_delegated_task",
+                conversation_id_value=conversation_id,
+                conversation_result_value=conversation_result,
+            )
+            _finish_latency("resume_delegated_task")
+            return _append_runtime_nudges(runtime, prompt=prompt, reply=resume_reply, conversation_id=conversation_id)
+    safe_direct_read_preflight_registry = (
+        _safe_direct_read_scope_preflight_registry(
+            base_tool_registry=base_tool_registry,
+            evidence=turn_tool_evidence,
+            model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+            user_message=tool_scope_user_message,
+        )
+        if skip_tool_scope_decision
+        else None
+    )
+    if safe_direct_read_preflight_registry is not None:
+        active_turn_tool_registry = safe_direct_read_preflight_registry
+        _mark_timing("tool_scope_safe_direct_read_preflight")
+    elif skip_tool_scope_decision:
+        active_turn_tool_registry = turn_tool_registry_for_evidence(
             base_tool_registry,
             evidence=turn_tool_evidence,
             model_client=None,
             user_message=tool_scope_user_message,
+            skip_tool_scope_decision=True,
         )
         _mark_timing("tool_scope_decision_skipped")
     else:
@@ -6770,14 +22714,18 @@ def _render_chat_turn(
         tool_scope_model_client = getattr(agent_orchestrator, "model_client", None) or model_client
         if fast_profile_candidate:
             tool_scope_model_client = _model_client_with_interactive_fast_profile(tool_scope_model_client)
-        active_turn_tool_registry = scoped_turn_tool_registry(
+        active_turn_tool_registry = turn_tool_registry_for_evidence(
             base_tool_registry,
             evidence=turn_tool_evidence,
             model_client=tool_scope_model_client,
             user_message=tool_scope_user_message,
+            skip_tool_scope_decision=False,
         )
         _mark_timing("tool_scope_registry_done")
-    if quoted_cron_name and not _turn_scope_requests_delete_cron(active_turn_tool_registry):
+    if (
+        (quoted_cron_name or mentions_current_cron_reference)
+        and not _turn_scope_requests_any_scheduler_action(active_turn_tool_registry)
+    ):
         forced_scope_client = getattr(agent_orchestrator, "model_client", None) or model_client
         if fast_profile_candidate:
             forced_scope_client = _model_client_with_interactive_fast_profile(forced_scope_client)
@@ -6788,26 +22736,145 @@ def _render_chat_turn(
             registry=base_tool_registry,
             force_model_decision=True,
         )
-        if forced_decision.valid:
+        if _tool_scope_decision_has_substantive_scope(forced_decision):
             active_turn_tool_registry = ScopedTurnToolRegistry(
                 base_tool_registry,
                 evidence=turn_tool_evidence,
                 tool_scope_decision=forced_decision,
             )
+    if existing_named_artifact_extensions:
+        existing_file_decision = _local_file_reference_scope_decision_from_message(
+            effective_prompt,
+            registry=base_tool_registry,
+            allow_file_write_artifacts=False,
+        )
+        if existing_file_decision is not None:
+            active_turn_tool_registry = ScopedTurnToolRegistry(
+                base_tool_registry,
+                evidence=turn_tool_evidence,
+                tool_scope_decision=existing_file_decision,
+            )
+    if planned_embedded_media_extensions:
+        existing_decision = getattr(active_turn_tool_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
+        planned_attachment_extensions = tuple(
+            dict.fromkeys([
+                *getattr(existing_decision, "requested_artifact_extensions", ()),
+                *requested_attachment_extensions,
+                *planned_embedded_media_extensions,
+            ])
+        )
+        planned_tool_names = tuple(getattr(existing_decision, "requested_tool_names", ()) or ())
+        active_turn_tool_registry = ScopedTurnToolRegistry(
+            base_tool_registry,
+            evidence=turn_tool_evidence,
+            tool_scope_decision=TurnToolScopeDecision(
+                web_action=getattr(existing_decision, "web_action", "none"),
+                scheduler_action=getattr(existing_decision, "scheduler_action", "none"),
+                scheduler_toggle_enabled=getattr(existing_decision, "scheduler_toggle_enabled", None),
+                scheduler_selection_policy=getattr(existing_decision, "scheduler_selection_policy", "none"),
+                scheduler_target_scope=getattr(existing_decision, "scheduler_target_scope", "none"),
+                skill_pack_action=getattr(existing_decision, "skill_pack_action", "none"),
+                connector_app_ids=tuple(getattr(existing_decision, "connector_app_ids", ()) or ()),
+                requested_tool_names=planned_tool_names,
+                required_tool_names=tuple(getattr(existing_decision, "required_tool_names", ()) or ()),
+                requested_artifact_extensions=planned_attachment_extensions,
+                required_embedded_media_extensions=tuple(
+                    dict.fromkeys([
+                        *getattr(existing_decision, "required_embedded_media_extensions", ()),
+                        *planned_embedded_media_extensions,
+                    ])
+                ),
+                confidence=max(float(getattr(existing_decision, "confidence", 0.0) or 0.0), 1.0),
+                valid=True,
+            ),
+        )
     phase_tracker.done(PHASE_SELECT_TOOLS, "tool_scope_registry")
     try:
         turn_latency.set(scoped_tool_count=len(active_turn_tool_registry.list_tool_definitions()))
     except Exception:
         pass
+    turn_scoped_attachment_extensions = (
+        *requested_attachment_extensions,
+        *_requested_artifact_extensions_from_registry(active_turn_tool_registry),
+    )
     turn_required_embedded_media_extensions = _required_embedded_media_extensions_from_tool_registry(
         active_turn_tool_registry
     )
-    turn_tool_flow_context = _tool_flow_context_for_required_media(turn_required_embedded_media_extensions)
+    turn_tool_flow_context = _tool_flow_context_for_required_media(
+        turn_required_embedded_media_extensions,
+        required_artifact_extensions=turn_scoped_attachment_extensions,
+    )
     agent_orchestrator = _orchestrator_with_interactive_fast_profile(
         agent_orchestrator,
         enabled=fast_profile_candidate,
         tool_registry=active_turn_tool_registry,
     )
+    if quoted_cron_name and _turn_scope_requests_toggle_cron(active_turn_tool_registry):
+        toggle_enabled = _turn_scope_toggle_cron_enabled(active_turn_tool_registry)
+        if isinstance(toggle_enabled, bool):
+            if activity_callback is not None:
+                activity_callback({
+                    "id": "toggle-cron-reply-context",
+                    "label": "Updating quoted cron",
+                    "status": "running",
+                })
+            toggle_cron_args, toggle_cron_arg_error = _delete_cron_args_for_quoted_name(
+                principal_id,
+                quoted_cron_name,
+            )
+            if toggle_cron_args is None:
+                toggle_cron_result = ToolResult(
+                    invocation_id=f"reply-context-toggle-cron-{request_id or uuid4().hex}",
+                    tool_name="toggle_cron",
+                    status="failed",
+                    output={"name": quoted_cron_name},
+                    error=toggle_cron_arg_error or "Could not resolve the quoted cron.",
+                )
+            else:
+                toggle_cron_result = invoke_tool_with_boundary_policy(
+                    runtime.store,
+                    ToolInvocation(
+                        invocation_id=f"reply-context-toggle-cron-{request_id or uuid4().hex}",
+                        tool_name="toggle_cron",
+                        principal_id=principal_id,
+                        arguments={**toggle_cron_args, "enabled": toggle_enabled},
+                        capsule_id=None,
+                    ),
+                    registry=active_turn_tool_registry,
+                )
+            if activity_callback is not None:
+                detail = toggle_cron_result.error or (
+                    str(toggle_cron_result.output.get("message") or "")[:140]
+                    if isinstance(toggle_cron_result.output, dict)
+                    else ""
+                )
+                activity_callback({
+                    "id": "toggle-cron-reply-context",
+                    "label": "Updating quoted cron",
+                    "status": "done" if normalize_tool_status(toggle_cron_result.status) == "completed" else "failed",
+                    **({"detail": detail} if detail else {}),
+                })
+            reply = _toggle_cron_reply_from_result(toggle_cron_result, quoted_cron_name, toggle_enabled)
+            _remember_chat_turn(
+                runtime,
+                chat_id=chat_id,
+                user_message=prompt,
+                assistant_reply=reply,
+                conversation_turn_id=conversation_result.turn.turn_id,
+                tool_results=[toggle_cron_result],
+            )
+            _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+            runtime.checkpoint()
+            _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+            _mark_timing("toggle_cron_reply_context")
+            _log_timing_if_slow(
+                "toggle_cron_reply_context",
+                conversation_id_value=conversation_id,
+                conversation_result_value=conversation_result,
+                tool_count=1,
+            )
+            _finish_latency("toggle_cron_reply_context", tool_count=1)
+            return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
     if quoted_cron_name and _turn_scope_requests_delete_cron(active_turn_tool_registry):
         if activity_callback is not None:
             activity_callback({
@@ -6882,6 +22949,18 @@ def _render_chat_turn(
                 "label": "Running selected cron",
                 "status": "running",
             })
+        cron_selection_registry = ScopedTurnToolRegistry(
+            base_tool_registry,
+            evidence=turn_tool_evidence,
+            tool_scope_decision=TurnToolScopeDecision(
+                scheduler_action="run",
+                scheduler_selection_policy="user_selected",
+                requested_tool_names=("run_cron", "list_crons"),
+                required_tool_names=("run_cron",),
+                confidence=1.0,
+                valid=True,
+            ),
+        )
         cron_selection_result = invoke_tool_with_boundary_policy(
             runtime.store,
             ToolInvocation(
@@ -6891,7 +22970,7 @@ def _render_chat_turn(
                 arguments=cron_selection_args,
                 capsule_id=None,
             ),
-            registry=active_turn_tool_registry,
+            registry=cron_selection_registry,
         )
         if activity_callback is not None:
             detail = cron_selection_result.error or (
@@ -6925,111 +23004,6 @@ def _render_chat_turn(
             tool_count=1,
         )
         _finish_latency("run_cron_numbered_selection", tool_count=1)
-        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
-    screenshot_reply = _telegram_screenshot_reply_if_requested(
-        runtime,
-        prompt=effective_prompt,
-        conversation_id=_conversation_id_for_chat(chat_id),
-        chat_id=chat_id,
-        request_id=request_id,
-        message_id=message_id,
-        principal_id=principal_id,
-    )
-    if screenshot_reply is not None:
-        _turn_is_suspended = screenshot_reply.startswith("Tool approval requested")
-        if not _turn_is_suspended:
-            _remember_chat_turn(
-                runtime,
-                chat_id=chat_id,
-                user_message=prompt,
-                assistant_reply=screenshot_reply,
-                conversation_turn_id=conversation_result.turn.turn_id,
-            )
-        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
-        runtime.checkpoint()
-        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
-        _mark_timing("screenshot")
-        _log_timing_if_slow(
-            "screenshot",
-            conversation_id_value=conversation_id,
-            conversation_result_value=conversation_result,
-        )
-        _finish_latency("screenshot")
-        return _append_runtime_nudges(runtime, prompt=prompt, reply=screenshot_reply, conversation_id=conversation_id)
-
-    artifact_result = run_pre_chat_artifact_workflow(
-        runtime,
-        prompt=effective_prompt,
-        registry=active_turn_tool_registry,
-        principal_id=principal_id,
-        source_image_path=_first_source_image_path(normalized_attachments),
-    )
-    if artifact_result.kind == "image" and artifact_result.image_result is not None:
-        image_result = artifact_result.image_result
-        if artifact_result.needs_approval:
-            reply = (
-                f"Tool approval requested: {artifact_result.approval_id}"
-                if artifact_result.approval_id
-                else "Tool approval requested."
-            )
-        elif artifact_result.completed:
-            reply = _append_chat_artifacts_to_reply(
-                runtime,
-                reply="Done.",
-                artifact_paths=artifact_result.artifact_paths,
-                prompt=effective_prompt,
-                principal_id=principal_id,
-                tool_results=artifact_result.tool_results,
-                required_attachment_extensions=requested_attachment_extensions,
-                source_attachment_paths=source_attachment_paths,
-            )
-        else:
-            detail = artifact_result.error or "Image generation provider failed."
-            reply = f"I couldn't generate the image: {detail}"
-        if artifact_result.completed:
-            reply = _enforce_chat_response_fulfillment(
-                runtime,
-                conversation_id=_conversation_id_for_chat(chat_id),
-                prompt=effective_prompt,
-                reply=reply,
-                tool_results=artifact_result.tool_results,
-                artifact_paths=artifact_result.artifact_paths,
-                principal_id=principal_id,
-                required_attachment_extensions=requested_attachment_extensions,
-                required_embedded_media_extensions=turn_required_embedded_media_extensions,
-                source_attachment_paths=source_attachment_paths,
-            )
-        update_active_task_frame_from_outcomes(
-            runtime.store,
-            conversation_id=_conversation_id_for_chat(chat_id),
-            tool_results=artifact_result.tool_results,
-            rendered_reply=reply,
-            completion_turn_id=conversation_result.turn.turn_id,
-        )
-        if not reply.startswith("Tool approval requested"):
-            _remember_chat_turn(
-                runtime,
-                chat_id=chat_id,
-                user_message=prompt,
-                assistant_reply=reply,
-                conversation_turn_id=conversation_result.turn.turn_id,
-            )
-        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
-        runtime.checkpoint()
-        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
-        _mark_timing("pre_chat_artifact")
-        _log_timing_if_slow(
-            "pre_chat_artifact",
-            conversation_id_value=conversation_id,
-            conversation_result_value=conversation_result,
-            tool_count=len(artifact_result.tool_results or []),
-            artifact_count=len(artifact_result.artifact_paths or []),
-        )
-        _finish_latency(
-            "pre_chat_artifact",
-            tool_count=len(artifact_result.tool_results or []),
-            artifact_count=len(artifact_result.artifact_paths or []),
-        )
         return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
     phase_tracker.done(PHASE_CHECK_TASK_STATE, "task_state")
     tool_activity_count = 0
@@ -7092,6 +23066,173 @@ def _render_chat_turn(
         if detail:
             event["detail"] = detail[:140]
         activity_callback(event)
+
+    screenshot_reply = _telegram_screenshot_reply_if_requested(
+        runtime,
+        prompt=effective_prompt,
+        conversation_id=_conversation_id_for_chat(chat_id),
+        chat_id=chat_id,
+        request_id=request_id,
+        message_id=message_id,
+        principal_id=principal_id,
+    )
+    if screenshot_reply is not None:
+        _turn_is_suspended = screenshot_reply.startswith("Tool approval requested")
+        if not _turn_is_suspended:
+            _remember_chat_turn(
+                runtime,
+                chat_id=chat_id,
+                user_message=prompt,
+                assistant_reply=screenshot_reply,
+                conversation_turn_id=conversation_result.turn.turn_id,
+            )
+        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        runtime.checkpoint()
+        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("screenshot")
+        _log_timing_if_slow(
+            "screenshot",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+        )
+        _finish_latency("screenshot")
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=screenshot_reply, conversation_id=conversation_id)
+
+    direct_structured_browser_result = _run_open_url_tool_directly(
+        runtime=runtime,
+        registry=active_turn_tool_registry,
+        base_registry=base_tool_registry,
+        principal_id=principal_id,
+        turn_id=conversation_result.turn.turn_id,
+        user_message=effective_prompt,
+        tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+    )
+    if direct_structured_browser_result is None:
+        direct_structured_browser_result = _run_browser_screenshot_tool_directly(
+            runtime=runtime,
+            registry=active_turn_tool_registry,
+            principal_id=principal_id,
+            turn_id=conversation_result.turn.turn_id,
+            user_message=effective_prompt,
+            tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+        )
+    if direct_structured_browser_result is not None:
+        direct_tool_results = list(getattr(direct_structured_browser_result, "tool_results", ()) or ())
+        direct_artifacts = list(getattr(direct_structured_browser_result, "artifacts", ()) or ())
+        if getattr(direct_structured_browser_result, "suspended_for_approval", False):
+            reply, _direct_browser_approval_live = _approval_marker_reply_for_turn_result(
+                runtime,
+                direct_structured_browser_result,
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+            )
+        else:
+            reply = getattr(direct_structured_browser_result, "final_text", None) or "Done."
+            if direct_artifacts:
+                reply = _append_chat_artifacts_to_reply(
+                    runtime,
+                    reply=reply,
+                    artifact_paths=direct_artifacts,
+                    prompt=effective_prompt,
+                    conversation_id=conversation_id,
+                    principal_id=principal_id,
+                    tool_results=direct_tool_results,
+                    required_attachment_extensions=requested_attachment_extensions,
+                    required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                    source_attachment_paths=source_attachment_paths,
+                )
+        _remember_chat_turn(
+            runtime,
+            chat_id=chat_id,
+            user_message=prompt,
+            assistant_reply=reply,
+            conversation_turn_id=conversation_result.turn.turn_id,
+            tool_results=direct_tool_results,
+        )
+        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        runtime.checkpoint()
+        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("direct_structured_browser_tool")
+        _log_timing_if_slow(
+            "direct_structured_browser_tool",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+            tool_count=len(direct_tool_results),
+        )
+        _finish_latency("direct_structured_browser_tool", tool_count=len(direct_tool_results))
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
+
+    artifact_result = run_pre_chat_artifact_workflow(
+        runtime,
+        prompt=effective_prompt,
+        registry=active_turn_tool_registry,
+        principal_id=principal_id,
+        source_image_path=_first_source_image_path(normalized_attachments),
+    )
+    if artifact_result.kind == "image" and artifact_result.image_result is not None:
+        image_result = artifact_result.image_result
+        if artifact_result.needs_approval:
+            reply, _artifact_approval_live = _approval_marker_reply_if_actionable(runtime, artifact_result.approval_id)
+        elif artifact_result.completed:
+            reply = _append_chat_artifacts_to_reply(
+                runtime,
+                reply="Done.",
+                artifact_paths=artifact_result.artifact_paths,
+                prompt=effective_prompt,
+                conversation_id=conversation_id,
+                principal_id=principal_id,
+                tool_results=artifact_result.tool_results,
+                required_attachment_extensions=requested_attachment_extensions,
+                source_attachment_paths=source_attachment_paths,
+            )
+        else:
+            detail = artifact_result.error or "Image generation provider failed."
+            reply = f"I couldn't generate the image: {detail}"
+        if artifact_result.completed:
+            reply = _enforce_chat_response_fulfillment(
+                runtime,
+                conversation_id=_conversation_id_for_chat(chat_id),
+                prompt=effective_prompt,
+                reply=reply,
+                tool_results=artifact_result.tool_results,
+                artifact_paths=artifact_result.artifact_paths,
+                principal_id=principal_id,
+                required_attachment_extensions=requested_attachment_extensions,
+                required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                source_attachment_paths=source_attachment_paths,
+            )
+        update_active_task_frame_from_outcomes(
+            runtime.store,
+            conversation_id=_conversation_id_for_chat(chat_id),
+            tool_results=artifact_result.tool_results,
+            rendered_reply=reply,
+            completion_turn_id=conversation_result.turn.turn_id,
+        )
+        if not reply.startswith("Tool approval requested"):
+            _remember_chat_turn(
+                runtime,
+                chat_id=chat_id,
+                user_message=prompt,
+                assistant_reply=reply,
+                conversation_turn_id=conversation_result.turn.turn_id,
+            )
+        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        runtime.checkpoint()
+        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("pre_chat_artifact")
+        _log_timing_if_slow(
+            "pre_chat_artifact",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+            tool_count=len(artifact_result.tool_results or []),
+            artifact_count=len(artifact_result.artifact_paths or []),
+        )
+        _finish_latency(
+            "pre_chat_artifact",
+            tool_count=len(artifact_result.tool_results or []),
+            artifact_count=len(artifact_result.artifact_paths or []),
+        )
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
     # Route all messages through the orchestrator when available (no heuristic pre-routing)
     if agent_orchestrator is not None:
         try:
@@ -7134,12 +23275,31 @@ def _render_chat_turn(
             orchestrator_conversation_history: list[dict[str, object]] = []
             orchestrator_conversation_history.append({
                 "role": "system",
-                "content": [{"type": "text", "text": _chat_delivery_contract_prompt(runtime, principal_id=principal_id)}],
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _chat_delivery_contract_prompt(
+                            runtime,
+                            principal_id=principal_id,
+                            compact_message_only=_turn_tool_scope_uses_compact_delivery_contract(
+                                active_turn_tool_registry
+                            ),
+                        ),
+                    }
+                ],
             })
+            plain_no_user_tool_fast_path = _tool_registry_has_only_context_discovery_tools(active_turn_tool_registry)
+            _capability_inventory_registry = (
+                base_tool_registry
+                if isinstance(active_turn_tool_registry, PlainNoToolFastPathRegistry)
+                else None
+                if plain_no_user_tool_fast_path
+                else active_turn_tool_registry
+            )
             _capability_inventory = _chat_capability_inventory_prompt(
                 runtime,
-                tool_registry=active_turn_tool_registry,
-            )
+                tool_registry=_capability_inventory_registry,
+            ) if _capability_inventory_registry is not None else None
             if _capability_inventory:
                 orchestrator_conversation_history.append({
                     "role": "system",
@@ -7176,7 +23336,10 @@ def _render_chat_turn(
                     })
                 _skill_pack_index_text = (
                     _enabled_skill_pack_index_prompt(settings)
-                    if tool_registry_allows_skill_pack_context(active_turn_tool_registry)
+                    if (
+                        not plain_no_user_tool_fast_path
+                        and tool_registry_allows_skill_pack_context(active_turn_tool_registry)
+                    )
                     else None
                 )
                 if _skill_pack_index_text:
@@ -7186,7 +23349,10 @@ def _render_chat_turn(
                     })
                 _skill_pack_text = (
                     _enabled_skill_pack_prompt(settings)
-                    if tool_registry_allows_skill_pack_prompt_context(active_turn_tool_registry)
+                    if (
+                        not plain_no_user_tool_fast_path
+                        and tool_registry_allows_skill_pack_prompt_context(active_turn_tool_registry)
+                    )
                     else None
                 )
                 if _skill_pack_text:
@@ -7194,17 +23360,18 @@ def _render_chat_turn(
                         "role": "system",
                         "content": [{"type": "text", "text": _skill_pack_text}],
                     })
-                try:
-                    from nullion.connections import format_workspace_connections_for_prompt
+                if not plain_no_user_tool_fast_path:
+                    try:
+                        from nullion.connections import format_workspace_connections_for_prompt
 
-                    _connections_text = format_workspace_connections_for_prompt(principal_id=principal_id)
-                except Exception:
-                    _connections_text = ""
-                if _connections_text:
-                    orchestrator_conversation_history.append({
-                        "role": "system",
-                        "content": [{"type": "text", "text": _connections_text}],
-                    })
+                        _connections_text = format_workspace_connections_for_prompt(principal_id=principal_id)
+                    except Exception:
+                        _connections_text = ""
+                    if _connections_text:
+                        orchestrator_conversation_history.append({
+                            "role": "system",
+                            "content": [{"type": "text", "text": _connections_text}],
+                        })
             except Exception:
                 pass
             if memory_context:
@@ -7212,40 +23379,146 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": f"Known user memory:\n{memory_context}"}],
                 })
-            route_hints = _builder_route_hints_prompt(runtime, active_turn_tool_registry)
+            route_hints = (
+                None
+                if plain_no_user_tool_fast_path
+                else _builder_route_hints_prompt(runtime, active_turn_tool_registry)
+            )
             if route_hints:
                 orchestrator_conversation_history.append({
                     "role": "system",
                     "content": [{"type": "text", "text": route_hints}],
                 })
             recent_tool_context = (
-                _recent_tool_context_prompt(runtime, conversation_id)
-                if _should_include_recent_tool_context(conversation_result)
-                else None
+                None
+                if explicit_reply_anchor
+                else (
+                    _recent_tool_context_prompt(runtime, conversation_id)
+                    if _should_include_recent_tool_context(
+                        conversation_result,
+                        structured_followup_evidence=(
+                            structured_followup_evidence
+                            and (
+                                bool(reply_context_prompt)
+                                or bool(numbered_option_context)
+                                or _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision)
+                            )
+                        ),
+                    )
+                    else None
+                )
             )
+            structured_tool_context_followup_names: tuple[str, ...] = ()
+            structured_tool_context_followup = bool(structured_tool_context_followup_names)
             if recent_tool_context:
+                (
+                    widened_tool_registry,
+                    structured_tool_context_followup_names,
+                    tool_scope_prompt,
+                ) = _apply_structured_tool_context_scope(
+                    active_turn_tool_registry,
+                    base_registry=base_tool_registry,
+                    evidence=turn_tool_evidence,
+                    context=recent_tool_context,
+                )
+                structured_tool_context_followup = bool(structured_tool_context_followup_names)
+                if widened_tool_registry is not active_turn_tool_registry:
+                    active_turn_tool_registry = widened_tool_registry
+                    if tool_scope_prompt:
+                        orchestrator_conversation_history.append({
+                            "role": "system",
+                            "content": [{"type": "text", "text": tool_scope_prompt}],
+                        })
                 orchestrator_conversation_history.append({
                     "role": "system",
                     "content": [{"type": "text", "text": recent_tool_context}],
                 })
+            compact_followup_guard = _compact_unstructured_followup_guard_prompt(
+                prompt=effective_prompt,
+                reply_context_prompt=reply_context_prompt,
+                numbered_option_context=numbered_option_context,
+                has_prior_context=bool(previous_assistant_message or thread),
+            )
+            if explicit_chat_command or bool(getattr(turn_tool_evidence, "slash_prefixed_literal", False)):
+                compact_followup_guard = None
+            if compact_followup_guard and _registry_has_exact_current_context_tool_scope(active_turn_tool_registry):
+                compact_followup_guard = None
+            durable_tool_context_history_query_turns = (
+                _durable_tool_context_query_turns(thread)
+                if durable_tool_context_recovery
+                else None
+            )
+            if durable_tool_context_recovery:
+                compact_followup_guard = None
+            compact_clarification_history_candidate = (
+                (compact_followup_guard is not None and structured_followup_evidence)
+                or (
+                    not durable_tool_context_recovery
+                    and not reply_context_prompt
+                    and not numbered_option_context
+                    and _chat_message_is_compact_context_reply(effective_prompt)
+                    and structured_followup_evidence
+                    and bool(previous_assistant_message)
+                )
+            )
+            compact_clarification_history_context = (
+                _compact_clarification_followup_history_context(
+                    prompt=effective_prompt,
+                    previous_assistant_message=previous_assistant_message,
+                    model_client=getattr(agent_orchestrator, "model_client", None),
+                )
+                if compact_clarification_history_candidate
+                else None
+            )
+            if compact_clarification_history_context:
+                compact_followup_guard = None
             visible_conversation_turns = _conversation_context_turns(
                 conversation_result,
                 thread,
                 active_turn_tool_registry,
             )
+            if explicit_reply_anchor:
+                visible_conversation_turns = _reply_context_anchor_chat_turns(
+                    runtime,
+                    conversation_id=conversation_id,
+                    reply_context_text=reply_context_text,
+                )
+            if compact_followup_guard:
+                visible_conversation_turns = []
+            automatic_history_visible_turns = (
+                []
+                if durable_tool_context_recovery
+                else visible_conversation_turns
+            )
+            compact_followup_clarification = (
+                _compact_unstructured_target_clarification_reply(
+                    prompt=effective_prompt,
+                    model_client=getattr(agent_orchestrator, "model_client", None),
+                )
+                if compact_followup_guard and structured_followup_evidence
+                else None
+            )
+            auto_include_saved_history = _should_auto_include_saved_chat_history(
+                conversation_result,
+                reply_context_prompt=reply_context_prompt,
+                numbered_option_context=numbered_option_context,
+                requested_extensions=requested_attachment_extensions,
+            )
+            if explicit_reply_anchor:
+                auto_include_saved_history = False
+            if compact_clarification_history_context:
+                auto_include_saved_history = True
+            if durable_tool_context_recovery and not explicit_reply_anchor:
+                auto_include_saved_history = True
             automatic_history_context = (
                 _automatic_saved_chat_history_prompt(
                     runtime,
                     conversation_id=conversation_id,
                     prompt=effective_prompt,
-                    visible_turns=visible_conversation_turns,
+                    visible_turns=automatic_history_visible_turns,
+                    query_turns=durable_tool_context_history_query_turns,
                 )
-                if _should_auto_include_saved_chat_history(
-                    conversation_result,
-                    reply_context_prompt=reply_context_prompt,
-                    numbered_option_context=numbered_option_context,
-                    requested_extensions=requested_attachment_extensions,
-                )
+                if auto_include_saved_history and compact_followup_guard is None
                 else None
             )
             if automatic_history_context:
@@ -7254,6 +23527,9 @@ def _render_chat_turn(
                     base_registry=base_tool_registry,
                     evidence=turn_tool_evidence,
                     history_context=automatic_history_context,
+                    allow_unlinked_context_scope=bool(
+                        durable_tool_context_recovery or compact_clarification_history_context
+                    ),
                 )
                 if widened_tool_registry is not active_turn_tool_registry:
                     active_turn_tool_registry = widened_tool_registry
@@ -7270,11 +23546,27 @@ def _render_chat_turn(
                 reference_context_message = _saved_history_reference_context_message(automatic_history_context)
                 if reference_context_message:
                     orchestrator_conversation_history.append(reference_context_message)
+            if compact_clarification_history_context:
+                orchestrator_conversation_history.append({
+                    "role": "system",
+                    "content": [{"type": "text", "text": compact_clarification_history_context}],
+                })
+            if automatic_history_context or compact_clarification_history_context:
+                active_turn_tool_registry = with_conversation_history_tool(
+                    active_turn_tool_registry,
+                    runtime=runtime,
+                    conversation_id=conversation_id,
+                )
             context_boundary = _conversation_context_boundary_prompt(conversation_result)
             if context_boundary:
                 orchestrator_conversation_history.append({
                     "role": "system",
                     "content": [{"type": "text", "text": context_boundary}],
+                })
+            if compact_followup_guard:
+                orchestrator_conversation_history.append({
+                    "role": "system",
+                    "content": [{"type": "text", "text": compact_followup_guard}],
                 })
             if reply_context_prompt:
                 orchestrator_conversation_history.append({
@@ -7328,6 +23620,10 @@ def _render_chat_turn(
             thinking_text: str | None = None
             dispatch_dag_plan = None
             dispatch_available_tools: list[str] | None = None
+            mini_agent_dispatch_terminal = False
+            mini_agent_dispatch_group_id: str | None = None
+            deferred_scheduler_receipt_reply: str | None = None
+            completed_run_cron_receipt_reply: str | None = None
 
             def _safe_text_delta_callback(delta: str) -> None:
                 if not delta:
@@ -7360,7 +23656,16 @@ def _render_chat_turn(
                         active_turn_tool_registry,
                         model_client=model_for_dispatch,
                         user_message=effective_prompt,
+                        evidence=turn_tool_evidence,
+                        planner_requested=planner_requested,
                     )
+                    if structured_tool_context_followup:
+                        active_turn_tool_registry, _followup_names, _scope_prompt = _apply_structured_tool_context_scope(
+                            active_turn_tool_registry,
+                            base_registry=base_tool_registry,
+                            evidence=turn_tool_evidence,
+                            context=recent_tool_context,
+                        )
                     dispatch_available_tools = [
                         str(tool.get("name", ""))
                         for tool in active_turn_tool_registry.list_tool_definitions()
@@ -7442,6 +23747,19 @@ def _render_chat_turn(
                             task_count=len(getattr(mission, "steps", ()) or ()),
                         ),
                     })
+                planner_task_tool_names = tuple(
+                    dict.fromkeys(
+                        str(tool or "").strip()
+                        for task in getattr(dispatch_dag_plan, "tasks", ()) or ()
+                        for tool in (getattr(task, "tool_scope", ()) or ())
+                        if str(tool or "").strip()
+                    )
+                )
+                planner_artifact_extensions = _planner_dispatch_artifact_extensions(
+                    active_turn_tool_registry,
+                    requested_attachment_extensions,
+                    available_tool_names=planner_task_tool_names or dispatch_available_tools,
+                )
                 dispatch_result = agent_orchestrator.dispatch_request_sync(
                     conversation_id=conversation_id,
                     principal_id=principal_id,
@@ -7452,10 +23770,10 @@ def _render_chat_turn(
                     available_tools=dispatch_available_tools,
                     single_task_fast_path=False,
                     dag_plan=dispatch_dag_plan,
-                    requires_artifact_delivery=bool(requested_attachment_extensions),
+                    requires_artifact_delivery=bool(planner_artifact_extensions),
                     required_artifact_kind=(
-                        str(requested_attachment_extensions[0]).lstrip(".")
-                        if requested_attachment_extensions
+                        str(planner_artifact_extensions[0]).lstrip(".")
+                        if planner_artifact_extensions
                         else None
                     ),
                 )
@@ -7472,7 +23790,9 @@ def _render_chat_turn(
                         runtime,
                         str(getattr(dispatch_result, "group_id", "") or ""),
                     )
+                    mini_agent_dispatch_group_id = str(getattr(dispatch_result, "group_id", "") or "") or None
                     mini_agents_terminal = completed_dispatch_summary is not None
+                    mini_agent_dispatch_terminal = mini_agents_terminal
                     if activity_callback is not None and planner_summary:
                         activity_callback({
                             "id": "planner",
@@ -7487,6 +23807,9 @@ def _render_chat_turn(
                             "status": "running",
                             "detail": format_mini_agent_activity_detail(dispatched_task_titles, task_count=task_count),
                         })
+                    foreground_status_delivered = bool(
+                        getattr(dispatch_result, "status_delivered", False)
+                    ) or activity_callback is not None
                     activity_tool_results = [
                         *(
                             [
@@ -7512,15 +23835,16 @@ def _render_chat_turn(
                                 ),
                                 "task_group_id": str(getattr(dispatch_result, "group_id", "") or ""),
                                 "tasks": dispatched_task_titles,
-                                "status_delivered": bool(getattr(dispatch_result, "status_delivered", False)),
+                                "status_delivered": foreground_status_delivered,
                             },
                         )
                     ]
-                    status_delivery_confirmed = bool(getattr(dispatch_result, "status_delivered", False))
                     if activity_tool_results:
                         mini_agents_output = activity_tool_results[-1].output
                         if isinstance(mini_agents_output, dict):
-                            mini_agents_output["status_delivery_confirmed"] = status_delivery_confirmed
+                            mini_agents_output["status_delivery_confirmed"] = bool(
+                                getattr(dispatch_result, "status_delivered", False)
+                            )
                     reply = completed_dispatch_summary or dispatch_result.acknowledgment or (
                         f"Working on {task_count} task(s)."
                     )
@@ -7563,8 +23887,8 @@ def _render_chat_turn(
                 activity_tool_results = list(mission_result.tool_results)
                 if mission_result.status == "suspended":
                     approval_id = mission_result.suspended_approval_id
-                    reply = f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
-                    mission_outcome = TurnOutcome.SUSPENDED
+                    reply, _mission_approval_live = _approval_marker_reply_if_actionable(runtime, approval_id)
+                    mission_outcome = TurnOutcome.SUSPENDED if _mission_approval_live else TurnOutcome.SUCCESS
                 else:
                     reply = mission_result.final_summary or "Mission complete."
                     reply = _append_chat_artifacts_to_reply(
@@ -7572,6 +23896,7 @@ def _render_chat_turn(
                         reply=reply,
                         artifact_paths=mission_result.artifacts,
                         prompt=effective_prompt,
+                        conversation_id=conversation_id,
                         principal_id=principal_id,
                         tool_results=mission_result.tool_results,
                         required_attachment_extensions=requested_attachment_extensions,
@@ -7623,27 +23948,105 @@ def _render_chat_turn(
                 )
             elif not handled_by_mini_agents:
                 # Single-step: run directly as an orchestrator turn so the LLM decides
-                turn_result = agent_orchestrator.run_turn(
-                    conversation_id=conversation_id,
-                    principal_id=principal_id,
-                    user_message=effective_prompt,
-                    user_content_blocks=user_content_blocks,
-                    conversation_history=orchestrator_conversation_history,
-                    tool_registry=active_turn_tool_registry,
-                    policy_store=runtime.store,
-                    approval_store=runtime.store,
-                    tool_result_callback=_record_tool_activity if activity_callback is not None else None,
-                    text_delta_callback=_safe_text_delta_callback if streaming_safe else None,
-                    cancellation_checker=cancellation_checker,
-                    tool_flow_context=turn_tool_flow_context,
+                direct_turn_max_iterations = _chat_agent_turn_max_iterations(active_turn_tool_registry)
+                plain_direct_reply = (
+                    _plain_no_tool_direct_model_reply(
+                        model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+                        prompt=effective_prompt,
+                        memory_context=memory_context,
+                        conversation_context=conversation_context,
+                        capability_context=_capability_inventory,
+                    )
+                    if _should_use_plain_no_tool_direct_model_reply(
+                        fast_profile_candidate=fast_profile_candidate,
+                        active_tool_registry=active_turn_tool_registry,
+                        allow_mini_agents=allow_mini_agents,
+                        planner_requested=planner_requested,
+                        normalized_attachments=normalized_attachments,
+                        requested_attachment_extensions=requested_attachment_extensions,
+                        required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                        reply_context_prompt=reply_context_prompt,
+                        numbered_option_context=numbered_option_context,
+                        recent_tool_context=recent_tool_context,
+                        automatic_history_context=automatic_history_context,
+                        compact_followup_guard=compact_followup_guard,
+                    )
+                    else None
                 )
-                _mark_timing("model_tools")
+                if plain_direct_reply is not None:
+                    turn_result = SimpleNamespace(
+                        tool_results=[],
+                        artifacts=[],
+                        suspended_for_approval=False,
+                        approval_id=None,
+                        final_text=plain_direct_reply,
+                        reached_iteration_limit=False,
+                        thinking_text=None,
+                    )
+                    _mark_timing("model_tools")
+                else:
+                    direct_open_url_result = _run_open_url_tool_directly(
+                        runtime=runtime,
+                        registry=active_turn_tool_registry,
+                        base_registry=base_tool_registry,
+                        principal_id=principal_id,
+                        turn_id=conversation_result.turn.turn_id,
+                        user_message=effective_prompt,
+                        tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                    )
+                    if direct_open_url_result is not None:
+                        turn_result = direct_open_url_result
+                        _mark_timing("direct_open_url_tool")
+                    else:
+                        direct_browser_screenshot_result = _run_browser_screenshot_tool_directly(
+                            runtime=runtime,
+                            registry=active_turn_tool_registry,
+                            principal_id=principal_id,
+                            turn_id=conversation_result.turn.turn_id,
+                            user_message=effective_prompt,
+                            tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                        )
+                        if direct_browser_screenshot_result is not None:
+                            turn_result = direct_browser_screenshot_result
+                            _mark_timing("direct_browser_screenshot_tool")
+                        else:
+                            direct_safe_read_result = _run_scoped_safe_read_tool_directly(
+                                runtime=runtime,
+                                registry=active_turn_tool_registry,
+                                model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+                                principal_id=principal_id,
+                                turn_id=conversation_result.turn.turn_id,
+                                user_message=effective_prompt,
+                                tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                            )
+                            if direct_safe_read_result is not None:
+                                turn_result = direct_safe_read_result
+                                _mark_timing("direct_safe_read_tool")
+                            else:
+                                turn_result = agent_orchestrator.run_turn(
+                                    conversation_id=conversation_id,
+                                    principal_id=principal_id,
+                                    user_message=effective_prompt,
+                                    user_content_blocks=user_content_blocks,
+                                    conversation_history=orchestrator_conversation_history,
+                                    tool_registry=active_turn_tool_registry,
+                                    policy_store=runtime.store,
+                                    approval_store=runtime.store,
+                                    max_iterations=direct_turn_max_iterations,
+                                    tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                                    foreground_event_callback=activity_callback,
+                                    text_delta_callback=_safe_text_delta_callback if streaming_safe else None,
+                                    cancellation_checker=cancellation_checker,
+                                    tool_flow_context=turn_tool_flow_context,
+                                )
+                                _mark_timing("model_tools")
                 def _operator_saved_history_context() -> str | None:
                     return _automatic_saved_chat_history_prompt(
                         runtime,
                         conversation_id=conversation_id,
                         prompt=effective_prompt,
-                        visible_turns=visible_conversation_turns,
+                        visible_turns=automatic_history_visible_turns,
+                        query_turns=durable_tool_context_history_query_turns,
                     )
 
                 def _operator_retry_turn(retry_history: list[dict[str, object]], retry_tool_registry: object):
@@ -7656,15 +24059,61 @@ def _render_chat_turn(
                         tool_registry=retry_tool_registry,
                         policy_store=runtime.store,
                         approval_store=runtime.store,
+                        max_iterations=direct_turn_max_iterations,
                         tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                        foreground_event_callback=activity_callback,
                         text_delta_callback=_safe_text_delta_callback if streaming_safe else None,
                         cancellation_checker=cancellation_checker,
                         tool_flow_context=turn_tool_flow_context,
                     )
 
+                retry_result = _run_chat_turn_common_retries(
+                    initial_result=turn_result,
+                    base_history=orchestrator_conversation_history,
+                    active_tool_registry=active_turn_tool_registry,
+                    base_tool_registry=base_tool_registry,
+                    model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+                    runtime=runtime,
+                    user_message=tool_scope_user_message,
+                    schema_user_message=effective_prompt,
+                    evidence=turn_tool_evidence,
+                    run_turn=_operator_retry_turn,
+                    numbered_option_selected=bool(numbered_option_context),
+                    fallback_tool_names=structured_tool_context_followup_names,
+                    principal_id=principal_id,
+                    include_local_system_fallback=True,
+                    mark_retry=_mark_timing,
+                    skill_reuse_callback=lambda titles: _emit_skill_usage_activity(activity_callback, titles),
+                )
+                _mark_timing("common_retries")
+                turn_result = retry_result.result
+                active_turn_tool_registry = retry_result.tool_registry
                 turn_result, active_turn_tool_registry, _retried_saved_history = _run_chat_turn_saved_history_retry(
                     initial_result=turn_result,
                     automatic_history_context=automatic_history_context,
+                    allow_saved_history_retry=(
+                        not explicit_reply_anchor
+                        and
+                        not retry_result.retried_model_tool_request
+                        and not retry_result.retried_no_tool_scope_decision
+                        and
+                        not retry_result.retried_account_read
+                        and not retry_result.retried_missing_tool_scope
+                        and not retry_result.retried_connector_skill_scope
+                        and not retry_result.retried_scheduler_run_scope
+                        and not retry_result.retried_scheduler_run_fallback
+                        and not retry_result.retried_scheduler_mutation_fallback
+                        and not retry_result.retried_schema_followup
+                        and not retry_result.retried_local_system_fallback
+                        and
+                        compact_followup_guard is None
+                        and (
+                            auto_include_saved_history
+                            or explicit_chat_command
+                            or bool(getattr(turn_tool_evidence, "slash_prefixed_literal", False))
+                            or _assistant_reply_has_numbered_choice_prompt(getattr(turn_result, "final_text", None))
+                        )
+                    ),
                     build_history_context=_operator_saved_history_context,
                     base_history=orchestrator_conversation_history,
                     active_tool_registry=active_turn_tool_registry,
@@ -7672,38 +24121,373 @@ def _render_chat_turn(
                     turn_tool_evidence=turn_tool_evidence,
                     run_turn=_operator_retry_turn,
                     mark_retry=lambda: _mark_timing("saved_history_retry"),
+                    allow_history_search_retry=compact_followup_guard is None,
                 )
+                _mark_timing("saved_history_retry_check")
                 phase_tracker.done(PHASE_RUN_TOOLS, "model_tools", format_tool_results_activity_detail(turn_result.tool_results))
                 activity_tool_results = list(turn_result.tool_results)
                 thinking_text = getattr(turn_result, "thinking_text", None)
-                if turn_result.suspended_for_approval:
-                    approval_id = turn_result.approval_id
-                    reply = f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
-                    turn_outcome = TurnOutcome.SUSPENDED
+                reply_artifact_rendered = False
+                deferred_scheduler_receipt_reply = _deferred_run_cron_receipt_reply(turn_result.tool_results)
+                completed_run_cron_receipt_reply = _completed_run_cron_receipt_reply(turn_result.tool_results)
+                turn_requested_attachment_extensions = (
+                    ()
+                    if _completed_scheduler_mutation(turn_result.tool_results)
+                    else turn_scoped_attachment_extensions
+                )
+                turn_result.artifacts = _filter_paths_to_requested_deliverables_if_present(
+                    list(turn_result.artifacts or ()),
+                    requested_extensions=turn_requested_attachment_extensions,
+                )
+                pending_tool_approval_id = (
+                    None
+                    if deferred_scheduler_receipt_reply
+                    else _materialize_pending_tool_approval_for_chat(
+                        runtime,
+                        tool_results=turn_result.tool_results,
+                        conversation_id=conversation_id,
+                        chat_id=chat_id,
+                        prompt=prompt,
+                        request_id=request_id,
+                        message_id=message_id,
+                        principal_id=principal_id,
+                        registry=active_turn_tool_registry,
+                    )
+                )
+                _mark_timing("approval_materialize")
+
+                def _lock_completed_requested_artifacts_if_ready() -> bool:
+                    nonlocal reply, reply_artifact_rendered
+                    completed_paths = _completed_requested_artifact_paths_for_turn_result(
+                        runtime,
+                        result=turn_result,
+                        prompt=effective_prompt,
+                        principal_id=principal_id,
+                        required_attachment_extensions=turn_requested_attachment_extensions,
+                        required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                    )
+                    if not completed_paths:
+                        return False
+                    turn_result.artifacts = list(completed_paths)
+                    completed_path_tuple = tuple(completed_paths)
+                    if (
+                        _reply_visible_text_references_all_artifact_paths(
+                            reply,
+                            completed_path_tuple,
+                            artifact_roots=tuple(dict.fromkeys(_artifact_roots_for_delivery(runtime, principal_id))),
+                        )
+                        and _should_preserve_artifact_reply_caption(
+                            reply,
+                            screenshot_is_primary_delivery=False,
+                            reply_is_browser_text_dump=False,
+                        )
+                    ):
+                        existing_media_identities = {
+                            identity
+                            for path in _reply_media_candidate_paths(reply)
+                            for identity in _path_identity_variants(path)
+                        }
+                        missing_media_lines = [
+                            f"MEDIA:{path}"
+                            for path in completed_path_tuple
+                            if not _path_matches_identity_set(path, existing_media_identities)
+                        ]
+                        if missing_media_lines:
+                            reply = "\n\n".join([str(reply or "").strip(), "\n".join(missing_media_lines)]).strip()
+                    else:
+                        reply = _completed_requested_artifact_reply(completed_paths, tool_results=turn_result.tool_results)
+                    reply_artifact_rendered = True
+                    return True
+
+                if pending_tool_approval_id:
+                    reply, _tool_result_approval_live = _approval_marker_reply_if_actionable(
+                        runtime,
+                        pending_tool_approval_id,
+                    )
+                    turn_outcome = TurnOutcome.SUSPENDED if _tool_result_approval_live else TurnOutcome.SUCCESS
+                elif getattr(turn_result, "reached_iteration_limit", False):
+                    limit_evidence_reply = _turn_limit_evidence_reply(
+                        user_message=effective_prompt,
+                        final_text=turn_result.final_text,
+                        tool_results=turn_result.tool_results,
+                    )
+                    if limit_evidence_reply:
+                        reply = limit_evidence_reply
+                        turn_outcome = TurnOutcome.SUCCESS
+                    else:
+                        approval_id = _store_agent_turn_limit_extension_suspended_turn(
+                            runtime,
+                            conversation_id=conversation_id,
+                            chat_id=chat_id,
+                            message=f"/chat {prompt}",
+                            request_id=request_id,
+                            message_id=message_id,
+                            messages_snapshot=[
+                                *orchestrator_conversation_history,
+                                {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
+                            ],
+                            current_max_iterations=direct_turn_max_iterations,
+                            tool_results=turn_result.tool_results,
+                            required_attachment_extensions=turn_requested_attachment_extensions,
+                        )
+                        if approval_id:
+                            reply, _turn_limit_approval_live = _approval_marker_reply_if_actionable(runtime, approval_id)
+                            turn_outcome = TurnOutcome.SUSPENDED if _turn_limit_approval_live else TurnOutcome.SUCCESS
+                        else:
+                            reply = turn_result.final_text or "Tool budget was reached before the request could finish."
+                            turn_outcome = TurnOutcome.SUCCESS
+                elif turn_result.suspended_for_approval:
+                    reply, _turn_approval_live = _approval_marker_reply_for_turn_result(
+                        runtime,
+                        turn_result,
+                        conversation_id=conversation_id,
+                        chat_id=chat_id,
+                    )
+                    turn_outcome = TurnOutcome.SUSPENDED if _turn_approval_live else TurnOutcome.SUCCESS
+                elif deferred_scheduler_receipt_reply:
+                    reply = deferred_scheduler_receipt_reply
+                    reply_artifact_rendered = True
+                    suppress_runtime_nudges = True
+                    turn_outcome = TurnOutcome.SUCCESS
                 else:
                     suppress_foreground_reply = _should_suppress_foreground_reply(turn_result.tool_results)
-                    reply = "" if suppress_foreground_reply else turn_result.final_text or "Done."
+                    account_source_selection_reply = _account_source_selection_reply_from_scope_results(
+                        turn_result.tool_results
+                    )
+                    reply = (
+                        account_source_selection_reply
+                        if account_source_selection_reply is not None
+                        else ""
+                        if suppress_foreground_reply
+                        else completed_run_cron_receipt_reply or turn_result.final_text or "Done."
+                    )
+                    connector_scope_only_fallback = (
+                        _connector_scope_builder_fallback(turn_result.tool_results, runtime=runtime)
+                        if (
+                            account_source_selection_reply is None
+                            and not suppress_foreground_reply
+                            and not numbered_option_context
+                            and _turn_result_used_only_scope_or_history_search(turn_result)
+                        )
+                        else None
+                    )
+                    connector_no_tool_fallback = (
+                        _active_connector_mention_builder_fallback(
+                            tool_scope_user_message,
+                            tool_registry=active_turn_tool_registry,
+                            runtime=runtime,
+                        )
+                        if (
+                            account_source_selection_reply is None
+                            and not suppress_foreground_reply
+                            and not numbered_option_context
+                            and not list(turn_result.tool_results or ())
+                        )
+                        else None
+                    )
+                    if connector_scope_only_fallback:
+                        reply = connector_scope_only_fallback
+                    elif connector_no_tool_fallback:
+                        reply = connector_no_tool_fallback
+                    elif account_source_selection_reply is None and compact_followup_clarification and (
+                        not _turn_result_has_substantive_tools(turn_result)
+                        or _turn_result_used_only_scope_or_history_search(turn_result)
+                    ):
+                        reply = _compact_unstructured_clarification_fallback(
+                            turn_result.tool_results,
+                            runtime=runtime,
+                        )
                     if not suppress_foreground_reply:
                         reply = _append_chat_artifacts_to_reply(
                             runtime,
                             reply=reply,
                             artifact_paths=turn_result.artifacts,
                             prompt=effective_prompt,
+                            conversation_id=conversation_id,
                             principal_id=principal_id,
                             tool_results=turn_result.tool_results,
-                            required_attachment_extensions=requested_attachment_extensions,
+                            required_attachment_extensions=turn_requested_attachment_extensions,
+                            source_attachment_paths=source_attachment_paths,
+                        )
+                        reply_artifact_rendered = True
+                        reply = _enforce_chat_response_fulfillment(
+                            runtime,
+                            conversation_id=conversation_id,
+                            prompt=effective_prompt,
+                            reply=reply,
+                            tool_results=turn_result.tool_results,
+                            artifact_paths=turn_result.artifacts,
+                            principal_id=principal_id,
+                            required_attachment_extensions=turn_requested_attachment_extensions,
+                            required_embedded_media_extensions=turn_required_embedded_media_extensions,
                             source_attachment_paths=source_attachment_paths,
                         )
                     turn_outcome = TurnOutcome.SUCCESS
-                update_active_task_frame_from_outcomes(
-                    runtime.store,
-                    conversation_id=conversation_id,
-                    tool_results=turn_result.tool_results,
-                    rendered_reply=reply,
-                    completion_turn_id=conversation_result.turn.turn_id,
-                )
-                if turn_outcome is TurnOutcome.SUCCESS and not _should_suppress_foreground_reply(turn_result.tool_results):
-                    if _needs_required_attachment_repair(
+                if not deferred_scheduler_receipt_reply:
+                    update_active_task_frame_from_outcomes(
+                        runtime.store,
+                        conversation_id=conversation_id,
+                        tool_results=turn_result.tool_results,
+                        rendered_reply=reply,
+                        completion_turn_id=conversation_result.turn.turn_id,
+                    )
+                if (
+                    turn_outcome is TurnOutcome.SUCCESS
+                    and not deferred_scheduler_receipt_reply
+                    and not _should_suppress_foreground_reply(turn_result.tool_results)
+                ):
+                    pre_repair_missing_extensions = _missing_required_attachment_extensions_for_repair(
+                        runtime,
+                        prompt=effective_prompt,
+                        principal_id=principal_id,
+                        required_attachment_extensions=turn_requested_attachment_extensions,
+                        required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                        tool_results=turn_result.tool_results,
+                        artifact_paths=turn_result.artifacts,
+                        source_attachment_paths=source_attachment_paths,
+                    )
+                    if pre_repair_missing_extensions:
+                        pre_repair_collected_media_paths = _current_turn_collected_media_paths(turn_result.tool_results)
+                        pre_repair_spreadsheet_results, pre_repair_spreadsheet_paths = _materialize_last_mile_spreadsheet_artifacts(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            reply=reply,
+                            missing_extensions=pre_repair_missing_extensions,
+                            collected_media_paths=pre_repair_collected_media_paths,
+                            tool_results=turn_result.tool_results,
+                        )
+                        if pre_repair_spreadsheet_results:
+                            turn_result.tool_results.extend(pre_repair_spreadsheet_results)
+                            activity_tool_results.extend(pre_repair_spreadsheet_results)
+                            turn_result.artifacts.extend(pre_repair_spreadsheet_paths)
+                            pre_repair_alias_results, pre_repair_alias_paths = _materialize_requested_filename_aliases(
+                                principal_id=principal_id,
+                                prompt=effective_prompt,
+                                artifact_paths=turn_result.artifacts,
+                                tool_results=turn_result.tool_results,
+                            )
+                            if pre_repair_alias_results:
+                                turn_result.tool_results.extend(pre_repair_alias_results)
+                                activity_tool_results.extend(pre_repair_alias_results)
+                                turn_result.artifacts.extend(pre_repair_alias_paths)
+                            reply = _append_chat_artifacts_to_reply(
+                                runtime,
+                                reply=reply,
+                                artifact_paths=turn_result.artifacts,
+                                prompt=effective_prompt,
+                                conversation_id=conversation_id,
+                                principal_id=principal_id,
+                                tool_results=turn_result.tool_results,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            )
+                            reply_artifact_rendered = True
+                            reply = _enforce_chat_response_fulfillment(
+                                runtime,
+                                conversation_id=conversation_id,
+                                prompt=effective_prompt,
+                                reply=reply,
+                                tool_results=turn_result.tool_results,
+                                artifact_paths=turn_result.artifacts,
+                                principal_id=principal_id,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            )
+                            update_active_task_frame_from_outcomes(
+                                runtime.store,
+                                conversation_id=conversation_id,
+                                tool_results=turn_result.tool_results,
+                                rendered_reply=reply,
+                                completion_turn_id=conversation_result.turn.turn_id,
+                            )
+                        pre_repair_pdf_results, pre_repair_pdf_paths = _materialize_last_mile_pdf_artifacts(
+                            principal_id=principal_id,
+                            missing_extensions=pre_repair_missing_extensions,
+                            collected_media_paths=_preferred_current_turn_collected_media_paths(turn_result.tool_results),
+                        )
+                        if pre_repair_pdf_results:
+                            turn_result.tool_results.extend(pre_repair_pdf_results)
+                            activity_tool_results.extend(pre_repair_pdf_results)
+                            turn_result.artifacts.extend(pre_repair_pdf_paths)
+                            reply = _append_chat_artifacts_to_reply(
+                                runtime,
+                                reply=reply,
+                                artifact_paths=turn_result.artifacts,
+                                prompt=effective_prompt,
+                                conversation_id=conversation_id,
+                                principal_id=principal_id,
+                                tool_results=turn_result.tool_results,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            )
+                            reply_artifact_rendered = True
+                            reply = _enforce_chat_response_fulfillment(
+                                runtime,
+                                conversation_id=conversation_id,
+                                prompt=effective_prompt,
+                                reply=reply,
+                                tool_results=turn_result.tool_results,
+                                artifact_paths=turn_result.artifacts,
+                                principal_id=principal_id,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            )
+                            update_active_task_frame_from_outcomes(
+                                runtime.store,
+                                conversation_id=conversation_id,
+                                tool_results=turn_result.tool_results,
+                                rendered_reply=reply,
+                                completion_turn_id=conversation_result.turn.turn_id,
+                            )
+                        pre_model_alias_candidate_paths = [
+                            *turn_result.artifacts,
+                            *_artifact_paths_from_tool_results(turn_result.tool_results),
+                        ]
+                        pre_model_alias_results, pre_model_alias_paths = _materialize_requested_filename_aliases(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            artifact_paths=dict.fromkeys(pre_model_alias_candidate_paths),
+                            tool_results=turn_result.tool_results,
+                        )
+                        if pre_model_alias_results:
+                            turn_result.tool_results.extend(pre_model_alias_results)
+                            activity_tool_results.extend(pre_model_alias_results)
+                            turn_result.artifacts.extend(pre_model_alias_paths)
+                            reply = _append_chat_artifacts_to_reply(
+                                runtime,
+                                reply=reply,
+                                artifact_paths=turn_result.artifacts,
+                                prompt=effective_prompt,
+                                conversation_id=conversation_id,
+                                principal_id=principal_id,
+                                tool_results=turn_result.tool_results,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            )
+                            reply_artifact_rendered = True
+                            reply = _enforce_chat_response_fulfillment(
+                                runtime,
+                                conversation_id=conversation_id,
+                                prompt=effective_prompt,
+                                reply=reply,
+                                tool_results=turn_result.tool_results,
+                                artifact_paths=turn_result.artifacts,
+                                principal_id=principal_id,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            )
+                            update_active_task_frame_from_outcomes(
+                                runtime.store,
+                                conversation_id=conversation_id,
+                                tool_results=turn_result.tool_results,
+                                rendered_reply=reply,
+                                completion_turn_id=conversation_result.turn.turn_id,
+                            )
+                    completed_requested_artifact_locked = _lock_completed_requested_artifacts_if_ready()
+                    if not completed_requested_artifact_locked and _needs_required_attachment_repair(
                         runtime,
                         conversation_id=conversation_id,
                         prompt=effective_prompt,
@@ -7711,53 +24495,325 @@ def _render_chat_turn(
                         tool_results=turn_result.tool_results,
                         artifact_paths=turn_result.artifacts,
                         principal_id=principal_id,
-                        required_attachment_extensions=requested_attachment_extensions,
+                        required_attachment_extensions=turn_requested_attachment_extensions,
                         required_embedded_media_extensions=turn_required_embedded_media_extensions,
                         source_attachment_paths=source_attachment_paths,
                     ):
+                        missing_repair_extensions = _missing_required_attachment_extensions_for_repair(
+                            runtime,
+                            prompt=effective_prompt,
+                            principal_id=principal_id,
+                            required_attachment_extensions=turn_requested_attachment_extensions,
+                            required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                            tool_results=turn_result.tool_results,
+                            artifact_paths=turn_result.artifacts,
+                            source_attachment_paths=source_attachment_paths,
+                        )
+                        repair_tool_registry = _repair_tool_registry_for_missing_attachment_extensions(
+                            base_registry=base_tool_registry,
+                            active_registry=active_turn_tool_registry,
+                            missing_extensions=missing_repair_extensions,
+                        )
                         repair_history = [
                             *orchestrator_conversation_history,
                             {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
                             {"role": "assistant", "content": [{"type": "text", "text": reply}]},
                         ]
-                        repair_result = agent_orchestrator.run_turn(
-                            conversation_id=conversation_id,
-                            principal_id=principal_id,
-                            user_message=_required_attachment_repair_prompt(requested_attachment_extensions),
-                            conversation_history=repair_history,
-                            tool_registry=active_turn_tool_registry,
-                            policy_store=runtime.store,
-                            approval_store=runtime.store,
-                            tool_result_callback=_record_tool_activity if activity_callback is not None else None,
-                            cancellation_checker=cancellation_checker,
-                            tool_flow_context=_tool_flow_context_for_required_media(
-                                _merge_required_embedded_media_extensions(
-                                    turn_required_embedded_media_extensions,
-                                    turn_result.tool_results,
+                        try:
+                            repair_result = agent_orchestrator.run_turn(
+                                conversation_id=conversation_id,
+                                principal_id=principal_id,
+                                user_message=_required_attachment_repair_prompt(
+                                    missing_repair_extensions or requested_attachment_extensions,
+                                    collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
+                                ),
+                                conversation_history=repair_history,
+                                tool_registry=repair_tool_registry,
+                                policy_store=runtime.store,
+                                approval_store=runtime.store,
+                                tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                                foreground_event_callback=activity_callback,
+                                cancellation_checker=cancellation_checker,
+                                tool_flow_context=_tool_flow_context_for_required_media(
+                                    _merge_required_embedded_media_extensions(
+                                        turn_required_embedded_media_extensions,
+                                        turn_result.tool_results,
+                                    ),
+                                    required_artifact_extensions=turn_requested_attachment_extensions,
+                                ),
+                            )
+                        except ChatBackendUnavailableError as exc:
+                            _preserve_initial_result_after_retry_backend_failure(
+                                retry_name="required_attachment_repair",
+                                exc=exc,
+                            )
+                            repair_result = None
+                        if repair_result is not None:
+                            _mark_timing("repair_model_tools")
+                            activity_tool_results.extend(list(repair_result.tool_results))
+                        if repair_result is not None and getattr(repair_result, "reached_iteration_limit", False):
+                            combined_tool_results = [*turn_result.tool_results, *list(repair_result.tool_results)]
+                            limit_evidence_reply = _turn_limit_evidence_reply(
+                                user_message=effective_prompt,
+                                final_text=repair_result.final_text,
+                                tool_results=combined_tool_results,
+                            )
+                            if limit_evidence_reply:
+                                reply = limit_evidence_reply
+                            else:
+                                approval_id = _store_agent_turn_limit_extension_suspended_turn(
+                                    runtime,
+                                    conversation_id=conversation_id,
+                                    chat_id=chat_id,
+                                    message=f"/chat {prompt}",
+                                    request_id=request_id,
+                                    message_id=message_id,
+                                    messages_snapshot=[
+                                        *orchestrator_conversation_history,
+                                        {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
+                                    ],
+                                    current_max_iterations=direct_turn_max_iterations,
+                                    tool_results=combined_tool_results,
+                                    required_attachment_extensions=turn_requested_attachment_extensions,
                                 )
-                            ),
-                        )
-                        _mark_timing("repair_model_tools")
-                        activity_tool_results.extend(list(repair_result.tool_results))
-                        if repair_result.suspended_for_approval:
-                            approval_id = repair_result.approval_id
-                            reply = f"Tool approval requested: {approval_id}" if approval_id else "Tool approval requested."
-                            turn_outcome = TurnOutcome.SUSPENDED
-                        else:
+                                if approval_id:
+                                    reply, _repair_limit_approval_live = _approval_marker_reply_if_actionable(runtime, approval_id)
+                                    turn_outcome = TurnOutcome.SUSPENDED if _repair_limit_approval_live else turn_outcome
+                        elif repair_result is not None and repair_result.suspended_for_approval:
+                            reply, _repair_approval_live = _approval_marker_reply_for_turn_result(
+                                runtime,
+                                repair_result,
+                                conversation_id=conversation_id,
+                                chat_id=chat_id,
+                            )
+                            turn_outcome = TurnOutcome.SUSPENDED if _repair_approval_live else turn_outcome
+                        elif repair_result is not None:
                             turn_result.tool_results.extend(list(repair_result.tool_results))
                             turn_result.artifacts.extend(list(repair_result.artifacts))
-                            reply = repair_result.final_text or reply
+                            repair_reply, repair_reply_deferred = _repair_final_text_for_completed_media_artifact(
+                                repair_reply=repair_result.final_text,
+                                repair_tool_results=repair_result.tool_results,
+                                combined_tool_results=turn_result.tool_results,
+                            )
+                            reply = repair_reply if repair_reply_deferred else repair_reply or reply
                             reply = _append_chat_artifacts_to_reply(
                                 runtime,
                                 reply=reply,
                                 artifact_paths=turn_result.artifacts,
                                 prompt=effective_prompt,
+                                conversation_id=conversation_id,
                                 principal_id=principal_id,
                                 tool_results=turn_result.tool_results,
-                                required_attachment_extensions=requested_attachment_extensions,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
                                 source_attachment_paths=source_attachment_paths,
                             )
+                            reply_artifact_rendered = True
                             thinking_text = thinking_text or getattr(repair_result, "thinking_text", None)
+                            completed_requested_artifact_locked = _lock_completed_requested_artifacts_if_ready()
+                            if not completed_requested_artifact_locked and _needs_required_attachment_repair(
+                                runtime,
+                                conversation_id=conversation_id,
+                                prompt=effective_prompt,
+                                reply=reply,
+                                tool_results=turn_result.tool_results,
+                                artifact_paths=turn_result.artifacts,
+                                principal_id=principal_id,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            ):
+                                second_missing_repair_extensions = _missing_required_attachment_extensions_for_repair(
+                                    runtime,
+                                    prompt=effective_prompt,
+                                    principal_id=principal_id,
+                                    required_attachment_extensions=turn_requested_attachment_extensions,
+                                    required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                                    tool_results=turn_result.tool_results,
+                                    artifact_paths=turn_result.artifacts,
+                                    source_attachment_paths=source_attachment_paths,
+                                )
+                                second_repair_tool_registry = _repair_tool_registry_for_missing_attachment_extensions(
+                                    base_registry=base_tool_registry,
+                                    active_registry=repair_tool_registry,
+                                    missing_extensions=second_missing_repair_extensions,
+                                )
+                                second_repair_history = [
+                                    *repair_history,
+                                    {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+                                ]
+                                try:
+                                    second_repair_result = agent_orchestrator.run_turn(
+                                        conversation_id=conversation_id,
+                                        principal_id=principal_id,
+                                        user_message=_required_attachment_repair_prompt(
+                                            second_missing_repair_extensions or turn_requested_attachment_extensions,
+                                            collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
+                                        ),
+                                        conversation_history=second_repair_history,
+                                        tool_registry=second_repair_tool_registry,
+                                        policy_store=runtime.store,
+                                        approval_store=runtime.store,
+                                        tool_result_callback=_record_tool_activity if activity_callback is not None else None,
+                                        foreground_event_callback=activity_callback,
+                                        cancellation_checker=cancellation_checker,
+                                        tool_flow_context=_tool_flow_context_for_required_media(
+                                            _merge_required_embedded_media_extensions(
+                                                turn_required_embedded_media_extensions,
+                                                turn_result.tool_results,
+                                            ),
+                                            required_artifact_extensions=turn_requested_attachment_extensions,
+                                        ),
+                                    )
+                                except ChatBackendUnavailableError as exc:
+                                    _preserve_initial_result_after_retry_backend_failure(
+                                        retry_name="second_required_attachment_repair",
+                                        exc=exc,
+                                    )
+                                    second_repair_result = None
+                                if second_repair_result is not None:
+                                    _mark_timing("second_repair_model_tools")
+                                    activity_tool_results.extend(list(second_repair_result.tool_results))
+                                if second_repair_result is not None and getattr(second_repair_result, "reached_iteration_limit", False):
+                                    combined_tool_results = [*turn_result.tool_results, *list(second_repair_result.tool_results)]
+                                    limit_evidence_reply = _turn_limit_evidence_reply(
+                                        user_message=effective_prompt,
+                                        final_text=second_repair_result.final_text,
+                                        tool_results=combined_tool_results,
+                                    )
+                                    if limit_evidence_reply:
+                                        reply = limit_evidence_reply
+                                    else:
+                                        approval_id = _store_agent_turn_limit_extension_suspended_turn(
+                                            runtime,
+                                            conversation_id=conversation_id,
+                                            chat_id=chat_id,
+                                            message=f"/chat {prompt}",
+                                            request_id=request_id,
+                                            message_id=message_id,
+                                            messages_snapshot=[
+                                                *orchestrator_conversation_history,
+                                                {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
+                                            ],
+                                            current_max_iterations=direct_turn_max_iterations,
+                                            tool_results=combined_tool_results,
+                                            required_attachment_extensions=turn_requested_attachment_extensions,
+                                        )
+                                        if approval_id:
+                                            reply, _second_repair_limit_approval_live = _approval_marker_reply_if_actionable(runtime, approval_id)
+                                            turn_outcome = TurnOutcome.SUSPENDED if _second_repair_limit_approval_live else turn_outcome
+                                elif second_repair_result is not None and second_repair_result.suspended_for_approval:
+                                    reply, _second_repair_approval_live = _approval_marker_reply_for_turn_result(
+                                        runtime,
+                                        second_repair_result,
+                                        conversation_id=conversation_id,
+                                        chat_id=chat_id,
+                                    )
+                                    turn_outcome = TurnOutcome.SUSPENDED if _second_repair_approval_live else turn_outcome
+                                elif second_repair_result is not None:
+                                    turn_result.tool_results.extend(list(second_repair_result.tool_results))
+                                    turn_result.artifacts.extend(list(second_repair_result.artifacts))
+                                    second_repair_reply, second_repair_deferred = _repair_final_text_for_completed_media_artifact(
+                                        repair_reply=second_repair_result.final_text,
+                                        repair_tool_results=second_repair_result.tool_results,
+                                        combined_tool_results=turn_result.tool_results,
+                                    )
+                                    reply = second_repair_reply if second_repair_deferred else second_repair_reply or reply
+                                    reply = _append_chat_artifacts_to_reply(
+                                        runtime,
+                                        reply=reply,
+                                        artifact_paths=turn_result.artifacts,
+                                        prompt=effective_prompt,
+                                        conversation_id=conversation_id,
+                                        principal_id=principal_id,
+                                        tool_results=turn_result.tool_results,
+                                        required_attachment_extensions=turn_requested_attachment_extensions,
+                                        source_attachment_paths=source_attachment_paths,
+                                    )
+                                    reply_artifact_rendered = True
+                                    thinking_text = thinking_text or getattr(second_repair_result, "thinking_text", None)
+                                    _lock_completed_requested_artifacts_if_ready()
+                    if turn_outcome is TurnOutcome.SUCCESS and not _lock_completed_requested_artifacts_if_ready():
+                        last_mile_missing_extensions = _missing_required_attachment_extensions_for_repair(
+                            runtime,
+                            prompt=effective_prompt,
+                            principal_id=principal_id,
+                            required_attachment_extensions=turn_requested_attachment_extensions,
+                            required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                            tool_results=turn_result.tool_results,
+                            artifact_paths=turn_result.artifacts,
+                            source_attachment_paths=source_attachment_paths,
+                        )
+                        last_mile_collected_media_paths = _current_turn_collected_media_paths(turn_result.tool_results)
+                        last_mile_results, last_mile_paths = _materialize_last_mile_text_artifacts(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            reply=reply,
+                            missing_extensions=last_mile_missing_extensions,
+                            artifact_paths=turn_result.artifacts,
+                            collected_media_paths=last_mile_collected_media_paths,
+                        )
+                        last_mile_pdf_results, last_mile_pdf_paths = _materialize_last_mile_pdf_artifacts(
+                            principal_id=principal_id,
+                            missing_extensions=last_mile_missing_extensions,
+                            collected_media_paths=_preferred_current_turn_collected_media_paths(turn_result.tool_results),
+                        )
+                        last_mile_document_results, last_mile_document_paths = _materialize_last_mile_document_artifacts(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            reply=reply,
+                            missing_extensions=last_mile_missing_extensions,
+                            collected_media_paths=last_mile_collected_media_paths,
+                        )
+                        last_mile_presentation_results, last_mile_presentation_paths = _materialize_last_mile_presentation_artifacts(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            reply=reply,
+                            missing_extensions=last_mile_missing_extensions,
+                            collected_media_paths=last_mile_collected_media_paths,
+                        )
+                        last_mile_spreadsheet_results, last_mile_spreadsheet_paths = _materialize_last_mile_spreadsheet_artifacts(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            reply=reply,
+                            missing_extensions=last_mile_missing_extensions,
+                            collected_media_paths=last_mile_collected_media_paths,
+                            tool_results=turn_result.tool_results,
+                        )
+                        last_mile_results.extend(last_mile_pdf_results)
+                        last_mile_paths.extend(last_mile_pdf_paths)
+                        last_mile_results.extend(last_mile_document_results)
+                        last_mile_paths.extend(last_mile_document_paths)
+                        last_mile_results.extend(last_mile_presentation_results)
+                        last_mile_paths.extend(last_mile_presentation_paths)
+                        last_mile_results.extend(last_mile_spreadsheet_results)
+                        last_mile_paths.extend(last_mile_spreadsheet_paths)
+                        if last_mile_results:
+                            turn_result.tool_results.extend(last_mile_results)
+                            activity_tool_results.extend(last_mile_results)
+                            turn_result.artifacts.extend(last_mile_paths)
+                        alias_results, alias_paths = _materialize_requested_filename_aliases(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            artifact_paths=turn_result.artifacts,
+                            tool_results=turn_result.tool_results,
+                        )
+                        if alias_results:
+                            turn_result.tool_results.extend(alias_results)
+                            activity_tool_results.extend(alias_results)
+                            turn_result.artifacts.extend(alias_paths)
+                        if last_mile_results or alias_results:
+                            reply = _append_chat_artifacts_to_reply(
+                                runtime,
+                                reply=reply,
+                                artifact_paths=turn_result.artifacts,
+                                prompt=effective_prompt,
+                                conversation_id=conversation_id,
+                                principal_id=principal_id,
+                                tool_results=turn_result.tool_results,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                            )
+                            reply_artifact_rendered = True
                     if turn_outcome is TurnOutcome.SUCCESS:
                         reply = _enforce_chat_response_fulfillment(
                             runtime,
@@ -7767,7 +24823,7 @@ def _render_chat_turn(
                             tool_results=turn_result.tool_results,
                             artifact_paths=turn_result.artifacts,
                             principal_id=principal_id,
-                            required_attachment_extensions=requested_attachment_extensions,
+                            required_attachment_extensions=turn_requested_attachment_extensions,
                             required_embedded_media_extensions=turn_required_embedded_media_extensions,
                             source_attachment_paths=source_attachment_paths,
                         )
@@ -7786,34 +24842,68 @@ def _render_chat_turn(
                     )
                     if attachment_failure is not None:
                         reply = attachment_failure
-                # Builder: observe this turn to detect reusable skills / patterns after delivery.
-                _schedule_builder_reflection(
-                    runtime,
-                    agent_orchestrator,
-                    user_message=effective_prompt,
-                    assistant_reply=reply,
-                    tool_names=[r.tool_name for r in turn_result.tool_results],
-                    tool_error_count=sum(
-                        1 for r in turn_result.tool_results if r.status not in ("completed", "approved")
-                    ),
-                    outcome=turn_outcome,
-                    conversation_id=conversation_id,
-                    memory_owner=_memory_owner_for_chat(chat_id, settings),
-                    turn_disposition=conversation_result.turn.disposition,
-                    tool_results=turn_result.tool_results,
-                )
+                if not deferred_scheduler_receipt_reply:
+                    # Builder: observe this turn to detect reusable skills / patterns after delivery.
+                    _schedule_builder_reflection(
+                        runtime,
+                        agent_orchestrator,
+                        user_message=effective_prompt,
+                        assistant_reply=reply,
+                        tool_names=[r.tool_name for r in turn_result.tool_results],
+                        tool_error_count=sum(
+                            1 for r in turn_result.tool_results if r.status not in ("completed", "approved")
+                        ),
+                        outcome=turn_outcome,
+                        conversation_id=conversation_id,
+                        memory_owner=_memory_owner_for_chat(chat_id, settings),
+                        turn_disposition=conversation_result.turn.disposition,
+                        tool_results=turn_result.tool_results,
+                    )
             # Only persist the turn when it has a real result.  Storing
             # "Tool approval requested: …" as the assistant reply pollutes the
             # conversation history and causes the LLM to think the approval is
             # still pending when the same request resumes after the user approves.
             _turn_is_suspended = isinstance(reply, str) and reply.startswith("Tool approval requested")
-            if not _turn_is_suspended:
+            if turn_outcome is TurnOutcome.SUCCESS and not _turn_is_suspended and not deferred_scheduler_receipt_reply:
+                already_rendered_media_reply = bool(locals().get("reply_artifact_rendered")) and bool(
+                    _reply_media_candidate_paths(reply)
+                )
+                if not (handled_by_mini_agents and not mini_agent_dispatch_terminal) and not already_rendered_media_reply:
+                    reply = _append_chat_artifacts_to_reply(
+                        runtime,
+                        reply=reply,
+                        artifact_paths=locals().get("turn_result", SimpleNamespace(artifacts=[])).artifacts,
+                        prompt=effective_prompt,
+                        conversation_id=conversation_id,
+                        principal_id=principal_id,
+                        tool_results=activity_tool_results,
+                        required_attachment_extensions=requested_attachment_extensions,
+                        source_attachment_paths=source_attachment_paths,
+                    )
+                    reply = _enforce_chat_response_fulfillment(
+                        runtime,
+                        conversation_id=conversation_id,
+                        prompt=effective_prompt,
+                        reply=reply,
+                        tool_results=activity_tool_results,
+                        artifact_paths=locals().get("turn_result", SimpleNamespace(artifacts=[])).artifacts,
+                        principal_id=principal_id,
+                        required_attachment_extensions=requested_attachment_extensions,
+                        required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                        source_attachment_paths=source_attachment_paths,
+                    )
+            if not _turn_is_suspended and not (
+                bool(locals().get("reply_artifact_rendered"))
+                and bool(_reply_media_candidate_paths(reply))
+            ):
                 reply = _sanitize_chat_reply(
                     prompt=effective_prompt,
                     reply=reply,
                     tool_results=activity_tool_results,
                     source="agent",
                 )
+            if completed_run_cron_receipt_reply:
+                reply = completed_run_cron_receipt_reply
             if activity_callback is not None:
                 result_detail = format_tool_results_activity_detail(activity_tool_results)
                 activity_callback({
@@ -7822,26 +24912,79 @@ def _render_chat_turn(
                     "status": "blocked" if _turn_is_suspended else "done",
                     "detail": result_detail,
                 })
-            if turn_outcome is TurnOutcome.SUCCESS and _should_suppress_foreground_reply(activity_tool_results):
+            stale_artifact_failure_suppressed = (
+                turn_outcome is TurnOutcome.SUCCESS
+                and not deferred_scheduler_receipt_reply
+                and _should_suppress_stale_artifact_failure_reply(
+                    runtime,
+                    conversation_id=conversation_id,
+                    prompt=prompt,
+                    reply=reply,
+                    principal_id=principal_id,
+                    required_attachment_extensions=locals().get(
+                        "turn_requested_attachment_extensions",
+                        requested_attachment_extensions,
+                    ),
+                    parent_turn_id=getattr(conversation_result.turn, "parent_turn_id", None),
+                )
+            )
+            suppress_foreground_reply = _should_suppress_foreground_reply(activity_tool_results)
+            if turn_outcome is TurnOutcome.SUCCESS and (
+                suppress_foreground_reply or stale_artifact_failure_suppressed
+            ):
                 if conversation_ingress_id and conversation_id:
                     runtime.store.add_conversation_ingress_id(conversation_id, conversation_ingress_id)
                 phase_tracker.emit(PHASE_SAVE_CONVERSATION, "running")
                 turn_latency.mark("save_start", once=True)
-                if not defer_checkpoint:
+                suppressed_artifact_count = _current_turn_artifact_count(reply, locals().get("turn_result", None))
+                if (
+                    not defer_checkpoint
+                    and _should_force_checkpoint_after_chat_turn(
+                        tool_results=activity_tool_results,
+                        artifact_count=suppressed_artifact_count,
+                        suspended_for_approval=_turn_is_suspended,
+                    )
+                ):
                     runtime.checkpoint(force=True)
                 _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
                 phase_tracker.done(PHASE_SAVE_CONVERSATION, "save")
                 turn_latency.mark("save_done", once=True)
                 _mark_timing("save_deferred" if defer_checkpoint else "save")
+                suppressed_outcome = (
+                    "suppressed_stale_artifact_failure"
+                    if stale_artifact_failure_suppressed
+                    else "suppressed"
+                )
                 _log_timing_if_slow(
-                    "suppressed",
+                    suppressed_outcome,
                     conversation_id_value=conversation_id,
                     conversation_result_value=conversation_result,
                     tool_count=len(activity_tool_results),
                 )
-                _finish_latency("suppressed", tool_count=len(activity_tool_results))
+                _finish_latency(suppressed_outcome, tool_count=len(activity_tool_results))
+                if _should_checkpoint_conversation_events_after_chat_turn(
+                    tool_results=activity_tool_results,
+                    artifact_count=suppressed_artifact_count,
+                    suspended_for_approval=_turn_is_suspended,
+                ):
+                    try:
+                        _checkpoint_conversation_events_after_chat_turn(runtime)
+                    except Exception:
+                        logger.debug("Unable to checkpoint conversation events after suppressed chat turn", exc_info=True)
                 return None
             phase_tracker.emit(PHASE_PREPARE_ARTIFACTS, "running")
+            if not _turn_is_suspended and not (
+                bool(locals().get("reply_artifact_rendered"))
+                and bool(_reply_media_candidate_paths(reply))
+            ):
+                reply = _sanitize_chat_reply(
+                    prompt=effective_prompt,
+                    reply=reply,
+                    tool_results=activity_tool_results,
+                    source="agent",
+                )
+            if completed_run_cron_receipt_reply:
+                reply = completed_run_cron_receipt_reply
             visible_reply = append_activity_trace_to_reply(
                 reply,
                 tool_results=activity_tool_results,
@@ -7859,12 +25002,28 @@ def _render_chat_turn(
                 thinking_text,
                 enabled=thinking_display_enabled_for_chat(runtime, chat_id=chat_id),
             )
+            current_artifact_count = _current_turn_artifact_count(reply, locals().get("turn_result", None))
+            if (
+                text_delta_callback is not None
+                and not streamed_text_parts
+                and not _turn_is_suspended
+                and not handled_by_mini_agents
+                and current_artifact_count == 0
+                and str(visible_reply or "").strip()
+            ):
+                _safe_text_delta_callback(str(visible_reply))
             if streamed_text_parts and "".join(streamed_text_parts) == visible_reply:
                 visible_reply = StreamedChatReply(visible_reply)
+            if handled_by_mini_agents and mini_agent_dispatch_group_id:
+                visible_reply = _metadata_chat_reply(
+                    visible_reply,
+                    mini_agent_dispatch=True,
+                    task_group_id=mini_agent_dispatch_group_id,
+                )
             phase_tracker.done(
                 PHASE_PREPARE_ARTIFACTS,
                 "artifacts",
-                f"{_current_turn_artifact_count(reply, locals().get('turn_result', None))} artifact(s)",
+                f"{current_artifact_count} artifact(s)",
             )
             phase_tracker.emit(PHASE_SAVE_CONVERSATION, "running")
             turn_latency.mark("save_start", once=True)
@@ -7876,9 +25035,10 @@ def _render_chat_turn(
                     assistant_reply=reply,
                     conversation_turn_id=conversation_result.turn.turn_id,
                     tool_results=activity_tool_results,
+                    artifact_paths=locals().get("turn_result", SimpleNamespace(artifacts=[])).artifacts,
                 )
             _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
-            if not _turn_is_suspended:
+            if not _turn_is_suspended and not deferred_scheduler_receipt_reply:
                 _schedule_chat_turn_memory_capture(
                     runtime,
                     agent_orchestrator,
@@ -7888,10 +25048,17 @@ def _render_chat_turn(
                     assistant_reply=reply,
                     tool_results=activity_tool_results,
                 )
-            if conversation_ingress_id and conversation_id:
-                runtime.store.add_conversation_ingress_id(conversation_id, conversation_ingress_id)
-            if not defer_checkpoint:
-                runtime.checkpoint(force=True)
+                if conversation_ingress_id and conversation_id:
+                    runtime.store.add_conversation_ingress_id(conversation_id, conversation_ingress_id)
+                if (
+                    not defer_checkpoint
+                    and _should_force_checkpoint_after_chat_turn(
+                        tool_results=activity_tool_results,
+                        artifact_count=current_artifact_count,
+                        suspended_for_approval=_turn_is_suspended,
+                    )
+                ):
+                    runtime.checkpoint(force=True)
             _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
             phase_tracker.done(PHASE_SAVE_CONVERSATION, "save")
             turn_latency.mark("save_done", once=True)
@@ -7901,13 +25068,22 @@ def _render_chat_turn(
                 conversation_id_value=conversation_id,
                 conversation_result_value=conversation_result,
                 tool_count=len(activity_tool_results),
-                artifact_count=_current_turn_artifact_count(reply, locals().get("turn_result", None)),
+                artifact_count=current_artifact_count,
             )
             _finish_latency(
                 "completed",
                 tool_count=len(activity_tool_results),
-                artifact_count=_current_turn_artifact_count(reply, locals().get("turn_result", None)),
+                artifact_count=current_artifact_count,
             )
+            if _should_checkpoint_conversation_events_after_chat_turn(
+                tool_results=activity_tool_results,
+                artifact_count=current_artifact_count,
+                suspended_for_approval=_turn_is_suspended,
+            ):
+                try:
+                    _checkpoint_conversation_events_after_chat_turn(runtime)
+                except Exception:
+                    logger.debug("Unable to checkpoint conversation events after chat turn", exc_info=True)
             if suppress_runtime_nudges:
                 return visible_reply
             nudged_reply = _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply, conversation_id=conversation_id)
@@ -8019,6 +25195,23 @@ def _render_chat_turn(
                     tool_results=live_tool_results,
                     principal_id=principal_id,
                 )
+                _materialize_pending_tool_approval_for_chat(
+                    runtime,
+                    tool_results=live_tool_results,
+                    conversation_id=conversation_id,
+                    chat_id=chat_id,
+                    prompt=prompt,
+                    request_id=request_id,
+                    message_id=message_id,
+                    principal_id=principal_id,
+                    registry=active_turn_tool_registry,
+                )
+                reply, _fallback_recovered_approval_live = _recover_orphan_approval_reply_for_conversation(
+                    runtime,
+                    reply,
+                    conversation_id=conversation_id,
+                    chat_id=chat_id,
+                )
                 contract = _build_chat_response_contract(
                     runtime,
                     prompt=prompt,
@@ -8037,40 +25230,42 @@ def _render_chat_turn(
                     message_id=message_id,
                 )
                 reply = render_chat_response_for_telegram(contract)
-                reply = _append_chat_artifacts_to_reply(
-                    runtime,
-                    reply=reply,
-                    artifact_paths=(),
-                    prompt=prompt,
-                    principal_id=principal_id,
-                    tool_results=live_tool_results,
-                    required_attachment_extensions=requested_attachment_extensions,
-                    source_attachment_paths=source_attachment_paths,
-                )
-                reply = _enforce_chat_response_fulfillment(
-                    runtime,
-                    conversation_id=_conversation_id_for_chat(chat_id),
-                    prompt=prompt,
-                    reply=reply,
-                    tool_results=live_tool_results,
-                    principal_id=principal_id,
-                    required_attachment_extensions=requested_attachment_extensions,
-                    required_embedded_media_extensions=turn_required_embedded_media_extensions,
-                    source_attachment_paths=source_attachment_paths,
-                )
-                attachment_failure = attachment_processing_failure_reply(
-                    effective_prompt,
-                    normalized_attachments,
-                    live_tool_results,
-                )
-                if attachment_failure is not None:
-                    reply = attachment_failure
-                reply = _sanitize_chat_reply(
-                    prompt=prompt,
-                    reply=reply,
-                    tool_results=live_tool_results,
-                    source="agent",
-                )
+                if not contract.state.pending_approval_ids:
+                    reply = _append_chat_artifacts_to_reply(
+                        runtime,
+                        reply=reply,
+                        artifact_paths=(),
+                        prompt=prompt,
+                        conversation_id=conversation_id,
+                        principal_id=principal_id,
+                        tool_results=live_tool_results,
+                        required_attachment_extensions=requested_attachment_extensions,
+                        source_attachment_paths=source_attachment_paths,
+                    )
+                    reply = _enforce_chat_response_fulfillment(
+                        runtime,
+                        conversation_id=conversation_id,
+                        prompt=prompt,
+                        reply=reply,
+                        tool_results=live_tool_results,
+                        principal_id=principal_id,
+                        required_attachment_extensions=requested_attachment_extensions,
+                        required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                        source_attachment_paths=source_attachment_paths,
+                    )
+                    attachment_failure = attachment_processing_failure_reply(
+                        effective_prompt,
+                        normalized_attachments,
+                        live_tool_results,
+                    )
+                    if attachment_failure is not None:
+                        reply = attachment_failure
+                    reply = _sanitize_chat_reply(
+                        prompt=prompt,
+                        reply=reply,
+                        tool_results=live_tool_results,
+                        source="agent",
+                    )
                 update_active_task_frame_from_outcomes(
                     runtime.store,
                     conversation_id=_conversation_id_for_chat(chat_id),
@@ -8160,6 +25355,23 @@ def _render_chat_turn(
             tool_results=live_tool_results,
             principal_id=principal_id,
         )
+        _materialize_pending_tool_approval_for_chat(
+            runtime,
+            tool_results=live_tool_results,
+            conversation_id=conversation_id,
+            chat_id=chat_id,
+            prompt=prompt,
+            request_id=request_id,
+            message_id=message_id,
+            principal_id=principal_id,
+            registry=active_turn_tool_registry,
+        )
+        reply, _fallback_recovered_approval_live = _recover_orphan_approval_reply_for_conversation(
+            runtime,
+            reply,
+            conversation_id=conversation_id,
+            chat_id=chat_id,
+        )
         contract = _build_chat_response_contract(
             runtime,
             prompt=prompt,
@@ -8178,40 +25390,42 @@ def _render_chat_turn(
             message_id=message_id,
         )
         reply = render_chat_response_for_telegram(contract)
-        reply = _append_chat_artifacts_to_reply(
-            runtime,
-            reply=reply,
-            artifact_paths=(),
-            prompt=prompt,
-            principal_id=principal_id,
-            tool_results=live_tool_results,
-            required_attachment_extensions=requested_attachment_extensions,
-            source_attachment_paths=source_attachment_paths,
-        )
-        reply = _enforce_chat_response_fulfillment(
-            runtime,
-            conversation_id=_conversation_id_for_chat(chat_id),
-            prompt=prompt,
-            reply=reply,
-            tool_results=live_tool_results,
-            principal_id=principal_id,
-            required_attachment_extensions=requested_attachment_extensions,
-            required_embedded_media_extensions=turn_required_embedded_media_extensions,
-            source_attachment_paths=source_attachment_paths,
-        )
-        attachment_failure = attachment_processing_failure_reply(
-            effective_prompt,
-            normalized_attachments,
-            live_tool_results,
-        )
-        if attachment_failure is not None:
-            reply = attachment_failure
-        reply = _sanitize_chat_reply(
-            prompt=prompt,
-            reply=reply,
-            tool_results=live_tool_results,
-            source="agent",
-        )
+        if not contract.state.pending_approval_ids:
+            reply = _append_chat_artifacts_to_reply(
+                runtime,
+                reply=reply,
+                artifact_paths=(),
+                prompt=prompt,
+                conversation_id=conversation_id,
+                principal_id=principal_id,
+                tool_results=live_tool_results,
+                required_attachment_extensions=requested_attachment_extensions,
+                source_attachment_paths=source_attachment_paths,
+            )
+            reply = _enforce_chat_response_fulfillment(
+                runtime,
+                conversation_id=conversation_id,
+                prompt=prompt,
+                reply=reply,
+                tool_results=live_tool_results,
+                principal_id=principal_id,
+                required_attachment_extensions=requested_attachment_extensions,
+                required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                source_attachment_paths=source_attachment_paths,
+            )
+            attachment_failure = attachment_processing_failure_reply(
+                effective_prompt,
+                normalized_attachments,
+                live_tool_results,
+            )
+            if attachment_failure is not None:
+                reply = attachment_failure
+            reply = _sanitize_chat_reply(
+                prompt=prompt,
+                reply=reply,
+                tool_results=live_tool_results,
+                source="agent",
+            )
         update_active_task_frame_from_outcomes(
             runtime.store,
             conversation_id=_conversation_id_for_chat(chat_id),
@@ -8250,6 +25464,7 @@ def _render_chat_turn(
         user_message=prompt,
         assistant_reply=reply,
         conversation_turn_id=conversation_result.turn.turn_id,
+        tool_results=live_tool_results,
     )
     _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
     _schedule_chat_turn_memory_capture(
@@ -8276,6 +25491,7 @@ def handle_chat_operator_message(
     settings: NullionSettings | None = None,
     request_id: str | None = None,
     message_id: str | None = None,
+    turn_id: str | None = None,
     model_client: object | None = None,
     agent_orchestrator: object | None = None,
     service: object | None = None,
@@ -8301,14 +25517,16 @@ def handle_chat_operator_message(
         chat_enabled = settings.telegram.chat_enabled
 
     channel_name, identity = _messaging_channel_and_identity_for_chat(chat_id)
-    if channel_name == "telegram" and not is_authorized_telegram_chat(chat_id, settings):
+    if channel_name == "web":
+        chat_enabled = True
+    elif channel_name == "telegram" and not is_authorized_telegram_chat(chat_id, settings):
         logger.warning(
             "Rejected unauthorized Chat operator command (chat_id=%s, command=%s, result=unauthorized)",
             chat_id,
             message,
         )
         return "Unauthorized operator chat."
-    if channel_name != "telegram" and not is_authorized_messaging_identity(channel_name, identity, settings):
+    elif channel_name != "telegram" and not is_authorized_messaging_identity(channel_name, identity, settings):
         logger.warning(
             "Rejected unauthorized %s operator command (identity=%s, command=%s, result=unauthorized)",
             channel_name,
@@ -8349,9 +25567,6 @@ def handle_chat_operator_message(
         if not chat_enabled:
             logger.info("Ignored non-command Telegram text (chat_id=%s, text=%s)", chat_id, message)
             return None
-        health_reply = _chat_model_issue_reply(runtime, message=message, model_client=model_client)
-        if health_reply is not None:
-            return health_reply
         reply = _render_chat_turn(
             runtime,
             message=f"/chat {message}",
@@ -8360,6 +25575,7 @@ def handle_chat_operator_message(
             settings=settings,
             request_id=request_id,
             message_id=message_id,
+            turn_id=turn_id,
             reply_context=reply_context,
             model_client=model_client,
             agent_orchestrator=agent_orchestrator,
@@ -8411,8 +25627,6 @@ def handle_chat_operator_message(
     elif planner_command.requested:
         if not chat_enabled:
             reply = "Telegram chat is disabled."
-        elif (health_reply := _chat_model_issue_reply(runtime, message=message, model_client=model_client)) is not None:
-            reply = health_reply
         elif not planner_command.prompt:
             reply = "Usage: /planner <message>"
         else:
@@ -8424,6 +25638,7 @@ def handle_chat_operator_message(
                 settings=settings,
                 request_id=request_id,
                 message_id=message_id,
+                turn_id=turn_id,
                 reply_context=reply_context,
                 model_client=model_client,
                 agent_orchestrator=agent_orchestrator,
@@ -8438,8 +25653,6 @@ def handle_chat_operator_message(
     elif _normalize_command_head(message) == "/chat":
         if not chat_enabled:
             reply = "Telegram chat is disabled."
-        elif (health_reply := _chat_model_issue_reply(runtime, message=message, model_client=model_client)) is not None:
-            reply = health_reply
         else:
             reply = _render_chat_turn(
                 runtime,
@@ -8449,6 +25662,7 @@ def handle_chat_operator_message(
                 settings=settings,
                 request_id=request_id,
                 message_id=message_id,
+                turn_id=turn_id,
                 reply_context=reply_context,
                 model_client=model_client,
                 agent_orchestrator=agent_orchestrator,

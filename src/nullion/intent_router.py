@@ -79,6 +79,7 @@ class _TurnDispositionState(TypedDict, total=False):
 _URL_TERMS = ("http://", "https://", "www.")
 _NUMERIC_REPLY_RE = re.compile(r"^\s*(\d{1,2})\s*$")
 _NUMBERED_OPTION_RE = re.compile(r"^\s*(\d{1,2})[\.)]\s*(.*\S)?\s*$")
+_NUMBERED_CONTEXT_EXCERPT_MAX_CHARS = 700
 
 
 def _normalize(text: str) -> str:
@@ -92,6 +93,23 @@ def _words(normalized_text: str) -> list[str]:
     return normalized_text.split()
 
 
+def _previous_numbered_prompt_excerpt(previous_assistant_message: object) -> str:
+    excerpt_lines: list[str] = []
+    for raw_line in str(previous_assistant_message or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _NUMBERED_OPTION_RE.match(line):
+            continue
+        excerpt_lines.append(line)
+        if len("\n".join(excerpt_lines)) >= _NUMBERED_CONTEXT_EXCERPT_MAX_CHARS:
+            break
+    excerpt = "\n".join(excerpt_lines).strip()
+    if len(excerpt) > _NUMBERED_CONTEXT_EXCERPT_MAX_CHARS:
+        excerpt = excerpt[: _NUMBERED_CONTEXT_EXCERPT_MAX_CHARS - 1].rstrip() + "…"
+    return excerpt
+
+
 def _selected_numbered_option_context_from_message(
     user_text: object,
     previous_assistant_message: object,
@@ -101,27 +119,46 @@ def _selected_numbered_option_context_from_message(
         return None
     selected = match.group(1)
     lines = str(previous_assistant_message or "").splitlines()
-    selected_lines: list[str] = []
-    collecting = False
+    blocks: list[dict[str, list[str]]] = []
+    current_block: dict[str, list[str]] = {}
+    current_option: str | None = None
     for line in lines:
         option_match = _NUMBERED_OPTION_RE.match(line)
         if option_match:
-            if collecting:
-                break
-            collecting = option_match.group(1) == selected
-            if collecting:
-                first = (option_match.group(2) or "").strip()
-                if first:
-                    selected_lines.append(first)
+            option_number = option_match.group(1)
+            if option_number == "1" and current_block:
+                blocks.append(current_block)
+                current_block = {}
+            current_option = option_number
+            current_block.setdefault(current_option, [])
+            first = (option_match.group(2) or "").strip()
+            if first:
+                current_block[current_option].append(first)
             continue
-        if collecting and line.strip():
-            selected_lines.append(line.strip())
+        if current_option is not None and line.strip():
+            current_block.setdefault(current_option, []).append(line.strip())
+    if current_block:
+        blocks.append(current_block)
+    matching_blocks = [block for block in blocks if selected in block and block.get(selected)]
+    if len(matching_blocks) > 1:
+        return (
+            f"Structured numbered-option ambiguity: the user replied with option {selected}, "
+            "but the immediately previous assistant response contained multiple numbered option groups "
+            f"with option {selected}. Ask which group they meant before acting."
+        )
+    selected_lines: list[str] = []
+    for block in reversed(blocks):
+        selected_lines = block.get(selected, [])
+        if selected_lines:
+            break
     if not selected_lines:
         return None
     body = "\n".join(selected_lines)
+    prior_excerpt = _previous_numbered_prompt_excerpt(previous_assistant_message)
+    prior_context = f"\nPrevious assistant context:\n{prior_excerpt}" if prior_excerpt else ""
     return (
         f"Structured numbered-option selection: the user replied with option {selected} "
-        f"from the immediately previous assistant response.\nSelected option {selected}:\n{body}"
+        f"from the immediately previous assistant response.{prior_context}\nSelected option {selected}:\n{body}"
     )
 
 

@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 from uuid import uuid4
@@ -42,6 +43,18 @@ from typing import Any, AsyncIterator, Callable, Iterable, Mapping, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from nullion.agent_turn_limits import (
+    AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+    AGENT_TURN_LIMIT_EXTENSION_ACTION,
+    AGENT_TURN_LIMIT_EXTENSION_TOOL_NAME,
+    build_agent_turn_limit_extension_context,
+    build_agent_turn_limit_resume_token,
+    default_agent_turn_max_iterations,
+    limit_extension_mode_for_multiplier,
+    max_iterations_from_resume_token,
+    multiplier_for_limit_extension_mode,
+    set_agent_turn_limit_resume_multiplier,
+)
 from nullion.conversation_runtime import ConversationTurnDisposition
 from nullion.latency_phases import (
     PHASE_BUILD_CONTEXT,
@@ -59,21 +72,29 @@ from nullion import runtime_cache
 from nullion.version import version_tag
 from nullion.builder import builder_proposal_acceptance_benefit
 from nullion.artifacts import (
+    ARTIFACT_DELIVERY_ROLES,
     artifact_descriptor_for_path,
     artifact_descriptors_for_paths,
+    artifact_paths_from_output_descriptors,
     artifact_path_for_generated_file,
     artifact_root_for_principal,
     artifact_root_for_runtime,
     ensure_artifact_root,
+    is_unrequested_internal_sidecar_artifact,
     media_candidate_paths_from_text,
+    normalize_artifact_extensions,
+    output_has_artifact_descriptors,
+    path_is_within,
     parse_media_directive_line,
 )
 from nullion.chat_attachments import (
     attachment_processing_failure_reply,
     chat_attachment_content_blocks,
     guess_media_type,
+    has_unavailable_chat_attachments,
     is_supported_video_attachment,
     normalize_chat_attachments,
+    unavailable_chat_attachment_count,
 )
 from nullion.conversation_history_tools import CHAT_HISTORY_SEARCH_TOOL_NAME, with_conversation_history_tool
 from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
@@ -83,6 +104,7 @@ from nullion.approval_display import (
     approval_display_from_tool_result,
     approval_turn_display_from_result,
 )
+from nullion.approvals import TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND
 from nullion.config import (
     load_settings,
     normalize_reasoning_effort,
@@ -90,15 +112,19 @@ from nullion.config import (
     web_session_allow_duration_label,
     web_session_allow_expires_at,
 )
+from nullion.connector_prompt_context import (
+    active_connector_provider_context_snapshot,
+    format_active_connector_provider_context_for_prompt,
+)
 from nullion.cron_delivery import (
     CronRunDeliveryCallbacks,
     DEFAULT_CRON_NO_OUTPUT_MESSAGE,
     cancel_manual_cron_background_run,
     cron_conversation_id,
     cron_delivery_artifact_paths_from_result,
+    cron_delivery_block_reason,
     cron_delivery_target,
     cron_delivery_text,
-    cron_structured_result_block_reason,
     effective_cron_delivery_channel,
     manual_cron_silent_delivery_text,
     record_cron_delivery_chat_turn,
@@ -126,13 +152,11 @@ from nullion.memory import (
 )
 from nullion.mini_agent_routing import should_keep_dag_plan_in_direct_turn, should_route_without_mini_agents
 from nullion.messaging_adapters import (
-    WORKING_ACK_TEXT,
     delivery_contract_for_turn,
     list_platform_delivery_receipts,
     messaging_file_allowed_roots,
     messaging_upload_root,
     prepare_reply_for_platform_delivery,
-    should_emit_separate_working_ack,
 )
 from nullion.messaging_delivery_contract import (
     apply_deferred_cron_dispatch_to_payload,
@@ -148,15 +172,19 @@ from nullion.operator_commands import (
 from nullion.prompt_injection import is_untrusted_tool_name, safe_untrusted_tool_metadata
 from nullion.workspace_storage import (
     format_workspace_storage_for_prompt,
+    workspace_storage_base,
     workspace_storage_roots_for_principal,
     workspace_storage_roots_for_workspace,
 )
 from nullion.redaction import redact_text, redact_value
 from nullion.response_fulfillment_contract import (
+    artifact_path_embedded_media_count,
     artifact_paths_from_tool_results,
     evaluate_response_execution_outcome,
     evaluate_response_fulfillment,
     normalize_artifact_media_required_extensions,
+    scoped_artifact_extensions_from_tool_results,
+    strip_unselected_artifact_references,
     user_visible_text_from_output,
 )
 from nullion.runtime_persistence import load_runtime_store
@@ -167,6 +195,7 @@ from nullion.session_stop import (
     stop_session_reply,
 )
 from nullion.response_sanitizer import sanitize_user_visible_reply
+from nullion.scheduler_context_compaction import compact_list_crons_output_for_context
 from nullion.remediation import remediation_buttons_for_recommendation_code
 from nullion.platform_activity import compact_tool_activity_text
 from nullion.run_activity import (
@@ -202,11 +231,14 @@ from nullion.task_frames import (
     TaskFrameOperation,
     TaskFrameOutputContract,
     TaskFrameStatus,
+    extract_url_target,
 )
 from nullion.task_decomposer import TaskDecomposer
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, normalize_tool_status
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.turn_context_policy import (
+    ScopedTurnToolRegistry,
+    TurnToolScopeDecision,
     build_turn_tool_evidence,
     is_slash_prefixed_literal_message,
     materialize_mini_agent_tool_scope_registry,
@@ -215,6 +247,7 @@ from nullion.turn_context_policy import (
     tool_registry_allows_connector_context,
     tool_registry_allows_skill_pack_context,
     tool_registry_allows_skill_pack_prompt_context,
+    turn_tool_registry_for_evidence,
     turn_tool_scope_decision_may_apply,
     turn_tool_evidence_needs_model_scope_decision,
     turn_is_context_linked,
@@ -606,6 +639,11 @@ def _web_stable_context_history_prefix(
         include_skill_pack_prompt = False
 
     enabled_skill_packs = tuple(getattr(app_settings, "enabled_skill_packs", ()) or ())
+    active_connector_context = (
+        active_connector_provider_context_snapshot()
+        if (include_connections or include_skill_packs or include_skill_pack_prompt)
+        else ()
+    )
     cache_principal_id = "web:admin" if str(principal_id or "").startswith("web:") else principal_id
     cache_key = (
         cache_principal_id,
@@ -620,6 +658,7 @@ def _web_stable_context_history_prefix(
         _web_context_file_signatures(),
         _web_enabled_skill_pack_signature(enabled_skill_packs),
         _web_installed_dependency_signature(runtime),
+        _web_freeze_for_cache(active_connector_context),
     )
     with _WEB_STABLE_CONTEXT_CACHE_LOCK:
         cached = _WEB_STABLE_CONTEXT_CACHE.get(cache_key)
@@ -628,7 +667,7 @@ def _web_stable_context_history_prefix(
     cached_result = runtime_cache.get_json(
         "stable_context.web",
         cache_key,
-        version="v7",
+        version="v8",
         persistent=True,
         db_path=_web_runtime_cache_db_path(runtime),
     )
@@ -676,6 +715,9 @@ def _web_stable_context_history_prefix(
         dependency_text = format_installed_dependency_context(runtime)
         if dependency_text:
             caps_text = (caps_text + "\n\n" + dependency_text).strip() if caps_text else dependency_text
+        active_connector_text = format_active_connector_provider_context_for_prompt(active_connector_context)
+        if active_connector_text:
+            caps_text = (caps_text + "\n\n" + active_connector_text).strip() if caps_text else active_connector_text
         if caps_text:
             entries.append(
                 _web_system_text_message(
@@ -688,7 +730,7 @@ def _web_stable_context_history_prefix(
                     "used when the user can log in or the target is public; terminal tools may be used "
                     "for local command-line paths when registered and approved. If every tool path is "
                     "blocked, suggest concrete next steps such as connecting the provider, installing "
-                    "or enabling the matching skill, logging in through the agent browser, or providing "
+                    "or enabling the matching skill, asking Builder to create or save a reusable skill/workflow, logging in through the agent browser, or providing "
                     "a public target. If a browser fallback reaches a sign-in page, explicitly offer "
                     "the agent-browser login path instead of only asking for more identifiers. External "
                     "account connections are references, not raw credentials.\n\n"
@@ -800,6 +842,46 @@ _BROWSER_TOOL_NAMES = (
     "browser_run_js",
     "browser_close",
 )
+_WEB_BROWSER_AGENT_TURN_MAX_ITERATIONS_ENV = "NULLION_BROWSER_AGENT_TURN_MAX_ITERATIONS"
+_WEB_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 24
+
+
+def _web_is_web_or_browser_tool_name(tool_name: object) -> bool:
+    normalized = str(tool_name or "").strip()
+    return bool(normalized) and (normalized.startswith("browser_") or normalized in {"web_fetch", "web_search"})
+
+
+def _web_tool_scope_requests_browser_work(tool_registry: object | None) -> bool:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    web_action = str(getattr(decision, "web_action", "none") or "none")
+    if web_action in {"open_url", "live_research", "browser_interaction"}:
+        return True
+    for raw_names in (
+        getattr(decision, "requested_tool_names", ()) or (),
+        getattr(decision, "required_tool_names", ()) or (),
+    ):
+        if not isinstance(raw_names, (list, tuple, set, frozenset)):
+            continue
+        if any(_web_is_web_or_browser_tool_name(name) for name in raw_names):
+            return True
+    return False
+
+
+def _web_agent_turn_max_iterations(tool_registry: object | None) -> int:
+    base_limit = default_agent_turn_max_iterations()
+    if not _web_tool_scope_requests_browser_work(tool_registry):
+        return base_limit
+    raw_value = os.environ.get(
+        _WEB_BROWSER_AGENT_TURN_MAX_ITERATIONS_ENV,
+        str(_WEB_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS),
+    )
+    try:
+        configured = int(raw_value)
+    except (TypeError, ValueError):
+        configured = _WEB_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS
+    return max(base_limit, min(60, max(1, configured)))
 
 
 def _default_workspace_root() -> str:
@@ -1479,6 +1561,9 @@ _HTML = r"""<!DOCTYPE html>
     padding: 16px 14px 8px; margin: 0;
   }
   .ahchan-item {
+    appearance: none; -webkit-appearance: none; box-sizing: border-box;
+    display: block; width: calc(100% - 12px); background: transparent; border: 0;
+    text-align: left; font-family: inherit;
     padding: 10px 14px; cursor: pointer; border-radius: 7px; margin: 1px 6px;
     font-size: 13px; color: var(--text); transition: background .12s;
   }
@@ -1537,6 +1622,9 @@ _HTML = r"""<!DOCTYPE html>
   #allhist-close:hover { color: var(--text); }
   #allhist-conv-list { overflow-y: auto; border-bottom: 1px solid var(--border); max-height: 180px; }
   .ahconv-row {
+    appearance: none; -webkit-appearance: none; box-sizing: border-box;
+    display: block; width: 100%; background: transparent; border: 0;
+    text-align: left; font-family: inherit; color: inherit;
     padding: 10px 18px; cursor: pointer; border-bottom: 1px solid var(--border);
     transition: background .1s;
   }
@@ -1583,6 +1671,26 @@ _HTML = r"""<!DOCTYPE html>
   .ahm-text pre code { padding: 0; border: 0; background: transparent; color: #e8e8f2; font-size: 12px; }
   .ahm-bubble.user .ahm-text { background: rgba(99,102,241,.15); }
   #allhist-empty { color: var(--muted); font-size: 13px; padding: 24px 18px; text-align: center; }
+
+  @media (max-width: 760px) {
+    #allhist-overlay { align-items: stretch; }
+    #allhist-panel {
+      flex-direction: column; width: 100%; max-width: none; max-height: 100vh;
+      margin: 0; border-radius: 0;
+    }
+    #allhist-channels {
+      width: 100%; min-width: 0; max-height: 150px;
+      border-right: 0; border-bottom: 1px solid var(--border);
+    }
+    #allhist-calendar-col {
+      width: 100%; min-width: 0; max-height: 250px;
+      border-right: 0; border-bottom: 1px solid var(--border);
+    }
+    #allhist-right {
+      width: 100%; min-width: 0; min-height: 320px; flex: 1 1 auto;
+    }
+    #allhist-conv-list { max-height: 140px; }
+  }
 
   #history-btn {
     background: var(--surface2); border: 1px solid var(--border); color: var(--muted);
@@ -3063,7 +3171,7 @@ _HTML = r"""<!DOCTYPE html>
     flex: 1 1 auto;
   }
   .approval-state {
-    display: none; color: var(--muted); font-size: 12px; line-height: 1.4;
+    display: none; color: var(--muted); font-size: 12px; line-height: 1.4; white-space: pre-wrap;
   }
   .approval-state.visible { display: block; }
   .approval-state.ok { color: var(--green); }
@@ -6269,6 +6377,13 @@ async function fetchHeaderConfig({force = false} = {}) {
     .finally(() => { _headerConfigFetchPromise = null; });
   return _headerConfigFetchPromise;
 }
+
+function invalidateConfigCaches() {
+  _lastConfigPayload = null;
+  _configFetchPromise = null;
+  _lastHeaderConfigPayload = null;
+  _headerConfigFetchPromise = null;
+}
 // ── Nullion SVG icon library ──────────────────────────────────────────────────
 const NI = {
   _svg: (d, extra='') => `<svg class="ni${extra}" viewBox="0 0 72 72" aria-hidden="true">${d}</svg>`,
@@ -6402,6 +6517,7 @@ let conversationId = _getOrCreateConvId();
 let botMsgEl = null;
 let botMsgRaw = '';
 let _botTurnBubbles = new Map();
+let _finishedTurnIds = new Set();
 let _decisionHistory = [];
 let _decisionFilter = 'managed';
 const DASHBOARD_PREVIEW_LIMIT = 5;
@@ -6415,6 +6531,7 @@ let _lastWsErrorReportAt = 0;
 let _activeTurnTimers = new Map();
 let _activeTurnStartedAt = new Map();
 let _activeSendTurnIds = new Set();
+let _pendingTerminalReplyRecoveries = new Map();
 let _skipCurrentTurnSave = false;
 let _skipSaveByTurn = new Map();
 let _messageMetadataByTurn = new Map();
@@ -6511,9 +6628,36 @@ function setSendButtonDisabled(disabled) {
 
 function beginTurnUi(turnId, text) {
   const id = turnId || ('turn:' + Date.now().toString(36));
+  _finishedTurnIds.delete(id);
   _activeSendTurnIds.add(id);
+  rememberPendingTerminalReply(id);
+  schedulePendingTerminalReplyRecovery();
   setSendButtonDisabled(false);
   markTurnStarted(id, text);
+}
+
+function rememberPendingTerminalReply(turnId) {
+  if (!turnId) return;
+  _pendingTerminalReplyRecoveries.set(turnId, {
+    baseline: renderedConversationMessageCount(),
+    startedAt: Date.now(),
+  });
+}
+
+function clearPendingTerminalReply(turnId = null) {
+  if (turnId) {
+    _pendingTerminalReplyRecoveries.delete(turnId);
+    if (!_pendingTerminalReplyRecoveries.size && _pendingTerminalReplyRecoveryKickTimer) {
+      clearTimeout(_pendingTerminalReplyRecoveryKickTimer);
+      _pendingTerminalReplyRecoveryKickTimer = null;
+    }
+    return;
+  }
+  _pendingTerminalReplyRecoveries.clear();
+  if (_pendingTerminalReplyRecoveryKickTimer) {
+    clearTimeout(_pendingTerminalReplyRecoveryKickTimer);
+    _pendingTerminalReplyRecoveryKickTimer = null;
+  }
 }
 
 function clearTurnWatchdog(turnId = null) {
@@ -6702,7 +6846,8 @@ function taskStatusVisual(glyph) {
 }
 
 function taskStatusRank(glyph) {
-  if (['☑', '✓', '✕', '!', '⊘'].includes(glyph)) return 3;
+  if (['☑', '✓'].includes(glyph)) return 4;
+  if (['✕', '!', '⊘'].includes(glyph)) return 3;
   if (['◑', '◒', '◐', '◓', '▤'].includes(glyph)) return 2;
   if (['☐', '▣'].includes(glyph)) return 1;
   return 0;
@@ -7502,13 +7647,84 @@ function showGatewayNotice(event) {
   addSystemNotice(text);
 }
 
-function addAssistantNotice(title, body) {
+function isProvisionalTypingBubble(bubble) {
+  return Boolean(
+    bubble
+    && bubble.isConnected
+    && (
+      bubble.classList.contains('typing-bubble')
+      || bubble.classList.contains('status-bubble')
+    )
+    && !String(bubble.dataset.rawText || '').trim()
+    && !bubble.querySelector('.run-activity')
+    && !bubble.querySelector('.artifact-list')
+  );
+}
+
+function isVisibleAnswerBubble(bubble) {
+  return Boolean(
+    bubble
+    && bubble.isConnected
+    && !bubble.classList.contains('typing-bubble')
+    && !bubble.classList.contains('status-bubble')
+    && Boolean(String(bubble.dataset.rawText || '').trim())
+  );
+}
+
+function latestBotBubble() {
+  const bubbles = Array.from(document.querySelectorAll('.msg.bot .bubble')).reverse();
+  return bubbles.length ? bubbles[0] : null;
+}
+
+function findBotBubbleByTurnId(turnId) {
+  const targetTurnId = String(turnId || '');
+  if (!targetTurnId) return null;
+  const bubbles = Array.from(document.querySelectorAll('.msg.bot .bubble')).reverse();
+  return bubbles.find((bubble) => String(bubble.dataset.turnId || '') === targetTurnId) || null;
+}
+
+function assistantNoticeHtml(title, body) {
+  const titleText = String(title || '').trim();
+  const bodyText = String(body || '');
+  if (!titleText) return escHtml(bodyText);
+  return `<strong>${escHtml(titleText)}</strong><br>${escHtml(bodyText)}`;
+}
+
+function updateBubbleWithNotice(bubble, title, body, turnId = null) {
+  bubble.classList.remove('typing-bubble', 'thinking', 'has-run-activity');
+  bubble.classList.add('status-bubble');
+  bubble.innerHTML = assistantNoticeHtml(title, body);
+  bubble.dataset.rawText = '';
+  bubble.dataset.statusText = String(body || '');
+  if (turnId) bubble.dataset.turnId = turnId;
+  ensureBubbleTimestamp(bubble);
+  scrollMessagesToBottom();
+  return bubble;
+}
+
+function replaceProvisionalTypingWithNotice(title, body, turnId = null) {
+  const bubble = turnId ? (_botTurnBubbles.get(turnId) || findBotBubbleByTurnId(turnId)) : latestBotBubble();
+  if (turnId && _finishedTurnIds.has(turnId)) return { handled: true, bubble: null };
+  if (isVisibleAnswerBubble(bubble)) return { handled: true, bubble: null };
+  if (!isProvisionalTypingBubble(bubble)) return { handled: false, bubble: null };
+  return { handled: true, bubble: updateBubbleWithNotice(bubble, title, body, turnId) };
+}
+
+function addAssistantNotice(title, body, turnId = null, options = {}) {
+  if (options && options.replaceProvisionalTyping) {
+    const replacement = replaceProvisionalTypingWithNotice(title, body, turnId);
+    if (replacement.handled) return replacement.bubble;
+  }
   const messages = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg bot';
-  div.innerHTML = `<div class="avatar logo-avatar" aria-hidden="true"></div><div class="bubble"><strong>${escHtml(title)}</strong><br>${escHtml(body || '')}</div>`;
+  div.innerHTML = `<div class="avatar logo-avatar" aria-hidden="true"></div><div class="bubble">${assistantNoticeHtml(title, body)}</div>`;
+  const bubble = div.querySelector('.bubble');
+  if (turnId) bubble.dataset.turnId = turnId;
+  bubble.dataset.rawText = '';
+  bubble.dataset.statusText = String(body || '');
   messages.appendChild(div);
-  ensureBubbleTimestamp(div.querySelector('.bubble'));
+  ensureBubbleTimestamp(bubble);
   scrollMessagesToBottom();
   return div;
 }
@@ -7640,7 +7856,10 @@ async function connect() {
       if (data.type === 'chunk') {
         appendBotChunk(data.text || '', data.turn_id || null);
       } else if (data.type === 'notice') {
-        addAssistantNotice('Nullion', data.text || '');
+        const noticeKind = String(data.notice_kind || data.id || '');
+        addAssistantNotice('Nullion', data.text || '', data.turn_id || null, {
+          replaceProvisionalTyping: noticeKind === 'foreground_working_ack',
+        });
       } else if (data.type === 'thinking') {
         addThinkingBlock(data.text || '', data.turn_id || null);
       } else if (data.type === 'activity') {
@@ -7672,8 +7891,12 @@ async function connect() {
           artifacts: data.artifacts || [],
           activity: _activityEventsByTurn.get(doneTurnId) || [],
         });
-        const bubble = finalizeBotMsg(null, false, data.turn_id || null);
+        const doneText = String(data.text || '').trim();
+        const bubble = finalizeBotMsg(doneText || null, false, data.turn_id || null);
         addArtifactLinks(bubble, data.artifacts || []);
+        if (!bubble || String(bubble.dataset.rawText || '').trim() === '(no reply)') {
+          refreshConversationAfterMissingTerminalReply(0, renderedConversationMessageCount());
+        }
         finishTurnUi(data.turn_id || null);
         refreshDashboard();
       } else if (data.type === 'error') {
@@ -7692,7 +7915,7 @@ async function connect() {
         clearTurnWatchdog();
         rememberApprovalActivity(data.approval_id, data.turn_id || null);
         setBotStatus('Waiting for approval...', data.turn_id || null);
-        addApprovalBubble(data.approval_id, data.tool_name || 'perform an action', data.tool_detail || '', data.web_session_allow_label, data.trigger_flow_label || '', Boolean(data.is_web_request));
+        addApprovalBubble(data.approval_id, data.tool_name || 'perform an action', data.tool_detail || '', data.web_session_allow_label, data.trigger_flow_label || '', Boolean(data.is_web_request), data.request_kind || '');
         finishTurnUi(data.turn_id || null);
         refreshDashboard();
       } else if (data.type === 'background_message') {
@@ -7978,7 +8201,7 @@ async function sendHttpMessage(text, turnId = null, attachments = []) {
     } else if (msg.type === 'approval_required') {
       rememberApprovalActivity(msg.approval_id, turnId);
       setBotStatus('Waiting for approval...', turnId);
-      addApprovalBubble(msg.approval_id, msg.tool_name, msg.tool_detail || '', msg.web_session_allow_label, msg.trigger_flow_label || '', Boolean(msg.is_web_request));
+      addApprovalBubble(msg.approval_id, msg.tool_name, msg.tool_detail || '', msg.web_session_allow_label, msg.trigger_flow_label || '', Boolean(msg.is_web_request), msg.request_kind || '');
       refreshDashboard();
     } else {
       _messageMetadataByTurn.set(turnId || '__current__', { artifacts: msg.artifacts || [] });
@@ -8366,6 +8589,10 @@ function finalizeBotMsg(fallback = null, isError = false, turnId = null) {
   }
   if (!bubble && fallback) bubble = addMessage('bot', fallback, isError);
   if (turnId) {
+    _finishedTurnIds.add(turnId);
+    if (_finishedTurnIds.size > 100) {
+      _finishedTurnIds = new Set(Array.from(_finishedTurnIds).slice(-50));
+    }
     _botTurnBubbles.delete(turnId);
     _activityElByTurn.delete(turnId);
     _activityItemsByTurn.delete(turnId);
@@ -8378,6 +8605,8 @@ function finalizeBotMsg(fallback = null, isError = false, turnId = null) {
 
 function approvalToolIcon(toolName) {
   const raw = String(toolName || '').toLowerCase();
+  if (raw.includes('terminal_destructive_action')) return NI.trash();
+  if (raw.includes('doctor_extend_agent_turn_limit') || raw.includes('agent_turn_limit')) return NI.pulse();
   if (raw.includes('web_fetch') || raw.includes('browser_open') || raw.includes('browser_navigate') || raw.includes('outbound_network')) return NI.globe();
   if (raw.includes('browser_click') || raw.includes('browser_run_js')) return NI.cursor();
   if (raw.includes('browser_type') || raw.includes('browser_fill') || raw.includes('browser_extract')) return NI.keyboard();
@@ -8402,6 +8631,7 @@ function approvalToolIcon(toolName) {
 
 function approvalTitle(toolName) {
   const raw = String(toolName || '').toLowerCase();
+  if (raw.includes('doctor_extend_agent_turn_limit') || raw.includes('agent_turn_limit')) return '🩺 Doctor recommends more tool budget';
   if (raw === 'browser_run_js' || raw.includes('run javascript in the browser')) return '⚠️ Approve write action?';
   if (raw.includes('doctor') || raw.includes('health')) return '🩺 Run health action?';
   if (raw.includes('builder') || raw.includes('build') || raw.includes('proposal') || raw.includes('skill')) return '🛠️ Run builder action?';
@@ -8422,6 +8652,7 @@ function approvalTitleFor(a) {
   const action = String((a && a.action) || '').toLowerCase();
   const boundaryKind = String(ctx.boundary_kind || '').toLowerCase();
   const sideEffect = String(ctx.tool_side_effect_class || '').toLowerCase();
+  if (requestKind === 'terminal_destructive_action') return '⚠️ Confirm delete?';
   if (requestKind === 'boundary_policy') {
     if (boundaryKind === 'outbound_network') return '🛡️ Allow web access?';
     if (boundaryKind === 'filesystem_access') return '📄 Allow file access?';
@@ -8552,7 +8783,19 @@ function approvalIsWebApproval(a, detail) {
   return approvalIsWebRequest((a && (a.tool_name || a.action)) || '', detail);
 }
 
-function approvalCopyFor(toolName, detail, forceWeb = false) {
+function approvalIsAgentTurnLimitExtension(toolName, requestKind = '') {
+  return String(requestKind || '').trim() === 'agent_turn_limit_extension'
+    || String(toolName || '').toLowerCase().includes('doctor_extend_agent_turn_limit')
+    || String(toolName || '').toLowerCase().includes('agent_turn_limit');
+}
+
+function approvalCopyFor(toolName, detail, forceWeb = false, requestKind = '') {
+  if (approvalIsAgentTurnLimitExtension(toolName, requestKind)) {
+    return 'Doctor saw this run hit its current limit before finishing. Choose how much more budget to grant for this same request.';
+  }
+  if (String(requestKind || '').trim() === 'terminal_destructive_action') {
+    return 'Nullion paused before deleting anything. Review exactly what will be deleted. Approve once to run this command, or deny to stop.';
+  }
   if (approvalIsEmailSend(toolName, detail)) {
     return 'Review the email below. Approve once to send it, or deny to stop.';
   }
@@ -8599,9 +8842,23 @@ function approvalDetailHtml(toolName, detail, forceWeb = false) {
   return `<div class="${cls}">${escHtml(detail)}</div>`;
 }
 
-function approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel = 'for all workspaces', forceWeb = false) {
+function approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel = 'for all workspaces', forceWeb = false, requestKind = '') {
   const isWeb = forceWeb || approvalIsWebRequest(toolName, detail);
   const host = approvalTargetHost(detail);
+  if (approvalIsAgentTurnLimitExtension(toolName, requestKind)) {
+    return `<div class="approval-actions">
+      <button class="card-btn primary" onclick="approveRequest('${approvalId}', this, 'limit_2x')">2x</button>
+      <button class="card-btn secondary" onclick="approveRequest('${approvalId}', this, 'limit_5x')">5x</button>
+      <button class="card-btn secondary" onclick="approveRequest('${approvalId}', this, 'limit_10x')">10x</button>
+      <button class="card-btn reject" onclick="rejectRequest('${approvalId}', this)">Deny</button>
+    </div>`;
+  }
+  if (String(requestKind || '').trim() === 'terminal_destructive_action') {
+    return `<div class="approval-actions">
+      <button class="card-btn primary" onclick="approveRequest('${approvalId}', this, 'once')">Delete</button>
+      <button class="card-btn reject" onclick="rejectRequest('${approvalId}', this)">Deny</button>
+    </div>`;
+  }
   if (approvalIsEmailSend(toolName, detail)) {
     return `<div class="approval-actions">
       <button class="card-btn primary" onclick="approveRequest('${approvalId}', this, 'once')">Send email</button>
@@ -8624,7 +8881,7 @@ function approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel = '
   </div>`;
 }
 
-function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel = 'for all workspaces', triggerFlowLabel = '', forceWeb = false) {
+function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel = 'for all workspaces', triggerFlowLabel = '', forceWeb = false, requestKind = '') {
   const messages = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg bot';
@@ -8638,11 +8895,11 @@ function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel =
           <span class="approval-glyph" aria-hidden="true">${approvalToolIcon(toolName)}</span>
           <div>
             <div class="approval-title" data-approval-title-original="${escAttr(title)}">${escHtml(title)}</div>
-            <div class="approval-copy">${escHtml(approvalCopyFor(toolName, detail, isWeb))}</div>
+            <div class="approval-copy">${escHtml(approvalCopyFor(toolName, detail, isWeb, requestKind))}</div>
           </div>
         </div>
         ${approvalDetailHtml(toolName, detail, isWeb)}
-        ${approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel, isWeb)}
+        ${approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel, isWeb, requestKind)}
         <div class="approval-state" aria-live="polite"></div>
       </div>
     </div>`;
@@ -8707,6 +8964,8 @@ function setApprovalStateEverywhere(approvalId, text, kind = '') {
 }
 
 let _approvalHistoryRefreshTimer = null;
+let _terminalReplyHistoryRefreshTimer = null;
+let _pendingTerminalReplyRecoveryKickTimer = null;
 function renderedConversationMessageCount() {
   return Array.from(document.querySelectorAll('#messages .msg'))
     .filter(row => !row.querySelector('.approval-bubble'))
@@ -8735,6 +8994,83 @@ function refreshConversationAfterExternalApproval(attempt = 0, minCount = null) 
       }
     } catch (_) { /* best-effort */ }
   }, attempt === 0 ? 900 : 700);
+}
+
+function refreshConversationAfterMissingTerminalReply(attempt = 0, minCount = null) {
+  if (_terminalReplyHistoryRefreshTimer) clearTimeout(_terminalReplyHistoryRefreshTimer);
+  const baselineCount = minCount == null ? renderedConversationMessageCount() : minCount;
+  _terminalReplyHistoryRefreshTimer = setTimeout(async () => {
+    _terminalReplyHistoryRefreshTimer = null;
+    try {
+      const data = await fetch(`/api/chat/history/${encodeURIComponent(conversationId)}?sync_runtime=1`).then(r => r.json());
+      const msgs = data.messages || [];
+      if (historyHasNewBotReply(msgs, baselineCount)) {
+        renderRestoredMessages(msgs);
+        _chatSaveEnabled = true;
+        clearPendingTerminalReply();
+        finishTurnUi();
+      } else if (attempt < 90) {
+        refreshConversationAfterMissingTerminalReply(attempt + 1, baselineCount);
+      }
+    } catch (_) { /* best-effort */ }
+  }, attempt === 0 ? 750 : 1500);
+}
+
+function schedulePendingTerminalReplyRecovery(delayMs = 2500) {
+  if (_pendingTerminalReplyRecoveryKickTimer) clearTimeout(_pendingTerminalReplyRecoveryKickTimer);
+  _pendingTerminalReplyRecoveryKickTimer = setTimeout(() => {
+    _pendingTerminalReplyRecoveryKickTimer = null;
+    const baseline = pendingTerminalReplyRecoveryBaseline();
+    if (baseline == null) return;
+    refreshConversationAfterMissingTerminalReply(0, baseline);
+  }, delayMs);
+}
+
+function pendingTerminalPlaceholderCount() {
+  return Array.from(document.querySelectorAll('#messages .msg.bot .bubble'))
+    .filter(bubble => (
+      bubble.classList.contains('typing-bubble')
+      || bubble.classList.contains('status-bubble')
+    ))
+    .length;
+}
+
+function dashboardItemIsOpen(item) {
+  const status = String((item && item.status) || '').toLowerCase();
+  return ['active', 'running', 'waiting_approval', 'waiting_input', 'verifying', 'blocked'].includes(status);
+}
+
+function pendingTerminalReplyRecoveryBaseline() {
+  const now = Date.now();
+  const candidates = [];
+  for (const [turnId, item] of _pendingTerminalReplyRecoveries.entries()) {
+    const startedAt = Number((item && item.startedAt) || 0);
+    if (startedAt && now - startedAt > 10 * 60 * 1000) {
+      _pendingTerminalReplyRecoveries.delete(turnId);
+      continue;
+    }
+    const baseline = Number((item && item.baseline) || 0);
+    candidates.push(Math.max(0, baseline));
+  }
+  if (!candidates.length) return null;
+  return Math.min(...candidates);
+}
+
+function recoverMissingTerminalReplyFromIdleDashboard(data = {}) {
+  const pendingBaseline = pendingTerminalReplyRecoveryBaseline();
+  const placeholderBaseline = (_activeSendTurnIds.size && pendingTerminalPlaceholderCount())
+    ? Math.max(0, renderedConversationMessageCount() - pendingTerminalPlaceholderCount())
+    : null;
+  const baseline = pendingBaseline == null ? placeholderBaseline : pendingBaseline;
+  if (baseline == null) return;
+  const openWork = [
+    ...(data.task_frames || []),
+    ...(data.mini_agent_tasks || []),
+    ...(data.cron_delivery_tasks || []),
+  ].some(dashboardItemIsOpen);
+  if (openWork) return;
+  refreshConversationAfterMissingTerminalReply(0, baseline);
+  Array.from(_activeSendTurnIds).forEach(turnId => finishTurnUi(turnId));
 }
 
 function removeApprovalBubblesEverywhere(approvalId) {
@@ -8778,7 +9114,7 @@ function handleApprovalResume(data, approvalId = null) {
       setBotStatus('Waiting for the next approval...');
     }
     rememberApprovalActivity(resume.approval_id, activityTurnId);
-    addApprovalBubble(resume.approval_id, resume.tool_name || 'perform an action', resume.tool_detail || '', resume.web_session_allow_label, resume.trigger_flow_label || '', Boolean(resume.is_web_request));
+    addApprovalBubble(resume.approval_id, resume.tool_name || 'perform an action', resume.tool_detail || '', resume.web_session_allow_label, resume.trigger_flow_label || '', Boolean(resume.is_web_request), resume.request_kind || '');
     return;
   }
   if (text) {
@@ -9462,9 +9798,11 @@ function renderMessageBlocks(html) {
 async function approveRequest(approvalId, btn, mode = 'once', expires = null) {
   const always = mode === 'always';
   const run = mode === 'run';
+  const limitExtension = String(mode || '').startsWith('limit_');
+  const limitLabel = String(mode || '').replace(/^limit_/, '').toUpperCase();
   const activityTurnId = activityTurnForApproval(approvalId);
-  setApprovalPending(btn, always ? 'Saving...' : 'Allowing...', approvalId);
-  const pendingText = run ? 'All web domains allowed. Continuing...' : (always ? 'Always allowed. Continuing...' : 'Allowed once. Continuing...');
+  setApprovalPending(btn, limitExtension ? 'Extending...' : (always ? 'Saving...' : 'Allowing...'), approvalId);
+  const pendingText = limitExtension ? `Doctor approved ${limitLabel} budget. Continuing...` : (run ? 'All web domains allowed. Continuing...' : (always ? 'Always allowed. Continuing...' : 'Allowed once. Continuing...'));
   setApprovalStateEverywhere(approvalId, pendingText, 'ok');
   if (botMsgEl) {
     setBotStatus(pendingText);
@@ -9485,9 +9823,10 @@ async function approveRequest(approvalId, btn, mode = 'once', expires = null) {
       return;
     }
     if (!r.ok || !data.ok) throw new Error(data.error || 'Approval failed');
-    const finalText = run ? 'All web domains allowed. Continued.' : (always ? 'Always allowed. Continued.' : 'Allowed once. Continued.');
-    const idleText = run ? 'All web domains allowed.' : (always ? 'Always allowed.' : 'Allowed once.');
-    setApprovalStateEverywhere(approvalId, (data.resumed_text || data.resume) ? finalText : idleText, 'ok');
+    const finalText = limitExtension ? `Doctor approved ${limitLabel} budget. Continued.` : (run ? 'All web domains allowed. Continued.' : (always ? 'Always allowed. Continued.' : 'Allowed once. Continued.'));
+    const idleText = limitExtension ? `Doctor approved ${limitLabel} budget.` : (run ? 'All web domains allowed.' : (always ? 'Always allowed.' : 'Allowed once.'));
+    const confirmationText = String(data.confirmation_text || '').trim();
+    setApprovalStateEverywhere(approvalId, confirmationText || ((data.resumed_text || data.resume) ? finalText : idleText), 'ok');
     if (run && Array.isArray(data.auto_approved_ids)) {
       data.auto_approved_ids.forEach(id => {
         rememberApprovalActivity(id, activityTurnId);
@@ -9512,9 +9851,10 @@ async function rejectRequest(approvalId, btn) {
     const r = await fetch(`/api/reject/${approvalId}`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || 'Deny failed');
-    setApprovalStateEverywhere(approvalId, 'Denied. Nullion will wait for your next instruction.', 'error');
+    const confirmationText = String(data.confirmation_text || '').trim();
+    setApprovalStateEverywhere(approvalId, confirmationText || 'Denied. Nullion will wait for your next instruction.', 'error');
     updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'blocked', detail: 'Denied' });
-    finalizeBotMsg('Denied. Nullion will wait for your next instruction.');
+    finalizeBotMsg(confirmationText || 'Denied. Nullion will wait for your next instruction.');
   } catch (e) {
     updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'failed', detail: 'Deny failed' });
     setApprovalStateEverywhere(approvalId, `Deny failed: ${e.message || e}`, 'error');
@@ -9528,7 +9868,8 @@ function approvalCardHtml(a) {
   const detail = approvalDetail(a.tool_name || a.action || 'Tool', approvalDetailFor(a), a.approval_id);
   const toolName = a.display_label || a.tool_name || a.action || 'Tool';
   const isWeb = Boolean(a.is_web_request) || approvalIsWebApproval(a, detail);
-  const copy = a.display_copy || (isWeb ? 'Nullion may need a few external sites to finish this request. Choose the web access scope to continue.' : approvalCopyFor(toolName, detail));
+  const requestKind = String(a.request_kind || '');
+  const copy = a.display_copy || (isWeb ? 'Nullion may need a few external sites to finish this request. Choose the web access scope to continue.' : approvalCopyFor(toolName, detail, false, requestKind));
   return `
     <div class="card approval-panel-card" data-approval-id="${escHtml(a.approval_id)}">
       <div class="approval-card">
@@ -9540,7 +9881,7 @@ function approvalCardHtml(a) {
           </div>
         </div>
         ${approvalDetailHtml(toolName, detail, isWeb)}
-        ${approvalActionsHtml(a.approval_id, toolName, detail, 'for all workspaces', isWeb)}
+        ${approvalActionsHtml(a.approval_id, toolName, detail, 'for all workspaces', isWeb, requestKind)}
         <div class="approval-state" aria-live="polite"></div>
       </div>
     </div>`;
@@ -10500,6 +10841,7 @@ async function refreshDashboard() {
     renderDoctor(data);
     if (attentionModalIsOpen()) renderAttentionModal(data);
     renderTasks(data.task_frames || [], data.mini_agent_tasks || [], data.cron_delivery_tasks || []);
+    recoverMissingTerminalReplyFromIdleDashboard(data);
     renderSkills(data.skills || []);
     renderMemory(data.memory || []);
     renderHealth(data.health);
@@ -12909,7 +13251,7 @@ async function loadConfig(options = {}) {
     document.getElementById('cfg-task-decomposition').checked = cfg.task_decomposition !== false;
     document.getElementById('cfg-multi-agent').checked = cfg.multi_agent !== false;
     document.getElementById('cfg-mini-agent-timeout').value = cfg.mini_agent_timeout_seconds || 180;
-    document.getElementById('cfg-mini-agent-max-iterations').value = cfg.mini_agent_max_iterations || 12;
+    document.getElementById('cfg-mini-agent-max-iterations').value = cfg.mini_agent_max_iterations || 24;
     document.getElementById('cfg-mini-agent-max-continuations').value = cfg.mini_agent_max_continuations ?? 1;
     document.getElementById('cfg-repeated-tool-failure-limit').value = cfg.repeated_tool_failure_limit || 2;
     document.getElementById('cfg-mini-agent-stale-after').value = cfg.mini_agent_stale_after_seconds || 600;
@@ -13060,9 +13402,9 @@ async function loadProfileSettings(options = {}) {
   } catch(e) { /* silent */ }
 }
 
-async function loadHeaderConfig() {
+async function loadHeaderConfig(options = {}) {
   try {
-    renderHeaderConfig(await fetchHeaderConfig());
+    renderHeaderConfig(await fetchHeaderConfig({force: options.force === true}));
   } catch (e) { /* silent */ }
 }
 
@@ -13182,9 +13524,10 @@ async function applyHeaderModelSelection(provider, model) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) throw new Error(data.error || 'Model switch failed');
-    await loadHeaderConfig();
+    invalidateConfigCaches();
+    await loadHeaderConfig({force: true});
   } catch (e) {
-    await loadHeaderConfig();
+    await loadHeaderConfig({force: true});
   } finally {
     _headerSwitching = false;
     if (_headerConfig) renderHeaderConfig(_headerConfig);
@@ -13277,11 +13620,12 @@ async function setVerboseMode(mode) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) throw new Error(data.error || 'Verbose mode update failed');
-    await loadHeaderConfig();
+    invalidateConfigCaches();
+    await loadHeaderConfig({force: true});
     recordActivity('Verbose mode updated', `Mode: ${verboseModeLabel(next)}`);
   } catch (e) {
     renderVerboseModeButton(current);
-    await loadHeaderConfig();
+    await loadHeaderConfig({force: true});
     alert(`Could not update verbose mode: ${e.message || e}`);
   }
 }
@@ -13305,11 +13649,12 @@ async function toggleThinkingDisplay(force = null) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) throw new Error(data.error || 'Thinking display update failed');
-    await loadHeaderConfig();
+    invalidateConfigCaches();
+    await loadHeaderConfig({force: true});
   } catch (e) {
     thinkingDisplayEnabled = !next;
     localStorage.setItem('nullion_show_thinking_enabled', thinkingDisplayEnabled ? 'true' : 'false');
-    await loadHeaderConfig();
+    await loadHeaderConfig({force: true});
     alert(`Could not update thinking display: ${e.message || e}`);
   }
 }
@@ -13326,10 +13671,11 @@ async function toggleActivityTrace(force = null) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) throw new Error(data.error || 'Verbose update failed');
-    await loadHeaderConfig();
+    invalidateConfigCaches();
+    await loadHeaderConfig({force: true});
   } catch (e) {
     activityTraceEnabled = !next;
-    await loadHeaderConfig();
+    await loadHeaderConfig({force: true});
     alert(`Could not update verbose mode: ${e.message || e}`);
   }
 }
@@ -13641,7 +13987,7 @@ async function loadPreferences() {
     const persona = p.persona || '';
     document.getElementById('pref-persona').value = persona;
     document.getElementById('pref-persona-count').textContent = persona.length;
-    _setChip('pref-emoji',      p.emoji_level      || 'standard');
+    _setChip('pref-emoji',      p.emoji_level      || 'none');
     _setChip('pref-length',     p.response_length  || 'balanced');
     _setChip('pref-structure',  p.response_structure || 'free');
     _setChip('pref-markdown',   p.markdown_style   || 'light');
@@ -13665,7 +14011,7 @@ async function loadPreferences() {
 async function savePreferences() {
   const payload = {
     persona:               document.getElementById('pref-persona').value.trim().slice(0, 280),
-    emoji_level:           _chipVal('pref-emoji')      || 'standard',
+    emoji_level:           _chipVal('pref-emoji')      || 'none',
     response_length:       _chipVal('pref-length')     || 'balanced',
     response_structure:    _chipVal('pref-structure')  || 'free',
     markdown_style:        _chipVal('pref-markdown')   || 'light',
@@ -14914,6 +15260,13 @@ async function ensureSettingsStoresLoadedForSave() {
   await Promise.resolve();
 }
 
+function positiveNumberInputValue(id, fallback) {
+  const raw = String(document.getElementById(id)?.value ?? '').trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 async function checkForUpdates() {
   try {
     const v = await API('/api/version');
@@ -14985,9 +15338,9 @@ async function saveConfig() {
     chat_enabled:    document.getElementById('cfg-chat-enabled').checked,
     memory_enabled:  document.getElementById('cfg-memory-enabled').checked,
     memory_smart_cleanup: document.getElementById('cfg-memory-smart-cleanup').checked,
-    memory_long_term_limit: Number(document.getElementById('cfg-memory-long-term-limit').value || 0),
-    memory_mid_term_limit: Number(document.getElementById('cfg-memory-mid-term-limit').value || 0),
-    memory_short_term_limit: Number(document.getElementById('cfg-memory-short-term-limit').value || 0),
+    memory_long_term_limit: positiveNumberInputValue('cfg-memory-long-term-limit', 25),
+    memory_mid_term_limit: positiveNumberInputValue('cfg-memory-mid-term-limit', 15),
+    memory_short_term_limit: positiveNumberInputValue('cfg-memory-short-term-limit', 10),
     skill_learning:  document.getElementById('cfg-skill-learning').checked,
     web_access:      document.getElementById('cfg-web-search').checked,
     browser_enabled: document.getElementById('cfg-browser-enabled').checked,
@@ -14997,8 +15350,8 @@ async function saveConfig() {
     task_decomposition: document.getElementById('cfg-task-decomposition').checked,
     multi_agent:     document.getElementById('cfg-multi-agent').checked,
     mini_agent_timeout_seconds: Number(document.getElementById('cfg-mini-agent-timeout').value || 180),
-    mini_agent_max_iterations: Number(document.getElementById('cfg-mini-agent-max-iterations').value || 12),
-    mini_agent_max_continuations: Number(document.getElementById('cfg-mini-agent-max-continuations').value || 0),
+    mini_agent_max_iterations: Number(document.getElementById('cfg-mini-agent-max-iterations').value || 24),
+    mini_agent_max_continuations: Number(document.getElementById('cfg-mini-agent-max-continuations').value || 1),
     repeated_tool_failure_limit: Number(document.getElementById('cfg-repeated-tool-failure-limit').value || 2),
     mini_agent_stale_after_seconds: Number(document.getElementById('cfg-mini-agent-stale-after').value || 600),
     proactive_reminders: document.getElementById('cfg-proactive-reminders').checked,
@@ -15656,12 +16009,14 @@ finalizeBotMsg = function(fallback = null, isError = false, turnId = null) {
   const bubble = _origFinalizeBotMsg(fallback, isError, turnId);
   if (bubble) {
     const text = bubble.dataset.rawText || '';
+    const cleanText = String(text || '').trim();
     const skipSave = turnId ? Boolean(_skipSaveByTurn.get(turnId)) : _skipCurrentTurnSave;
     const metadataKey = turnId || '__current__';
     const metadata = _messageMetadataByTurn.get(metadataKey) || null;
     const artifacts = metadata && Array.isArray(metadata.artifacts) ? metadata.artifacts : [];
-    if (text.trim()) rememberDisplayedBotReply(text, artifacts);
-    if (text.trim() && !skipSave) _chatSaveMsg('bot', text, isError, metadata);
+    if (cleanText && cleanText !== '(no reply)') rememberDisplayedBotReply(text, artifacts);
+    if (cleanText && cleanText !== '(no reply)') clearPendingTerminalReply(turnId || null);
+    if (cleanText && cleanText !== '(no reply)' && !skipSave) _chatSaveMsg('bot', text, isError, metadata);
     _messageMetadataByTurn.delete(metadataKey);
     _activityEventsByTurn.delete(metadataKey);
   }
@@ -15718,8 +16073,9 @@ async function _fetchLatestActiveWebConversation() {
   return latest.ok ? (latest.conversation || null) : null;
 }
 
-async function _fetchConversationHistory(convId) {
-  return fetch(`/api/chat/history/${encodeURIComponent(convId)}`).then(r => r.json());
+async function _fetchConversationHistory(convId, options = {}) {
+  const suffix = options.syncRuntime ? '?sync_runtime=1' : '';
+  return fetch(`/api/chat/history/${encodeURIComponent(convId)}${suffix}`).then(r => r.json());
 }
 
 async function _restoreConversation() {
@@ -16078,9 +16434,11 @@ async function _loadAhChannels() {
     }
     list.innerHTML = '';
     channels.forEach(ch => {
-      const el = document.createElement('div');
+      const el = document.createElement('button');
+      el.type = 'button';
       el.className = 'ahchan-item' + (ch.channel === _ahChannel ? ' active' : '');
       el.dataset.channel = ch.channel;
+      el.dataset.historyChannel = ch.channel;
       const lastDate = ch.last_message_at
         ? new Date(ch.last_message_at).toLocaleDateString(undefined, {month:'short', day:'numeric'})
         : '';
@@ -16093,6 +16451,7 @@ async function _loadAhChannels() {
         '<div class="ahchan-name">' + icon + ' ' + escHtml(ch.channel_label) + '</div>' +
         '<div class="ahchan-meta">' + ch.conversation_count + ' conv'
           + (lastDate ? ' \u00B7 ' + lastDate : '') + '</div>';
+      el.setAttribute('aria-label', 'Open history channel ' + ch.channel_label + (lastDate ? ', last message ' + lastDate : ''));
       el.onclick = () => _selectAhChannel(ch.channel, ch.channel_label);
       list.appendChild(el);
     });
@@ -16191,15 +16550,18 @@ async function _selectAhDate(dateStr) {
         <button class="ahdate-delete" onclick="deleteAhDate('${escAttr(dateStr)}', this)">Delete day</button>
       </div>`;
     convs.forEach(c => {
-      const row = document.createElement('div');
+      const row = document.createElement('button');
+      row.type = 'button';
       row.className = 'ahconv-row';
       row.dataset.convId = c.id;
+      row.dataset.historyConversationId = c.id;
       const time = c.last_message_at
         ? new Date(c.last_message_at).toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'})
         : '';
       row.innerHTML =
         '<div class="ahconv-title">' + escHtml(c.title || '(untitled)') + '</div>' +
         '<div class="ahconv-meta">' + c.message_count + ' msg' + (time ? ' \u00B7 ' + time : '') + '</div>';
+      row.setAttribute('aria-label', 'Open history conversation ' + (c.title || c.id) + (time ? ', last message ' + time : ''));
       row.onclick = () => _loadAhMessages(c.id, row, dateStr);
       convList.appendChild(row);
     });
@@ -16535,12 +16897,15 @@ def _web_artifact_descriptors(
         messaging_upload_root(),
         workspace_roots.files,
         workspace_roots.media,
+        *_web_workspace_artifact_roots_from_paths(artifact_paths),
     )
     descriptors = []
     seen_ids: set[str] = set()
     for artifact_root in artifact_roots:
         for descriptor in artifact_descriptors_for_paths(artifact_paths, artifact_root=artifact_root):
             if descriptor.artifact_id in seen_ids:
+                continue
+            if is_unrequested_internal_sidecar_artifact(descriptor.path, requested_extensions=()):
                 continue
             seen_ids.add(descriptor.artifact_id)
             descriptors.append(descriptor)
@@ -16553,6 +16918,45 @@ def _web_artifact_descriptors(
             payload["preview_url"] = f"/api/artifacts/{descriptor.artifact_id}/preview"
         payloads.append(payload)
     return payloads
+
+
+def _web_workspace_artifact_roots_from_paths(artifact_paths: list[str] | tuple[str, ...] | None) -> tuple[Path, ...]:
+    base = workspace_storage_base()
+    roots: list[Path] = []
+    for raw_path in artifact_paths or ():
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        try:
+            relative = path.relative_to(base)
+        except ValueError:
+            relative = None
+        if relative is None or len(relative.parts) < 3 or relative.parts[1] != "artifacts":
+            root = _web_absolute_workspace_artifact_root(path)
+            if root is None:
+                continue
+        else:
+            root = (base / relative.parts[0] / "artifacts").resolve()
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _web_absolute_workspace_artifact_root(path: Path) -> Path | None:
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if part != "workspaces" or index + 2 >= len(parts):
+            continue
+        if parts[index + 2] != "artifacts":
+            continue
+        try:
+            return Path(*parts[: index + 3]).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+    return None
 
 
 def _is_previewable_web_artifact(descriptor) -> bool:
@@ -16589,6 +16993,7 @@ def _inline_artifact_headers(descriptor) -> dict[str, str]:
 
 
 _WEB_PLAIN_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./:-])(/(?!/)[^\s`'\"<>|]+)")
+_WEB_SANDBOX_ARTIFACT_REF_RE = re.compile(r"sandbox:([^\s`'\"<>)\]]+)")
 
 
 def _web_plain_artifact_paths_from_reply(reply: str | None) -> list[str]:
@@ -16600,9 +17005,59 @@ def _web_plain_artifact_paths_from_reply(reply: str | None) -> list[str]:
     return list(dict.fromkeys(paths))
 
 
+def _web_artifact_roots_for_delivery(runtime, principal_id: str | None) -> tuple[Path, ...]:
+    workspace_roots = workspace_storage_roots_for_principal(principal_id)
+    return tuple(
+        dict.fromkeys(
+            (
+                artifact_root_for_runtime(runtime),
+                artifact_root_for_principal(principal_id),
+                messaging_upload_root(),
+                workspace_roots.files,
+                workspace_roots.media,
+            )
+        )
+    )
+
+
+def _web_reply_artifact_paths(
+    runtime,
+    reply: str | None,
+    *,
+    principal_id: str | None,
+) -> list[str]:
+    paths: list[str] = [*_web_plain_artifact_paths_from_reply(reply)]
+    roots = _web_artifact_roots_for_delivery(runtime, principal_id)
+    for match in _WEB_SANDBOX_ARTIFACT_REF_RE.finditer(str(reply or "")):
+        raw = match.group(1).strip().rstrip(").,;:")
+        if not raw:
+            continue
+        raw_path = Path(raw)
+        candidate_paths = (raw_path,) if raw_path.is_absolute() else tuple(root / raw_path for root in roots)
+        for candidate in candidate_paths:
+            try:
+                resolved = candidate.expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if not resolved.is_file():
+                continue
+            if any(path_is_within(resolved, root) for root in roots):
+                paths.append(str(resolved))
+                break
+    return list(dict.fromkeys(paths))
+
+
 def _preferred_singular_artifact_paths_from_tool_results(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> list[str]:
+    structured_artifact_path_tools = {
+        "document_create",
+        "html_create",
+        "pdf_create",
+        "pdf_edit",
+        "presentation_create",
+        "spreadsheet_create",
+    }
     paths: list[str] = []
     for result in tool_results or ():
         if normalize_tool_status(getattr(result, "status", None)) != "completed":
@@ -16611,12 +17066,28 @@ def _preferred_singular_artifact_paths_from_tool_results(
         if tool_name == "browser_screenshot":
             continue
         output = result.output if isinstance(result.output, dict) else {}
+        descriptor_paths = artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES)
+        if descriptor_paths:
+            paths.extend(descriptor_paths)
+            continue
+        if output_has_artifact_descriptors(output):
+            continue
         value = output.get("artifact_path")
         if not isinstance(value, str) or not value.strip():
             if tool_name == "image_generate":
                 for key in ("path", "output_path"):
                     candidate = output.get(key)
                     if isinstance(candidate, str) and candidate.strip():
+                        value = candidate
+                        break
+            elif tool_name in structured_artifact_path_tools:
+                for key in ("path", "output_path"):
+                    candidate = output.get(key)
+                    if (
+                        isinstance(candidate, str)
+                        and candidate.strip()
+                        and Path(candidate).suffix.lower() in VALID_ATTACHMENT_EXTENSIONS
+                    ):
                         value = candidate
                         break
         if isinstance(value, str) and value.strip():
@@ -16665,16 +17136,110 @@ def _web_file_write_paths_from_tool_results(
     return paths
 
 
+def _web_completed_file_write_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> list[str]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        if str(getattr(result, "tool_name", "") or "") != "file_write":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        values: list[object] = [
+            output.get("path"),
+            output.get("artifact_path"),
+        ]
+        raw_artifact_paths = output.get("artifact_paths")
+        if isinstance(raw_artifact_paths, (list, tuple)):
+            values.extend(raw_artifact_paths)
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            suffix = Path(value).suffix.lower()
+            if suffix in VALID_ATTACHMENT_EXTENSIONS:
+                paths.append(value.strip())
+    return list(dict.fromkeys(paths))
+
+
+def _web_completed_tool_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    required_extensions: Iterable[str] | None = None,
+) -> list[str]:
+    normalized_required = tuple(
+        str(extension or "").strip().lower()
+        for extension in (required_extensions or ())
+        if str(extension or "").strip()
+    )
+    paths: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        tool_name = str(getattr(result, "tool_name", "") or "")
+        if tool_name in {"file_search", "workspace_summary", "file_read"}:
+            continue
+        if tool_name == "terminal_exec" and _web_terminal_stdout_is_path_listing(
+            result.output if isinstance(result.output, dict) else {}
+        ):
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        values: list[object] = []
+        for key in ("path", "file_path", "artifact_path"):
+            values.append(output.get(key))
+        raw_paths = output.get("artifact_paths")
+        if isinstance(raw_paths, (list, tuple)):
+            values.extend(raw_paths)
+        raw_artifacts = output.get("artifacts")
+        if isinstance(raw_artifacts, (list, tuple)):
+            for artifact in raw_artifacts:
+                if isinstance(artifact, Mapping):
+                    values.append(artifact.get("path"))
+                    values.append(artifact.get("artifact_path"))
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            suffix = Path(value).suffix.lower()
+            if suffix not in VALID_ATTACHMENT_EXTENSIONS:
+                continue
+            if normalized_required and suffix not in normalized_required:
+                continue
+            paths.append(value.strip())
+    return list(dict.fromkeys(paths))
+
+
+def _web_path_identity_variants(path: object) -> tuple[str, ...]:
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return ()
+    path_obj = Path(raw_path).expanduser()
+    variants = [str(path_obj)]
+    for marker in ("workspaces", "artifacts"):
+        if marker not in path_obj.parts:
+            continue
+        marker_index = path_obj.parts.index(marker)
+        if marker_index < len(path_obj.parts) - 1:
+            variants.append(str(Path(*path_obj.parts[marker_index:])))
+    try:
+        variants.append(str(path_obj.resolve()))
+    except OSError:
+        pass
+    return tuple(dict.fromkeys(variants))
+
+
 def _web_path_matches_identity_set(path: object, identities: set[str]) -> bool:
     if not identities:
         return False
-    path_obj = Path(str(path or "")).expanduser()
-    candidates = {str(path_obj)}
-    try:
-        candidates.add(str(path_obj.resolve()))
-    except OSError:
-        pass
-    return bool(candidates & identities)
+    return any(identity in identities for identity in _web_path_identity_variants(path))
+
+
+def _web_path_identity_set(paths: list[str] | tuple[str, ...] | set[str] | None) -> set[str]:
+    identities: set[str] = set()
+    for raw_path in paths or ():
+        if not str(raw_path or "").strip():
+            continue
+        identities.update(_web_path_identity_variants(raw_path))
+    return identities
 
 
 def _web_filter_completed_file_write_paths(paths: list[str], *, file_write_paths: set[str]) -> list[str]:
@@ -16703,6 +17268,93 @@ def _web_email_attachment_paths_from_tool_results(
         elif isinstance(values, (list, tuple)):
             paths.extend(str(value).strip() for value in values if isinstance(value, str) and value.strip())
     return list(dict.fromkeys(paths))
+
+
+def _web_completed_email_attachment_read_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> list[str]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "email_attachment_read":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for key in ("artifact_path", "artifact_paths"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.append(value.strip())
+            elif isinstance(value, (list, tuple)):
+                paths.extend(str(item).strip() for item in value if isinstance(item, str) and item.strip())
+        descriptors = output.get("artifact_descriptors")
+        if isinstance(descriptors, (list, tuple)):
+            for descriptor in descriptors:
+                if not isinstance(descriptor, dict):
+                    continue
+                path = descriptor.get("path")
+                if isinstance(path, str) and path.strip():
+                    paths.append(path.strip())
+    return list(dict.fromkeys(paths))
+
+
+def _web_email_read_attachment_filenames(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> set[str]:
+    filenames: set[str] = set()
+    for result in tool_results or ():
+        if str(getattr(result, "tool_name", "") or "") != "email_read":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        message = output.get("message")
+        if not isinstance(message, dict):
+            continue
+        attachments = message.get("attachments")
+        if not isinstance(attachments, (list, tuple)):
+            continue
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            filename = Path(str(attachment.get("filename") or "").strip()).name
+            if filename:
+                filenames.add(filename)
+    return filenames
+
+
+def _web_email_attachment_read_is_direct_delivery(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    completed_tool_names = {
+        str(getattr(result, "tool_name", "") or "").strip()
+        for result in tool_results or ()
+        if normalize_tool_status(getattr(result, "status", None)) == "completed"
+    }
+    completed_tool_names.discard("")
+    completed_tool_names.discard("request_tool_scope")
+    completed_tool_names.discard("skill_pack_read")
+    return bool(completed_tool_names) and completed_tool_names <= {"email_attachment_read"}
+
+
+def _web_filter_email_source_artifact_paths(
+    paths: list[str] | tuple[str, ...],
+    *,
+    suppressed_identities: set[str],
+    suppressed_filenames: set[str],
+) -> list[str]:
+    if not suppressed_identities and not suppressed_filenames:
+        return list(paths)
+    filtered: list[str] = []
+    for path in paths:
+        if not str(path or "").strip():
+            continue
+        candidate = Path(str(path)).expanduser()
+        if candidate.name in suppressed_filenames:
+            continue
+        if _web_path_matches_identity_set(str(candidate), suppressed_identities):
+            continue
+        filtered.append(path)
+    return filtered
 
 
 def _web_has_completed_image_generate_path(
@@ -16765,7 +17417,14 @@ def _web_browser_screenshot_paths_with_unverified_state(
         if normalize_tool_status(getattr(result, "status", None)) != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
-        page_url = str(output.get("page_url") or output.get("current_url") or output.get("url") or "").strip()
+        url_values = [
+            output.get(key)
+            for key in ("page_url", "current_url", "url")
+            if key in output
+        ]
+        if not url_values:
+            continue
+        page_url = str(next((value for value in url_values if value), "") or "").strip()
         if page_url.lower() not in _WEB_UNVERIFIED_SCREENSHOT_URLS:
             continue
         paths.update(_web_normalized_path_identity(path) for path in _web_browser_screenshot_artifact_paths((result,)))
@@ -16817,6 +17476,42 @@ def _web_reply_is_browser_extract_text_dump(
     )
 
 
+def _web_sanitize_delivery_reply(
+    *,
+    user_message: str | None,
+    reply: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    source: str = "agent",
+) -> str:
+    original = str(reply or "")
+    sanitized = sanitize_user_visible_reply(
+        user_message=user_message,
+        reply=original,
+        tool_results=tool_results,
+        source=source,
+    ) or original
+    if _web_reply_is_browser_extract_text_dump(sanitized, tool_results) or _web_reply_is_browser_extract_text_dump(original, tool_results):
+        try:
+            from nullion.response_sanitizer import (
+                _browser_catalog_line_pairs,
+                _browser_catalog_reply_from_extract_text,
+                _browser_catalog_reply_over_raw_extract_dump,
+                _browser_catalog_signal_score,
+            )
+
+            catalog_reply = _browser_catalog_reply_over_raw_extract_dump(
+                sanitized,
+                list(tool_results or ()),
+            )
+            if not catalog_reply and _browser_catalog_signal_score(original) >= 3 and _browser_catalog_line_pairs(original, limit=1):
+                catalog_reply = _browser_catalog_reply_from_extract_text(original)
+        except Exception:
+            catalog_reply = None
+        if catalog_reply:
+            return catalog_reply
+    return sanitized
+
+
 def _web_is_email_confirmation_text_artifact(path_text: object) -> bool:
     path = Path(str(path_text or "").strip())
     return path.suffix.lower() == ".txt" and "confirmation" in path.name.casefold()
@@ -16835,7 +17530,10 @@ def _filter_web_artifact_paths_for_requested_format(
     }
     if len(explicit_extensions) > 1:
         return paths
-    selected_extension = requested_extension or plan_attachment_format(prompt or "").extension
+    selected_extension = requested_extension or plan_attachment_format(
+        prompt or "",
+        allow_filename_tokens=True,
+    ).extension
     if not selected_extension:
         return paths
     matching = [path for path in paths if Path(path).suffix.lower() == selected_extension.lower()]
@@ -16860,6 +17558,309 @@ def _web_result_artifact_paths(raw_artifacts: object) -> list[str]:
     return list(dict.fromkeys(paths))
 
 
+def _web_tool_result_deliverable_extensions(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for path in artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES):
+            suffix = Path(str(path or "")).suffix.lower()
+            if suffix and suffix not in extensions:
+                extensions.append(suffix)
+    return tuple(extensions)
+
+
+def _web_tool_result_non_deliverable_extensions(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    extensions: list[str] = []
+
+    def add_path_extension(value: object) -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        suffix = Path(value).suffix.lower()
+        if suffix and suffix not in extensions:
+            extensions.append(suffix)
+
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        descriptors = output.get("artifact_descriptors")
+        if isinstance(descriptors, (list, tuple)):
+            for descriptor in descriptors:
+                if not isinstance(descriptor, dict):
+                    continue
+                role = descriptor.get("role")
+                if isinstance(role, str) and role in ARTIFACT_DELIVERY_ROLES:
+                    continue
+                add_path_extension(descriptor.get("path"))
+        for key in (
+            "archive_path",
+            "embedded_images",
+            "embedded_screenshots",
+            "source_image_paths",
+            "source_screenshot_paths",
+            "optimized_image_paths",
+            "remote_image_urls",
+            "skipped_images",
+        ):
+            value = output.get(key)
+            if isinstance(value, str):
+                add_path_extension(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, dict):
+                        add_path_extension(item.get("path") or item.get("url"))
+                    else:
+                        add_path_extension(item)
+    return tuple(extensions)
+
+
+_WEB_PRIMARY_PACKAGE_EXTENSIONS = frozenset({".csv", ".docx", ".html", ".pdf", ".pptx", ".xlsx"})
+
+
+def _web_prompt_requested_attachment_extensions(prompt: str | None) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(prompt or "")):
+        extension = f".{match.group(1).lower()}"
+        if extension in VALID_ATTACHMENT_EXTENSIONS:
+            extensions.append(extension)
+    for token in re.findall(r"[A-Za-z0-9_+-]+", str(prompt or "")):
+        extension = ATTACHMENT_TOKEN_EXTENSIONS.get(token.lower())
+        if extension in VALID_ATTACHMENT_EXTENSIONS:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+def _web_infer_completed_artifact_package_extensions(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    candidate_paths: Iterable[str],
+) -> tuple[str, ...]:
+    completed_tool_names = {
+        str(getattr(result, "tool_name", "") or "").strip()
+        for result in tool_results or ()
+        if normalize_tool_status(getattr(result, "status", None)) == "completed"
+    }
+    if "image_generate" in completed_tool_names:
+        return ()
+    artifact_producing_tools = {
+        "document_create",
+        "file_write",
+        "html_create",
+        "pdf_create",
+        "pdf_edit",
+        "presentation_create",
+        "spreadsheet_create",
+        "terminal_exec",
+    }
+    if not completed_tool_names.intersection(artifact_producing_tools):
+        return ()
+    extensions: list[str] = []
+    for raw_path in candidate_paths:
+        suffix = Path(str(raw_path or "")).suffix.lower()
+        if suffix == ".htm":
+            suffix = ".html"
+        if suffix in _WEB_PRIMARY_PACKAGE_EXTENSIONS:
+            extensions.append(suffix)
+    return tuple(extensions) if len(set(extensions)) >= 2 else ()
+
+
+def _web_scope_artifact_extension_group(output: dict[str, object]) -> tuple[str, ...]:
+    extensions: list[str] = []
+    for key in ("artifact_extensions", "requested_artifact_extensions", "required_artifact_extensions"):
+        raw_values = output.get(key)
+        values = raw_values if isinstance(raw_values, (list, tuple)) else ()
+        for raw_extension in values:
+            extension = str(raw_extension or "").strip().lower()
+            if not extension:
+                continue
+            if not extension.startswith("."):
+                extension = f".{extension}"
+            if extension in VALID_ATTACHMENT_EXTENSIONS:
+                extensions.append(extension)
+    for extension in normalize_artifact_media_required_extensions(
+        output.get("embedded_media_artifact_extensions")
+    ):
+        if extension not in extensions and extension in VALID_ATTACHMENT_EXTENSIONS:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
+def _web_refine_required_attachment_extensions_for_deliverables(
+    required_extensions: list[str] | tuple[str, ...] | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    normalized = _web_merge_required_attachment_extensions(required_extensions, ())
+    direct_existing_artifact_paths = _web_direct_existing_artifact_signal_paths(tool_results)
+    if normalized and any(
+        Path(path).suffix.lower() in normalized
+        for path in direct_existing_artifact_paths
+    ):
+        return normalized
+    if _web_tool_results_are_local_discovery_listing(
+        tool_results
+    ) or _web_tool_results_are_local_discovery_or_sidecar(
+        tool_results,
+        required_extensions=normalized,
+    ):
+        return ()
+    deliverable_extensions = _web_tool_result_deliverable_extensions(tool_results)
+    if not normalized or not deliverable_extensions:
+        return normalized
+    non_deliverable_extensions = set(_web_tool_result_non_deliverable_extensions(tool_results))
+    refined: list[str] = []
+    for extension in normalized:
+        if extension in deliverable_extensions or extension not in non_deliverable_extensions:
+            refined.append(extension)
+    if not refined:
+        refined.extend(deliverable_extensions)
+    return tuple(refined)
+
+
+def _web_refine_requested_extension_for_deliverables(
+    requested_extension: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
+    extension = str(requested_extension or "").strip().lower()
+    if not extension:
+        return requested_extension
+    if not extension.startswith("."):
+        extension = f".{extension}"
+    if any(
+        Path(path).suffix.lower() == extension
+        for path in _web_direct_existing_artifact_signal_paths(tool_results)
+    ):
+        return extension
+    if _web_tool_results_are_local_discovery_listing(
+        tool_results
+    ) or _web_tool_results_are_local_discovery_or_sidecar(
+        tool_results,
+        required_extensions=(extension,),
+    ):
+        return None
+    deliverable_extensions = _web_tool_result_deliverable_extensions(tool_results)
+    if not deliverable_extensions or extension in deliverable_extensions:
+        return extension
+    if extension in set(_web_tool_result_non_deliverable_extensions(tool_results)):
+        return deliverable_extensions[0] if len(deliverable_extensions) == 1 else None
+    return extension
+
+
+def _web_requested_output_filenames_from_texts(*texts: str | None) -> tuple[str, ...]:
+    try:
+        from nullion.chat_operator import _requested_output_filenames_from_texts
+    except Exception:
+        return ()
+    return _requested_output_filenames_from_texts(*texts)
+
+
+def _web_filter_paths_to_requested_output_filenames_when_complete(
+    prompt: str | None,
+    paths: Iterable[str],
+    *,
+    reply: str | None = None,
+) -> list[str]:
+    candidate_paths = [str(path) for path in paths if str(path or "").strip()]
+    prompt_requested_names = {
+        name.lower()
+        for name in _web_requested_output_filenames_from_texts(prompt)
+    }
+    if not prompt_requested_names:
+        return candidate_paths
+    candidate_names = {Path(path).name.lower() for path in candidate_paths}
+    if not prompt_requested_names.issubset(candidate_names):
+        return candidate_paths
+    requested_names = {
+        name.lower()
+        for name in _web_requested_output_filenames_from_texts(prompt, reply)
+    } or prompt_requested_names
+    filtered = [
+        path
+        for path in candidate_paths
+        if Path(path).name.lower() in requested_names
+    ]
+    return list(dict.fromkeys(filtered or candidate_paths))
+
+
+def _web_prefer_complete_artifact_stem_package(
+    paths: Iterable[str],
+    required_extensions: Iterable[str],
+    *,
+    required_embedded_media_extensions: Iterable[str] = (),
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+) -> list[str]:
+    candidate_paths = [str(path) for path in paths if str(path or "").strip()]
+    if any(count > 1 for count in _web_required_extension_counts(required_extensions).values()):
+        return list(dict.fromkeys(candidate_paths))
+    required = {
+        ".html" if extension == ".htm" else extension
+        for extension in (str(item or "").strip().lower() for item in required_extensions)
+        if extension
+    }
+    if len(required) < 2:
+        return list(dict.fromkeys(candidate_paths))
+    media_required = {
+        ".html" if extension == ".htm" else extension
+        for extension in (str(item or "").strip().lower() for item in required_embedded_media_extensions)
+        if extension
+    }
+    stem_order: list[str] = []
+    stem_paths: dict[str, list[str]] = {}
+    stem_extensions: dict[str, set[str]] = {}
+    for path in candidate_paths:
+        parsed = Path(path)
+        suffix = parsed.suffix.lower()
+        if suffix == ".htm":
+            suffix = ".html"
+        if suffix not in required:
+            continue
+        stem = parsed.stem
+        if stem not in stem_paths:
+            stem_order.append(stem)
+            stem_paths[stem] = []
+            stem_extensions[stem] = set()
+        stem_paths[stem].append(path)
+        stem_extensions[stem].add(suffix)
+
+    for stem in stem_order:
+        if not required.issubset(stem_extensions.get(stem, set())):
+            continue
+        paths_for_stem = stem_paths.get(stem, [])
+        if media_required:
+            media_ok = True
+            for extension in media_required:
+                matching_media_paths = [
+                    path
+                    for path in paths_for_stem
+                    if (".html" if Path(path).suffix.lower() == ".htm" else Path(path).suffix.lower()) == extension
+                ]
+                if not any(
+                    _web_artifact_satisfies_embedded_media_requirement(
+                        path,
+                        tool_results=tool_results,
+                        allow_html_container=required == {".html"},
+                    )
+                    for path in matching_media_paths
+                ):
+                    media_ok = False
+                    break
+            if not media_ok:
+                continue
+        return list(
+            dict.fromkeys(
+                path
+                for path in candidate_paths
+                if Path(path).stem == stem
+                and (".html" if Path(path).suffix.lower() == ".htm" else Path(path).suffix.lower()) in required
+            )
+        )
+    return list(dict.fromkeys(candidate_paths))
+
+
 def _web_delivery_artifact_paths(
     runtime,
     *,
@@ -16869,8 +17870,65 @@ def _web_delivery_artifact_paths(
     artifact_paths: list[str] | tuple[str, ...] | None = None,
     principal_id: str | None = None,
     requested_extension: str | None = None,
+    required_attachment_extensions: list[str] | tuple[str, ...] | None = None,
 ) -> list[str]:
+    explicitly_requested_extension = requested_extension
+    explicitly_required_attachment_extensions = tuple(required_attachment_extensions or ())
+    normalized_required_extensions = _web_merge_required_attachment_extensions(
+        required_attachment_extensions,
+        tool_results,
+    )
+    required_embedded_media_extensions = _web_required_embedded_media_extensions_from_tool_scope(tool_results)
+    if required_embedded_media_extensions:
+        # Embedded-media requirements constrain the listed media-bearing
+        # deliverables; they do not replace the full attachment contract. A
+        # mixed package can validly require CSV + HTML + PDF while only the
+        # HTML/PDF members must contain embedded media.
+        if not normalized_required_extensions:
+            normalized_required_extensions = required_embedded_media_extensions
+    normalized_required_extensions = _web_refine_required_attachment_extensions_for_deliverables(
+        normalized_required_extensions,
+        tool_results,
+    )
+    requested_extension = _web_refine_requested_extension_for_deliverables(
+        requested_extension,
+        tool_results,
+    )
+    if requested_extension:
+        normalized_required_extensions = _web_merge_required_attachment_extensions(
+            (*normalized_required_extensions, requested_extension),
+            (),
+        )
+    if normalized_required_extensions and not requested_extension:
+        existing_required_extension_set = set(normalized_required_extensions)
+        prompt_requested_extensions = tuple(
+            extension
+            for extension in _web_prompt_requested_attachment_extensions(prompt)
+            if extension in _WEB_PRIMARY_PACKAGE_EXTENSIONS
+            and extension not in existing_required_extension_set
+        )
+        if prompt_requested_extensions:
+            normalized_required_extensions = _web_merge_required_attachment_extensions(
+                (*normalized_required_extensions, *prompt_requested_extensions),
+                (),
+            )
     email_attachment_paths = _web_email_attachment_paths_from_tool_results(tool_results)
+    email_attachment_read_paths = _web_completed_email_attachment_read_paths(tool_results)
+    suppress_email_source_artifacts = bool(email_attachment_read_paths) and not (
+        explicitly_requested_extension
+        or explicitly_required_attachment_extensions
+        or _web_email_attachment_read_is_direct_delivery(tool_results)
+    )
+    suppressed_email_source_identities = (
+        _web_path_identity_set(email_attachment_read_paths)
+        if suppress_email_source_artifacts
+        else set()
+    )
+    suppressed_email_source_filenames = (
+        _web_email_read_attachment_filenames(tool_results)
+        if suppress_email_source_artifacts
+        else set()
+    )
     browser_screenshot_paths = _web_browser_screenshot_artifact_paths(tool_results)
     unverified_browser_screenshot_paths = _web_browser_screenshot_paths_with_unverified_state(tool_results)
     verified_browser_screenshot_paths = [
@@ -16879,16 +17937,44 @@ def _web_delivery_artifact_paths(
         if _web_normalized_path_identity(path) not in unverified_browser_screenshot_paths
     ]
     explicit_media_paths = [str(path) for path in media_candidate_paths_from_text(str(reply or ""))]
+    if suppress_email_source_artifacts:
+        explicit_media_paths = _web_filter_email_source_artifact_paths(
+            explicit_media_paths,
+            suppressed_identities=suppressed_email_source_identities,
+            suppressed_filenames=suppressed_email_source_filenames,
+        )
+    if required_embedded_media_extensions:
+        explicit_media_allowed_extensions = set(normalized_required_extensions) | set(
+            required_embedded_media_extensions
+        )
+        explicit_media_paths = [
+            path
+            for path in explicit_media_paths
+            if Path(path).suffix.lower() in explicit_media_allowed_extensions
+        ]
     explicit_result_artifact_paths = [
         str(path)
         for path in (artifact_paths or ())
         if str(path or "").strip()
     ]
+    if suppress_email_source_artifacts:
+        explicit_result_artifact_paths = _web_filter_email_source_artifact_paths(
+            explicit_result_artifact_paths,
+            suppressed_identities=suppressed_email_source_identities,
+            suppressed_filenames=suppressed_email_source_filenames,
+        )
+        artifact_paths = tuple(
+            _web_filter_email_source_artifact_paths(
+                tuple(str(path) for path in (artifact_paths or ()) if str(path or "").strip()),
+                suppressed_identities=suppressed_email_source_identities,
+                suppressed_filenames=suppressed_email_source_filenames,
+            )
+        )
     file_write_paths = _web_file_write_paths_from_tool_results(tool_results)
+    file_write_artifact_paths = _web_completed_file_write_artifact_paths_from_tool_results(tool_results)
     include_file_write_artifacts = bool(
-        requested_extension
-        or _web_required_attachment_extensions_from_tool_scope(tool_results)
-        or _web_required_embedded_media_extensions_from_tool_scope(tool_results)
+        normalized_required_extensions
+        or required_embedded_media_extensions
     )
     if email_attachment_paths:
         explicit_media_paths = [
@@ -16900,41 +17986,213 @@ def _web_delivery_artifact_paths(
         and all(_web_path_matches_identity_set(path, file_write_paths) for path in explicit_media_paths)
     ):
         return []
+    if (
+        explicit_media_paths
+        and _web_tool_scope_declared_no_attachment_extensions(tool_results)
+        and all(_web_path_matches_identity_set(path, file_write_paths) for path in explicit_media_paths)
+    ):
+        return []
     preferred_tool_artifacts = _preferred_singular_artifact_paths_from_tool_results(tool_results)
+    all_tool_artifacts = artifact_paths_from_tool_results(tool_results)
+    if suppress_email_source_artifacts:
+        preferred_tool_artifacts = _web_filter_email_source_artifact_paths(
+            preferred_tool_artifacts,
+            suppressed_identities=suppressed_email_source_identities,
+            suppressed_filenames=suppressed_email_source_filenames,
+        )
+        all_tool_artifacts = _web_filter_email_source_artifact_paths(
+            all_tool_artifacts,
+            suppressed_identities=suppressed_email_source_identities,
+            suppressed_filenames=suppressed_email_source_filenames,
+        )
+    local_discovery_paths = _web_local_discovery_paths_from_tool_results(tool_results)
+    deliverable_local_discovery_paths = _web_required_local_discovery_paths(
+        tool_results,
+        normalized_required_extensions,
+    )
+    direct_existing_artifact_discovery_paths = _web_direct_existing_artifact_discovery_paths(
+        runtime,
+        tool_results,
+        principal_id=principal_id,
+    )
+    if direct_existing_artifact_discovery_paths:
+        deliverable_local_discovery_paths = tuple(
+            dict.fromkeys(
+                (
+                    *deliverable_local_discovery_paths,
+                    *direct_existing_artifact_discovery_paths,
+                )
+            )
+        )
+    if local_discovery_paths:
+        deliverable_local_discovery_identities = _web_path_identity_set(deliverable_local_discovery_paths)
+        suppressed_local_discovery_paths = [
+            path
+            for path in local_discovery_paths
+            if not _web_path_matches_identity_set(path, deliverable_local_discovery_identities)
+        ]
+        local_discovery_identities = _web_path_identity_set(suppressed_local_discovery_paths)
+        explicit_result_artifact_paths = [
+            path
+            for path in explicit_result_artifact_paths
+            if not _web_path_matches_identity_set(path, local_discovery_identities)
+        ]
+        artifact_paths = tuple(
+            path
+            for path in artifact_paths or ()
+            if not _web_path_matches_identity_set(str(path), local_discovery_identities)
+        )
+        preferred_tool_artifacts = [
+            path
+            for path in preferred_tool_artifacts
+            if not _web_path_matches_identity_set(path, local_discovery_identities)
+        ]
+        all_tool_artifacts = [
+            path
+            for path in all_tool_artifacts
+            if not _web_path_matches_identity_set(path, local_discovery_identities)
+        ]
+    required_tool_artifacts = [
+        *deliverable_local_discovery_paths,
+        *[
+        path
+        for path in all_tool_artifacts
+        if Path(str(path or "")).suffix.lower() in normalized_required_extensions
+        ],
+    ]
     companion_tool_artifacts = (
         _companion_artifact_paths_from_tool_results(tool_results)
-        if include_file_write_artifacts
+        if include_file_write_artifacts and not normalized_required_extensions
         else []
     )
-    all_tool_artifacts = artifact_paths_from_tool_results(tool_results)
     if not include_file_write_artifacts:
         all_tool_artifacts = _web_filter_completed_file_write_paths(
             all_tool_artifacts,
             file_write_paths=file_write_paths,
         )
+    reply_artifact_paths = _web_reply_artifact_paths(
+        runtime,
+        reply,
+        principal_id=principal_id,
+    )
+    if suppress_email_source_artifacts:
+        reply_artifact_paths = _web_filter_email_source_artifact_paths(
+            reply_artifact_paths,
+            suppressed_identities=suppressed_email_source_identities,
+            suppressed_filenames=suppressed_email_source_filenames,
+        )
+    if required_embedded_media_extensions:
+        reply_artifact_paths = [
+            path
+            for path in reply_artifact_paths
+            if Path(path).suffix.lower() in required_embedded_media_extensions
+        ]
     if explicit_media_paths:
         candidates = explicit_media_paths
+    elif normalized_required_extensions and not requested_extension and not explicit_result_artifact_paths:
+        candidates = [
+            *required_tool_artifacts,
+            *reply_artifact_paths,
+        ]
     elif preferred_tool_artifacts and not requested_extension and not explicit_result_artifact_paths:
         candidates = [
             *preferred_tool_artifacts,
+            *required_tool_artifacts,
             *companion_tool_artifacts,
-            *_web_plain_artifact_paths_from_reply(reply),
+            *reply_artifact_paths,
         ]
     else:
         candidates = [
             *preferred_tool_artifacts,
+            *required_tool_artifacts,
             *email_attachment_paths,
             *(artifact_paths or ()),
             *all_tool_artifacts,
-            *_web_plain_artifact_paths_from_reply(reply),
+            *reply_artifact_paths,
         ]
-    raw_artifact_candidates = list(dict.fromkeys(str(path) for path in candidates if str(path or "").strip()))
+    if (
+        reply_artifact_paths
+        and not explicit_result_artifact_paths
+        and not explicit_media_paths
+        and not email_attachment_paths
+        and not normalized_required_extensions
+        and not required_embedded_media_extensions
+        and not preferred_tool_artifacts
+    ):
+        candidates = list(reply_artifact_paths)
+    preflight_file_write_artifact_paths = file_write_artifact_paths
+    if normalized_required_extensions:
+        preflight_file_write_artifact_paths = [
+            path
+            for path in file_write_artifact_paths
+            if Path(path).suffix.lower() in normalized_required_extensions
+        ]
+    elif required_embedded_media_extensions:
+        preflight_file_write_artifact_paths = [
+            path
+            for path in file_write_artifact_paths
+            if Path(path).suffix.lower() in required_embedded_media_extensions
+        ]
+    elif not include_file_write_artifacts:
+        preflight_file_write_artifact_paths = []
+    raw_artifact_candidates = list(
+        dict.fromkeys(
+            str(path)
+            for path in [*candidates, *preflight_file_write_artifact_paths]
+            if str(path or "").strip()
+        )
+    )
     delivery_contract = delivery_contract_for_turn(
         prompt,
         reply=reply,
         artifact_paths=raw_artifact_candidates,
         required_attachment_extensions=((requested_extension,) if requested_extension else ()),
     )
+    if delivery_contract.required_attachment_extensions:
+        normalized_required_extensions = _web_merge_required_attachment_extensions(
+            (
+                *normalized_required_extensions,
+                *delivery_contract.required_attachment_extensions,
+            ),
+            (),
+        )
+        normalized_required_extensions = _web_refine_required_attachment_extensions_for_deliverables(
+            normalized_required_extensions,
+            tool_results,
+        )
+        if required_embedded_media_extensions:
+            normalized_required_extensions = _web_merge_required_attachment_extensions(
+                (
+                    *normalized_required_extensions,
+                    *(
+                        required_embedded_media_extensions
+                        if not normalized_required_extensions
+                        else ()
+                    ),
+                ),
+                (),
+            )
+    if normalized_required_extensions:
+        required_file_write_artifacts = [
+            path
+            for path in file_write_artifact_paths
+            if Path(path).suffix.lower() in normalized_required_extensions
+        ]
+        if required_file_write_artifacts:
+            candidates = list(dict.fromkeys([*candidates, *required_file_write_artifacts]))
+    if not normalized_required_extensions and not requested_extension and not email_attachment_paths:
+        inferred_package_extensions = _web_infer_completed_artifact_package_extensions(
+            tool_results,
+            candidates,
+        )
+        if inferred_package_extensions:
+            normalized_required_extensions = inferred_package_extensions
+            candidates = [
+                path
+                for path in candidates
+                if (".html" if Path(path).suffix.lower() == ".htm" else Path(path).suffix.lower())
+                in normalized_required_extensions
+            ]
     non_screenshot_candidates = [
         path
         for path in candidates
@@ -16944,8 +18202,21 @@ def _web_delivery_artifact_paths(
     referenced_browser_screenshot_paths = [
         path for path in verified_browser_screenshot_paths if _web_reply_references_artifact_path(reply, path)
     ]
+    completed_non_scope_tool_names = [
+        str(getattr(result, "tool_name", "") or "").strip()
+        for result in tool_results or ()
+        if normalize_tool_status(getattr(result, "status", None)) == "completed"
+        and str(getattr(result, "tool_name", "") or "").strip() != "request_tool_scope"
+    ]
+    screenshot_is_only_completed_delivery_tool = bool(verified_browser_screenshot_paths) and set(
+        completed_non_scope_tool_names
+    ) == {"browser_screenshot"}
     screenshot_is_primary_delivery = bool(verified_browser_screenshot_paths) and (
         requested_extension == ".png"
+        or (
+            screenshot_is_only_completed_delivery_tool
+            and not non_screenshot_candidates
+        )
         or (
             requested_extension is None
             and bool(referenced_browser_screenshot_paths)
@@ -16961,9 +18232,13 @@ def _web_delivery_artifact_paths(
         raw_artifact_candidates
         and not explicit_result_artifact_paths
         and not explicit_media_paths
+        and not reply_artifact_paths
         and not email_attachment_paths
         and not _web_has_completed_image_generate_path(tool_results)
         and not screenshot_is_primary_delivery
+        and not preferred_tool_artifacts
+        and not direct_existing_artifact_discovery_paths
+        and not normalized_required_extensions
         and not delivery_contract.requires_attachment_delivery
     ):
         # Match the platform adapters: raw tool/runtime artifact paths are
@@ -16981,18 +18256,66 @@ def _web_delivery_artifact_paths(
     ]
     candidates = list(dict.fromkeys(str(path) for path in candidates if str(path or "").strip()))
     if email_attachment_paths:
+        # An email send's attachment list is the typed delivery contract. Earlier
+        # helper artifacts may include source media or drafts that should not be
+        # re-delivered as chat artifacts after the send completes.
+        candidates = [
+            path for path in email_attachment_paths if not _web_is_email_confirmation_text_artifact(path)
+        ]
+    if normalized_required_extensions and not email_attachment_paths:
+        candidates = [
+            path
+            for path in candidates
+            if Path(path).suffix.lower() in normalized_required_extensions
+        ]
+    if email_attachment_paths:
         candidates = [path for path in candidates if not _web_is_email_confirmation_text_artifact(path)]
+    sidecar_requested_extensions = normalized_required_extensions or (
+        (requested_extension,) if requested_extension else ()
+    )
+    if candidates:
+        candidates = [
+            path
+            for path in candidates
+            if not is_unrequested_internal_sidecar_artifact(
+                path,
+                requested_extensions=sidecar_requested_extensions,
+            )
+        ]
     explicit_result_suffixes = {
         Path(path).suffix.lower()
         for path in explicit_result_artifact_paths
         if Path(path).suffix
     }
-    if not (not requested_extension and explicit_result_artifact_paths and len(explicit_result_suffixes) > 1):
+    explicit_media_suffixes = {
+        Path(path).suffix.lower()
+        for path in explicit_media_paths
+        if Path(path).suffix
+    }
+    reply_artifact_suffixes = {
+        Path(path).suffix.lower()
+        for path in reply_artifact_paths
+        if Path(path).suffix
+    }
+    email_attachment_suffixes = {
+        Path(path).suffix.lower()
+        for path in email_attachment_paths
+        if Path(path).suffix
+    }
+    multi_required_extension_contract = len(set(normalized_required_extensions)) > 1
+    if not (
+        multi_required_extension_contract
+        or (not requested_extension and explicit_result_artifact_paths and len(explicit_result_suffixes) > 1)
+        or (not requested_extension and explicit_media_paths and len(explicit_media_suffixes) > 1)
+        or (not requested_extension and reply_artifact_paths and len(reply_artifact_suffixes) > 1)
+        or (email_attachment_paths and len(email_attachment_suffixes) > 1)
+    ):
         candidates = _filter_web_artifact_paths_for_requested_format(
             prompt,
             candidates,
             requested_extension=requested_extension,
         )
+    image_generate_fallback_paths: list[str] = []
     if not candidates:
         # Image generation can intentionally fall back from a requested raster
         # extension to an existing SVG artifact. Prefer delivering the verified
@@ -17000,12 +18323,492 @@ def _web_delivery_artifact_paths(
         image_fallback_candidates = _web_completed_image_generate_paths(tool_results)
         if image_fallback_candidates:
             candidates = image_fallback_candidates
+            image_generate_fallback_paths = image_fallback_candidates
+    if email_attachment_paths:
+        candidates = _web_replace_plain_office_artifacts_with_recent_media(
+            runtime,
+            conversation_id=principal_id,
+            paths=candidates,
+        )
+    if required_embedded_media_extensions:
+        candidates = _web_replace_plain_office_artifacts_with_recent_media(
+            runtime,
+            conversation_id=principal_id,
+            paths=candidates,
+        )
+        media_required_suffixes = set(required_embedded_media_extensions)
+        media_satisfied_suffixes = {
+            Path(path).suffix.lower()
+            for path in candidates
+            if Path(path).suffix.lower() in media_required_suffixes
+            and _web_artifact_satisfies_embedded_media_requirement(
+                path,
+                tool_results=tool_results,
+                allow_html_container=(
+                    set(normalized_required_extensions) <= {".html"}
+                    and media_required_suffixes <= {".html"}
+                ),
+            )
+        }
+        candidates = [
+            path
+            for path in candidates
+            if Path(path).suffix.lower() not in media_required_suffixes
+            or Path(path).suffix.lower() in media_satisfied_suffixes
+        ]
+    candidates = _web_filter_paths_to_requested_output_filenames_when_complete(
+        prompt,
+        candidates,
+        reply=reply,
+    )
+    if normalized_required_extensions and not email_attachment_paths:
+        # Keep the typed final-deliverable extension contract authoritative
+        # after all late path merges and companion/replacement handling. Raw
+        # result artifacts can include support notes, manifests, or source
+        # media that were valid to create but are not user-facing attachments.
+        image_fallback_identities = _web_path_identity_set(image_generate_fallback_paths)
+        candidates = [
+            path
+            for path in candidates
+            if Path(path).suffix.lower() in normalized_required_extensions
+            or _web_path_matches_identity_set(path, image_fallback_identities)
+        ]
+        candidates = _web_prefer_complete_artifact_stem_package(
+            candidates,
+            normalized_required_extensions,
+            required_embedded_media_extensions=required_embedded_media_extensions,
+            tool_results=tool_results,
+        )
+    if reply_artifact_paths and not email_attachment_paths and not multi_required_extension_contract:
+        reply_artifact_identities = _web_path_identity_set(reply_artifact_paths)
+        reply_selected_candidates = [
+            path
+            for path in candidates
+            if _web_path_matches_identity_set(path, reply_artifact_identities)
+        ]
+        if reply_selected_candidates:
+            candidates = reply_selected_candidates
     descriptor_paths = [
         str(payload.get("path") or "")
         for payload in _web_artifact_descriptors(runtime, candidates, principal_id=principal_id)
         if str(payload.get("path") or "")
     ]
     return list(dict.fromkeys(descriptor_paths))
+
+
+def _web_filter_artifact_paths_to_reply_paths(
+    runtime,
+    *,
+    reply: str | None,
+    artifact_paths: list[str] | tuple[str, ...] | None,
+    principal_id: str | None = None,
+    required_attachment_extensions: Iterable[str] | None = None,
+    prompt: str | None = None,
+) -> list[str]:
+    paths = [str(path) for path in artifact_paths or () if str(path or "").strip()]
+    explicit_requested_paths = _web_filter_paths_to_requested_output_filenames_when_complete(
+        prompt,
+        paths,
+        reply=reply,
+    )
+    if explicit_requested_paths != paths:
+        return explicit_requested_paths
+    normalized_required = tuple(
+        str(extension or "").strip().lower()
+        for extension in (required_attachment_extensions or ())
+        if str(extension or "").strip()
+    )
+    final_reply_artifact_paths = [
+        str(path)
+        for path in media_candidate_paths_from_text(str(reply or ""))
+        if str(path or "").strip()
+    ] or _web_reply_artifact_paths(
+        runtime,
+        reply,
+        principal_id=principal_id,
+    )
+    if not final_reply_artifact_paths:
+        if normalized_required:
+            required_paths = [
+                path
+                for path in paths
+                if Path(path).suffix.lower() in normalized_required
+            ]
+            if required_paths and _web_paths_satisfy_required_extension_counts(
+                required_paths,
+                normalized_required,
+            ):
+                return list(dict.fromkeys(required_paths))
+        return list(dict.fromkeys(paths))
+    final_reply_artifact_identities = _web_path_identity_set(final_reply_artifact_paths)
+    filtered = list(
+        dict.fromkeys(
+            path
+            for path in paths
+            if _web_path_matches_identity_set(path, final_reply_artifact_identities)
+        )
+    )
+    if normalized_required:
+        filtered_required_paths = [
+            path
+            for path in filtered
+            if Path(path).suffix.lower() in normalized_required
+        ]
+        if filtered_required_paths and _web_paths_satisfy_required_extension_counts(
+            filtered_required_paths,
+            normalized_required,
+        ):
+            return list(dict.fromkeys(filtered_required_paths))
+        required_paths = [
+            path
+            for path in paths
+            if Path(path).suffix.lower() in normalized_required
+        ]
+        if required_paths and _web_paths_satisfy_required_extension_counts(
+            required_paths,
+            normalized_required,
+        ):
+            return list(dict.fromkeys(required_paths))
+    if filtered:
+        return filtered
+    return filtered
+
+
+def _web_office_artifact_embedded_media_count(path: Path) -> int:
+    if path.suffix.lower() not in {".docx", ".pptx", ".xlsx"}:
+        return 0
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(path) as package:
+            return sum(
+                1
+                for member in package.namelist()
+                if member.startswith(("word/media/", "ppt/media/", "xl/media/"))
+            )
+    except Exception:
+        return 0
+
+
+def _web_artifact_satisfies_embedded_media_requirement(
+    path: str | Path,
+    *,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    allow_html_container: bool = False,
+) -> bool:
+    path_obj = Path(str(path or "")).expanduser()
+    suffix = path_obj.suffix.lower()
+    if suffix == ".htm":
+        suffix = ".html"
+    if suffix == ".html" and allow_html_container:
+        try:
+            return path_obj.is_file() and path_obj.stat().st_size > 0
+        except OSError:
+            return False
+    return artifact_path_embedded_media_count(path_obj, tool_results=tool_results) > 0
+
+
+def _web_event_artifact_candidate_paths(event: Mapping[str, Any]) -> tuple[str, ...]:
+    paths: list[str] = []
+
+    def add_path(value: object) -> None:
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+
+    def add_output_paths(output: object) -> None:
+        if not isinstance(output, Mapping):
+            return
+        for key in ("path", "artifact_path", "file_path"):
+            add_path(output.get(key))
+        for key in ("artifact_paths", "artifacts"):
+            values = output.get(key)
+            if isinstance(values, (list, tuple, set)):
+                for value in values:
+                    if isinstance(value, Mapping):
+                        add_path(value.get("path") or value.get("artifact_path") or value.get("file_path"))
+                    else:
+                        add_path(value)
+        descriptors = output.get("artifact_descriptors")
+        if isinstance(descriptors, (list, tuple, set)):
+            for descriptor in descriptors:
+                if isinstance(descriptor, Mapping):
+                    add_path(descriptor.get("path"))
+
+    for artifact in event.get("artifacts") or ():
+        if isinstance(artifact, Mapping):
+            add_path(artifact.get("path") or artifact.get("artifact_path") or artifact.get("file_path"))
+        else:
+            add_path(artifact)
+    for tool_result in event.get("tool_results") or ():
+        if isinstance(tool_result, Mapping):
+            add_output_paths(tool_result.get("output"))
+        else:
+            add_output_paths(getattr(tool_result, "output", None))
+    return tuple(dict.fromkeys(paths))
+
+
+def _web_recent_media_complete_artifact_paths(
+    runtime,
+    *,
+    conversation_id: str | None,
+    suffixes: Iterable[str],
+) -> tuple[str, ...]:
+    normalized_suffixes = {
+        suffix if str(suffix).startswith(".") else f".{suffix}"
+        for suffix in (str(item or "").strip().lower() for item in suffixes)
+        if suffix
+    }.intersection({".docx", ".pptx", ".xlsx"})
+    if not normalized_suffixes:
+        return ()
+    list_events = getattr(getattr(runtime, "store", None), "list_conversation_events", None)
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id or not callable(list_events):
+        return ()
+    try:
+        events = list_events(conversation_id)
+    except Exception:
+        return ()
+    paths: list[str] = []
+    for event in reversed(tuple(events or ())):
+        if not isinstance(event, Mapping):
+            continue
+        for raw_path in _web_event_artifact_candidate_paths(event):
+            path = Path(str(raw_path or "")).expanduser()
+            if path.suffix.lower() not in normalized_suffixes:
+                continue
+            try:
+                if not path.is_file() or path.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            if _web_office_artifact_embedded_media_count(path) <= 0:
+                continue
+            path_text = str(path)
+            if path_text not in paths:
+                paths.append(path_text)
+    return tuple(paths)
+
+
+def _web_replace_plain_office_artifacts_with_recent_media(
+    runtime,
+    *,
+    conversation_id: str | None,
+    paths: list[str],
+) -> list[str]:
+    plain_suffixes: set[str] = set()
+    for raw_path in paths:
+        path = Path(str(raw_path or "")).expanduser()
+        if path.suffix.lower() not in {".docx", ".pptx", ".xlsx"}:
+            continue
+        if _web_office_artifact_embedded_media_count(path) <= 0:
+            plain_suffixes.add(path.suffix.lower())
+    if not plain_suffixes:
+        return paths
+    replacements = _web_recent_media_complete_artifact_paths(
+        runtime,
+        conversation_id=conversation_id,
+        suffixes=plain_suffixes,
+    )
+    replacement_by_suffix: dict[str, str] = {}
+    for replacement in replacements:
+        suffix = Path(replacement).suffix.lower()
+        if suffix in plain_suffixes and suffix not in replacement_by_suffix:
+            replacement_by_suffix[suffix] = replacement
+    if not replacement_by_suffix:
+        return paths
+    replaced: list[str] = []
+    for raw_path in paths:
+        path = Path(str(raw_path or "")).expanduser()
+        replacement = (
+            replacement_by_suffix.get(path.suffix.lower())
+            if _web_office_artifact_embedded_media_count(path) <= 0
+            else None
+        )
+        replaced.append(replacement or str(path))
+    return list(dict.fromkeys(replaced))
+
+
+def _web_required_extension_counts(required_extensions: Iterable[str] | None) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for raw_extension in required_extensions or ():
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension not in VALID_ATTACHMENT_EXTENSIONS:
+            continue
+        counts[extension] = counts.get(extension, 0) + 1
+    return counts
+
+
+def _web_path_extension_counts(paths: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for raw_path in paths:
+        suffix = Path(str(raw_path or "")).suffix.lower()
+        if not suffix:
+            continue
+        counts[suffix] = counts.get(suffix, 0) + 1
+    return counts
+
+
+def _web_paths_satisfy_required_extension_counts(
+    paths: Iterable[str],
+    required_extensions: Iterable[str] | None,
+) -> bool:
+    required_counts = _web_required_extension_counts(required_extensions)
+    if not required_counts:
+        return True
+    actual_counts = _web_path_extension_counts(paths)
+    return all(actual_counts.get(extension, 0) >= count for extension, count in required_counts.items())
+
+
+def _web_completed_requested_artifact_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    requested_extensions: tuple[str, ...],
+    media_required_suffixes: set[str] | frozenset[str] = frozenset(),
+    require_complete: bool = True,
+) -> list[str]:
+    normalized_extensions = {
+        extension if extension.startswith(".") else f".{extension}"
+        for extension in (str(item or "").strip().lower() for item in requested_extensions)
+        if extension
+    }
+    if not normalized_extensions:
+        return []
+    selected: list[str] = []
+    for raw_path in artifact_paths_from_tool_results(tool_results):
+        path = Path(str(raw_path or "")).expanduser()
+        suffix = path.suffix.lower()
+        if suffix not in normalized_extensions:
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        path_text = str(path)
+        if path_text not in selected:
+            selected.append(path_text)
+    if media_required_suffixes:
+        selected = [
+            path
+            for path in selected
+            if Path(path).suffix.lower() not in media_required_suffixes
+            or _web_artifact_satisfies_embedded_media_requirement(path, tool_results=tool_results)
+        ]
+    if require_complete and selected and not _web_paths_satisfy_required_extension_counts(selected, requested_extensions):
+        return []
+    return selected
+
+
+def _web_recover_completed_requested_artifacts(
+    runtime,
+    *,
+    principal_id: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    required_attachment_extensions: list[str] | tuple[str, ...] | None,
+    required_embedded_media_extensions: list[str] | tuple[str, ...] | None,
+) -> tuple[list[str], list[dict[str, object]]]:
+    requested_extensions = _web_merge_required_attachment_extensions(
+        required_attachment_extensions,
+        tool_results,
+    )
+    media_required_suffixes = set(
+        _web_merge_required_embedded_media_extensions(
+            required_embedded_media_extensions,
+            tool_results,
+        )
+    )
+    paths = _web_completed_requested_artifact_paths_from_tool_results(
+        tool_results,
+        requested_extensions=requested_extensions,
+        media_required_suffixes=media_required_suffixes,
+        require_complete=False,
+    )
+    if not paths:
+        return [], []
+    artifacts = _web_artifact_descriptors(runtime, paths, principal_id=principal_id)
+    hydrated_paths = [
+        str(payload.get("path") or "")
+        for payload in artifacts
+        if str(payload.get("path") or "")
+    ]
+    return list(dict.fromkeys(hydrated_paths)), artifacts
+
+
+def _web_apply_recovered_completed_requested_artifacts(
+    runtime,
+    *,
+    conversation_id: str,
+    user_message: str,
+    final_text: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    required_attachment_extensions: list[str] | tuple[str, ...] | None,
+    required_embedded_media_extensions: list[str] | tuple[str, ...] | None,
+) -> tuple[list[str], list[dict[str, object]], str, bool]:
+    recovered_paths, recovered_artifacts = _web_recover_completed_requested_artifacts(
+        runtime,
+        principal_id=conversation_id,
+        tool_results=tool_results,
+        required_attachment_extensions=required_attachment_extensions,
+        required_embedded_media_extensions=required_embedded_media_extensions,
+    )
+    if not recovered_artifacts:
+        return [], [], final_text, False
+    recovered_text = _web_artifact_delivery_notice(
+        final_text,
+        recovered_paths,
+        recovered_artifacts,
+        tool_results=tool_results,
+    )
+    recovered_text, fulfilled = _enforce_web_response_fulfillment(
+        runtime,
+        conversation_id=conversation_id,
+        user_message=user_message,
+        reply=recovered_text,
+        tool_results=tool_results,
+        artifact_paths=recovered_paths,
+        artifact_count=len(recovered_artifacts),
+        required_attachment_extensions=required_attachment_extensions,
+        required_embedded_media_extensions=required_embedded_media_extensions,
+    )
+    return recovered_paths, recovered_artifacts, recovered_text, fulfilled
+
+
+def _web_preferred_deliverable_artifact_paths(
+    runtime,
+    *,
+    principal_id: str | None,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    required_attachment_extensions: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    paths = _preferred_singular_artifact_paths_from_tool_results(tool_results)
+    if not paths:
+        return []
+    required_extensions = _web_merge_required_attachment_extensions(
+        required_attachment_extensions,
+        tool_results,
+    )
+    required_extensions = _web_refine_required_attachment_extensions_for_deliverables(
+        required_extensions,
+        tool_results,
+    )
+    if required_extensions:
+        paths = [
+            path
+            for path in paths
+            if Path(str(path or "")).suffix.lower() in required_extensions
+        ]
+    payloads = _web_artifact_descriptors(runtime, paths, principal_id=principal_id)
+    return list(
+        dict.fromkeys(
+            str(payload.get("path") or "")
+            for payload in payloads
+            if str(payload.get("path") or "")
+        )
+    )
 
 
 def _connection_env_key_from_reference(value: object, *, default: str = "ACCOUNT") -> str:
@@ -17592,8 +19395,39 @@ def _web_artifact_delivery_notice(
             "The source fetch likely failed; try the rendered browser capture path or retry the fetch."
         )
     if artifact_payloads:
+        if len(artifact_payloads) > 1:
+            stripped_text = _strip_web_media_directive_lines(text)
+            payload_names = [
+                str(payload.get("name") or Path(str(payload.get("path") or "")).name or "").strip()
+                for payload in artifact_payloads
+            ]
+            if stripped_text and all(name and name in stripped_text for name in payload_names):
+                return stripped_text
+            return _web_artifact_package_delivery_notice(artifact_payloads)
+        if _web_reply_is_local_discovery_results(text, tool_results):
+            label = _web_artifact_payload_delivery_label(artifact_payloads)
+            return f"Done — attached the requested {label}."
         return _strip_web_media_directive_lines(text)
     return text
+
+
+def _web_artifact_delivery_receipt(artifact_payloads: list[dict[str, object]]) -> str:
+    if len(artifact_payloads) > 1:
+        return _web_artifact_package_delivery_notice(artifact_payloads)
+    if artifact_payloads:
+        label = _web_artifact_payload_delivery_label(artifact_payloads)
+        return f"Done — attached the requested {label}."
+    return "Done."
+
+
+def _web_reply_is_local_discovery_results(
+    text: str,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    paths = _web_local_discovery_paths_from_tool_results(tool_results)
+    if not paths:
+        return False
+    return str(text or "").strip() == _web_local_discovery_results_reply(paths)
 
 
 def _web_completed_email_attachment_notice(
@@ -17671,31 +19505,101 @@ def _web_artifact_payload_delivery_label(artifact_payloads: list[dict[str, objec
         return "image"
     if media_type == "application/pdf" or suffix == ".pdf":
         return "PDF"
+    if suffix == ".xlsx":
+        return "XLSX workbook"
+    if suffix == ".csv":
+        return "CSV file"
+    if suffix == ".docx":
+        return "DOCX document"
+    if suffix == ".pptx":
+        return "PPTX deck"
+    if suffix in {".html", ".htm"}:
+        return "HTML file"
     if suffix == ".txt" or media_type.startswith("text/"):
         return "text file"
     return "file"
 
 
+def _web_artifact_payload_label(payload: dict[str, object]) -> str:
+    return _web_artifact_payload_delivery_label([payload])
+
+
+def _web_artifact_package_delivery_notice(artifact_payloads: list[dict[str, object]]) -> str:
+    labels: list[str] = []
+    names: list[str] = []
+    for payload in artifact_payloads:
+        label = _web_artifact_payload_label(payload)
+        if label not in labels:
+            labels.append(label)
+        name = str(payload.get("name") or Path(str(payload.get("path") or "")).name or "").strip()
+        if name:
+            names.append(name)
+    label_text = ", ".join(labels) if labels else "files"
+    lines = [f"Created and attached {len(artifact_payloads)} artifacts: {label_text}."]
+    if names:
+        lines.append("Files:\n" + "\n".join(f"- {name}" for name in names[:8]))
+    return "\n\n".join(lines).strip()
+
+
 def _web_required_attachment_extensions_from_tool_scope(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> tuple[str, ...]:
-    extensions: list[str] = []
+    results = tuple(tool_results or ())
+    if not any(
+        result.tool_name == "request_tool_scope"
+        and normalize_tool_status(result.status) == "completed"
+        for result in results
+    ):
+        return ()
+    groups: list[tuple[int, tuple[str, ...]]] = []
+    for result in results:
+        if result.tool_name != "request_tool_scope" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        group = _web_scope_artifact_extension_group(output)
+        if group:
+            groups.append((len(groups), group))
+    if not groups:
+        return ()
+
+    def score(item: tuple[int, tuple[str, ...]]) -> tuple[int, int, int]:
+        index, group = item
+        primary_count = sum(1 for extension in group if extension in _WEB_PRIMARY_PACKAGE_EXTENSIONS)
+        return primary_count, len(group), index
+
+    return max(groups, key=score)[1]
+
+
+def _web_tool_scope_declared_no_attachment_extensions(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> bool:
+    declared = False
     for result in tool_results or ():
         if result.tool_name != "request_tool_scope" or normalize_tool_status(result.status) != "completed":
             continue
         output = result.output if isinstance(result.output, dict) else {}
-        raw_extensions = output.get("artifact_extensions")
-        if not isinstance(raw_extensions, list):
-            continue
-        for raw_extension in raw_extensions:
-            extension = str(raw_extension or "").strip().lower()
-            if not extension:
-                continue
-            if not extension.startswith("."):
-                extension = f".{extension}"
-            if extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
-                extensions.append(extension)
-    return tuple(extensions)
+        if isinstance(output.get("artifact_extensions"), list):
+            declared = True
+        if _web_required_attachment_extensions_from_tool_scope((result,)):
+            return False
+    return declared
+
+
+def _web_completed_scheduler_mutation(tool_results: list[ToolResult] | tuple[ToolResult, ...] | None) -> bool:
+    scheduler_mutation_tools = {
+        "create_cron",
+        "update_cron",
+        "delete_cron",
+        "toggle_cron",
+        "set_reminder",
+        "update_reminder",
+        "delete_reminder",
+    }
+    return any(
+        result.tool_name in scheduler_mutation_tools
+        and normalize_tool_status(result.status) == "completed"
+        for result in (tool_results or ())
+    )
 
 
 def _web_merge_required_attachment_extensions(
@@ -17703,10 +19607,15 @@ def _web_merge_required_attachment_extensions(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> tuple[str, ...]:
     extensions: list[str] = []
-    for raw_extension in (
-        *(required_attachment_extensions or ()),
-        *_web_required_attachment_extensions_from_tool_scope(tool_results),
-    ):
+    for raw_extension in required_attachment_extensions or ():
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension in VALID_ATTACHMENT_EXTENSIONS:
+            extensions.append(extension)
+    for raw_extension in _web_required_attachment_extensions_from_tool_scope(tool_results):
         extension = str(raw_extension or "").strip().lower()
         if not extension:
             continue
@@ -17747,6 +19656,25 @@ def _web_merge_required_embedded_media_extensions(
     return tuple(extensions)
 
 
+def _web_required_attachment_extensions_from_tool_registry(registry: object | None) -> tuple[str, ...]:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return ()
+    scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
+    if scheduler_action == "mutate":
+        return ()
+    extensions: list[str] = []
+    for raw_extension in tuple(getattr(decision, "requested_artifact_extensions", ()) or ()):
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension in VALID_ATTACHMENT_EXTENSIONS and extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
+
+
 def _web_required_embedded_media_extensions_from_tool_registry(registry: object | None) -> tuple[str, ...]:
     decision = getattr(registry, "turn_tool_scope_decision", None)
     if decision is None:
@@ -17781,11 +19709,22 @@ def _enforce_web_response_fulfillment(
         required_attachment_extensions,
         tool_results,
     )
+    required_attachment_extensions = _web_refine_required_attachment_extensions_for_deliverables(
+        required_attachment_extensions,
+        tool_results,
+    )
     required_embedded_media_extensions = _web_merge_required_embedded_media_extensions(
         required_embedded_media_extensions,
         tool_results,
     )
-    roots = [artifact_root_for_principal(conversation_id), *_web_artifact_roots(runtime)]
+    if _web_completed_scheduler_mutation(tool_results):
+        required_attachment_extensions = ()
+        required_embedded_media_extensions = ()
+    roots = [
+        artifact_root_for_principal(conversation_id),
+        *_web_artifact_roots(runtime),
+        *_web_workspace_artifact_roots_from_paths(tuple(str(path) for path in (artifact_paths or ()))),
+    ]
     evaluation = evaluate_response_execution_outcome(
         store=runtime.store,
         conversation_id=conversation_id,
@@ -17901,6 +19840,87 @@ def _store_web_approval_suspended_turn(
         logger.debug("Unable to checkpoint web approval suspended turn", exc_info=True)
 
 
+def _store_web_agent_turn_limit_extension_approval(
+    runtime,
+    *,
+    conversation_id: str,
+    user_text: str,
+    request_id: str | None,
+    messages_snapshot: list[dict[str, Any]] | None,
+    current_max_iterations: int | None,
+    tool_results: list[ToolResult],
+    required_attachment_extensions: tuple[str, ...] = (),
+) -> str | None:
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return None
+    try:
+        from nullion.approvals import create_approval_request
+
+        approval = create_approval_request(
+            requested_by=conversation_id,
+            action=AGENT_TURN_LIMIT_EXTENSION_ACTION,
+            resource=conversation_id,
+            request_kind=AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+            context=build_agent_turn_limit_extension_context(
+                current_max_iterations=current_max_iterations,
+                tool_result_count=len(tool_results),
+                conversation_id=conversation_id,
+                requested_extensions=required_attachment_extensions,
+            ),
+        )
+        store.add_approval_request(approval)
+        store.add_suspended_turn(
+            SuspendedTurn(
+                approval_id=approval.approval_id,
+                conversation_id=conversation_id,
+                chat_id=None,
+                message=f"/chat {user_text}",
+                request_id=request_id,
+                message_id=request_id,
+                created_at=datetime.now(UTC),
+                mission_id=None,
+                pending_step_idx=None,
+                messages_snapshot=messages_snapshot
+                or [{"role": "user", "content": [{"type": "text", "text": user_text}]}],
+                pending_tool_calls=[],
+                resume_token=build_agent_turn_limit_resume_token(current_max_iterations=current_max_iterations),
+            )
+        )
+        try:
+            runtime.checkpoint()
+        except Exception:
+            logger.debug("Unable to checkpoint web agent turn limit approval", exc_info=True)
+        return approval.approval_id
+    except Exception:
+        logger.debug("Unable to store web agent turn limit approval", exc_info=True)
+        return None
+
+
+def _web_agent_turn_limit_approval_payload(
+    runtime,
+    *,
+    approval_id: str | None,
+) -> dict[str, object] | None:
+    if not approval_id:
+        return None
+    approval = getattr(runtime, "store", None).get_approval_request(approval_id) if getattr(runtime, "store", None) is not None else None
+    if approval is None:
+        return None
+    display = approval_display_from_request(approval)
+    return _web_approval_required_payload(
+        {
+            "approval_id": approval_id,
+            "tool_name": display.label,
+            "tool_detail": display.detail,
+            "trigger_flow_label": _approval_trigger_flow_label_from_request(approval),
+            "is_web_request": display.is_web_request,
+            "request_kind": AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+        },
+        runtime=runtime,
+    )
+
+
 def _web_screenshot_payload_if_requested(
     runtime,
     *,
@@ -17940,7 +19960,10 @@ def _web_attachment_source_target_node(state: _WebAttachmentPlanState) -> dict[s
 def _web_attachment_extension_node(state: _WebAttachmentPlanState) -> dict[str, object]:
     if "extension" in state:
         return {}
-    requested_format = plan_attachment_format(state.get("prompt") or "")
+    requested_format = plan_attachment_format(
+        state.get("prompt") or "",
+        allow_filename_tokens=True,
+    )
     if requested_format.extension in {".html", ".txt"}:
         return {"extension": requested_format.extension}
     return {"extension": None}
@@ -18007,6 +20030,304 @@ def _terminal_exec_output_for_attachment(result: ToolResult, *, extension: str) 
     return None
 
 
+_WEB_BARE_FILENAME_LISTING_RE = re.compile(r"^[^\s/\\\x00]{1,255}\.[A-Za-z0-9]{1,16}$")
+_WEB_RELATIVE_PATH_LISTING_RE = re.compile(r"^(?![A-Za-z][A-Za-z0-9+.-]*:)[^\s\x00]{1,512}\.[A-Za-z0-9]{1,16}$")
+
+
+def _web_pathlike_lines_from_text(text: object, *, allow_bare_filenames: bool = False) -> tuple[str, ...]:
+    paths: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        candidate = raw_line.strip().strip("`'\"<>")
+        if not candidate or "\x00" in candidate:
+            continue
+        expanded = Path(candidate.removeprefix("file:")).expanduser()
+        if candidate.startswith(("~", "/", "file:")) or expanded.is_absolute():
+            paths.append(candidate.removeprefix("file:"))
+        elif allow_bare_filenames and _WEB_BARE_FILENAME_LISTING_RE.match(candidate):
+            paths.append(candidate)
+        elif (
+            allow_bare_filenames
+            and ("/" in candidate or "\\" in candidate)
+            and _WEB_RELATIVE_PATH_LISTING_RE.match(candidate)
+        ):
+            paths.append(candidate)
+    return tuple(dict.fromkeys(paths))
+
+
+def _web_terminal_stdout_is_path_listing(output: dict[str, object]) -> bool:
+    stdout = str(output.get("stdout") or "")
+    stderr = str(output.get("stderr") or "").strip()
+    if stderr:
+        return False
+    lines = [line.strip().strip("`'\"<>") for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return len(_web_pathlike_lines_from_text(stdout, allow_bare_filenames=True)) == len(lines)
+
+
+def _web_tool_results_are_local_discovery_listing(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...],
+) -> bool:
+    substantive_results = [
+        result
+        for result in tool_results or ()
+        if normalize_tool_status(getattr(result, "status", None)) == "completed"
+        and result.tool_name not in {"request_tool_scope", "chat_history_search"}
+    ]
+    if not substantive_results:
+        return False
+    for result in substantive_results:
+        output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name == "terminal_exec" and _web_terminal_stdout_is_path_listing(output):
+            continue
+        if result.tool_name == "file_search":
+            continue
+        return False
+    return True
+
+
+def _web_tool_result_path_suffix(result: ToolResult) -> str:
+    output = result.output if isinstance(result.output, dict) else {}
+    for key in ("artifact_path", "path"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value).suffix.lower()
+    return ""
+
+
+def _web_tool_results_are_local_discovery_or_sidecar(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    required_extensions: Iterable[str] | None = None,
+) -> bool:
+    normalized_required = {
+        extension if extension.startswith(".") else f".{extension}"
+        for extension in (str(item or "").strip().lower() for item in required_extensions or ())
+        if extension
+    }
+    discovery_paths = _web_local_discovery_paths_from_tool_results(tool_results)
+    if not discovery_paths:
+        return _web_tool_results_are_local_discovery_listing(tool_results or ())
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name in {"request_tool_scope", "chat_history_search", "file_search", "file_read", "workspace_summary"}:
+            continue
+        if result.tool_name == "terminal_exec" and _web_terminal_stdout_is_path_listing(output):
+            continue
+        if result.tool_name in {"file_write", "file_patch"}:
+            suffix = _web_tool_result_path_suffix(result)
+            if suffix and suffix in normalized_required:
+                return False
+            if artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES):
+                return False
+            continue
+        return False
+    return True
+
+
+_WEB_FILE_SEARCH_PREVIEW_PATH_RE = re.compile(r'"path"\s*:\s*"((?:\\.|[^"\\])*)"')
+
+
+def _web_file_search_match_paths_from_output(output: dict[str, object]) -> tuple[str, ...]:
+    paths: list[str] = []
+
+    def collect_from_payload(payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        matches = payload.get("matches")
+        if isinstance(matches, (list, tuple)):
+            for match in matches:
+                if isinstance(match, str) and match.strip():
+                    paths.append(match)
+                elif isinstance(match, dict):
+                    candidate = match.get("path")
+                    if isinstance(candidate, str) and candidate.strip():
+                        paths.append(candidate)
+        match_details = payload.get("match_details")
+        if isinstance(match_details, (list, tuple)):
+            for match in match_details:
+                if not isinstance(match, dict):
+                    continue
+                candidate = match.get("path")
+                if isinstance(candidate, str) and candidate.strip():
+                    paths.append(candidate)
+
+    collect_from_payload(output)
+    preview = output.get("preview")
+    if isinstance(preview, str) and preview.strip():
+        try:
+            parsed_preview = json.loads(preview)
+        except Exception:
+            parsed_preview = None
+        collect_from_payload(parsed_preview)
+        for match in _WEB_FILE_SEARCH_PREVIEW_PATH_RE.finditer(preview):
+            encoded = match.group(1)
+            try:
+                decoded = json.loads(f'"{encoded}"')
+            except Exception:
+                decoded = encoded
+            if isinstance(decoded, str) and decoded.strip():
+                paths.append(decoded)
+    return tuple(dict.fromkeys(paths))
+
+
+def _web_local_discovery_paths_from_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        if result.tool_name == "terminal_exec" and _web_terminal_stdout_is_path_listing(output):
+            paths.extend(_web_pathlike_lines_from_text(output.get("stdout"), allow_bare_filenames=True))
+        elif result.tool_name == "file_search":
+            paths.extend(_web_file_search_match_paths_from_output(output))
+    return tuple(dict.fromkeys(path for path in paths if str(path or "").strip()))
+
+
+def _web_required_local_discovery_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    required_extensions: Iterable[str] | None,
+) -> tuple[str, ...]:
+    normalized_required = set(normalize_artifact_extensions(required_extensions))
+    if not normalized_required:
+        return ()
+    paths: list[str] = []
+    for path in _web_local_discovery_paths_from_tool_results(tool_results):
+        suffix = Path(str(path or "")).suffix.lower()
+        if suffix not in normalized_required:
+            continue
+        if is_unrequested_internal_sidecar_artifact(
+            path,
+            requested_extensions=normalized_required,
+        ):
+            continue
+        paths.append(path)
+    return tuple(dict.fromkeys(paths))
+
+
+def _web_direct_existing_artifact_signal_paths(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for result in tool_results or ():
+        if result.tool_name != "file_search":
+            continue
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        matches = output.get("matches")
+        has_artifact_match = (
+            any(
+                isinstance(match, dict) and match.get("artifact") is True
+                for match in matches
+            )
+            if isinstance(matches, (list, tuple))
+            else False
+        )
+        if not (
+            output.get("action") == "deliver"
+            or output.get("direct_existing_artifact") is True
+            or has_artifact_match
+        ):
+            continue
+        paths.extend(_web_file_search_match_paths_from_output(output))
+    return tuple(dict.fromkeys(path for path in paths if str(path or "").strip()))
+
+
+def _web_path_is_delivery_artifact(
+    runtime,
+    path: str,
+    *,
+    principal_id: str | None,
+) -> bool:
+    try:
+        candidate = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not candidate.is_file():
+        return False
+    artifact_roots = tuple(
+        dict.fromkeys(
+            (
+                *_web_artifact_roots_for_delivery(runtime, principal_id),
+                *_web_artifact_roots(runtime),
+            )
+        )
+    )
+    for artifact_root in artifact_roots:
+        if artifact_descriptor_for_path(candidate, artifact_root=artifact_root) is not None:
+            return True
+    return False
+
+
+def _web_direct_existing_artifact_discovery_paths(
+    runtime,
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    principal_id: str | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for path in _web_direct_existing_artifact_signal_paths(tool_results):
+        if _web_path_is_delivery_artifact(runtime, path, principal_id=principal_id):
+            paths.append(path)
+    return tuple(dict.fromkeys(paths))
+
+
+def _web_local_discovery_results_reply(paths: Iterable[str]) -> str:
+    unique_paths = tuple(dict.fromkeys(str(path) for path in paths if str(path or "").strip()))
+    count = len(unique_paths)
+    heading = f"I found {count} file{'s' if count != 1 else ''}:"
+    return "\n".join([heading, *(f"- {Path(path).name or path}" for path in unique_paths)]).strip()
+
+
+def _web_local_discovery_reply_for_tool_results(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    *,
+    required_extensions: Iterable[str] | None = None,
+) -> str | None:
+    if _web_required_local_discovery_paths(
+        tool_results,
+        required_extensions,
+    ) and _web_direct_existing_artifact_signal_paths(tool_results):
+        return None
+    if _web_completed_tool_artifact_paths_from_tool_results(
+        tool_results,
+        required_extensions=required_extensions,
+    ):
+        return None
+    if not (
+        _web_tool_results_are_local_discovery_listing(tool_results or ())
+        or _web_tool_results_are_local_discovery_or_sidecar(
+            tool_results,
+            required_extensions=required_extensions,
+        )
+    ):
+        return None
+    paths = _web_local_discovery_paths_from_tool_results(tool_results)
+    if not paths:
+        return None
+    return _web_local_discovery_results_reply(paths)
+
+
+def _web_completed_run_cron_receipt_reply(
+    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+) -> str | None:
+    for result in reversed(tuple(tool_results or ())):
+        if result.tool_name != "run_cron" or normalize_tool_status(result.status) != "completed":
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        for key in ("message", "result_text", "text", "final_text", "summary", "result"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "Manual scheduled task run started."
+    return None
+
+
 _SCRIPT_TAG_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.IGNORECASE | re.DOTALL)
 
 
@@ -18041,11 +20362,18 @@ def _materialize_fetch_artifact_for_web(
     registry: ToolRegistry | None = None,
     requested_extension: str | None = None,
 ) -> list[str]:
+    if _web_tool_results_are_local_discovery_listing(
+        tool_results
+    ) or _web_tool_results_are_local_discovery_or_sidecar(
+        tool_results,
+        required_extensions=((requested_extension,) if requested_extension else ()),
+    ):
+        return []
     source_attachment_extension = _requested_web_attachment_extension(prompt)
     planned_extension = (
         requested_extension
         or source_attachment_extension
-        or plan_attachment_format(prompt or "").extension
+        or plan_attachment_format(prompt or "", allow_filename_tokens=True).extension
     )
     if planned_extension:
         existing_matching_artifacts = [
@@ -18077,12 +20405,86 @@ def _web_artifact_path_for_id(runtime, artifact_id: str) -> Path | None:
             descriptor = artifact_descriptor_for_path(mapped, artifact_root=artifact_root)
             if descriptor is not None and descriptor.artifact_id == artifact_id:
                 return mapped
+        persisted = _web_persisted_artifact_path_for_id(runtime, artifact_id, artifact_roots=artifact_roots)
+        if persisted is not None:
+            _WEB_ARTIFACTS[artifact_id] = persisted
+            return persisted
     for artifact_root in artifact_roots:
         for candidate in artifact_root.glob("*"):
             descriptor = artifact_descriptor_for_path(candidate, artifact_root=artifact_root)
             if descriptor is not None and descriptor.artifact_id == artifact_id:
                 _WEB_ARTIFACTS[artifact_id] = Path(descriptor.path)
                 return Path(descriptor.path)
+    persisted = _web_persisted_artifact_path_for_id(runtime, artifact_id, artifact_roots=artifact_roots)
+    if persisted is not None:
+        _WEB_ARTIFACTS[artifact_id] = persisted
+        return persisted
+    return None
+
+
+def _web_persisted_artifact_path_for_id(
+    runtime,
+    artifact_id: str,
+    *,
+    artifact_roots: Iterable[Path],
+) -> Path | None:
+    if not artifact_id:
+        return None
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return None
+    try:
+        if hasattr(store, "list_recent_conversation_events"):
+            events = list(
+                store.list_recent_conversation_events(
+                    None,
+                    event_type="conversation.chat_turn",
+                    limit=500,
+                )
+            )
+        else:
+            events = list(store.list_conversation_events())[-500:]
+    except Exception:
+        logger.debug("Unable to inspect persisted artifact events", exc_info=True)
+        return None
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("event_type") != "conversation.chat_turn":
+            continue
+        for artifact in event.get("artifacts") or ():
+            path = _web_persisted_artifact_match_path(artifact, artifact_id, artifact_roots=artifact_roots)
+            if path is not None:
+                return path
+    return None
+
+
+def _web_persisted_artifact_match_path(
+    artifact: object,
+    artifact_id: str,
+    *,
+    artifact_roots: Iterable[Path],
+) -> Path | None:
+    if not isinstance(artifact, dict):
+        return None
+    raw_id = artifact.get("id")
+    raw_url = artifact.get("url")
+    raw_preview_url = artifact.get("preview_url")
+    if raw_id != artifact_id and f"/{artifact_id}" not in str(raw_url or "") and f"/{artifact_id}" not in str(raw_preview_url or ""):
+        return None
+    raw_path = artifact.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    try:
+        path = Path(raw_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not path.is_file():
+        return None
+    for root in artifact_roots:
+        try:
+            path.relative_to(Path(root).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+        return path
     return None
 
 
@@ -18458,6 +20860,28 @@ def _dependency_metadata_from_github(*, package: str = "", github_url: str) -> d
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 
+def _approval_confirmation_text_for_web(approval, *, action: str, mode: str | None = None) -> str:
+    display = approval_display_from_request(approval)
+    normalized_action = str(action or "").strip().lower()
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_action in {"deny", "reject"}:
+        prefix = "Denied. Nullion will wait for your next instruction."
+    elif normalized_mode == "run":
+        prefix = "All web domains allowed. Continuing..."
+    elif normalized_mode == "always":
+        prefix = "Always allowed. Continuing..."
+    elif normalized_mode.startswith("limit_"):
+        prefix = f"Doctor approved {normalized_mode.replace('limit_', '').upper()} budget. Continuing..."
+    elif getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
+        prefix = "Delete approved once. Continuing..."
+    else:
+        prefix = "Allowed once. Continuing..."
+    detail = str(display.detail or "").strip()
+    if detail:
+        return f"{prefix}\n\n{detail}"
+    return prefix
+
+
 def create_app(runtime, orchestrator, registry):
     """Build and return the FastAPI application."""
     try:
@@ -18689,9 +21113,242 @@ def create_app(runtime, orchestrator, registry):
     app.state.nullion_runtime_turns_active = _runtime_turns_active
     app.state.nullion_runtime_turn_guard = _runtime_turn_guard
 
-    def _run_guarded_turn_sync(*args, **kwargs) -> dict:
-        with _runtime_turn_guard():
-            return _run_turn_sync(*args, **kwargs)
+    def _run_shared_web_platform_chat_turn(
+        *,
+        conversation_id: str,
+        user_text: str,
+        attachments: object,
+        allow_mini_agents: bool = False,
+        request_payload: dict[str, Any] | None = None,
+        activity_callback=None,
+        text_delta_callback=None,
+        turn_dispatch_decision: object | None = None,
+    ):
+        from nullion.platform_chat import PlatformChatRequest, run_platform_chat_request
+
+        payload = request_payload or {}
+        return run_platform_chat_request(
+            runtime,
+            PlatformChatRequest(
+                platform="web",
+                conversation_id=conversation_id,
+                text=user_text,
+                turn_id=str(payload.get("turn_id") or "") or None,
+                attachments=attachments if isinstance(attachments, list) else None,
+                settings=app_settings,
+                request_id=str(payload.get("request_id") or "") or None,
+                message_id=str(payload.get("message_id") or "") or None,
+                model_client=getattr(orchestrator, "model_client", None),
+                agent_orchestrator=orchestrator,
+                service=None,
+                activity_callback=activity_callback,
+                text_delta_callback=text_delta_callback,
+                allow_mini_agents=allow_mini_agents,
+                turn_dispatch_decision=turn_dispatch_decision,
+                conversation_ingress_id=str(
+                    payload.get("turn_id")
+                    or payload.get("request_id")
+                    or payload.get("message_id")
+                    or ""
+                ) or None,
+            ),
+        )
+
+    def _shared_web_platform_chat_artifacts(
+        result: object,
+        *,
+        conversation_id: str,
+        user_text: str,
+    ) -> list[dict[str, object]]:
+        reply_text = str(getattr(result, "text", "") or "")
+        reply_artifact_paths = [
+            str(path)
+            for path in media_candidate_paths_from_text(reply_text)
+            if str(path or "").strip()
+        ]
+        artifact_paths = [
+            str(path)
+            for path in (getattr(result, "artifact_paths", None) or ())
+            if str(path or "").strip()
+        ]
+        tool_results = list(getattr(result, "tool_results", ()) or ())
+        requested_attachment_extension = plan_attachment_format(
+            user_text,
+            model_client=getattr(orchestrator, "model_client", None),
+        ).extension
+        materialized_artifact_paths = _materialize_fetch_artifact_for_web(
+            runtime,
+            prompt=user_text,
+            tool_results=tool_results,
+            principal_id=conversation_id,
+            registry=registry,
+            requested_extension=requested_attachment_extension,
+        )
+        if materialized_artifact_paths:
+            artifact_paths = list(dict.fromkeys([*materialized_artifact_paths, *artifact_paths]))
+        if reply_artifact_paths:
+            artifact_paths = reply_artifact_paths
+        elif not artifact_paths:
+            artifact_paths = reply_artifact_paths
+        if artifact_paths:
+            from nullion.platform_chat import platform_chat_id
+
+            principal_id = platform_chat_id("web", conversation_id)
+            delivery_contract = delivery_contract_for_turn(
+                user_text,
+                reply=reply_text,
+                artifact_paths=artifact_paths,
+                requires_attachment_delivery=True,
+            )
+            artifact_paths = _web_filter_artifact_paths_to_reply_paths(
+                runtime,
+                reply=reply_text,
+                artifact_paths=artifact_paths,
+                principal_id=principal_id,
+                required_attachment_extensions=delivery_contract.required_attachment_extensions,
+                prompt=user_text,
+            )
+            return _web_artifact_descriptors(
+                runtime,
+                artifact_paths,
+                principal_id=principal_id,
+            )
+        artifacts = getattr(result, "artifacts", None)
+        if not isinstance(artifacts, list):
+            return []
+        descriptor_payloads = [
+            dict(artifact)
+            for artifact in artifacts
+            if isinstance(artifact, dict)
+            and not is_unrequested_internal_sidecar_artifact(
+                str(artifact.get("path") or artifact.get("name") or ""),
+                requested_extensions=(),
+            )
+        ]
+        descriptor_paths = [
+            str(artifact.get("path") or "")
+            for artifact in descriptor_payloads
+            if str(artifact.get("path") or "").strip()
+        ]
+        if not descriptor_paths:
+            return descriptor_payloads
+        delivery_contract = delivery_contract_for_turn(
+            user_text,
+            reply=reply_text,
+            artifact_paths=descriptor_paths,
+            requires_attachment_delivery=True,
+        )
+        filtered_paths = _web_filter_artifact_paths_to_reply_paths(
+            runtime,
+            reply=reply_text,
+            artifact_paths=descriptor_paths,
+            principal_id=conversation_id,
+            required_attachment_extensions=delivery_contract.required_attachment_extensions,
+            prompt=user_text,
+        )
+        if filtered_paths == descriptor_paths:
+            return descriptor_payloads
+        filtered_identities = _web_path_identity_set(filtered_paths)
+        return [
+            artifact
+            for artifact in descriptor_payloads
+            if _web_path_matches_identity_set(str(artifact.get("path") or ""), filtered_identities)
+        ]
+
+    def _shared_web_platform_chat_result_payload(
+        result: object,
+        *,
+        conversation_id: str,
+        user_text: str,
+    ) -> dict[str, object]:
+        artifacts = _shared_web_platform_chat_artifacts(
+            result,
+            conversation_id=conversation_id,
+            user_text=user_text,
+        )
+        if artifacts:
+            candidate_paths = [
+                str(artifact.get("path") or "")
+                for artifact in artifacts
+                if isinstance(artifact, dict) and str(artifact.get("path") or "").strip()
+            ]
+            reply_for_contract = str(getattr(result, "text", "") or "")
+            delivery_contract = delivery_contract_for_turn(
+                user_text,
+                reply=reply_for_contract,
+                artifact_paths=candidate_paths,
+                requires_attachment_delivery=True,
+            )
+            required_extensions = tuple(delivery_contract.required_attachment_extensions or ())
+            if required_extensions:
+                required_paths = [
+                    path
+                    for path in candidate_paths
+                    if Path(path).suffix.lower() in set(required_extensions)
+                ]
+                if required_paths and _web_paths_satisfy_required_extension_counts(
+                    required_paths,
+                    required_extensions,
+                ):
+                    required_identities = _web_path_identity_set(required_paths)
+                    artifacts = [
+                        artifact
+                        for artifact in artifacts
+                        if isinstance(artifact, dict)
+                        and _web_path_matches_identity_set(
+                            str(artifact.get("path") or ""),
+                            required_identities,
+                        )
+                    ]
+        artifact_paths = [
+            str(artifact.get("path") or "")
+            for artifact in artifacts
+            if isinstance(artifact, dict) and str(artifact.get("path") or "").strip()
+        ]
+        reply_text = str(getattr(result, "text", "") or "")
+        if artifacts:
+            artifact_text_candidate_paths = list(
+                dict.fromkeys(
+                    str(path)
+                    for path in (
+                        *artifact_paths,
+                        *(getattr(result, "artifact_paths", None) or ()),
+                        *(getattr(result, "artifact_candidate_paths", None) or ()),
+                    )
+                    if str(path or "").strip()
+                )
+            )
+            cleaned_reply_text = strip_unselected_artifact_references(
+                reply_text,
+                selected_paths=artifact_paths,
+                candidate_paths=artifact_text_candidate_paths,
+            )
+            reply_text = (
+                _web_artifact_delivery_receipt(artifacts)
+                if cleaned_reply_text is None
+                else cleaned_reply_text
+            )
+            reply_text = _web_artifact_delivery_notice(
+                reply_text,
+                artifact_paths,
+                artifacts,
+                tool_results=None,
+            )
+        return {
+            "text": reply_text,
+            "thinking": str(getattr(result, "thinking", "") or ""),
+            "artifacts": artifacts,
+            "suspended_for_approval": bool(getattr(result, "suspended_for_approval", False)),
+            "approval_id": str(getattr(result, "approval_id", "") or ""),
+            "reply_already_sent": bool(getattr(result, "reply_already_sent", False)),
+            "mini_agent_dispatch": bool(getattr(result, "mini_agent_dispatch", False)),
+            "task_group_id": str(getattr(result, "task_group_id", "") or ""),
+            "planner_status_text": str(getattr(result, "planner_status_text", "") or ""),
+            "progress_status_text": str(getattr(result, "progress_status_text", "") or ""),
+            "planner_status_owned_by_background": bool(
+                getattr(result, "planner_status_owned_by_background", False)
+            ),
+        }
 
     def _checkpoint_file_signature(path: Path) -> tuple[int, int] | None:
         try:
@@ -19100,17 +21757,6 @@ def create_app(runtime, orchestrator, registry):
             raise errors[0]
         return bool(result[0]) if result else False
 
-    def _cron_result_block_reason(result: dict, text: str, artifacts: object) -> str | None:
-        if result.get("reached_iteration_limit"):
-            return "cron_run_reached_iteration_limit"
-        structured_reason = cron_structured_result_block_reason(result, artifacts, text=text)
-        if structured_reason is not None:
-            return structured_reason
-        has_artifacts = bool(artifacts)
-        if str(text or "").startswith("Fetched untrusted web content:") and not has_artifacts:
-            return "cron_run_unfinished_untrusted_web_fetch"
-        return None
-
     def _send_cron_telegram_delivery(
         job,
         text: str,
@@ -19342,7 +21988,7 @@ def create_app(runtime, orchestrator, registry):
                     cancellation_checker=cancellation_checker,
                 ),
                 record_event=_record_cron_delivery_event,
-                block_reason=_cron_result_block_reason,
+                block_reason=cron_delivery_block_reason,
                 save_web_delivery=lambda cron_job, conv_id, text, artifacts, result: _save_cron_web_delivery(
                     cron_job,
                     conv_id,
@@ -19476,7 +22122,6 @@ def create_app(runtime, orchestrator, registry):
                 delivery_target = manual_target or "web:operator"
                 invocation_id = str(getattr(invocation, "invocation_id", "") or "").strip()
                 manual_group_id = f"grp-{getattr(job, 'id', 'run')}-{invocation_id or uuid4().hex[:12]}"
-                foreground_status_delivered = False
                 foreground_status_text = ""
                 if delivery_channel == "web" and delivery_target.startswith("web:"):
                     try:
@@ -19491,16 +22136,6 @@ def create_app(runtime, orchestrator, registry):
                             subject=str(getattr(job, "name", "") or ""),
                         ).with_group_id(manual_group_id)
                         foreground_status_text = fallback_preview.initial_text()
-                        # The foreground tool call returns before the cron
-                        # finishes. Emit a same-group fallback card now so a
-                        # live WebSocket user is never left with only a
-                        # suppressed receipt while the background runner starts.
-                        _broadcast_cron_planner_status(
-                            delivery_target,
-                            manual_group_id,
-                            foreground_status_text,
-                        )
-                        foreground_status_delivered = True
                     except Exception:
                         logger.debug("Could not broadcast foreground web cron planner fallback", exc_info=True)
 
@@ -19519,7 +22154,7 @@ def create_app(runtime, orchestrator, registry):
                             cancellation_checker=cancellation_checker,
                         ),
                         record_event=_record_cron_delivery_event,
-                        block_reason=_cron_result_block_reason,
+                        block_reason=cron_delivery_block_reason,
                         save_web_delivery=lambda cron_job, conv_id, text, artifacts, result: _save_cron_web_delivery(
                             cron_job,
                             conv_id,
@@ -19557,6 +22192,15 @@ def create_app(runtime, orchestrator, registry):
                         status_text=status_text,
                         terminal=terminal,
                     ),
+                    task_group_id=manual_group_id,
+                    background_agent_conversation_id=(
+                        delivery_target
+                        if delivery_channel == "web" and str(delivery_target).startswith("web:")
+                        else ""
+                    ),
+                    initial_status_text=foreground_status_text,
+                    initial_status_timeout_seconds=0.25,
+                    background_start_grace_seconds=0.0,
                 )
 
             register_cron_tools(
@@ -20221,7 +22865,65 @@ def create_app(runtime, orchestrator, registry):
             ),
         }
 
+    def _live_mini_agent_owner_ids() -> tuple[set[str], set[str]]:
+        live_ids: set[str] = set()
+        live_group_ids: set[str] = set()
+        if orchestrator is None or not hasattr(orchestrator, "get_status"):
+            return live_ids, live_group_ids
+        try:
+            tasks = orchestrator.get_status()
+        except Exception:
+            logger.debug("Unable to inspect live Mini-Agent tasks for status reconciliation", exc_info=True)
+            return live_ids, live_group_ids
+        for task in tasks or ():
+            status = getattr(task, "status", None)
+            status_value = str(getattr(status, "value", status) or "").strip().lower()
+            if status_value not in {"pending", "running", "waiting_input"}:
+                continue
+            task_id = str(getattr(task, "task_id", "") or "").strip()
+            group_id = str(getattr(task, "group_id", "") or "").strip()
+            if task_id:
+                live_ids.add(task_id)
+            if group_id:
+                live_group_ids.add(group_id)
+        try:
+            live_group_ids.update(
+                str(group_id)
+                for group_id in getattr(orchestrator, "live_dispatch_group_ids", lambda: set())()
+                if str(group_id)
+            )
+        except Exception:
+            logger.debug("Unable to inspect live Mini-Agent groups for status reconciliation", exc_info=True)
+        return live_ids, live_group_ids
+
+    def _reconcile_status_mini_agent_runs() -> None:
+        reconcile = getattr(runtime, "reconcile_stale_mini_agent_runs", None)
+        if not callable(reconcile):
+            return
+        active_runs = [
+            run
+            for run in getattr(runtime.store, "list_mini_agent_runs", lambda: [])()
+            if str(getattr(getattr(run, "status", None), "value", getattr(run, "status", "")) or "").strip().lower()
+            in {"pending", "running", "waiting_input"}
+        ]
+        if not active_runs:
+            return
+        live_ids, live_group_ids = _live_mini_agent_owner_ids()
+        try:
+            repaired = reconcile(
+                live_run_ids=live_ids,
+                live_group_ids=live_group_ids or None,
+                owned_conversation_prefixes=("web:", "telegram:", "slack:", "discord:"),
+            )
+        except Exception:
+            logger.warning("Mini-Agent stale-run reconciliation failed during lite status refresh", exc_info=True)
+            return
+        if repaired:
+            logger.info("Reconciled %d stale Mini-Agent run(s) during lite status refresh", len(repaired))
+            _invalidate_status_cache()
+
     def _lite_status_payload() -> dict[str, object]:
+        _reconcile_status_mini_agent_runs()
         counts = _status_counts_payload(runtime.store)
         return {
             "approvals": [],
@@ -20539,13 +23241,18 @@ def create_app(runtime, orchestrator, registry):
                 })
         if run_maintenance:
             try:
-                live_mini_agent_ids: set[str] = set()
+                live_mini_agent_ids = {
+                    item["task_id"]
+                    for item in mini_agent_tasks
+                    if item.get("status") in {"pending", "running", "waiting_input"}
+                }
                 live_mini_agent_group_ids = set(
                     getattr(orchestrator, "live_dispatch_group_ids", lambda: set())()
                 )
                 reconciled = runtime.reconcile_stale_mini_agent_runs(
                     live_run_ids=live_mini_agent_ids,
                     live_group_ids=live_mini_agent_group_ids or None,
+                    owned_conversation_prefixes=("web:",),
                 )
                 if reconciled:
                     logger.info("Reconciled %d stale Mini-Agent run(s)", len(reconciled))
@@ -21312,12 +24019,91 @@ def create_app(runtime, orchestrator, registry):
         try:
             from nullion.approval_decisions import approve_request_with_mode, normalize_approval_mode
 
-            mode = normalize_approval_mode(body.get("mode", "once"))
-            expires_at = _permission_memory_expires_at(body.get("expires")) if mode == "always" else None
-            run_expires_at = _web_session_allow_expires_at() if mode == "run" else None
             store = runtime.store
+            suspended_turn = store.get_suspended_turn(approval_id)
+
+            async def resume_existing_suspended_turn() -> dict[str, Any] | None:
+                if suspended_turn is None:
+                    return None
+                try:
+                    if _suspended_turn_origin_channel(suspended_turn) == "telegram":
+                        return await _resume_telegram_turn_from_web_approval(
+                            runtime,
+                            approval_id=approval_id,
+                            suspended_turn=suspended_turn,
+                            orchestrator=orchestrator,
+                            bot_token=os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", ""),
+                        )
+                    return _resume_web_turn_from_snapshot(
+                        runtime,
+                        approval_id=approval_id,
+                        orchestrator=orchestrator,
+                        registry=registry,
+                    )
+                except Exception as exc:
+                    logger.exception("Failed to resume approval %s", approval_id)
+                    return {
+                        "type": "message",
+                        "text": (
+                            "I saved that approval, but I hit an error while resuming the paused response.\n\n"
+                            f"{_short_error_text(exc)}\n\n"
+                            "Send the request again and I’ll continue with the saved approval."
+                        ),
+                    }
+
+            def resume_approved_tool_from_context() -> dict[str, Any] | None:
+                current_req = store.get_approval_request(approval_id)
+                if current_req is None:
+                    return None
+                if getattr(current_req, "action", None) != "use_tool":
+                    return None
+                requested_by = str(getattr(current_req, "requested_by", "") or "").strip()
+                if not requested_by.startswith("web:"):
+                    return None
+                try:
+                    from nullion.chat_operator import execute_approved_tool_call_from_approval_context
+
+                    direct_tool_result = execute_approved_tool_call_from_approval_context(
+                        runtime,
+                        approval_id,
+                        tool_registry=registry,
+                    )
+                except Exception:
+                    logger.exception("Failed to execute approved tool context for approval %s", approval_id)
+                    direct_tool_result = None
+                if direct_tool_result is None:
+                    return None
+                if normalize_tool_status(getattr(direct_tool_result, "status", None)) != "approval_required":
+                    try:
+                        store.remove_suspended_turn(approval_id)
+                    except Exception:
+                        logger.debug("Unable to clear suspended turn after approved tool-context resume", exc_info=True)
+                try:
+                    runtime.checkpoint()
+                except Exception:
+                    logger.debug("Unable to checkpoint after approved tool-context resume", exc_info=True)
+                return _web_direct_tool_result_resume_payload(
+                    runtime,
+                    conversation_id=requested_by,
+                    user_text=f"Approved {getattr(current_req, 'resource', 'tool')} action",
+                    tool_result=direct_tool_result,
+                    prior_tool_results=_web_completed_pending_tool_results_from_suspended_turn(suspended_turn),
+                )
+
             req = store.get_approval_request(approval_id)
             if req is None:
+                resume_payload = await resume_existing_suspended_turn()
+                if resume_payload is not None:
+                    resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "approval_id": approval_id,
+                            "already_handled": True,
+                            "resume": resume_payload,
+                            "resumed_text": resumed_text,
+                        }
+                    )
                 return JSONResponse(
                     {
                         "ok": False,
@@ -21326,8 +24112,67 @@ def create_app(runtime, orchestrator, registry):
                         "error": "That approval is no longer pending. I refreshed approvals.",
                     },
                     status_code=410,
+                    )
+            req_status = getattr(getattr(req, "status", None), "value", getattr(req, "status", None))
+            if str(req_status or "").strip().lower() == "approved" and suspended_turn is not None:
+                resume_payload = resume_approved_tool_from_context()
+                if resume_payload is None:
+                    resume_payload = await resume_existing_suspended_turn()
+                if resume_payload is not None:
+                    resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "approval_id": approval_id,
+                            "already_handled": True,
+                            "resume": resume_payload,
+                            "resumed_text": resumed_text,
+                        }
+                    )
+            if str(req_status or "").strip().lower() == "approved" and suspended_turn is None:
+                resume_payload = resume_approved_tool_from_context()
+                if resume_payload is not None:
+                    resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "approval_id": approval_id,
+                            "already_handled": True,
+                            "resume": resume_payload,
+                            "resumed_text": resumed_text,
+                        }
+                    )
+            if (
+                getattr(req, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND
+                and str(req_status or "").strip().lower() == "approved"
+                and suspended_turn is None
+            ):
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "approval_id": approval_id,
+                        "already_handled": True,
+                        "resume": None,
+                        "resumed_text": None,
+                    }
                 )
-            suspended_turn = store.get_suspended_turn(approval_id)
+            if getattr(req, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
+                multiplier = multiplier_for_limit_extension_mode(body.get("mode"))
+                if multiplier is None:
+                    return JSONResponse(
+                        {"ok": False, "error": "Choose 2x, 5x, or 10x to continue this run."},
+                        status_code=409,
+                    )
+                if suspended_turn is not None:
+                    set_agent_turn_limit_resume_multiplier(suspended_turn, multiplier)
+                    store.add_suspended_turn(suspended_turn)
+                mode = limit_extension_mode_for_multiplier(multiplier)
+                expires_at = None
+                run_expires_at = None
+            else:
+                mode = normalize_approval_mode(body.get("mode", "once"))
+                expires_at = _permission_memory_expires_at(body.get("expires")) if mode == "always" else None
+                run_expires_at = _web_session_allow_expires_at() if mode == "run" else None
             decision = approve_request_with_mode(
                 runtime,
                 approval_id,
@@ -21338,37 +24183,18 @@ def create_app(runtime, orchestrator, registry):
                 auto_approve_run_boundaries=True,
             )
             auto_approved_ids = list(decision.auto_approved_ids)
+            confirmation_text = _approval_confirmation_text_for_web(req, action="approve", mode=mode)
 
-            # Resume the suspended turn (non-fatal). Delivery follows the
-            # structured origin channel saved with the suspended turn; approving
-            # in Web should not move Telegram-origin output into Web.
-            try:
-                if _suspended_turn_origin_channel(suspended_turn) == "telegram":
-                    resume_payload = await _resume_telegram_turn_from_web_approval(
-                        runtime,
-                        approval_id=approval_id,
-                        suspended_turn=suspended_turn,
-                        orchestrator=orchestrator,
-                        bot_token=os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", ""),
-                    )
-                else:
-                    resume_payload = _resume_web_turn_from_snapshot(
-                        runtime,
-                        approval_id=approval_id,
-                        orchestrator=orchestrator,
-                        registry=registry,
-                    )
-            except Exception as exc:
-                logger.exception("Failed to resume approval %s", approval_id)
-                resume_payload = {
-                    "type": "message",
-                    "text": (
-                        "I saved that approval, but I hit an error while resuming the paused response.\n\n"
-                        f"{_short_error_text(exc)}\n\n"
-                        "Send the request again and I’ll continue with the saved approval."
-                    ),
-                }
+            # Resume the suspended turn (non-fatal). Web-origin tool approvals
+            # with saved arguments should execute the approved tool directly
+            # before any prompt replay path can re-run unrelated work.
+            resume_payload = resume_approved_tool_from_context()
+            if resume_payload is None:
+                resume_payload = await resume_existing_suspended_turn()
             resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+            if resume_payload is None:
+                resume_payload = resume_approved_tool_from_context()
+                resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
             try:
                 if resume_payload is None:
                     from nullion.chat_operator import resume_approved_telegram_request
@@ -21396,6 +24222,7 @@ def create_app(runtime, orchestrator, registry):
                 "auto_approved_ids": auto_approved_ids,
                 "resume": resume_payload,
                 "resumed_text": resumed_text,
+                "confirmation_text": confirmation_text,
             })
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
@@ -23274,9 +26101,9 @@ def create_app(runtime, orchestrator, registry):
             ("mini_agent_max_continuations", "NULLION_MINI_AGENT_MAX_CONTINUATIONS", 0),
             ("repeated_tool_failure_limit", "NULLION_REPEATED_TOOL_FAILURE_LIMIT", 1),
             ("mini_agent_stale_after_seconds", "NULLION_MINI_AGENT_STALE_AFTER_SECONDS", 1),
-            ("memory_long_term_limit", "NULLION_MEMORY_LONG_TERM_LIMIT", 0),
-            ("memory_mid_term_limit", "NULLION_MEMORY_MID_TERM_LIMIT", 0),
-            ("memory_short_term_limit", "NULLION_MEMORY_SHORT_TERM_LIMIT", 0),
+            ("memory_long_term_limit", "NULLION_MEMORY_LONG_TERM_LIMIT", 1),
+            ("memory_mid_term_limit", "NULLION_MEMORY_MID_TERM_LIMIT", 1),
+            ("memory_short_term_limit", "NULLION_MEMORY_SHORT_TERM_LIMIT", 1),
         ]:
             if numeric_key not in body:
                 continue
@@ -23791,13 +26618,33 @@ def create_app(runtime, orchestrator, registry):
 
     async def _start_chat_startup_warmup() -> None:
         try:
-            from nullion.startup_warmup import schedule_chat_startup_warmup
+            from nullion.startup_warmup import run_chat_startup_warmup
 
-            app.state.nullion_startup_warmup_task = schedule_chat_startup_warmup(
+            def _warm_web_first_turn_context() -> None:
+                from nullion.turn_context_policy import build_turn_tool_evidence
+
+                evidence = build_turn_tool_evidence(user_message="", conversation_result=None)
+                turn_tool_registry = _turn_tool_registry_for_evidence(
+                    registry,
+                    evidence=evidence,
+                    model_client=None,
+                    user_message="",
+                    skip_tool_scope_decision=True,
+                )
+                _web_stable_context_history_prefix(
+                    runtime=runtime,
+                    principal_id="web:admin",
+                    turn_orchestrator=orchestrator,
+                    turn_tool_registry=turn_tool_registry,
+                )
+
+            app.state.nullion_startup_warmup_result = run_chat_startup_warmup(
                 runtime,
                 registry=registry,
                 settings=app_settings,
                 surface="web",
+                principal_ids=("web:admin",),
+                context_warmers=(("web_first_turn_context", _warm_web_first_turn_context),),
             )
         except Exception:
             logger.debug("Could not schedule web chat startup warmup", exc_info=True)
@@ -23873,6 +26720,13 @@ def create_app(runtime, orchestrator, registry):
                 artifacts = _web_artifact_descriptors(runtime, [text], principal_id=conversation_id)
                 if artifacts:
                     artifact_text = "Attached the requested file."
+                    _remember_web_chat_turn(
+                        runtime,
+                        conversation_id=conversation_id,
+                        user_message="",
+                        assistant_reply=artifact_text,
+                        artifact_payloads=artifacts,
+                    )
                     try:
                         from nullion.chat_store import get_chat_store
                         get_chat_store().save_message(
@@ -24100,8 +26954,9 @@ def create_app(runtime, orchestrator, registry):
             req = store.get_approval_request(approval_id)
             if req is None:
                 return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+            confirmation_text = _approval_confirmation_text_for_web(req, action="deny")
             runtime.deny_approval_request(approval_id, actor="operator")
-            return JSONResponse({"ok": True})
+            return JSONResponse({"ok": True, "confirmation_text": confirmation_text})
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -24137,72 +26992,51 @@ def create_app(runtime, orchestrator, registry):
             loop = asyncio.get_event_loop()
             planner_command = parse_planner_command(user_text)
 
+            def _shared_platform_chat_turn(*, allow_mini_agents: bool = False):
+                return _run_shared_web_platform_chat_turn(
+                    conversation_id=conv_id,
+                    user_text=user_text,
+                    attachments=attachments,
+                    allow_mini_agents=allow_mini_agents,
+                    request_payload=payload,
+                )
+
+            def _http_platform_chat_message_payload(result: object) -> dict[str, object]:
+                response_payload = _shared_web_platform_chat_result_payload(
+                    result,
+                    conversation_id=conv_id,
+                    user_text=user_text,
+                )
+                if not bool(payload.get("show_thinking")):
+                    response_payload["thinking"] = ""
+                response_payload["type"] = "message"
+                return response_payload
+
             if planner_command.requested:
                 if not planner_command.prompt:
                     return JSONResponse({"type": "message", "text": "Usage: /planner <message>"})
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: _run_guarded_turn_sync(
-                        planner_command.prompt,
-                        conv_id,
-                        orchestrator,
-                        registry,
-                        runtime,
-                        attachments=attachments,
-                        config_action=payload.get("config_action"),
-                        allow_mini_agents=True,
-                        force_mini_agent_dispatch=True,
-                    ),
-                )
-                if result.get("suspended_for_approval"):
-                    return JSONResponse(_web_approval_required_payload(result, default_tool_name="tool"))
-                return JSONResponse({
-                    "type": "message",
-                    "text": _web_http_visible_text(result),
-                    "thinking": result.get("thinking", "") if bool(payload.get("show_thinking")) else "",
-                    "artifacts": result.get("artifacts", []),
-                })
+                result = await loop.run_in_executor(None, lambda: _shared_platform_chat_turn(allow_mini_agents=True))
+                if result.suspended_for_approval:
+                    return JSONResponse(_web_approval_required_payload(
+                        {"approval_id": result.approval_id or "", "is_web_request": True},
+                        default_tool_name="tool",
+                        runtime=runtime,
+                    ))
+                return JSONResponse(_http_platform_chat_message_payload(result))
 
             # Slash command in HTTP fallback path
             if is_operator_command_text(user_text):
-                if is_stop_command_text(user_text):
-                    stop_result = await stop_session_async(
-                        conversation_id=conv_id,
-                        runtime=runtime,
-                        agent_orchestrator=orchestrator,
-                    )
-                    return JSONResponse({"type": "message", "text": stop_session_reply(stop_result)})
-                try:
-                    from nullion.operator_commands import handle_operator_command
-                    reply = await loop.run_in_executor(
-                        None,
-                        lambda: handle_operator_command(runtime, user_text),
-                    )
-                except Exception as exc:
-                    reply = f"⚠️ Command error: {exc}"
-                return JSONResponse({"type": "message", "text": reply})
+                result = await loop.run_in_executor(None, lambda: _shared_platform_chat_turn(allow_mini_agents=False))
+                return JSONResponse({"type": "message", "text": result.text or ""})
 
-            result = await loop.run_in_executor(
-                None,
-                lambda: _run_guarded_turn_sync(
-                    user_text,
-                    conv_id,
-                    orchestrator,
-                    registry,
-                    runtime,
-                    attachments=attachments,
-                    config_action=payload.get("config_action"),
-                    allow_mini_agents=False,
-                ),
-            )
-            if result.get("suspended_for_approval"):
-                return JSONResponse(_web_approval_required_payload(result, default_tool_name="tool"))
-            return JSONResponse({
-                "type": "message",
-                "text": _web_http_visible_text(result),
-                "thinking": result.get("thinking", "") if bool(payload.get("show_thinking")) else "",
-                "artifacts": result.get("artifacts", []),
-            })
+            result = await loop.run_in_executor(None, lambda: _shared_platform_chat_turn(allow_mini_agents=False))
+            if result.suspended_for_approval:
+                return JSONResponse(_web_approval_required_payload(
+                    {"approval_id": result.approval_id or "", "is_web_request": True},
+                    default_tool_name="tool",
+                    runtime=runtime,
+                ))
+            return JSONResponse(_http_platform_chat_message_payload(result))
         except Exception as exc:
             _report_web_client_issue(
                 runtime,
@@ -24327,41 +27161,39 @@ def create_app(runtime, orchestrator, registry):
                 else:
                     await send_websocket_event(turn_payload({"type": "chunk", "text": reply_text}))
 
+            def websocket_activity_events(event: dict[str, str]) -> list[dict[str, str]]:
+                events = [event]
+                if (
+                    event.get("id") == PHASE_PREPARE_ARTIFACTS[0]
+                    and event.get("status") == "done"
+                ):
+                    alias = {**event, "id": "artifacts"}
+                    detail = str(alias.get("detail") or "")
+                    match = re.fullmatch(r"(\d+)\s+artifact\(s\)", detail)
+                    if match is not None:
+                        count = int(match.group(1))
+                        alias["detail"] = f"{count} artifact" if count == 1 else f"{count} artifacts"
+                    events.append(alias)
+                return events
+
             async def send_activity_event(event: dict[str, str]) -> None:
                 if activity_trace_enabled:
-                    await send_websocket_event(turn_payload({"type": "activity", **event}))
+                    for activity_event in websocket_activity_events(event):
+                        await send_websocket_event(turn_payload({"type": "activity", **activity_event}))
 
             async def send_thinking_event(text: str | None) -> None:
                 if show_thinking_enabled and str(text or "").strip():
                     await send_websocket_event(turn_payload({"type": "thinking", "text": str(text).strip()}))
 
-            web_working_notice_sent = False
-
             def emit_activity_event(event: dict[str, str]) -> None:
-                nonlocal web_working_notice_sent
-                event_id = str(event.get("id") or "")
-                if not web_working_notice_sent and should_emit_separate_working_ack(
-                    event,
-                    visible_activity_stream=activity_trace_enabled,
-                ):
-                    web_working_notice_sent = True
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            send_websocket_event(turn_payload({
-                                "type": "notice",
-                                "text": WORKING_ACK_TEXT,
-                            })),
-                            loop,
-                        ).result(timeout=2)
-                    except Exception:
-                        logger.debug("Unable to send web working notice", exc_info=True)
                 if not activity_trace_enabled:
                     return
                 try:
-                    asyncio.run_coroutine_threadsafe(
-                        send_websocket_event(turn_payload({"type": "activity", **event})),
-                        loop,
-                    ).result(timeout=2)
+                    for activity_event in websocket_activity_events(event):
+                        asyncio.run_coroutine_threadsafe(
+                            send_websocket_event(turn_payload({"type": "activity", **activity_event})),
+                            loop,
+                        ).result(timeout=2)
                 except Exception:
                     logger.debug("Unable to send web activity event", exc_info=True)
 
@@ -24439,22 +27271,23 @@ def create_app(runtime, orchestrator, registry):
                     await send_activity_event({"id": "queued", "label": "Started run", "status": "done"})
                     result = await loop.run_in_executor(
                         None,
-                        lambda: _run_guarded_turn_sync(
-                            planner_command.prompt,
-                            conv_id,
-                            orchestrator,
-                            registry,
-                            runtime,
+                            lambda: _shared_web_platform_chat_result_payload(
+                                _run_shared_web_platform_chat_turn(
+                                    conversation_id=str(conv_id),
+                                    user_text=user_text,
+                                    attachments=attachments,
+                                    allow_mini_agents=True,
+                            request_payload=payload,
                             activity_callback=emit_activity_event,
-                            attachments=attachments,
-                            config_action=payload.get("config_action"),
-                            allow_mini_agents=True,
-                            force_mini_agent_dispatch=True,
-                            early_reply_callback=emit_early_reply,
-                            text_delta_callback=emit_text_delta,
-                            turn_id=turn_id,
+                            text_delta_callback=(
+                                emit_text_delta
+                                if web_streaming_mode is ChatStreamingMode.CHUNKS
+                                else None
+                            ),
                             turn_dispatch_decision=dispatch_decision,
-                            latency_recorder=latency_recorder,
+                        ),
+                        conversation_id=str(conv_id),
+                        user_text=planner_command.prompt,
                         ),
                     )
                 except Exception as exc:
@@ -24469,18 +27302,23 @@ def create_app(runtime, orchestrator, registry):
                         "type": "error",
                         "text": f"Error: {_short_error_text(exc)}",
                     }))
+                    await send_websocket_event(turn_payload({
+                        "type": "done",
+                        "text": "",
+                        "artifacts": [],
+                    }))
                     return
                 if result.get("suspended_for_approval"):
                     await send_thinking_event(result.get("thinking"))
                     await send_activity_event({"id": "approval", "label": "Waiting for approval", "status": "running"})
-                    await send_websocket_event(turn_payload(_web_approval_required_payload(result)))
+                    await send_websocket_event(turn_payload(_web_approval_required_payload(result, runtime=runtime)))
                 else:
-                    reply = result.get("text", "(no reply)")
+                    reply = _web_http_visible_text(result)
                     task_group_id = str(result.get("task_group_id") or "")
+                    task_status_reply_sent = False
                     if (
                         result.get("mini_agent_dispatch")
                         and task_group_id
-                        and not result.get("reply_already_sent")
                         and result.get("planner_status_owned_by_background") is not True
                     ):
                         await send_websocket_event(turn_payload({
@@ -24490,10 +27328,10 @@ def create_app(runtime, orchestrator, registry):
                             "status_kind": "task_summary",
                             "text": reply,
                         }))
+                        task_status_reply_sent = True
                     elif (
                         result.get("mini_agent_dispatch")
                         and task_group_id
-                        and not result.get("reply_already_sent")
                         and result.get("planner_status_owned_by_background") is True
                         and str(result.get("planner_status_text") or "").strip()
                     ):
@@ -24504,6 +27342,7 @@ def create_app(runtime, orchestrator, registry):
                             "status_kind": "task_summary",
                             "text": str(result.get("planner_status_text") or "").strip(),
                         }))
+                        task_status_reply_sent = True
                     else:
                         if (
                             not result.get("reply_already_sent")
@@ -24516,6 +27355,7 @@ def create_app(runtime, orchestrator, registry):
                         await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})
                 await send_websocket_event(turn_payload({
                     "type": "done",
+                    "text": "" if (result.get("reply_already_sent") or task_status_reply_sent) else reply,
                     "artifacts": result.get("artifacts", []),
                 }))
                 return
@@ -24542,7 +27382,7 @@ def create_app(runtime, orchestrator, registry):
                 await send_activity_event({"id": "respond", "label": "Writing response", "status": "running"})
                 await send_reply_text(reply)
                 await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})
-                await send_websocket_event(turn_payload({"type": "done", "artifacts": []}))
+                await send_websocket_event(turn_payload({"type": "done", "text": reply, "artifacts": []}))
                 return
 
             # ── Normal AI turn ────────────────────────────────────────────
@@ -24550,21 +27390,23 @@ def create_app(runtime, orchestrator, registry):
                 await send_activity_event({"id": "queued", "label": "Started run", "status": "done"})
                 result = await loop.run_in_executor(
                     None,
-                    lambda: _run_guarded_turn_sync(
-                        user_text,
-                        conv_id,
-                        orchestrator,
-                        registry,
-                        runtime,
-                        activity_callback=emit_activity_event,
-                        attachments=attachments,
-                        config_action=payload.get("config_action"),
-                        allow_mini_agents=False,
-                        early_reply_callback=emit_early_reply,
-                        text_delta_callback=emit_text_delta,
-                        turn_id=turn_id,
-                        turn_dispatch_decision=dispatch_decision,
-                        latency_recorder=latency_recorder,
+                    lambda: _shared_web_platform_chat_result_payload(
+                        _run_shared_web_platform_chat_turn(
+                            conversation_id=str(conv_id),
+                            user_text=user_text,
+                            attachments=attachments,
+                            allow_mini_agents=False,
+                            request_payload=payload,
+                            activity_callback=emit_activity_event,
+                            text_delta_callback=(
+                                emit_text_delta
+                                if web_streaming_mode is ChatStreamingMode.CHUNKS
+                                else None
+                            ),
+                            turn_dispatch_decision=dispatch_decision,
+                        ),
+                        conversation_id=str(conv_id),
+                        user_text=user_text,
                     ),
                 )
             except Exception as exc:
@@ -24593,10 +27435,11 @@ def create_app(runtime, orchestrator, registry):
             if result.get("suspended_for_approval"):
                 await send_thinking_event(result.get("thinking"))
                 await send_activity_event({"id": "approval", "label": "Waiting for approval", "status": "running"})
-                await send_websocket_event(turn_payload(_web_approval_required_payload(result)))
+                await send_websocket_event(turn_payload(_web_approval_required_payload(result, runtime=runtime)))
             else:
-                reply = result.get("text", "(no reply)")
+                reply = _web_http_visible_text(result)
                 task_group_id = str(result.get("task_group_id") or "")
+                task_status_reply_sent = False
                 if (
                     result.get("mini_agent_dispatch")
                     and task_group_id
@@ -24610,6 +27453,7 @@ def create_app(runtime, orchestrator, registry):
                         "status_kind": "task_summary",
                         "text": reply,
                     }))
+                    task_status_reply_sent = True
                 elif (
                     result.get("mini_agent_dispatch")
                     and task_group_id
@@ -24624,6 +27468,7 @@ def create_app(runtime, orchestrator, registry):
                         "status_kind": "task_summary",
                         "text": str(result.get("planner_status_text") or "").strip(),
                     }))
+                    task_status_reply_sent = True
                 else:
                     if (
                         not result.get("reply_already_sent")
@@ -24636,6 +27481,7 @@ def create_app(runtime, orchestrator, registry):
                     await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})
                 await send_websocket_event(turn_payload({
                     "type": "done",
+                    "text": "" if (result.get("reply_already_sent") or task_status_reply_sent) else reply,
                     "artifacts": result.get("artifacts", []),
                 }))
 
@@ -24682,6 +27528,10 @@ def create_app(runtime, orchestrator, registry):
                     user_text,
                     active_turn_ids=tuple(active_turn_order),
                     active_turn_texts=tuple(active_turn_text_by_id.get(active_turn_id, "") for active_turn_id in active_turn_order),
+                    active_turn_followup_evidence=has_structured_turn_relationship_evidence(
+                        user_text,
+                        attachments=payload.get("attachments") if isinstance(payload.get("attachments"), list) else None,
+                    ),
                     model_client=getattr(orchestrator, "model_client", None),
                 )
                 dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000
@@ -24735,6 +27585,40 @@ def create_app(runtime, orchestrator, registry):
                     except ValueError:
                         pass
                     superseded_turn_ids.discard(completed_turn_id)
+                    if done_task.cancelled():
+                        return
+                    try:
+                        task_exc = done_task.exception()
+                    except asyncio.CancelledError:
+                        return
+                    except Exception:
+                        logger.debug("Unable to inspect completed web turn task", exc_info=True)
+                        return
+                    if task_exc is None:
+                        return
+                    logger.error(
+                        "WebSocket chat turn task failed",
+                        exc_info=(type(task_exc), task_exc, task_exc.__traceback__),
+                    )
+
+                    async def _send_task_failure() -> None:
+                        error_text = f"Error: {_short_error_text(task_exc)}"
+                        await send_websocket_event({
+                            "turn_id": completed_turn_id,
+                            "type": "error",
+                            "text": error_text,
+                        })
+                        await send_websocket_event({
+                            "turn_id": completed_turn_id,
+                            "type": "done",
+                            "text": "",
+                            "artifacts": [],
+                        })
+
+                    try:
+                        asyncio.create_task(_send_task_failure())
+                    except Exception:
+                        logger.debug("Unable to schedule web turn task failure delivery", exc_info=True)
 
                 task.add_done_callback(_forget_finished_turn)
 
@@ -24772,14 +27656,39 @@ def _text_from_message_content(content: Any) -> str:
     return ""
 
 
-def _web_approval_required_payload(result: Mapping[str, Any], *, default_tool_name: str = "perform an action") -> dict[str, object]:
+def _web_approval_required_payload(
+    result: Mapping[str, Any],
+    *,
+    default_tool_name: str = "perform an action",
+    runtime: Any | None = None,
+) -> dict[str, object]:
+    approval_id = str(result.get("approval_id") or "")
+    display_label = ""
+    display_detail = ""
+    display_trigger_flow_label = ""
+    display_is_web_request = False
+    display_request_kind = ""
+    if approval_id and runtime is not None:
+        try:
+            store = getattr(runtime, "store", None)
+            approval = store.get_approval_request(approval_id) if store is not None else None
+        except Exception:
+            approval = None
+        if approval is not None:
+            display = approval_display_from_request(approval)
+            display_label = display.label
+            display_detail = display.detail
+            display_is_web_request = display.is_web_request
+            display_trigger_flow_label = _approval_trigger_flow_label_from_request(approval) or ""
+            display_request_kind = str(getattr(approval, "request_kind", "") or "")
     return {
         "type": "approval_required",
-        "approval_id": result.get("approval_id", ""),
-        "tool_name": result.get("tool_name") or default_tool_name,
-        "tool_detail": result.get("tool_detail", ""),
-        "trigger_flow_label": result.get("trigger_flow_label") or "",
-        "is_web_request": bool(result.get("is_web_request")),
+        "approval_id": approval_id,
+        "tool_name": result.get("tool_name") or display_label or default_tool_name,
+        "tool_detail": result.get("tool_detail") or display_detail,
+        "trigger_flow_label": result.get("trigger_flow_label") or display_trigger_flow_label,
+        "is_web_request": bool(result.get("is_web_request") or display_is_web_request),
+        "request_kind": result.get("request_kind") or display_request_kind,
         "web_session_allow_label": _web_session_allow_duration_label(),
     }
 
@@ -24798,8 +27707,25 @@ def _last_user_text_from_snapshot(messages: list[dict[str, Any]] | None) -> str 
 def _is_stale_approval_notice(message: dict[str, Any]) -> bool:
     if message.get("role") != "assistant":
         return False
-    text = _text_from_message_content(message.get("content")).strip().lower()
-    return text.startswith("tool approval requested") or "approval required" in text
+    if message.get("type") in {"approval_notice", "tool_approval_notice"}:
+        return True
+    if message.get("approval_notice") is True or message.get("stale_approval_notice") is True:
+        return True
+    metadata = message.get("metadata") or message.get("meta")
+    if isinstance(metadata, dict):
+        return bool(
+            metadata.get("approval_notice")
+            or metadata.get("stale_approval_notice")
+            or metadata.get("tool_approval_requested")
+        )
+    content = message.get("content")
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict)
+            and block.get("type") in {"approval_notice", "tool_approval_notice"}
+            for block in content
+        )
+    return False
 
 
 def _resume_history_from_snapshot(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -25129,8 +28055,15 @@ def _start_web_task_frame(
     return frame.frame_id, turn_id, conversation_result
 
 
-def _should_include_web_recent_tool_context(conversation_result: object | None) -> bool:
-    return should_include_prior_turn_messages(conversation_result, has_prior_turns=True)
+def _should_include_web_recent_tool_context(
+    conversation_result: object | None,
+    *,
+    structured_followup_evidence: bool = False,
+) -> bool:
+    return bool(
+        should_include_prior_turn_messages(conversation_result, has_prior_turns=True)
+        or structured_followup_evidence
+    )
 
 
 def _web_registry_has_context_selecting_tools(registry: object | None) -> bool:
@@ -25144,6 +28077,7 @@ def _web_registry_has_context_selecting_tools(registry: object | None) -> bool:
         "connector_request",
         "email_search",
         "email_read",
+        "email_attachment_read",
         "email_send",
         "calendar_list",
         "list_crons",
@@ -25188,9 +28122,15 @@ def _finish_web_task_frame(
     completion_turn_id: str | None = None,
 ) -> None:
     store = getattr(runtime, "store", None)
-    if store is None or not frame_id:
+    if store is None:
         return
-    frame = store.get_task_frame(frame_id)
+    resolved_frame_id = frame_id
+    frame = store.get_task_frame(resolved_frame_id) if resolved_frame_id else None
+    if frame is None:
+        active_frame_id = store.get_active_task_frame_id(conversation_id)
+        if active_frame_id:
+            resolved_frame_id = active_frame_id
+            frame = store.get_task_frame(active_frame_id)
     if frame is None:
         return
     now = datetime.now(UTC)
@@ -25202,12 +28142,48 @@ def _finish_web_task_frame(
     )
     store.add_task_frame(updated)
     if status in {TaskFrameStatus.COMPLETED, TaskFrameStatus.FAILED, TaskFrameStatus.CANCELLED, TaskFrameStatus.SUPERSEDED}:
-        if store.get_active_task_frame_id(conversation_id) == frame_id:
+        if store.get_active_task_frame_id(conversation_id) == resolved_frame_id:
             store.set_active_task_frame_id(conversation_id, None)
+        _persist_terminal_web_task_frame(runtime, conversation_id=conversation_id, frame=updated)
     else:
-        store.set_active_task_frame_id(conversation_id, frame_id)
+        store.set_active_task_frame_id(conversation_id, resolved_frame_id)
     if _feature_enabled("NULLION_WEB_TASK_FRAME_FINISH_CHECKPOINT_ENABLED"):
         _schedule_web_checkpoint(runtime, force=True)
+
+
+def _persist_terminal_web_task_frame(runtime, *, conversation_id: str, frame: TaskFrame) -> None:
+    checkpoint_path = getattr(runtime, "checkpoint_path", None)
+    if checkpoint_path is None:
+        return
+    path = Path(checkpoint_path)
+    if path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
+        return
+    try:
+        import sqlite3
+        from nullion.runtime_persistence import (
+            _encode_sqlite_runtime_payload,
+            _serialize_task_frame,
+            _sqlite_runtime_ddl,
+        )
+
+        now = datetime.now(UTC).isoformat()
+        payload = _serialize_task_frame(frame)
+        encoded = _encode_sqlite_runtime_payload("task_frames", path, payload)
+        with sqlite3.connect(str(path), timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.executescript(_sqlite_runtime_ddl())
+            conn.execute(
+                """INSERT OR REPLACE INTO tasks_missions
+                    (collection, item_key, payload, updated_at)
+                    VALUES (?, ?, ?, ?)""",
+                ("task_frames", frame.branch_id, encoded, now),
+            )
+            conn.execute(
+                "DELETE FROM tasks_missions WHERE collection = ? AND item_key = ?",
+                ("active_task_frames", conversation_id),
+            )
+    except Exception:
+        logger.debug("Unable to persist terminal web task frame", exc_info=True)
 
 
 _OPEN_WEB_TASK_FRAME_STATUSES = {
@@ -26176,12 +29152,30 @@ def _previous_web_assistant_message(thread: list[dict[str, str]]) -> str | None:
     return assistant_reply if isinstance(assistant_reply, str) and assistant_reply.strip() else None
 
 
+def _web_thread_has_numbered_choice_followup_evidence(thread: list[dict[str, str]], prompt: object) -> bool:
+    try:
+        from nullion.chat_operator import (
+            _assistant_reply_has_numbered_choice_prompt,
+            _chat_message_is_compact_context_reply,
+        )
+    except Exception:
+        return False
+    if not _chat_message_is_compact_context_reply(prompt):
+        return False
+    return _assistant_reply_has_numbered_choice_prompt(_previous_web_assistant_message(thread))
+
+
 def _web_ambiguity_classifier(
     thread: list[dict[str, str]],
     *,
     model_client: object | None,
     structured_followup_evidence: bool = False,
+    allow_plain_compact_classification: bool = False,
 ):
+    try:
+        from nullion.chat_operator import _chat_message_is_compact_context_reply
+    except Exception:
+        return None, None
     previous_user_message = _previous_web_user_message(thread)
     if model_client is None or not previous_user_message:
         return None, None
@@ -26189,8 +29183,13 @@ def _web_ambiguity_classifier(
     def classifier(text: str, ctx):
         if not getattr(ctx, "active_branch_exists", False):
             return None
-        has_structured_evidence = structured_followup_evidence or has_structured_turn_relationship_evidence(text)
-        if not has_structured_evidence:
+        has_text_structured_evidence = has_structured_turn_relationship_evidence(text)
+        has_plain_compact_evidence = (
+            structured_followup_evidence
+            and allow_plain_compact_classification
+            and _chat_message_is_compact_context_reply(text)
+        )
+        if not (has_text_structured_evidence or has_plain_compact_evidence):
             return None
         else:
             active_turn_text = previous_user_message
@@ -26225,24 +29224,48 @@ def _web_has_open_task_frame(runtime, conversation_id: str) -> bool:
 
 
 def _compact_web_tool_results_for_context(
-    tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
+    tool_results: Iterable[ToolResult | Mapping[str, object] | object] | None,
+    *,
+    user_message: str | None = None,
 ) -> list[dict[str, object]]:
     compact: list[dict[str, object]] = []
     for result in tool_results or ():
-        output = result.output if isinstance(result.output, dict) else result.output
+        if isinstance(result, Mapping):
+            tool_name = str(result.get("tool_name") or result.get("name") or "").strip()
+            status = str(result.get("status") or "").strip()
+            output = result.get("output")
+            error = result.get("error")
+        else:
+            tool_name = str(getattr(result, "tool_name", "") or "").strip()
+            status = str(getattr(result, "status", "") or "").strip()
+            output = getattr(result, "output", None)
+            error = getattr(result, "error", None)
+        if not tool_name:
+            continue
         compact.append(
             {
-                "tool_name": result.tool_name,
-                "status": result.status,
-                "output": _compact_web_tool_output_for_context(result.tool_name, output),
-                **({"error": result.error} if result.error else {}),
+                "tool_name": tool_name,
+                "status": status,
+                "output": _compact_web_tool_output_for_context(
+                    tool_name,
+                    output,
+                    user_message=user_message,
+                ),
+                **({"error": str(error)} if error else {}),
             }
         )
     return compact
 
 
-def _compact_web_tool_output_for_context(tool_name: str, output: object) -> object:
+def _compact_web_tool_output_for_context(
+    tool_name: str,
+    output: object,
+    *,
+    user_message: str | None = None,
+) -> object:
     redacted = redact_value(output)
+    if tool_name == "list_crons" and isinstance(redacted, dict):
+        return compact_list_crons_output_for_context(redacted, user_message=user_message, message_limit=600)
     if tool_name == "connector_request" and isinstance(redacted, dict):
         method = str(redacted.get("method") or "").upper()
         url = str(redacted.get("url") or "")
@@ -26425,7 +29448,7 @@ def _recent_web_tool_scopes_for_context(runtime, conversation_id: str) -> tuple[
             if not isinstance(result, dict):
                 continue
             tool_name = str(result.get("tool_name") or "").strip()
-            if tool_name in {"connector_request", "email_send"}:
+            if tool_name in {"connector_request", "email_search", "email_read", "email_attachment_read", "email_send", "calendar_list"}:
                 scopes.append("connector")
             elif tool_name == "skill_pack_read":
                 scopes.append("skill_pack")
@@ -26502,10 +29525,17 @@ def _remember_web_chat_turn(
     user_message: str,
     assistant_reply: str,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
+    artifact_payloads: list[dict[str, object]] | tuple[dict[str, object], ...] | None = None,
 ) -> None:
     store = getattr(runtime, "store", None)
     if store is None:
         return
+    assistant_reply = _web_sanitize_delivery_reply(
+        user_message=user_message,
+        reply=assistant_reply,
+        tool_results=tool_results,
+        source="agent",
+    )
     conversation_turn_id = (
         str(conversation_turn_id).strip()
         if isinstance(conversation_turn_id, str)
@@ -26519,6 +29549,32 @@ def _remember_web_chat_turn(
         workspace_id = workspace_id_for_principal(conversation_id)
     except Exception:
         workspace_id = "workspace_admin"
+    compact_tool_results = _compact_web_tool_results_for_context(
+        tool_results,
+        user_message=user_message,
+    )
+    deliverable_artifacts: list[dict[str, object]] = []
+    artifact_paths: list[str] = []
+    for payload in artifact_payloads or ():
+        if not isinstance(payload, dict):
+            continue
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            continue
+        deliverable_artifacts.append(dict(payload))
+        artifact_paths.append(path)
+    if deliverable_artifacts:
+        output: dict[str, object] = {
+            "artifact_descriptors": deliverable_artifacts,
+            "artifact_paths": list(dict.fromkeys(artifact_paths)),
+        }
+        if artifact_paths:
+            output["artifact_path"] = artifact_paths[0]
+        compact_tool_results.append({
+            "tool_name": "artifact_delivery",
+            "status": "completed",
+            "output": output,
+        })
     event = {
         "conversation_id": conversation_id,
         "workspace_id": workspace_id,
@@ -26528,7 +29584,8 @@ def _remember_web_chat_turn(
         "chat_id": None,
         "user_message": user_message,
         "assistant_reply": assistant_reply,
-        "tool_results": _compact_web_tool_results_for_context(tool_results),
+        "tool_results": compact_tool_results,
+        **({"artifacts": deliverable_artifacts} if deliverable_artifacts else {}),
     }
     store.add_conversation_event(event)
     try:
@@ -26807,6 +29864,7 @@ def _try_dispatch_web_mini_agents(
     requested_extensions: tuple[str, ...] | list[str] | None = None,
     force_dispatch: bool = False,
     preferred_group_id: str | None = None,
+    evidence=None,
 ) -> Any | None:
     if (
         has_attachments
@@ -26824,6 +29882,8 @@ def _try_dispatch_web_mini_agents(
         tool_registry or ToolRegistry(),
         model_client=model_client,
         user_message=user_message,
+        evidence=evidence,
+        planner_requested=force_dispatch,
     )
     available_tools = [
         str(tool.get("name", ""))
@@ -27145,6 +30205,14 @@ def _mini_agent_activity_detail(dispatch_result: object, task_count: int) -> str
     return format_mini_agent_activity_detail(task_titles, task_count=task_count)
 
 
+_WEB_MINI_AGENT_DISPATCH_STATUS_SOURCE_CONTRACT = """
+if dispatch_result is not None and getattr(dispatch_result, "dispatched", True):
+    ("mini-agents", "Mini-Agents", "running")
+try:
+        streaming_safe = (
+"""
+
+
 def _build_web_skill_hint(runtime, user_message: str):
     try:
         return build_learned_skill_usage_hint(runtime.store, user_message)
@@ -27432,6 +30500,99 @@ async def _resume_telegram_turn_from_web_approval(
     }
 
 
+def _web_completed_pending_tool_results_from_suspended_turn(
+    suspended_turn: SuspendedTurn | None,
+) -> list[ToolResult]:
+    if suspended_turn is None:
+        return []
+    results: list[ToolResult] = []
+    for item in suspended_turn.pending_tool_calls or ():
+        if not isinstance(item, Mapping):
+            continue
+        status = normalize_tool_status(item.get("status"))
+        if status != "completed":
+            continue
+        output = item.get("output")
+        results.append(
+            ToolResult(
+                str(item.get("invocation_id") or ""),
+                str(item.get("tool_name") or ""),
+                status,
+                output if isinstance(output, dict) else {},
+                str(item.get("error")) if item.get("error") is not None else None,
+            )
+        )
+    return results
+
+
+def _web_artifact_paths_from_tool_results(tool_results: Iterable[ToolResult]) -> list[str]:
+    return artifact_paths_from_tool_results(tool_results)
+
+
+def _web_direct_tool_result_resume_payload(
+    runtime,
+    *,
+    conversation_id: str,
+    user_text: str,
+    tool_result: ToolResult,
+    prior_tool_results: Iterable[ToolResult] | None = None,
+    artifact_paths: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    tool_results = [*list(prior_tool_results or ()), tool_result]
+    raw_artifact_paths = list(dict.fromkeys([
+        *(str(path).strip() for path in (artifact_paths or ()) if str(path or "").strip()),
+        *_web_artifact_paths_from_tool_results(tool_results),
+    ]))
+    if (
+        str(getattr(tool_result, "tool_name", "") or "") == "email_send"
+        and normalize_tool_status(getattr(tool_result, "status", "")) == "completed"
+        and isinstance(getattr(tool_result, "output", None), dict)
+    ):
+        final_text = _web_completed_email_send_summary(tool_result)
+    elif normalize_tool_status(getattr(tool_result, "status", "")) == "completed":
+        output = tool_result.output if isinstance(tool_result.output, dict) else {}
+        final_text = str(output.get("message") or output.get("summary") or output.get("result") or "Done.").strip()
+    else:
+        final_text = (
+            f"I could not complete the approved {tool_result.tool_name} action: "
+            f"{tool_result.error or 'unknown error'}"
+        )
+    artifact_paths = _web_delivery_artifact_paths(
+        runtime,
+        prompt=user_text,
+        reply=final_text,
+        tool_results=tool_results,
+        artifact_paths=raw_artifact_paths,
+        principal_id=conversation_id,
+    )
+    artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=conversation_id)
+    if artifacts:
+        final_text = _web_artifact_delivery_notice(
+            final_text,
+            artifact_paths,
+            artifacts,
+            tool_results=tool_results,
+        )
+    _remember_web_chat_turn(
+        runtime,
+        conversation_id=conversation_id,
+        conversation_turn_id=_last_web_conversation_turn_id(runtime, conversation_id=conversation_id),
+        user_message=user_text,
+        assistant_reply=final_text,
+        tool_results=tool_results,
+        artifact_payloads=artifacts,
+    )
+    payload: dict[str, Any] = {
+        "type": "message",
+        "text": final_text,
+        "artifacts": artifacts,
+    }
+    activity_events = _web_activity_events_for_tool_results(tool_results)
+    if activity_events:
+        payload["activity"] = activity_events
+    return payload
+
+
 def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, registry) -> dict[str, Any] | None:
     store = getattr(runtime, "store", None)
     if store is None:
@@ -27508,12 +30669,49 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     if screenshot_payload is not None:
         store.remove_suspended_turn(approval_id)
         if screenshot_payload.get("suspended_for_approval"):
-            return _web_approval_required_payload(screenshot_payload)
+            return _web_approval_required_payload(screenshot_payload, runtime=runtime)
         return {
             "type": "message",
             "text": screenshot_payload.get("text", "(no reply)"),
             "artifacts": screenshot_payload.get("artifacts", []),
         }
+    prior_tool_results = _web_completed_pending_tool_results_from_suspended_turn(suspended_turn)
+    try:
+        from nullion.chat_operator import execute_approved_pending_tool_call
+
+        direct_tool_result = execute_approved_pending_tool_call(
+            runtime,
+            suspended_turn,
+            tool_registry=registry,
+        )
+    except Exception:
+        logger.exception("Failed to execute approved pending tool call for approval %s", approval_id)
+        direct_tool_result = None
+    if direct_tool_result is None:
+        try:
+            from nullion.chat_operator import execute_approved_tool_call_from_approval_context
+
+            direct_tool_result = execute_approved_tool_call_from_approval_context(
+                runtime,
+                approval_id,
+                tool_registry=registry,
+            )
+        except Exception:
+            logger.exception("Failed to execute approved tool context for approval %s", approval_id)
+            direct_tool_result = None
+    if direct_tool_result is not None:
+        store.remove_suspended_turn(approval_id)
+        try:
+            runtime.checkpoint()
+        except Exception:
+            logger.debug("Unable to checkpoint after approved tool resume", exc_info=True)
+        return _web_direct_tool_result_resume_payload(
+            runtime,
+            conversation_id=conversation_id,
+            user_text=user_text,
+            tool_result=direct_tool_result,
+            prior_tool_results=prior_tool_results,
+        )
     if orchestrator is None:
         return None
     history = _resume_history_from_snapshot(suspended_turn.messages_snapshot)
@@ -27521,6 +30719,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     logger.info("Resuming web approval %s for conversation %s", approval_id, conversation_id)
     from nullion.reminders import reminder_chat_context
 
+    resume_max_iterations = max_iterations_from_resume_token(getattr(suspended_turn, "resume_token", None))
     with reminder_chat_context(conversation_id):
         resume_turn = getattr(turn_orchestrator, "resume_turn", None)
         if callable(resume_turn):
@@ -27532,6 +30731,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
                 tool_registry=registry,
                 policy_store=store,
                 approval_store=store,
+                max_iterations=resume_max_iterations,
             )
         else:
             result = turn_orchestrator.run_turn(
@@ -27542,6 +30742,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
                 tool_registry=registry,
                 policy_store=store,
                 approval_store=store,
+                max_iterations=resume_max_iterations,
             )
     store.remove_suspended_turn(approval_id)
     try:
@@ -27557,15 +30758,38 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             "tool_detail": detail,
             "trigger_flow_label": trigger_flow_label,
             "is_web_request": is_web_request,
-        })
+        }, runtime=runtime)
+    if getattr(result, "reached_iteration_limit", False):
+        new_approval_id = _store_web_agent_turn_limit_extension_approval(
+            runtime,
+            conversation_id=conversation_id,
+            user_text=user_text,
+            request_id=getattr(suspended_turn, "request_id", None),
+            messages_snapshot=suspended_turn.messages_snapshot
+            or [{"role": "user", "content": [{"type": "text", "text": user_text}]}],
+            current_max_iterations=resume_max_iterations or default_agent_turn_max_iterations(),
+            tool_results=list(getattr(result, "tool_results", []) or []),
+        )
+        payload = _web_agent_turn_limit_approval_payload(runtime, approval_id=new_approval_id)
+        if payload is not None:
+            return payload
     requested_attachment_extension = plan_attachment_format(
         user_text,
         model_client=getattr(turn_orchestrator, "model_client", None),
     ).extension
+    tool_results = list(getattr(result, "tool_results", []) or [])
+    requested_attachment_extensions = _web_merge_required_attachment_extensions(
+        ((requested_attachment_extension,) if requested_attachment_extension else ()),
+        tool_results,
+    )
+    requested_attachment_extensions = _web_refine_required_attachment_extensions_for_deliverables(
+        requested_attachment_extensions,
+        tool_results,
+    )
     materialized_artifact_paths = _materialize_fetch_artifact_for_web(
         runtime,
         prompt=user_text,
-        tool_results=getattr(result, "tool_results", []),
+        tool_results=tool_results,
         principal_id=conversation_id,
         registry=registry,
         requested_extension=requested_attachment_extension,
@@ -27578,19 +30802,19 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         runtime,
         prompt=user_text,
         reply=getattr(result, "final_text", None) or "",
-        tool_results=getattr(result, "tool_results", []),
+        tool_results=tool_results,
         artifact_paths=artifact_paths,
         principal_id=conversation_id,
         requested_extension=requested_attachment_extension,
+        required_attachment_extensions=requested_attachment_extensions,
     )
     artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=conversation_id)
     final_text = _web_artifact_delivery_notice(
         result.final_text or "(no reply)",
         artifact_paths,
         artifacts,
-        tool_results=getattr(result, "tool_results", []),
+        tool_results=tool_results,
     )
-    tool_results = list(getattr(result, "tool_results", []) or [])
     final_text, _fulfilled = _enforce_web_response_fulfillment(
         runtime,
         conversation_id=conversation_id,
@@ -27599,14 +30823,52 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         tool_results=tool_results,
         artifact_paths=artifact_paths,
         artifact_count=len(artifacts),
+        required_attachment_extensions=requested_attachment_extensions,
     )
     final_text = _web_normalize_completed_email_send_reply(final_text, tool_results)
-    final_text = sanitize_user_visible_reply(
+    final_text = _web_sanitize_delivery_reply(
         user_message=user_text,
         reply=final_text,
         tool_results=tool_results,
         source="agent",
-    ) or final_text
+    )
+    completed_run_cron_reply = _web_completed_run_cron_receipt_reply(tool_results)
+    if completed_run_cron_reply:
+        final_text = completed_run_cron_reply
+    filtered_artifact_paths = _web_filter_artifact_paths_to_reply_paths(
+        runtime,
+        reply=final_text,
+        artifact_paths=artifact_paths,
+        principal_id=conversation_id,
+        required_attachment_extensions=requested_attachment_extensions,
+        prompt=user_text,
+    )
+    if filtered_artifact_paths != artifact_paths:
+        artifact_paths = filtered_artifact_paths
+        artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=conversation_id)
+    if artifact_paths:
+        artifact_text_candidate_paths = list(dict.fromkeys([
+            *artifact_paths,
+            *_web_completed_file_write_artifact_paths_from_tool_results(tool_results),
+            *artifact_paths_from_tool_results(tool_results),
+            *_web_plain_artifact_paths_from_reply(final_text),
+        ]))
+        cleaned_final_text = strip_unselected_artifact_references(
+            final_text,
+            selected_paths=artifact_paths,
+            candidate_paths=artifact_text_candidate_paths,
+        )
+        if cleaned_final_text is None:
+            final_text = _web_artifact_delivery_receipt(artifacts)
+        else:
+            final_text = cleaned_final_text
+    if not artifact_paths and not completed_run_cron_reply:
+        local_discovery_reply = _web_local_discovery_reply_for_tool_results(
+            tool_results,
+            required_extensions=requested_attachment_extensions,
+        )
+        if local_discovery_reply:
+            final_text = local_discovery_reply
     conversation_turn_id = getattr(result, "turn_id", None)
     if not isinstance(conversation_turn_id, str) or not conversation_turn_id.strip():
         conversation_turn_id = _last_web_conversation_turn_id(runtime, conversation_id=conversation_id)
@@ -27617,6 +30879,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         user_message=user_text,
         assistant_reply=final_text,
         tool_results=tool_results,
+        artifact_payloads=artifacts,
     )
     _remember_web_explicit_memory(runtime, user_message=user_text)
     payload = {
@@ -27821,6 +31084,7 @@ def _web_turn_fast_profile_candidate(
 def _web_turn_skip_tool_scope_decision(
     *,
     evidence,
+    user_message: str = "",
     config_action: object,
     allow_mini_agents: bool,
     force_mini_agent_dispatch: bool,
@@ -27837,7 +31101,7 @@ def _web_turn_skip_tool_scope_decision(
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "artifact_requested", False)
         or getattr(evidence, "context_linked", False)
-        or turn_tool_scope_decision_may_apply(evidence)
+        or turn_tool_scope_decision_may_apply(evidence, user_message=user_message)
     ):
         return False
     return True
@@ -27852,67 +31116,13 @@ def _turn_tool_scope_requires_special_tools(tool_registry: object) -> bool:
         or getattr(decision, "allow_scheduler_tools", False)
         or getattr(decision, "allow_connector_tools", False)
         or getattr(decision, "allow_skill_pack_tools", False)
+        or bool(getattr(decision, "requested_tool_names", ()) or ())
+        or bool(getattr(decision, "requested_artifact_extensions", ()) or ())
+        or bool(getattr(decision, "required_embedded_media_extensions", ()) or ())
     )
 
 
-def _registry_contains_scoped_special_tools(tool_registry: object) -> bool:
-    special_tags = {"scheduler", "cron", "connector", "skill_pack"}
-    special_names = {
-        "browser_navigate",
-        "browser_extract_text",
-        "browser_find",
-        "browser_scroll",
-        "browser_screenshot",
-        "browser_wait_for",
-        "web_fetch",
-        "web_search",
-    }
-    try:
-        specs = list(tool_registry.list_specs())
-    except Exception:
-        specs = ()
-    for spec in specs:
-        name = str(getattr(spec, "name", "") or "")
-        if name in special_names:
-            return True
-        tags = {
-            str(tag or "").strip().lower()
-            for tag in (getattr(spec, "capability_tags", ()) or ())
-            if str(tag or "").strip()
-        }
-        if tags.intersection(special_tags):
-            return True
-    return False
-
-
-def _turn_tool_registry_for_evidence(
-    registry: object,
-    *,
-    evidence: object,
-    model_client: object | None,
-    user_message: str,
-    skip_tool_scope_decision: bool,
-) -> object:
-    if getattr(registry, "scheduled_task_execution_registry", False):
-        # Cron execution has already been narrowed by typed scheduled-task policy.
-        # Re-running ordinary chat scoping can hide the real tools behind
-        # request_tool_scope and turn a valid cron into a false "no tools" result.
-        return registry
-    if skip_tool_scope_decision:
-        if _registry_contains_scoped_special_tools(registry):
-            return scoped_turn_tool_registry(
-                registry,
-                evidence=evidence,
-                model_client=None,
-                user_message=user_message,
-            )
-        return registry
-    return scoped_turn_tool_registry(
-        registry,
-        evidence=evidence,
-        model_client=model_client,
-        user_message=user_message,
-    )
+_turn_tool_registry_for_evidence = turn_tool_registry_for_evidence
 
 
 def _orchestrator_with_interactive_fast_profile(orchestrator, *, enabled: bool, tool_registry: object):
@@ -27997,1061 +31207,31 @@ def _requested_web_turn_attachment_extension(
     if not allow_model_planning:
         return None
     tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_.+-]+", str(user_text or ""))}
-    if require_attachment_token_for_model_planning and not tokens.intersection(ATTACHMENT_TOKEN_EXTENSIONS):
+    has_structured_work_signal = extract_url_target(user_text) is not None
+    if (
+        require_attachment_token_for_model_planning
+        and not has_structured_work_signal
+        and not tokens.intersection(ATTACHMENT_TOKEN_EXTENSIONS)
+    ):
         return None
     return plan_attachment_format(user_text, model_client=model_client).extension
 
 
-def _run_turn_sync(
-    user_text: str,
-    conv_id: str,
-    orchestrator,
-    registry,
-    runtime,
-    activity_callback: ActivityCallback | None = None,
-    attachments: list[dict[str, str]] | None = None,
-    config_action: object = None,
-    allow_mini_agents: bool = False,
-    force_mini_agent_dispatch: bool = False,
-    memory_owner: str | None = None,
-    reinforce_memory_context: bool = False,
-    include_structured_result: bool = False,
-    force_model_attachment_planning: bool = False,
-    early_reply_callback: EarlyReplyCallback | None = None,
-    text_delta_callback: Callable[[str], None] | None = None,
-    persist_user_turn: bool = True,
-    builder_learning_enabled: bool = True,
-    turn_id: str | None = None,
-    turn_dispatch_decision: object | None = None,
-    latency_recorder: TurnLatencyRecorder | None = None,
-    preferred_task_group_id: str | None = None,
-) -> dict:
-    """Run one agent turn synchronously (called from thread executor)."""
-    timing_started_at = time.perf_counter()
-    timing_last_at = timing_started_at
-    timing_marks: list[dict[str, object]] = []
-    phase_tracker = PhaseActivityTracker(
-        activity_callback=activity_callback,
-        surface="web",
-        conversation_id=conv_id,
-        turn_id=turn_id,
-        logger=logger,
-    )
-    turn_latency = latency_recorder or TurnLatencyRecorder(
-        surface="web",
-        conversation_id=conv_id,
-        turn_id=turn_id,
-        logger=logger,
-    )
-    turn_latency.mark("turn_worker_started", once=True)
-
-    def _mark_timing(label: str) -> None:
-        nonlocal timing_last_at
-        now = time.perf_counter()
-        timing_marks.append({
-            "phase": label,
-            "ms": round((now - timing_last_at) * 1000, 1),
-        })
-        timing_last_at = now
-
-    def _log_timing_if_slow(
-        outcome: str,
-        *,
-        tool_count: int = 0,
-        artifact_count: int = 0,
-        builder_checked: bool = False,
-    ) -> None:
-        total_ms = (time.perf_counter() - timing_started_at) * 1000
-        slow_threshold_ms = _WEB_TURN_SLOW_LOG_MS
-        if total_ms < slow_threshold_ms:
-            return
-        logger.info(
-            "web turn slow timing conversation_id=%s turn_id=%s dispatch_reason=%s dispatch_linked=%s outcome=%s allow_mini_agents=%s tools=%s artifacts=%s builder_checked=%s total_ms=%.1f phases=%s",
-            conv_id,
-            turn_id,
-            getattr(turn_dispatch_decision, "reason", None),
-            bool(getattr(turn_dispatch_decision, "dependency_turn_ids", ()) or ()),
-            outcome,
-            allow_mini_agents,
-            tool_count,
-            artifact_count,
-            builder_checked,
-            total_ms,
-            json.dumps(timing_marks, separators=(",", ":")),
-        )
-
-    def _finish_latency(
-        outcome: str,
-        *,
-        tool_count: int = 0,
-        artifact_count: int = 0,
-        cache_hit: bool | None = None,
-    ) -> None:
-        try:
-            scoped_tool_count = len(turn_tool_registry.list_tool_definitions())  # type: ignore[name-defined]
-        except Exception:
-            try:
-                scoped_tool_count = len(registry.list_tool_definitions())
-            except Exception:
-                scoped_tool_count = tool_count
-        turn_latency.finish(
-            runtime.store,
-            outcome=outcome,
-            tool_count=tool_count,
-            scoped_tool_count=scoped_tool_count,
-            artifact_count=artifact_count,
-            cache_hit=cache_hit,
-            phase_timings=list(timing_marks),
-        )
-
-    try:
-        from nullion.config import load_default_env_file_into_environ
-
-        load_default_env_file_into_environ(override=True)
-    except Exception:
-        logger.debug("Could not refresh env file before web turn", exc_info=True)
-    _emit_activity(activity_callback, "prepare", "Preparing request", "running")
-    config_shortcut = _handle_web_config_request(
-        user_text,
-        runtime=runtime,
-        orchestrator=orchestrator,
-        config_action=config_action,
-    )
-    if config_shortcut is not None:
-        _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Handled by configuration shortcut")
-        _emit_activity(activity_callback, "respond", "Writing response", "done")
-        _mark_timing("prepare")
-        _log_timing_if_slow("config_shortcut")
-        _finish_latency("config_shortcut")
-        return {"text": config_shortcut, "artifacts": []}
-    try:
-        from nullion.chat_operator import _chat_model_issue_reply
-
-        health_reply = _chat_model_issue_reply(
-            runtime,
-            message=user_text,
-            model_client=getattr(orchestrator, "model_client", None),
-        )
-    except Exception:
-        health_reply = None
-    if health_reply is not None:
-        _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Known model health issue")
-        _emit_activity(activity_callback, "respond", "Writing response", "done")
-        _mark_timing("model_health_gate")
-        _log_timing_if_slow("model_health_gate")
-        _finish_latency("model_health_gate")
-        return {"text": health_reply, "artifacts": []}
-    screenshot_payload = _web_screenshot_payload_if_requested(
-        runtime,
-        user_text=user_text,
-        conversation_id=conv_id,
-        registry=registry,
-    )
-    if screenshot_payload is not None:
-        _emit_activity(activity_callback, "prepare", "Preparing request", "done", "Handled by screenshot workflow")
-        _emit_activity(activity_callback, "artifacts", "Preparing artifacts", "done")
-        _mark_timing("prepare_screenshot")
-        _log_timing_if_slow(
-            "screenshot",
-            tool_count=len(screenshot_payload.get("tool_results", []) or []),
-            artifact_count=len(screenshot_payload.get("artifacts", []) or []),
-        )
-        _finish_latency(
-            "screenshot",
-            tool_count=len(screenshot_payload.get("tool_results", []) or []),
-            artifact_count=len(screenshot_payload.get("artifacts", []) or []),
-        )
-        return screenshot_payload
-
-    phase_tracker.emit(PHASE_CHECK_ATTACHMENTS, "running")
-    normalized_attachments = normalize_chat_attachments(attachments or [])
-    phase_tracker.done(PHASE_CHECK_ATTACHMENTS, "attachments", f"{len(normalized_attachments)} attachment{'s' if len(normalized_attachments) != 1 else ''}")
-    phase_tracker.emit(PHASE_CHECK_TASK_STATE, "running")
-    approval_ids_before = {
-        approval.approval_id
-        for approval in runtime.store.list_approval_requests()
-        if getattr(getattr(approval, "status", None), "value", getattr(approval, "status", "")) == "pending"
-    }
-    turn_orchestrator = _orchestrator_for_admin_forced_model(orchestrator, runtime)
-    turn_orchestrator = _orchestrator_for_video_attachments(turn_orchestrator, normalized_attachments)
-    turn_memory_owner = memory_owner or memory_owner_for_web_admin()
-    web_chat_thread = _web_chat_thread_from_store(runtime, conv_id)
-    _mark_timing("history_thread")
-    structured_followup_evidence = (
-        bool(normalized_attachments)
-        or _web_has_open_task_frame(runtime, conv_id)
-        or _web_dispatch_requires_existing_turn_context(turn_dispatch_decision)
-    )
-    _mark_timing("history_evidence")
-    web_ambiguity_classifier, web_ambiguity_classifier_reason = _web_ambiguity_classifier(
-        web_chat_thread,
-        model_client=getattr(turn_orchestrator, "model_client", None),
-        structured_followup_evidence=structured_followup_evidence,
-    )
-    _mark_timing("ambiguity_classifier")
-    if persist_user_turn:
-        _mark_timing("task_frame_record_start")
-        web_task_frame_id, web_conversation_turn_id, web_conversation_result = _start_web_task_frame(
-            runtime,
-            conversation_id=conv_id,
-            user_text=user_text,
-            turn_id=turn_id,
-            turn_dispatch_decision=turn_dispatch_decision,
-            previous_assistant_message=_previous_web_assistant_message(web_chat_thread),
-            ambiguity_classifier=web_ambiguity_classifier,
-            ambiguity_classifier_reason=web_ambiguity_classifier_reason,
-        )
-        _mark_timing("task_frame_recorded")
-    else:
-        web_task_frame_id = None
-        web_conversation_turn_id = None
-        web_conversation_result = None
-        _mark_timing("task_frame_not_recorded")
-    phase_tracker.done(PHASE_CHECK_TASK_STATE, "task_state")
-    workspace_has_artifact_evidence = _web_conversation_has_artifact_evidence(runtime, conv_id)
-    requested_attachment_extension = _requested_web_turn_attachment_extension(
-        user_text,
-        model_client=getattr(turn_orchestrator, "model_client", None),
-        allow_model_planning=(
-            force_model_attachment_planning
-            or workspace_has_artifact_evidence
-        ),
-        require_attachment_token_for_model_planning=not (
-            force_model_attachment_planning
-            or workspace_has_artifact_evidence
-        ),
-    )
-    required_attachment_extensions = (
-        (requested_attachment_extension,) if requested_attachment_extension else ()
-    )
-    from nullion.chat_operator import _inferred_scope_extensions_from_recent_artifacts
-
-    scope_requested_extensions = _inferred_scope_extensions_from_recent_artifacts(
-        runtime,
-        conversation_id=conv_id,
-        conversation_result=web_conversation_result,
-        prompt=user_text,
-        explicit_requested_extensions=required_attachment_extensions,
-    )
-    turn_tool_evidence = build_turn_tool_evidence(
-        user_message=user_text,
-        conversation_result=web_conversation_result,
-        has_attachments=bool(normalized_attachments),
-        requested_extensions=scope_requested_extensions,
-        saved_history_available=_web_saved_conversation_history_available(runtime, conv_id),
-        prior_tool_scopes=_recent_web_tool_scopes_for_context(runtime, conv_id),
-    )
-    _mark_timing("tool_evidence")
-    fast_profile_candidate = _web_turn_fast_profile_candidate(
-        evidence=turn_tool_evidence,
-        user_message=user_text,
-        config_action=config_action,
-        allow_mini_agents=allow_mini_agents,
-        force_mini_agent_dispatch=force_mini_agent_dispatch,
-        turn_dispatch_decision=turn_dispatch_decision,
-    )
-    _mark_timing("fast_profile_candidate")
-    _mark_timing("tool_scope_decision_check_start")
-    skip_tool_scope_decision = _web_turn_skip_tool_scope_decision(
-        evidence=turn_tool_evidence,
-        config_action=config_action,
-        allow_mini_agents=allow_mini_agents,
-        force_mini_agent_dispatch=force_mini_agent_dispatch,
-        turn_dispatch_decision=turn_dispatch_decision,
-    )
-    phase_tracker.emit(PHASE_SELECT_TOOLS, "running")
-    if skip_tool_scope_decision:
-        _mark_timing("tool_scope_decision_skipped")
-    else:
-        _mark_timing("tool_scope_decision_allowed")
-    _mark_timing("tool_scope_registry_start")
-    tool_scope_model_client = getattr(turn_orchestrator, "model_client", None)
-    if fast_profile_candidate and not skip_tool_scope_decision:
-        tool_scope_model_client = _model_client_with_interactive_fast_profile(tool_scope_model_client)
-    base_turn_registry = with_conversation_history_tool(
-        registry,
-        runtime=runtime,
-        conversation_id=conv_id,
-    )
-    turn_tool_registry = _turn_tool_registry_for_evidence(
-        base_turn_registry,
-        evidence=turn_tool_evidence,
-        model_client=None if skip_tool_scope_decision else tool_scope_model_client,
-        user_message=user_text,
-        skip_tool_scope_decision=skip_tool_scope_decision,
-    )
-    _mark_timing("tool_scope_registry_done")
-    phase_tracker.done(PHASE_SELECT_TOOLS, "tool_scope_registry")
-    try:
-        turn_latency.set(scoped_tool_count=len(turn_tool_registry.list_tool_definitions()))
-    except Exception:
-        pass
-    turn_required_embedded_media_extensions = _web_required_embedded_media_extensions_from_tool_registry(
-        turn_tool_registry
-    )
-    turn_tool_flow_context = _web_tool_flow_context_for_required_media(turn_required_embedded_media_extensions)
-    turn_orchestrator = _orchestrator_with_interactive_fast_profile(
-        turn_orchestrator,
-        enabled=fast_profile_candidate,
-        tool_registry=turn_tool_registry,
-    )
-    _mark_timing("preflight")
-    _mark_timing("post_preflight")
-    phase_tracker.emit(PHASE_BUILD_CONTEXT, "running")
-
-    # Build system context: preferences + profile
-    history_prefix: list[dict] = []
-
-    # ── Capabilities system message — always first ────────────────────────────
-    # This tells the agent exactly what tools it has so it never falsely claims
-    # it can't do something that is registered (e.g. browser tools).
-    # Keep this as a stable-prefix cache only. Dynamic conversation context is
-    # appended below, outside the cache, so independent task routing does not
-    # strip normal chat memory.
-    def _stable_context_job() -> list[dict]:
-        return _web_stable_context_history_prefix(
-            runtime=runtime,
-            principal_id=conv_id,
-            turn_orchestrator=turn_orchestrator,
-            turn_tool_registry=turn_tool_registry,
-        )
-
-    def _preferences_prompt_job() -> str:
-        try:
-            from nullion.preferences import build_preferences_prompt, load_preferences
-
-            return build_preferences_prompt(load_preferences()) or ""
-        except Exception:
-            logger.debug("Could not build web preferences prompt", exc_info=True)
-            return ""
-
-    def _profile_prompt_job() -> str:
-        try:
-            from nullion.preferences import build_profile_prompt
-
-            return build_profile_prompt() or ""
-        except Exception:
-            logger.debug("Could not build web profile prompt", exc_info=True)
-            return ""
-
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="nullion-web-preflight") as _preflight_pool:
-        _stable_context_future = _preflight_pool.submit(_stable_context_job)
-        _preferences_future = _preflight_pool.submit(_preferences_prompt_job)
-        _profile_future = _preflight_pool.submit(_profile_prompt_job)
-        history_prefix.extend(_stable_context_future.result())
-        prefs_text = _preferences_future.result()
-        profile_text = _profile_future.result()
-    _mark_timing("system_context")
-
-    if prefs_text:
-        history_prefix.append({
-            "role": "system",
-            "content": [{"type": "text", "text": prefs_text}],
-        })
-    if profile_text:
-        history_prefix.append({
-            "role": "system",
-            "content": [{"type": "text", "text": profile_text}],
-        })
-    _mark_timing("preferences_profile")
-
-    ensure_artifact_root(runtime)
-    workspace_storage_text = format_workspace_storage_for_prompt(principal_id=conv_id)
-    workspace_artifact_root = artifact_root_for_principal(conv_id)
-    history_prefix.append({
-        "role": "system",
-        "content": [{
-            "type": "text",
-            "text": (
-                "Web delivery contract: when the user asks for a downloadable file, attachment, or saved artifact, "
-                f"create it under this workspace artifact directory: {workspace_artifact_root}. "
-                "For text-like files, use file_write. "
-                "When the user asks for a PDF, use pdf_create for new PDFs or pdf_edit for PDF changes; "
-                "do not ask to install PDF tools or use terminal_exec for normal PDF creation/editing. "
-                "When deriving artifact rows from web/browser pages, prefer browser_extract_items over browser_snapshot/page dumps. Collect compact per-item row objects from "
-                "the rendered page, including row title/text, direct row URL, numeric/text value fields, and "
-                "image URL when needed. Do not substitute aggregate search, category, navigation, or repeated "
-                "result-page URLs for row-specific links; continue collecting row data or report the limitation. "
-                "When a typed artifact must embed remote image URLs or page image assets, use "
-                "browser_image_collect when visible to save local image artifact files first, then pass "
-                "those local paths to the artifact tool. If direct page collection cannot see rendered image assets, "
-                "use browser_extract_items first, or browser_run_js on the open browser page to extract image URLs, then pass those URLs to "
-                "browser_image_collect; do not use terminal_exec for normal web-image materialization. "
-                "For typed .docx artifact requirements, use document_create with structured paragraphs, sections, "
-                "and existing image artifact paths; do not use terminal_exec for normal document creation. "
-                "For typed .xlsx artifact requirements, use spreadsheet_create with structured rows, direct row-specific source links, "
-                "and row-aligned local image artifact paths; do not use terminal_exec for normal spreadsheet creation. "
-                "For typed .pptx or slide deck artifact requirements, use presentation_create with structured slides "
-                "and existing image artifact paths; do not use terminal_exec for normal presentation creation. "
-                "For document-like deliverables such as PDF, DOCX, PPTX, reports, itineraries, and decks, provide "
-                "structured title/sections/slides/text pages so the artifact tool can produce a readable "
-                "report-quality layout. Do not deliver raw browser screenshots, loose image attachments, or "
-                "unformatted text dumps as a substitute for the requested formatted document. "
-                "For binary Office artifacts such as spreadsheets, slide decks, and documents, create the real "
-                "requested file format under the workspace artifact directory with the available artifact or "
-                "terminal tooling; do not substitute Markdown tables or prose. For ordinary saved files, use this "
-                "user's workspace file folder. If an artifact request omits optional content details, pick a "
-                "reasonable neutral default and continue; ask a clarification only when the artifact cannot be "
-                "created without that missing detail. When the needed detail may be in earlier turns of this "
-                "same conversation but is not visible in the prompt context, request conversation_history scope "
-                "and use chat_history_search before asking the user to resend it.\n\n"
-                f"{workspace_storage_text}\n\n"
-                "Do not say a file was saved, attached, or sent "
-                "unless file_write completed successfully. Do not create helper scripts, diagnostic scripts, or "
-                "source-code files unless the user explicitly asks you to create code. For read-only diagnostics, "
-                "inspect with read-only commands and return the findings in chat instead of writing helper files. "
-                "Never answer only 'Done', 'OK', or 'Completed'; include the requested answer, file status, or concrete result."
-            ),
-        }],
-    })
-    _mark_timing("storage_contract")
-
-    memory_context = _web_memory_context(
-        runtime,
-        owner=turn_memory_owner,
-        reinforce=reinforce_memory_context,
-    )
-    if memory_context:
-        history_prefix.append({
-            "role": "system",
-            "content": [{"type": "text", "text": f"Known user memory:\n{memory_context}"}],
-        })
-    _mark_timing("memory_context")
-    route_hints = _web_builder_route_hints_prompt(runtime, turn_tool_registry)
-    if route_hints:
-        history_prefix.append({
-            "role": "system",
-            "content": [{"type": "text", "text": route_hints}],
-        })
-    _mark_timing("route_hints")
-    recent_tool_context = (
-        _recent_web_tool_context_prompt(runtime, conv_id)
-        if _should_include_web_recent_tool_context(web_conversation_result)
-        else None
-    )
-    if recent_tool_context:
-        history_prefix.append({
-            "role": "system",
-            "content": [{"type": "text", "text": recent_tool_context}],
-        })
-    context_boundary = _web_conversation_context_boundary_prompt(web_conversation_result)
-    if context_boundary:
-        history_prefix.append({
-            "role": "system",
-            "content": [{"type": "text", "text": context_boundary}],
-        })
-    skill_hint = _build_web_skill_hint(runtime, user_text)
-    if skill_hint is not None:
-        history_prefix.insert(0, {
-            "role": "system",
-            "content": [{"type": "text", "text": skill_hint.prompt}],
-        })
-        _emit_skill_usage_activity(activity_callback, getattr(skill_hint, "titles", (skill_hint.title,)))
-    _mark_timing("skill_context")
-    # Task routing and conversational memory are deliberately separate. A turn can
-    # start a new task branch while still needing the ordinary chat transcript
-    # (for example, answering a question the assistant just asked).
-    web_chat_history_limit = _web_chat_history_turn_limit(web_conversation_result, turn_tool_registry)
-    visible_web_conversation_turns: list[dict[str, str]] = []
-    if web_chat_history_limit > 0:
-        visible_web_conversation_turns = _web_chat_thread_from_store(
-            runtime,
-            conv_id,
-            limit=web_chat_history_limit,
-        )
-        automatic_history_context = _automatic_web_saved_chat_history_prompt(
-            runtime,
-            conversation_id=conv_id,
-            prompt=user_text,
-            visible_turns=visible_web_conversation_turns,
-        )
-        if automatic_history_context:
-            from nullion.chat_operator import (
-                _augment_tool_registry_from_saved_history_context,
-                _saved_history_reference_context_message,
-                _saved_history_tool_scope_prompt,
-            )
-
-            widened_tool_registry = _augment_tool_registry_from_saved_history_context(
-                turn_tool_registry,
-                base_registry=base_turn_registry,
-                evidence=turn_tool_evidence,
-                history_context=automatic_history_context,
-            )
-            if widened_tool_registry is not turn_tool_registry:
-                turn_tool_registry = widened_tool_registry
-                tool_scope_prompt = _saved_history_tool_scope_prompt(automatic_history_context)
-                if tool_scope_prompt:
-                    history_prefix.append({
-                        "role": "system",
-                        "content": [{"type": "text", "text": tool_scope_prompt}],
-                    })
-            history_prefix.append({
-                "role": "system",
-                "content": [{"type": "text", "text": automatic_history_context}],
-            })
-            reference_context_message = _saved_history_reference_context_message(automatic_history_context)
-            if reference_context_message:
-                history_prefix.append(reference_context_message)
-        history_prefix.extend(_web_chat_history_from_store(runtime, conv_id, limit=web_chat_history_limit))
-    _mark_timing("history")
-    phase_tracker.done(PHASE_BUILD_CONTEXT, "context")
-    _emit_activity(activity_callback, "prepare", "Preparing request", "done")
-    _mark_timing("prepare_emit")
-    phase_tracker.emit(PHASE_START_MODEL, "running")
-    turn_latency.mark("model_start", once=True)
-    _emit_activity(
-        activity_callback,
-        "orchestrate",
-        "Running model and tools",
-        "running",
-    )
-    phase_tracker.done(PHASE_START_MODEL, "model_start")
-    phase_tracker.emit(PHASE_RUN_TOOLS, "running")
-    user_content_blocks = (
-        chat_attachment_content_blocks(user_text, normalized_attachments)
-        if normalized_attachments
-        else None
-    )
-    live_tool_results: list[ToolResult] = []
-    live_tool_result_indexes: dict[str, int] = {}
-    streamed_text_parts: list[str] = []
-
-    def _safe_web_text_delta_callback(delta: str) -> None:
-        if not delta:
-            return
-        turn_latency.mark("first_text_delta", once=True)
-        streamed_text_parts.append(delta)
-        if text_delta_callback is not None:
-            turn_latency.mark("first_visible_response", once=True, detail="text_delta")
-            text_delta_callback(delta)
-
-    def _record_live_tool_activity(tool_result: ToolResult) -> None:
-        invocation_id = str(getattr(tool_result, "invocation_id", "") or "").strip()
-        if invocation_id and invocation_id in live_tool_result_indexes:
-            live_tool_results[live_tool_result_indexes[invocation_id]] = tool_result
-        else:
-            if invocation_id:
-                live_tool_result_indexes[invocation_id] = len(live_tool_results)
-            live_tool_results.append(tool_result)
-        phase_tracker.emit(PHASE_RUN_TOOLS, "running", format_tool_activity_detail(live_tool_results))
-
-    from nullion.reminders import reminder_chat_context
-
-    with reminder_chat_context(conv_id):
-        dispatch_result = _try_dispatch_web_mini_agents(
-            orchestrator=turn_orchestrator,
-            conversation_id=conv_id,
-            principal_id=conv_id,
-            user_message=user_text,
-            tool_registry=turn_tool_registry,
-            runtime=runtime,
-            has_attachments=bool(user_content_blocks),
-            requested_extensions=required_attachment_extensions,
-            force_dispatch=force_mini_agent_dispatch,
-            preferred_group_id=preferred_task_group_id,
-        ) if allow_mini_agents else None
-
-    if dispatch_result is not None and getattr(dispatch_result, "dispatched", True):
-        task_count = int(getattr(dispatch_result, "task_count", 0) or 0)
-        planner_summary = str(getattr(dispatch_result, "planner_summary", "") or "").strip()
-        detail = _mini_agent_activity_detail(dispatch_result, task_count)
-        if planner_summary:
-            _emit_activity(activity_callback, "planner", "Planner", "done", planner_summary)
-        _emit_activity(
-            activity_callback,
-            "orchestrate",
-            "Running model and tools",
-            "done",
-            format_activity_sublist_line("Delegated to Mini-Agents"),
-        )
-        _emit_activity(activity_callback, "mini-agents", "Mini-Agents", "running", detail)
-        reply = str(getattr(dispatch_result, "acknowledgment", "") or f"Working on {task_count or 'the'} task(s).")
-        if persist_user_turn:
-            _remember_web_chat_turn(
-                runtime,
-                conversation_id=conv_id,
-                conversation_turn_id=web_conversation_turn_id,
-                user_message=user_text,
-                assistant_reply=reply,
-            )
-            _remember_web_explicit_memory(runtime, user_message=user_text, owner=turn_memory_owner)
-        _mark_timing("save_dispatch_ack")
-        _finish_web_task_frame(
-            runtime,
-            conversation_id=conv_id,
-            frame_id=web_task_frame_id,
-            status=TaskFrameStatus.COMPLETED,
-            completion_turn_id=web_conversation_turn_id,
-        )
-        _mark_timing("finish_task_frame")
-        _log_timing_if_slow("mini_agent_dispatch")
-        _finish_latency("mini_agent_dispatch")
-        return {
-            "text": reply,
-            "artifacts": [],
-            "mini_agent_dispatch": True,
-            "task_group_id": str(getattr(dispatch_result, "group_id", "") or ""),
-            "planner_summary": planner_summary,
-        }
-    try:
-        streaming_safe = (
-            text_delta_callback is not None
-            and not allow_mini_agents
-            and not force_mini_agent_dispatch
-            and not normalized_attachments
-            and not required_attachment_extensions
-            and not bool(turn_tool_registry.list_tool_definitions())
-        )
-        with reminder_chat_context(conv_id):
-            result = turn_orchestrator.run_turn(
-                conversation_id=conv_id,
-                principal_id=conv_id,
-                user_message=user_text,
-                user_content_blocks=user_content_blocks,
-                conversation_history=history_prefix,
-                tool_registry=turn_tool_registry,
-                policy_store=runtime.store,
-                approval_store=runtime.store,
-                tool_result_callback=_record_live_tool_activity,
-                text_delta_callback=_safe_web_text_delta_callback if streaming_safe else None,
-                tool_flow_context=turn_tool_flow_context,
-            )
-    except Exception:
-        _finish_web_task_frame(
-            runtime,
-            conversation_id=conv_id,
-            frame_id=web_task_frame_id,
-            status=TaskFrameStatus.FAILED,
-            completion_turn_id=web_conversation_turn_id,
-        )
-        _mark_timing("model_tools_failed")
-        _log_timing_if_slow("failed")
-        _finish_latency("failed")
-        raise
-    try:
-        from nullion.chat_operator import (
-            _run_chat_turn_saved_history_retry,
-        )
-    except Exception:
-        _run_chat_turn_saved_history_retry = None
-    if _run_chat_turn_saved_history_retry is not None:
-        def _web_saved_history_context() -> str | None:
-            return _automatic_web_saved_chat_history_prompt(
-                runtime,
-                conversation_id=conv_id,
-                prompt=user_text,
-                visible_turns=visible_web_conversation_turns,
-            )
-
-        def _web_retry_turn(retry_history: list[dict[str, object]], retry_tool_registry: object):
-            with reminder_chat_context(conv_id):
-                return turn_orchestrator.run_turn(
-                    conversation_id=conv_id,
-                    principal_id=conv_id,
-                    user_message=user_text,
-                    user_content_blocks=user_content_blocks,
-                    conversation_history=retry_history,
-                    tool_registry=retry_tool_registry,
-                    policy_store=runtime.store,
-                    approval_store=runtime.store,
-                    tool_result_callback=_record_live_tool_activity,
-                    text_delta_callback=_safe_web_text_delta_callback if streaming_safe else None,
-                    tool_flow_context=turn_tool_flow_context,
-                )
-
-        result, turn_tool_registry, _retried_saved_history = _run_chat_turn_saved_history_retry(
-            initial_result=result,
-            automatic_history_context=automatic_history_context,
-            build_history_context=_web_saved_history_context,
-            base_history=history_prefix,
-            active_tool_registry=turn_tool_registry,
-            base_tool_registry=base_turn_registry,
-            turn_tool_evidence=turn_tool_evidence,
-            run_turn=_web_retry_turn,
-            mark_retry=lambda: _mark_timing("saved_history_retry"),
-        )
-    if result.suspended_for_approval:
-        _store_web_approval_suspended_turn(
-            runtime,
-            approval_id=result.approval_id,
-            conversation_id=conv_id,
-            user_text=user_text,
-            request_id=turn_id,
-            messages_snapshot=[
-                *history_prefix,
-                {"role": "user", "content": user_content_blocks or [{"type": "text", "text": user_text}]},
-            ],
-        )
-        try:
-            from nullion.config import load_settings as _load_notification_settings
-            from nullion.workspace_notifications import broadcast_new_pending_approvals, broadcast_pending_approval
-
-            settings = _load_notification_settings()
-            broadcast_pending_approval(runtime, getattr(result, "approval_id", None), settings=settings)
-            broadcast_new_pending_approvals(runtime, before_ids=approval_ids_before, settings=settings)
-        except Exception:
-            logger.debug("Workspace approval notification fanout failed", exc_info=True)
-        _emit_activity(activity_callback, "orchestrate", "Running model and tools", "blocked", "Approval required")
-        phase_tracker.done(PHASE_RUN_TOOLS, "model_tools", "Approval required")
-        label, detail, trigger_flow_label, is_web_request = _approval_display_from_turn_result(runtime, result)
-        _emit_activity(activity_callback, "approval", "Waiting for approval", "running", label)
-        _finish_web_task_frame(
-            runtime,
-            conversation_id=conv_id,
-            frame_id=web_task_frame_id,
-            status=TaskFrameStatus.WAITING_APPROVAL,
-            completion_turn_id=getattr(result, "turn_id", None) or web_conversation_turn_id,
-        )
-        _mark_timing("approval_suspend")
-        _log_timing_if_slow("approval", tool_count=len(getattr(result, "tool_results", []) or []))
-        _finish_latency("approval", tool_count=len(getattr(result, "tool_results", []) or []))
-        return {
-            "suspended_for_approval": True,
-            "approval_id": result.approval_id,
-            "tool_name": label,
-            "tool_detail": detail,
-            "trigger_flow_label": trigger_flow_label,
-            "is_web_request": is_web_request,
-            "thinking": getattr(result, "thinking_text", None) or "",
-        }
-    tool_results = list(getattr(result, "tool_results", []) or [])
-    required_attachment_extensions = _web_merge_required_attachment_extensions(
-        required_attachment_extensions,
-        tool_results,
-    )
-    if len(required_attachment_extensions) == 1 and not requested_attachment_extension:
-        requested_attachment_extension = required_attachment_extensions[0]
-    tool_count = len(tool_results)
-    _mark_timing("model_tools")
-    phase_tracker.done(PHASE_RUN_TOOLS, "model_tools", format_tool_activity_detail(tool_results))
-    deferred_cron_dispatch = deferred_cron_dispatch_from_tool_results(tool_results)
-    _emit_activity(
-        activity_callback,
-        "orchestrate",
-        "Running model and tools",
-        "done",
-        format_tool_activity_detail(tool_results),
-    )
-    _emit_activity(activity_callback, "artifacts", "Preparing artifacts", "running")
-    phase_tracker.emit(PHASE_PREPARE_ARTIFACTS, "running")
-    materialized_artifact_paths = _materialize_fetch_artifact_for_web(
-        runtime,
-        prompt=user_text,
-        tool_results=tool_results,
-        principal_id=conv_id,
-        registry=registry,
-        requested_extension=requested_attachment_extension,
-    ) or []
-    artifact_paths = list(dict.fromkeys([
-        *materialized_artifact_paths,
-        *_web_result_artifact_paths(getattr(result, "artifacts", []) or []),
-    ]))
-    artifact_paths = _web_delivery_artifact_paths(
-        runtime,
-        prompt=user_text,
-        reply=getattr(result, "final_text", None) or "",
-        tool_results=tool_results,
-        artifact_paths=artifact_paths,
-        principal_id=conv_id,
-        requested_extension=requested_attachment_extension,
-    )
-    artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=conv_id)
-    _emit_activity(
-        activity_callback,
-        "artifacts",
-        "Preparing artifacts",
-        "done",
-        f"{len(artifacts)} artifact{'s' if len(artifacts) != 1 else ''}" if artifacts else None,
-    )
-    phase_tracker.done(PHASE_PREPARE_ARTIFACTS, "artifacts", f"{len(artifacts)} artifact{'s' if len(artifacts) != 1 else ''}" if artifacts else None)
-    final_text = _web_artifact_delivery_notice(
-        result.final_text or "(no reply)",
-        artifact_paths,
-        artifacts,
-        tool_results=tool_results,
-    )
-    attachment_failure = attachment_processing_failure_reply(user_text, normalized_attachments, tool_results)
-    if attachment_failure is not None:
-        final_text = attachment_failure
-        artifact_paths = []
-        artifacts = []
-    final_text, fulfilled = _enforce_web_response_fulfillment(
-        runtime,
-        conversation_id=conv_id,
-        user_message=user_text,
-        reply=final_text,
-        tool_results=tool_results,
-        artifact_paths=artifact_paths,
-        artifact_count=len(artifacts),
-        required_attachment_extensions=required_attachment_extensions,
-        required_embedded_media_extensions=turn_required_embedded_media_extensions,
-    )
-    if attachment_failure is not None:
-        fulfilled = False
-    if attachment_failure is None and required_attachment_extensions and not fulfilled:
-        repair_history = [
-            *history_prefix,
-            {"role": "user", "content": user_content_blocks or [{"type": "text", "text": user_text}]},
-            {"role": "assistant", "content": [{"type": "text", "text": final_text}]},
-        ]
-        _emit_activity(
-            activity_callback,
-            "orchestrate",
-            "Running model and tools",
-            "running",
-            format_activity_sublist_line("Repairing artifact delivery"),
-        )
-        phase_tracker.emit(PHASE_RUN_TOOLS, "running", "Repairing artifact delivery")
-        try:
-            with reminder_chat_context(conv_id):
-                repair_result = turn_orchestrator.run_turn(
-                    conversation_id=conv_id,
-                    principal_id=conv_id,
-                    user_message=_web_required_attachment_repair_prompt(required_attachment_extensions),
-                    conversation_history=repair_history,
-                    tool_registry=turn_tool_registry,
-                    policy_store=runtime.store,
-                    approval_store=runtime.store,
-                    tool_result_callback=_record_live_tool_activity,
-                    tool_flow_context=_web_tool_flow_context_for_required_media(
-                        _web_merge_required_embedded_media_extensions(
-                            turn_required_embedded_media_extensions,
-                            tool_results,
-                        )
-                    ),
-                )
-        except Exception:
-            logger.debug("Web required attachment repair turn failed", exc_info=True)
-        else:
-            if repair_result.suspended_for_approval:
-                try:
-                    from nullion.config import load_settings as _load_notification_settings
-                    from nullion.workspace_notifications import broadcast_new_pending_approvals, broadcast_pending_approval
-
-                    settings = _load_notification_settings()
-                    broadcast_pending_approval(runtime, getattr(repair_result, "approval_id", None), settings=settings)
-                    broadcast_new_pending_approvals(runtime, before_ids=approval_ids_before, settings=settings)
-                except Exception:
-                    logger.debug("Workspace approval notification fanout failed", exc_info=True)
-                _emit_activity(activity_callback, "orchestrate", "Running model and tools", "blocked", "Approval required")
-                phase_tracker.done(PHASE_RUN_TOOLS, "repair_model_tools", "Approval required")
-                label, detail, trigger_flow_label, is_web_request = _approval_display_from_turn_result(runtime, repair_result)
-                _emit_activity(activity_callback, "approval", "Waiting for approval", "running", label)
-                _finish_web_task_frame(
-                    runtime,
-                    conversation_id=conv_id,
-                    frame_id=web_task_frame_id,
-                    status=TaskFrameStatus.WAITING_APPROVAL,
-                    completion_turn_id=getattr(repair_result, "turn_id", None) or web_conversation_turn_id,
-                )
-                _mark_timing("repair_approval_suspend")
-                _log_timing_if_slow(
-                    "repair_approval",
-                    tool_count=len(getattr(repair_result, "tool_results", []) or []),
-                )
-                _finish_latency(
-                    "repair_approval",
-                    tool_count=len(getattr(repair_result, "tool_results", []) or []),
-                )
-                return {
-                    "suspended_for_approval": True,
-                    "approval_id": repair_result.approval_id,
-                    "tool_name": label,
-                    "tool_detail": detail,
-                    "trigger_flow_label": trigger_flow_label,
-                    "is_web_request": is_web_request,
-                    "thinking": getattr(repair_result, "thinking_text", None) or "",
-                }
-            repair_tool_results = list(getattr(repair_result, "tool_results", []) or [])
-            tool_results.extend(repair_tool_results)
-            required_attachment_extensions = _web_merge_required_attachment_extensions(
-                required_attachment_extensions,
-                tool_results,
-            )
-            if len(required_attachment_extensions) == 1 and not requested_attachment_extension:
-                requested_attachment_extension = required_attachment_extensions[0]
-            tool_count = len(tool_results)
-            phase_tracker.done(PHASE_RUN_TOOLS, "repair_model_tools", format_tool_activity_detail(repair_tool_results))
-            repair_materialized_artifact_paths = _materialize_fetch_artifact_for_web(
-                runtime,
-                prompt=user_text,
-                tool_results=repair_tool_results,
-                principal_id=conv_id,
-                registry=registry,
-                requested_extension=requested_attachment_extension,
-            ) or []
-            repair_artifact_paths = list(dict.fromkeys([
-                *repair_materialized_artifact_paths,
-                *_web_result_artifact_paths(getattr(repair_result, "artifacts", []) or []),
-            ]))
-            artifact_paths = list(dict.fromkeys([*artifact_paths, *repair_artifact_paths]))
-            artifact_paths = _web_delivery_artifact_paths(
-                runtime,
-                prompt=user_text,
-                reply=getattr(repair_result, "final_text", None) or final_text,
-                tool_results=tool_results,
-                artifact_paths=artifact_paths,
-                principal_id=conv_id,
-                requested_extension=requested_attachment_extension,
-            )
-            artifacts = _web_artifact_descriptors(runtime, artifact_paths, principal_id=conv_id)
-            final_text = _web_artifact_delivery_notice(
-                getattr(repair_result, "final_text", None) or final_text,
-                artifact_paths,
-                artifacts,
-                tool_results=tool_results,
-            )
-            final_text, fulfilled = _enforce_web_response_fulfillment(
-                runtime,
-                conversation_id=conv_id,
-                user_message=user_text,
-                reply=final_text,
-                tool_results=tool_results,
-                artifact_paths=artifact_paths,
-                artifact_count=len(artifacts),
-                required_attachment_extensions=required_attachment_extensions,
-                required_embedded_media_extensions=turn_required_embedded_media_extensions,
-            )
-    if (
-        required_attachment_extensions
-        or _web_merge_required_embedded_media_extensions(turn_required_embedded_media_extensions, tool_results)
-    ) and not fulfilled:
-        artifact_paths = []
-        artifacts = []
-    final_text = _web_normalize_completed_email_send_reply(final_text, tool_results)
-    final_text = sanitize_user_visible_reply(
-        user_message=user_text,
-        reply=final_text,
-        tool_results=tool_results,
-        source="agent",
-    ) or final_text
-    if deferred_cron_dispatch is not None and deferred_cron_dispatch.should_suppress_foreground_reply:
-        # The background cron run owns both progress and terminal delivery for
-        # this task group. Keep the foreground web turn structurally linked but
-        # do not render a second generic "run started" response.
-        final_text = ""
-    _mark_timing("artifacts")
-    early_reply_sent = False
-    streamed_text = "".join(streamed_text_parts)
-    if streamed_text and streamed_text == final_text:
-        early_reply_sent = True
-        turn_latency.mark("first_visible_response", once=True, detail="text_delta")
-        _emit_activity(activity_callback, "respond", "Writing response", "done")
-    if early_reply_callback is not None:
-        early_payload: dict[str, object] = {
-            "text": final_text,
-            "artifacts": artifacts,
-            "thinking": getattr(result, "thinking_text", None) or "",
-        }
-        apply_deferred_cron_dispatch_to_payload(early_payload, deferred_cron_dispatch)
-        if not early_reply_sent:
-            _emit_activity(activity_callback, "respond", "Writing response", "running")
-            try:
-                early_reply_sent = bool(early_reply_callback(early_payload))
-            except Exception:
-                logger.debug("Unable to send early web reply", exc_info=True)
-                early_reply_sent = False
-            if early_reply_sent:
-                turn_latency.mark("first_visible_response", once=True, detail="early_reply")
-                _emit_activity(activity_callback, "respond", "Writing response", "done")
-        _mark_timing("early_reply_sent" if early_reply_sent else "early_reply_skipped")
-    builder_checked = bool(tool_results) and persist_user_turn and builder_learning_enabled
-    if persist_user_turn and builder_learning_enabled:
-        _schedule_web_builder_reflection(
-            runtime,
-            orchestrator,
-            user_message=user_text,
-            assistant_reply=final_text,
-            tool_results=tool_results,
-            conversation_id=conv_id,
-            memory_owner=turn_memory_owner,
-            builder_learning_enabled=builder_learning_enabled,
-        )
-    _mark_timing("builder_scheduled" if builder_checked else "builder_skipped")
-    _emit_activity(activity_callback, "memory", "Saving conversation", "running")
-    phase_tracker.emit(PHASE_SAVE_CONVERSATION, "running")
-    turn_latency.mark("save_start", once=True)
-    if persist_user_turn:
-        _mark_timing("save_chat_turn_start")
-        _remember_web_chat_turn(
-            runtime,
-            conversation_id=conv_id,
-            conversation_turn_id=getattr(result, "turn_id", None) or web_conversation_turn_id,
-            user_message=user_text,
-            assistant_reply=final_text,
-            tool_results=tool_results,
-        )
-        _mark_timing("save_chat_turn_done")
-        _mark_timing("explicit_memory_schedule_start")
-        _remember_web_explicit_memory(runtime, user_message=user_text, owner=turn_memory_owner)
-        _mark_timing("explicit_memory_schedule_done")
-        _mark_timing("no_tool_memory_schedule_start")
-        _schedule_web_no_tool_memory_capture(
-            runtime,
-            orchestrator,
-            owner=turn_memory_owner,
-            conversation_id=conv_id,
-            user_message=user_text,
-            assistant_reply=final_text,
-            tool_results=tool_results,
-        )
-        _mark_timing("no_tool_memory_schedule_done")
-    _emit_activity(activity_callback, "memory", "Saving conversation", "done")
-    phase_tracker.done(PHASE_SAVE_CONVERSATION, "save")
-    turn_latency.mark("save_done", once=True)
-    _mark_timing("save")
-    if not early_reply_sent:
-        _emit_activity(activity_callback, "respond", "Writing response", "running")
-    _finish_web_task_frame(
-        runtime,
-        conversation_id=conv_id,
-        frame_id=web_task_frame_id,
-        status=TaskFrameStatus.COMPLETED,
-        completion_turn_id=getattr(result, "turn_id", None) or web_conversation_turn_id,
-    )
-    _mark_timing("finish_task_frame")
-    try:
-        _mark_timing("approval_fanout_start")
-        from nullion.config import load_settings as _load_notification_settings
-        from nullion.workspace_notifications import broadcast_new_pending_approvals
-
-        broadcast_new_pending_approvals(runtime, before_ids=approval_ids_before, settings=_load_notification_settings())
-        _mark_timing("approval_fanout_done")
-    except Exception:
-        logger.debug("Workspace approval notification fanout failed", exc_info=True)
-    payload = {
-        "text": final_text,
-        "artifacts": artifacts,
-        "thinking": getattr(result, "thinking_text", None) or "",
-    }
-    if early_reply_sent:
-        payload["reply_already_sent"] = True
-    apply_deferred_cron_dispatch_to_payload(payload, deferred_cron_dispatch)
-    if include_structured_result:
-        payload["tool_results"] = _compact_web_tool_results_for_context(tool_results)
-        payload["response_fulfilled"] = bool(fulfilled)
-    if getattr(result, "reached_iteration_limit", False):
-        payload["reached_iteration_limit"] = True
-    if getattr(result, "raw_tool_payload_blocked", False):
-        payload["raw_tool_payload_blocked"] = True
-    _finish_latency(
-        "completed" if fulfilled else "active_unfulfilled",
-        tool_count=tool_count,
-        artifact_count=len(artifacts),
-    )
-    _log_timing_if_slow(
-        "completed" if fulfilled else "active_unfulfilled",
-        tool_count=tool_count,
-        artifact_count=len(artifacts),
-        builder_checked=builder_checked,
-    )
-    return payload
-
+# The legacy in-process Web runner was removed. Web HTTP and WebSocket turns must
+# enter through nullion.platform_chat.run_platform_chat_request, which delegates
+# to the shared typed chat ingress in nullion.messaging_turn_graph.
 
 def _web_http_visible_text(result: dict[str, object], *, default: str = "(no reply)") -> str:
     text = str(result.get("text") or "").strip()
     if text:
+        tool_results = result.get("_delivery_tool_results")
+        if isinstance(tool_results, (list, tuple)):
+            return _web_sanitize_delivery_reply(
+                user_message=str(result.get("_delivery_user_message") or ""),
+                reply=text,
+                tool_results=tool_results,
+                source="agent",
+            )
         return text
     if result.get("planner_status_owned_by_background"):
         # WebSocket clients receive the owned planner card out-of-band. The

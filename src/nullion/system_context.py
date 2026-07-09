@@ -10,11 +10,11 @@ from nullion.tools import ToolRegistry, ToolSpec
 
 CORE_FALLBACK_TOOL_NAMES = ("file_read", "file_write", "terminal_exec", "web_fetch")
 _PLUGIN_CAPABILITIES: dict[str, tuple[str, ...]] = {
-    "search_plugin": ("web_search",),
+    "search_plugin": ("web_search", "file_download"),
     "browser_plugin": ("browser_navigate",),
-    "workspace_plugin": ("file_search", "file_patch", "workspace_summary"),
+    "workspace_plugin": ("archive_create", "archive_extract", "file_search", "file_patch", "workspace_summary"),
     "email_plugin": ("email_search", "email_read"),
-    "calendar_plugin": ("calendar_list",),
+    "calendar_plugin": ("calendar_list", "calendar_create", "calendar_update", "calendar_respond", "calendar_delete"),
     "media_plugin": ("audio_transcribe", "image_extract_text", "image_generate"),
 }
 _PLUGIN_BY_CAPABILITY: dict[str, str] = {

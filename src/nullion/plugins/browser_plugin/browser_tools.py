@@ -6,7 +6,9 @@ import hashlib
 import io
 import json
 import os
+import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -29,14 +31,34 @@ def _ok(invocation: ToolInvocation, output: dict[str, Any]) -> ToolResult:
     )
 
 
-def _fail(invocation: ToolInvocation, message: str) -> ToolResult:
+def _fail(invocation: ToolInvocation, message: str, output: dict[str, Any] | None = None) -> ToolResult:
     return ToolResult(
         invocation_id=invocation.invocation_id,
         tool_name=invocation.tool_name,
         status="failed",
-        output={},
+        output=output or {},
         error=message,
     )
+
+
+def _compact_failure_message(message: object, *, max_chars: int = 360) -> str:
+    text = re.sub(r"\s+", " ", str(message or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _browser_failure_reason(message: object) -> str:
+    text = str(message or "").lower()
+    if "not editable" in text:
+        return "field_not_editable"
+    if "not visible" in text or "hidden" in text:
+        return "field_not_visible"
+    if "not found" in text or "no matching" in text or "waiting for locator" in text:
+        return "field_not_found"
+    if "timeout" in text or "timed out" in text:
+        return "field_timeout"
+    return "browser_action_failed"
 
 
 def _resize_browser_screenshot_to_layout_pixels(
@@ -98,6 +120,7 @@ _BROWSER_LOOP_LOCK = threading.Lock()
 _MAX_CONCURRENT_BROWSER_OPS = 8
 _BROWSER_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_BROWSER_OPS)
 _LOCAL_PREVIEW_SUFFIXES = frozenset({".html", ".htm", ".pdf"})
+_ACTIVE_BROWSER_SESSION_TTL_SECONDS = 10 * 60
 
 
 def _browser_snapshot_script(*, max_elements: int = 120) -> str:
@@ -542,8 +565,13 @@ def _browser_type_id_script(element_id: str, text: str, *, clear: bool = True) -
   if (el.disabled || el.getAttribute('aria-disabled') === 'true') {{
     return {{ok: false, reason: 'element_disabled', element_id: elementId}};
   }}
+  const style = window.getComputedStyle(el);
+  const rect = el.getBoundingClientRect();
+  const visible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  if (!visible) return {{ok: false, reason: 'element_not_visible', element_id: elementId}};
   const tag = el.tagName.toLowerCase();
-  const editable = el.isContentEditable || tag === 'textarea' || tag === 'select' || tag === 'input';
+  const type = (el.getAttribute('type') || '').toLowerCase();
+  const editable = el.isContentEditable || tag === 'textarea' || tag === 'select' || (tag === 'input' && type !== 'hidden');
   if (!editable) return {{ok: false, reason: 'element_not_editable', element_id: elementId}};
   el.scrollIntoView({{block: 'center', inline: 'center'}});
   if (typeof el.focus === 'function') el.focus({{preventScroll: true}});
@@ -846,14 +874,29 @@ def _browser_assert_page_state_script(*, required: list[str], forbidden: list[st
     const expectedNorm = normalize(expected);
     const candidateNorm = normalize(candidate);
     if (!expectedNorm || !candidateNorm) return false;
-    if (candidateNorm.includes(expectedNorm) || expectedNorm.includes(candidateNorm)) return true;
+    if (candidateNorm.includes(expectedNorm)) return true;
     const expectedTokens = new Set(tokens(expected));
     const candidateTokens = new Set(tokens(candidate));
     const numericTokens = [...expectedTokens].filter((token) => /\\d/.test(token));
     const wordTokens = [...expectedTokens].filter((token) => !/\\d/.test(token));
     const meaningfulWordTokens = wordTokens.filter((token) => token.length >= 3);
     if (numericTokens.length) {{
-      if (!numericTokens.every((token) => candidateTokens.has(token))) return false;
+      const monthNumbers = {{
+        jan: '1', january: '1', feb: '2', february: '2', mar: '3', march: '3',
+        apr: '4', april: '4', may: '5', jun: '6', june: '6',
+        jul: '7', july: '7', aug: '8', august: '8', sep: '9', sept: '9', september: '9',
+        oct: '10', october: '10', nov: '11', november: '11', dec: '12', december: '12'
+      }};
+      const normalizeNumber = (token) => String(parseInt(token, 10));
+      const candidateNumberTokens = new Set(
+        [...candidateTokens]
+          .filter((token) => /\\d/.test(token))
+          .map((token) => normalizeNumber(token))
+      );
+      for (const token of candidateTokens) {{
+        if (monthNumbers[token]) candidateNumberTokens.add(monthNumbers[token]);
+      }}
+      if (!numericTokens.every((token) => candidateNumberTokens.has(normalizeNumber(token)))) return false;
       return !meaningfulWordTokens.length || meaningfulWordTokens.some((token) => candidateTokens.has(token));
     }}
     if (meaningfulWordTokens.length > 1) return meaningfulWordTokens.every((token) => candidateTokens.has(token));
@@ -951,6 +994,15 @@ def _workspace_html_preview_url(raw_url: str, *, principal_id: str | None) -> st
     return None
 
 
+def _principal_allows_private_host_navigation(principal_id: str | None) -> bool:
+    try:
+        from nullion.connections import principal_has_admin_access
+
+        return principal_has_admin_access(principal_id)
+    except Exception:
+        return False
+
+
 class BrowserTools:
     """Sync wrappers around the async backend, registered as kernel tools."""
 
@@ -960,47 +1012,63 @@ class BrowserTools:
         self._policy = policy
         self._cleanup_lock = threading.Lock()
         self._sessions_by_scope: dict[str, set[str]] = {}
+        self._active_session_lock = threading.Lock()
+        self._active_sessions_by_principal: dict[str, tuple[str, float]] = {}
         self._element_snapshot_lock = threading.Lock()
         self._element_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
 
     def _session_id(self, invocation: ToolInvocation) -> str:
         raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
         if self._uses_shared_default_session():
-            if raw_session_id.startswith("isolated:"):
-                suffix = raw_session_id.removeprefix("isolated:").strip()
-                if suffix:
-                    return f"isolated-{hashlib.sha256(suffix.encode('utf-8')).hexdigest()[:16]}"
+            workspace_session_id = self._workspace_browser_session_id(invocation)
+            active_session_id = self._recent_active_session_id(invocation)
             if raw_session_id and raw_session_id != "default":
+                if self._shared_session_prefers_workspace_scope(invocation, workspace_session_id):
+                    if active_session_id:
+                        return active_session_id
+                    return workspace_session_id
                 return raw_session_id
-            if self._uses_isolated_default_session(invocation):
-                scope = self._isolated_default_scope(invocation)
-                return f"isolated-{hashlib.sha256(scope.encode('utf-8')).hexdigest()[:16]}"
-            # Visible browser backends represent the operator's real logged-in
-            # browser. Keep the default session global so setup/login opened by
-            # Web is the same browser session later used by Telegram, Slack,
-            # Discord, Web, and mini-agent browser tools.
-            return DEFAULT_AGENT_BROWSER_SESSION_ID
+            if active_session_id:
+                return active_session_id
+            return workspace_session_id
         if raw_session_id and raw_session_id != "default":
             return raw_session_id
         scope = self._cleanup_scope(invocation)
         digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
         return f"default-{digest}"
 
-    def _uses_isolated_default_session(self, invocation: ToolInvocation) -> bool:
+    def _workspace_browser_session_id(self, invocation: ToolInvocation) -> str:
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
-        return bool(
-            context.get("isolated_browser_session")
-            or context.get("scheduled_task_run")
-            or context.get("browser_session_scope")
-            or invocation.capsule_id
-        )
+        workspace_id = str(context.get("workspace_id") or "").strip()
+        if not workspace_id:
+            try:
+                from nullion.connections import workspace_id_for_principal
 
-    def _isolated_default_scope(self, invocation: ToolInvocation) -> str:
+                workspace_id = str(workspace_id_for_principal(invocation.principal_id) or "").strip()
+            except Exception:
+                workspace_id = ""
+        if not workspace_id:
+            workspace_id = "workspace_admin"
+        try:
+            from nullion.workspace_storage import sanitize_workspace_id
+
+            workspace_id = sanitize_workspace_id(workspace_id)
+        except Exception:
+            workspace_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", workspace_id).strip("-") or "workspace_admin"
+        if workspace_id == "workspace_admin":
+            return DEFAULT_AGENT_BROWSER_SESSION_ID
+        digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:16]
+        return f"workspace-{digest}"
+
+    def _shared_session_prefers_workspace_scope(
+        self,
+        invocation: ToolInvocation,
+        workspace_session_id: str,
+    ) -> bool:
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
-        explicit_scope = str(context.get("browser_session_scope") or "").strip()
-        if explicit_scope:
-            return explicit_scope
-        return self._cleanup_scope(invocation)
+        if str(context.get("workspace_id") or "").strip():
+            return True
+        return workspace_session_id != DEFAULT_AGENT_BROWSER_SESSION_ID
 
     def _cleanup_scope(self, invocation: ToolInvocation) -> str:
         return str(invocation.capsule_id or invocation.principal_id or "global")
@@ -1026,11 +1094,53 @@ class BrowserTools:
         }
 
     def _remember_session(self, invocation: ToolInvocation, session_id: str) -> None:
-        if self._uses_shared_default_session() and session_id == DEFAULT_AGENT_BROWSER_SESSION_ID:
+        if invocation.tool_name != "browser_assert_page_state":
+            self._remember_active_session(invocation, session_id)
+        if self._uses_shared_default_session():
             return
         scope = self._cleanup_scope(invocation)
         with self._cleanup_lock:
             self._sessions_by_scope.setdefault(scope, set()).add(session_id)
+
+    def _active_session_keys(self, invocation: ToolInvocation) -> tuple[str, ...]:
+        context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        keys: list[str] = []
+        for key in ("browser_session_scope", "conversation_id", "chat_id", "request_id"):
+            value = str(context.get(key) or "").strip()
+            if value:
+                keys.append(f"{key}:{value}")
+        principal_key = str(invocation.principal_id or "").strip()
+        if principal_key:
+            keys.append(principal_key)
+        return tuple(dict.fromkeys(keys or ["global"]))
+
+    def _active_session_key(self, invocation: ToolInvocation) -> str:
+        return self._active_session_keys(invocation)[0]
+
+    def _remember_active_session(self, invocation: ToolInvocation, session_id: str) -> None:
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return
+        with self._active_session_lock:
+            remembered_at = time.monotonic()
+            for key in self._active_session_keys(invocation):
+                self._active_sessions_by_principal[key] = (session_id, remembered_at)
+
+    def _recent_active_session_id(self, invocation: ToolInvocation, *, exclude: str | None = None) -> str | None:
+        now = time.monotonic()
+        with self._active_session_lock:
+            for key in self._active_session_keys(invocation):
+                item = self._active_sessions_by_principal.get(key)
+                if not item:
+                    continue
+                session_id, remembered_at = item
+                if now - remembered_at > _ACTIVE_BROWSER_SESSION_TTL_SECONDS:
+                    self._active_sessions_by_principal.pop(key, None)
+                    continue
+                if exclude and session_id == exclude:
+                    continue
+                return session_id
+        return None
 
     def _forget_session(self, session_id: str) -> None:
         with self._cleanup_lock:
@@ -1063,6 +1173,57 @@ class BrowserTools:
         with self._element_snapshot_lock:
             cached = self._element_snapshots.get(session_id, {}).get(element_id)
         return dict(cached) if isinstance(cached, dict) else None
+
+    def _visible_editable_field_candidates(self, session_id: str, *, limit: int = 8) -> list[dict[str, object]]:
+        run_js = getattr(self._backend, "run_js", None)
+        if not callable(run_js):
+            return []
+        try:
+            snapshot = _run(run_js(session_id, _browser_snapshot_script(max_elements=80)))
+        except Exception:
+            return []
+        if not isinstance(snapshot, dict):
+            return []
+        self._remember_element_snapshot(session_id, snapshot)
+        raw_elements = snapshot.get("elements")
+        if not isinstance(raw_elements, list):
+            return []
+        candidates: list[dict[str, object]] = []
+        for element in raw_elements:
+            if not isinstance(element, dict):
+                continue
+            if not element.get("visible") or element.get("disabled") or not element.get("editable"):
+                continue
+            candidate: dict[str, object] = {}
+            for key in ("element_id", "role", "label", "placeholder", "name", "type", "value"):
+                value = str(element.get(key) or "").strip()
+                if value:
+                    candidate[key] = value[:120]
+            if candidate:
+                candidates.append(candidate)
+            if len(candidates) >= max(1, limit):
+                break
+        return candidates
+
+    def _field_failure_output(
+        self,
+        *,
+        session_id: str,
+        target: dict[str, object],
+        text: object,
+        error: object,
+    ) -> dict[str, object]:
+        output: dict[str, object] = {
+            "reason": _browser_failure_reason(error),
+            "message": _compact_failure_message(error),
+            "session_id": session_id,
+            "target": dict(target),
+            "text_length": len(str(text or "")),
+        }
+        candidates = self._visible_editable_field_candidates(session_id)
+        if candidates:
+            output["visible_editable_fields"] = candidates
+        return output
 
     @staticmethod
     def _semantic_target_from_cached_element(element: dict[str, Any] | None, *, for_click: bool) -> dict[str, object]:
@@ -1120,7 +1281,10 @@ class BrowserTools:
         navigate_url = _workspace_html_preview_url(str(url), principal_id=invocation.principal_id)
         try:
             if navigate_url is None:
-                self._policy.check_url(str(url))
+                self._policy.check_url(
+                    str(url),
+                    allow_private_host=_principal_allows_private_host_navigation(invocation.principal_id),
+                )
                 navigate_url = str(url)
         except BrowserPolicyViolation as e:
             return _fail(invocation, str(e))
@@ -1158,7 +1322,13 @@ class BrowserTools:
         try:
             click_element = getattr(self._backend, "click_element", None)
             if callable(click_element):
-                _run(click_element(session_id, target))
+                try:
+                    _run(click_element(session_id, target))
+                except Exception:
+                    selector = str(target.get("selector") or "").strip()
+                    if not selector:
+                        raise
+                    _run(self._backend.click(session_id, selector))
             else:
                 selector = str(target.get("selector") or target.get("label") or target.get("text") or target.get("name") or "")
                 _run(self._backend.click(session_id, selector))
@@ -1199,7 +1369,11 @@ class BrowserTools:
                 _run(self._backend.type_text(session_id, selector, str(text)))
             return _ok(invocation, {"typed": len(str(text)), "target": target, "session_id": session_id})
         except Exception as e:
-            return _fail(invocation, f"Type failed: {e}")
+            return _fail(
+                invocation,
+                f"Type failed: {e}",
+                self._field_failure_output(session_id=session_id, target=target, text=text, error=e),
+            )
 
     def browser_snapshot(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
@@ -1315,7 +1489,16 @@ class BrowserTools:
                 reason = result.get("reason") if isinstance(result, dict) else "invalid_result"
                 cached_element = self._cached_element(session_id, element_id)
                 if cached_element and cached_element.get("editable") is False:
-                    return _fail(invocation, f"Type failed: {reason}")
+                    return _fail(
+                        invocation,
+                        f"Type failed: {reason}",
+                        self._field_failure_output(
+                            session_id=session_id,
+                            target={"element_id": element_id},
+                            text=text,
+                            error=reason,
+                        ),
+                    )
                 target = self._semantic_target_from_cached_element(cached_element, for_click=False)
                 type_field = getattr(self._backend, "type_field", None)
                 if target and callable(type_field):
@@ -1332,8 +1515,26 @@ class BrowserTools:
                             },
                         )
                     except Exception as fallback_error:
-                        return _fail(invocation, f"Type failed: {reason}; fallback failed: {fallback_error}")
-                return _fail(invocation, f"Type failed: {reason}")
+                        return _fail(
+                            invocation,
+                            f"Type failed: {reason}; fallback failed: {fallback_error}",
+                            self._field_failure_output(
+                                session_id=session_id,
+                                target=target,
+                                text=text,
+                                error=fallback_error,
+                            ),
+                        )
+                return _fail(
+                    invocation,
+                    f"Type failed: {reason}",
+                    self._field_failure_output(
+                        session_id=session_id,
+                        target={"element_id": element_id},
+                        text=text,
+                        error=reason,
+                    ),
+                )
             if not result.get("verified"):
                 target = self._semantic_target_from_cached_element(
                     self._cached_element(session_id, element_id),
@@ -1358,11 +1559,35 @@ class BrowserTools:
                         return _fail(
                             invocation,
                             f"Type failed: field value did not verify after input; fallback failed: {fallback_error}",
+                            self._field_failure_output(
+                                session_id=session_id,
+                                target=target,
+                                text=text,
+                                error=fallback_error,
+                            ),
                         )
-                return _fail(invocation, "Type failed: field value did not verify after input")
+                return _fail(
+                    invocation,
+                    "Type failed: field value did not verify after input",
+                    self._field_failure_output(
+                        session_id=session_id,
+                        target={"element_id": element_id},
+                        text=text,
+                        error="field value did not verify after input",
+                    ),
+                )
             return _ok(invocation, {"result": result, "typed": len(text), "session_id": session_id})
         except Exception as e:
-            return _fail(invocation, f"Type failed: {e}")
+            return _fail(
+                invocation,
+                f"Type failed: {e}",
+                self._field_failure_output(
+                    session_id=session_id,
+                    target={"element_id": element_id},
+                    text=text,
+                    error=e,
+                ),
+            )
 
     def browser_select_combobox(self, invocation: ToolInvocation) -> ToolResult:
         query = str(invocation.arguments.get("query") or "").strip()
@@ -1523,25 +1748,68 @@ class BrowserTools:
         forbidden = [str(raw_forbidden)] if isinstance(raw_forbidden, str) else [str(item) for item in raw_forbidden if str(item).strip()]
         if not required and not forbidden:
             return _fail(invocation, "Provide required or forbidden page text/state assertions")
+        raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
+        has_explicit_session = bool(raw_session_id and raw_session_id != "default")
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:
+            script = _browser_assert_page_state_script(required=required, forbidden=forbidden)
             result = _run(
                 self._backend.run_js(
                     session_id,
-                    _browser_assert_page_state_script(required=required, forbidden=forbidden),
+                    script,
                 )
             )
             if not isinstance(result, dict):
                 return _fail(invocation, "Page state assertion returned an invalid result.")
             if not result.get("ok"):
-                return ToolResult(
-                    invocation_id=invocation.invocation_id,
-                    tool_name=invocation.tool_name,
-                    status="failed",
-                    output={"result": result, "session_id": session_id},
-                    error="Page state assertion failed",
-                )
+                current_url = str(result.get("url") or "").strip()
+                if current_url in {"", "about:blank"}:
+                    fallback_session_id = None if has_explicit_session else self._recent_active_session_id(
+                        invocation,
+                        exclude=session_id,
+                    )
+                    if fallback_session_id:
+                        try:
+                            fallback_result = _run(self._backend.run_js(fallback_session_id, script))
+                        except Exception:
+                            fallback_result = None
+                        if isinstance(fallback_result, dict):
+                            fallback_url = str(fallback_result.get("url") or "").strip()
+                            if fallback_result.get("ok") or fallback_url not in {"", "about:blank"}:
+                                session_id = fallback_session_id
+                                result = fallback_result
+                                current_url = fallback_url
+                                self._remember_active_session(invocation, session_id)
+                    if current_url in {"", "about:blank"} and not result.get("ok"):
+                        return _fail(
+                            invocation,
+                            "Browser page is blank; navigate to a source page or search result before asserting visible page state.",
+                        )
+                if not result.get("ok"):
+                    missing = result.get("missing") if isinstance(result.get("missing"), list) else []
+                    forbidden_found = (
+                        result.get("forbidden_found") if isinstance(result.get("forbidden_found"), list) else []
+                    )
+                    return _ok(
+                        invocation,
+                        {
+                            "result": result,
+                            "verified": False,
+                            "missing_required": [
+                                str(item.get("expected", "")).strip()
+                                for item in missing
+                                if isinstance(item, dict) and str(item.get("expected", "")).strip()
+                            ],
+                            "forbidden_found": [
+                                str(item.get("expected") or item.get("match") or "").strip()
+                                for item in forbidden_found
+                                if isinstance(item, dict)
+                                and str(item.get("expected") or item.get("match") or "").strip()
+                            ],
+                            "session_id": session_id,
+                        },
+                    )
             return _ok(invocation, {"result": result, "verified": True, "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"Page state assertion failed: {e}")
@@ -1565,7 +1833,14 @@ class BrowserTools:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:
-            result = _run(self._backend.run_js(session_id, str(script)))
+            script_text = str(script)
+            try:
+                result = _run(self._backend.run_js(session_id, script_text))
+            except Exception as first_exc:
+                if "Illegal return statement" not in str(first_exc):
+                    raise
+                wrapped_script = f"async () => {{\n{script_text}\n}}"
+                result = _run(self._backend.run_js(session_id, wrapped_script))
             return _ok(invocation, {"result": result, "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"JavaScript execution failed: {e}")

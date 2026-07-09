@@ -32,6 +32,7 @@ def _make_spec(
     requires_approval: bool = False,
     timeout: int = 30,
     input_schema: dict[str, object] | None = None,
+    continuation_tools: tuple[str, ...] = (),
 ) -> ToolSpec:
     return ToolSpec(
         name=name,
@@ -41,6 +42,7 @@ def _make_spec(
         requires_approval=requires_approval,
         timeout_seconds=timeout,
         input_schema=input_schema,
+        continuation_tools=continuation_tools,
     )
 
 
@@ -118,6 +120,17 @@ def register_browser_tools(
             risk=ToolRiskLevel.MEDIUM,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
+            continuation_tools=(
+                "browser_snapshot",
+                "browser_extract_text",
+                "browser_extract_items",
+                "browser_click_element",
+                "browser_type_field",
+                "browser_wait_for",
+                "browser_assert_page_state",
+                "browser_screenshot",
+                "browser_image_collect",
+            ),
             input_schema=_object_schema(
                 {
                     "url": {
@@ -203,6 +216,14 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            continuation_tools=(
+                "browser_click_id",
+                "browser_type_id",
+                "browser_click_element",
+                "browser_type_field",
+                "browser_wait_for",
+                "browser_assert_page_state",
+            ),
             input_schema=_object_schema(
                 {
                     "max_elements": {
@@ -227,6 +248,7 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            continuation_tools=("browser_run_js", "browser_image_collect"),
             input_schema=_object_schema(
                 {
                     "max_items": {
@@ -323,6 +345,7 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            continuation_tools=("browser_run_js", "browser_image_collect", "browser_screenshot"),
             input_schema=_object_schema(
                 {
                     "selector": {
@@ -415,6 +438,13 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            continuation_tools=(
+                "browser_navigate",
+                "browser_extract_text",
+                "browser_extract_items",
+                "browser_snapshot",
+                "browser_screenshot",
+            ),
             input_schema=_object_schema(
                 {
                     "required": {

@@ -131,7 +131,9 @@ class _TaskFrameContinuationState(TypedDict, total=False):
 
 
 def _normalize_url(url: str) -> str:
-    parsed = urlparse(url)
+    parsed = _parse_url_candidate(url)
+    if parsed is None:
+        return url
     normalized = parsed._replace(fragment="")
     normalized_text = normalized.geturl()
     if parsed.path == "" and not normalized_text.endswith("/"):
@@ -162,8 +164,17 @@ def _looks_like_domain(hostname: str) -> bool:
     return len(tld) >= 2 and all(ch.isalpha() for ch in tld)
 
 
+def _parse_url_candidate(raw_candidate: str):
+    try:
+        return urlparse(raw_candidate)
+    except ValueError:
+        return None
+
+
 def _to_url_if_hosted(raw_candidate: str, *, has_explicit_scheme: bool) -> str | None:
-    parsed = urlparse(raw_candidate)
+    parsed = _parse_url_candidate(raw_candidate)
+    if parsed is None:
+        return None
     if not parsed.netloc:
         return None
     hostname = parsed.hostname or ""
@@ -225,7 +236,9 @@ def extract_url_target(text: str) -> TaskFrameTarget | None:
 
 
 def _detect_output_override(text: str, current: TaskFrameOutputContract) -> TaskFrameOutputContract | None:
-    requested_format = plan_attachment_format(text)
+    # File extensions are structured output-format evidence for an active frame;
+    # reuse the shared attachment graph before URL/domain target substitution.
+    requested_format = plan_attachment_format(text, allow_filename_tokens=True)
     if requested_format.extension is not None:
         return TaskFrameOutputContract(
             artifact_kind=requested_format.extension.removeprefix("."),

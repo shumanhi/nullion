@@ -52,6 +52,13 @@ except ImportError:  # pragma: no cover - removed when conversation_runtime modu
         cancellation_token: str | None = None
 
 
+_CONVERSATION_SESSION_SETTING_FIELDS = frozenset({
+    "activity_trace_enabled",
+    "chat_streaming_enabled",
+    "thinking_display_enabled",
+})
+
+
 def _require_string_field(record: dict[str, Any], key: str) -> str:
     value = record.get(key)
     if not isinstance(value, str):
@@ -180,12 +187,14 @@ class RuntimeStore:
     conversation_ingress_ids: dict[str, set[str]] = field(default_factory=dict)
     conversation_events: list[dict[str, Any]] = field(default_factory=list)
     _conversation_events_by_conversation: dict[str, list[dict[str, Any]]] = field(default_factory=dict, init=False)
+    _conversation_session_settings: dict[str, dict[str, Any]] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self._rebuild_conversation_event_index()
 
     def _rebuild_conversation_event_index(self) -> None:
         index: dict[str, list[dict[str, Any]]] = {}
+        session_settings: dict[str, dict[str, Any]] = {}
         for event in self.conversation_events:
             if not isinstance(event, dict):
                 continue
@@ -193,7 +202,13 @@ class RuntimeStore:
             if not isinstance(conversation_id, str):
                 continue
             index.setdefault(conversation_id, []).append(event)
+            if event.get("event_type") == "conversation.session_settings":
+                settings = session_settings.setdefault(conversation_id, {})
+                for key in _CONVERSATION_SESSION_SETTING_FIELDS:
+                    if key in event:
+                        settings[key] = event.get(key)
         self._conversation_events_by_conversation = index
+        self._conversation_session_settings = session_settings
 
     def set_conversation_events(self, events: list[dict[str, Any]]) -> None:
         self.conversation_events = events
@@ -477,6 +492,14 @@ class RuntimeStore:
         conversation_id = normalized.get("conversation_id")
         if isinstance(conversation_id, str):
             self._conversation_events_by_conversation.setdefault(conversation_id, []).append(normalized)
+            if normalized.get("event_type") == "conversation.session_settings":
+                settings = self._conversation_session_settings.setdefault(conversation_id, {})
+                for key in _CONVERSATION_SESSION_SETTING_FIELDS:
+                    if key in normalized:
+                        settings[key] = normalized.get(key)
+
+    def get_conversation_session_setting(self, conversation_id: str, key: str) -> Any | None:
+        return deepcopy(self._conversation_session_settings.get(conversation_id, {}).get(key))
 
     def list_conversation_events(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
         if conversation_id is None:

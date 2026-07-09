@@ -32,7 +32,7 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
         category="Knowledge",
         status="available",
         summary="Search the web and fetch public pages with Sentinel approval on outbound access.",
-        tools=("web_search", "web_fetch"),
+        tools=("web_search", "web_fetch", "file_download"),
         providers=(
             PluginProviderCatalogEntry(
                 provider_id="builtin_search_provider",
@@ -187,8 +187,8 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
         name="Calendar",
         category="Accounts",
         status="preview",
-        summary="List calendar events through an explicitly connected provider account.",
-        tools=("calendar_list",),
+        summary="List, create, update, respond to, and delete calendar events through an explicitly connected provider account.",
+        tools=("calendar_list", "calendar_create", "calendar_update", "calendar_respond", "calendar_delete"),
         providers=(
             PluginProviderCatalogEntry(
                 provider_id="google_workspace_provider",

@@ -12,7 +12,7 @@ import sqlite3
 from typing import Any
 
 
-STARTUP_MAINTENANCE_MARKER = "startup_maintenance_tool_output_retention_v1"
+STARTUP_MAINTENANCE_MARKER = "startup_maintenance_tool_output_retention_v2"
 _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 _MAX_STORED_TOOL_OUTPUT_CHARS = 12_000
 _MAX_WORKSPACE_SUMMARY_SAMPLE_FILES = 50
@@ -215,6 +215,38 @@ def _compact_stored_tool_result(item: object) -> object:
 
 def _compact_tool_output(tool_name: str, output: object) -> object:
     candidate = output
+    if tool_name == "list_crons" and isinstance(candidate, dict):
+        crons = candidate.get("crons")
+        compact_crons: list[dict[str, object]] = []
+        if isinstance(crons, list):
+            for item in crons:
+                if not isinstance(item, dict):
+                    continue
+                compact_crons.append(
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "selection_index",
+                            "id",
+                            "name",
+                            "display_name",
+                            "enabled",
+                            "schedule_description",
+                            "next_run_description",
+                            "run_by_name",
+                            "has_task",
+                            "has_last_result",
+                        )
+                        if item.get(key) is not None
+                    }
+                )
+        candidate = {
+            "cron_count": len(crons) if isinstance(crons, list) else 0,
+            "crons": compact_crons,
+        }
+        message = output.get("message")
+        if isinstance(message, str) and message.strip():
+            candidate["message"] = message[:8_000]
     if tool_name == "workspace_summary" and isinstance(candidate, dict):
         sample_files = candidate.get("sample_files")
         if isinstance(sample_files, list) and len(sample_files) > _MAX_WORKSPACE_SUMMARY_SAMPLE_FILES:
