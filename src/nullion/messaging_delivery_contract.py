@@ -25,7 +25,11 @@ def foreground_reply_should_be_suppressed(tool_results: Iterable[object]) -> boo
     """Return the shared foreground-reply suppression decision for chat surfaces."""
     for tool_result in tool_results or ():
         output = _tool_output(tool_result)
-        if isinstance(output, dict) and _first_bool((output,), ("foreground_reply_suppressed",)):
+        if (
+            isinstance(output, dict)
+            and _first_bool((output,), ("foreground_reply_suppressed",))
+            and _tool_result_may_suppress_foreground_reply(tool_result, output)
+        ):
             return True
     return False
 
@@ -57,7 +61,9 @@ def task_status_has_active_work(text: str) -> bool:
         line = raw_line.strip()
         if not line:
             continue
-        if line.upper().startswith("ACTIVITY"):
+        normalized_line = line.replace("*", "").strip()
+        normalized_label = normalized_line.casefold()
+        if normalized_label in {"activity", "activity live"}:
             in_activity_section = True
             continue
         # Activity rows are historical tool evidence. They must not keep a
@@ -165,8 +171,9 @@ def _deferred_cron_status_from_output(output: object) -> tuple[str, str] | None:
         return None
     status_text = "\n".join(
         [
-            "⏱️ SCHEDULED TASKS",
-            f"For: {len(deferred_results)} manual scheduled task run(s)",
+            "⏰ **SCHEDULED TASKS**",
+            "",
+            f"Manual scheduled task runs: {len(deferred_results)}",
             *rows,
             "  Results will be delivered to the configured destinations when ready.",
         ]
@@ -178,6 +185,23 @@ def _tool_output(tool_result: object) -> object:
     if isinstance(tool_result, dict):
         return tool_result.get("output")
     return getattr(tool_result, "output", None)
+
+
+def _tool_name(tool_result: object) -> str:
+    if isinstance(tool_result, dict):
+        return str(tool_result.get("tool_name") or "").strip()
+    return str(getattr(tool_result, "tool_name", "") or "").strip()
+
+
+def _tool_result_may_suppress_foreground_reply(tool_result: object, output: dict[str, object]) -> bool:
+    """Return true only for tools whose typed delivery contract owns the reply elsewhere."""
+    tool_name = _tool_name(tool_result)
+    if tool_name == "run_cron":
+        return True
+    delivery_status = str(output.get("delivery_status") or output.get("cron_delivery_status") or "").strip()
+    if output.get("mini_agent_dispatch") is True and delivery_status == "deferred":
+        return True
+    return False
 
 
 def _first_bool(sources: tuple[object, ...], keys: tuple[str, ...]) -> bool:

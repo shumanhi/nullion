@@ -6,7 +6,16 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Callable, Iterable
 
-from nullion.approvals import ApprovalRequest, ApprovalStatus
+from nullion.agent_turn_limits import (
+    AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+    multiplier_for_limit_extension_mode,
+)
+from nullion.approvals import (
+    ApprovalRequest,
+    ApprovalStatus,
+    TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND,
+    TERMINAL_DESTRUCTIVE_PERMISSION_PREFIX,
+)
 from nullion.policy import BoundaryKind
 
 
@@ -38,6 +47,14 @@ def approval_context(approval: ApprovalRequest) -> dict[str, object]:
 
 
 def approval_tool_permissions(approval: ApprovalRequest) -> list[str]:
+    if approval.request_kind == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
+        return []
+    if approval.request_kind == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
+        ctx = approval_context(approval)
+        token = ctx.get("destructive_permission_token")
+        if isinstance(token, str) and token.strip():
+            return [f"{TERMINAL_DESTRUCTIVE_PERMISSION_PREFIX}{token.strip()}"]
+        return []
     if approval.request_kind == "boundary_policy" or approval.action == "allow_boundary":
         return []
     ctx = approval_context(approval)
@@ -86,6 +103,9 @@ def is_outbound_boundary_approval(approval: ApprovalRequest) -> bool:
 
 def approval_decision_reason(*, mode: str, source: str) -> str:
     source_label = str(source or "operator").strip() or "operator"
+    multiplier = multiplier_for_limit_extension_mode(mode)
+    if multiplier is not None:
+        return f"Approved {multiplier}x tool budget from {source_label}"
     if mode == "run":
         return f"Allowed all web domains from {source_label}"
     if mode == "always":
@@ -105,11 +125,18 @@ def approve_request_with_mode(
     allow_redecide_denied: bool = False,
     run_expiry_factory: Callable[[], datetime | None] | None = None,
 ) -> ApprovalDecisionResult:
-    normalized_mode = normalize_approval_mode(mode)
     store = runtime.store
     approval = store.get_approval_request(approval_id)
     if approval is None:
         raise KeyError(approval_id)
+    normalized_mode = normalize_approval_mode(
+        mode,
+        allowed=(
+            ("once", "always", "run")
+            if approval.request_kind != AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND
+            else ("limit_2x", "limit_5x", "limit_10x")
+        ),
+    )
 
     status = approval_status_value(approval)
     if status == ApprovalStatus.DENIED.value:

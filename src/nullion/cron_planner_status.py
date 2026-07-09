@@ -93,27 +93,30 @@ class CronPlannerStatusPreview:
             )
             for task in self.group.tasks
         }
-        return format_task_status_summary(
+        body = format_task_status_summary(
             self.group.tasks,
             planner_summary=self.planner_summary,
             subject=self.subject,
             status_lines=status_lines,
             default_status=TaskStatus.PENDING,
         )
+        return _with_scheduled_task_preview_header(body, self.subject)
 
     def terminal_text(self, *, success: bool) -> str:
         terminal_status = TaskStatus.COMPLETE if success else TaskStatus.FAILED
+        terminal_tasks = [replace(task, status=terminal_status) for task in self.group.tasks]
         status_lines = {
             task.task_id: format_task_status_line(task, status=terminal_status)
-            for task in self.group.tasks
+            for task in terminal_tasks
         }
-        return format_task_status_summary(
-            self.group.tasks,
+        body = format_task_status_summary(
+            terminal_tasks,
             planner_summary=self.planner_summary,
             subject=self.subject,
             status_lines=status_lines,
             default_status=terminal_status,
         )
+        return _with_scheduled_task_preview_header(body, self.subject)
 
     def with_group_id(self, group_id: str) -> CronPlannerStatusPreview:
         target_group_id = str(group_id or "").strip()
@@ -159,6 +162,13 @@ class CronPlannerStatusPreview:
             planner_summary=self.planner_summary,
             subject=self.subject,
         )
+
+
+def _with_scheduled_task_preview_header(text: str, subject: str = "") -> str:
+    subject_text = " ".join(str(subject or "").split())
+    header = f"⏰ SCHEDULED TASK: {subject_text}" if subject_text else "⏰ SCHEDULED TASK"
+    body = str(text or "").strip()
+    return f"{header}\n\n{body}" if body else header
 
 
 def build_cron_planner_status_preview(

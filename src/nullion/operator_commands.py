@@ -27,6 +27,7 @@ from nullion.approvals import (
     PermissionGrant,
     is_permission_grant_active,
 )
+from nullion.builder import builder_proposal_connector_app_label
 from nullion.codebase_summary import build_codebase_summary, format_codebase_summary
 from nullion.config import NullionSettings, load_settings, web_session_allow_duration_label, web_session_allow_expires_at
 from nullion.builder_capabilities import accept_dependency_builder_proposal
@@ -809,10 +810,13 @@ def _readme_project_context() -> tuple[str | None, tuple[str, ...], tuple[str, .
 _TOOL_HUMAN_NAMES: dict[str, str] = {
     "web_fetch": "Browse & fetch web pages",
     "fetch_url": "Browse & fetch web pages",
+    "file_download": "Download files from URLs",
     "web_search": "Search the web",
     "search_web": "Search the web",
     "file_read": "Read files in your project folder",
     "file_write": "Write files in your project folder",
+    "archive_create": "Create zip archives in your project folder",
+    "archive_extract": "Extract zip archives in your project folder",
     "list_files": "List files in your project folder",
     "terminal_exec": "Run terminal commands",
     "exec": "Run terminal commands",
@@ -1719,6 +1723,28 @@ def _render_builder_proposal(runtime: PersistentRuntime, token: str | None) -> s
     return "\n".join(lines)
 
 
+def _accepted_builder_skill_reply(record, skill) -> str:
+    lines = [
+        f"Accepted Builder proposal: {record.proposal.title}.",
+        f"Saved skill: {skill.title}",
+    ]
+    connector_label = builder_proposal_connector_app_label(record.proposal)
+    if connector_label:
+        lines.extend(
+            [
+                "",
+                (
+                    f"What happens now: Nullion saved a reusable {connector_label} connector workflow. "
+                    "This does not connect the account or rerun the previous request by itself."
+                ),
+                (
+                    f"Send the {connector_label} task you want next, and Nullion will use this saved skill "
+                    "to guide the connector path."
+                ),
+            ]
+        )
+    return "\n".join(lines)
+
 
 def _accept_builder_proposal(runtime: PersistentRuntime, token: str | None) -> str:
     if token is None:
@@ -1745,7 +1771,7 @@ def _accept_builder_proposal(runtime: PersistentRuntime, token: str | None) -> s
         skill = runtime.accept_stored_builder_skill_proposal(record.proposal_id, actor="operator")
     except ValueError as exc:
         return str(exc)
-    return f"Accepted Builder proposal: {record.proposal.title}.\nSaved skill: {skill.title}"
+    return _accepted_builder_skill_reply(record, skill)
 
 
 def _reject_builder_proposal(runtime: PersistentRuntime, token: str | None) -> str:

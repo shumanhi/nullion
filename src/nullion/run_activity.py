@@ -27,8 +27,6 @@ class RunActivityPhase(str, Enum):
 def classify_run_activity_phase(*, reply: str | None) -> RunActivityPhase:
     if is_tool_approval_marker(reply):
         return RunActivityPhase.WAITING_APPROVAL
-    if isinstance(reply, str) and "approval required" in reply.casefold():
-        return RunActivityPhase.WAITING_APPROVAL
     return RunActivityPhase.ACTIVE
 
 
@@ -235,7 +233,8 @@ def _is_image_generation_setup_error(tool_name: str, error: str) -> bool:
 
 
 def _tool_activity_should_hide_detail(tool_name: str) -> bool:
-    return str(tool_name or "").strip().lower() in {"connector_request"}
+    normalized = str(tool_name or "").strip().lower()
+    return normalized in {"connector_request"} or normalized.startswith("browser_")
 
 
 def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
@@ -250,6 +249,11 @@ def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
         return "✉️ messages searched"
     if normalized_tool == "email_read":
         return "✉️ message read"
+    if normalized_tool == "email_attachment_read":
+        filename = output.get("filename")
+        if isinstance(filename, str) and filename.strip():
+            return f"✉️ attachment {filename.strip()[:80]}"
+        return "✉️ attachment read"
     if normalized_tool == "email_send":
         return "✉️ sent"
     if normalized_tool == "calendar_list":
@@ -349,10 +353,22 @@ def format_tool_activity_line(tool_result: Any) -> str:
 
 
 def format_tool_activity_detail(tool_results: Iterable[Any]) -> str:
+    results = list(tool_results or ())
+    completed_tools = {
+        str(_tool_field(result, "tool_name", "tool") or "tool").strip().lower()
+        for result in results
+        if str(_tool_field(result, "status", "unknown") or "unknown").strip().lower()
+        in {"completed", "approved", "ok", "success"}
+    }
     counts: dict[str, int] = {}
     order: list[str] = []
-    for result in tool_results or ():
+    for result in results:
         if should_suppress_tool_activity(result):
+            continue
+        tool_name = str(_tool_field(result, "tool_name", "tool") or "tool")
+        normalized_tool_name = tool_name.strip().lower()
+        status = str(_tool_field(result, "status", "unknown") or "unknown").strip().lower()
+        if normalized_tool_name in completed_tools and status in {"failed", "failure", "error"}:
             continue
         line = format_tool_activity_line(result)
         if line not in counts:
@@ -391,15 +407,7 @@ def _mini_agent_task_titles_from_result(tool_result: Any) -> list[str]:
 
 
 def _is_useful_mini_agent_task_title(title: str) -> bool:
-    stripped = title.strip()
-    if not stripped:
-        return False
-    lowered = stripped.casefold()
-    if lowered in {"and", "or", "then", "also"}:
-        return False
-    if lowered.startswith(("and ", "or ", "then ", "also ", "as ")):
-        return False
-    return True
+    return bool(title.strip())
 
 
 def format_mini_agent_activity_detail(

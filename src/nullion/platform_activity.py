@@ -10,7 +10,7 @@ import time
 
 _PLANNER_COUNT_SUFFIX_RE = re.compile(r"\s*(?:[*•]|—|-)\s*\d+(?:\s+\S+)?\s*$", re.IGNORECASE)
 _PLANNER_PREFIX_RE = re.compile(r"^\s*planner\s+", re.IGNORECASE)
-_PLANNER_HEADING_PREFIX = "❖ PLANNER"
+_PLANNER_HEADING_TEXT = "PLANNER"
 _TOOL_STATUS_GLYPHS = {"✓", "→", "⊗", "⊘", "•"}
 _RUNNING_SPINNER_GLYPHS: tuple[str, ...] = ("◑", "◒", "◐", "◓")
 
@@ -307,14 +307,22 @@ def _platform_activity_line_identity(line: str) -> str:
 
 
 def _render_platform_activity_section(activity_lines: list[str]) -> str:
-    rendered = ["ACTIVITY  LIVE"]
+    rendered = ["Activity"]
     for block in activity_lines:
         block_lines = [line.strip() for line in str(block or "").splitlines() if line.strip()]
         if not block_lines:
             continue
-        rendered.append(f"→ {block_lines[0]}")
-        rendered.extend(f"    {line}" for line in block_lines[1:])
+        rendered.extend(_render_platform_activity_line(line) for line in block_lines)
     return "\n".join(rendered).strip()
+
+
+def _render_platform_activity_line(line: str) -> str:
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    if text[:1] in _TOOL_STATUS_GLYPHS:
+        return text
+    return f"✓ {text}"
 
 
 def _render_platform_planner_summary(summary: str) -> str:
@@ -324,14 +332,44 @@ def _render_platform_planner_summary(summary: str) -> str:
     first = lines[0].strip()
     if first.startswith("Planner:"):
         label = _render_platform_planner_label(first.split(":", 1)[1])
-        heading = _PLANNER_HEADING_PREFIX
-        if label:
-            heading = f"{heading}  {label}"
+        heading = _format_platform_planner_heading(label)
         rest = [line.rstrip(":") if line.lstrip().startswith(("→", "->")) else line for line in lines[1:]]
-        return "\n".join([heading, *rest]).strip()
+        return "\n".join([heading, "", *rest]).strip()
+    if _line_is_platform_planner_heading(first):
+        heading = _normalize_platform_planner_heading(first)
+        rest = [line.rstrip(":") if line.lstrip().startswith(("→", "->")) else line for line in lines[1:]]
+        while rest and not rest[0].strip():
+            rest.pop(0)
+        return "\n".join([heading, "", *rest]).strip()
     if first.casefold() == "planner":
-        return "\n".join([_PLANNER_HEADING_PREFIX, *lines[1:]]).strip()
+        return "\n".join([_format_platform_planner_heading(""), "", *lines[1:]]).strip()
     return "\n".join(lines).strip()
+
+
+def _format_platform_planner_heading(label: str) -> str:
+    compact = str(label or "").strip()
+    if compact:
+        return f"🎯 **{_PLANNER_HEADING_TEXT}  {compact}**"
+    return f"🎯 **{_PLANNER_HEADING_TEXT}**"
+
+
+def _line_is_platform_planner_heading(line: str) -> bool:
+    value = str(line or "").strip()
+    if value.startswith("🎯"):
+        value = value[len("🎯") :].strip()
+    value = re.sub(r"[*_]+", "", value).strip()
+    return value.casefold().startswith("planner")
+
+
+def _normalize_platform_planner_heading(line: str) -> str:
+    value = str(line or "").strip()
+    if value.startswith("🎯"):
+        value = value[len("🎯") :].strip()
+    value = re.sub(r"[*_]+", "", value).strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    compact = _PLANNER_PREFIX_RE.sub("", value).strip()
+    label = _render_platform_planner_label(compact)
+    return _format_platform_planner_heading(label)
 
 
 def _render_platform_planner_label(label: str) -> str:

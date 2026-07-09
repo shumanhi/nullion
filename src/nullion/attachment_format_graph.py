@@ -31,7 +31,6 @@ ATTACHMENT_TOKEN_EXTENSIONS: dict[str, str] = {
     "json": ".json",
     "m4a": ".m4a",
     "m4v": ".m4v",
-    "markdown": ".md",
     "md": ".md",
     "mkv": ".mkv",
     "mov": ".mov",
@@ -57,7 +56,10 @@ ATTACHMENT_TOKEN_EXTENSIONS: dict[str, str] = {
     "yaml": ".yaml",
     "yml": ".yaml",
 }
-VALID_ATTACHMENT_EXTENSIONS: tuple[str, ...] = tuple(sorted(set(ATTACHMENT_TOKEN_EXTENSIONS.values())))
+VALID_ATTACHMENT_EXTENSIONS: tuple[str, ...] = tuple(
+    sorted({*ATTACHMENT_TOKEN_EXTENSIONS.values(), ".htm", ".markdown", ".yml"})
+)
+EMBEDDED_MEDIA_ATTACHMENT_EXTENSIONS: tuple[str, ...] = (".docx", ".pdf", ".pptx", ".xlsx")
 _GENERIC_EXTENSION_RE = re.compile(r"^\.[A-Za-z0-9]{1,16}$")
 _DOMAIN_SUFFIX_EXTENSIONS = frozenset(
     {
@@ -84,10 +86,12 @@ logger = logging.getLogger(__name__)
 class AttachmentFormatPlan:
     extension: str | None = None
     evidence: str = "none"
+    embedded_media_extensions: tuple[str, ...] = ()
 
 
 class AttachmentFormatState(TypedDict, total=False):
     text: str
+    allow_filename_tokens: bool
     extensions: list[str]
     plan: AttachmentFormatPlan
 
@@ -169,8 +173,17 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                                 ]
                             },
                             "confidence": {"type": "number"},
+                            "embedded_media_extensions": {
+                                "type": "array",
+                                "description": (
+                                    "Final artifact suffixes that must contain requested images, screenshots, "
+                                    "generated visuals, or other media bytes inside the file itself. Use an empty "
+                                    "array when media may be listed, linked, attached separately, or not requested."
+                                ),
+                                "items": {"type": "string", "enum": list(EMBEDDED_MEDIA_ATTACHMENT_EXTENSIONS)},
+                            },
                         },
-                        "required": ["extension"],
+                        "required": ["extension", "embedded_media_extensions"],
                         "additionalProperties": False,
                     },
                 }
@@ -180,6 +193,12 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                 "Identify whether this user request specifies a required attachment file format. "
                 "Call select_attachment_format with the result. "
                 "extension must be a literal file extension such as .pdf, .html, or .blend, or null. "
+                "embedded_media_extensions must include final artifact suffixes only when the requested output file "
+                "itself must contain images, screenshots, generated visuals, or other embedded media bytes. "
+                "Return an empty embedded_media_extensions array for ordinary text, table, memo, note, report, "
+                "spreadsheet, PDF, HTML, or deck files unless the user specifically requires visual/media bytes "
+                "inside that final file. "
+                "When the required attachment is a browser/page screenshot image, use extension .png. "
                 "Use null when no attachment file format is specified."
             ),
         }
@@ -202,15 +221,38 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
     payload = _structured_payload_from_model_response(response) or _parse_json_object(_text_from_model_response(response))
     if payload is None:
         return None
+    embedded_media_extensions = _validated_embedded_media_extensions(
+        payload.get("embedded_media_extensions")
+    )
     extension = payload.get("extension")
     if extension is None:
-        return AttachmentFormatPlan(evidence="model_structured_output")
+        return AttachmentFormatPlan(
+            evidence="model_structured_output",
+            embedded_media_extensions=embedded_media_extensions,
+        )
     normalized = str(extension or "").strip().lower()
     if normalized and not normalized.startswith("."):
         normalized = f".{normalized}"
     if _GENERIC_EXTENSION_RE.fullmatch(normalized) is None:
         return None
-    return AttachmentFormatPlan(extension=normalized, evidence="model_structured_output")
+    return AttachmentFormatPlan(
+        extension=normalized,
+        evidence="model_structured_output",
+        embedded_media_extensions=embedded_media_extensions,
+    )
+
+
+def _validated_embedded_media_extensions(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    extensions: list[str] = []
+    for raw_extension in value:
+        extension = str(raw_extension or "").strip().lower()
+        if extension and not extension.startswith("."):
+            extension = f".{extension}"
+        if extension in EMBEDDED_MEDIA_ATTACHMENT_EXTENSIONS and extension not in extensions:
+            extensions.append(extension)
+    return tuple(extensions)
 
 
 def _attachment_format_model_timeout_seconds() -> float | None:
@@ -250,6 +292,31 @@ def _extension_candidate_priority(token: str) -> int:
     return 1
 
 
+_STRUCTURED_ATTACHMENT_DESCRIPTOR_KEYS = frozenset({"artifact", "artifacts", "file", "filename", "output", "path"})
+_SCREENSHOT_ATTACHMENT_RE = re.compile(r"\bscreenshots?\b", re.IGNORECASE)
+
+
+def _is_structured_attachment_descriptor(token: str) -> bool:
+    if "=" not in token:
+        return False
+    key = token.split("=", 1)[0].strip().lower()
+    return key in _STRUCTURED_ATTACHMENT_DESCRIPTOR_KEYS
+
+
+def has_unambiguous_attachment_extension_context(full_text: str, token: str) -> bool:
+    token = str(token or "").strip("`'\"<>(),;:")
+    if not token:
+        return False
+    if token.startswith("."):
+        return True
+    if "/" in token or "\\" in token or _is_structured_attachment_descriptor(token):
+        return True
+    parts = tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
+    if "artifacts" in parts or "files" in parts:
+        return True
+    return str(full_text or "").strip("`'\"<>(),;:") == token
+
+
 def _is_hidden_path_component_extension(token: str, raw_extension: str) -> bool:
     if "/" not in token and "\\" not in token:
         return False
@@ -260,7 +327,7 @@ def _is_hidden_path_component_extension(token: str, raw_extension: str) -> bool:
     return basename.lower() == f".{raw_extension.lower()}"
 
 
-def _extension_from_match(token: str, raw_extension: str) -> str | None:
+def _extension_from_match(token: str, raw_extension: str, *, allow_filename_tokens: bool = False) -> str | None:
     if _is_hidden_path_component_extension(token, raw_extension):
         return None
     normalized = raw_extension.lower()
@@ -284,6 +351,13 @@ def _extension_from_match(token: str, raw_extension: str) -> str | None:
     basename = re.split(r"[\\/]+", token)[-1].lower()
     if basename == f".{normalized}" and ("/" in token or "\\" in token or token.startswith("~")):
         return None
+    has_path_evidence = (
+        token.startswith(".")
+        or "/" in token
+        or "\\" in token
+        or "artifacts" in tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
+        or "files" in tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
+    )
     if mapped is not None:
         return mapped
     extension = f".{normalized}"
@@ -292,24 +366,24 @@ def _extension_from_match(token: str, raw_extension: str) -> str | None:
     if is_domain_suffix_extension(extension):
         return None
     parts = tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
-    has_path_evidence = (
-        token.startswith(".")
-        or "/" in token
-        or "\\" in token
-        or "artifacts" in parts
-        or "files" in parts
-    )
-    return extension if has_path_evidence else None
+    has_path_evidence = token.startswith(".") or "/" in token or "\\" in token or "artifacts" in parts or "files" in parts
+    return extension if has_path_evidence or allow_filename_tokens else None
 
 
-def _explicit_extensions(text: str) -> list[str]:
+def _explicit_extensions(text: str, *, allow_filename_tokens: bool = False) -> list[str]:
     candidates: list[tuple[int, int, str]] = []
     value = str(text or "")
     for index, match in enumerate(re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", value)):
         if match.start() > 0 and value[match.start() - 1] == ".":
             continue
         token = _token_around(value, match.start(), match.end())
-        extension = _extension_from_match(token, match.group(1))
+        if not allow_filename_tokens and not has_unambiguous_attachment_extension_context(value, token):
+            continue
+        extension = _extension_from_match(
+            token,
+            match.group(1),
+            allow_filename_tokens=allow_filename_tokens,
+        )
         if extension is None:
             continue
         candidates.append((_extension_candidate_priority(token), index, extension))
@@ -321,13 +395,26 @@ def _explicit_extensions(text: str) -> list[str]:
 
 
 def _normalize_node(state: AttachmentFormatState) -> dict[str, object]:
-    return {"extensions": _explicit_extensions(state.get("text") or "")}
+    return {
+        "extensions": _explicit_extensions(
+            state.get("text") or "",
+            allow_filename_tokens=bool(state.get("allow_filename_tokens")),
+        )
+    }
 
 
 def _extension_token_node(state: AttachmentFormatState) -> dict[str, object]:
     extensions = state.get("extensions") or []
     if extensions:
         return {"plan": AttachmentFormatPlan(extension=extensions[0], evidence="literal_extension")}
+    return {}
+
+
+def _artifact_kind_node(state: AttachmentFormatState) -> dict[str, object]:
+    if state.get("plan") is not None:
+        return {}
+    if _SCREENSHOT_ATTACHMENT_RE.search(state.get("text") or ""):
+        return {"plan": AttachmentFormatPlan(extension=".png", evidence="artifact_kind")}
     return {}
 
 
@@ -342,25 +429,45 @@ def _compiled_attachment_format_graph():
     graph = StateGraph(AttachmentFormatState)
     graph.add_node("normalize", _normalize_node)
     graph.add_node("extension_token", _extension_token_node)
+    graph.add_node("artifact_kind", _artifact_kind_node)
     graph.add_node("default", _default_node)
     graph.add_edge(START, "normalize")
     graph.add_edge("normalize", "extension_token")
-    graph.add_edge("extension_token", "default")
+    graph.add_edge("extension_token", "artifact_kind")
+    graph.add_edge("artifact_kind", "default")
     graph.add_edge("default", END)
     return graph.compile()
 
 
-def plan_attachment_format(text: str, *, model_client: object | None = None) -> AttachmentFormatPlan:
+def plan_attachment_format(
+    text: str,
+    *,
+    model_client: object | None = None,
+    include_media_requirements: bool = False,
+    allow_filename_tokens: bool = False,
+) -> AttachmentFormatPlan:
     final_state = _compiled_attachment_format_graph().invoke(
-        {"text": text},
+        {"text": text, "allow_filename_tokens": allow_filename_tokens},
         config={"configurable": {"thread_id": "attachment-format-plan"}},
     )
     plan = final_state.get("plan")
-    if isinstance(plan, AttachmentFormatPlan) and plan.extension is not None:
+    if isinstance(plan, AttachmentFormatPlan) and plan.extension is not None and not include_media_requirements:
         return plan
     model_plan = _model_attachment_format_plan(text, model_client)
     if model_plan is not None and is_domain_suffix_extension(model_plan.extension):
         return AttachmentFormatPlan()
+    if isinstance(plan, AttachmentFormatPlan) and plan.extension is not None and include_media_requirements:
+        return AttachmentFormatPlan(
+            extension=plan.extension,
+            evidence=(
+                "literal_extension+model_structured_output"
+                if model_plan is not None
+                else plan.evidence
+            ),
+            embedded_media_extensions=(
+                model_plan.embedded_media_extensions if model_plan is not None else ()
+            ),
+        )
     if model_plan is not None:
         return model_plan
     return plan if isinstance(plan, AttachmentFormatPlan) else AttachmentFormatPlan()
@@ -368,9 +475,11 @@ def plan_attachment_format(text: str, *, model_client: object | None = None) -> 
 
 __all__ = [
     "ATTACHMENT_TOKEN_EXTENSIONS",
+    "EMBEDDED_MEDIA_ATTACHMENT_EXTENSIONS",
     "AttachmentFormatPlan",
     "AttachmentFormatState",
     "VALID_ATTACHMENT_EXTENSIONS",
+    "has_unambiguous_attachment_extension_context",
     "is_domain_suffix_extension",
     "plan_attachment_format",
 ]

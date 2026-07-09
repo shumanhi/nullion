@@ -102,7 +102,10 @@ def _compiled_fetch_artifact_workflow():
 
 
 def _plan_node(state: FetchArtifactState) -> dict[str, object]:
-    extension = plan_attachment_format(state.get("prompt") or "").extension
+    extension = plan_attachment_format(
+        state.get("prompt") or "",
+        allow_filename_tokens=True,
+    ).extension
     if extension not in _SUPPORTED_FETCH_ARTIFACT_EXTENSIONS:
         return {"extension": None}
     return {"extension": extension, "error": None}

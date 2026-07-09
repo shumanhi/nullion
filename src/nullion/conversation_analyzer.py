@@ -51,26 +51,28 @@ multi-step patterns that could be captured as a named, reusable skill.
 A skill is a named procedure with:
   - A short title (≤ 8 words)
   - A one-sentence summary of what it does
-  - A trigger phrase the user would type to invoke it (≤ 20 words)
+  - A language-neutral activation condition describing when the workflow applies
   - An ordered list of 2–8 concrete steps (imperative sentences, ≤ 20 words each)
   - Up to 4 tags (single lowercase words or short hyphenated phrases)
 
-Detection heuristics:
-  1. REPEATED REQUEST — the user asked for the same type of action more than once.
-  2. MULTI-STEP DELEGATION — the user described a sequence of actions for the agent
-     to perform, the agent executed them successfully, and the user approved.
-  3. EXPLICIT INTENT — the user said things like "every time", "automatically",
-     "remember to", "always do this", or "make this a workflow".
-  4. PATTERN COMPLETION — the agent completed a recognisable operational task
-     (deploy, diagnose, backup, report, etc.) that could clearly be templated.
+Detection signals:
+  1. REPEATED REQUEST — multiple turns share the same structured goal or workflow shape.
+  2. MULTI-STEP DELEGATION — the transcript shows a reusable sequence of actions,
+     successful execution, and user acceptance.
+  3. EXPLICIT USER PREFERENCE — the user expresses a durable preference that future
+     equivalent situations should use the same workflow, regardless of language.
+  4. PATTERN COMPLETION — the agent completed a reusable operational task that could
+     clearly be templated from its structured goal, inputs, and outputs.
 
 Rules:
   - Only propose skills with CONFIDENCE ≥ 0.7 (scale 0.0–1.0).
   - Do not propose skills for purely conversational exchanges or one-off lookups.
   - Each proposal must be genuinely distinct; do not split a single workflow into
     multiple near-identical skills.
-  - Keep steps concrete and action-oriented, not vague ("Run health check via
-    /diagnose", not "Check the system").
+  - Use semantic understanding across languages. Do not require or reward any
+    specific natural-language phrase, English wording, regex, or synonym list.
+  - Keep steps concrete and action-oriented, grounded in the transcript's runtime
+    facts, tools, artifacts, approvals, and outcomes rather than prompt wording.
   - Return ONLY a JSON array (no prose).  If no patterns qualify, return [].
 
 Output schema (JSON array of objects):
@@ -78,12 +80,11 @@ Output schema (JSON array of objects):
   {
     "title": "...",
     "summary": "...",
-    "trigger": "...",
+    "activation_condition": "...",
     "steps": ["...", "..."],
     "tags": ["...", "..."],
     "confidence": 0.85,
-    "evidence": "Short sentence explaining which part of the conversation
-                 triggered this proposal."
+    "evidence": "Short sentence naming the repeated workflow signal, not literal wording."
   }
 ]
 """
@@ -96,6 +97,8 @@ class ConversationAnalysis:
     """A proposed skill extracted from conversation history."""
     title: str
     summary: str
+    # Kept as the storage/API field expected by SkillRecord. Semantically this is
+    # an activation condition, not a phrase that must be matched literally.
     trigger: str
     steps: list[str]
     tags: list[str] = field(default_factory=list)
@@ -338,7 +341,7 @@ def _parse_proposals(raw: str) -> list[ConversationAnalysis]:
             continue
         title = str(item.get("title") or "").strip()
         summary = str(item.get("summary") or "").strip()
-        trigger = str(item.get("trigger") or "").strip()
+        trigger = str(item.get("activation_condition") or item.get("trigger") or "").strip()
         steps = [str(s).strip() for s in item.get("steps", []) if s]
         if not (title and summary and trigger and steps):
             continue

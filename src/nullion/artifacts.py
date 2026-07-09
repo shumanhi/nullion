@@ -9,7 +9,6 @@ import mimetypes
 import os
 from pathlib import Path
 import re
-import tempfile
 from typing import Iterable
 from urllib.parse import quote
 from uuid import uuid4
@@ -40,11 +39,29 @@ _ARTIFACT_DIRECTIVE_PREFIX = "ARTIFACT:"
 _ATTACHMENT_DIRECTIVE_PREFIXES = (_MEDIA_DIRECTIVE_PREFIX, _ARTIFACT_DIRECTIVE_PREFIX)
 _ATTACHMENT_DIRECTIVE_WORDS = ("MEDIA", "ARTIFACT")
 _MEDIA_DIRECTIVE_STRIP_CHARS = "\ufeff\u200b\u200c\u200d"
+ARTIFACT_ROLE_DELIVERABLE = "deliverable"
+ARTIFACT_ROLE_SOURCE = "source"
+ARTIFACT_ROLE_INTERMEDIATE = "intermediate"
+ARTIFACT_DELIVERY_ROLES = frozenset({"deliverable", "deliver_receipt", "verify"})
 _ARTIFACT_MEDIA_TYPES_BY_SUFFIX = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
+_INTERNAL_SIDECAR_ARTIFACT_SUFFIXES = frozenset({".json", ".log", ".md", ".txt"})
+_INTERNAL_SIDECAR_ARTIFACT_TOKENS = frozenset(
+    {
+        "debug",
+        "diagnostic",
+        "diagnostics",
+        "manifest",
+        "metadata",
+        "raw",
+        "sidecar",
+        "status",
+        "trace",
+    }
+)
 _FENCED_HTML_BLOCK_RE = re.compile(
     r"```(?P<language>html|htm)\s*\n(?P<body>[\s\S]*?)```",
     flags=re.IGNORECASE,
@@ -52,6 +69,16 @@ _FENCED_HTML_BLOCK_RE = re.compile(
 _HTML_DOCUMENT_RE = re.compile(r"<\s*(?:!doctype\s+html|html|body|head)\b", flags=re.IGNORECASE)
 _HTML_FRAGMENT_RE = re.compile(r"<\s*(?:div|table|section|article|main|style|p|h[1-6]|img|a)\b", flags=re.IGNORECASE)
 _MIN_INLINE_HTML_ARTIFACT_CHARS = 500
+
+
+def nullion_data_home() -> Path:
+    data_dir = os.environ.get("NULLION_DATA_DIR")
+    if isinstance(data_dir, str) and data_dir.strip():
+        return Path(data_dir).expanduser().resolve()
+    nullion_home = os.environ.get("NULLION_HOME")
+    if isinstance(nullion_home, str) and nullion_home.strip():
+        return Path(nullion_home).expanduser().resolve()
+    return (Path.home() / ".nullion").resolve()
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,10 +109,7 @@ def artifact_root_for_runtime(runtime) -> Path:
     checkpoint_path = getattr(runtime, "checkpoint_path", None)
     if checkpoint_path is not None:
         return Path(checkpoint_path).expanduser().resolve().parent / ".nullion-artifacts"
-    data_dir = os.environ.get("NULLION_DATA_DIR")
-    if isinstance(data_dir, str) and data_dir.strip():
-        return Path(data_dir).expanduser().resolve() / ".nullion-artifacts"
-    return (Path.home() / ".nullion" / ".nullion-artifacts").resolve()
+    return nullion_data_home() / ".nullion-artifacts"
 
 
 def ensure_artifact_root(runtime) -> Path:
@@ -106,6 +130,44 @@ def path_is_within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def normalize_artifact_extensions(extensions: Iterable[str] | None) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for raw_extension in extensions or ():
+        extension = str(raw_extension or "").strip().lower()
+        if not extension:
+            continue
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if extension not in normalized:
+            normalized.append(extension)
+    return tuple(normalized)
+
+
+def is_unrequested_internal_sidecar_artifact(
+    path: str | Path,
+    *,
+    requested_extensions: Iterable[str] | None = None,
+) -> bool:
+    candidate = Path(str(path or "")).expanduser()
+    suffix = candidate.suffix.lower()
+    if not suffix:
+        return False
+    if suffix in set(normalize_artifact_extensions(requested_extensions)):
+        return False
+    if suffix in {".json", ".log"}:
+        return True
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", candidate.stem.lower())
+        if token
+    }
+    if suffix == ".json":
+        return bool(tokens & _INTERNAL_SIDECAR_ARTIFACT_TOKENS)
+    if suffix in {".md", ".txt"}:
+        return bool(tokens & _INTERNAL_SIDECAR_ARTIFACT_TOKENS)
+    return False
 
 
 def artifact_descriptor_for_path(path: Path, *, artifact_root: Path) -> ArtifactDescriptor | None:
@@ -137,6 +199,31 @@ def artifact_descriptor_for_path(path: Path, *, artifact_root: Path) -> Artifact
     )
 
 
+def is_deliverable_explicit_media_path(path: Path) -> bool:
+    """Return whether an explicit MEDIA/ARTIFACT path is safe to upload."""
+    if not path.is_absolute():
+        return False
+    resolved_path = path.expanduser().resolve()
+    if not resolved_path.is_file():
+        return False
+    try:
+        stat = resolved_path.stat()
+    except OSError:
+        return False
+    if stat.st_size == 0:
+        return False
+    if resolved_path.suffix.lower() in _BLOCKED_DOWNLOAD_SUFFIXES:
+        return False
+    if resolved_path.suffix.lower() in _HTML_ARTIFACT_SUFFIXES:
+        try:
+            sample = resolved_path.read_text(encoding="utf-8", errors="ignore")[:512].strip().lower()
+        except OSError:
+            return False
+        if stat.st_size < _MIN_HTML_ARTIFACT_BYTES or "<html" not in sample:
+            return False
+    return True
+
+
 def artifact_descriptors_for_paths(
     artifact_paths: list[str] | tuple[str, ...] | None,
     *,
@@ -150,6 +237,63 @@ def artifact_descriptors_for_paths(
         if descriptor is not None:
             descriptors.append(descriptor)
     return descriptors
+
+
+def artifact_output_descriptor(
+    path: str | Path,
+    *,
+    role: str = ARTIFACT_ROLE_DELIVERABLE,
+    kind: str | None = None,
+    label: str | None = None,
+) -> dict[str, object]:
+    resolved_path = Path(path).expanduser()
+    descriptor: dict[str, object] = {
+        "path": str(resolved_path),
+        "role": role,
+    }
+    if kind:
+        descriptor["kind"] = kind
+    if label:
+        descriptor["label"] = label
+    suffix = resolved_path.suffix.lower()
+    if suffix:
+        descriptor["extension"] = suffix
+    media_type = _ARTIFACT_MEDIA_TYPES_BY_SUFFIX.get(suffix) or mimetypes.guess_type(resolved_path.name)[0]
+    if media_type:
+        descriptor["media_type"] = media_type
+    try:
+        if resolved_path.is_file():
+            descriptor["size_bytes"] = resolved_path.stat().st_size
+    except OSError:
+        pass
+    return descriptor
+
+
+def artifact_paths_from_output_descriptors(
+    output: object,
+    *,
+    roles: Iterable[str] | None = None,
+) -> list[str]:
+    if not isinstance(output, dict):
+        return []
+    role_set = set(roles or ARTIFACT_DELIVERY_ROLES)
+    paths: list[str] = []
+    descriptors = output.get("artifact_descriptors")
+    if isinstance(descriptors, (list, tuple)):
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                continue
+            role = descriptor.get("role")
+            if not isinstance(role, str) or role not in role_set:
+                continue
+            path = descriptor.get("path")
+            if isinstance(path, str) and path.strip():
+                paths.append(path)
+    return list(dict.fromkeys(paths))
+
+
+def output_has_artifact_descriptors(output: object) -> bool:
+    return isinstance(output, dict) and isinstance(output.get("artifact_descriptors"), (list, tuple))
 
 
 def promote_supporting_asset_artifact_paths(
@@ -369,11 +513,6 @@ def is_safe_artifact_path(path: Path, *, artifact_root: Path | None = None) -> b
         return True
     if resolved_path.parent.name == ".nullion-artifacts":
         return True
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    if temp_root in resolved_path.parents:
-        return resolved_path.name.startswith("nullion-artifact-")
-    if Path("/tmp").resolve() in resolved_path.parents or Path("/private/tmp").resolve() in resolved_path.parents:
-        return resolved_path.name.startswith("nullion-artifact-")
     return False
 
 

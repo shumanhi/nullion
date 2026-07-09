@@ -80,8 +80,6 @@ _VOLATILE_MEMORY_KEY_PARTS = frozenset(
         "pending",
         "reminder",
         "reminders",
-        "run",
-        "runs",
         "runtime",
         "schedule",
         "scheduled",
@@ -91,22 +89,37 @@ _VOLATILE_MEMORY_KEY_PARTS = frozenset(
         "unavailable",
     }
 )
+_VOLATILE_MEMORY_VALUE_PARTS = frozenset(
+    {
+        "approval",
+        "approvals",
+        "cron",
+        "crons",
+        "failed",
+        "failure",
+        "metric",
+        "metrics",
+        "monitor",
+        "monitors",
+        "reminder",
+        "reminders",
+        "runtime",
+        "schedule",
+        "scheduled",
+        "scheduler",
+        "state",
+        "task",
+        "tasks",
+        "traffic",
+        "unavailable",
+    }
+)
 _CRON_EXPRESSION_RE = re.compile(
     r"(?<!\S)(?:\*|\d{1,2}|\*/\d{1,2}|\d{1,2}-\d{1,2}|\d{1,2},\d{1,2})(?:\s+"
     r"(?:\*|\d{1,2}|\*/\d{1,2}|\d{1,2}-\d{1,2}|\d{1,2},\d{1,2})){4}(?!\S)"
 )
 _ISO_DATETIME_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b")
 _EMAIL_ADDRESS_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
-# Reject runtime/scheduler/report state, but do not reject durable preferences
-# solely because they mention a structured tool or protocol name.
-_OPERATIONAL_MEMORY_VALUE_RE = re.compile(
-    r"\b(?:"
-    r"audience metrics|can be triggered on request|configured destination|delivery saves|failed metric sources|"
-    r"list_crons|public awareness|run_cron|scheduled cron|scheduled monitor|scheduled task|"
-    r"traffic metrics|web scraping"
-    r")\b",
-    re.I,
-)
 _OPERATIONAL_BUILDER_TOOL_NAMES = frozenset(
     {
         "create_cron",
@@ -150,11 +163,22 @@ class MemoryPolicy:
         return self.long_term_limit + self.mid_term_limit + self.short_term_limit
 
     def limit_for_kind(self, kind: UserMemoryKind) -> int:
-        if kind is UserMemoryKind.PREFERENCE:
+        if _memory_kind_value(kind) == UserMemoryKind.PREFERENCE.value:
             return self.long_term_limit
-        if kind is UserMemoryKind.ENVIRONMENT_FACT:
+        if _memory_kind_value(kind) == UserMemoryKind.ENVIRONMENT_FACT.value:
             return self.mid_term_limit
         return self.short_term_limit
+
+
+def _memory_kind_value(kind: object) -> str:
+    value = str(getattr(kind, "value", kind)).strip().lower()
+    if value.endswith(".preference"):
+        return UserMemoryKind.PREFERENCE.value
+    if value.endswith(".environment_fact"):
+        return UserMemoryKind.ENVIRONMENT_FACT.value
+    if value.endswith(".fact"):
+        return UserMemoryKind.FACT.value
+    return value
 
 
 _MEMORY_BUCKET_LABELS: dict[UserMemoryKind, str] = {
@@ -225,6 +249,7 @@ Rules:
 - Set content_type to "task_observation" for transient task status, one-off command outputs, generated artifact/report findings, delivery/output quality, raw logs, or conversation history.
 - Set content_type to "secret_or_token" for secrets or tokens.
 - Entries whose content_type is not "durable_memory" will be discarded.
+- Do not save product bug reports or regression guardrails about how tools should format, retry, attach, filter, search, route, or display results. Those are task_observation unless the user states a personal style, safety, or consent preference.
 - Do not add facts not supported by the provided turn or existing memory.
 - Do not rely on English trigger words; judge memory only from the full turn evidence.
 - If nothing should be remembered, return {"entries": []}.
@@ -249,6 +274,8 @@ Return ONLY valid JSON:
 Rules:
 - Use only the current turn evidence. Do not preserve or rewrite old memory here.
 - Include durable user facts, preferences, and workspace context that should help later turns.
+- Explicit user requests about future assistant style, such as response tone, emoji use, formatting,
+  structure, length, urgency markers, or scan-friendly layout, are durable preferences.
 - Use kind "preference" for long-term user preferences, "environment_fact" for mid-term workspace/environment context, and "fact" for short-term context.
 - Set content_type to "durable_memory" only for entries that belong in long-term, mid-term, or short-term memory.
 - Set content_type to "task_observation" for transient task status, generated IDs, one-off command outputs, generated artifact/report findings, delivery/output quality, raw logs, or conversation history.
@@ -498,7 +525,7 @@ def _memory_write_node(state: _BuilderMemoryState) -> dict[str, object]:
     for entry in replacement_entries:
         store.add_user_memory_entry(entry)
     cleanup_removed = 0
-    if smart_cleanup_enabled():
+    if smart_cleanup_enabled() and _owner_memory_exceeds_limit(store, owner, policy=policy):
         cleanup_removed = smart_cleanup_owner_memory(store, owner, policy=policy).removed
     _checkpoint_runtime(runtime)
     return {"result": BuilderMemoryResult(written=len(replacement_entries), removed=removed + cleanup_removed)}
@@ -716,7 +743,7 @@ def memory_pressure_for_owner(
     buckets: list[dict[str, object]] = []
     full_buckets: list[dict[str, object]] = []
     for kind in (UserMemoryKind.PREFERENCE, UserMemoryKind.ENVIRONMENT_FACT, UserMemoryKind.FACT):
-        count = sum(1 for entry in entries if entry.kind is kind)
+        count = sum(1 for entry in entries if _memory_kind_value(entry.kind) == kind.value)
         limit = policy.limit_for_kind(kind)
         bucket = {
             "kind": kind.value,
@@ -750,7 +777,7 @@ def smart_cleanup_owner_memory(
     entries = _entries_for_owner(store, owner)
     removed = 0
     for kind in (UserMemoryKind.PREFERENCE, UserMemoryKind.ENVIRONMENT_FACT, UserMemoryKind.FACT):
-        candidates = [entry for entry in entries if entry.kind is kind]
+        candidates = [entry for entry in entries if _memory_kind_value(entry.kind) == kind.value]
         limit = policy.limit_for_kind(kind)
         if not candidates or len(candidates) < limit:
             continue
@@ -770,6 +797,16 @@ def smart_cleanup_owner_memory(
             if _remove_memory_entry(store, entry.entry_id):
                 removed += 1
     return BuilderMemoryResult(removed=removed, skipped=None if removed else "nothing_to_clean")
+
+
+def _owner_memory_exceeds_limit(store, owner: str, *, policy: MemoryPolicy) -> bool:
+    entries = _entries_for_owner(store, owner)
+    for kind in (UserMemoryKind.PREFERENCE, UserMemoryKind.ENVIRONMENT_FACT, UserMemoryKind.FACT):
+        limit = policy.limit_for_kind(kind)
+        count = sum(1 for entry in entries if _memory_kind_value(entry.kind) == kind.value)
+        if count > limit:
+            return True
+    return False
 
 
 def memory_policy_from_env(environ: Mapping[str, str] | None = None) -> MemoryPolicy:
@@ -807,6 +844,8 @@ def _memory_limit_from_env(
         value = int(float(str(default if raw_value is None else raw_value).strip()))
     except (TypeError, ValueError):
         value = default
+    if value <= 0:
+        return default
     return max(0, min(value, MAX_CONFIGURED_MEMORY_LIMIT))
 
 
@@ -849,7 +888,11 @@ def select_memory_entries_for_prompt(
         limit = max(0, policy.limit_for_kind(kind) * max(1, limit_multiplier))
         if limit <= 0:
             continue
-        candidates = [entry for entry in entries if entry.kind is kind and is_durable_memory_entry(entry)]
+        candidates = [
+            entry
+            for entry in entries
+            if _memory_kind_value(entry.kind) == kind.value and is_durable_memory_entry(entry)
+        ]
         selected.extend(sorted(candidates, key=_memory_survival_sort_key, reverse=True)[:limit])
     return selected
 
@@ -935,9 +978,10 @@ def _memory_survival_sort_key(entry: UserMemoryEntry) -> tuple[float, datetime, 
 
 
 def _promoted_memory_kind(kind: UserMemoryKind, score: float) -> UserMemoryKind:
-    if kind is UserMemoryKind.FACT and score >= PROMOTE_TO_MID_TERM_SCORE:
+    kind_value = _memory_kind_value(kind)
+    if kind_value == UserMemoryKind.FACT.value and score >= PROMOTE_TO_MID_TERM_SCORE:
         return UserMemoryKind.ENVIRONMENT_FACT
-    if kind is UserMemoryKind.ENVIRONMENT_FACT and score >= PROMOTE_TO_LONG_TERM_SCORE:
+    if kind_value == UserMemoryKind.ENVIRONMENT_FACT.value and score >= PROMOTE_TO_LONG_TERM_SCORE:
         return UserMemoryKind.PREFERENCE
     return kind
 
@@ -993,8 +1037,8 @@ def _parse_turn_memory_entries(raw: str, *, policy: MemoryPolicy | None = None) 
             kind = UserMemoryKind(str(item.get("kind") or "fact"))
         except ValueError:
             kind = UserMemoryKind.FACT
-        content_type = str(item.get("content_type") or "durable_memory").strip().lower()
-        if content_type != "durable_memory":
+        content_type = str(item.get("content_type") or "").strip().lower()
+        if content_type and content_type != "durable_memory":
             continue
         if per_kind_seen[kind] >= policy.limit_for_kind(kind):
             continue
@@ -1018,6 +1062,9 @@ def _is_structurally_durable_memory(key: str, value: str) -> bool:
         return False
     if any(part in _VOLATILE_MEMORY_KEY_PARTS for part in key_parts):
         return False
+    value_parts = [part for part in _normalize_memory_key(value).split("_") if part]
+    if any(part in _VOLATILE_MEMORY_VALUE_PARTS for part in value_parts):
+        return False
     if _has_long_digit_run(value):
         return False
     if _has_runtime_shaped_token(value):
@@ -1027,8 +1074,6 @@ def _is_structurally_durable_memory(key: str, value: str) -> bool:
     if _has_iso_datetime(value):
         return False
     if _has_email_address(value):
-        return False
-    if _has_operational_memory_value(value):
         return False
     return True
 
@@ -1059,10 +1104,6 @@ def _has_iso_datetime(value: str) -> bool:
 
 def _has_email_address(value: str) -> bool:
     return bool(_EMAIL_ADDRESS_RE.search(value))
-
-
-def _has_operational_memory_value(value: str) -> bool:
-    return bool(_OPERATIONAL_MEMORY_VALUE_RE.search(value))
 
 
 def _parse_json_object(raw: str) -> dict[str, object]:
@@ -1158,7 +1199,7 @@ def _replace_owner_memory(store, owner: str, replacements: list[UserMemoryEntry]
     for entry in existing:
         if entry.entry_id in replacement_ids:
             continue
-        if entry.kind is UserMemoryKind.PREFERENCE:
+        if _memory_kind_value(entry.kind) == UserMemoryKind.PREFERENCE.value:
             continue
         if _remove_memory_entry(store, entry.entry_id):
             removed += 1

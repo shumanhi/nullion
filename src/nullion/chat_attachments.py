@@ -143,10 +143,80 @@ def normalize_chat_attachments(value: object) -> list[ChatAttachment]:
     return attachments
 
 
-def chat_attachment_content_blocks(message: str, attachments: list[ChatAttachment]) -> list[dict[str, Any]]:
+_UNAVAILABLE_ATTACHMENT_STATUSES = {"download_failed", "failed", "save_skipped", "skipped", "unavailable"}
+
+
+def _unavailable_attachment_descriptors(raw_attachments: object) -> list[dict[str, str]]:
+    if not isinstance(raw_attachments, list):
+        return []
+    descriptors: list[dict[str, str]] = []
+    for item in raw_attachments:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("path") or "").strip()
+        if raw_path and Path(raw_path).expanduser().is_file():
+            continue
+        status = str(item.get("download_status") or item.get("status") or "").strip().lower()
+        error = str(item.get("error") or item.get("reason") or "").strip()
+        if status not in _UNAVAILABLE_ATTACHMENT_STATUSES and not error:
+            continue
+        name = Path(str(item.get("name") or item.get("filename") or "attachment")).name or "attachment"
+        media_type = str(item.get("media_type") or guess_media_type(name)).strip() or "application/octet-stream"
+        descriptors.append(
+            {
+                "name": name,
+                "media_type": media_type,
+                "source_kind": str(item.get("source_kind") or "attachment"),
+                "status": status or "unavailable",
+                "detail": error or status or "unavailable",
+                "attempts": str(item.get("attempts") or "").strip(),
+                "bytes": str(item.get("bytes") or "").strip(),
+            }
+        )
+    return descriptors
+
+
+def has_unavailable_chat_attachments(raw_attachments: object) -> bool:
+    return bool(_unavailable_attachment_descriptors(raw_attachments))
+
+
+def unavailable_chat_attachment_count(raw_attachments: object) -> int:
+    return len(_unavailable_attachment_descriptors(raw_attachments))
+
+
+def unavailable_chat_attachment_names(raw_attachments: object) -> list[str]:
+    return [descriptor["name"] for descriptor in _unavailable_attachment_descriptors(raw_attachments)]
+
+
+def chat_attachment_content_blocks(
+    message: str,
+    attachments: list[ChatAttachment],
+    *,
+    raw_attachments: object = None,
+) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     if message:
         blocks.append({"type": "text", "text": message})
+    unavailable_descriptors = _unavailable_attachment_descriptors(raw_attachments)
+    for descriptor_item in unavailable_descriptors:
+        lines = [
+            "\n\nAttachment received but not available as a local file:",
+            f"- name: {descriptor_item['name']}",
+            f"- media_type: {descriptor_item['media_type']}",
+            f"- source_kind: {descriptor_item['source_kind']}",
+            f"- status: {descriptor_item['status']}",
+            f"- detail: {descriptor_item['detail']}",
+        ]
+        if descriptor_item["attempts"]:
+            lines.append(f"- attempts: {descriptor_item['attempts']}")
+        if descriptor_item["bytes"]:
+            lines.append(f"- bytes: {descriptor_item['bytes']}")
+        lines.append(
+            "No workspace file path exists for this attachment, so file/document tools cannot inspect it. "
+            "Do not ask the user for the filename; state that the upload bytes were not received and ask for "
+            "the file to be sent again if the task depends on that attachment."
+        )
+        blocks.append({"type": "text", "text": "\n".join(lines)})
     for attachment in attachments:
         path = Path(attachment.path)
         descriptor = f"\n\nAttached file: {attachment.name} ({attachment.media_type}) at {attachment.path}"
@@ -200,10 +270,13 @@ __all__ = [
     "audio_transcription_satisfied",
     "chat_attachment_content_blocks",
     "guess_media_type",
+    "has_unavailable_chat_attachments",
     "is_supported_audio_attachment",
     "is_supported_chat_file",
     "is_supported_image_attachment",
     "is_supported_video_attachment",
     "normalize_chat_attachments",
+    "unavailable_chat_attachment_count",
+    "unavailable_chat_attachment_names",
     "VIDEO_EXTENSIONS",
 ]

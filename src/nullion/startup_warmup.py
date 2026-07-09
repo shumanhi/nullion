@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable, Iterable
 from typing import Any
 
 
@@ -70,6 +71,8 @@ def run_chat_startup_warmup(
     registry: object | None = None,
     settings: object | None = None,
     surface: str = "chat",
+    principal_ids: Iterable[str | None] | None = None,
+    context_warmers: Iterable[tuple[str, Callable[[], object]]] | None = None,
     record_event: bool = True,
 ) -> StartupWarmupResult:
     started_at = time.perf_counter()
@@ -102,14 +105,33 @@ def run_chat_startup_warmup(
         chat_operator._chat_capability_inventory_prompt(runtime, tool_registry=registry)
         chat_operator._enabled_skill_pack_index_prompt(settings)
         chat_operator._chat_delivery_contract_prompt(runtime, principal_id=None)
+        seen_principals: set[str] = set()
+        for principal_id in principal_ids or ():
+            normalized = str(principal_id or "").strip()
+            if not normalized or normalized in seen_principals:
+                continue
+            seen_principals.add(normalized)
+            chat_operator._chat_delivery_contract_prompt(runtime, principal_id=normalized)
 
     step("chat_context", warm_chat_contexts)
 
+    for warmer_name, warmer in tuple(context_warmers or ()):
+        normalized_name = str(warmer_name or "").strip() or "context"
+        if callable(warmer):
+            step(f"context:{normalized_name}", warmer)
+
     def warm_tool_scope() -> None:
-        from nullion.turn_context_policy import build_turn_tool_evidence, scoped_turn_tool_registry
+        from nullion.turn_context_policy import build_turn_tool_evidence, turn_tool_registry_for_evidence
 
         evidence = build_turn_tool_evidence(user_message="", conversation_result=None)
-        scoped_turn_tool_registry(registry, evidence=evidence, model_client=None, user_message="") if registry is not None else None
+        if registry is not None:
+            turn_tool_registry_for_evidence(
+                registry,
+                evidence=evidence,
+                model_client=None,
+                user_message="",
+                skip_tool_scope_decision=True,
+            )
 
     step("tool_scope", warm_tool_scope)
 
@@ -151,6 +173,8 @@ def schedule_chat_startup_warmup(
     registry: object | None = None,
     settings: object | None = None,
     surface: str = "chat",
+    principal_ids: Iterable[str | None] | None = None,
+    context_warmers: Iterable[tuple[str, Callable[[], object]]] | None = None,
 ) -> threading.Thread | None:
     if not _warmup_enabled():
         return None
@@ -167,6 +191,8 @@ def schedule_chat_startup_warmup(
             "registry": registry,
             "settings": settings,
             "surface": surface,
+            "principal_ids": tuple(principal_ids or ()),
+            "context_warmers": tuple(context_warmers or ()),
         },
         name=f"nullion-{surface or 'chat'}-startup-warmup",
         daemon=True,

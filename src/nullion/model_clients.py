@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+from pathlib import Path
 import time as _time
 from typing import Any, Callable
 
@@ -26,6 +27,12 @@ except Exception:  # pragma: no cover - import guard
     _httpx = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CodexTokenRefresh:
+    access_token: str
+    refresh_token: str | None = None
 
 
 def _image_block_data_url(block: dict[str, Any]) -> str | None:
@@ -93,8 +100,8 @@ def _jwt_is_expired(token: str, *, leeway_seconds: int = 60) -> bool:
         return False
 
 
-def _refresh_codex_access_token(refresh_token: str) -> str:
-    """Exchange a Codex OAuth refresh token for a fresh access token."""
+def _refresh_codex_access_token(refresh_token: str) -> CodexTokenRefresh:
+    """Exchange a Codex OAuth refresh token for fresh OAuth credentials."""
     if _httpx is None:  # pragma: no cover
         raise ModelClientConfigurationError("httpx package is not installed")
     try:
@@ -119,7 +126,57 @@ def _refresh_codex_access_token(refresh_token: str) -> str:
     access_token = payload.get("access_token")
     if not isinstance(access_token, str) or not access_token.strip():
         raise ModelClientConfigurationError("Codex OAuth refresh did not return an access token.")
-    return access_token.strip()
+    rotated_refresh = payload.get("refresh_token")
+    return CodexTokenRefresh(
+        access_token=access_token.strip(),
+        refresh_token=rotated_refresh.strip() if isinstance(rotated_refresh, str) and rotated_refresh.strip() else None,
+    )
+
+
+def _codex_auth_json_paths() -> tuple[Path, ...]:
+    paths: list[Path] = []
+    configured_path = os.environ.get("NULLION_CODEX_AUTH_JSON", "")
+    if configured_path.strip():
+        paths.append(Path(configured_path).expanduser())
+    configured_home = os.environ.get("CODEX_HOME", "")
+    if configured_home.strip():
+        paths.append(Path(configured_home).expanduser() / "auth.json")
+    paths.append(Path.home() / ".codex" / "auth.json")
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return tuple(deduped)
+
+
+def _load_codex_auth_json_tokens() -> CodexTokenRefresh | None:
+    for path in _codex_auth_json_paths():
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except Exception:
+            continue
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        if not isinstance(tokens, dict):
+            continue
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        access_token = access_token.strip() if isinstance(access_token, str) else ""
+        refresh_token = refresh_token.strip() if isinstance(refresh_token, str) else ""
+        if access_token or refresh_token:
+            return CodexTokenRefresh(
+                access_token=access_token,
+                refresh_token=refresh_token or None,
+            )
+    return None
 
 
 def _codex_token_expired_response(detail: str) -> bool:
@@ -127,8 +184,8 @@ def _codex_token_expired_response(detail: str) -> bool:
     return "token_expired" in lowered or "authentication token is expired" in lowered
 
 
-def _persist_codex_access_token(access_token: str) -> None:
-    """Best-effort persistence for a refreshed Codex access token."""
+def _persist_codex_oauth_tokens(access_token: str, refresh_token: str | None = None) -> None:
+    """Best-effort persistence for refreshed Codex OAuth credentials."""
     try:
         from nullion.credential_store import load_encrypted_credentials, save_encrypted_credentials
 
@@ -136,6 +193,8 @@ def _persist_codex_access_token(access_token: str) -> None:
         if creds.get("provider") != "codex":
             return
         creds["api_key"] = access_token
+        if isinstance(refresh_token, str) and refresh_token.strip():
+            creds["refresh_token"] = refresh_token.strip()
         keys = creds.get("keys")
         if not isinstance(keys, dict):
             keys = {}
@@ -143,7 +202,12 @@ def _persist_codex_access_token(access_token: str) -> None:
         creds["keys"] = keys
         save_encrypted_credentials(creds)
     except Exception:
-        logger.debug("Could not persist refreshed Codex OAuth access token", exc_info=True)
+        logger.debug("Could not persist refreshed Codex OAuth credentials", exc_info=True)
+
+
+def _persist_codex_access_token(access_token: str) -> None:
+    """Backward-compatible wrapper for older tests/extensions."""
+    _persist_codex_oauth_tokens(access_token)
 
 
 class ModelClientConfigurationError(RuntimeError):
@@ -720,15 +784,17 @@ class CodexResponsesModelClient:
         if not refresh_token:
             return False
         refreshed = _refresh_codex_access_token(refresh_token)
-        account_id = _extract_chatgpt_account_id(refreshed)
+        account_id = _extract_chatgpt_account_id(refreshed.access_token)
         if not account_id:
             raise ModelClientConfigurationError(
                 "Codex OAuth refresh returned an access token without a ChatGPT account claim. "
                 "Re-run `nullion-auth` to sign in again."
             )
-        self.api_key = refreshed
+        self.api_key = refreshed.access_token
         self.account_id = account_id
-        _persist_codex_access_token(refreshed)
+        if refreshed.refresh_token:
+            self.refresh_token = refreshed.refresh_token
+        _persist_codex_oauth_tokens(refreshed.access_token, refreshed.refresh_token)
         return True
 
     @staticmethod
@@ -1106,6 +1172,11 @@ def build_model_client_from_settings(
         codex_token = "" if raw_codex_token.startswith("sk-") else raw_codex_token
         refresh_token = getattr(model_cfg, "codex_refresh_token", None) if model_cfg is not None else None
         refresh_token = refresh_token.strip() if isinstance(refresh_token, str) else ""
+        if raw_codex_token.startswith("sk-") and not refresh_token:
+            raise ModelClientConfigurationError(
+                "Codex OAuth is selected, but no Codex OAuth access or refresh token is configured. "
+                "Run `nullion-auth` and choose ChatGPT / OpenAI Codex."
+            )
 
         # Attempt a token refresh up front when the saved access token is
         # absent, expired, or missing the chatgpt_account_id claim. The old
@@ -1122,27 +1193,57 @@ def build_model_client_from_settings(
                 return True
             return False
 
-        refresh_error: str | None = None
-        if _needs_refresh(codex_token) and refresh_token:
-            try:
-                refreshed = _refresh_codex_access_token(refresh_token)
-                if refreshed:
-                    codex_token = refreshed
-                    # Persist the fresh access token so subsequent runs (and
-                    # other processes) don't keep using the stale one.
-                    try:
-                        from nullion.web_app import (
-                            _read_credentials_json,
-                            _write_credentials_json,
-                        )
-                        _creds = _read_credentials_json() or {}
-                        if _creds.get("provider") == "codex":
-                            _creds["api_key"] = codex_token
-                            _write_credentials_json(_creds)
-                    except Exception:
-                        pass  # best-effort persistence
-            except ModelClientConfigurationError as exc:
-                refresh_error = str(exc)
+        local_codex_tokens = _load_codex_auth_json_tokens() if _needs_refresh(codex_token) else None
+        if (
+            local_codex_tokens is not None
+            and local_codex_tokens.access_token
+            and not _needs_refresh(local_codex_tokens.access_token)
+        ):
+            codex_token = local_codex_tokens.access_token
+            if local_codex_tokens.refresh_token:
+                refresh_token = local_codex_tokens.refresh_token
+
+        refresh_errors: list[str] = []
+        refresh_candidates = tuple(
+            dict.fromkeys(
+                token
+                for token in (
+                    refresh_token,
+                    local_codex_tokens.refresh_token if local_codex_tokens is not None else "",
+                )
+                if isinstance(token, str) and token.strip()
+            )
+        )
+        if _needs_refresh(codex_token) and refresh_candidates:
+            for candidate_refresh_token in refresh_candidates:
+                try:
+                    refreshed = _refresh_codex_access_token(candidate_refresh_token)
+                    if refreshed.access_token:
+                        codex_token = refreshed.access_token
+                        if refreshed.refresh_token:
+                            refresh_token = refreshed.refresh_token
+                        else:
+                            refresh_token = candidate_refresh_token
+                        _persist_codex_oauth_tokens(refreshed.access_token, refreshed.refresh_token)
+                        # Persist the fresh access token so subsequent runs (and
+                        # other processes) don't keep using stale OAuth credentials.
+                        try:
+                            from nullion.web_app import (
+                                _read_credentials_json,
+                                _write_credentials_json,
+                            )
+                            _creds = _read_credentials_json() or {}
+                            if _creds.get("provider") == "codex":
+                                _creds["api_key"] = codex_token
+                                if refreshed.refresh_token:
+                                    _creds["refresh_token"] = refreshed.refresh_token
+                                _write_credentials_json(_creds)
+                        except Exception:
+                            pass  # best-effort persistence
+                        break
+                except ModelClientConfigurationError as exc:
+                    refresh_errors.append(str(exc))
+        refresh_error = "; ".join(refresh_errors) if refresh_errors else None
 
         if not codex_token:
             hint = f" Refresh attempt failed: {refresh_error}" if refresh_error else ""

@@ -20,7 +20,6 @@ from nullion.messaging_adapters import (
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
     MessagingIngress,
-    WORKING_ACK_TEXT,
     execute_platform_reply_delivery,
     formatted_reply_chunks,
     handle_messaging_ingress_result,
@@ -31,7 +30,6 @@ from nullion.messaging_adapters import (
     sanitize_external_inline_markup,
     save_messaging_attachment,
     send_with_plain_text_fallback,
-    should_emit_separate_working_ack,
     split_reply_for_platform,
 )
 from nullion.messaging_runtime import build_messaging_runtime_service_from_settings
@@ -44,6 +42,7 @@ from nullion.platform_activity import (
 from nullion.run_activity import activity_trace_enabled
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
+from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.users import resolve_messaging_user
 
 
@@ -566,35 +565,10 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
 
     working_channel = str(event.get("channel") or "").strip()
     working_ts = None
-    loop = asyncio.get_running_loop()
-    tool_working_ack_sent = False
 
     def emit_working_ack_for_tool_activity(event: dict[str, object]) -> None:
-        nonlocal tool_working_ack_sent, working_ts, working_channel
-        if (
-            tool_working_ack_sent
-            or client is None
-            or not working_channel
-            or not should_emit_separate_working_ack(event)
-        ):
-            return
-        tool_working_ack_sent = True
+        del event
 
-        async def _send() -> None:
-            nonlocal working_ts, working_channel
-            try:
-                response = await say(WORKING_ACK_TEXT)
-                working_ts = _slack_response_field(response, "ts")
-                working_channel = _slack_response_field(response, "channel") or working_channel
-            except Exception:
-                logger.debug("Slack working message send failed", exc_info=True)
-
-        try:
-            asyncio.run_coroutine_threadsafe(_send(), loop)
-        except Exception:
-            logger.debug("Slack working message scheduling failed", exc_info=True)
-
-    _mark_timing("working_message")
     text_streamer = _SlackTextDeltaStreamer(
         loop=asyncio.get_running_loop(),
         client=client,
@@ -607,6 +581,10 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
         ingress.text,
         turn_id=ingress.message_id or ingress.request_id,
         model_client=getattr(service, "model_client", None),
+        active_turn_followup_evidence=has_structured_turn_relationship_evidence(
+            ingress.text,
+            attachments=ingress.attachments,
+        ),
     )
     _mark_timing("turn_registered")
     try:
@@ -735,6 +713,7 @@ async def run_slack_app(
             registry=getattr(service, "tool_registry", None),
             settings=settings,
             surface="slack",
+            principal_ids=("telegram_chat",),
         )
     except Exception:
         logger.debug("Could not schedule Slack chat startup warmup", exc_info=True)

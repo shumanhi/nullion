@@ -16,6 +16,7 @@ class TelegramPostRunState(TypedDict, total=False):
     text_for_ack: str | None
     reply: str
     inbound_attachments: tuple[dict[str, str], ...]
+    artifact_paths: tuple[str, ...]
     runtime: Any
     conversation_id: str | None
     decision_card: Any
@@ -61,12 +62,16 @@ def _build_delivery_contract_node(state: TelegramPostRunState) -> dict[str, obje
             state.get("text_for_ack"),
             reply=state["reply"],
             inbound_attachments=state.get("inbound_attachments") or (),
+            artifact_paths=state.get("artifact_paths") or (),
+            requires_attachment_delivery=bool(state.get("artifact_paths") or ()),
         )
     else:
         delivery_contract = delivery_contract_for_turn(
             state.get("text_for_ack"),
             reply=state["reply"],
             inbound_attachments=state.get("inbound_attachments") or (),
+            artifact_paths=state.get("artifact_paths") or (),
+            requires_attachment_delivery=bool(state.get("artifact_paths") or ()),
         )
     return {"delivery_contract": delivery_contract}
 
@@ -99,6 +104,7 @@ def plan_telegram_post_run_delivery(
     text_for_ack: str | None,
     reply: str,
     inbound_attachments: tuple[dict[str, str], ...] = (),
+    artifact_paths: tuple[str, ...] = (),
     runtime: Any = None,
     conversation_id: str | None = None,
     decision_card: Any = None,
@@ -112,6 +118,7 @@ def plan_telegram_post_run_delivery(
             "text_for_ack": text_for_ack,
             "reply": reply,
             "inbound_attachments": inbound_attachments,
+            "artifact_paths": artifact_paths,
             "runtime": runtime,
             "conversation_id": conversation_id,
             "decision_card": decision_card,

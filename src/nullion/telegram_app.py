@@ -18,13 +18,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from nullion.agent_turn_limits import (
+    AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+    limit_extension_mode_for_multiplier,
+    multiplier_for_limit_extension_action,
+    set_agent_turn_limit_resume_multiplier,
+)
 from nullion.approval_display import (
     approval_display_from_request,
     approval_inline_code,
     approval_title_for,
     format_approval_detail_markdown,
 )
-from nullion.approvals import ApprovalStatus
+from nullion.approvals import ApprovalStatus, TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND
 from nullion.approval_markers import split_tool_approval_marker, strip_tool_approval_marker
 from nullion.artifacts import is_safe_artifact_path, split_media_reply_attachments
 from nullion.chat_attachments import (
@@ -41,6 +47,8 @@ from nullion.messaging_adapters import (
     DeliveryContract,
     WORKING_ACK_TEXT,
     build_platform_delivery_receipt,
+    delivery_contract_for_turn,
+    is_retryable_messaging_delivery_error,
     platform_delivery_failure_reply,
     principal_id_for_messaging_identity,
     prepare_reply_for_platform_delivery,
@@ -50,6 +58,7 @@ from nullion.messaging_adapters import (
     save_messaging_attachment,
     should_emit_separate_working_ack,
     split_reply_for_platform_delivery,
+    telegram_attachment_upload_limit_bytes,
 )
 from nullion.messaging_delivery_contract import (
     deferred_cron_status_owned_by_background_from_event,
@@ -58,6 +67,7 @@ from nullion.messaging_delivery_contract import (
 )
 from nullion.telegram_turn_graph import plan_telegram_post_run_delivery
 from nullion.turn_dispatch_graph import AsyncTurnDispatchTracker, TurnDispatchDecision
+from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.policy import permission_scope_principal
 from nullion.chat_streaming import (
     ChatStreamingMode,
@@ -101,21 +111,27 @@ from nullion.builder import builder_proposal_acceptance_benefit
 from nullion.runtime import PersistentRuntime, format_doctor_diagnosis_for_operator
 from nullion.runtime_persistence import load_runtime_store
 from nullion.telegram_formatting import format_telegram_text
-from nullion.telegram_transport import build_telegram_bot, configure_telegram_application_builder, telegram_request_timeout_kwargs
+from nullion.telegram_transport import (
+    build_telegram_bot,
+    configure_telegram_application_builder,
+    telegram_media_read_timeout_seconds,
+    telegram_request_timeout_kwargs,
+    telegram_uses_local_bot_api,
+)
 from nullion.chat_operator import (
-    _chat_model_issue_reply,
     _chat_prompt_for_message,
     activity_trace_enabled_for_chat,
     chat_streaming_enabled_for_chat,
     chat_streaming_status_text_for_chat,
     _is_authorized_chat,
     _local_chat_reply_body,
-    handle_chat_operator_message,
     resume_approved_telegram_request,
     set_chat_streaming_enabled_for_chat,
     set_verbose_mode_for_chat,
     verbose_mode_status_text_for_chat,
 )
+from nullion import platform_chat
+from nullion.platform_chat import PlatformChatRequest, PlatformChatResponse
 
 try:
     from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -131,6 +147,19 @@ except ImportError:  # pragma: no cover - exercised only when dependency missing
 
 
 TELEGRAM_BOT_COMMANDS: tuple[tuple[str, str], ...] = telegram_bot_command_menu(include_private_aliases=False)
+_FAST_OPERATOR_COMMAND_HEADS = frozenset(
+    {
+        "/help",
+        "/models",
+        "/verbose",
+        "/stream",
+        "/streaming",
+        "/thinking",
+        "/ping",
+        "/version",
+        "/uptime",
+    }
+)
 
 
 def build_telegram_bot_commands() -> list[object]:
@@ -237,6 +266,22 @@ def _telegram_reply_context(message) -> dict[str, object] | None:
     return {key: value for key, value in context.items() if value is not None}
 
 
+def _telegram_active_turn_accepts_unstructured_followup(runtime: object, conversation_id: str | None) -> bool:
+    if not conversation_id:
+        return False
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return False
+    try:
+        active_frame_id = store.get_active_task_frame_id(conversation_id)
+        frame = store.get_task_frame(active_frame_id) if isinstance(active_frame_id, str) else None
+    except Exception:
+        return False
+    status = getattr(frame, "status", None)
+    status_value = str(getattr(status, "value", status) or "").strip().lower()
+    return status_value in {"waiting_input", "waiting_approval"}
+
+
 def _telegram_request_id(update) -> str | None:
     update_id = getattr(update, "update_id", None)
     if update_id is None:
@@ -282,17 +327,20 @@ _TELEGRAM_ATTACHMENT_CAPTION_LIMIT = 1024
 def _telegram_document_timeout_kwargs() -> dict[str, float | int]:
     timeouts = telegram_request_timeout_kwargs()
     kwargs: dict[str, float | int] = {}
-    for key in ("connect_timeout", "read_timeout", "pool_timeout"):
+    for key in ("connect_timeout", "pool_timeout"):
         value = timeouts.get(key)
         if value is not None:
             kwargs[key] = value
+    media_read_timeout = telegram_media_read_timeout_seconds() or timeouts.get("read_timeout")
+    if media_read_timeout is not None:
+        kwargs["read_timeout"] = media_read_timeout
     media_write_timeout = timeouts.get("media_write_timeout") or timeouts.get("write_timeout")
     if media_write_timeout is not None:
         kwargs["write_timeout"] = media_write_timeout
     return kwargs
 
 
-async def _reply_document_attachment(message, attachment_path: Path, **kwargs) -> None:
+async def _reply_document_attachment(message, attachment_path: Path, **kwargs) -> object | None:
     delivery_kwargs = {**_telegram_document_timeout_kwargs(), **kwargs}
 
     async def operation() -> object:
@@ -302,11 +350,10 @@ async def _reply_document_attachment(message, attachment_path: Path, **kwargs) -
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            await retry_messaging_delivery_operation(operation, attempts=1)
-            return
+            return await retry_messaging_delivery_operation(operation, attempts=1)
         except Exception as exc:
             last_exc = exc
-            if attempt >= 2 or not _is_pre_upload_telegram_attachment_connect_failure(exc):
+            if attempt >= 2 or not is_retryable_messaging_delivery_error(exc):
                 break
             await asyncio.sleep(0.5 * (attempt + 1))
     assert last_exc is not None
@@ -376,6 +423,8 @@ async def _answer_callback_query_safely(callback_query, *args, **kwargs) -> bool
 logger = logging.getLogger(__name__)
 _TYPING_KEEPALIVE_INTERVAL_SECONDS = 2.0
 _TELEGRAM_ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
+_TELEGRAM_HOSTED_BOT_API_GET_FILE_LIMIT_BYTES = 20 * 1024 * 1024
+_TELEGRAM_HOSTED_BOT_API_GET_FILE_LIMIT_LABEL = "20 MB"
 _TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS = max(
     0.2,
     float(os.environ.get("NULLION_TELEGRAM_MEDIA_GROUP_DEBOUNCE_SECONDS", "1.25")),
@@ -469,27 +518,30 @@ def _split_telegram_message_chunks(text: str, *, limit: int = _TELEGRAM_MESSAGE_
     return chunks
 
 
-async def _reply_text_in_chunks(message, text: str, *, do_quote: bool, **kwargs) -> None:
+async def _reply_text_in_chunks(message, text: str, *, do_quote: bool, **kwargs) -> object | None:
     reply_text = getattr(message, "reply_text", None)
     if reply_text is None:
         raise AttributeError("Telegram message object has no reply_text method")
     chunks = _split_telegram_message_chunks(text)
     if len(chunks) == 1:
-        await retry_messaging_delivery_operation(
+        return await retry_messaging_delivery_operation(
             lambda: reply_text(text, do_quote=do_quote, **kwargs)
         )
-        return
+    first_message = None
     # Long resumed tool output often contains raw command results. Send chunks as
     # plain text so HTML/Markdown tags cannot be split across message boundaries.
     safe_kwargs = {key: value for key, value in kwargs.items() if key not in {"parse_mode"}}
     for index, chunk in enumerate(chunks):
-        await retry_messaging_delivery_operation(
+        sent_message = await retry_messaging_delivery_operation(
             lambda chunk=chunk, index=index: reply_text(
                 chunk,
                 do_quote=do_quote if index == 0 else False,
                 **safe_kwargs,
             )
         )
+        if first_message is None:
+            first_message = sent_message
+    return first_message
 
 
 def _without_parse_mode(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -513,6 +565,10 @@ def _is_telegram_message_not_modified_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ == "BadRequest" and "message is not modified" in str(exc).lower()
 
 
+def _is_telegram_no_text_to_edit_error(exc: BaseException) -> bool:
+    return exc.__class__.__name__ == "BadRequest" and "no text in the message to edit" in str(exc).lower()
+
+
 def _telegram_plain_format_fallback_text(plain_text: str) -> tuple[str, dict[str, str]]:
     fallback = (
         "Telegram could not render the formatted reply, so here is the same text as plain output:\n\n"
@@ -530,7 +586,7 @@ async def _reply_text_in_chunks_with_plain_fallback(
     *,
     do_quote: bool,
     **kwargs,
-) -> None:
+) -> object | None:
     if "parse_mode" in kwargs and len(formatted_text) > _TELEGRAM_MESSAGE_CHUNK_SIZE:
         reply_text = getattr(message, "reply_text", None)
         if reply_text is None:
@@ -551,7 +607,7 @@ async def _reply_text_in_chunks_with_plain_fallback(
                 **chunk_kwargs,
             }
             try:
-                await retry_messaging_delivery_operation(
+                sent_message = await retry_messaging_delivery_operation(
                     lambda chunk_text=chunk_text, index=index, chunk_kwargs=chunk_kwargs: (
                         reply_text(
                             chunk_text,
@@ -560,11 +616,13 @@ async def _reply_text_in_chunks_with_plain_fallback(
                         )
                     )
                 )
+                if index == 0:
+                    first_message = sent_message
             except Exception as exc:
                 if "parse_mode" not in chunk_kwargs or not _is_telegram_parse_error(exc):
                     raise
                 logger.warning("Telegram rejected formatted chunk; retrying as plain text.", exc_info=True)
-                await retry_messaging_delivery_operation(
+                sent_message = await retry_messaging_delivery_operation(
                     lambda plain_chunk=plain_chunk, index=index, chunk_kwargs=chunk_kwargs: (
                         reply_text(
                             sanitize_external_inline_markup(plain_chunk),
@@ -573,10 +631,12 @@ async def _reply_text_in_chunks_with_plain_fallback(
                         )
                     )
                 )
+                if index == 0:
+                    first_message = sent_message
             index += 1
-        return
+        return first_message if "first_message" in locals() else None
     try:
-        await _reply_text_in_chunks(message, formatted_text, do_quote=do_quote, **kwargs)
+        return await _reply_text_in_chunks(message, formatted_text, do_quote=do_quote, **kwargs)
     except Exception as exc:
         if "parse_mode" not in kwargs or not _is_telegram_parse_error(exc):
             raise
@@ -584,7 +644,7 @@ async def _reply_text_in_chunks_with_plain_fallback(
         fallback_text, fallback_kwargs = _telegram_plain_format_fallback_text(plain_text)
         fallback_delivery_kwargs = {**_without_parse_mode(kwargs), **fallback_kwargs}
         try:
-            await _reply_text_in_chunks(
+            return await _reply_text_in_chunks(
                 message,
                 fallback_text,
                 do_quote=do_quote,
@@ -593,7 +653,7 @@ async def _reply_text_in_chunks_with_plain_fallback(
         except Exception as fallback_exc:
             if "parse_mode" not in fallback_delivery_kwargs or not _is_telegram_parse_error(fallback_exc):
                 raise
-            await _reply_text_in_chunks(
+            return await _reply_text_in_chunks(
                 message,
                 sanitize_external_inline_markup(plain_text),
                 do_quote=do_quote,
@@ -635,14 +695,42 @@ async def _edit_text_with_plain_fallback(
             )
 
 
+async def _edit_message_text_or_caption_with_plain_fallback(
+    message,
+    formatted_text: str,
+    plain_text: str,
+    **kwargs,
+) -> None:
+    try:
+        await _edit_text_with_plain_fallback(
+            message.edit_text,
+            formatted_text,
+            plain_text,
+            **kwargs,
+        )
+        return
+    except Exception as exc:
+        if not _is_telegram_no_text_to_edit_error(exc):
+            raise
+    edit_caption = getattr(message, "edit_caption", None)
+    if edit_caption is None:
+        raise
+    await _edit_text_with_plain_fallback(
+        edit_caption,
+        formatted_text,
+        plain_text,
+        **kwargs,
+    )
+
+
 async def _deliver_callback_action_result(message, acknowledgement: str, reply: str) -> None:
     """Update callback cards without losing oversized action output."""
     formatted_reply, reply_kwargs = format_telegram_text(reply)
     reply_kwargs = {**reply_kwargs, "reply_markup": None}
     if len(formatted_reply) <= _TELEGRAM_MESSAGE_CHUNK_SIZE:
         try:
-            await _edit_text_with_plain_fallback(
-                message.edit_text,
+            await _edit_message_text_or_caption_with_plain_fallback(
+                message,
                 formatted_reply,
                 reply,
                 **reply_kwargs,
@@ -660,8 +748,8 @@ async def _deliver_callback_action_result(message, acknowledgement: str, reply: 
     formatted_summary, summary_kwargs = format_telegram_text(summary_text)
     summary_kwargs = {**summary_kwargs, "reply_markup": None}
     try:
-        await _edit_text_with_plain_fallback(
-            message.edit_text,
+        await _edit_message_text_or_caption_with_plain_fallback(
+            message,
             formatted_summary,
             summary_text,
             **summary_kwargs,
@@ -813,6 +901,10 @@ _TELEGRAM_NOTIFIED_DOCTOR_ACTION_IDS: set[str] = set()
 _TELEGRAM_DOCTOR_NOTIFICATION_SEVERITIES = frozenset({"medium", "high", "critical"})
 
 
+def _approval_status_value(status: object) -> str:
+    return str(getattr(status, "value", status) or "").strip().lower()
+
+
 def _should_notify_telegram_doctor_action(action: dict[str, object]) -> bool:
     severity = str(action.get("severity") or "").strip().lower()
     return severity in _TELEGRAM_DOCTOR_NOTIFICATION_SEVERITIES
@@ -823,7 +915,7 @@ def _capture_decision_snapshot(runtime: PersistentRuntime) -> DecisionSnapshot:
         pending_approval_ids=frozenset(
             approval.approval_id
             for approval in runtime.store.list_approval_requests()
-            if approval.status is ApprovalStatus.PENDING
+            if _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
         ),
         pending_builder_proposal_ids=frozenset(
             proposal.proposal_id
@@ -854,6 +946,9 @@ _CALLBACK_ACTION_CODES = {
     "allow_session": "as",
     "allow_once": "ao",
     "always_allow": "aa",
+    "extend_limit_2x": "e2",
+    "extend_limit_5x": "e5",
+    "extend_limit_10x": "e10",
     "deny": "dn",
     "accept": "ac",
     "review": "rv",
@@ -951,13 +1046,87 @@ def _builder_proposal_card_text(record) -> str:
     if summary and summary[-1] not in ".!?":
         summary += "."
     lines = [
-        "Builder suggestion",
+        "🛠️ **Builder suggestion**",
+        "",
         str(getattr(proposal, "title", "") or "Optional improvement").strip(),
     ]
     if summary:
         lines.extend(["", summary])
     lines.extend(["", builder_proposal_acceptance_benefit(proposal), "", "Tap an action below."])
     return "\n".join(line for line in lines if line is not None)
+
+
+def _telegram_truthy_builder_event_value(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _latest_builder_proposal_event_payload(runtime: PersistentRuntime, proposal_id: str) -> dict[str, object] | None:
+    list_events = getattr(getattr(runtime, "store", None), "list_events", None)
+    if not callable(list_events):
+        return None
+    for event in reversed(list_events()):
+        event_type = str(getattr(event, "event_type", "") or "")
+        if event_type not in {"builder.proposal_accepted", "builder.proposal_duplicate_skipped"}:
+            continue
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("proposal_id") or "") == proposal_id:
+            return dict(payload)
+    return None
+
+
+def _builder_proposal_skill_title(runtime: PersistentRuntime, record) -> str:
+    skill_id = str(getattr(record, "accepted_skill_id", "") or "").strip()
+    if skill_id:
+        get_skill = getattr(runtime, "get_skill", None)
+        if callable(get_skill):
+            skill = get_skill(skill_id)
+            title = str(getattr(skill, "title", "") or "").strip()
+            if title:
+                return title
+    proposal = getattr(record, "proposal", None)
+    for attr in ("suggested_skill_title", "title"):
+        title = str(getattr(proposal, attr, "") or "").strip()
+        if title:
+            return title
+    return "saved Builder skill"
+
+
+def _accepted_builder_proposal_callback_result(runtime: PersistentRuntime, record) -> tuple[str, str]:
+    proposal_id = str(getattr(record, "proposal_id", "") or "")
+    payload = _latest_builder_proposal_event_payload(runtime, proposal_id)
+    created_skill = None if payload is None else _telegram_truthy_builder_event_value(payload.get("created_skill"))
+    merged_duplicate = None if payload is None else _telegram_truthy_builder_event_value(payload.get("merged_duplicate"))
+    skill_id = str(getattr(record, "accepted_skill_id", "") or "").strip()
+
+    lines = ["🛠️ **Builder suggestion**", ""]
+    if skill_id:
+        title = _builder_proposal_skill_title(runtime, record)
+        if merged_duplicate is True or created_skill is False:
+            lines.append(f"Builder already reused and updated the existing skill: **{title}**.")
+        elif created_skill is True:
+            lines.append(f"Builder already created the skill: **{title}**.")
+        else:
+            lines.append(f"Builder already saved the skill: **{title}**.")
+        lines.extend(["", "No second approval is needed. Future matching requests can use that skill now."])
+        return "Skill ready", "\n".join(lines)
+
+    lines.extend([
+        "Builder already accepted this suggestion.",
+        "",
+        "No second approval is needed.",
+    ])
+    return "Already handled", "\n".join(lines)
 
 
 def _doctor_action_is_closed(action: dict[str, object] | None) -> bool:
@@ -1127,10 +1296,27 @@ def _build_models_card(runtime: PersistentRuntime) -> DecisionCard | None:
     return DecisionCard(text=_render_models(runtime), reply_markup=InlineKeyboardMarkup(rows))
 
 
+_CALENDAR_APPROVAL_CARD_ACTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "calendar_create": (("Add event", "allow_once"), ("Deny", "deny")),
+    "calendar_update": (("Update event", "allow_once"), ("Deny", "deny")),
+    "calendar_delete": (("Delete event", "allow_once"), ("Deny", "deny")),
+    "calendar_respond": (("Send response", "allow_once"), ("Deny", "deny")),
+}
+
+
 def _approval_card_actions(approval) -> tuple[tuple[str, str], ...]:
     context = getattr(approval, "context", None)
-    if isinstance(context, dict) and context.get("tool_name") == "email_send":
-        return (("Send email", "allow_once"), ("Deny", "deny"))
+    if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
+        return (("2x", "extend_limit_2x"), ("5x", "extend_limit_5x"), ("10x", "extend_limit_10x"), ("Deny", "deny"))
+    if getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
+        return (("Delete", "allow_once"), ("Deny", "deny"))
+    if isinstance(context, dict):
+        tool_name = str(context.get("tool_name") or "").strip()
+        if tool_name == "email_send":
+            return (("Send email", "allow_once"), ("Deny", "deny"))
+        calendar_actions = _CALENDAR_APPROVAL_CARD_ACTIONS.get(tool_name)
+        if calendar_actions is not None:
+            return calendar_actions
     tool_name, detail = _approval_card_fields(approval)
     if _approval_is_web_request(tool_name, detail):
         return (
@@ -1440,19 +1626,24 @@ def _check_new_reminder_card(runtime: "PersistentRuntime", reminder_ids_before: 
     return _build_reminder_confirmation_card(reminder)
 
 
-def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> DecisionCard | None:
+def _approval_decision_card(approval) -> DecisionCard:
+    return DecisionCard(
+        text=_approval_card_text(approval),
+        reply_markup=_build_approval_markup(approval=approval),
+    )
+
+
+def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot, *, reply: str | None = None) -> DecisionCard | None:
+    marker = split_tool_approval_marker(reply) if isinstance(reply, str) else None
+    marked_approval_id = marker.approval_id if marker is not None and marker.approval_id else None
     pending_approvals = {
         approval.approval_id: approval
         for approval in runtime.store.list_approval_requests()
-        if approval.status is ApprovalStatus.PENDING
+        if _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
     }
     new_approval_ids = sorted(set(pending_approvals) - set(before.pending_approval_ids))
-    if new_approval_ids:
-        approval = pending_approvals[new_approval_ids[0]]
-        return DecisionCard(
-            text=_approval_card_text(approval),
-            reply_markup=_build_approval_markup(approval=approval),
-        )
+    if marked_approval_id in new_approval_ids:
+        return _approval_decision_card(pending_approvals[marked_approval_id])
 
     pending_builder_proposals = {
         proposal.proposal_id: proposal
@@ -1466,7 +1657,21 @@ def _new_decision_card(runtime: PersistentRuntime, before: DecisionSnapshot) -> 
         if proposal_id not in _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS
     ]
     if new_proposal_ids:
-        _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS.update(new_proposal_ids)
+        proposal_id = new_proposal_ids[0]
+        _TELEGRAM_NOTIFIED_BUILDER_PROPOSAL_IDS.add(proposal_id)
+        return DecisionCard(
+            text=_builder_proposal_card_text(pending_builder_proposals[proposal_id]),
+            reply_markup=_build_decision_markup(
+                kind="proposal",
+                record_id=proposal_id,
+                actions=(
+                    ("Review", "review"),
+                    ("Approve", "accept"),
+                    ("Dismiss", "reject"),
+                ),
+            ),
+            supplemental=True,
+        )
 
     pending_doctor_actions = {
         str(action["action_id"]): action
@@ -1510,41 +1715,42 @@ def _existing_pending_approval_card(runtime: PersistentRuntime, reply: str | Non
     marker = split_tool_approval_marker(reply)
     if marker is not None and marker.approval_id:
         approval = runtime.store.get_approval_request(marker.approval_id)
-        if approval is not None and approval.status is ApprovalStatus.PENDING:
-            return DecisionCard(
-                text=_approval_card_text(approval),
-                reply_markup=_build_approval_markup(approval=approval),
-            )
-    if marker is None and "approval required" not in reply.casefold():
-        return None
-    pending_approvals = [
-        approval
-        for approval in runtime.store.list_approval_requests()
-        if approval.status is ApprovalStatus.PENDING
-    ]
-    if len(pending_approvals) != 1:
-        return None
-    approval = pending_approvals[0]
-    return DecisionCard(
-        text=_approval_card_text(approval),
-        reply_markup=_build_approval_markup(approval=approval),
-    )
+        if (
+            approval is not None
+            and _approval_status_value(getattr(approval, "status", None)) == ApprovalStatus.PENDING.value
+        ):
+            return _approval_decision_card(approval)
+    return None
 
 
 def _should_disable_web_preview(reply: str) -> bool:
-    return reply.startswith("📌 Nullion status") or reply.startswith("✅ Approval inbox")
+    return (
+        reply.startswith("📌 Nullion status")
+        or reply.startswith("✅ Approval inbox")
+        or bool(re.search(r"https?://", str(reply or ""), flags=re.IGNORECASE))
+    )
 
 
-def _record_telegram_delivery_receipt(message, delivery, *, transport_ok: bool, error: str | None = None) -> None:
+def _record_telegram_delivery_receipt(
+    message,
+    delivery,
+    *,
+    transport_ok: bool,
+    error: str | None = None,
+    request_id: str | None = None,
+    delivered_message=None,
+) -> None:
     chat = None if message is None else getattr(message, "chat", None)
     chat_id = None if chat is None else getattr(chat, "id", None)
-    message_id = None if message is None else getattr(message, "message_id", None)
+    message_id_source = delivered_message if delivered_message is not None else message
+    message_id = None if message_id_source is None else getattr(message_id_source, "message_id", None)
     record_platform_delivery_receipt(
         build_platform_delivery_receipt(
             channel="telegram",
             target_id=None if chat_id is None else str(chat_id),
             delivery=delivery,
             transport_ok=transport_ok,
+            request_id=request_id,
             message_id=None if message_id is None else str(message_id),
             error=error,
         )
@@ -1561,9 +1767,11 @@ async def _deliver_reply(
     principal_id: str | None = None,
     allow_attachments: bool | None = None,
     delivery_contract: DeliveryContract | None = None,
+    artifact_paths: tuple[str, ...] | list[str] | None = None,
     request_id: str | None = None,
     turn_id: str | None = None,
     phase: str = "primary",
+    quote_reply: bool | None = None,
 ) -> None:
     """Send a reply to a Telegram message.
 
@@ -1606,21 +1814,26 @@ async def _deliver_reply(
         timing_last_at = now
 
     visible_reply = decision_card.text if decision_card is not None else strip_tool_approval_marker(reply)
-    delivery_kwargs: dict[str, object] = {"principal_id": principal_id}
+    delivery_kwargs: dict[str, object] = {
+        "principal_id": principal_id,
+        "max_attachment_bytes": telegram_attachment_upload_limit_bytes(),
+    }
     if allow_attachments is not None:
         delivery_kwargs["allow_attachments"] = allow_attachments
     if delivery_contract is not None:
         delivery_kwargs["delivery_contract"] = delivery_contract
+    if artifact_paths:
+        delivery_kwargs["artifact_paths"] = tuple(str(path) for path in artifact_paths if str(path or "").strip())
     delivery = prepare_reply_for_platform_delivery(
         visible_reply or "",
         **delivery_kwargs,
     )
     caption = delivery.text
     attachment_paths = delivery.attachments
+    do_quote = _should_quote_reply(_message_text_or_caption(message)) if quote_reply is None else bool(quote_reply)
     _mark_timing("prepared")
     if attachment_paths:
         _mark_timing("delivery_attachment_mode")
-        do_quote = _should_quote_reply(_message_text_or_caption(message))
         formatted_caption, caption_kwargs, caption_too_long = _telegram_attachment_caption_kwargs(caption)
         if caption is not None and caption_too_long:
             formatted_text, text_kwargs = format_telegram_text(caption)
@@ -1638,14 +1851,22 @@ async def _deliver_reply(
                 attachment_kwargs = caption_kwargs if index == 0 else {}
                 if index == 0 and decision_card is not None and decision_card.reply_markup is not None:
                     attachment_kwargs = {**attachment_kwargs, "reply_markup": decision_card.reply_markup}
-                await _reply_document_attachment(
+                sent_message = await _reply_document_attachment(
                     message,
                     attachment_path,
                     caption=formatted_caption if index == 0 else None,
                     do_quote=do_quote if index == 0 else False,
                     **attachment_kwargs,
                 )
-            _record_telegram_delivery_receipt(message, delivery, transport_ok=True)
+                if index == 0:
+                    first_sent_message = sent_message
+            _record_telegram_delivery_receipt(
+                message,
+                delivery,
+                transport_ok=True,
+                request_id=request_id,
+                delivered_message=first_sent_message if "first_sent_message" in locals() else None,
+            )
         except Exception:
             logger.warning("Could not upload Telegram reply attachment", exc_info=True)
             outcome = "attachment_failed"
@@ -1654,6 +1875,7 @@ async def _deliver_reply(
                 delivery,
                 transport_ok=False,
                 error="attachment_upload_failed",
+                request_id=request_id,
             )
             await _send_telegram_delivery_failure_safely(
                 message,
@@ -1697,7 +1919,7 @@ async def _deliver_reply(
                 if await _reply_text_with_streaming_edits(
                     message,
                     formatted_reply,
-                    do_quote=_should_quote_reply(_message_text_or_caption(message)),
+                    do_quote=do_quote,
                 ):
                     _mark_timing("delivery_complete")
                     total_ms = (time.perf_counter() - started_at) * 1000
@@ -1707,11 +1929,11 @@ async def _deliver_reply(
                 logger.warning("Telegram streaming reply failed; retrying final text delivery.", exc_info=True)
         try:
             _mark_timing("reply_text_fallback")
-            await _reply_text_in_chunks_with_plain_fallback(
+            sent_message = await _reply_text_in_chunks_with_plain_fallback(
                 message,
                 formatted_reply,
                 delivery_text,
-                do_quote=_should_quote_reply(_message_text_or_caption(message)),
+                do_quote=do_quote,
                 **reply_kwargs,
             )
         except Exception:
@@ -1720,6 +1942,7 @@ async def _deliver_reply(
                 delivery,
                 transport_ok=False,
                 error="text_delivery_failed",
+                request_id=request_id,
             )
             outcome = "text_delivery_failed"
             logger.warning("Could not deliver Telegram text reply after retries", exc_info=True)
@@ -1727,7 +1950,13 @@ async def _deliver_reply(
             total_ms = (time.perf_counter() - started_at) * 1000
             _log_slow_delivery(total_ms)
             return
-        _record_telegram_delivery_receipt(message, delivery, transport_ok=True)
+        _record_telegram_delivery_receipt(
+            message,
+            delivery,
+            transport_ok=True,
+            request_id=request_id,
+            delivered_message=sent_message if "sent_message" in locals() else None,
+        )
         _mark_timing("delivery_complete")
         total_ms = (time.perf_counter() - started_at) * 1000
         _log_slow_delivery(total_ms)
@@ -1743,6 +1972,7 @@ async def _deliver_reply(
                 delivery,
                 transport_ok=False,
                 error="text_delivery_failed",
+                request_id=request_id,
             )
             outcome = "text_edit_failed"
             logger.warning("Could not edit Telegram text reply after retries", exc_info=True)
@@ -1750,7 +1980,7 @@ async def _deliver_reply(
             total_ms = (time.perf_counter() - started_at) * 1000
             _log_slow_delivery(total_ms)
             return
-        _record_telegram_delivery_receipt(message, delivery, transport_ok=True)
+        _record_telegram_delivery_receipt(message, delivery, transport_ok=True, request_id=request_id)
         _mark_timing("delivery_complete")
         total_ms = (time.perf_counter() - started_at) * 1000
         _log_slow_delivery(total_ms)
@@ -1965,7 +2195,7 @@ def _planner_summary_reply_should_be_suppressed(
     )
     if not has_matching_status_card:
         has_matching_status_card = any(
-            key_chat == chat_id and "❖ PLANNER" in str(status_text or "")
+            key_chat == chat_id and "PLANNER" in str(status_text or "")
             for (key_chat, _key_group), status_text in status_texts.items()
         )
     return has_matching_status_card
@@ -2024,7 +2254,7 @@ async def _deliver_telegram_planner_summary_card(
     )
     if not rendered_status:
         return False
-    await _send_or_edit_telegram_task_status_message(
+    delivered = await _send_or_edit_telegram_task_status_message(
         bot_token,
         status_messages if status_messages is not None else {},
         chat_id=chat_id,
@@ -2036,7 +2266,7 @@ async def _deliver_telegram_planner_summary_card(
         status_locks=status_locks,
         typing_tasks=typing_tasks,
     )
-    return True
+    return delivered
 
 
 def _should_live_stream_telegram_activity(
@@ -2377,7 +2607,11 @@ async def _send_operator_telegram_message(
     try:
         from telegram import Bot  # type: ignore[import]
 
-        delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
+        delivery = prepare_reply_for_platform_delivery(
+            text,
+            principal_id=principal_id,
+            max_attachment_bytes=telegram_attachment_upload_limit_bytes(),
+        )
         sent_message_id = None
         async with build_telegram_bot(Bot, bot_token) as bot:
             if delivery.attachments:
@@ -2762,7 +2996,8 @@ def _call_handle_update_with_activity(
         timing_marks.append(f"{label}:{round((now - timing_last_at) * 1000, 1)}ms")
         timing_last_at = now
 
-    parameters = inspect.signature(service.handle_update).parameters
+    handle_update = getattr(service, "handle_update_response", None) or service.handle_update
+    parameters = inspect.signature(handle_update).parameters
     if "activity_callback" in parameters:
         _mark_timing("handle_update_activity_enabled")
         kwargs = {
@@ -2779,10 +3014,10 @@ def _call_handle_update_with_activity(
             kwargs["turn_dispatch_decision"] = turn_dispatch_decision
         if "cancellation_checker" in parameters:
             kwargs["cancellation_checker"] = cancellation_checker
-        result = service.handle_update(update, **kwargs)
+        result = handle_update(update, **kwargs)
     else:
         _mark_timing("handle_update_plain")
-        result = service.handle_update(update)
+        result = handle_update(update)
     _mark_timing("handle_update_done")
     total_ms = (time.perf_counter() - started_at) * 1000
     if total_ms >= _float_env_ms(_NULLION_TELEGRAM_FLOW_SLOW_LOG_MS, default=1200.0):
@@ -2809,6 +3044,7 @@ async def _send_callback_follow_up(
         visible_reply or "",
         principal_id=principal_id,
         allow_attachments=allow_attachments,
+        max_attachment_bytes=telegram_attachment_upload_limit_bytes(),
     )
     caption = delivery.text
     attachment_paths = delivery.attachments
@@ -2901,6 +3137,72 @@ async def _telegram_get_file(file_ref, context):
     return None
 
 
+def _telegram_attachment_exception_status(exc: Exception) -> tuple[str, str, bool]:
+    detail = str(exc or "").strip() or exc.__class__.__name__
+    lower_detail = detail.lower()
+    class_name = exc.__class__.__name__.lower()
+    if "file is too big" in lower_detail:
+        return "file_too_large", detail, True
+    if class_name == "badrequest":
+        return "download_rejected", detail, True
+    return "download_failed", detail, False
+
+
+def _telegram_attachment_file_size(file_ref: object) -> str:
+    for attr in ("file_size", "fileSize"):
+        value = getattr(file_ref, attr, None)
+        if isinstance(value, int) and value >= 0:
+            return str(value)
+    return ""
+
+
+def _telegram_unavailable_attachment_reply(attachments: list[dict[str, str]]) -> str | None:
+    if not attachments or normalize_chat_attachments(attachments):
+        return None
+    permanent_failures = [
+        attachment
+        for attachment in attachments
+        if str(attachment.get("error") or "") in {"file_too_large", "download_rejected"}
+    ]
+    if not permanent_failures:
+        return None
+    lines = [
+        "Telegram would not provide this attachment to the bot, so Nullion cannot inspect the file contents.",
+        "",
+    ]
+    for attachment in permanent_failures:
+        lines.append(f"- File: {attachment.get('name') or 'attachment'}")
+        if attachment.get("bytes"):
+            lines.append(f"- Size: {attachment['bytes']} bytes")
+        lines.append(f"- Reason: {attachment.get('detail') or attachment.get('error') or 'download rejected'}")
+    if any(str(attachment.get("error") or "") == "file_too_large" for attachment in permanent_failures):
+        lines.append(f"- Hosted Telegram Bot API download limit: {_TELEGRAM_HOSTED_BOT_API_GET_FILE_LIMIT_LABEL}")
+    lines.extend(
+        [
+            "",
+            "This Nullion Telegram runtime needs a local Telegram Bot API server for files this large. "
+            "Otherwise, send a smaller file, split the archive, or share the file through storage that Nullion can access.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _telegram_message_has_attachment_candidate(message: object) -> bool:
+    if message is None:
+        return False
+    if list(getattr(message, "photo", []) or []):
+        return True
+    for attr in ("audio", "voice", "video"):
+        if getattr(message, attr, None) is not None:
+            return True
+    document = getattr(message, "document", None)
+    if document is None:
+        return False
+    mime_type = str(getattr(document, "mime_type", "") or "")
+    file_name = str(getattr(document, "file_name", "") or "")
+    return is_supported_chat_file(filename=file_name, media_type=mime_type)
+
+
 async def _download_telegram_attachments(message, context, *, settings: NullionSettings | None = None) -> list[dict[str, str]]:
     if message is None:
         return []
@@ -2956,19 +3258,46 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
         _mark_timing(f"file_attempt_start:{filename}")
         attempts = 0
         data = None
-        for attempt in range(1, _TELEGRAM_ATTACHMENT_DOWNLOAD_ATTEMPTS + 1):
-            attempts = attempt
-            try:
-                file_obj = await _telegram_get_file(file_ref, context)
-                data = await _telegram_file_bytes(file_obj)
-                break
-            except Exception:
-                if attempt >= _TELEGRAM_ATTACHMENT_DOWNLOAD_ATTEMPTS:
-                    logger.warning("Could not download Telegram attachment", exc_info=True)
-                else:
-                    await asyncio.sleep(0.25 * attempt)
+        failure_status = "download_failed"
+        failure_detail = "download_failed"
+        file_size = _telegram_attachment_file_size(file_ref)
+        file_size_int = int(file_size) if file_size.isdigit() else 0
+        if (
+            file_size_int > _TELEGRAM_HOSTED_BOT_API_GET_FILE_LIMIT_BYTES
+            and not telegram_uses_local_bot_api()
+        ):
+            failure_status = "file_too_large"
+            failure_detail = "File is too big for Telegram hosted Bot API download"
+            _mark_timing(f"file_download_skipped:{filename}:status={failure_status}")
+        else:
+            for attempt in range(1, _TELEGRAM_ATTACHMENT_DOWNLOAD_ATTEMPTS + 1):
+                attempts = attempt
+                try:
+                    file_obj = await _telegram_get_file(file_ref, context)
+                    data = await _telegram_file_bytes(file_obj)
+                    break
+                except Exception as exc:
+                    failure_status, failure_detail, permanent_failure = _telegram_attachment_exception_status(exc)
+                    if permanent_failure or attempt >= _TELEGRAM_ATTACHMENT_DOWNLOAD_ATTEMPTS:
+                        logger.warning("Could not download Telegram attachment", exc_info=True)
+                        break
+                    else:
+                        await asyncio.sleep(0.25 * attempt)
         if data is None:
-            _mark_timing(f"file_download_failed:{filename}:attempts={attempts}")
+            failed_attachment = {
+                "name": filename,
+                "path": "",
+                "media_type": media_type or "",
+                "source_kind": source_kind,
+                "download_status": failure_status,
+                "error": failure_status,
+                "detail": failure_detail,
+                "attempts": str(attempts),
+            }
+            if file_size:
+                failed_attachment["bytes"] = file_size
+            attachments.append(failed_attachment)
+            _mark_timing(f"file_download_failed:{filename}:status={failure_status}:attempts={attempts}")
             continue
         saved = save_messaging_attachment(
             filename=filename,
@@ -2981,15 +3310,27 @@ async def _download_telegram_attachments(message, context, *, settings: NullionS
             attachments.append(saved)
             _mark_timing(f"file_saved:{filename}")
         else:
+            attachments.append(
+                {
+                    "name": filename,
+                    "path": "",
+                    "media_type": media_type or "",
+                    "source_kind": source_kind,
+                    "download_status": "save_skipped",
+                    "error": "save_skipped",
+                    "bytes": str(len(data)),
+                }
+            )
             _mark_timing(f"file_save_skipped:{filename}")
     _mark_timing("attachment_scan_complete")
     total_ms = (time.perf_counter() - started_at) * 1000
     if total_ms >= _float_env_ms(_NULLION_TELEGRAM_FLOW_SLOW_LOG_MS, default=1200.0):
+        saved_count = sum(1 for attachment in attachments if str(attachment.get("path") or ""))
         logger.warning(
             "telegram attachment timing chat_id=%s candidate_count=%s saved_count=%s total_ms=%.1f phases=%s",
             str(chat_id or ""),
             len(candidates),
-            len(attachments),
+            saved_count,
             total_ms,
             ", ".join(timing_marks),
         )
@@ -3240,6 +3581,8 @@ def _approval_decision_emoji(display_title: str) -> str:
 
 def _approval_decision_subject(approval, detail: str) -> str:
     display = approval_display_from_request(approval)
+    if getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
+        return "delete action"
     title = display.title.lower()
     if display.is_web_request or _approval_is_web_request(display.label, detail):
         return "web access"
@@ -3264,6 +3607,13 @@ def _approval_decision_subject(approval, detail: str) -> str:
 
 def _approval_decision_target(approval, detail: str) -> str:
     display = approval_display_from_request(approval)
+    if getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
+        context = getattr(approval, "context", None)
+        if isinstance(context, dict):
+            target = str(context.get("target") or "").strip()
+            if target:
+                return target
+        return ""
     target_url = _approval_target_url(detail)
     if display.is_web_request and target_url:
         return _approval_target_host(target_url)
@@ -3279,10 +3629,29 @@ def _approval_decision_target(approval, detail: str) -> str:
     return detail.strip().rstrip(".")
 
 
+def _approval_decision_detail_suffix(detail: str) -> str:
+    formatted = format_approval_detail_markdown(detail).strip()
+    if not formatted or formatted == "Request details were not provided.":
+        return ""
+    return f"\n\n{formatted}"
+
+
 def _approval_decision_messages(approval, action: str) -> tuple[str, str]:
     display = approval_display_from_request(approval)
     detail = _approval_detail(display.label, display.detail, getattr(approval, "approval_id", ""))
     emoji = _approval_decision_emoji(display.title)
+    detail_suffix = _approval_decision_detail_suffix(detail)
+    multiplier = multiplier_for_limit_extension_action(action)
+    if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND and multiplier is not None:
+        return (
+            f"Doctor approved {multiplier}x tool budget",
+            f"✅ {emoji} Doctor approved {multiplier}x tool budget. Continuing...{detail_suffix}",
+        )
+    if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND and action in {"deny", "reject"}:
+        return (
+            "Denied Doctor continuation",
+            f"🚫 {emoji} Denied Doctor continuation. I'll stop here.{detail_suffix}",
+        )
     subject = _approval_decision_subject(approval, detail)
     target = _approval_decision_target(approval, detail)
     target_suffix = f" for {approval_inline_code(target)}" if target else ""
@@ -3290,20 +3659,20 @@ def _approval_decision_messages(approval, action: str) -> tuple[str, str]:
 
     if action == "allow_session":
         acknowledgement = "Approved web access"
-        reply = f"✅ {emoji} Approved all web domains for this run. Continuing..."
+        reply = f"✅ {emoji} Approved all web domains for this run. Continuing...{detail_suffix}"
     elif action == "always_allow":
         acknowledgement = f"Always allowed {subject}"
-        reply = f"✅ {emoji} Always allowed {subject}{target_suffix}. Continuing..."
+        reply = f"✅ {emoji} Always allowed {subject}{target_suffix}. Continuing...{detail_suffix}"
     elif action in {"allow_once", "approve"}:
         acknowledgement = f"Approved {subject}"
         once = " once" if action == "allow_once" else ""
-        reply = f"✅ {emoji} Approved {subject}{once}{target_colon}. Continuing..."
+        reply = f"✅ {emoji} Approved {subject}{once}{target_colon}. Continuing...{detail_suffix}"
     elif action in {"deny", "reject"}:
         acknowledgement = f"Denied {subject}"
-        reply = f"🚫 {emoji} Denied {subject}{target_colon}. I'll stop here."
+        reply = f"🚫 {emoji} Denied {subject}{target_colon}. I'll stop here.{detail_suffix}"
     else:
         acknowledgement = "Approved"
-        reply = f"✅ {emoji} Approved {subject}{target_colon}. Continuing..."
+        reply = f"✅ {emoji} Approved {subject}{target_colon}. Continuing...{detail_suffix}"
     return acknowledgement, reply
 
 
@@ -3354,6 +3723,29 @@ def _execute_decision_action(
                 "Approval expired",
                 "⏳ That approval is no longer active. Please rerun the request if you still want Nullion to continue.",
             )
+        if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
+            multiplier = multiplier_for_limit_extension_action(action)
+            if multiplier is None:
+                if action in {"deny", "reject"}:
+                    service.runtime.deny_approval_request(record_id, actor="operator")
+                    return _approval_decision_messages(approval, action)
+                raise ValueError(f"Unsupported approval action: {action}")
+            suspended_turn = service.runtime.store.get_suspended_turn(record_id)
+            if approval.status is ApprovalStatus.APPROVED and suspended_turn is None:
+                return (
+                    "Already handled",
+                    "✅ 🩺 Doctor already approved this tool budget. I won't run the request again.",
+                )
+            if suspended_turn is not None:
+                set_agent_turn_limit_resume_multiplier(suspended_turn, multiplier)
+                service.runtime.store.add_suspended_turn(suspended_turn)
+            approve_request_with_mode(
+                service.runtime,
+                record_id,
+                mode=limit_extension_mode_for_multiplier(multiplier),
+                source="Telegram",
+            )
+            return _approval_decision_messages(approval, action)
         if getattr(approval, "request_kind", None) == "boundary_policy":
             if action == "allow_session":
                 approve_request_with_mode(
@@ -3418,7 +3810,7 @@ def _execute_decision_action(
             status = str(getattr(record, "status", "") or "").strip().lower()
             if status != "pending":
                 if status == "accepted":
-                    return "Already accepted", "That Builder suggestion is already accepted."
+                    return _accepted_builder_proposal_callback_result(service.runtime, record)
                 if status == "rejected":
                     return "Already dismissed", "That Builder suggestion was already dismissed."
                 if status == "archived":
@@ -3589,6 +3981,7 @@ def _foreground_working_ack_text(
     *,
     chat_id: str | None,
     settings: NullionSettings,
+    dispatch_decision: TurnDispatchDecision | None = None,
 ) -> str | None:
     if text is None:
         return None
@@ -3601,6 +3994,9 @@ def _foreground_working_ack_text(
         return None
     if _local_chat_reply_body(prompt) is not None:
         return None
+    ack = _natural_overlap_ack(prompt, dispatch_decision=dispatch_decision)
+    if ack:
+        return ack
     return WORKING_ACK_TEXT
 
 
@@ -3895,10 +4291,11 @@ class ChatOperatorService:
         media_client = build_model_client_from_settings(settings)
         return media_client, AgentOrchestrator(model_client=media_client)
 
-    def handle_text_message(
+    def handle_text_request(
         self,
         *,
         text: str,
+        platform: str = "telegram",
         chat_id: str | None = None,
         reminder_chat_id: str | None = None,
         attachments: list[dict[str, str]] | None = None,
@@ -3911,7 +4308,7 @@ class ChatOperatorService:
         turn_dispatch_decision=None,
         cancellation_checker=None,
         reply_context: dict[str, object] | None = None,
-    ) -> str | None:
+    ) -> PlatformChatResponse:
         started_at = time.perf_counter()
         timing_marks: list[str] = []
         timing_last_at = started_at
@@ -3927,27 +4324,30 @@ class ChatOperatorService:
         model_client, agent_orchestrator = self._media_model_for_attachments(attachments)
         _mark_timing("media_model_selection")
         with reminder_chat_context(reminder_chat_id or chat_id):
-            reply = handle_chat_operator_message(
+            response = platform_chat.run_platform_chat_request(
                 self.runtime,
-                text,
-                chat_id=chat_id,
-                attachments=attachments,
-                settings=self.settings,
-                request_id=request_id,
-                message_id=message_id,
-                reply_context=reply_context,
-                model_client=model_client,
-                agent_orchestrator=agent_orchestrator,
-                service=self,
-                activity_callback=activity_callback,
-                text_delta_callback=text_delta_callback,
-                append_activity_trace=append_activity_trace,
-                allow_mini_agents=allow_mini_agents,
-                turn_dispatch_decision=turn_dispatch_decision,
-                cancellation_checker=cancellation_checker,
-                conversation_ingress_id=_ingress_dedupe_key(request_id=request_id, message_id=message_id),
+                PlatformChatRequest(
+                    platform=platform,
+                    text=text,
+                    chat_id=chat_id,
+                    attachments=attachments,
+                    settings=self.settings,
+                    request_id=request_id,
+                    message_id=message_id,
+                    reply_context=reply_context,
+                    model_client=model_client,
+                    agent_orchestrator=agent_orchestrator,
+                    service=self,
+                    activity_callback=activity_callback,
+                    text_delta_callback=text_delta_callback,
+                    append_activity_trace=append_activity_trace,
+                    allow_mini_agents=allow_mini_agents,
+                    turn_dispatch_decision=turn_dispatch_decision,
+                    cancellation_checker=cancellation_checker,
+                    conversation_ingress_id=_ingress_dedupe_key(request_id=request_id, message_id=message_id),
+                ),
             )
-        _mark_timing("handle_chat_operator_message")
+        _mark_timing("platform_chat_request")
 
         total_ms = (time.perf_counter() - started_at) * 1000
         if total_ms >= _float_env_ms(_NULLION_TELEGRAM_FLOW_SLOW_LOG_MS, default=1200.0):
@@ -3959,9 +4359,45 @@ class ChatOperatorService:
                 total_ms,
                 ", ".join(timing_marks),
             )
-        return reply
+        return response
 
-    def handle_update(
+    def handle_text_message(
+        self,
+        *,
+        text: str,
+        platform: str = "telegram",
+        chat_id: str | None = None,
+        reminder_chat_id: str | None = None,
+        attachments: list[dict[str, str]] | None = None,
+        request_id: str | None = None,
+        message_id: str | None = None,
+        activity_callback=None,
+        text_delta_callback=None,
+        append_activity_trace: bool = True,
+        allow_mini_agents: bool = False,
+        turn_dispatch_decision=None,
+        cancellation_checker=None,
+        reply_context: dict[str, object] | None = None,
+    ) -> str | None:
+        response = self.handle_text_request(
+            text=text,
+            platform=platform,
+            chat_id=chat_id,
+            reminder_chat_id=reminder_chat_id,
+            attachments=attachments,
+            request_id=request_id,
+            message_id=message_id,
+            activity_callback=activity_callback,
+            text_delta_callback=text_delta_callback,
+            append_activity_trace=append_activity_trace,
+            allow_mini_agents=allow_mini_agents,
+            turn_dispatch_decision=turn_dispatch_decision,
+            cancellation_checker=cancellation_checker,
+            reply_context=reply_context,
+        )
+        return response.text
+
+    def handle_update_response(
         self,
         update,
         *,
@@ -3972,7 +4408,7 @@ class ChatOperatorService:
         append_activity_trace: bool = True,
         turn_dispatch_decision=None,
         cancellation_checker=None,
-    ) -> str | None:
+    ) -> PlatformChatResponse | None:
         started_at = time.perf_counter()
         timing_marks: list[str] = []
         timing_last_at = started_at
@@ -4013,7 +4449,7 @@ class ChatOperatorService:
 
         _mark_timing("ids_ready")
 
-        result = self.handle_text_message(
+        result = self.handle_text_request(
             text=text,
             chat_id=chat_id,
             attachments=attachments,
@@ -4038,6 +4474,31 @@ class ChatOperatorService:
                 ", ".join(timing_marks),
             )
         return result
+
+    def handle_update(
+        self,
+        update,
+        *,
+        attachments: list[dict[str, str]] | None = None,
+        text_override: str | None = None,
+        activity_callback=None,
+        text_delta_callback=None,
+        append_activity_trace: bool = True,
+        turn_dispatch_decision=None,
+        cancellation_checker=None,
+    ) -> str | None:
+        response = self.handle_update_response(
+            update,
+            attachments=attachments,
+            text_override=text_override,
+            activity_callback=activity_callback,
+            text_delta_callback=text_delta_callback,
+            append_activity_trace=append_activity_trace,
+            turn_dispatch_decision=turn_dispatch_decision,
+            cancellation_checker=cancellation_checker,
+        )
+        return None if response is None else response.text
+
     async def deliver_due_reminders(self, *, bot, now: datetime | None = None) -> None:
         from nullion.reminder_delivery import deliver_due_reminders_once
 
@@ -4241,30 +4702,22 @@ class ChatOperatorService:
             turn_outcome = "unauthorized_ingress"
             _log_turn_timing(turn_outcome)
             return
-        if isinstance(text_for_ack, str) and (
-            not text_for_ack.startswith("/")
-            or not is_operator_command_text(text_for_ack)
-        ) and self.settings.telegram.chat_enabled:
-            _mark_timing("model_health_precheck_started")
-            health_reply = _chat_model_issue_reply(self.runtime, message=text_for_ack, model_client=self.model_client)
-            _mark_timing("model_health_precheck_complete")
-            if health_reply is not None:
-                if message is not None:
-                    await _deliver_reply(
-                        message,
-                        health_reply,
-                        request_id=request_id,
-                        phase="telegram_health_gate",
-                    )
-                turn_outcome = "model_health_gate"
-                _log_turn_timing(turn_outcome)
-                return
+        command_head = ""
+        if isinstance(text_for_ack, str):
+            command_head = text_for_ack.strip().split(maxsplit=1)[0].partition("@")[0].lower()
+        fast_operator_command = (
+            bool(command_head)
+            and command_head in _FAST_OPERATOR_COMMAND_HEADS
+            and is_operator_command_text(str(text_for_ack or ""))
+            and media_group_messages is None
+            and not _telegram_message_has_attachment_candidate(message)
+        )
         should_refresh_checkpoint = bool(
             text_for_ack is not None
             and (
                 is_stop_command_text(text_for_ack)
-                or str(text_for_ack).startswith("/")
-                or is_operator_command_text(str(text_for_ack))
+                or (str(text_for_ack).startswith("/") and not fast_operator_command)
+                or (is_operator_command_text(str(text_for_ack)) and not fast_operator_command)
             )
         )
         if should_refresh_checkpoint and _refresh_runtime_from_checkpoint(
@@ -4293,6 +4746,74 @@ class ChatOperatorService:
                     lambda: message.reply_text(stop_reply, do_quote=False)
                 )
             turn_outcome = "stop_command"
+            _log_turn_timing(turn_outcome)
+            return
+
+        if fast_operator_command:
+            conversation_id = None if chat_id_text is None else f"telegram:{chat_id_text}"
+            message_id = message_id_local or _telegram_message_id(message=message, chat_id=chat_id_text)
+            dedupe_key = _ingress_dedupe_key(request_id=request_id, message_id=message_id)
+            if dedupe_key is not None and dedupe_key in self._seen_ingress_ids:
+                turn_outcome = "duplicate_fast_command_inmemory"
+                logger.info("Ignored duplicate Telegram command ingress (chat_id=%s, ingress_id=%s)", chat_id_text, dedupe_key)
+                _log_turn_timing(turn_outcome)
+                return
+            if (
+                dedupe_key is not None
+                and conversation_id is not None
+                and self.runtime.store.has_conversation_ingress_id(conversation_id, dedupe_key)
+            ):
+                turn_outcome = "duplicate_fast_command_store"
+                logger.info("Ignored duplicate Telegram command ingress (chat_id=%s, ingress_id=%s)", chat_id_text, dedupe_key)
+                _log_turn_timing(turn_outcome)
+                return
+            if dedupe_key is not None:
+                self._seen_ingress_ids.add(dedupe_key)
+
+            update_message = getattr(update, "message", None) or getattr(update, "effective_message", None)
+            decision_card = None
+            phase = "telegram_fast_operator_command"
+
+            def _run_fast_command_fallback() -> str | None:
+                return self.handle_text_message(
+                    text=str(text_for_ack),
+                    chat_id=chat_id_text,
+                    request_id=request_id,
+                    message_id=message_id,
+                )
+
+            if command_head == "/help":
+                decision_card = _build_help_menu_card()
+                reply = decision_card.text if decision_card is not None else _run_fast_command_fallback()
+                phase = "telegram_help_card" if decision_card is not None else phase
+            elif command_head == "/models":
+                decision_card = _build_models_card(self.runtime)
+                reply = decision_card.text if decision_card is not None else _run_fast_command_fallback()
+                phase = "telegram_models_card" if decision_card is not None else phase
+            elif command_head == "/verbose" and len(str(text_for_ack).strip().split()) in {1, 2}:
+                parts = str(text_for_ack).strip().split()
+                if len(parts) == 1 or parts[1].lower() in {"status", "show"}:
+                    decision_card = _build_verbose_settings_card(self.runtime, chat_id=chat_id_text)
+                    reply = decision_card.text if decision_card is not None else _run_fast_command_fallback()
+                    phase = "telegram_verbose_card" if decision_card is not None else phase
+                else:
+                    reply = _run_fast_command_fallback()
+            else:
+                reply = _run_fast_command_fallback()
+
+            if dedupe_key is not None and conversation_id is not None:
+                self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
+            _mark_timing("fast_operator_command")
+            if message is not None:
+                await _deliver_reply(
+                    update_message,
+                    str(reply or ""),
+                    decision_card=decision_card,
+                    request_id=request_id,
+                    turn_id=dedupe_key or message_id or request_id,
+                    phase=phase,
+                )
+            turn_outcome = "fast_operator_command"
             _log_turn_timing(turn_outcome)
             return
 
@@ -4342,8 +4863,30 @@ class ChatOperatorService:
             _log_turn_timing(turn_outcome)
             return
 
+        unavailable_attachment_reply = _telegram_unavailable_attachment_reply(telegram_attachments)
+        if unavailable_attachment_reply is not None and message is not None:
+            if dedupe_key is not None:
+                self._seen_ingress_ids.add(dedupe_key)
+            if dedupe_key is not None and conversation_id is not None:
+                self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
+            _mark_timing("unavailable_attachment_reply")
+            await _deliver_reply(
+                message,
+                unavailable_attachment_reply,
+                request_id=request_id,
+                turn_id=dedupe_key or message_id or request_id,
+                phase="telegram_attachment_unavailable",
+            )
+            turn_outcome = "attachment_unavailable"
+            _log_turn_timing(turn_outcome)
+            return
+
         busy_ack = None
         busy_ack_sent = False
+        active_turn_followup_evidence = (
+            has_structured_turn_relationship_evidence(str(text_for_ack or ""), attachments=telegram_attachments)
+            or _telegram_active_turn_accepts_unstructured_followup(self.runtime, conversation_id)
+        )
 
         turn_registration = await self._turn_dispatch_tracker.register(
             conversation_id or f"telegram:{inflight_key}",
@@ -4351,6 +4894,7 @@ class ChatOperatorService:
             turn_id=dedupe_key or message_id or request_id,
             model_client=self.model_client,
             reply_context=reply_context,
+            active_turn_followup_evidence=active_turn_followup_evidence,
         )
         turn_registration_local = turn_registration
         _mark_timing("turn_registered")
@@ -4427,6 +4971,7 @@ class ChatOperatorService:
                 text_for_ack,
                 chat_id=chat_id_text,
                 settings=self.settings,
+                dispatch_decision=turn_registration.decision,
             )
             if working_ack is None:
                 return
@@ -4452,6 +4997,7 @@ class ChatOperatorService:
         _mark_timing("activity_streamer_registered")
 
         reply = None
+        reply_artifact_paths: tuple[str, ...] = ()
         decision_card = None
         _new_reminder_card = None
         _suggestion_markup = None
@@ -4495,8 +5041,6 @@ class ChatOperatorService:
                     if _help_card is not None:
                         if dedupe_key is not None and conversation_id is not None:
                             self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
-                            self.runtime.checkpoint()
-                            _cache_runtime_checkpoint_signature(self.runtime)
                         _mark_timing("help_card_delivery")
                         await _deliver_reply(
                             getattr(update, "message", None) or getattr(update, "effective_message", None),
@@ -4516,8 +5060,6 @@ class ChatOperatorService:
                         if _models_card is not None:
                             if dedupe_key is not None and conversation_id is not None:
                                 self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
-                                self.runtime.checkpoint()
-                                _cache_runtime_checkpoint_signature(self.runtime)
                             _mark_timing("models_card_delivery")
                             await _deliver_reply(
                                 getattr(update, "message", None) or getattr(update, "effective_message", None),
@@ -4537,8 +5079,6 @@ class ChatOperatorService:
                             if _verbose_card is not None:
                                 if dedupe_key is not None and conversation_id is not None:
                                     self.runtime.store.add_conversation_ingress_id(conversation_id, dedupe_key)
-                                    self.runtime.checkpoint()
-                                    _cache_runtime_checkpoint_signature(self.runtime)
                                 _mark_timing("verbose_card_delivery")
                                 await _deliver_reply(
                                     getattr(update, "message", None) or getattr(update, "effective_message", None),
@@ -4566,7 +5106,8 @@ class ChatOperatorService:
                                 "status": "running",
                                 "detail": "Building and running the plan",
                             })
-                        activity_streamer.emit({"id": "prepare", "label": "Preparing request", "status": "running"})
+                        else:
+                            activity_streamer.emit({"id": "prepare", "label": "Preparing request", "status": "running"})
                     _mark_timing("handler_dispatched")
                     # Keep the callback wired for planner turns too so typed
                     # planner/tool activity can still flow through the shared
@@ -4589,6 +5130,13 @@ class ChatOperatorService:
                         cancellation_checker=turn_registration.is_cancelled,
                     )
                     _mark_timing("handler_completed")
+                    if isinstance(reply, PlatformChatResponse):
+                        reply_artifact_paths = tuple(
+                            str(path)
+                            for path in reply.artifact_paths
+                            if str(path or "").strip()
+                        )
+                        reply = reply.text
                     # The chat handler may checkpoint the same in-memory runtime
                     # before returning. Cache that file signature here so the
                     # next Telegram update does not reload our own last save.
@@ -4658,7 +5206,7 @@ class ChatOperatorService:
                         _mark_runtime_checkpoint_signature_stale(self.runtime)
                     ingress_checkpoint_deferred = True
                 if handler_error is None:
-                    decision_card = _new_decision_card(self.runtime, decision_snapshot)
+                    decision_card = _new_decision_card(self.runtime, decision_snapshot, reply=reply)
                     if decision_card is None:
                         decision_card = _existing_pending_approval_card(self.runtime, reply)
                     # UX-16: detect newly-created reminders for a confirmation card.
@@ -4743,7 +5291,7 @@ class ChatOperatorService:
                     # Background status already delivered and confirmed: keep
                     # planner summary out of the primary reply channel.
                     suppress_primary_reply_delivery = True
-                if planner_running_ack and activity_streamer is None:
+                if (planner_running_ack or planner_card_delivered) and activity_streamer is None:
                     planner_activity_notice_text = "Activity\n→ Planner — Building and running the plan"
             if handler_error is None and not planner_status_requested and isinstance(reply, str):
                 latest_cron_event = _latest_chat_turn_for_reply(self.runtime, chat_id=chat_id_text, reply=reply)
@@ -4844,6 +5392,7 @@ class ChatOperatorService:
                     text_for_ack=text_for_ack,
                     reply=reply,
                     inbound_attachments=telegram_attachments,
+                    artifact_paths=reply_artifact_paths,
                     runtime=self.runtime,
                     conversation_id=conversation_id,
                     decision_card=decision_card,
@@ -4860,6 +5409,7 @@ class ChatOperatorService:
                     streaming_mode=delivery_plan.streaming_mode,
                     principal_id=principal_id,
                     delivery_contract=delivery_plan.delivery_contract,
+                    artifact_paths=reply_artifact_paths,
                     request_id=request_id,
                     turn_id=turn_registration.turn_id,
                     phase="telegram_primary",
@@ -4988,22 +5538,30 @@ class ChatOperatorService:
                     _run_typing_keepalive(message, runtime=self.runtime, text=suggestion_text)
                 )
                 try:
-                    from nullion.chat_operator import handle_chat_operator_message as _handle_msg
-                    suggestion_reply = await asyncio.to_thread(
-                        _handle_msg,
-                        self.runtime,
-                        suggestion_text,
+                    suggestion_response = await asyncio.to_thread(
+                        self.handle_text_request,
+                        text=suggestion_text,
                         chat_id=chat_id_text,
-                        model_client=self.model_client,
-                        agent_orchestrator=self.agent_orchestrator,
-                        service=self,
-                        settings=self.settings,
+                    )
+                    suggestion_reply = suggestion_response.text
+                    suggestion_artifact_paths = tuple(
+                        str(path)
+                        for path in suggestion_response.artifact_paths
+                        if str(path or "").strip()
                     )
                     if suggestion_reply:
-                        await _send_callback_follow_up(
+                        await _deliver_reply(
                             message,
                             suggestion_reply,
                             principal_id=_principal_id_for_telegram_message(message, self.settings),
+                            delivery_contract=delivery_contract_for_turn(
+                                suggestion_text,
+                                reply=suggestion_reply,
+                                artifact_paths=suggestion_artifact_paths,
+                                requires_attachment_delivery=bool(suggestion_artifact_paths),
+                            ),
+                            artifact_paths=suggestion_artifact_paths,
+                            phase="telegram_suggestion",
                         )
                 except Exception:
                     logger.exception(
@@ -5044,7 +5602,6 @@ class ChatOperatorService:
             # and surface the status as a callback alert instead of replacing chat text.
             skip_message_edit = kind == "proposal" and acknowledgement in {
                 "Expired",
-                "Already accepted",
                 "Already dismissed",
                 "Already archived",
                 "Already handled",
@@ -5058,7 +5615,22 @@ class ChatOperatorService:
             if message is None or skip_message_edit:
                 return
             await _deliver_callback_action_result(message, acknowledgement, reply)
-            should_resume_approval = kind == "approval" and action in {"approve", "allow_session", "allow_once", "always_allow"}
+            should_resume_approval = kind == "approval" and action in {
+                "approve",
+                "allow_session",
+                "allow_once",
+                "always_allow",
+                "extend_limit_2x",
+                "extend_limit_5x",
+                "extend_limit_10x",
+            }
+            if should_resume_approval:
+                approval = self.runtime.store.get_approval_request(record_id)
+                if (
+                    getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND
+                    and self.runtime.store.get_suspended_turn(record_id) is None
+                ):
+                    should_resume_approval = False
             if should_resume_approval:
                 approval = self.runtime.store.get_approval_request(record_id)
                 resume_delivery_channel = _resume_delivery_channel_for_approval(self.runtime, approval)
@@ -5106,21 +5678,32 @@ class ChatOperatorService:
                                     new_card.text,
                                     decision_card=new_card,
                                     principal_id=new_approval.requested_by,
+                                    quote_reply=False,
                                 )
                             else:
-                                await _send_callback_follow_up(
+                                await _deliver_reply(
                                     message,
                                     "Approval required. Open /approvals to continue.",
                                     principal_id=resumed_principal_id,
+                                    phase="telegram_callback_approval_required",
+                                    quote_reply=False,
                                 )
                         else:
-                            await _send_callback_follow_up(
+                            await _deliver_reply(
                                 message,
                                 "Approval required. Open /approvals to continue.",
                                 principal_id=resumed_principal_id,
+                                phase="telegram_callback_approval_required",
+                                quote_reply=False,
                             )
                     elif resume_delivery_channel == "telegram":
-                        await _send_callback_follow_up(message, resumed_reply, principal_id=resumed_principal_id)
+                        await _deliver_reply(
+                            message,
+                            resumed_reply,
+                            principal_id=resumed_principal_id,
+                            phase="telegram_callback_resume",
+                            quote_reply=False,
+                        )
                     else:
                         logger.info(
                             "Skipped Telegram resumed reply for approval_id=%s because origin channel is %s",
@@ -5136,10 +5719,12 @@ class ChatOperatorService:
                         chat_id_text,
                     )
                     if resume_delivery_channel == "telegram":
-                        await _send_callback_follow_up(
+                        await _deliver_reply(
                             message,
                             _approval_resume_fallback_reply(approval, reply),
                             principal_id=resumed_principal_id,
+                            phase="telegram_callback_resume_empty",
+                            quote_reply=False,
                         )
         finally:
             await _stop_typing_keepalive(typing_keepalive_task)
@@ -5220,6 +5805,12 @@ class ChatOperatorService:
                     include_activity = activity_trace_enabled_for_chat(_service_ref.runtime, chat_id=chat_id)
                     if not _telegram_allows_status_streaming(_service_ref.runtime, chat_id=chat_id):
                         return False
+                    if not should_deliver_task_status(
+                        status_kind=status_kind,
+                        planner_feed_enabled=True,
+                        include_activity=include_activity,
+                    ):
+                        return True
                     update = prepare_platform_task_status_update(
                         target_id=chat_id,
                         group_id=group_id,
@@ -5235,8 +5826,8 @@ class ChatOperatorService:
                         return False
                     if not update.rendered_text:
                         return True
-                    async def _deliver_status(use_loop_bound_state: bool) -> None:
-                        await _send_or_edit_telegram_task_status_message(
+                    async def _deliver_status(use_loop_bound_state: bool) -> bool:
+                        return await _send_or_edit_telegram_task_status_message(
                             bot_token,
                             _status_messages,
                             chat_id=update.target_id,
@@ -5249,9 +5840,16 @@ class ChatOperatorService:
                             typing_tasks=_status_typing_tasks if use_loop_bound_state else None,
                         )
 
+                    is_terminal_status = bool(kwargs.get("terminal"))
+                    # A task-summary card owns the visible planner surface. Do
+                    # not report it as delivered until Telegram has accepted
+                    # the send/edit; otherwise the foreground fallback can be
+                    # suppressed while the user only sees the generic Activity
+                    # card.
+                    confirm_delivery = is_terminal_status or status_kind == "task_summary"
                     return _schedule_or_run_telegram_status_delivery(
                         _deliver_status,
-                        confirm=status_kind == "task_summary",
+                        confirm=confirm_delivery,
                     )
                 # Final results and artifacts are awaited so delivery failures
                 # surface to the result aggregator instead of disappearing.

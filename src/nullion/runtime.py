@@ -140,6 +140,7 @@ from nullion.intent_router import (
 from nullion.runtime_store import RuntimeStore
 from nullion.runtime_persistence import (
     build_runtime_store_payload,
+    checkpoint_runtime_conversation_events,
     list_runtime_store_backups as _list_runtime_store_backups,
     load_runtime_store,
     render_runtime_store_payload_json,
@@ -187,7 +188,7 @@ from nullion.skill_planner import (
     transition_skill_execution_plan_for_progress,
     transition_skill_execution_plan_for_step_completion as transition_skill_execution_plan_for_step_completion_read_model,
 )
-from nullion.skills import SkillRecord, SkillRevision, SkillWorkflowSignal
+from nullion.skills import SkillRecord, SkillRevision, SkillWorkflowSignal, ensure_skill_write_delete_consent_step
 from nullion.system_context import (
     CORE_FALLBACK_TOOL_NAMES,
     build_system_context_snapshot as build_system_context_snapshot_read_model,
@@ -342,6 +343,9 @@ class PersistentRuntime:
                 merge_existing,
             )
         return saved_path
+
+    def checkpoint_conversation_events(self, *, limit: int = 128) -> Path:
+        return checkpoint_runtime_conversation_events(self.store, self.checkpoint_path, limit=limit)
 
     def list_backups(self) -> list[dict[str, object]]:
         return list_runtime_store_backups(self.checkpoint_path)
@@ -1077,6 +1081,7 @@ class PersistentRuntime:
         stale_after: timedelta | None = None,
         live_run_ids: Iterable[str] | None = None,
         live_group_ids: Iterable[str] | None = None,
+        owned_conversation_prefixes: Iterable[str] | None = None,
     ) -> list[MiniAgentRun]:
         event_count = len(getattr(self.store, "events", []) or [])
         doctor_action_count = len(getattr(self.store, "doctor_actions", []) or [])
@@ -1086,6 +1091,7 @@ class PersistentRuntime:
             stale_after=stale_after,
             live_run_ids=live_run_ids,
             live_group_ids=live_group_ids,
+            owned_conversation_prefixes=owned_conversation_prefixes,
         )
         changed = (
             runs
@@ -1137,12 +1143,19 @@ def start_mini_agent_run(
     branch_id: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> MiniAgentRun:
+    run_metadata = dict(metadata or {})
+    if conversation_id and not run_metadata.get("conversation_id"):
+        run_metadata["conversation_id"] = str(conversation_id)
+    if turn_id and not run_metadata.get("turn_id"):
+        run_metadata["turn_id"] = str(turn_id)
+    if branch_id and not run_metadata.get("branch_id"):
+        run_metadata["branch_id"] = str(branch_id)
     run = create_mini_agent_run(
         run_id=run_id,
         capsule_id=capsule_id,
         mini_agent_type=mini_agent_type,
         created_at=created_at,
-        metadata=metadata,
+        metadata=run_metadata,
     )
     store.add_mini_agent_run(run)
 
@@ -1279,6 +1292,7 @@ def reconcile_stale_mini_agent_runs(
     stale_after: timedelta | None = None,
     live_run_ids: Iterable[str] | None = None,
     live_group_ids: Iterable[str] | None = None,
+    owned_conversation_prefixes: Iterable[str] | None = None,
 ) -> list[MiniAgentRun]:
     """Fail orphaned active Mini-Agent records that can no longer make progress.
 
@@ -1300,6 +1314,11 @@ def reconcile_stale_mini_agent_runs(
     live_group_id_set: set[str] = set()
     if live_group_ids is not None:
         live_group_id_set = {str(group_id) for group_id in live_group_ids if str(group_id)}
+    owner_prefixes = tuple(
+        str(prefix).strip()
+        for prefix in (owned_conversation_prefixes or ())
+        if str(prefix).strip()
+    )
     stale_after = stale_after or mini_agent_stale_after()
     repaired: list[MiniAgentRun] = []
     active_statuses = {
@@ -1312,6 +1331,8 @@ def reconcile_stale_mini_agent_runs(
         if run.status not in active_statuses or run.run_id in live_ids:
             continue
         if run.capsule_id in live_group_id_set:
+            continue
+        if owner_prefixes and not _mini_agent_run_matches_conversation_prefix(run, owner_prefixes):
             continue
         created_at = run.created_at
         if created_at.tzinfo is None:
@@ -1344,6 +1365,13 @@ def reconcile_stale_mini_agent_runs(
                 logger.debug("Unable to record Mini-Agent reconciliation failure", exc_info=True)
 
     return repaired
+
+
+def _mini_agent_run_matches_conversation_prefix(run: MiniAgentRun, prefixes: tuple[str, ...]) -> bool:
+    metadata = getattr(run, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    conversation_id = str(metadata.get("conversation_id") or "").strip()
+    return bool(conversation_id) and any(conversation_id.startswith(prefix) for prefix in prefixes)
 
 
 def _stale_mini_agent_repair_summary(run: MiniAgentRun, *, age: timedelta) -> str:
@@ -2095,8 +2123,12 @@ def _active_boundary_rules_for_approval(
                 revoked_at=permit.revoked_at,
                 reason="boundary_permit",
             )
-        )
+    )
     return rules
+
+
+def _approval_status_value(status: object) -> str:
+    return str(getattr(status, "value", status) or "").strip().lower()
 
 
 def _pending_approval_already_covered(
@@ -2105,7 +2137,7 @@ def _pending_approval_already_covered(
     *,
     now: datetime,
 ) -> bool:
-    if approval.status is not ApprovalStatus.PENDING:
+    if _approval_status_value(getattr(approval, "status", None)) != ApprovalStatus.PENDING.value:
         return False
     permissions = set(_approval_permission_candidates(approval))
     if permissions:
@@ -2936,9 +2968,15 @@ def _resolve_conversation_turn_from_ingress_id(
     for event in reversed(store.list_conversation_events(conversation_id)):
         if not isinstance(event, dict):
             continue
-        if event.get("event_type") not in {"conversation.turn_recorded", "conversation.message_received"}:
+        if event.get("event_type") not in {
+            "conversation.turn_recorded",
+            "conversation.message_received",
+            "conversation.chat_turn",
+        }:
             continue
         if ingress_id not in {event.get("request_id"), event.get("message_id"), event.get("turn_id")}:
+            continue
+        if event.get("conversation_id") != conversation_id:
             continue
         event_turn_id = event.get("turn_id")
         if not isinstance(event_turn_id, str) or not event_turn_id:
@@ -2946,6 +2984,39 @@ def _resolve_conversation_turn_from_ingress_id(
         turn = store.get_conversation_turn(event_turn_id)
         if turn is not None and turn.conversation_id == conversation_id:
             return turn
+        branch_id = event.get("branch_id")
+        if not isinstance(branch_id, str) or not branch_id:
+            continue
+        created_at = event.get("created_at")
+        if isinstance(created_at, str) and created_at.strip():
+            try:
+                parsed_created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if parsed_created_at.tzinfo is None:
+                    parsed_created_at = parsed_created_at.replace(tzinfo=UTC)
+            except ValueError:
+                parsed_created_at = datetime.now(UTC)
+        else:
+            parsed_created_at = datetime.now(UTC)
+        try:
+            disposition = ConversationTurnDisposition(str(event.get("disposition") or "independent"))
+        except ValueError:
+            disposition = ConversationTurnDisposition.INDEPENDENT
+        parent_turn_id = event.get("parent_turn_id")
+        return ConversationTurn(
+            turn_id=event_turn_id,
+            conversation_id=conversation_id,
+            branch_id=branch_id,
+            parent_turn_id=parent_turn_id if isinstance(parent_turn_id, str) and parent_turn_id else None,
+            disposition=disposition,
+            user_message=str(event.get("user_message") or ""),
+            status=str(event.get("status") or "accepted"),
+            created_at=parsed_created_at,
+            disposition_reason=(
+                str(event.get("disposition_reason"))
+                if event.get("disposition_reason") is not None
+                else None
+            ),
+        )
     return None
 
 
@@ -2965,7 +3036,12 @@ def _resolve_dispatch_parent_turn(
             continue
         branch = store.get_conversation_branch(turn.branch_id)
         if branch is None:
-            continue
+            branch = ConversationBranch(
+                branch_id=turn.branch_id,
+                conversation_id=conversation_id,
+                status=ConversationBranchStatus.ACTIVE,
+                created_from_turn_id=turn.turn_id,
+            )
         return turn, branch
     return None, None
 
@@ -3556,6 +3632,9 @@ def process_conversation_message(
     if dispatch_linked:
         disposition = normalized_dispatch_disposition or ConversationTurnDisposition.INDEPENDENT
         disposition_reason = _dispatch_reason_text(dispatch_reason, disposition)
+    elif normalized_dispatch_disposition is ConversationTurnDisposition.INDEPENDENT and str(dispatch_reason or "").strip():
+        disposition = ConversationTurnDisposition.INDEPENDENT
+        disposition_reason = _dispatch_reason_text(dispatch_reason, disposition)
     else:
         disposition_decision = classify_turn_disposition_with_reason(
             text=user_message,
@@ -3621,6 +3700,7 @@ def process_conversation_message(
 
         branch_to_supersede = context_branch
         if disposition in {ConversationTurnDisposition.INTERRUPT, ConversationTurnDisposition.REVISE} and branch_to_supersede is not None:
+            parent_turn_id = context_turn_id
             superseded = replace(
                 branch_to_supersede,
                 status=ConversationBranchStatus.SUPERSEDED,
@@ -4370,7 +4450,10 @@ def _merge_legacy_runtime_dict(store: RuntimeStore, legacy_store: RuntimeStore, 
             continue
         if attr == "approval_requests":
             existing = current[key]
-            if existing.status is ApprovalStatus.PENDING and value.status is not ApprovalStatus.PENDING:
+            if (
+                _approval_status_value(getattr(existing, "status", None)) == ApprovalStatus.PENDING.value
+                and _approval_status_value(getattr(value, "status", None)) != ApprovalStatus.PENDING.value
+            ):
                 current[key] = deepcopy(value)
                 imported += 1
             elif existing.decided_at is None and value.decided_at is not None:
@@ -6045,6 +6128,8 @@ def create_skill_result(
     if not normalized_steps:
         raise ValueError("at least one step is required")
     normalized_tags = _normalize_skill_tags(tags)
+    if normalized_actor in AUTO_SKILL_ACTORS:
+        normalized_steps = ensure_skill_write_delete_consent_step(normalized_steps)
     duplicate = _find_duplicate_skill(
         store,
         title=normalized_title,
@@ -6128,7 +6213,7 @@ def accept_builder_skill_proposal_result(
         raise ValueError("proposal must be a skill proposal")
     resolved_title = title or proposal.suggested_skill_title or proposal.title
     resolved_trigger = trigger or proposal.suggested_trigger
-    resolved_steps = steps or list(proposal.suggested_steps)
+    resolved_steps = ensure_skill_write_delete_consent_step(steps or list(proposal.suggested_steps))
     resolved_tags = tags or list(proposal.suggested_tags)
     if not resolved_trigger or not resolved_steps:
         raise ValueError("proposal is missing draft skill details")

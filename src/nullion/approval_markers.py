@@ -11,6 +11,10 @@ from dataclasses import dataclass
 
 TOOL_APPROVAL_REQUESTED_MARKER = "Tool approval requested"
 APPROVAL_REQUIRED_CONTINUE_MARKER = "Approval required before Nullion can continue."
+ORPHAN_APPROVAL_REQUEST_REPLY = (
+    "I couldn't create a usable approval request for that action. "
+    "No changes were made."
+)
 
 
 @dataclass(frozen=True, slots=True)

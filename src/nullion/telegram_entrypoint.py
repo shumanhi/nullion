@@ -19,7 +19,11 @@ from typing import Callable
 from nullion.config import ProviderBinding, load_env_file_into_environ, load_settings
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.artifacts import ensure_artifact_root
-from nullion.messaging_adapters import messaging_file_allowed_roots, retry_messaging_delivery_operation
+from nullion.messaging_adapters import (
+    messaging_file_allowed_roots,
+    principal_id_for_messaging_identity,
+    retry_messaging_delivery_operation,
+)
 from nullion.providers import resolve_plugin_provider_kwargs
 from nullion.runtime import bootstrap_persistent_runtime
 from nullion.runtime_persistence import (
@@ -638,18 +642,6 @@ def _build_runtime_service_from_settings(
 
         return cron_delivery_target(job, channel, settings=_current_service_settings())
 
-    def _cron_result_block_reason(result: dict, text: str, artifacts: object) -> str | None:
-        from nullion.cron_delivery import cron_structured_result_block_reason
-
-        if result.get("reached_iteration_limit"):
-            return "cron_run_reached_iteration_limit"
-        if result.get("suspended_for_approval"):
-            return "waiting_for_approval"
-        if result.get("raw_tool_payload_blocked"):
-            return "cron_run_raw_tool_payload"
-        _ = text
-        return cron_structured_result_block_reason(result, artifacts, text=text)
-
     def _notify_cron_approval_required(job, channel: str, target: str, result: dict) -> None:
         _ = (job, channel, target)
         approval_id = str((result or {}).get("approval_id") or "").strip()
@@ -816,7 +808,7 @@ def _build_runtime_service_from_settings(
                         except Exception:
                             logger.debug("Could not clear manual cron status card state", exc_info=True)
 
-            return _schedule_or_run_telegram_status_delivery(_deliver_status, confirm=terminal)
+            return _schedule_or_run_telegram_status_delivery(_deliver_status, confirm=True)
         except Exception:
             logger.debug("Could not send manual cron status update for %s", getattr(job, "id", ""), exc_info=True)
             return False
@@ -850,6 +842,7 @@ def _build_runtime_service_from_settings(
     def _cron_tool_runner(job, invocation=None):
         from nullion.cron_delivery import (
             CronRunDeliveryCallbacks,
+            cron_delivery_block_reason,
             cron_conversation_id,
             manual_cron_silent_delivery_text,
             run_cron_delivery_workflow,
@@ -916,6 +909,7 @@ def _build_runtime_service_from_settings(
 
         channel = _manual_effective_channel(job)
         target = _manual_delivery_target(job, channel)
+        origin_conversation_id = cron_conversation_id(job, channel, target)
 
         return start_manual_cron_background_delivery(
             job,
@@ -930,7 +924,7 @@ def _build_runtime_service_from_settings(
                     cancellation_checker=cancellation_checker,
                 ),
                 record_event=_record_cron_delivery_event,
-                block_reason=_cron_result_block_reason,
+                block_reason=cron_delivery_block_reason,
                 save_web_delivery=_save_cron_web_delivery,
                 send_platform_delivery=lambda cron_job, channel, target, text: _send_cron_platform_delivery(
                     cron_job,
@@ -945,10 +939,11 @@ def _build_runtime_service_from_settings(
                 notify_approval_required=_notify_cron_approval_required,
                 record_chat_turn=_record_cron_delivery_chat_turn,
             ),
-            origin_conversation_id=cron_conversation_id(job, channel, target),
+            origin_conversation_id=origin_conversation_id,
             thread_name_prefix="nullion-telegram-manual-cron",
             before_run=_start_manual_cron_monitor,
             workflow_runner=run_cron_delivery_workflow,
+            background_agent_conversation_id=origin_conversation_id,
             status_update_callback=lambda group_id, status_text, terminal: _send_manual_cron_status_update(
                 job,
                 group_id,
@@ -958,6 +953,7 @@ def _build_runtime_service_from_settings(
                 target=target,
             ),
             status_update_interval_seconds=6.0,
+            background_start_grace_seconds=0.0,
         )
 
     register_cron_tools(
@@ -969,11 +965,19 @@ def _build_runtime_service_from_settings(
     try:
         from nullion.startup_warmup import schedule_chat_startup_warmup
 
+        warm_principal_ids: list[str] = ["telegram_chat"]
+        if _operator_chat_id:
+            try:
+                warm_principal_ids.append(principal_id_for_messaging_identity("telegram", _operator_chat_id, settings))
+            except Exception:
+                logger.debug("Could not resolve Telegram startup warmup principal", exc_info=True)
+
         schedule_chat_startup_warmup(
             runtime,
             registry=active_tool_registry,
             settings=settings,
             surface="telegram",
+            principal_ids=tuple(dict.fromkeys(warm_principal_ids)),
         )
     except Exception:
         logger.debug("Could not schedule Telegram chat startup warmup", exc_info=True)
@@ -1032,6 +1036,7 @@ async def _send_operator_telegram_delivery(
     reply_markup=None,
     suppress_link_preview: bool = False,
     parse_mode: str | None = None,
+    request_id: str | None = None,
 ) -> bool:
     """Send a Telegram delivery, uploading any MEDIA artifact directives."""
     delivery = None
@@ -1043,13 +1048,19 @@ async def _send_operator_telegram_delivery(
             delivery_receipt_transport_succeeded,
             prepare_reply_for_platform_delivery,
             record_platform_delivery_receipt,
+            telegram_attachment_upload_limit_bytes,
         )
         from nullion.telegram_formatting import format_telegram_text
 
-        delivery = prepare_reply_for_platform_delivery(text, principal_id=principal_id)
+        delivery = prepare_reply_for_platform_delivery(
+            text,
+            principal_id=principal_id,
+            max_attachment_bytes=telegram_attachment_upload_limit_bytes(),
+        )
         async with build_telegram_bot(Bot, bot_token) as bot:
             if delivery.attachments:
                 caption = delivery.text
+                sent_message_id = None
                 for index, attachment_path in enumerate(delivery.attachments):
                     caption_text = caption[:1024] if caption and index == 0 else None
                     caption_kwargs = {}
@@ -1070,12 +1081,16 @@ async def _send_operator_telegram_delivery(
                                 **caption_kwargs,
                             )
 
-                    await retry_messaging_delivery_operation(send_document)
+                    sent_message = await retry_messaging_delivery_operation(send_document)
+                    if sent_message_id is None:
+                        sent_message_id = getattr(sent_message, "message_id", None)
                 receipt = build_platform_delivery_receipt(
                     channel="telegram",
                     target_id=str(chat_id),
                     delivery=delivery,
                     transport_ok=True,
+                    request_id=request_id,
+                    message_id=None if sent_message_id is None else str(sent_message_id),
                 )
                 record_platform_delivery_receipt(receipt)
                 return delivery_receipt_transport_succeeded(receipt)
@@ -1090,14 +1105,17 @@ async def _send_operator_telegram_delivery(
             else:
                 message_text, formatting_kwargs = format_telegram_text(delivery.text or "")
                 message_kwargs.update(formatting_kwargs)
-            await retry_messaging_delivery_operation(
+            sent_message = await retry_messaging_delivery_operation(
                 lambda: bot.send_message(chat_id, message_text, **message_kwargs)
             )
+            sent_message_id = getattr(sent_message, "message_id", None)
             receipt = build_platform_delivery_receipt(
                 channel="telegram",
                 target_id=str(chat_id),
                 delivery=delivery,
                 transport_ok=True,
+                request_id=request_id,
+                message_id=None if sent_message_id is None else str(sent_message_id),
             )
             record_platform_delivery_receipt(receipt)
             return delivery_receipt_transport_succeeded(receipt)
@@ -1113,6 +1131,7 @@ async def _send_operator_telegram_delivery(
                         target_id=str(chat_id),
                         delivery=delivery,
                         transport_ok=False,
+                        request_id=request_id,
                         error="platform_delivery_failed",
                     )
                 )

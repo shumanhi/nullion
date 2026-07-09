@@ -160,6 +160,14 @@ print_setup_overview() {
 # ── helpers ───────────────────────────────────────────────────────────────────
 command_exists() { command -v "$1" &>/dev/null; }
 
+brew_install() {
+    if [[ "${NULLION_INSTALLER_SMOKE:-false}" == "true" ]]; then
+        HOMEBREW_NO_ASK=1 brew install "$@"
+    else
+        brew install "$@"
+    fi
+}
+
 xml_escape() {
     local value="$1"
     value="${value//&/&amp;}"
@@ -907,7 +915,7 @@ ensure_whisper_cpp_runtime() {
     if ((${#missing_packages[@]} > 0)); then
         if [[ "$PLATFORM" == "macos" ]] && command_exists brew; then
             print_info "Installing ${missing_packages[*]} via Homebrew..."
-            brew install "${missing_packages[@]}"
+            brew_install "${missing_packages[@]}"
         else
             print_info "Install ${missing_packages[*]} for default audio transcription."
         fi
@@ -965,7 +973,7 @@ install_default_local_media_runtime() {
 
     if ((${#brew_packages[@]} > 0)); then
         print_info "Installing local media packages via Homebrew: ${brew_packages[*]}"
-        if brew install "${brew_packages[@]}"; then
+        if brew_install "${brew_packages[@]}"; then
             installed_any=true
         fi
     fi
@@ -992,7 +1000,7 @@ ensure_git() {
     print_info "git not found. Attempting to install..."
     if [[ "$PLATFORM" == "macos" ]]; then
         if command_exists brew; then
-            brew install git
+            brew_install git
         else
             print_err "git is required to clone Nullion."
             print_info "Install Git or Homebrew, then re-run this script."
@@ -1096,7 +1104,7 @@ if [[ -z "$PYTHON" ]]; then
     if [[ "$PLATFORM" == "macos" ]]; then
         if command_exists brew; then
             print_info "Installing Python 3.12 via Homebrew..."
-            brew install python@3.12
+            brew_install python@3.12
             PYTHON="python3.12"
             print_ok "Python 3.12 installed."
         else
@@ -1965,7 +1973,7 @@ if [[ "$EMAIL_CALENDAR_ENABLED" == "false" && "$CUSTOM_EMAIL_API_ENABLED" == "fa
                 print_info "Himalaya is not installed on this machine."
                 if [[ "$PLATFORM" == "macos" ]] && command_exists brew; then
                     if confirm "Install Himalaya now with Homebrew?"; then
-                        brew install himalaya
+                        brew_install himalaya
                         print_ok "Himalaya installed."
                     else
                         print_info "Skipped Himalaya install. Install it later with: brew install himalaya"

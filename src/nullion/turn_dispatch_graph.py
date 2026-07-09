@@ -17,6 +17,7 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from .conversation_runtime import ConversationTurnDisposition
+from .turn_relationship_evidence import has_structured_turn_relationship_evidence
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ class TurnDispatchDecision:
     disposition: ConversationTurnDisposition = ConversationTurnDisposition.INDEPENDENT
     reason: str = "default_independent"
     target_active_turn_index: int | None = None
+    work_ack_recommended: bool = False
 
     @property
     def should_wait(self) -> bool:
@@ -52,12 +54,14 @@ class _StructuredTurnDisposition:
     disposition: ConversationTurnDisposition
     reason: str
     target_active_turn_index: int | None = None
+    target_is_explicit: bool = False
 
 
 class _TurnDispatchState(TypedDict, total=False):
     text: str
     active_turn_ids: tuple[str, ...]
     active_turn_texts: tuple[str, ...]
+    active_turn_followup_evidence: bool
     model_client: object | None
     disposition: ConversationTurnDisposition
     disposition_reason: str
@@ -71,9 +75,14 @@ def _normalize_node(state: _TurnDispatchState) -> dict[str, object]:
     if len(raw_active_turn_texts) < len(active_turn_ids):
         raw_active_turn_texts = raw_active_turn_texts + ("",) * (len(active_turn_ids) - len(raw_active_turn_texts))
     active_turn_texts = raw_active_turn_texts[: len(active_turn_ids)]
+    active_turn_structured_evidence = any(
+        has_structured_turn_relationship_evidence(text) for text in active_turn_texts
+    )
     return {
         "active_turn_ids": active_turn_ids,
         "active_turn_texts": active_turn_texts,
+        "active_turn_followup_evidence": bool(state.get("active_turn_followup_evidence", True))
+        or active_turn_structured_evidence,
     }
 
 
@@ -117,6 +126,7 @@ def _model_turn_disposition(
     model_client: object | None,
     current_text: str,
     active_turn_texts: tuple[str, ...],
+    active_turn_followup_evidence: bool,
 ) -> _StructuredTurnDisposition | None:
     if model_client is None or not active_turn_texts:
         return None
@@ -130,10 +140,14 @@ def _model_turn_disposition(
     system = (
         "Classify whether the current user message should link to one active or recent request "
         "or run as a separate request. Return only JSON with keys relationship, effect, confidence, "
-        "and target_index. "
+        "target_index, and target_is_explicit. "
         "relationship must be one of: follow_up, separate. effect must be one of: continue, revise, interrupt. "
         "For follow_up, target_index must be the index of exactly one active_requests item. "
         "For separate, target_index must be null. "
+        "target_is_explicit must be true only when the current_message itself semantically identifies, "
+        "modifies, or requests work on a specific active_requests item. Set target_is_explicit false for "
+        "generic agreement, acknowledgement, permission, or continuation messages that could refer to "
+        "an earlier completed turn instead of the active request. "
         "Use continue when the active request should still produce its own result, revise when the current "
         "message changes the active request's requested output or parameters, and interrupt when the active "
         "request should be replaced. "
@@ -166,7 +180,15 @@ def _model_turn_disposition(
         confidence = 0.0
     if confidence < 0.55:
         return None
+    explicit_field = payload.get("target_is_explicit")
+    target_is_explicit = (
+        bool(active_turn_followup_evidence)
+        if explicit_field is None
+        else bool(explicit_field)
+    )
     if relationship == "follow_up":
+        if not active_turn_followup_evidence:
+            return None
         target_index = payload.get("target_index")
         if target_index is None and len(active_turn_texts) == 1:
             target_index = 0
@@ -183,20 +205,26 @@ def _model_turn_disposition(
                 ConversationTurnDisposition.REVISE,
                 "model_structured_revision",
                 target_index,
+                target_is_explicit,
             )
         if effect == "interrupt":
             return _StructuredTurnDisposition(
                 ConversationTurnDisposition.INTERRUPT,
                 "model_structured_interrupt",
                 target_index,
+                target_is_explicit,
             )
         return _StructuredTurnDisposition(
             ConversationTurnDisposition.CONTINUE,
             "model_structured_follow_up",
             target_index,
+            target_is_explicit,
         )
     if relationship == "separate":
-        return _StructuredTurnDisposition(ConversationTurnDisposition.INDEPENDENT, "model_structured_separate")
+        return _StructuredTurnDisposition(
+            ConversationTurnDisposition.INDEPENDENT,
+            "model_structured_separate",
+        )
     return None
 
 
@@ -211,11 +239,21 @@ def _classify_node(state: _TurnDispatchState) -> dict[str, object]:
             model_client=state.get("model_client"),
             current_text=str(state.get("text") or ""),
             active_turn_texts=tuple(state.get("active_turn_texts", ())),
+            active_turn_followup_evidence=bool(state.get("active_turn_followup_evidence", True)),
         )
         if model_decision is None:
-            disposition = ConversationTurnDisposition.INDEPENDENT
-            reason = "no_structured_dispatch_decision"
-            target_active_turn_index = None
+            if (
+                state.get("model_client") is not None
+                and bool(state.get("active_turn_followup_evidence", True))
+                and len(active_turn_ids) == 1
+            ):
+                disposition = ConversationTurnDisposition.CONTINUE
+                reason = "structured_active_followup_evidence"
+                target_active_turn_index = 0
+            else:
+                disposition = ConversationTurnDisposition.INDEPENDENT
+                reason = "no_structured_dispatch_decision"
+                target_active_turn_index = None
         else:
             disposition = model_decision.disposition
             reason = model_decision.reason
@@ -290,6 +328,7 @@ def route_turn_dispatch_with_context(
     *,
     active_turn_ids: tuple[str, ...] = (),
     active_turn_texts: tuple[str, ...] = (),
+    active_turn_followup_evidence: bool = True,
     model_client: object | None = None,
 ) -> TurnDispatchDecision:
     final_state = _compiled_turn_dispatch_graph().invoke(
@@ -297,6 +336,7 @@ def route_turn_dispatch_with_context(
             "text": text,
             "active_turn_ids": tuple(active_turn_ids),
             "active_turn_texts": tuple(active_turn_texts),
+            "active_turn_followup_evidence": bool(active_turn_followup_evidence),
             "model_client": model_client,
         },
         config={"configurable": {"thread_id": "turn-dispatch"}},
@@ -368,6 +408,7 @@ class AsyncTurnDispatchTracker:
         task: asyncio.Task | None = None,
         model_client: object | None = None,
         reply_context: dict[str, object] | None = None,
+        active_turn_followup_evidence: bool = False,
     ) -> ActiveTurnRegistration:
         conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
         turn_key = _normalize_key(turn_id, fallback=f"turn-{uuid4().hex[:12]}")
@@ -393,6 +434,7 @@ class AsyncTurnDispatchTracker:
                 str(text or ""),
                 active_turn_ids=active_turn_ids,
                 active_turn_texts=active_turn_texts,
+                active_turn_followup_evidence=active_turn_followup_evidence,
                 model_client=model_client,
             )
         else:

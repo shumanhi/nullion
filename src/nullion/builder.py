@@ -10,6 +10,8 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from nullion.skills import SKILL_WRITE_DELETE_CONSENT_STEP
+
 
 class BuilderDecisionType(str, Enum):
     NOOP = "noop"
@@ -86,6 +88,26 @@ class SkillRefinementProposal:
     confidence: float
 
 
+_CONNECTOR_APP_TAG_PREFIX = "connector-app:"
+
+
+def builder_proposal_connector_app_id(proposal: BuilderProposal) -> str | None:
+    for tag in getattr(proposal, "suggested_tags", ()) or ():
+        tag_text = str(tag or "").strip()
+        if tag_text.startswith(_CONNECTOR_APP_TAG_PREFIX):
+            app_id = tag_text.removeprefix(_CONNECTOR_APP_TAG_PREFIX).strip()
+            return app_id or None
+    return None
+
+
+def builder_proposal_connector_app_label(proposal: BuilderProposal) -> str | None:
+    app_id = builder_proposal_connector_app_id(proposal)
+    if app_id is None:
+        return None
+    label = app_id.replace("-", " ").replace("_", " ").strip()
+    return label.title() if label else None
+
+
 def builder_proposal_acceptance_benefit(proposal: BuilderProposal) -> str:
     """Shared, platform-neutral copy explaining why accepting a proposal helps."""
     approval_mode = str(getattr(proposal, "approval_mode", "") or "").strip().lower()
@@ -100,10 +122,20 @@ def builder_proposal_acceptance_benefit(proposal: BuilderProposal) -> str:
             "Why accept: Builder saves the lesson as durable memory so future work can reuse the "
             "right context instead of asking you to repeat it."
         )
+    connector_label = builder_proposal_connector_app_label(proposal)
+    if approval_mode == "skill" and connector_label:
+        return (
+            f"Why accept: Builder saves this {connector_label} connector workflow so future requests "
+            "can start with the right connection steps. It may request read access through that "
+            "connector, but it does not grant write access by itself; write actions still require a "
+            "write-capable connector, explicit chat confirmation, and normal approval. It does not connect "
+            "the account or rerun the previous request by itself."
+        )
     return (
         "Why accept: Builder saves this as a reusable skill so future similar work can start with "
         "the right steps, create or update files/artifacts when needed, and finish requested work "
-        "with less setup."
+        "with less setup. It does not grant permission to modify or delete data; write/delete actions "
+        "still require explicit chat confirmation."
     )
 
 
@@ -125,11 +157,13 @@ def format_builder_proposal_notification(record: BuilderProposalRecord) -> str:
     if summary_text and summary_text[-1] not in ".!?":
         summary_text += "."
     lines = [
-        "────────────────",
-        "🧱 Builder suggestion",
+        "🛠️ **Builder suggestion**",
+        "",
+        "I opened a Builder suggestion you can review and approve.",
         f"Optional improvement: {proposal.title}",
         f"What it would do: {summary_text}",
         builder_proposal_acceptance_benefit(proposal),
+        f"Consent rule: {SKILL_WRITE_DELETE_CONSENT_STEP}",
         "",
         "Actions",
         "- Review: /proposal latest",
@@ -412,7 +446,8 @@ def format_builder_proposal_for_telegram(snapshot: dict[str, object]) -> str:
     benefit = str(snapshot.get("acceptance_benefit") or "")
     benefit_line = f"{benefit}\n" if benefit else ""
     return (
-        "🧱 Nullion Builder\n"
+        "🛠️ **Builder suggestion**\n"
+        "\n"
         f"{snapshot['title']}\n"
         "\n"
         f"{snapshot['summary']}\n"
@@ -466,6 +501,8 @@ __all__ = [
     "build_builder_proposal",
     "build_builder_proposal_snapshot",
     "builder_proposal_acceptance_benefit",
+    "builder_proposal_connector_app_id",
+    "builder_proposal_connector_app_label",
     "build_skill_refinement_proposal_snapshot",
     "evaluate_builder_decision",
     "format_builder_proposal_notification",

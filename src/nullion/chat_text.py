@@ -7,6 +7,8 @@ known Markdown constructs readable across narrow chat surfaces.
 
 from __future__ import annotations
 
+import re
+
 
 def _is_generic_column_label(label: str) -> bool:
     normalized = " ".join(str(label or "").strip().lower().split())
@@ -41,31 +43,49 @@ def _is_separator_row(cells: list[str]) -> bool:
     return any("-" in cell for cell in cells)
 
 
+def _expand_compacted_table_lines(text: str) -> str:
+    lines: list[str] = []
+    for line in str(text).splitlines():
+        if "|" not in line or "---" not in line:
+            lines.append(line)
+            continue
+        expanded = re.sub(r"\|\s+(?=\|)", "|\n", line)
+        lines.extend(part for part in expanded.splitlines() if part.strip() != "|")
+    return "\n".join(lines)
+
+
 def _render_table_as_list(header: list[str], rows: list[list[str]]) -> list[str]:
     rendered: list[str] = []
-    for row in rows:
+    multiple_rows = len(rows) > 1
+    for row_index, row in enumerate(rows, start=1):
         cells = [_clean_cell(row[index] if index < len(row) else "") for index in range(len(header))]
         if len(header) == 2 and cells[0] and cells[1]:
             rendered.append(f"- {cells[0]}: {cells[1]}")
             continue
-        parts: list[str] = []
+        parts: list[tuple[str, str]] = []
         for cell_index, heading in enumerate(header):
             value = cells[cell_index] if cell_index < len(cells) else ""
             if not value:
                 continue
             label = _clean_cell(heading)
             if _is_generic_column_label(label):
-                parts.append(value)
+                parts.append(("", value))
             else:
-                parts.append(f"{label}: {value}")
+                parts.append((label, value))
         if parts:
-            rendered.append(f"- {' · '.join(parts)}")
+            if rendered and rendered[-1] != "":
+                rendered.append("")
+            first_label, first_value = parts[0]
+            prefix = f"{row_index}. " if multiple_rows else ""
+            rendered.append(f"{prefix}{first_label + ': ' if first_label else ''}{first_value}")
+            for label, value in parts[1:]:
+                rendered.append(f"{label + ': ' if label else ''}{value}")
     return rendered
 
 
 def make_markdown_tables_chat_readable(text: str) -> str:
     """Convert Markdown table blocks into wrapped list text for chat delivery."""
-    lines = str(text).splitlines()
+    lines = _expand_compacted_table_lines(str(text)).splitlines()
     output: list[str] = []
     index = 0
     in_fence = False

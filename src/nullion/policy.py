@@ -323,6 +323,6 @@ def evaluate_boundary_request(
         if selected_rule.mode is PolicyMode.DENY:
             return PolicyDecision.DENY
 
-    if request.boundary.kind is BoundaryKind.OUTBOUND_NETWORK:
+    if request.boundary.kind in {BoundaryKind.OUTBOUND_NETWORK, BoundaryKind.ACCOUNT_ACCESS}:
         return PolicyDecision.REQUIRE_APPROVAL
     return PolicyDecision.DENY

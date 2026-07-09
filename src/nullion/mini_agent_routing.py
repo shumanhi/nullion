@@ -28,6 +28,29 @@ _EXTENSION_ARTIFACT_TOOLS = {
     ".xlsx": frozenset({"spreadsheet_create"}),
 }
 _SIMPLE_ARTIFACT_DISPOSITIONS = frozenset({"single_turn", "sequential_mission"})
+_STATEFUL_DIRECT_TURN_TOOLS = frozenset(
+    {
+        "calendar_create",
+        "calendar_delete",
+        "calendar_list",
+        "calendar_respond",
+        "calendar_update",
+        "create_cron",
+        "delete_cron",
+        "delete_reminder",
+        "email_attachment_read",
+        "email_read",
+        "email_search",
+        "email_send",
+        "list_crons",
+        "list_reminders",
+        "run_cron",
+        "set_reminder",
+        "toggle_cron",
+        "update_cron",
+        "update_reminder",
+    }
+)
 
 
 def should_route_without_mini_agents(message: str, *, has_attachments: bool = False) -> bool:
@@ -65,6 +88,14 @@ def should_keep_dag_plan_in_direct_turn(
         for tool in (available_tools or ())
         if str(tool or "").strip()
     }
+    for task in tasks:
+        tool_scope = {
+            str(tool or "").strip()
+            for tool in (getattr(task, "tool_scope", ()) or ())
+            if str(tool or "").strip()
+        }
+        if tool_scope.intersection(_STATEFUL_DIRECT_TURN_TOOLS).intersection(available_tool_names):
+            return True
     if normalized_extensions and _artifact_tools_for_extensions(normalized_extensions).intersection(available_tool_names):
         return True
     for task in tasks:

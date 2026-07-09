@@ -9,6 +9,8 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from nullion.skills import SKILL_WRITE_DELETE_CONSENT_STEP
+
 LEARNED_SKILL_INJECT_MIN_SCORE = 4
 DEFAULT_LEARNED_SKILL_USAGE_LIMIT = 3
 
@@ -92,6 +94,7 @@ def build_learned_skill_usage_hint(
             f"   Trigger: {skill.trigger}\n"
             f"   Follow these steps:\n{steps_text}"
         )
+    prompt_sections.append(f"Consent guard: {SKILL_WRITE_DELETE_CONSENT_STEP}")
     titles = tuple(skill.title for skill in selected)
     return LearnedSkillUsageHint(
         title=titles[0],

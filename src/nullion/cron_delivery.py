@@ -16,11 +16,13 @@ import json
 import mimetypes
 import inspect
 import logging
+import os
 from pathlib import Path
 import re
+import textwrap
 import threading
 import time
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, Sequence, TypedDict
 from urllib.error import URLError
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -35,13 +37,28 @@ SUPPORTED_CRON_DELIVERY_CHANNELS = frozenset({"web", "telegram", "slack", "disco
 MESSAGING_CRON_DELIVERY_CHANNELS = frozenset({"telegram", "slack", "discord"})
 MAX_CRON_TEXT_ARTIFACT_CHARS = 12000
 MAX_CRON_ATTACHMENT_FALLBACK_CHARS = 420
+MAX_CRON_SILENT_STATE_JSON_BYTES = 64_000
+MAX_CRON_FINAL_REPAIR_EVIDENCE_CHARS = 9000
+MAX_CRON_FINAL_REPAIR_TOOL_RESULTS = 18
+MAX_CRON_FINAL_REPAIR_ITEMS_PER_TOOL = 8
+MAX_CRON_FINAL_REPAIR_BODY_EXCERPT_CHARS = 700
 DEFAULT_CRON_NO_OUTPUT_MESSAGE = "Cron ran successfully; no output was produced."
 CRON_DELIVERY_REPLY_PREFIX = "⏰ "
-CRON_DELIVERY_REPLY_PREFIXES = (CRON_DELIVERY_REPLY_PREFIX, "⏱️ ", "❖ ")
-SCHEDULED_TASK_STATUS_TITLE = "⏱️ SCHEDULED TASK"
-SCHEDULED_TASK_DELIVERY_PREFIX = "⏱️ SCHEDULED TASK:"
+CRON_DELIVERY_REPLY_PREFIXES = (CRON_DELIVERY_REPLY_PREFIX, "⏱️ ", "🎯 ", "❖ ")
+SCHEDULED_TASK_STATUS_TITLE = "⏰ **SCHEDULED TASK**"
+SCHEDULED_TASK_DELIVERY_PREFIX = "⏰ **SCHEDULED TASK:**"
+CRON_DELIVERY_PRESENTATION_WRAP_WIDTH = 78
+DEFAULT_CRON_AGENT_MAX_ITERATIONS = 24
+MAX_CRON_AGENT_MAX_ITERATIONS = 40
+MANUAL_CRON_STATUS_FRAMES = ("◐", "◓", "◑", "◒")
 CRON_INTERNAL_CAPABILITY_TAGS = frozenset({"scheduler"})
 CRON_INTERNAL_REFERENCE_TOOLS = frozenset({"request_tool_scope", "skill_pack_read"})
+CRON_RAW_TEXT_EVIDENCE_TOOLS = frozenset({"browser_extract_text", "terminal_exec"})
+CRON_RAW_TEXT_EVIDENCE_MIN_CHARS = 40
+_CRON_RAW_TEXT_EVIDENCE_KEYS_BY_TOOL = {
+    "browser_extract_text": ("text", "content", "result"),
+    "terminal_exec": ("stdout", "stderr", "text", "content", "result"),
+}
 CRON_DELIVERABLE_ARTIFACT_TOOLS = frozenset(
     {
         "document_create",
@@ -59,6 +76,9 @@ _HTML_LOCAL_IMAGE_SRC_RE = re.compile(
 )
 _CRON_ARTIFACT_PATH_RE = re.compile(r"(?<![\w./-])(?:[~\w./:-]*/)?artifacts/[^\s`\"'<>]+")
 _HTML_INLINE_IMAGE_EXTENSIONS = frozenset({".apng", ".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"})
+_PRIMARY_RENDERED_ARTIFACT_EXTENSIONS = frozenset({".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm"})
+_TEXT_SUPPORT_ASSET_EXTENSIONS = frozenset({".txt", ".md"})
+_INTERNAL_STATE_ARTIFACT_EXTENSIONS = frozenset({".json", ".jsonl", ".db", ".sqlite", ".sqlite3"})
 _HTML_INLINE_REMOTE_IMAGE_MAX_BYTES = 4 * 1024 * 1024
 _HTML_INLINE_REMOTE_IMAGE_TIMEOUT_SECONDS = 8.0
 _HTML_INLINE_REMOTE_IMAGE_USER_AGENT = "NullionCronDelivery/1.0"
@@ -76,11 +96,22 @@ _CRON_INTERNAL_SKILL_PACK_CONTEXT_RE = re.compile(
     r"(?:Enabled skill packs are reference instructions|Use skill_pack_read for detailed installed-pack docs|Loaded instructions:)",
     re.IGNORECASE,
 )
+_CRON_RAW_TERMINAL_SECTION_RE = re.compile(r"(?im)^\s*(?:STDOUT|STDERR|EXIT CODE)\s*$")
+_CRON_RAW_NAMED_STRUCTURED_BLOCK_RE = re.compile(
+    r"(?is)^\s*[A-Za-z_][\w.-]*\s*\{\s*[\r\n]+[^{}]*\"[A-Za-z0-9_ -]+\"\s*:"
+)
 _CRON_INTERNAL_UUID_TOKEN_RE = re.compile(
     r"\$[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
 )
+_CRON_OPAQUE_ACCOUNT_IDENTIFIER_RE = re.compile(
+    r"(?=.{10,160}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9][A-Za-z0-9._:-]*[A-Za-z0-9]"
+)
 _CRON_SPACED_TOKEN_RE = re.compile(r"(?:\b[A-Za-z]\s+){4,}[A-Za-z]\b")
+_CRON_SOURCE_POINTS_HEADING_RE = re.compile(
+    r"^\s*(?:[#>*_\-\s`]+)?relevant\s+source\s+points(?:[#>*_\-\s`]+)?\s*$",
+    re.IGNORECASE,
+)
 _CRON_RESTART_ACTIVE_EVENT_TYPES = frozenset(
     {
         "cron.delivery.started",
@@ -374,6 +405,8 @@ def _manual_cron_failure_detail(reason: str, error: str) -> str:
         return "  Reason: Scheduled task produced raw tool output instead of a deliverable report."
     if reason == "cron_run_internal_tool_output_leaked":
         return "  Reason: Scheduled task tried to deliver internal tool reference content."
+    if reason == "cron_run_source_points_only":
+        return "  Reason: Scheduled task produced source snippets instead of a deliverable result."
     if reason == "cron_run_malformed_delivery_text":
         return "  Reason: Scheduled task produced malformed internal text instead of a deliverable report."
     if reason == "cron_run_without_completed_tool_evidence":
@@ -387,11 +420,14 @@ def _manual_cron_failure_detail(reason: str, error: str) -> str:
     return "  The run ended before a result could be delivered."
 _CRON_SENSITIVE_ACCOUNT_TOOLS = frozenset(
     {
+        "calendar_list",
         "calendar_read",
         "calendar_search",
         "connector_request",
+        "email_attachment_read",
         "email_read",
         "email_search",
+        "google_calendar_list",
         "google_calendar_read",
         "google_calendar_search",
         "google_mail_read",
@@ -420,10 +456,33 @@ _CRON_SENSITIVE_METADATA_KEYS = frozenset(
         "to",
     }
 )
-_CRON_ACCOUNT_SUMMARY_TITLE_KEYS = frozenset({"name", "subject", "title"})
+_CRON_SENSITIVE_IDENTIFIER_KEYS = frozenset(
+    {
+        "calendar_id",
+        "calendarid",
+        "conversation_id",
+        "conversationid",
+        "email_id",
+        "emailid",
+        "event_id",
+        "eventid",
+        "gmail_id",
+        "gmailid",
+        "id",
+        "message_id",
+        "messageid",
+        "provider_id",
+        "providerid",
+        "thread_id",
+        "threadid",
+    }
+)
+_CRON_ACCOUNT_SUMMARY_TITLE_KEYS = frozenset({"name", "subject", "summary", "title"})
 _CRON_ACCOUNT_SUMMARY_SOURCE_KEYS = frozenset({"from", "sender", "source"})
-_CRON_ACCOUNT_SUMMARY_DATE_KEYS = frozenset({"created_at", "date", "received_at", "updated_at"})
-_CRON_ACCOUNT_SUMMARY_DETAIL_KEYS = frozenset({"description", "preview", "snippet", "summary"})
+_CRON_ACCOUNT_SUMMARY_DATE_KEYS = frozenset(
+    {"created_at", "date", "datetime", "end_time", "received_at", "start_time", "updated_at"}
+)
+_CRON_ACCOUNT_SUMMARY_DETAIL_KEYS = frozenset({"description", "location", "preview", "snippet"})
 _CRON_ACCOUNT_SUMMARY_MAX_ITEMS = 6
 _CRON_ACCOUNT_SUMMARY_FIELD_MAX_CHARS = 180
 _CRON_ACCOUNT_SUMMARY_DETAIL_MAX_CHARS = 160
@@ -431,6 +490,31 @@ _CRON_SENSITIVE_BODY_MIN_CHARS = 180
 _CRON_SENSITIVE_BODY_MATCH_CHARS = 220
 _CRON_SENSITIVE_METADATA_MIN_CHARS = 8
 _CRON_SENSITIVE_METADATA_MATCH_MIN_COUNT = 2
+_CRON_ACCOUNT_PREVIEW_LABEL_RE = re.compile(r"^\s*(from|date|preview)\s*:", re.IGNORECASE)
+_CRON_ACCOUNT_TOOL_SUMMARY_RE = re.compile(
+    r"^(?:[📅✉️📧]\s*)?(?:"
+    r"i\s+checked\s+your\s+(?:calendar|email)"
+    r"|i\s+found\s+\d+\s+matching\s+(?:calendar|email)"
+    r"|found\s+\d+\s+(?:events?|messages?)"
+    r"|relevant\s+(?:calendar|email)"
+    r")\b",
+    re.IGNORECASE,
+)
+_CRON_FILE_INVENTORY_TOOLS = frozenset({"file_search"})
+_CRON_FILE_INVENTORY_KEYS = frozenset(
+    {
+        "file",
+        "files",
+        "match",
+        "matches",
+        "path",
+        "paths",
+        "result",
+        "results",
+        "item",
+        "items",
+    }
+)
 
 # Cron delivery contract for future agents:
 # - Cron can deliver text, file attachments, both, or no message.
@@ -465,6 +549,32 @@ def normalize_html_image_delivery_mode(value: object) -> str:
     return HTML_IMAGE_DELIVERY_MODE_AUTO
 
 
+def _parse_iteration_limit(value: object, *, default: int) -> int:
+    try:
+        limit = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return min(MAX_CRON_AGENT_MAX_ITERATIONS, max(1, limit))
+
+
+def default_cron_agent_max_iterations() -> int:
+    """Return the scheduled-task agent turn budget.
+
+    Cron runs are background workflows and often create reports/artifacts across
+    several tools. They need a larger default than ordinary chat while keeping a
+    bounded ceiling for bad loops.
+    """
+
+    explicit = os.environ.get("NULLION_CRON_AGENT_MAX_ITERATIONS")
+    if explicit is not None:
+        return _parse_iteration_limit(explicit, default=DEFAULT_CRON_AGENT_MAX_ITERATIONS)
+    chat_limit = _parse_iteration_limit(
+        os.environ.get("NULLION_AGENT_TURN_MAX_ITERATIONS"),
+        default=DEFAULT_CRON_AGENT_MAX_ITERATIONS,
+    )
+    return max(DEFAULT_CRON_AGENT_MAX_ITERATIONS, chat_limit)
+
+
 def cron_agent_prompt(job: object, *, label: str) -> str:
     """Build the synthetic user message for a scheduled task turn."""
     name = str(getattr(job, "name", "") or "Scheduled task").strip()
@@ -482,8 +592,15 @@ def cron_agent_prompt(job: object, *, label: str) -> str:
         "layout; do not deliver raw browser screenshots, loose image attachments, or unformatted text dumps as "
         "a substitute for the requested formatted document.\n"
         "- Generated artifacts must be internally consistent and valid for their file type before delivery: "
-        "JSON must parse, text must be non-empty, HTML reports must not duplicate or contradict their own "
-        "visible counts, and binary formats must be real files.\n"
+        "JSON must parse, CSV rows must parse with the same column count on every row, text must be non-empty, "
+        "HTML reports must not duplicate or contradict their own visible counts, and binary formats must be real files.\n"
+        "- If both self-contained and linked/non-self-contained HTML reports are requested, create two distinct "
+        "artifacts: the self-contained file may inline image data, while the linked/non-self-contained file must "
+        "reference local sibling asset files by relative path. Do not label an HTML artifact as linked when its "
+        "images are all data URIs.\n"
+        "- Do not say images or support files are attached separately unless the final delivery is explicitly "
+        "attaching those loose files. If images are embedded in DOCX/PPTX/XLSX/PDF or referenced from HTML, "
+        "describe them as embedded or referenced instead.\n"
         "- For HTML dashboards/reports, derive visible metrics, charts, and tables from the same source rows "
         "instead of manually repeating totals.\n"
         "- HTML report primary content must be present in static markup. Do not require client-side JavaScript "
@@ -495,9 +612,16 @@ def cron_agent_prompt(job: object, *, label: str) -> str:
         "or report and do not imply that authenticated browser state was available.\n"
         "- User-facing reminders, reports, and alerts are delivered by the scheduler through this task's "
         "configured delivery channel. Do not invoke account-write tools merely to deliver the scheduled-task output.\n"
-        "- Keep scratch/checkpoint/state files in the workspace unless they are requested deliverables.\n"
+        "- Keep helper scripts, scratch files, checkpoints, and state files under workspace scratch; "
+        "only requested final deliverables belong in the artifact directory.\n"
         "- For email, calendar, and account connector results, deliver concise extracted obligations, confirmations, "
         "dates, and actions. Do not paste full message bodies or raw connector payloads.\n"
+        "- Shape the visible reply to the amount and type of content: short reports should be compact paragraphs "
+        "or tight short-line summaries; larger multi-record reports should use clearly separated item groups with "
+        "short field labels or sections. Do not force every reply into bullets, and do not use Markdown tables on "
+        "chat surfaces when the same data would read better as grouped records. When a section heading improves "
+        "readability, start it with a relevant emoji, wrap the heading text in **bold**, and leave an empty line "
+        "after the heading. Use platform-friendly **bold** for important labels, statuses, names, and conclusions.\n"
         "- If the task says to alert only on new data or meaningful changes, return no output when nothing changed.\n"
         f"- If no output behavior is specified and there is nothing specific to report, send: {DEFAULT_CRON_NO_OUTPUT_MESSAGE}"
     )
@@ -573,8 +697,14 @@ def cron_agent_history(
             "Cron delivery contract: create requested deliverable files under this artifact directory "
             f"and attach them with explicit MEDIA lines: {artifact_root}. "
             "For document-like deliverables, produce structured report-quality artifacts rather than raw screenshots, "
-            "loose images, or unformatted text dumps. Keep scratch, checkpoint, and state files in the workspace "
-            "unless they are requested deliverables.\n\n"
+            "loose images, or unformatted text dumps. CSV deliverables must parse with a stable column count on every "
+            "row. If both self-contained and linked HTML outputs are requested, the linked file must reference local "
+            "sibling assets by relative path instead of inlining every image as a data URI. Do not promise loose image "
+            "attachments unless loose image files are actual requested deliverables. Keep helper scripts, scratch files, "
+            "checkpoints, and state files under workspace scratch; only requested final deliverables belong in the artifact "
+            "directory. Shape chat-visible scheduled-task summaries to the content density: "
+            "compact paragraph or short-line replies for a few facts, separated grouped records for larger result sets, "
+            "and no Markdown tables on narrow chat surfaces when grouped records are more readable.\n\n"
             "If a tool requires approval, pause and wait for the approval decision card. "
             "After approval, resume from the suspended step; if denied, stop the run.\n\n"
             f"{storage_text}"
@@ -658,11 +788,13 @@ def run_single_agent_cron_turn(
         planned_tool_names=None,
     )
     structured_tool_names = structured_cron_passthrough_tool_names(tool_registry)
+    max_iterations = default_cron_agent_max_iterations()
     _record_preflight(
         "connector_scope",
         connector_allowed=bool(connector_scope.allow_connector_tools),
         connector_providers=len(connector_scope.provider_ids),
         structured_passthrough_tools=len(structured_tool_names),
+        max_iterations=max_iterations,
     )
     execution_registry = CronExecutionToolRegistry(
         tool_registry,
@@ -672,7 +804,6 @@ def run_single_agent_cron_turn(
         connector_provider_ids=connector_scope.provider_ids,
     )
     guard = turn_guard() if turn_guard is not None else nullcontext()
-    browser_session_scope = f"cron:{getattr(job, 'id', '')}:{uuid4().hex}"
     try:
         with guard:
             result = orchestrator.run_turn(
@@ -691,12 +822,11 @@ def run_single_agent_cron_turn(
                 tool_registry=execution_registry,
                 policy_store=getattr(runtime, "store", None),
                 approval_store=getattr(runtime, "store", None),
+                max_iterations=max_iterations,
                 tool_result_callback=tool_result_callback,
                 cancellation_checker=cancellation_checker,
                 tool_flow_context={
                     "scheduled_task_run": True,
-                    "isolated_browser_session": True,
-                    "browser_session_scope": browser_session_scope,
                     "cron_id": str(getattr(job, "id", "") or ""),
                     "cron_name": str(getattr(job, "name", "") or ""),
                 },
@@ -717,12 +847,7 @@ def run_single_agent_cron_turn(
         )
         return failure_result
 
-    _record_preflight(
-        "single_agent_done",
-        tool_results=len(getattr(result, "tool_results", ()) or ()),
-        artifacts=len(getattr(result, "artifacts", ()) or ()),
-    )
-    return {
+    result_payload = {
         "text": getattr(result, "final_text", "") or "",
         "tool_results": list(getattr(result, "tool_results", ()) or ()),
         "artifacts": list(getattr(result, "artifacts", ()) or ()),
@@ -731,7 +856,393 @@ def run_single_agent_cron_turn(
         "reached_iteration_limit": bool(getattr(result, "reached_iteration_limit", False)),
         "raw_tool_payload_blocked": bool(getattr(result, "raw_tool_payload_blocked", False)),
         "cron_execution_mode": "single_agent",
+        "cron_task": str(getattr(job, "task", "") or ""),
     }
+    _record_preflight(
+        "single_agent_done",
+        tool_results=len(result_payload.get("tool_results") or ()),
+        artifacts=len(result_payload.get("artifacts") or ()),
+        final_text_chars=len(str(result_payload.get("text") or "")),
+    )
+    _repair_cron_agent_final_text_if_needed(
+        job,
+        result_payload,
+        model_client=active_model_client,
+        record_preflight=_record_preflight,
+    )
+    return result_payload
+
+
+def _repair_cron_agent_final_text_if_needed(
+    job: object,
+    result: dict[str, object],
+    *,
+    model_client: object | None,
+    record_preflight: Callable[..., None] | None = None,
+) -> None:
+    """Repair an invalid cron final answer from verified tool evidence.
+
+    The delivery layer still owns final filtering. This step only gives the
+    single cron agent one chance to turn tool evidence into the report the cron
+    asked for when its first final text was clearly a connector/body/list dump.
+    """
+
+    original_text = str(result.get("text") or result.get("final_text") or "")
+    cron_task = str(getattr(job, "task", "") or "")
+    reason = _cron_final_text_repair_reason(result, original_text, user_message=cron_task)
+    if not reason:
+        return
+    result["cron_agent_final_repair_needed"] = True
+    result["cron_agent_final_repair_reason"] = reason
+    if record_preflight is not None:
+        record_preflight(
+            "final_repair_started",
+            reason=reason,
+            tool_results=len(result.get("tool_results") or ()),
+            final_text_chars=len(original_text),
+        )
+    if model_client is None:
+        result["cron_agent_final_repair_failed"] = True
+        result["cron_agent_final_repair_failure"] = "model_client_unavailable"
+        if record_preflight is not None:
+            record_preflight("final_repair_failed", reason=reason, failure="model_client_unavailable")
+        return
+
+    evidence = _cron_final_repair_tool_evidence(result.get("tool_results") or ())
+    if not evidence:
+        result["cron_agent_final_repair_failed"] = True
+        result["cron_agent_final_repair_failure"] = "tool_evidence_unavailable"
+        if record_preflight is not None:
+            record_preflight("final_repair_failed", reason=reason, failure="tool_evidence_unavailable")
+        return
+
+    prompt = (
+        "Scheduled task name:\n"
+        f"{str(getattr(job, 'name', '') or 'Scheduled task').strip() or 'Scheduled task'}\n\n"
+        "Scheduled task instructions:\n"
+        f"{str(getattr(job, 'task', '') or '').strip()}\n\n"
+        "Rejected draft final response:\n"
+        f"{_compact_safe_account_summary_value(original_text, max_chars=1800)}\n\n"
+        "Verified compact tool evidence from this run:\n"
+        f"{evidence}\n\n"
+        "Write the corrected scheduled-task report now."
+    )
+    try:
+        response = model_client.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            tools=[],
+            max_tokens=1400,
+            system=_cron_final_repair_system_prompt(),
+        )
+    except Exception:
+        logger.debug("Cron final repair model call failed", exc_info=True)
+        result["cron_agent_final_repair_failed"] = True
+        result["cron_agent_final_repair_failure"] = "model_call_failed"
+        if record_preflight is not None:
+            record_preflight("final_repair_failed", reason=reason, failure="model_call_failed")
+        return
+
+    repaired = _cron_model_response_text(response)
+    if not repaired:
+        result["cron_agent_final_repair_failed"] = True
+        result["cron_agent_final_repair_failure"] = "empty_repair"
+        if record_preflight is not None:
+            record_preflight("final_repair_failed", reason=reason, failure="empty_repair")
+        return
+    validation_result = dict(result)
+    validation_result["raw_tool_payload_blocked"] = False
+    if _cron_final_text_repair_reason(
+        validation_result,
+        repaired,
+        include_raw_payload_flag=False,
+        user_message=cron_task,
+    ):
+        result["cron_agent_final_repair_failed"] = True
+        result["cron_agent_final_repair_failure"] = "repair_still_invalid"
+        if record_preflight is not None:
+            record_preflight("final_repair_failed", reason=reason, failure="repair_still_invalid")
+        return
+
+    result["text"] = repaired
+    result["final_text"] = repaired
+    result["cron_agent_final_repaired"] = True
+    if result.get("raw_tool_payload_blocked"):
+        result["cron_raw_tool_payload_repaired"] = True
+        result["raw_tool_payload_blocked"] = False
+    if record_preflight is not None:
+        record_preflight(
+            "final_repaired",
+            reason=reason,
+            repaired_text_chars=len(repaired),
+        )
+
+
+def _cron_final_text_repair_reason(
+    result: dict[str, object],
+    text: str | None,
+    *,
+    include_raw_payload_flag: bool = True,
+    user_message: str | None = None,
+) -> str | None:
+    visible_text = str(text or "").strip()
+    if not visible_text:
+        return None
+    try:
+        from nullion.response_sanitizer import is_structured_tool_evidence_replacement_reply
+
+        if is_structured_tool_evidence_replacement_reply(
+            reply=visible_text,
+            tool_results=result.get("tool_results") or (),
+            user_message=user_message,
+        ):
+            return "structured_evidence_fallback"
+    except Exception:
+        logger.debug("Could not compare cron final text with structured evidence fallback", exc_info=True)
+    if _cron_internal_reference_tool_output_leaked(result, visible_text):
+        return "internal_reference_output_leaked"
+    if _cron_sensitive_account_preview_dumped(result, visible_text):
+        return "account_preview_dumped"
+    if _cron_sensitive_account_body_leaked(result, visible_text):
+        return "account_body_leaked"
+    if _cron_sensitive_account_identifier_copied(result, visible_text):
+        return "account_identifier_dumped"
+    if (
+        include_raw_payload_flag
+        and result.get("raw_tool_payload_blocked")
+        and _cron_sensitive_account_metadata_copied(result, visible_text)
+    ):
+        return "account_metadata_dumped"
+    if _cron_account_tool_summary_dumped(result, visible_text):
+        return "account_tool_summary_dumped"
+    if _cron_file_inventory_dumped(result, visible_text):
+        return "file_inventory_dumped"
+    if _cron_result_leaked_internal_tool_output(result, visible_text):
+        return "internal_tool_output_leaked"
+    if _cron_delivery_text_is_malformed_or_internal(visible_text):
+        return "malformed_or_internal_text"
+    if _cron_result_has_source_points_only_browser_summary(result, visible_text):
+        return "source_points_only"
+    if include_raw_payload_flag and result.get("raw_tool_payload_blocked"):
+        return "raw_tool_payload_blocked"
+    return None
+
+
+def _cron_final_repair_system_prompt() -> str:
+    return (
+        "You repair scheduled-task final answers for Nullion. Use only the verified tool evidence from "
+        "this same run and the stored scheduled-task instructions. Produce only the user-facing "
+        "scheduled-task report that should be delivered. Do not mention repair, guards, raw payloads, "
+        "tool rows, or connector dumps. Do not paste full email bodies, raw connector payloads, JSON, "
+        "or internal tool output. If the scheduled task asks for particular sections or a report format, "
+        "use those sections. Summarize obligations, confirmations, dates, amounts, contacts, and next "
+        "actions that are supported by evidence. If a requested section has no verified item, say "
+        "None verified for that section. Keep it concise and readable on chat surfaces."
+    )
+
+
+def _cron_model_response_text(response: object) -> str:
+    if not isinstance(response, dict):
+        return ""
+    content = response.get("content") or []
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+            parts.append(str(block.get("text") or ""))
+    return "".join(parts).strip()
+
+
+def _cron_final_repair_tool_evidence(tool_results: object) -> str:
+    if not isinstance(tool_results, (list, tuple)):
+        return ""
+    records: list[dict[str, object]] = []
+    remaining = MAX_CRON_FINAL_REPAIR_EVIDENCE_CHARS
+    for tool_result in list(tool_results)[-MAX_CRON_FINAL_REPAIR_TOOL_RESULTS:]:
+        record = _cron_final_repair_tool_record(tool_result)
+        text = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        if len(text) > remaining:
+            record = _shrink_cron_final_repair_record(record, remaining)
+            text = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        if len(text) > remaining and records:
+            break
+        records.append(record)
+        remaining -= min(remaining, len(text))
+        if remaining <= 0:
+            break
+    return json.dumps(records, ensure_ascii=False, sort_keys=True)
+
+
+def _cron_final_repair_tool_record(tool_result: object) -> dict[str, object]:
+    tool_name = _tool_result_name(tool_result)
+    output = _tool_result_output(tool_result)
+    record: dict[str, object] = {
+        "tool_name": tool_name,
+        "status": _normalized_tool_result_status(tool_result) or _tool_result_status(tool_result),
+    }
+    error = _tool_result_error(tool_result)
+    if error:
+        record["error"] = _compact_safe_account_summary_value(error, max_chars=500)
+    if tool_name in _CRON_SENSITIVE_ACCOUNT_TOOLS:
+        items = _cron_final_repair_account_items(output)
+        if items:
+            record["items"] = _cron_head_tail_sample(
+                items,
+                head=5,
+                tail=3,
+                limit=MAX_CRON_FINAL_REPAIR_ITEMS_PER_TOOL,
+            )
+            if len(items) > MAX_CRON_FINAL_REPAIR_ITEMS_PER_TOOL:
+                record["items_truncated"] = {
+                    "shown": len(record["items"]),
+                    "head": 5,
+                    "tail": 3,
+                    "total": len(items),
+                }
+        else:
+            record["output_summary"] = _cron_final_repair_compact_value(output)
+    else:
+        record["output_summary"] = _cron_final_repair_compact_value(output)
+    return record
+
+
+def _shrink_cron_final_repair_record(record: dict[str, object], remaining: int) -> dict[str, object]:
+    compact = dict(record)
+    items = compact.get("items")
+    if isinstance(items, list):
+        compact["items"] = _cron_head_tail_sample(items, head=1, tail=1, limit=2)
+        compact["items_truncated_for_prompt"] = True
+    output_summary = compact.get("output_summary")
+    if output_summary is not None:
+        compact["output_summary"] = _compact_safe_account_summary_value(
+            output_summary,
+            max_chars=max(160, remaining - 220),
+        )
+    error = compact.get("error")
+    if error is not None:
+        compact["error"] = _compact_safe_account_summary_value(error, max_chars=220)
+    return compact
+
+
+def _cron_final_repair_account_items(value: object) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for record in _iter_sensitive_account_summary_records(value):
+        item: dict[str, object] = {}
+        title = _account_summary_first_field(
+            record,
+            _CRON_ACCOUNT_SUMMARY_TITLE_KEYS,
+            max_chars=_CRON_ACCOUNT_SUMMARY_FIELD_MAX_CHARS,
+        )
+        source = _account_summary_first_field(
+            record,
+            _CRON_ACCOUNT_SUMMARY_SOURCE_KEYS,
+            max_chars=_CRON_ACCOUNT_SUMMARY_FIELD_MAX_CHARS,
+        )
+        date = _account_summary_first_field(
+            record,
+            _CRON_ACCOUNT_SUMMARY_DATE_KEYS,
+            max_chars=_CRON_ACCOUNT_SUMMARY_FIELD_MAX_CHARS,
+        )
+        detail = _account_summary_first_field(
+            record,
+            _CRON_ACCOUNT_SUMMARY_DETAIL_KEYS,
+            max_chars=_CRON_ACCOUNT_SUMMARY_DETAIL_MAX_CHARS,
+        )
+        body_excerpt = _account_summary_first_field(
+            record,
+            _CRON_SENSITIVE_BODY_KEYS,
+            max_chars=MAX_CRON_FINAL_REPAIR_BODY_EXCERPT_CHARS,
+        )
+        if title:
+            item["title"] = title
+        if source:
+            item["source"] = source
+        if date:
+            item["date"] = date
+        if detail:
+            item["detail"] = detail
+        if body_excerpt and body_excerpt.casefold() not in " ".join(str(part).casefold() for part in item.values()):
+            item["evidence_excerpt"] = body_excerpt
+        if item:
+            items.append(item)
+    return items
+
+
+def _cron_final_repair_compact_value(value: object, *, depth: int = 0) -> object:
+    if depth >= 4:
+        return _compact_safe_account_summary_value(value, max_chars=260)
+    if isinstance(value, str):
+        return _compact_safe_account_summary_value(value, max_chars=900 if depth == 0 else 360)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        if len(items) <= 6:
+            return [_cron_final_repair_compact_value(item, depth=depth + 1) for item in items]
+        sample = _cron_head_tail_sample(items, head=4, tail=2, limit=6)
+        return {
+            "total_items": len(items),
+            "shown_items": len(sample),
+            "omitted_items": max(0, len(items) - len(sample)),
+            "items_head": [
+                _cron_final_repair_compact_value(item, depth=depth + 1)
+                for item in sample[:4]
+            ],
+            "items_tail": [
+                _cron_final_repair_compact_value(item, depth=depth + 1)
+                for item in sample[4:]
+            ],
+        }
+    if isinstance(value, dict):
+        compact: dict[str, object] = {}
+        preferred = (
+            "message",
+            "summary",
+            "result_text",
+            "title",
+            "name",
+            "subject",
+            "from",
+            "sender",
+            "date",
+            "start",
+            "end",
+            "start_time",
+            "end_time",
+            "location",
+            "description",
+            "preview",
+            "snippet",
+            "reason",
+            "error",
+            "status",
+            "count",
+            "items",
+            "messages",
+            "events",
+            "results",
+            "available_connector_providers",
+            "next_step",
+        )
+        keys = [key for key in preferred if key in value]
+        keys.extend(str(key) for key in value.keys() if str(key) not in keys)
+        for key in keys[:12]:
+            normalized_key = str(key or "").strip()
+            if normalized_key.lower() in _CRON_SENSITIVE_BODY_KEYS:
+                continue
+            compact[normalized_key] = _cron_final_repair_compact_value(value.get(key), depth=depth + 1)
+        if len(keys) > 12:
+            compact["keys_truncated"] = {
+                "shown": 12,
+                "total": len(keys),
+                "omitted_keys": [str(key) for key in keys[12:24]],
+            }
+        return compact
+    return _compact_safe_account_summary_value(value, max_chars=360)
 
 
 def manual_cron_silent_delivery_text(
@@ -767,15 +1278,42 @@ def manual_cron_status_group_id(job: object, *, run_id: object = "") -> str:
     return f"manual-cron-{cron_id}-{uuid4().hex[:8]}"
 
 
-def manual_cron_running_status_text(job: object, *, label: str = "Manual scheduled task run") -> str:
+def manual_cron_background_agent_conversation_id(origin_conversation_id: object, task_group_id: object) -> str:
+    origin = str(origin_conversation_id or "").strip()
+    group = re.sub(r"[^A-Za-z0-9_.:-]+", "-", str(task_group_id or "manual-cron")).strip("-") or "manual-cron"
+    if origin:
+        return f"{origin}:background:{group}"
+    return f"cron:background:{group}"
+
+
+def _manual_cron_status_frame(frame_index: object) -> str:
+    try:
+        index = int(frame_index)
+    except (TypeError, ValueError):
+        index = 0
+    return MANUAL_CRON_STATUS_FRAMES[index % len(MANUAL_CRON_STATUS_FRAMES)]
+
+
+def _scheduled_task_header_text(job: object, *, label: str = "Scheduled task") -> str:
+    name = str(getattr(job, "name", "") or "Scheduled task").strip() or "Scheduled task"
+    title = str(label or "Scheduled task").strip() or "Scheduled task"
+    return f"⏰ **{title.upper()}: {name}**"
+
+
+def manual_cron_running_status_text(
+    job: object,
+    *,
+    label: str = "Manual scheduled task run",
+    frame_index: int = 0,
+) -> str:
     """Return the compact visible status card for a deferred manual cron run."""
 
-    name = str(getattr(job, "name", "") or "scheduled task").strip() or "scheduled task"
+    frame = _manual_cron_status_frame(frame_index)
     return "\n".join(
         [
-            SCHEDULED_TASK_STATUS_TITLE,
-            f"For: {name}",
-            f"◐ Running: {label} started.",
+            _scheduled_task_header_text(job, label=label),
+            "",
+            f"{frame} Running: {label} started.",
             "  Result will be delivered to this chat when ready.",
         ]
     )
@@ -790,7 +1328,6 @@ def manual_cron_terminal_status_text(
 ) -> str:
     """Return the terminal status-card text for a manual cron run."""
 
-    name = str(getattr(job, "name", "") or "scheduled task").strip() or "scheduled task"
     result_payload = result if isinstance(result, dict) else {}
     status = str(result_payload.get("cron_delivery_status") or result_payload.get("delivery_status") or "").strip()
     reason = str(result_payload.get("reason") or result_payload.get("error") or "").strip()
@@ -823,7 +1360,7 @@ def manual_cron_terminal_status_text(
     else:
         row = f"✓ Completed: {label} finished."
         detail = "  Result delivered to this chat."
-    return "\n".join([SCHEDULED_TASK_STATUS_TITLE, f"For: {name}", row, detail])
+    return "\n".join([_scheduled_task_header_text(job, label=label), "", row, detail])
 
 
 def start_manual_cron_background_delivery(
@@ -837,11 +1374,16 @@ def start_manual_cron_background_delivery(
     workflow_runner: Callable[..., dict[str, object]] | None = None,
     status_update_callback: Callable[[str, str, bool], object] | None = None,
     status_update_interval_seconds: float = 1.5,
+    background_start_grace_seconds: float = 5.0,
+    initial_status_timeout_seconds: float = 0.0,
+    background_agent_conversation_id: object = "",
+    task_group_id: object = "",
+    initial_status_text: object = "",
 ) -> dict[str, object]:
     """Start a manual cron run once and return the platform-agnostic receipt."""
 
-    task_group_id = manual_cron_status_group_id(job)
-    running_status_text = manual_cron_running_status_text(job, label=label)
+    task_group_id = str(task_group_id or "").strip() or manual_cron_status_group_id(job)
+    running_status_text = str(initial_status_text or "").strip() or manual_cron_running_status_text(job, label=label)
     cancel_event = threading.Event()
     completed_event = threading.Event()
     status_stop = threading.Event()
@@ -896,10 +1438,13 @@ def start_manual_cron_background_delivery(
         interval = max(float(status_update_interval_seconds or 0), 0.0)
         if interval <= 0:
             return
+        frame_index = 1
         while not status_stop.wait(interval):
             if status_terminal.is_set():
                 return
-            _emit_status_update(running_status_text, terminal=False)
+            status_text = manual_cron_running_status_text(job, label=label, frame_index=frame_index)
+            frame_index += 1
+            _emit_status_update(status_text, terminal=False)
 
     def _start_status_animation_loop() -> None:
         if status_update_callback is None or status_animation_started.is_set():
@@ -917,10 +1462,17 @@ def start_manual_cron_background_delivery(
         result: dict[str, object] | None = None
         error: BaseException | None = None
         serial_lock = _manual_cron_background_serial_lock(origin_conversation_id)
+        try:
+            start_grace_seconds = max(float(background_start_grace_seconds or 0), 0.0)
+        except (TypeError, ValueError):
+            start_grace_seconds = 0.0
 
         def _run_once() -> None:
             nonlocal cleanup, result, error
             if cancel_event.is_set():
+                result = {"cron_delivery_status": "cancelled", "cron_run_cancelled": True}
+                return
+            if start_grace_seconds and cancel_event.wait(start_grace_seconds):
                 result = {"cron_delivery_status": "cancelled", "cron_run_cancelled": True}
                 return
             _start_status_animation_loop()
@@ -934,6 +1486,11 @@ def start_manual_cron_background_delivery(
                 runner_signature = None
             if runner_signature is not None and "cancellation_checker" in runner_signature.parameters:
                 runner_kwargs["cancellation_checker"] = cancel_event.is_set
+            if runner_signature is not None and "agent_conversation_id" in runner_signature.parameters:
+                runner_kwargs["agent_conversation_id"] = str(
+                    background_agent_conversation_id
+                    or manual_cron_background_agent_conversation_id(origin_conversation_id, task_group_id)
+                )
             result = runner(job, **runner_kwargs)
             if isinstance(result, dict) and (result.get("cron_delivery_failed") or result.get("cron_run_failed")):
                 logger.warning(
@@ -967,10 +1524,26 @@ def start_manual_cron_background_delivery(
                     logger.debug("Could not clean up manual cron background hooks", exc_info=True)
             unregister_background_run()
 
-    if status_update_callback is not None:
-        initial_status_delivered = _emit_status_update(running_status_text, terminal=False)
-    else:
-        initial_status_delivered = False
+    initial_status_delivered = False
+    try:
+        initial_status_timeout = max(float(initial_status_timeout_seconds or 0), 0.0)
+    except (TypeError, ValueError):
+        initial_status_timeout = 0.0
+    if status_update_callback is not None and initial_status_timeout > 0:
+        status_result: dict[str, object] = {}
+
+        def _emit_initial_status() -> None:
+            status_result["delivered"] = _emit_status_update(running_status_text, terminal=False)
+
+        status_thread = threading.Thread(
+            target=_emit_initial_status,
+            name=f"{thread_name_prefix}-initial-status-{getattr(job, 'id', 'run')}",
+            daemon=True,
+        )
+        status_thread.start()
+        status_thread.join(initial_status_timeout)
+        if not status_thread.is_alive():
+            initial_status_delivered = bool(status_result.get("delivered"))
 
     thread = threading.Thread(
         target=_background_manual_cron_run,
@@ -1056,10 +1629,268 @@ def scheduled_task_delivery_text(job: object, text: str, *, run_label: str | Non
     timestamp_suffix, normalized_body = _strip_leading_cron_report_heading(body, name)
     if timestamp_suffix or normalized_body != body:
         body = normalized_body
-    header = f"⏱️ {label.upper()}: {name}"
+    header = _scheduled_task_header_text(job, label=label).removesuffix("**")
     if timestamp_suffix:
         header = f"{header} — {timestamp_suffix}"
+    header = f"{header}**"
+    body = _format_scheduled_task_delivery_body(body)
     return f"{header}\n\n{body}" if body else header
+
+
+def _format_scheduled_task_delivery_body(text: str) -> str:
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    lines = _compact_cron_numbered_scalar_detail_lines(body.splitlines())
+    structural_line_count = sum(
+        1
+        for line in lines
+        if _cron_presentation_line_kind(line.strip()) in {"bullet", "numbered", "heading"}
+    )
+    if structural_line_count < 2:
+        return body
+    lines = _compact_cron_heading_detail_groups(lines)
+    formatted: list[str] = []
+    previous_kind = ""
+    current_item_open = False
+
+    def next_structural_kind(start: int) -> str:
+        for candidate in lines[start:]:
+            candidate_kind = _cron_presentation_line_kind(candidate.strip())
+            if candidate_kind != "blank":
+                return candidate_kind
+        return ""
+
+    for index, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if not stripped:
+            next_kind = next_structural_kind(index + 1)
+            if previous_kind == "bullet" and next_kind in {"bullet", "numbered"}:
+                continue
+            if formatted and formatted[-1] != "":
+                formatted.append("")
+            previous_kind = "blank"
+            current_item_open = False
+            continue
+        if _cron_delivery_preserve_line(stripped):
+            if formatted and formatted[-1] != "":
+                formatted.append("")
+            formatted.append(stripped)
+            previous_kind = "preserved"
+            current_item_open = False
+            continue
+        kind = _cron_presentation_line_kind(stripped)
+        if kind == "heading" or _cron_structural_heading_candidate(lines, index):
+            if formatted and formatted[-1] != "":
+                formatted.append("")
+            formatted.extend(_wrap_cron_delivery_line(_format_cron_heading_line(stripped)))
+            formatted.append("")
+            previous_kind = kind
+            current_item_open = False
+            continue
+        if kind == "bullet":
+            if formatted and formatted[-1] != "" and previous_kind not in {"bullet"}:
+                formatted.append("")
+            bullet_body = re.sub(r"^[•*+-]\s+", "", stripped).strip()
+            formatted.extend(_wrap_cron_delivery_line(f"• {bullet_body}", subsequent_indent="  "))
+            previous_kind = kind
+            current_item_open = True
+            continue
+        if kind == "numbered":
+            indent = "  " if current_item_open or previous_kind in {"bullet", "numbered_detail"} else ""
+            formatted.extend(_wrap_cron_delivery_line(f"{indent}{stripped}", subsequent_indent=f"{indent}   "))
+            previous_kind = "numbered_detail" if indent else kind
+            continue
+        if current_item_open:
+            formatted.extend(_wrap_cron_delivery_line(f"  {stripped}", subsequent_indent="  "))
+            previous_kind = "detail"
+            continue
+        if previous_kind not in {"", "blank"} and formatted and formatted[-1] != "":
+            formatted.append("")
+        formatted.extend(_wrap_cron_delivery_line(stripped))
+        previous_kind = "paragraph"
+        current_item_open = False
+    while formatted and formatted[-1] == "":
+        formatted.pop()
+    return "\n".join(formatted)
+
+
+def _format_cron_heading_line(line: str) -> str:
+    stripped = str(line or "").strip().rstrip(":").strip()
+    if not stripped:
+        return ""
+    if stripped.startswith(("**", "__")) or _line_contains_balanced_bold_markup(stripped):
+        return stripped
+    if _line_starts_with_symbol_prefix(stripped):
+        return f"**{stripped}**"
+    return f"📌 **{stripped}**"
+
+
+def _line_contains_balanced_bold_markup(line: str) -> bool:
+    return bool(re.search(r"(?:\*\*[^*\n][\s\S]*?[^*\n]\*\*|__[^_\n][\s\S]*?[^_\n]__)", str(line or "")))
+
+
+def _line_starts_with_symbol_prefix(line: str) -> bool:
+    first = str(line or "").strip()[:1]
+    return bool(first and not first.isalnum())
+
+
+def _cron_structural_heading_candidate(lines: list[str], index: int) -> bool:
+    try:
+        line = str(lines[index] or "").strip()
+    except IndexError:
+        return False
+    if not line or _cron_presentation_line_kind(line) != "paragraph":
+        return False
+    if _cron_scalar_detail_line(line):
+        return False
+    if len(line) > 72 or line.endswith((".", "!", "?", ";", ",")):
+        return False
+    previous_lines = [str(item or "").strip() for item in lines[:index]]
+    next_lines = [str(item or "").strip() for item in lines[index + 1 :]]
+    previous_boundary = not previous_lines or previous_lines[-1] == ""
+    if not previous_boundary:
+        return False
+    try:
+        next_nonblank = next(item for item in next_lines if item)
+    except StopIteration:
+        return False
+    return _cron_presentation_line_kind(next_nonblank) in {"bullet", "numbered", "paragraph", "heading"}
+
+
+def _compact_cron_numbered_scalar_detail_lines(lines: list[str]) -> list[str]:
+    """Keep fallback-style numbered item/value rows compact for chat delivery."""
+
+    compacted: list[str] = []
+    index = 0
+    total = len(lines)
+    while index < total:
+        raw_line = lines[index]
+        stripped = raw_line.strip()
+        if _cron_presentation_line_kind(stripped) != "numbered":
+            compacted.append(raw_line)
+            index += 1
+            continue
+
+        detail_index = index + 1
+        while detail_index < total and not lines[detail_index].strip():
+            detail_index += 1
+        if detail_index >= total:
+            compacted.append(raw_line)
+            index += 1
+            continue
+
+        detail = lines[detail_index].strip()
+        if not _cron_scalar_detail_line(detail):
+            compacted.append(raw_line)
+            index += 1
+            continue
+
+        compacted.append(f"{stripped} — {detail}")
+        index = detail_index + 1
+        next_index = index
+        while next_index < total and not lines[next_index].strip():
+            next_index += 1
+        if next_index < total and _cron_presentation_line_kind(lines[next_index].strip()) == "numbered":
+            index = next_index
+    return compacted
+
+
+def _cron_scalar_detail_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped or len(stripped) > 80:
+        return False
+    stripped = stripped.strip("*_`").strip()
+    if re.match(r"^[\$€£¥₹]\s?\d[\d,]*(?:\.\d+)?(?:\s+[A-Z]{2,4})?$", stripped):
+        return True
+    if re.match(r"^[+-]?\d[\d,]*(?:\.\d+)?%$", stripped):
+        return True
+    if re.match(
+        r"(?i)^(?:price|current price|value|quote|last):\s*[\$€£¥₹]?\s?\d[\d,]*(?:\.\d+)?(?:\s+[A-Z]{2,4})?$",
+        stripped,
+    ):
+        return True
+    return False
+
+
+def _compact_cron_heading_detail_groups(lines: list[str]) -> list[str]:
+    """Turn loose heading/detail blocks into readable chat item groups."""
+    heading_count = sum(
+        1
+        for line in lines
+        if _cron_presentation_line_kind(str(line).strip()) == "heading"
+    )
+    if heading_count < 2:
+        return lines
+    compacted: list[str] = []
+    index = 0
+    total = len(lines)
+    while index < total:
+        raw_line = lines[index]
+        stripped = raw_line.strip()
+        if _cron_presentation_line_kind(stripped) != "heading":
+            compacted.append(raw_line)
+            index += 1
+            continue
+
+        scan = index + 1
+        detail_lines: list[str] = []
+        while scan < total:
+            candidate = lines[scan].strip()
+            candidate_kind = _cron_presentation_line_kind(candidate)
+            if candidate_kind == "blank":
+                scan += 1
+                continue
+            if candidate_kind == "heading":
+                break
+            detail_lines.append(candidate)
+            scan += 1
+
+        if detail_lines and all(_cron_presentation_line_kind(line) == "paragraph" for line in detail_lines):
+            compacted.append(stripped)
+            compacted.extend(f"• {line}" for line in detail_lines)
+            index = scan
+            continue
+
+        compacted.append(raw_line)
+        index += 1
+    return compacted
+
+
+def _cron_delivery_preserve_line(line: str) -> bool:
+    return line.startswith(("MEDIA:", "ARTIFACT:"))
+
+
+def _cron_presentation_line_kind(line: str) -> str:
+    if not line:
+        return "blank"
+    if _cron_delivery_preserve_line(line):
+        return "preserved"
+    if re.match(r"^[•*+-]\s+\S", line):
+        return "bullet"
+    if re.match(r"^\d{1,2}[.)]\s+\S", line):
+        return "numbered"
+    if line.endswith(":") and len(line) <= 96:
+        return "heading"
+    return "paragraph"
+
+
+def _wrap_cron_delivery_line(
+    line: str,
+    *,
+    subsequent_indent: str = "",
+) -> list[str]:
+    if len(line) <= CRON_DELIVERY_PRESENTATION_WRAP_WIDTH:
+        return [line]
+    initial_indent = line[: len(line) - len(line.lstrip())]
+    return textwrap.wrap(
+        line,
+        width=CRON_DELIVERY_PRESENTATION_WRAP_WIDTH,
+        initial_indent="",
+        subsequent_indent=subsequent_indent or initial_indent,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [line]
 
 
 def configured_delivery_target(channel: str, settings: object | None = None, env: dict[str, str] | None = None) -> str:
@@ -1292,6 +2123,11 @@ def _cron_result_leaked_internal_tool_output(result: dict[str, object], text: st
             continue
         tool_name = _tool_result_name(tool_result)
         output = _tool_result_output(tool_result)
+        if tool_name in CRON_RAW_TEXT_EVIDENCE_TOOLS:
+            for key in _CRON_RAW_TEXT_EVIDENCE_KEYS_BY_TOOL.get(tool_name, ("text", "content", "result")):
+                output_text = str(output.get(key) or "").strip()
+                if _cron_visible_text_copies_tool_text(visible_text, output_text):
+                    return True
         if tool_name in CRON_INTERNAL_REFERENCE_TOOLS:
             for key in ("text", "message"):
                 output_text = str(output.get(key) or "").strip()
@@ -1311,6 +2147,28 @@ def _cron_result_leaked_internal_tool_output(result: dict[str, object], text: st
                 if receipt_text and (visible_text == receipt_text or receipt_text in visible_text):
                     return True
     return False
+
+
+def _cron_visible_text_copies_tool_text(visible_text: str, output_text: str) -> bool:
+    visible = _compact_match_text(visible_text)
+    output = _compact_match_text(output_text)
+    if len(visible) < CRON_RAW_TEXT_EVIDENCE_MIN_CHARS or len(output) < CRON_RAW_TEXT_EVIDENCE_MIN_CHARS:
+        return False
+    if visible == output:
+        return True
+    if output.startswith(visible[: min(len(visible), _CRON_SENSITIVE_BODY_MATCH_CHARS)]):
+        return True
+    if visible.startswith(output[: min(len(output), _CRON_SENSITIVE_BODY_MATCH_CHARS)]):
+        return True
+    visible_probe = visible[: min(len(visible), _CRON_SENSITIVE_BODY_MATCH_CHARS)]
+    output_probe = output[: min(len(output), _CRON_SENSITIVE_BODY_MATCH_CHARS)]
+    return (
+        len(visible_probe) >= CRON_RAW_TEXT_EVIDENCE_MIN_CHARS
+        and visible_probe in output
+    ) or (
+        len(output_probe) >= CRON_RAW_TEXT_EVIDENCE_MIN_CHARS
+        and output_probe in visible
+    )
 
 
 def _cron_result_has_empty_scope_request(result: dict[str, object]) -> bool:
@@ -1361,15 +2219,36 @@ def cron_structured_result_block_reason(
     text: str | None = None,
 ) -> str | None:
     """Return a delivery block reason from typed cron execution facts."""
-    from nullion.response_sanitizer import is_safe_raw_tool_payload_replacement_reply
+    from nullion.response_sanitizer import (
+        is_safe_raw_tool_payload_replacement_reply,
+        is_structured_tool_evidence_replacement_reply,
+    )
 
-    if result.get("raw_tool_payload_blocked"):
+    if result.get("raw_tool_payload_blocked") and not result.get("cron_raw_tool_payload_repaired"):
         return "cron_run_raw_tool_payload"
     if result.get("cron_run_failed") or result.get("cron_delivery_failed"):
         return str(result.get("reason") or "cron_run_failed")
     if result.get("response_fulfilled") is False:
         return "cron_run_unfulfilled_delivery_contract"
     if is_safe_raw_tool_payload_replacement_reply(reply=text, tool_results=result.get("tool_results") or ()):
+        return "cron_run_raw_tool_payload"
+    if is_structured_tool_evidence_replacement_reply(
+        reply=text,
+        tool_results=result.get("tool_results") or (),
+        user_message=str(result.get("cron_task") or result.get("task") or "") or None,
+    ):
+        return "cron_run_raw_tool_payload"
+    if _cron_result_has_source_points_only_browser_summary(result, text):
+        result["cron_source_points_only_withheld"] = True
+        return "cron_run_source_points_only"
+    if result.get("cron_internal_reference_output_withheld") or result.get(
+        "cron_internal_reference_output_summary_withheld"
+    ):
+        return "cron_run_internal_tool_output_leaked"
+    if result.get("cron_sensitive_tool_identifier_withheld"):
+        return "cron_run_raw_tool_payload"
+    if _cron_sensitive_account_identifier_copied(result, text or ""):
+        result["cron_sensitive_tool_identifier_withheld"] = True
         return "cron_run_raw_tool_payload"
     if _cron_result_leaked_internal_tool_output(result, text):
         return "cron_run_internal_tool_output_leaked"
@@ -1392,6 +2271,40 @@ def cron_structured_result_block_reason(
     return None
 
 
+def cron_delivery_block_reason(result: dict[str, object], text: str, artifacts: object) -> str | None:
+    """Return the shared delivery block reason for every cron surface."""
+    if result.get("reached_iteration_limit"):
+        return "cron_run_reached_iteration_limit"
+    if result.get("suspended_for_approval"):
+        return "waiting_for_approval"
+    structured_reason = cron_structured_result_block_reason(result, artifacts, text=text)
+    if structured_reason is not None:
+        return structured_reason
+    if str(text or "").startswith("Fetched untrusted web content:") and not bool(artifacts):
+        return "cron_run_unfinished_untrusted_web_fetch"
+    return None
+
+
+def _cron_result_has_source_points_only_browser_summary(result: dict[str, object], text: str | None) -> bool:
+    if not _cron_result_has_completed_raw_text_evidence(result):
+        return False
+    visible_text = _cron_delivery_text_without_media_directives(str(text or ""))
+    lines = [line.strip() for line in visible_text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return _CRON_SOURCE_POINTS_HEADING_RE.match(lines[0]) is not None
+
+
+def _cron_result_has_completed_raw_text_evidence(result: dict[str, object]) -> bool:
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "completed":
+            continue
+        tool_name = _tool_result_name(tool_result)
+        if tool_name in CRON_RAW_TEXT_EVIDENCE_TOOLS:
+            return True
+    return False
+
+
 def _cron_delivery_text_is_malformed_or_internal(text: str | None) -> bool:
     raw = str(text or "")
     stripped = raw.strip()
@@ -1402,6 +2315,10 @@ def _cron_delivery_text_is_malformed_or_internal(text: str | None) -> bool:
     if _CRON_INTERNAL_SKILL_PACK_PROMPT_RE.search(stripped):
         return True
     if _CRON_INTERNAL_SKILL_PACK_CONTEXT_RE.search(stripped):
+        return True
+    if _CRON_RAW_TERMINAL_SECTION_RE.search(stripped):
+        return True
+    if _CRON_RAW_NAMED_STRUCTURED_BLOCK_RE.search(stripped):
         return True
     replacement_count = stripped.count("\ufffd")
     if replacement_count >= 2:
@@ -1672,16 +2589,102 @@ def _workspace_state_filenames(result: dict[str, object]) -> set[str]:
     return state_names
 
 
+def _completed_workspace_json_state_paths(result: dict[str, object]) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "completed":
+            continue
+        if _tool_result_name(tool_result) != "file_write":
+            continue
+        path_text = str(_tool_result_output(tool_result).get("path") or "").strip()
+        if not path_text:
+            continue
+        path = Path(path_text).expanduser()
+        if path.suffix.lower() != ".json":
+            continue
+        parts = _path_parts(path_text)
+        if "files" not in parts or "artifacts" in parts:
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_CRON_SILENT_STATE_JSON_BYTES:
+                continue
+        except OSError:
+            continue
+        paths.append(path)
+    return tuple(dict.fromkeys(paths))
+
+
+def _load_cron_json_state(path: Path) -> dict[str, object]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _cron_state_summary_value(data: dict[str, object]) -> tuple[str, str]:
+    for key in ("action", "status", "state", "outcome"):
+        value = data.get(key)
+        if isinstance(value, (str, int, float, bool)) and str(value).strip():
+            return key, str(value).strip()
+    return "", ""
+
+
+def _humanize_cron_state_token(value: str) -> str:
+    return re.sub(r"[_-]+", " ", str(value or "")).strip()
+
+
+def _cron_state_count_lines(data: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    for key, value in data.items():
+        if not isinstance(value, list):
+            continue
+        label = _humanize_cron_state_token(key)
+        if not label:
+            continue
+        lines.append(f"- {label}: {len(value)}")
+        if len(lines) >= 6:
+            break
+    return lines
+
+
+def cron_silent_state_delivery_text(result: dict[str, object]) -> str:
+    """Summarize structured cron state when a run produced no final text.
+
+    This is intentionally limited to small JSON files written under a workspace
+    files area by a completed file_write result. The summary uses top-level
+    structured fields and counts only, so checkpoint contents and local paths do
+    not become user-visible.
+    """
+
+    for path in _completed_workspace_json_state_paths(result):
+        data = _load_cron_json_state(path)
+        key, value = _cron_state_summary_value(data)
+        if not key or not value:
+            continue
+        human_key = _humanize_cron_state_token(key).capitalize()
+        human_value = _humanize_cron_state_token(value)
+        lines = [
+            "The scheduled task completed without new report text, but it recorded structured run state.",
+            "",
+            "Run state:",
+            f"- {human_key}: {human_value}",
+        ]
+        lines.extend(_cron_state_count_lines(data))
+        return "\n".join(lines).strip()
+    return ""
+
+
 def _is_state_artifact_media(path_text: str, state_filenames: set[str]) -> bool:
     if not state_filenames:
         return False
     parts = _path_parts(path_text)
-    return "artifacts" in parts and Path(path_text).name in state_filenames
+    return ("artifacts" in parts or "files" in parts) and Path(path_text).name in state_filenames
 
 
 def _file_write_deliverable_artifact_path(path_text: object, state_filenames: set[str]) -> str:
     path = _artifact_path_from_value(path_text)
-    if not path or _is_state_artifact_media(path, state_filenames):
+    if not path or _is_state_artifact_media(path, state_filenames) or _cron_internal_state_path(path):
         return ""
     parts = _path_parts(path)
     if "artifacts" not in parts:
@@ -1709,14 +2712,89 @@ def _structured_tool_artifact_paths(result: dict[str, object], state_filenames: 
         if tool_name in CRON_DELIVERABLE_ARTIFACT_TOOLS:
             for key in ("artifact_path", "artifact_paths", "artifacts"):
                 for path in _artifact_paths_from_value(output.get(key)):
-                    if _is_state_artifact_media(path, state_filenames):
+                    if _is_state_artifact_media(path, state_filenames) or _cron_internal_state_path(path):
                         continue
                     paths.append(path)
         if tool_name == "file_write":
             path = _file_write_deliverable_artifact_path(output.get("path"), state_filenames)
             if path:
                 paths.append(path)
-    return tuple(dict.fromkeys(paths))
+    return _drop_support_asset_text_markers(tuple(dict.fromkeys(paths)))
+
+
+def _cron_artifact_path_key(path_text: object) -> str:
+    path = Path(str(path_text or "")).expanduser()
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _cron_delivery_candidate_paths(
+    *,
+    text_referenced_paths: Sequence[str],
+    structured_paths: Sequence[str],
+) -> tuple[str, ...]:
+    if not text_referenced_paths:
+        return tuple(dict.fromkeys(structured_paths))
+    if not structured_paths:
+        return tuple(dict.fromkeys(text_referenced_paths))
+
+    structured_keys = {_cron_artifact_path_key(path) for path in structured_paths}
+    text_paths_are_structured_outputs = all(
+        _cron_artifact_path_key(path) in structured_keys for path in text_referenced_paths
+    )
+    if text_paths_are_structured_outputs:
+        return tuple(dict.fromkeys([*text_referenced_paths, *structured_paths]))
+    return tuple(dict.fromkeys(text_referenced_paths))
+
+
+def _path_resolved_or_expanded(path_text: str) -> Path:
+    path = Path(str(path_text or "")).expanduser()
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def _asset_dir_belongs_to_primary_artifact(asset_dir: Path, primary_paths: tuple[Path, ...]) -> bool:
+    dir_name = asset_dir.name.lower()
+    if "asset" not in dir_name:
+        return False
+    for primary in primary_paths:
+        if asset_dir.parent != primary.parent:
+            continue
+        primary_stem = primary.stem.lower()
+        if dir_name in {
+            f"{primary_stem}_assets",
+            f"{primary_stem}-assets",
+            f"{primary_stem}.assets",
+            "assets",
+        }:
+            return True
+        if dir_name.endswith("_assets") or dir_name.endswith("-assets") or dir_name.endswith(".assets"):
+            return True
+    return False
+
+
+def _drop_support_asset_text_markers(paths: tuple[str, ...]) -> tuple[str, ...]:
+    primary_paths = tuple(
+        _path_resolved_or_expanded(path)
+        for path in paths
+        if Path(str(path or "")).suffix.lower() in _PRIMARY_RENDERED_ARTIFACT_EXTENSIONS
+    )
+    if not primary_paths:
+        return paths
+    kept: list[str] = []
+    for path_text in paths:
+        path = _path_resolved_or_expanded(path_text)
+        if (
+            path.suffix.lower() in _TEXT_SUPPORT_ASSET_EXTENSIONS
+            and _asset_dir_belongs_to_primary_artifact(path.parent, primary_paths)
+        ):
+            continue
+        kept.append(path_text)
+    return tuple(kept)
 
 
 def _filter_state_media_from_text(text: str, state_filenames: set[str]) -> str:
@@ -1752,10 +2830,16 @@ def _filter_state_media_from_text(text: str, state_filenames: set[str]) -> str:
 
     state_media_indexes = [index for index, block in enumerate(blocks) if block.get("state_media")]
     caption_indexes = {
-        max((index for index in range(media_index) if str(blocks[index].get("text") or "").strip()), default=-1)
+        caption_index
         for media_index in state_media_indexes
+        if (
+            caption_index := max(
+                (index for index in range(media_index) if str(blocks[index].get("text") or "").strip()),
+                default=-1,
+            )
+        ) >= 0
+        and _cron_state_media_caption_is_internal(str(blocks[caption_index].get("text") or ""))
     }
-    caption_indexes.discard(-1)
     kept: list[str] = []
     for index, block in enumerate(blocks):
         block_text = str(block.get("text") or "").strip()
@@ -1763,6 +2847,15 @@ def _filter_state_media_from_text(text: str, state_filenames: set[str]) -> str:
             continue
         kept.append(block_text)
     return "\n\n".join(kept).strip()
+
+
+def _cron_state_media_caption_is_internal(text: str) -> bool:
+    compact = " ".join(str(text or "").split())
+    if not compact:
+        return False
+    if len(compact) > 80:
+        return False
+    return "\n" not in str(text or "").strip()
 
 
 def _strip_split_artifact_directives(text: str, deliverable_paths: tuple[str, ...]) -> str:
@@ -1878,7 +2971,7 @@ def _resolve_relative_media_directives(text: str, *, principal_id: str | None) -
     return "\n".join(lines).strip() if changed else text
 
 
-def _append_media_directives(text: str, deliverable_paths: tuple[str, ...]) -> str:
+def _append_media_directives(text: str, deliverable_paths: tuple[str, ...], *, separator: str = "\n\n") -> str:
     if not deliverable_paths:
         return text
     from nullion.artifacts import parse_media_directive_line
@@ -1892,16 +2985,16 @@ def _append_media_directives(text: str, deliverable_paths: tuple[str, ...]) -> s
     if not media_lines:
         return text
     parts = [part for part in (str(text or "").strip(), "\n".join(media_lines)) if part]
-    return "\n\n".join(parts)
+    return separator.join(parts)
 
 
 def _cron_internal_state_path(path_text: object) -> bool:
     path = Path(str(path_text or "").strip().strip("`'\"<>.,)")).expanduser()
     parts = _path_parts(str(path))
-    if "artifacts" not in parts:
+    if "artifacts" not in parts and "files" not in parts:
         return False
     suffix = path.suffix.lower()
-    if suffix in {".json", ".jsonl", ".db", ".sqlite", ".sqlite3"}:
+    if suffix in _INTERNAL_STATE_ARTIFACT_EXTENSIONS:
         return True
     name = path.name.casefold()
     return any(token in name for token in ("checkpoint", "state", "cache", "snapshot"))
@@ -1934,13 +3027,34 @@ def _filter_internal_state_paths_from_text(text: str, deliverable_paths: tuple[s
 
 
 def _cron_text_artifact_path_candidates(text: str) -> tuple[str, ...]:
+    from nullion.artifacts import media_candidate_paths_from_text
+
     candidates: list[str] = []
     for raw_line in str(text or "").splitlines():
+        candidates.extend(str(path) for path in media_candidate_paths_from_text(raw_line))
         for match in _CRON_ARTIFACT_PATH_RE.finditer(raw_line):
             path_text = match.group(0).rstrip(".,;:)]}")
             if path_text:
                 candidates.append(path_text)
     return tuple(dict.fromkeys(candidates))
+
+
+def _cron_text_media_directive_separator(text: str, deliverable_paths: tuple[str, ...]) -> str | None:
+    if not deliverable_paths:
+        return None
+    from nullion.artifacts import parse_media_directive_line
+
+    deliverable = {str(Path(path).expanduser()) for path in deliverable_paths}
+    deliverable_names = {Path(path).name for path in deliverable_paths}
+    lines = str(text or "").splitlines()
+    for index, raw_line in enumerate(lines):
+        directive = parse_media_directive_line(raw_line)
+        if directive is None:
+            continue
+        directive_path = str(Path(str(directive.path)).expanduser())
+        if directive_path in deliverable or Path(str(directive.path)).name in deliverable_names:
+            return "\n\n" if index > 0 and not lines[index - 1].strip() else "\n"
+    return None
 
 
 def _text_referenced_deliverable_paths(
@@ -2039,6 +3153,45 @@ def _sensitive_account_tool_metadata_values(value: object) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _sensitive_account_schema_key(raw_key: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(raw_key or "").strip().lower()).strip("_")
+
+
+def _opaque_account_identifier(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    compact = _compact_match_text(value).strip()
+    if not compact or len(compact) < 10:
+        return ""
+    if "@" in compact or "://" in compact:
+        return ""
+    if not _CRON_OPAQUE_ACCOUNT_IDENTIFIER_RE.fullmatch(compact):
+        return ""
+    return compact
+
+
+def _sensitive_account_tool_identifier_values(value: object) -> tuple[str, ...]:
+    values: list[str] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, dict):
+            for raw_key, child in node.items():
+                key = _sensitive_account_schema_key(raw_key)
+                if key in _CRON_SENSITIVE_IDENTIFIER_KEYS or key.endswith("_id"):
+                    identifier = _opaque_account_identifier(child)
+                    if identifier:
+                        values.append(identifier)
+                    continue
+                visit(child)
+            return
+        if isinstance(node, (list, tuple, set, frozenset)):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return tuple(dict.fromkeys(values))
+
+
 def _cron_sensitive_account_body_leaked(result: dict[str, object], text: str) -> bool:
     visible_text = _compact_match_text(text)
     if len(visible_text) < _CRON_SENSITIVE_BODY_MIN_CHARS:
@@ -2067,6 +3220,27 @@ def _cron_sensitive_account_body_leaked(result: dict[str, object], text: str) ->
     return False
 
 
+def _cron_sensitive_account_identifier_copied(result: dict[str, object], text: str) -> bool:
+    visible_text = _compact_match_text(text)
+    if not visible_text:
+        return False
+    visible_lower = visible_text.lower()
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "completed":
+            continue
+        if _tool_result_name(tool_result) not in _CRON_SENSITIVE_ACCOUNT_TOOLS:
+            continue
+        candidates = [*_sensitive_account_tool_identifier_values(_tool_result_output(tool_result))]
+        if isinstance(tool_result, dict):
+            candidates.extend(_sensitive_account_tool_identifier_values(tool_result.get("message")))
+        else:
+            candidates.extend(_sensitive_account_tool_identifier_values(getattr(tool_result, "message", None)))
+        for raw_value in dict.fromkeys(candidates):
+            if raw_value.lower() in visible_lower:
+                return True
+    return False
+
+
 def _cron_sensitive_account_metadata_copied(result: dict[str, object], text: str) -> bool:
     visible_text = _compact_match_text(text)
     if len(visible_text) < _CRON_SENSITIVE_BODY_MIN_CHARS:
@@ -2091,13 +3265,205 @@ def _cron_sensitive_account_metadata_copied(result: dict[str, object], text: str
     return False
 
 
+def _cron_sensitive_account_preview_dumped(result: dict[str, object], text: str) -> bool:
+    visible_text = str(text or "").strip()
+    if not visible_text:
+        return False
+    has_completed_account_tool = any(
+        _normalized_tool_result_status(tool_result) == "completed"
+        and _tool_result_name(tool_result) in _CRON_SENSITIVE_ACCOUNT_TOOLS
+        for tool_result in result.get("tool_results") or ()
+    )
+    if not has_completed_account_tool:
+        return False
+    labels = {
+        match.group(1).casefold()
+        for line in visible_text.splitlines()
+        if (match := _CRON_ACCOUNT_PREVIEW_LABEL_RE.match(line.strip()))
+    }
+    return "preview" in labels and bool(labels.intersection({"from", "date"}))
+
+
+def _cron_delivery_payload_lines(text: object) -> tuple[str, ...]:
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        cleaned = re.sub(r"[*_`]+", "", raw_line).strip(" \t>")
+        if not cleaned:
+            continue
+        upper = cleaned.upper()
+        if "SCHEDULED TASK" in upper and (
+            cleaned.startswith("⏰")
+            or upper.startswith("MANUAL SCHEDULED TASK")
+            or upper.startswith("SCHEDULED TASK")
+        ):
+            continue
+        lines.append(cleaned)
+    return tuple(lines)
+
+
+def _cron_completed_account_tools(result: dict[str, object]) -> tuple[object, ...]:
+    return tuple(
+        tool_result
+        for tool_result in result.get("tool_results") or ()
+        if _normalized_tool_result_status(tool_result) == "completed"
+        and _tool_result_name(tool_result) in _CRON_SENSITIVE_ACCOUNT_TOOLS
+    )
+
+
+def _cron_account_tool_summary_copied(result: dict[str, object], text: str) -> bool:
+    visible_lower = _compact_match_text(text).casefold()
+    if not visible_lower:
+        return False
+    copied = 0
+    seen: set[str] = set()
+    for tool_result in _cron_completed_account_tools(result):
+        for record in _iter_sensitive_account_summary_records(_tool_result_output(tool_result)):
+            title = _account_summary_first_field(
+                record,
+                _CRON_ACCOUNT_SUMMARY_TITLE_KEYS,
+                max_chars=_CRON_ACCOUNT_SUMMARY_FIELD_MAX_CHARS,
+            )
+            normalized = _compact_match_text(title).casefold()
+            if len(normalized) < 4 or normalized in seen:
+                continue
+            seen.add(normalized)
+            if normalized not in visible_lower:
+                continue
+            copied += 1
+            if copied >= 2:
+                return True
+    return False
+
+
+def _cron_account_tool_summary_dumped(result: dict[str, object], text: str) -> bool:
+    if not _cron_completed_account_tools(result):
+        return False
+    payload_lines = _cron_delivery_payload_lines(text)
+    if not payload_lines:
+        return False
+    first_line = payload_lines[0]
+    if not _CRON_ACCOUNT_TOOL_SUMMARY_RE.match(first_line):
+        return False
+    if _cron_account_tool_summary_copied(result, text):
+        return True
+    if len(payload_lines) <= 3:
+        return True
+    return any(line.startswith(("-", "•", "*")) for line in payload_lines[1:])
+
+
+def _cron_file_inventory_names(value: object) -> tuple[str, ...]:
+    names: list[str] = []
+
+    def add_name(raw: object) -> None:
+        if not isinstance(raw, str):
+            return
+        compact = raw.strip()
+        if not compact:
+            return
+        name = Path(compact).name
+        if not name or name in {".", ".."}:
+            return
+        if "." not in name and "/" not in compact and "\\" not in compact:
+            return
+        names.append(name)
+
+    def collect_file_search_paths(payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        matches = payload.get("matches")
+        if isinstance(matches, (list, tuple)):
+            for match in matches:
+                if isinstance(match, str):
+                    add_name(match)
+                elif isinstance(match, dict):
+                    add_name(match.get("path"))
+        match_details = payload.get("match_details")
+        if isinstance(match_details, (list, tuple)):
+            for match in match_details:
+                if isinstance(match, dict):
+                    add_name(match.get("path"))
+        preview = payload.get("preview")
+        if isinstance(preview, str) and preview.strip():
+            try:
+                parsed_preview = json.loads(preview)
+            except Exception:
+                parsed_preview = None
+            collect_file_search_paths(parsed_preview)
+
+    def visit(node: object, *, parent_key: str = "") -> None:
+        if isinstance(node, dict):
+            collect_file_search_paths(node)
+            for raw_key, child in node.items():
+                visit(child, parent_key=str(raw_key or "").strip().lower())
+            return
+        if isinstance(node, (list, tuple, set, frozenset)):
+            for child in node:
+                visit(child, parent_key=parent_key)
+            return
+        if not isinstance(node, str):
+            return
+        if parent_key and parent_key not in _CRON_FILE_INVENTORY_KEYS:
+            return
+        add_name(node)
+
+    visit(value)
+    return tuple(dict.fromkeys(names))
+
+
+def _cron_file_inventory_dumped(result: dict[str, object], text: str) -> bool:
+    visible_text = str(text or "").strip()
+    if not visible_text:
+        return False
+    visible_lower = visible_text.casefold()
+    copied_names = 0
+    has_completed_file_inventory_tool = False
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "completed":
+            continue
+        if _tool_result_name(tool_result) not in _CRON_FILE_INVENTORY_TOOLS:
+            continue
+        has_completed_file_inventory_tool = True
+        for name in _cron_file_inventory_names(_tool_result_output(tool_result)):
+            if name.casefold() not in visible_lower:
+                continue
+            copied_names += 1
+            if copied_names >= 2:
+                return True
+    return has_completed_file_inventory_tool and copied_names >= 1 and "matching file" in visible_lower
+
+
 def _compact_safe_account_summary_value(value: object, *, max_chars: int) -> str:
     compact = html.unescape(_compact_match_text(value)).strip()
     if not compact:
         return ""
     if len(compact) <= max_chars:
         return compact
-    return f"{compact[:max_chars].rstrip()}..."
+    if max_chars <= 24:
+        return f"{compact[:max(0, max_chars - 3)].rstrip()}..."
+    marker = " ... [truncated] ... "
+    budget = max_chars - len(marker)
+    if budget <= 12:
+        return f"{compact[:max(0, max_chars - 3)].rstrip()}..."
+    head_chars = max(1, int(budget * 0.65))
+    tail_chars = max(1, budget - head_chars)
+    omitted = max(0, len(compact) - head_chars - tail_chars)
+    marker = f" ... [truncated; {omitted} chars omitted] ... "
+    budget = max_chars - len(marker)
+    if budget <= 12:
+        return f"{compact[:max(0, max_chars - 3)].rstrip()}..."
+    head_chars = max(1, int(budget * 0.65))
+    tail_chars = max(1, budget - head_chars)
+    return f"{compact[:head_chars].rstrip()}{marker}{compact[-tail_chars:].lstrip()}"
+
+
+def _cron_head_tail_sample(items: list[object], *, head: int, tail: int, limit: int) -> list[object]:
+    if len(items) <= limit:
+        return list(items)
+    head_count = max(0, min(head, limit))
+    tail_count = max(0, min(tail, limit - head_count))
+    if tail_count == 0:
+        return list(items[:head_count])
+    return [*items[:head_count], *items[-tail_count:]]
 
 
 def _account_summary_field_values(record: dict[object, object], keys: frozenset[str]) -> tuple[str, ...]:
@@ -2136,7 +3502,6 @@ def _iter_sensitive_account_summary_records(value: object) -> tuple[dict[object,
             has_summary_field = bool(
                 _account_summary_field_values(node, _CRON_ACCOUNT_SUMMARY_TITLE_KEYS)
                 or _account_summary_field_values(node, _CRON_ACCOUNT_SUMMARY_SOURCE_KEYS)
-                or _account_summary_field_values(node, _CRON_ACCOUNT_SUMMARY_DATE_KEYS)
                 or _account_summary_field_values(node, _CRON_ACCOUNT_SUMMARY_DETAIL_KEYS)
             )
             if has_summary_field:
@@ -2183,7 +3548,12 @@ def _iter_sensitive_account_summary_records(value: object) -> tuple[dict[object,
     return tuple(unique)
 
 
-def _safe_account_message_summary_from_tool_results(result: dict[str, object]) -> str:
+def _safe_account_message_summary_from_tool_results(
+    result: dict[str, object],
+    *,
+    include_detail: bool = True,
+    intro: str | None = None,
+) -> str:
     blocks: list[str] = []
     seen_records: set[tuple[str, str, str]] = set()
     for tool_result in result.get("tool_results") or ():
@@ -2207,10 +3577,14 @@ def _safe_account_message_summary_from_tool_results(result: dict[str, object]) -
                 _CRON_ACCOUNT_SUMMARY_DATE_KEYS,
                 max_chars=_CRON_ACCOUNT_SUMMARY_FIELD_MAX_CHARS,
             )
-            detail = _account_summary_first_field(
-                record,
-                _CRON_ACCOUNT_SUMMARY_DETAIL_KEYS,
-                max_chars=_CRON_ACCOUNT_SUMMARY_DETAIL_MAX_CHARS,
+            detail = (
+                _account_summary_first_field(
+                    record,
+                    _CRON_ACCOUNT_SUMMARY_DETAIL_KEYS,
+                    max_chars=_CRON_ACCOUNT_SUMMARY_DETAIL_MAX_CHARS,
+                )
+                if include_detail
+                else ""
             )
             identity = (title.casefold(), source.casefold(), date.casefold())
             if not any(identity) or identity in seen_records:
@@ -2231,15 +3605,24 @@ def _safe_account_message_summary_from_tool_results(result: dict[str, object]) -
     if not blocks:
         return ""
     return (
-        "The scheduled task checked email/account data. Raw message body text was removed before delivery.\n\n"
+        (
+            intro
+            or "The scheduled task checked email/account data. Raw message body text was removed before delivery."
+        )
+        + "\n\n"
         "Safe summary from verified tool results:\n"
         + "\n\n".join(blocks)
     )
 
 
-def _safe_account_message_summary(result: dict[str, object], *, use_structured_summary: bool = False) -> str:
+def _safe_account_message_summary(
+    result: dict[str, object],
+    *,
+    use_structured_summary: bool = False,
+    include_detail: bool = True,
+) -> str:
     if use_structured_summary:
-        summary = _safe_account_message_summary_from_tool_results(result)
+        summary = _safe_account_message_summary_from_tool_results(result, include_detail=include_detail)
         if summary:
             result["cron_sensitive_tool_summary_repaired"] = True
             return summary
@@ -2250,14 +3633,79 @@ def _safe_account_message_summary(result: dict[str, object], *, use_structured_s
     )
 
 
+def _cron_account_report_failure_text(copied: str) -> str:
+    copied = str(copied or "account connector output").strip()
+    return (
+        "The scheduled task checked connected account data, but the generated delivery copied "
+        f"{copied} instead of the scheduled-task report. That connector dump was not delivered. "
+        "No verified deadline/action report was produced for this run."
+    )
+
+
+def _cron_internal_reference_tool_output_leaked(result: dict[str, object], text: str) -> bool:
+    visible_text = _compact_match_text(text)
+    if len(visible_text) < _CRON_SENSITIVE_BODY_MIN_CHARS:
+        return False
+    for tool_result in result.get("tool_results") or ():
+        if _normalized_tool_result_status(tool_result) != "completed":
+            continue
+        if _tool_result_name(tool_result) not in CRON_INTERNAL_REFERENCE_TOOLS:
+            continue
+        reference_text = _compact_match_text(_tool_result_output(tool_result).get("text"))
+        if len(reference_text) < _CRON_SENSITIVE_BODY_MIN_CHARS:
+            continue
+        reference_probe = reference_text[: min(len(reference_text), _CRON_SENSITIVE_BODY_MATCH_CHARS)]
+        visible_probe = visible_text[: min(len(visible_text), _CRON_SENSITIVE_BODY_MATCH_CHARS)]
+        if reference_text in visible_text or visible_text in reference_text:
+            return True
+        if len(reference_probe) >= _CRON_SENSITIVE_BODY_MIN_CHARS and reference_probe in visible_text:
+            return True
+        if len(visible_probe) >= _CRON_SENSITIVE_BODY_MIN_CHARS and visible_probe in reference_text:
+            return True
+    return False
+
+
+def _replace_internal_reference_output_leak(result: dict[str, object], text: str) -> str:
+    if not _cron_internal_reference_tool_output_leaked(result, text):
+        return text
+    result["cron_internal_reference_output_withheld"] = True
+    result["cron_internal_reference_output_summary_withheld"] = True
+    return _cron_account_report_failure_text("internal connector/tool documentation")
+
+
 def _replace_sensitive_account_leak(result: dict[str, object], text: str) -> str:
+    if _cron_sensitive_account_preview_dumped(result, text):
+        result["cron_sensitive_tool_preview_withheld"] = True
+        result["cron_sensitive_tool_summary_withheld"] = True
+        return _cron_account_report_failure_text("an email preview")
     if _cron_sensitive_account_body_leaked(result, text):
         result["cron_sensitive_tool_body_withheld"] = True
-        return _safe_account_message_summary(result, use_structured_summary=True)
+        result["cron_sensitive_tool_summary_withheld"] = True
+        return _cron_account_report_failure_text("raw account message content")
+    if _cron_sensitive_account_identifier_copied(result, text):
+        result["cron_sensitive_tool_identifier_withheld"] = True
+        result["cron_sensitive_tool_summary_withheld"] = True
+        return _cron_account_report_failure_text("account message identifiers")
     if result.get("raw_tool_payload_blocked") and _cron_sensitive_account_metadata_copied(result, text):
         result["cron_sensitive_tool_metadata_withheld"] = True
-        return _safe_account_message_summary(result)
+        result["cron_sensitive_tool_summary_withheld"] = True
+        return _cron_account_report_failure_text("account message metadata")
+    if _cron_account_tool_summary_dumped(result, text):
+        result["cron_account_tool_summary_withheld"] = True
+        result["cron_account_tool_summary_withheld_without_repair"] = True
+        return _cron_account_report_failure_text("a connector result list")
     return text
+
+
+def _replace_file_inventory_leak(result: dict[str, object], text: str) -> str:
+    if not _cron_file_inventory_dumped(result, text):
+        return text
+    result["cron_file_inventory_withheld"] = True
+    return (
+        "The scheduled task searched files, but the generated delivery copied a file-search "
+        "inventory instead of a verified report or task summary, so it was withheld. No verified "
+        "scheduled-task result was produced for this run."
+    )
 
 
 def cron_delivery_text_from_result(
@@ -2277,32 +3725,37 @@ def cron_delivery_text_from_result(
     from nullion.response_fulfillment_contract import user_visible_text_from_output
 
     text = cron_delivery_text(user_visible_text_from_output(result), result.get("artifacts"))
+    text = _replace_internal_reference_output_leak(result, text)
     text = _replace_sensitive_account_leak(result, text)
+    text = _replace_file_inventory_leak(result, text)
     text = _normalize_split_artifact_directives(text)
     text = _resolve_relative_media_directives(text, principal_id=principal_id)
     state_filenames = _workspace_state_filenames(result)
-    deliverable_paths = tuple(
-        dict.fromkeys(
-            [
-                *_structured_tool_artifact_paths(result, state_filenames),
-                *_text_referenced_deliverable_paths(
-                    text,
-                    principal_id=principal_id,
-                    state_filenames=state_filenames,
-                ),
-            ]
-        )
+    structured_paths = _structured_tool_artifact_paths(result, state_filenames)
+    text_referenced_paths = _text_referenced_deliverable_paths(
+        text,
+        principal_id=principal_id,
+        state_filenames=state_filenames,
+    )
+    deliverable_paths = _cron_delivery_candidate_paths(
+        text_referenced_paths=text_referenced_paths,
+        structured_paths=structured_paths,
     )
     deliverable_paths, support_assets = _prepare_cron_deliverable_paths_for_delivery(
         deliverable_paths,
         html_image_delivery_mode=_normalize_html_image_delivery_mode(html_image_delivery_mode),
     )
+    explicit_media_separator = _cron_text_media_directive_separator(text, deliverable_paths)
     text = _filter_state_media_from_text(text, state_filenames)
     text = _filter_html_support_media_from_text(text, support_assets)
     text = _strip_split_artifact_directives(text, deliverable_paths)
     text = _filter_internal_state_paths_from_text(text, deliverable_paths)
     text = _strip_deliverable_artifact_paths_from_text(text, deliverable_paths)
-    return _append_media_directives(text, deliverable_paths)
+    return _append_media_directives(
+        text,
+        deliverable_paths,
+        separator=explicit_media_separator or "\n\n",
+    )
 
 
 def cron_delivery_artifact_paths_from_result(
@@ -2316,12 +3769,18 @@ def cron_delivery_artifact_paths_from_result(
     from nullion.artifacts import parse_media_directive_line
 
     state_filenames = _workspace_state_filenames(result)
-    paths = list(_structured_tool_artifact_paths(result, state_filenames))
-    paths.extend(
+    structured_paths = list(_structured_tool_artifact_paths(result, state_filenames))
+    text_referenced_paths = list(
         _text_referenced_deliverable_paths(
             text or "",
             principal_id=principal_id,
             state_filenames=state_filenames,
+        )
+    )
+    paths = list(
+        _cron_delivery_candidate_paths(
+            text_referenced_paths=text_referenced_paths,
+            structured_paths=structured_paths,
         )
     )
     for raw_line in str(text or "").splitlines():
@@ -2532,6 +3991,7 @@ class _CronRunDeliveryState(TypedDict, total=False):
     delivery_channel: str
     delivery_target: str
     conversation_id: str
+    agent_conversation_id: str
     result: dict[str, object]
     text: str
     artifacts: object
@@ -2575,6 +4035,7 @@ def _cron_run_resolve_route_node(state: _CronRunDeliveryState) -> dict[str, obje
         "delivery_channel": delivery_channel,
         "delivery_target": delivery_target,
         "conversation_id": conversation_id,
+        "agent_conversation_id": str(state.get("agent_conversation_id") or conversation_id),
     }
 
 
@@ -2590,11 +4051,11 @@ def _cron_run_agent_node(state: _CronRunDeliveryState) -> dict[str, object]:
         if signature is not None and "cancellation_checker" in signature.parameters:
             result = run_agent_turn(
                 state["job"],
-                state["conversation_id"],
+                str(state.get("agent_conversation_id") or state["conversation_id"]),
                 cancellation_checker=state.get("cancellation_checker"),
             )
         else:
-            result = run_agent_turn(state["job"], state["conversation_id"])
+            result = run_agent_turn(state["job"], str(state.get("agent_conversation_id") or state["conversation_id"]))
     except BaseException as exc:
         error_text = " ".join(str(exc).strip().split()) or exc.__class__.__name__
         failure_result = _cron_agent_exception_result(exc)
@@ -2678,6 +4139,11 @@ def _cron_run_prepare_delivery_node(state: _CronRunDeliveryState) -> dict[str, o
             principal_id=state.get("conversation_id"),
             html_image_delivery_mode=html_image_delivery_mode,
         )
+    if not str(text or "").strip():
+        replacement = cron_silent_state_delivery_text(result)
+        if str(replacement or "").strip():
+            text = str(replacement)
+            result["cron_silent_state_result_replaced"] = True
     if not str(text or "").strip() and state["callbacks"].silent_delivery_text is not None:
         replacement = state["callbacks"].silent_delivery_text(state["job"], state.get("label", ""), result)
         if str(replacement or "").strip():
@@ -3019,9 +4485,19 @@ def run_cron_delivery_workflow(
     label: str,
     callbacks: CronRunDeliveryCallbacks,
     cancellation_checker: Callable[[], bool] | None = None,
+    agent_conversation_id: str | None = None,
 ) -> dict[str, object]:
+    initial_state: _CronRunDeliveryState = {
+        "job": job,
+        "label": label,
+        "callbacks": callbacks,
+        "result": {},
+        "cancellation_checker": cancellation_checker,
+    }
+    if agent_conversation_id:
+        initial_state["agent_conversation_id"] = str(agent_conversation_id)
     final_state = _compiled_cron_run_delivery_graph().invoke(
-        {"job": job, "label": label, "callbacks": callbacks, "result": {}, "cancellation_checker": cancellation_checker}
+        initial_state
     )
     result = final_state.get("result")
     return dict(result or {})
@@ -3038,6 +4514,7 @@ __all__ = [
     "cron_conversation_id",
     "cron_artifact_validation_block_reason",
     "cron_delivery_artifact_paths_from_result",
+    "cron_delivery_block_reason",
     "cron_delivery_reply_text",
     "cron_delivery_target",
     "cron_delivery_text",
@@ -3045,8 +4522,10 @@ __all__ = [
     "cron_structured_result_block_reason",
     "cancel_manual_cron_background_run",
     "cancel_manual_cron_background_runs",
+    "default_cron_agent_max_iterations",
     "effective_cron_delivery_channel",
     "manual_cron_deferred_receipt",
+    "manual_cron_background_agent_conversation_id",
     "manual_cron_running_status_text",
     "manual_cron_status_group_id",
     "manual_cron_silent_delivery_text",

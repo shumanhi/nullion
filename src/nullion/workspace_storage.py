@@ -20,9 +20,10 @@ class WorkspaceStorageRoots:
     uploads: Path
     media: Path
     artifacts: Path
+    scratch: Path
 
     def all_roots(self) -> tuple[Path, ...]:
-        return (self.root, self.files, self.uploads, self.media, self.artifacts)
+        return (self.root, self.files, self.uploads, self.media, self.artifacts, self.scratch)
 
 
 def workspace_storage_base() -> Path:
@@ -32,6 +33,9 @@ def workspace_storage_base() -> Path:
     data_dir = os.environ.get("NULLION_DATA_DIR")
     if isinstance(data_dir, str) and data_dir.strip():
         return (Path(data_dir).expanduser().resolve() / "workspaces").resolve()
+    nullion_home = os.environ.get("NULLION_HOME")
+    if isinstance(nullion_home, str) and nullion_home.strip():
+        return (Path(nullion_home).expanduser().resolve() / "workspaces").resolve()
     return (Path.home() / ".nullion" / "workspaces").resolve()
 
 
@@ -50,6 +54,7 @@ def workspace_storage_roots_for_workspace(workspace_id: str | None, *, create: b
         uploads=root / "uploads",
         media=root / "media",
         artifacts=root / "artifacts",
+        scratch=root / "scratch",
     )
     if create:
         for path in roots.all_roots():
@@ -99,6 +104,7 @@ def format_workspace_storage_for_prompt(*, principal_id: str | None = None) -> s
         f"- Save ordinary user files under: {roots.files}\n"
         f"- Save uploaded/input files under: {roots.uploads}\n"
         f"- Save media scratch or generated media under: {roots.media}\n"
+        f"- Save internal scratch/helper scripts under: {roots.scratch}\n"
         f"- Save downloadable artifacts under: {roots.artifacts}"
     )
 

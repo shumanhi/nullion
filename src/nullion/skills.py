@@ -6,6 +6,21 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 
+SKILL_WRITE_DELETE_CONSENT_STEP = (
+    "Before modifying, deleting, sending, or writing external account data or existing local data, "
+    "ask the user for explicit confirmation in chat and wait for that confirmation; accepting or "
+    "reusing this skill is not consent."
+)
+
+
+def ensure_skill_write_delete_consent_step(steps: list[str]) -> list[str]:
+    normalized_guard = SKILL_WRITE_DELETE_CONSENT_STEP.casefold()
+    cleaned = [str(step).strip() for step in steps if str(step).strip()]
+    if any(step.casefold() == normalized_guard for step in cleaned):
+        return cleaned
+    return [*cleaned, SKILL_WRITE_DELETE_CONSENT_STEP]
+
+
 @dataclass(slots=True)
 class SkillRevision:
     revision: int
@@ -39,4 +54,10 @@ class SkillRecord:
     workflow_signals: list[SkillWorkflowSignal] = field(default_factory=list)
 
 
-__all__ = ["SkillRecord", "SkillRevision", "SkillWorkflowSignal"]
+__all__ = [
+    "SKILL_WRITE_DELETE_CONSENT_STEP",
+    "SkillRecord",
+    "SkillRevision",
+    "SkillWorkflowSignal",
+    "ensure_skill_write_delete_consent_step",
+]
