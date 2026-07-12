@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import inspect
 import logging
+import time
 from typing import Any, Callable, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -100,6 +101,20 @@ def platform_chat_id(platform: str, conversation_id: str | None = None, chat_id:
     if normalized_platform in {"telegram", "slack", "discord"}:
         return raw_conversation
     return f"{normalized_platform}:{raw_conversation}"
+
+
+def platform_conversation_id(platform: str, principal_id: str | None, conversation_id: str | None = None) -> str | None:
+    explicit = str(conversation_id or "").strip()
+    if explicit and ":" in explicit:
+        return explicit
+    principal = str(principal_id or "").strip()
+    normalized_platform = str(platform or "").strip().lower() or "telegram"
+    if principal and ":" in principal:
+        return principal
+    raw_id = principal or explicit
+    if not raw_id:
+        return None
+    return f"{normalized_platform}:{raw_id}"
 
 
 def _coerce_stored_tool_results(raw_results: object) -> list[object]:
@@ -1261,6 +1276,7 @@ def _latest_stored_turn_delivery_evidence(
     conversation_id: str | None,
     *,
     request_text: str | None = None,
+    turn_id: str | None = None,
 ) -> tuple[str | None, list[str], list[object], list[str]]:
     if not conversation_id:
         return None, [], [], []
@@ -1269,18 +1285,60 @@ def _latest_stored_turn_delivery_evidence(
     if not callable(list_events):
         return None, [], [], []
     try:
-        events = list_events(conversation_id, event_type="conversation.chat_turn", limit=1)
+        # Multiple independent turns may finish in the same conversation at
+        # nearly the same time.  Selecting only the latest event can bind this
+        # delivery to a sibling turn and fall back to an earlier streamed
+        # preview instead of the completed response.  Keep the lookup bounded,
+        # but resolve the exact typed turn identity whenever it is available.
+        events = list_events(conversation_id, event_type="conversation.chat_turn", limit=32)
     except Exception:
         return None, [], [], []
     if not events:
         return None, [], [], []
-    event = events[-1]
-    if not isinstance(event, dict):
+
+    normalized_request = " ".join(str(request_text or "").split())
+    normalized_turn_id = str(turn_id or "").strip()
+    candidates = [event for event in reversed(events) if isinstance(event, dict)]
+    event = None
+    if normalized_turn_id:
+        event = next(
+            (
+                candidate
+                for candidate in candidates
+                if str(candidate.get("turn_id") or "").strip() == normalized_turn_id
+            ),
+            None,
+        )
+    elif normalized_request:
+        event = next(
+            (
+                candidate
+                for candidate in candidates
+                if " ".join(str(candidate.get("user_message") or "").split()) == normalized_request
+            ),
+            None,
+        )
+        if event is None:
+            # Older persisted turns did not carry request identity.  They are
+            # safe as a compatibility fallback only when the record itself has
+            # neither a user message nor a turn id; never substitute a sibling
+            # event that explicitly belongs to a different request.
+            event = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if not str(candidate.get("user_message") or "").strip()
+                    and not str(candidate.get("turn_id") or "").strip()
+                ),
+                None,
+            )
+    elif candidates:
+        event = candidates[0]
+    if event is None:
         return None, [], [], []
     stored_user_message = event.get("user_message")
     if isinstance(stored_user_message, str) and isinstance(request_text, str):
         normalized_stored = " ".join(stored_user_message.split())
-        normalized_request = " ".join(request_text.split())
         if normalized_stored and normalized_request and normalized_stored != normalized_request:
             return None, [], [], []
     from nullion.response_fulfillment_contract import (
@@ -1782,6 +1840,11 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
     from nullion.chat_operator import handle_chat_operator_message as _handle_chat_operator_message
 
     principal_id = platform_chat_id(request.platform, request.conversation_id, request.chat_id)
+    evidence_conversation_id = platform_conversation_id(
+        request.platform,
+        principal_id,
+        request.conversation_id,
+    )
     text = _handle_chat_operator_message(
         runtime,
         request.text,
@@ -1830,9 +1893,32 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
 
     stored_reply, stored_artifact_paths, stored_tool_results, raw_stored_artifact_paths = _latest_stored_turn_delivery_evidence(
         runtime,
-        principal_id,
+        evidence_conversation_id,
         request_text=request.text,
+        turn_id=request.turn_id,
     )
+    if (
+        not stored_artifact_paths
+        and not stored_tool_results
+        and (
+            _requested_output_filenames(request.text, text)
+            or _requested_attachment_output_extensions(request.text)
+            or _media_paths_from_reply_text(str(text or ""))
+        )
+    ):
+        evidence_deadline = time.perf_counter() + 2.0
+        while time.perf_counter() < evidence_deadline:
+            time.sleep(0.05)
+            stored_reply, stored_artifact_paths, stored_tool_results, raw_stored_artifact_paths = (
+                _latest_stored_turn_delivery_evidence(
+                    runtime,
+                    evidence_conversation_id,
+                    request_text=request.text,
+                    turn_id=request.turn_id,
+                )
+            )
+            if stored_artifact_paths or stored_tool_results:
+                break
     delivery_metadata = _delivery_metadata_from_reply(text)
     delivery_metadata.update(_delivery_metadata_from_tool_results(stored_tool_results))
     delivery_text = (

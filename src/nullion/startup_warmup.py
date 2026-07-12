@@ -99,6 +99,14 @@ def run_chat_startup_warmup(
             ),
         )
 
+    step(
+        "connector_context",
+        lambda: __import__(
+            "nullion.connector_prompt_context",
+            fromlist=["active_connector_provider_context_snapshot"],
+        ).active_connector_provider_context_snapshot(),
+    )
+
     def warm_chat_contexts() -> None:
         from nullion import chat_operator
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import bz2
 import csv
@@ -36,7 +37,7 @@ import tarfile
 import textwrap
 import threading
 from time import perf_counter
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Iterable, Mapping, Protocol
 import base64
 import unicodedata
 import urllib.error
@@ -1972,6 +1973,41 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "explicitly asks for a count per source/category."
                     ),
                 },
+                "sheets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sheet_name": {
+                                "type": "string",
+                                "description": "Worksheet name.",
+                            },
+                            "columns": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Ordered column names for this worksheet.",
+                            },
+                            "rows": {
+                                "type": "array",
+                                "items": {
+                                    "anyOf": [
+                                        {"type": "object"},
+                                        {"type": "array", "items": {}},
+                                    ]
+                                },
+                                "description": "Structured data rows for this worksheet.",
+                            },
+                        },
+                        "required": ["sheet_name", "rows"],
+                        "additionalProperties": False,
+                    },
+                    "description": (
+                        "Optional multi-sheet workbook contents. Use this instead of top-level sheet_name, columns, "
+                        "and rows whenever the requested workbook needs more than one worksheet, including a "
+                        "separate Summary sheet. The first entry is the primary data sheet."
+                    ),
+                },
                 "expected_rows": {
                     "type": "integer",
                     "minimum": 0,
@@ -2010,6 +2046,13 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "type": "object",
                         "properties": {
                             "title": {"type": "string", "description": "Chart title."},
+                            "sheet_name": {
+                                "type": "string",
+                                "description": (
+                                    "Worksheet containing the category and value columns. Defaults to the first "
+                                    "sheet; set this for charts based on another sheet in a multi-sheet workbook."
+                                ),
+                            },
                             "type": {
                                 "type": "string",
                                 "enum": ["bar", "line", "pie"],
@@ -2031,7 +2074,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                         "required": ["type", "categories_column", "values_column"],
                         "additionalProperties": False,
                     },
-                    "description": "Optional real Excel charts generated from existing row columns.",
+                    "description": "Optional real Excel charts generated from columns on the selected worksheet.",
                 },
                 "conditional_formats": {
                     "type": "array",
@@ -2046,6 +2089,13 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                             "column": {
                                 "type": "string",
                                 "description": "Column name to format.",
+                            },
+                            "sheet_name": {
+                                "type": "string",
+                                "description": (
+                                    "Worksheet containing the column. Defaults to the first sheet; set this for "
+                                    "conditional formatting on another sheet in a multi-sheet workbook."
+                                ),
                             },
                             "color": {
                                 "type": "string",
@@ -2657,13 +2707,52 @@ def _default_market_quote_fetcher(symbol: str, timeout_seconds: int) -> dict[str
     timestamp: str | None = None
     if isinstance(regular_market_time, (int, float)):
         timestamp = datetime.fromtimestamp(float(regular_market_time), tz=UTC).isoformat(timespec="seconds")
+    previous_close = _coerce_market_quote_price(
+        meta.get("previousClose") or meta.get("chartPreviousClose")
+    )
+    change = round(price - previous_close, 4) if previous_close is not None else None
+    change_percent = (
+        round(((price - previous_close) / previous_close) * 100, 4)
+        if previous_close is not None
+        else None
+    )
+    indicators = first.get("indicators") if isinstance(first, dict) else None
+    quote_rows = indicators.get("quote") if isinstance(indicators, dict) else None
+    quote_row = quote_rows[0] if isinstance(quote_rows, list) and quote_rows and isinstance(quote_rows[0], dict) else {}
+
+    def _finite_market_values(key: str) -> list[float]:
+        values = quote_row.get(key)
+        if not isinstance(values, list):
+            return []
+        normalized: list[float] = []
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number >= 0:
+                normalized.append(number)
+        return normalized
+
+    highs = [value for value in _finite_market_values("high") if value > 0]
+    lows = [value for value in _finite_market_values("low") if value > 0]
+    volumes = _finite_market_values("volume")
     return {
         "symbol": str(meta.get("symbol") or symbol).upper(),
         "name": str(meta.get("longName") or meta.get("shortName") or symbol).strip(),
         "price": round(price, 4),
+        "previous_close": round(previous_close, 4) if previous_close is not None else None,
+        "change": change,
+        "change_percent": change_percent,
+        "day_high": round(max(highs), 4) if highs else None,
+        "day_low": round(min(lows), 4) if lows else None,
+        "volume": int(sum(volumes)) if volumes else None,
+        "fifty_two_week_high": _coerce_market_quote_price(meta.get("fiftyTwoWeekHigh")),
+        "fifty_two_week_low": _coerce_market_quote_price(meta.get("fiftyTwoWeekLow")),
         "currency": str(meta.get("currency") or "").strip() or "USD",
         "exchange": str(meta.get("fullExchangeName") or meta.get("exchangeName") or "").strip(),
         "regular_market_time": timestamp,
+        "regular_market_date": timestamp[:10] if timestamp else None,
         "source_url": url,
         "provider": "yahoo-finance-chart",
     }
@@ -2685,11 +2774,24 @@ def _build_market_quote_handler(
         quotes: list[dict[str, object]] = []
         errors: list[dict[str, str]] = []
         timeout_seconds = min(12, max(3, int(invocation.arguments.get("timeout_seconds") or 8)))
-        for symbol in symbols:
+
+        def _fetch(symbol: str) -> tuple[str, dict[str, object] | None, str | None]:
             try:
-                quotes.append(quote_fetcher(symbol, timeout_seconds))
+                return symbol, quote_fetcher(symbol, timeout_seconds), None
             except Exception as exc:
-                errors.append({"symbol": symbol, "error": str(exc)})
+                return symbol, None, str(exc)
+
+        # The tool contract accepts a bounded batch of explicit symbols. Fetch
+        # that batch concurrently so a healthy 16-symbol request cannot exceed
+        # the handler deadline merely because each independent HTTP request was
+        # performed serially. ``executor.map`` preserves the requested order.
+        with ThreadPoolExecutor(max_workers=len(symbols), thread_name_prefix="nullion-market-quote") as executor:
+            outcomes = list(executor.map(_fetch, symbols))
+        for symbol, quote_row, error in outcomes:
+            if quote_row is not None:
+                quotes.append(quote_row)
+            else:
+                errors.append({"symbol": symbol, "error": error or "quote unavailable"})
         return ToolResult(
             invocation.invocation_id,
             invocation.tool_name,
@@ -6464,6 +6566,98 @@ def _build_file_read_handler(
             )
 
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if path.suffix.lower() in {".xlsx", ".xlsm"}:
+            try:
+                from openpyxl import load_workbook
+
+                workbook = load_workbook(path, read_only=True, data_only=False)
+                worksheets: list[dict[str, object]] = []
+                content_sections: list[str] = []
+                workbook_truncated = False
+                max_rows = 200
+                max_columns = 50
+                max_content_chars = 24_000
+                for worksheet in workbook.worksheets:
+                    rows: list[list[object]] = []
+                    worksheet_truncated = bool(
+                        int(worksheet.max_row or 0) > max_rows
+                        or int(worksheet.max_column or 0) > max_columns
+                    )
+                    for row in worksheet.iter_rows(
+                        min_row=1,
+                        max_row=min(int(worksheet.max_row or 0), max_rows),
+                        max_col=min(int(worksheet.max_column or 0), max_columns),
+                        values_only=True,
+                    ):
+                        normalized_row: list[object] = []
+                        for value in row:
+                            if value is None or isinstance(value, (str, int, float, bool)):
+                                normalized_row.append(value)
+                            else:
+                                normalized_row.append(str(value))
+                        while normalized_row and normalized_row[-1] is None:
+                            normalized_row.pop()
+                        rows.append(normalized_row)
+                    while rows and not rows[-1]:
+                        rows.pop()
+                    worksheets.append(
+                        {
+                            "name": worksheet.title,
+                            "rows": rows,
+                            "row_count": int(worksheet.max_row or 0),
+                            "column_count": int(worksheet.max_column or 0),
+                            "truncated": worksheet_truncated,
+                        }
+                    )
+                    lines = [f"Sheet: {worksheet.title}"]
+                    lines.extend("\t".join("" if value is None else str(value) for value in row) for row in rows)
+                    content_sections.append("\n".join(lines))
+                    workbook_truncated = workbook_truncated or worksheet_truncated
+                workbook.close()
+                content = "\n\n".join(content_sections)
+                if len(content) > max_content_chars:
+                    content = content[:max_content_chars].rstrip() + "\n[truncated]"
+                    workbook_truncated = True
+            except FileNotFoundError:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={},
+                    error=f"File not found: {path}",
+                )
+            except ModuleNotFoundError as exc:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"path": str(path), "type": "spreadsheet", "media_type": media_type},
+                    error=f"Spreadsheet reading requires the shipped openpyxl runtime dependency: {exc}",
+                )
+            except Exception as exc:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={"path": str(path), "type": "spreadsheet", "media_type": media_type},
+                    error=f"Could not extract spreadsheet contents: {exc}",
+                )
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                tool_name=invocation.tool_name,
+                status="completed",
+                output={
+                    "path": str(path),
+                    "type": "spreadsheet",
+                    "media_type": media_type,
+                    "content": content,
+                    "sheet_count": len(worksheets),
+                    "worksheets": worksheets,
+                    "truncated": workbook_truncated,
+                    "extraction_method": "openpyxl",
+                },
+                error=None,
+            )
         if path.suffix.lower() == ".pdf" or media_type == "application/pdf":
             try:
                 data = path.read_bytes()
@@ -6695,6 +6889,56 @@ def _build_file_write_handler(
                     "Use complete local image bytes or browser-collected image artifacts before writing the HTML."
                 ),
             )
+        if path.suffix.lower() in {".html", ".htm"}:
+            normalized_html = content.strip().casefold()
+            missing_document_parts = [
+                token
+                for token in ("<html", "<body", "</body>", "</html>")
+                if token not in normalized_html
+            ]
+            if missing_document_parts:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(path),
+                        "reason": "incomplete_html_document",
+                        "missing_document_parts": missing_document_parts,
+                    },
+                    error=(
+                        "file_write HTML is incomplete or truncated. Write a complete HTML document with html/body "
+                        "opening and closing tags before treating it as a deliverable artifact."
+                    ),
+                )
+        required_content_tokens = _flow_context_required_artifact_content_tokens(
+            invocation.flow_context,
+            path.suffix.lower(),
+        )
+        if required_content_tokens:
+            from nullion.artifact_validation import missing_required_artifact_content_tokens
+
+            missing_content_tokens = missing_required_artifact_content_tokens(
+                content,
+                suffix=path.suffix.lower(),
+                required_tokens=required_content_tokens,
+            )
+            if missing_content_tokens:
+                return ToolResult(
+                    invocation_id=invocation.invocation_id,
+                    tool_name=invocation.tool_name,
+                    status="failed",
+                    output={
+                        "path": str(path),
+                        "reason": "artifact_required_content_missing",
+                        "missing_required_content_tokens": list(missing_content_tokens),
+                        "required_content_token_count": len(required_content_tokens),
+                    },
+                    error=(
+                        "The artifact is incomplete because required structured content keys are missing. "
+                        "Include every missing key in the visible artifact content before delivery."
+                    ),
+                )
         if (
             path.suffix.lower() in {".html", ".htm"}
             and inline_local_html_images
@@ -6945,6 +7189,22 @@ def _flow_context_requires_artifact_delivery_for_extension(flow_context: object,
         return False
     normalized_extension = ".html" if extension == ".htm" else str(extension or "").strip().lower()
     return not normalized_extension or normalized_extension in required_extensions
+
+
+def _flow_context_required_artifact_content_tokens(flow_context: object, extension: str) -> tuple[str, ...]:
+    if not isinstance(flow_context, dict):
+        return ()
+    required_extensions: set[str] = set()
+    for key in ("artifact_extensions", "required_artifact_extensions", "requested_artifact_extensions"):
+        required_extensions.update(_normalized_extension_values(flow_context.get(key)))
+    normalized_extension = ".html" if extension == ".htm" else str(extension or "").strip().lower()
+    if required_extensions and normalized_extension not in required_extensions:
+        return ()
+    from nullion.artifact_validation import normalize_required_artifact_content_tokens
+
+    return normalize_required_artifact_content_tokens(
+        flow_context.get("required_artifact_content_tokens")
+    )
 
 
 def _existing_xlsx_embedded_media_count(path: Path) -> int:
@@ -7328,6 +7588,34 @@ def _write_document_html_artifact(
                 "failed",
                 {"path": str(output_path), "reason": "html_data_images_disallowed"},
                 "document_create linked HTML cannot contain data:image sources when disallow_html_data_images is true.",
+            )
+    required_content_tokens = _flow_context_required_artifact_content_tokens(
+        invocation.flow_context,
+        output_path.suffix.lower(),
+    )
+    if required_content_tokens:
+        from nullion.artifact_validation import missing_required_artifact_content_tokens
+
+        missing_content_tokens = missing_required_artifact_content_tokens(
+            content,
+            suffix=output_path.suffix.lower(),
+            required_tokens=required_content_tokens,
+        )
+        if missing_content_tokens:
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "path": str(output_path),
+                    "reason": "artifact_required_content_missing",
+                    "missing_required_content_tokens": list(missing_content_tokens),
+                    "required_content_token_count": len(required_content_tokens),
+                },
+                (
+                    "The artifact is incomplete because required structured content keys are missing. "
+                    "Include every missing key in the visible artifact content before delivery."
+                ),
             )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(content, encoding="utf-8")
@@ -8025,12 +8313,17 @@ def _spreadsheet_rows_have_formula(rows: list[object], columns: list[str] | None
     return any(value_has_formula(row) for row in rows)
 
 
-def _spreadsheet_chart_specs(raw_charts: object, columns: list[str]) -> tuple[list[dict[str, str]], str | None]:
+def _spreadsheet_chart_specs(
+    raw_charts: object,
+    columns: list[str],
+    *,
+    sheet_columns: Mapping[str, list[str]] | None = None,
+    default_sheet_name: str = "Sheet1",
+) -> tuple[list[dict[str, str]], str | None]:
     if raw_charts is None:
         return [], None
     if not isinstance(raw_charts, list):
         return [], "charts must be a list"
-    column_set = set(columns)
     chart_specs: list[dict[str, str]] = []
     for index, raw_chart in enumerate(raw_charts, start=1):
         if not isinstance(raw_chart, dict):
@@ -8038,6 +8331,13 @@ def _spreadsheet_chart_specs(raw_charts: object, columns: list[str]) -> tuple[li
         chart_type = str(raw_chart.get("type") or "").strip().lower()
         if chart_type not in {"bar", "line", "pie"}:
             return [], f"charts[{index}].type must be one of bar, line, or pie"
+        sheet_name = str(raw_chart.get("sheet_name") or default_sheet_name).strip() or default_sheet_name
+        target_columns = columns
+        if sheet_columns is not None:
+            if sheet_name not in sheet_columns:
+                return [], f"charts[{index}].sheet_name must match a spreadsheet worksheet"
+            target_columns = sheet_columns[sheet_name]
+        column_set = set(target_columns)
         categories_column = str(raw_chart.get("categories_column") or "").strip()
         values_column = str(raw_chart.get("values_column") or "").strip()
         if categories_column not in column_set:
@@ -8051,6 +8351,7 @@ def _spreadsheet_chart_specs(raw_charts: object, columns: list[str]) -> tuple[li
             {
                 "type": chart_type,
                 "title": str(raw_chart.get("title") or "").strip(),
+                "sheet_name": sheet_name,
                 "categories_column": categories_column,
                 "values_column": values_column,
                 "anchor": anchor,
@@ -8062,12 +8363,14 @@ def _spreadsheet_chart_specs(raw_charts: object, columns: list[str]) -> tuple[li
 def _spreadsheet_conditional_format_specs(
     raw_formats: object,
     columns: list[str],
+    *,
+    sheet_columns: Mapping[str, list[str]] | None = None,
+    default_sheet_name: str = "Sheet1",
 ) -> tuple[list[dict[str, str]], str | None]:
     if raw_formats is None:
         return [], None
     if not isinstance(raw_formats, list):
         return [], "conditional_formats must be a list"
-    column_set = set(columns)
     format_specs: list[dict[str, str]] = []
     for index, raw_format in enumerate(raw_formats, start=1):
         if not isinstance(raw_format, dict):
@@ -8075,11 +8378,20 @@ def _spreadsheet_conditional_format_specs(
         format_type = str(raw_format.get("type") or "").strip().lower()
         if format_type not in {"data_bar", "color_scale"}:
             return [], f"conditional_formats[{index}].type must be one of data_bar or color_scale"
+        sheet_name = str(raw_format.get("sheet_name") or default_sheet_name).strip() or default_sheet_name
+        target_columns = columns
+        if sheet_columns is not None:
+            if sheet_name not in sheet_columns:
+                return [], f"conditional_formats[{index}].sheet_name must match a spreadsheet worksheet"
+            target_columns = sheet_columns[sheet_name]
+        column_set = set(target_columns)
         column = str(raw_format.get("column") or "").strip()
         if column not in column_set:
             return [], f"conditional_formats[{index}].column must match a spreadsheet column"
         color = re.sub(r"[^0-9A-Fa-f]", "", str(raw_format.get("color") or "").strip())[:6]
-        format_specs.append({"type": format_type, "column": column, "color": color})
+        format_specs.append(
+            {"type": format_type, "column": column, "color": color, "sheet_name": sheet_name}
+        )
     return format_specs, None
 
 
@@ -8240,71 +8552,6 @@ def _local_raster_image_too_small(image_path: Path, *, min_bytes: int = 128) -> 
         return image_path.stat().st_size < min_bytes
     except OSError:
         return True
-
-
-def _write_spreadsheet_contract_marker_image(
-    output_path: Path,
-    *,
-    title: object,
-    rows: list[object],
-    columns: list[str],
-) -> Path | None:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception:
-        return None
-    try:
-        media_dir = output_path.parent / ".nullion-generated-media"
-        media_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(
-            json.dumps(
-                {
-                    "title": str(title or ""),
-                    "rows": len(rows),
-                    "columns": columns,
-                },
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()[:12]
-        marker_path = media_dir / f"{output_path.stem}-embedded-marker-{digest}.png"
-        if marker_path.is_file():
-            return marker_path
-        image = Image.new("RGB", (720, 420), "#f8fafc")
-        draw = ImageDraw.Draw(image)
-        try:
-            title_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 34)
-            body_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 22)
-            small_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 17)
-        except Exception:
-            title_font = ImageFont.load_default()
-            body_font = ImageFont.load_default()
-            small_font = ImageFont.load_default()
-        draw.rounded_rectangle((28, 28, 692, 392), radius=30, fill="#ffffff", outline="#cbd5e1", width=3)
-        draw.rounded_rectangle((58, 68, 238, 248), radius=26, fill="#e0f2fe", outline="#38bdf8", width=3)
-        colors = ("#2563eb", "#14b8a6", "#f59e0b", "#ef4444")
-        bar_widths = (132, 94, 156, 112)
-        for index, (color, width) in enumerate(zip(colors, bar_widths)):
-            y = 96 + index * 32
-            draw.rounded_rectangle((82, y, 82 + width, y + 18), radius=9, fill=color)
-        title_text = str(title or output_path.stem or "Spreadsheet visual").strip()
-        title_lines = textwrap.wrap(title_text, width=30)[:2] or ["Spreadsheet visual"]
-        y = 76
-        for line in title_lines:
-            draw.text((274, y), line, fill="#0f172a", font=title_font)
-            y += 42
-        draw.text((276, 184), f"{len(rows)} data row(s)", fill="#334155", font=body_font)
-        draw.text((276, 220), f"{len(columns)} data column(s)", fill="#334155", font=body_font)
-        draw.text((58, 304), "Embedded workbook media marker", fill="#0f172a", font=body_font)
-        column_preview = ", ".join(columns[:5])
-        if len(columns) > 5:
-            column_preview = f"{column_preview}, ..."
-        for offset, line in enumerate(textwrap.wrap(column_preview or "Workbook data", width=62)[:2]):
-            draw.text((58, 340 + offset * 24), line, fill="#64748b", font=small_font)
-        image.save(marker_path, format="PNG")
-        return marker_path
-    except Exception:
-        return None
 
 
 def _spreadsheet_numeric_cell_value(value: object) -> float | None:
@@ -8542,7 +8789,55 @@ def _build_spreadsheet_create_handler(
         except ModuleNotFoundError as exc:
             openpyxl_import_error = exc
 
-        rows = list(invocation.arguments.get("rows") or [])
+        raw_sheets = invocation.arguments.get("sheets")
+        sheet_specs: list[dict[str, object]] = []
+        if raw_sheets is not None:
+            if not isinstance(raw_sheets, list) or not raw_sheets:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "sheets must be a non-empty list")
+            for index, raw_sheet in enumerate(raw_sheets, start=1):
+                if not isinstance(raw_sheet, dict):
+                    return ToolResult(
+                        invocation.invocation_id,
+                        invocation.tool_name,
+                        "failed",
+                        {},
+                        f"sheets[{index}] must be an object",
+                    )
+                raw_sheet_rows = raw_sheet.get("rows")
+                if not isinstance(raw_sheet_rows, list):
+                    return ToolResult(
+                        invocation.invocation_id,
+                        invocation.tool_name,
+                        "failed",
+                        {},
+                        f"sheets[{index}].rows must be a list",
+                    )
+                raw_sheet_name = str(raw_sheet.get("sheet_name") or "").strip()
+                if not raw_sheet_name:
+                    return ToolResult(
+                        invocation.invocation_id,
+                        invocation.tool_name,
+                        "failed",
+                        {},
+                        f"sheets[{index}].sheet_name must be non-empty",
+                    )
+                sheet_specs.append(
+                    {
+                        "sheet_name": raw_sheet_name,
+                        "columns": raw_sheet.get("columns"),
+                        "rows": list(raw_sheet_rows),
+                    }
+                )
+            rows = list(sheet_specs[0]["rows"])
+            primary_columns = sheet_specs[0].get("columns")
+            primary_sheet_name = str(sheet_specs[0]["sheet_name"])
+        else:
+            raw_rows = invocation.arguments.get("rows") or []
+            if not isinstance(raw_rows, list):
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "rows must be a list")
+            rows = list(raw_rows)
+            primary_columns = invocation.arguments.get("columns")
+            primary_sheet_name = str(invocation.arguments.get("sheet_name") or "Sheet1")
         if not isinstance(rows, list):
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, "rows must be a list")
         expected_rows_raw = invocation.arguments.get("expected_rows")
@@ -8557,21 +8852,51 @@ def _build_spreadsheet_create_handler(
                     "expected_rows must be a non-negative integer when provided",
                 )
             expected_rows = expected_rows_raw
-            if len(rows) != expected_rows:
+            actual_row_count = (
+                sum(len(list(sheet_spec.get("rows") or [])) for sheet_spec in sheet_specs)
+                if sheet_specs
+                else len(rows)
+            )
+            if actual_row_count != expected_rows:
                 return ToolResult(
                     invocation.invocation_id,
                     invocation.tool_name,
                     "failed",
                     {
-                        "rows": len(rows),
+                        "rows": actual_row_count,
                         "expected_rows": expected_rows,
                         "reason": "row_count_mismatch",
                     },
                     "spreadsheet_create rows must match expected_rows when a structured row-count contract is provided.",
                 )
-        columns = _spreadsheet_columns(invocation.arguments.get("columns"), rows)
+        columns = _spreadsheet_columns(primary_columns, rows)
+        workbook_sheet_specs = (
+            sheet_specs
+            if sheet_specs
+            else [
+                {
+                    "sheet_name": primary_sheet_name,
+                    "columns": primary_columns,
+                    "rows": rows,
+                }
+            ]
+        )
+        sheet_columns_by_name = {
+            str(sheet_spec.get("sheet_name") or "").strip(): _spreadsheet_columns(
+                sheet_spec.get("columns"),
+                list(sheet_spec.get("rows") or []),
+            )
+            for sheet_spec in workbook_sheet_specs
+        }
         formulas_required = bool(invocation.arguments.get("formulas_required"))
-        if formulas_required and not _spreadsheet_rows_have_formula(rows, columns):
+        workbook_has_formula = any(
+            _spreadsheet_rows_have_formula(
+                list(sheet_spec.get("rows") or []),
+                sheet_columns_by_name.get(str(sheet_spec.get("sheet_name") or "").strip()),
+            )
+            for sheet_spec in workbook_sheet_specs
+        )
+        if formulas_required and not workbook_has_formula:
             return ToolResult(
                 invocation.invocation_id,
                 invocation.tool_name,
@@ -8667,12 +8992,19 @@ def _build_spreadsheet_create_handler(
                 },
                 "spreadsheet_create cannot overwrite an archive manifest with a partial row set.",
             )
-        chart_specs, chart_error = _spreadsheet_chart_specs(invocation.arguments.get("charts"), columns)
+        chart_specs, chart_error = _spreadsheet_chart_specs(
+            invocation.arguments.get("charts"),
+            columns,
+            sheet_columns=sheet_columns_by_name,
+            default_sheet_name=primary_sheet_name,
+        )
         if chart_error is not None:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, chart_error)
         conditional_format_specs, conditional_format_error = _spreadsheet_conditional_format_specs(
             invocation.arguments.get("conditional_formats"),
             columns,
+            sheet_columns=sheet_columns_by_name,
+            default_sheet_name=primary_sheet_name,
         )
         if conditional_format_error is not None:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, conditional_format_error)
@@ -8753,7 +9085,7 @@ def _build_spreadsheet_create_handler(
 
         wb = Workbook()
         ws = wb.active
-        sheet_name = str(invocation.arguments.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+        sheet_name = primary_sheet_name.strip() or "Sheet1"
         ws.title = re.sub(r"[\[\]:*?/\\]", " ", sheet_name)[:31] or "Sheet1"
         ws.append(workbook_columns)
         for cell in ws[1]:
@@ -8858,42 +9190,78 @@ def _build_spreadsheet_create_handler(
                     embedded_target=embedded_screenshots,
                 )
 
+        created_sheet_names = [ws.title]
+        for sheet_index, sheet_spec in enumerate(sheet_specs[1:], start=2):
+            extra_rows = list(sheet_spec.get("rows") or [])
+            extra_columns = _spreadsheet_columns(sheet_spec.get("columns"), extra_rows)
+            extra_sheet_name = re.sub(r"[\[\]:*?/\\]", " ", str(sheet_spec.get("sheet_name") or "").strip())[:31]
+            if not extra_sheet_name:
+                return ToolResult(
+                    invocation.invocation_id,
+                    invocation.tool_name,
+                    "failed",
+                    {"reason": "invalid_sheet_name", "sheet_index": sheet_index},
+                    f"sheets[{sheet_index}].sheet_name is invalid",
+                )
+            if extra_sheet_name in created_sheet_names:
+                return ToolResult(
+                    invocation.invocation_id,
+                    invocation.tool_name,
+                    "failed",
+                    {"reason": "duplicate_sheet_name", "sheet_name": extra_sheet_name},
+                    "spreadsheet_create requires unique worksheet names",
+                )
+            extra_ws = wb.create_sheet(extra_sheet_name)
+            created_sheet_names.append(extra_ws.title)
+            extra_ws.append(extra_columns)
+            for cell in extra_ws[1]:
+                cell.font = Font(bold=True)
+            for extra_row in extra_rows:
+                extra_values = _spreadsheet_row_values(extra_row, extra_columns)
+                extra_ws.append([value for value, _hyperlink in extra_values])
+                current_row = extra_ws.max_row
+                for column_index, (_value, hyperlink) in enumerate(extra_values, start=1):
+                    if hyperlink:
+                        cell = extra_ws.cell(row=current_row, column=column_index)
+                        cell.hyperlink = hyperlink
+                        cell.font = Font(color="0563C1", underline="single")
+            for column_cells in extra_ws.columns:
+                header = str(column_cells[0].value or "")
+                max_length = max(len(str(cell.value or "")) for cell in column_cells[:100])
+                extra_ws.column_dimensions[column_cells[0].column_letter].width = min(
+                    max(max_length + 2, len(header) + 2, 12),
+                    48,
+                )
+
+        existing_embedded_media_count = _existing_xlsx_embedded_media_count(output_path)
+        embedded_media_required = _flow_context_requires_embedded_media_for_extension(
+            invocation.flow_context,
+            output_path.suffix.lower(),
+        )
         if (
-            _flow_context_requires_embedded_media_for_extension(invocation.flow_context, output_path.suffix.lower())
+            embedded_media_required
+            and existing_embedded_media_count > 0
             and not embedded_images
             and not embedded_screenshots
             and not skipped_images
         ):
-            marker_path = _write_spreadsheet_contract_marker_image(
-                output_path,
-                title=invocation.arguments.get("title") or sheet_name,
-                rows=rows,
-                columns=columns,
+            return ToolResult(
+                invocation.invocation_id,
+                invocation.tool_name,
+                "failed",
+                {
+                    "path": str(output_path),
+                    "reason": "stale_embedded_media_cannot_satisfy_regeneration",
+                    "existing_embedded_media_count": existing_embedded_media_count,
+                    "required_arguments": ["image_paths", "screenshot_paths"],
+                    "message": (
+                        "The existing workbook's embedded media is stale for this regeneration. "
+                        "Use a current-turn image source tool, then retry spreadsheet_create with the resulting "
+                        "local raster path in image_paths or screenshot_paths."
+                    ),
+                },
+                "spreadsheet_create will not reuse stale embedded media for a regenerated visual workbook.",
             )
-            if marker_path is not None:
-                marker_sheet = wb.create_sheet("Visual Marker")
-                marker_sheet["A1"] = "Embedded Media"
-                marker_sheet["A1"].font = Font(bold=True, size=16)
-                marker_sheet["A2"] = "This raster marker satisfies the workbook embedded-media delivery contract."
-                marker_sheet.column_dimensions["A"].width = 62
-                try:
-                    embed_path = optimized_embedded_image_path(marker_path)
-                    image = WorksheetImage(str(embed_path))
-                    if image.width > 480:
-                        scale = 480 / float(image.width)
-                        image.width = int(image.width * scale)
-                        image.height = int(image.height * scale)
-                    if image.height > 280:
-                        scale = 280 / float(image.height)
-                        image.width = int(image.width * scale)
-                        image.height = int(image.height * scale)
-                    marker_sheet.add_image(image, "A4")
-                    marker_sheet.row_dimensions[4].height = max(marker_sheet.row_dimensions[4].height or 15, 180)
-                    embedded_images.append(str(marker_path))
-                    if embed_path != marker_path:
-                        optimized_image_paths.append(str(embed_path))
-                except Exception:
-                    skipped_images.append(str(marker_path))
 
         if skipped_images:
             reason = "spreadsheet_embed_paths_failed"
@@ -8915,6 +9283,7 @@ def _build_spreadsheet_create_handler(
                     "path": str(output_path),
                     "rows": len(rows),
                     "columns": len(workbook_columns),
+                    "sheet_names": created_sheet_names,
                     "embedded_images": embedded_images,
                     "embedded_screenshots": embedded_screenshots,
                     "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
@@ -8926,7 +9295,7 @@ def _build_spreadsheet_create_handler(
             )
 
         if (
-            _flow_context_requires_embedded_media_for_extension(invocation.flow_context, output_path.suffix.lower())
+            embedded_media_required
             and not embedded_images
             and not embedded_screenshots
         ):
@@ -8973,7 +9342,7 @@ def _build_spreadsheet_create_handler(
             )
 
         applied_conditional_formats: list[dict[str, str]] = []
-        if conditional_format_specs and rows:
+        if conditional_format_specs:
             try:
                 from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
             except ModuleNotFoundError as exc:
@@ -8985,9 +9354,19 @@ def _build_spreadsheet_create_handler(
                     f"spreadsheet_create requires openpyxl conditional formatting support: {exc}",
                 )
             for format_spec in conditional_format_specs:
-                column_index = columns.index(format_spec["column"]) + 1
-                column_letter = ws.cell(row=1, column=column_index).column_letter
-                cell_range = f"{column_letter}2:{column_letter}{len(rows) + 1}"
+                target_sheet_name = re.sub(r"[\[\]:*?/\\]", " ", format_spec["sheet_name"])[:31] or "Sheet1"
+                target_ws = wb[target_sheet_name]
+                target_columns = sheet_columns_by_name[format_spec["sheet_name"]]
+                target_rows = next(
+                    list(sheet_spec.get("rows") or [])
+                    for sheet_spec in workbook_sheet_specs
+                    if str(sheet_spec.get("sheet_name") or "").strip() == format_spec["sheet_name"]
+                )
+                if not target_rows:
+                    continue
+                column_index = target_columns.index(format_spec["column"]) + 1
+                column_letter = target_ws.cell(row=1, column=column_index).column_letter
+                cell_range = f"{column_letter}2:{column_letter}{len(target_rows) + 1}"
                 if format_spec["type"] == "data_bar":
                     rule = DataBarRule(
                         start_type="min",
@@ -9005,11 +9384,14 @@ def _build_spreadsheet_create_handler(
                         end_type="max",
                         end_color="63BE7B",
                     )
-                ws.conditional_formatting.add(cell_range, rule)
-                applied_conditional_formats.append({**format_spec, "range": cell_range})
+                target_ws.conditional_formatting.add(cell_range, rule)
+                applied_spec = {**format_spec, "range": cell_range}
+                if format_spec["sheet_name"] == primary_sheet_name:
+                    applied_spec.pop("sheet_name", None)
+                applied_conditional_formats.append(applied_spec)
 
         embedded_charts: list[dict[str, str]] = []
-        if chart_specs and rows:
+        if chart_specs:
             try:
                 from openpyxl.chart import BarChart, LineChart, PieChart, Reference
             except ModuleNotFoundError as exc:
@@ -9021,8 +9403,18 @@ def _build_spreadsheet_create_handler(
                     f"spreadsheet_create requires openpyxl chart support: {exc}",
                 )
             for chart_spec in chart_specs:
-                category_column_index = columns.index(chart_spec["categories_column"]) + 1
-                value_column_index = columns.index(chart_spec["values_column"]) + 1
+                target_sheet_name = re.sub(r"[\[\]:*?/\\]", " ", chart_spec["sheet_name"])[:31] or "Sheet1"
+                target_ws = wb[target_sheet_name]
+                target_columns = sheet_columns_by_name[chart_spec["sheet_name"]]
+                target_rows = next(
+                    list(sheet_spec.get("rows") or [])
+                    for sheet_spec in workbook_sheet_specs
+                    if str(sheet_spec.get("sheet_name") or "").strip() == chart_spec["sheet_name"]
+                )
+                if not target_rows:
+                    continue
+                category_column_index = target_columns.index(chart_spec["categories_column"]) + 1
+                value_column_index = target_columns.index(chart_spec["values_column"]) + 1
                 chart_type = chart_spec["type"]
                 if chart_type == "line":
                     chart = LineChart()
@@ -9032,24 +9424,27 @@ def _build_spreadsheet_create_handler(
                     chart = BarChart()
                 chart.title = chart_spec["title"] or None
                 data = Reference(
-                    ws,
+                    target_ws,
                     min_col=value_column_index,
                     min_row=1,
-                    max_row=len(rows) + 1,
+                    max_row=len(target_rows) + 1,
                 )
                 categories = Reference(
-                    ws,
+                    target_ws,
                     min_col=category_column_index,
                     min_row=2,
-                    max_row=len(rows) + 1,
+                    max_row=len(target_rows) + 1,
                 )
                 chart.add_data(data, titles_from_data=True)
                 chart.set_categories(categories)
                 if chart_type != "pie":
                     chart.y_axis.title = chart_spec["values_column"]
                     chart.x_axis.title = chart_spec["categories_column"]
-                ws.add_chart(chart, chart_spec["anchor"])
-                embedded_charts.append(chart_spec)
+                target_ws.add_chart(chart, chart_spec["anchor"])
+                applied_chart_spec = dict(chart_spec)
+                if chart_spec["sheet_name"] == primary_sheet_name:
+                    applied_chart_spec.pop("sheet_name", None)
+                embedded_charts.append(applied_chart_spec)
 
         for column_cells in ws.columns:
             header = str(column_cells[0].value or "")
@@ -9059,36 +9454,6 @@ def _build_spreadsheet_create_handler(
             ws.column_dimensions[ws.cell(row=1, column=image_column_index).column_letter].width = 22
         if screenshot_column_index is not None:
             ws.column_dimensions[ws.cell(row=1, column=screenshot_column_index).column_letter].width = 22
-
-        existing_embedded_media_count = _existing_xlsx_embedded_media_count(output_path)
-        if existing_embedded_media_count > 0 and not embedded_images and not embedded_screenshots:
-            return ToolResult(
-                invocation.invocation_id,
-                invocation.tool_name,
-                "completed",
-                {
-                    "path": str(output_path),
-                    "artifact_path": str(output_path),
-                    "artifact_paths": [str(output_path)],
-                    "artifact_descriptors": [
-                        artifact_output_descriptor(output_path, role=ARTIFACT_ROLE_DELIVERABLE, kind="spreadsheet")
-                    ],
-                    "rows": len(rows),
-                    "columns": len(workbook_columns),
-                    "embedded_images": embedded_images,
-                    "embedded_screenshots": embedded_screenshots,
-                    "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
-                    "embedded_charts": embedded_charts,
-                    "conditional_formats": applied_conditional_formats,
-                    "formulas_required": formulas_required,
-                    "skipped_images": skipped_images,
-                    "remote_image_urls": remote_image_urls,
-                    "existing_embedded_media_count": existing_embedded_media_count,
-                    "preserved_existing_artifact": True,
-                    "reason": "preserved_existing_embedded_media_artifact",
-                },
-                None,
-            )
 
         cached_formula_values = _spreadsheet_formula_cached_values(ws)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9107,6 +9472,7 @@ def _build_spreadsheet_create_handler(
                 ],
                 "rows": len(rows),
                 "columns": len(workbook_columns),
+                "sheet_names": created_sheet_names,
                 "embedded_images": embedded_images,
                 "embedded_screenshots": embedded_screenshots,
                 "optimized_image_paths": list(dict.fromkeys(optimized_image_paths)),
@@ -12838,17 +13204,34 @@ def _build_weather_forecast_handler(
 ) -> ToolHandler:
     def _handler(invocation: ToolInvocation) -> ToolResult:
         try:
-            location = _resolve_open_meteo_location(invocation.arguments, json_get=json_get)
-            forecast_days = invocation.arguments.get("forecast_days", 3)
+            arguments = dict(invocation.arguments)
+            has_coordinates = arguments.get("latitude") is not None and arguments.get("longitude") is not None
+            if not str(arguments.get("location_text") or "").strip() and not has_coordinates:
+                try:
+                    from nullion.preferences import load_profile
+
+                    profile = load_profile()
+                except Exception:
+                    profile = {}
+                profile_location = (
+                    str(profile.get("address") or "").strip()
+                    if isinstance(profile, Mapping)
+                    else ""
+                )
+                if profile_location:
+                    arguments["location_text"] = profile_location
+                    arguments["location_source"] = "saved_profile"
+            location = _resolve_open_meteo_location(arguments, json_get=json_get)
+            forecast_days = arguments.get("forecast_days", 3)
             try:
                 days = min(7, max(1, int(forecast_days)))
             except (TypeError, ValueError):
                 days = 3
-            timezone = str(invocation.arguments.get("timezone") or location.get("timezone") or "auto").strip() or "auto"
-            include_hourly = _coerce_bool_arg(invocation.arguments.get("include_hourly"), default=False)
+            timezone = str(arguments.get("timezone") or location.get("timezone") or "auto").strip() or "auto"
+            include_hourly = _coerce_bool_arg(arguments.get("include_hourly"), default=False)
             hourly_limit: int | None = None
             if include_hourly:
-                requested_hours = invocation.arguments.get("hourly_hours")
+                requested_hours = arguments.get("hourly_hours")
                 try:
                     hourly_limit = min(168, max(1, int(requested_hours))) if requested_hours is not None else min(168, days * 24)
                 except (TypeError, ValueError):
@@ -12886,6 +13269,7 @@ def _build_weather_forecast_handler(
                     "longitude": location.get("longitude"),
                     "timezone": payload.get("timezone") or timezone,
                 },
+                "location_source": arguments.get("location_source") or "tool_arguments",
                 "current": payload.get("current") if isinstance(payload.get("current"), dict) else {},
                 "daily": _daily_open_meteo_forecast(payload),
                 "hourly": hourly_rows,
@@ -13101,6 +13485,8 @@ def _build_kernel_tool_registry(
                 name="spreadsheet_create",
                 description=(
                     "Create a real .xlsx spreadsheet artifact from structured rows, links, and existing image files. "
+                    "Use the structured sheets argument when the requested workbook needs multiple worksheets, "
+                    "including a separate summary sheet. "
                     "If the request or a structured plan gives an explicit total data-row count, pass expected_rows "
                     "and make the provided rows match it; only treat the count as per-source/per-category when that "
                     "is explicitly requested. "
@@ -15504,11 +15890,21 @@ def _build_web_search_handler(
         try:
             results = web_searcher(raw_query, limit)
         except Exception as exc:  # pragma: no cover - caller-provided searcher guard
+            status_code = getattr(exc, "code", None)
+            systemic_http_failure = isinstance(status_code, int) and (
+                status_code in {401, 402, 403, 408, 429} or status_code >= 500
+            )
+            failure_scope = "tool" if systemic_http_failure or isinstance(exc, urllib.error.URLError) else "invocation"
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
-                output={"query": raw_query, "reason": "web_search_failed"},
+                output={
+                    "query": raw_query,
+                    "reason": "web_search_failed",
+                    "failure_scope": failure_scope,
+                    **({"status_code": status_code} if isinstance(status_code, int) else {}),
+                },
                 error=str(exc),
             )
 
@@ -18584,13 +18980,24 @@ def register_cron_tools(
     cron_runner: Callable[..., str | dict[str, object] | None] | None = None,
     default_delivery_channel: str = "",
     default_delivery_target: str = "",
+    skip_existing: bool = False,
 ) -> None:
     """Register cron management tools into an existing ToolRegistry.
 
     Call this after building the registry so the agent can create, list,
     update, toggle, run, and delete scheduled cron jobs.
     """
-    registry.register(
+    def _register(spec: ToolSpec, handler: Callable[..., object]) -> None:
+        if skip_existing:
+            try:
+                registry.get_spec(spec.name)
+            except KeyError:
+                pass
+            else:
+                return
+        registry.register(spec, handler)
+
+    _register(
         ToolSpec(
             name="create_cron",
             description=(
@@ -18613,7 +19020,7 @@ def register_cron_tools(
             default_delivery_target=default_delivery_target,
         ),
     )
-    registry.register(
+    _register(
         ToolSpec(
             name="list_crons",
             description=(
@@ -18630,7 +19037,7 @@ def register_cron_tools(
         ),
         _build_list_crons_handler(),
     )
-    registry.register(
+    _register(
         ToolSpec(
             name="delete_cron",
             description="Delete a scheduled cron job by id. Required args: id (the cron job id).",
@@ -18642,7 +19049,7 @@ def register_cron_tools(
         ),
         _build_delete_cron_handler(),
     )
-    registry.register(
+    _register(
         ToolSpec(
             name="update_cron",
             description=(
@@ -18658,7 +19065,7 @@ def register_cron_tools(
         ),
         _build_update_cron_handler(),
     )
-    registry.register(
+    _register(
         ToolSpec(
             name="toggle_cron",
             description=(
@@ -18675,7 +19082,7 @@ def register_cron_tools(
         ),
         _build_toggle_cron_handler(),
     )
-    registry.register(
+    _register(
         ToolSpec(
             name="run_cron",
             description=(

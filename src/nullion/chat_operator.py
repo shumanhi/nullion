@@ -210,6 +210,7 @@ from nullion.tools import (
 )
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.turn_context_policy import (
+    _PLAIN_DIRECT_SAFE_READ_TOOLS,
     PlainNoToolFastPathRegistry,
     ScopedTurnToolRegistry,
     TurnToolScopeDecision,
@@ -240,6 +241,8 @@ logger = logging.getLogger(__name__)
 
 _BROWSER_AGENT_TURN_MAX_ITERATIONS_ENV = "NULLION_BROWSER_AGENT_TURN_MAX_ITERATIONS"
 _BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 24
+_COMPLEX_AGENT_TURN_MAX_ITERATIONS_ENV = "NULLION_COMPLEX_AGENT_TURN_MAX_ITERATIONS"
+_COMPLEX_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 24
 _WEB_OR_BROWSER_TOOL_NAMES = frozenset({"web_fetch", "web_search"})
 
 
@@ -275,10 +278,39 @@ def _configured_browser_agent_turn_max_iterations(base_limit: int) -> int:
     return max(base_limit, min(60, max(1, configured)))
 
 
+def _tool_scope_requests_multi_artifact_work(tool_registry: object | None) -> bool:
+    decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    extensions = {
+        str(extension or "").strip().lower()
+        for extension in (
+            *(getattr(decision, "requested_artifact_extensions", ()) or ()),
+            *(getattr(decision, "required_embedded_media_extensions", ()) or ()),
+        )
+        if str(extension or "").strip()
+    }
+    return len(extensions) >= 2
+
+
+def _configured_complex_agent_turn_max_iterations(base_limit: int) -> int:
+    raw_value = os.environ.get(
+        _COMPLEX_AGENT_TURN_MAX_ITERATIONS_ENV,
+        str(_COMPLEX_AGENT_TURN_DEFAULT_MAX_ITERATIONS),
+    )
+    try:
+        configured = int(raw_value)
+    except (TypeError, ValueError):
+        configured = _COMPLEX_AGENT_TURN_DEFAULT_MAX_ITERATIONS
+    return max(base_limit, min(60, max(1, configured)))
+
+
 def _chat_agent_turn_max_iterations(tool_registry: object | None) -> int:
     base_limit = default_agent_turn_max_iterations()
     if _tool_scope_requests_web_or_browser_work(tool_registry):
         return _configured_browser_agent_turn_max_iterations(base_limit)
+    if _tool_scope_requests_multi_artifact_work(tool_registry):
+        return _configured_complex_agent_turn_max_iterations(base_limit)
     return base_limit
 ActivityCallback = Callable[[dict[str, str]], None]
 TextDeltaCallback = Callable[[str], None]
@@ -1048,8 +1080,6 @@ def _requested_embedded_media_extensions(
 ) -> tuple[str, ...]:
     if is_slash_prefixed_literal_message(prompt):
         return ()
-    if len(set(_literal_requested_attachment_extensions(prompt))) > 1:
-        return ()
     has_format_candidate = _has_attachment_format_candidate(prompt)
     has_planner = callable(getattr(model_client, "create", None))
     should_plan = has_planner and (has_format_candidate or allow_model_planning)
@@ -1264,10 +1294,11 @@ def _merge_current_prompt_attachment_extensions(
 def _required_attachment_extensions_from_tool_scope(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> tuple[str, ...]:
-    explicit_scope_extensions = _explicit_attachment_extensions_from_tool_scope(tool_results)
-    if _tool_scope_declared_attachment_extensions(tool_results):
-        return explicit_scope_extensions
-    return ()
+    if not _tool_scope_declared_attachment_extensions(tool_results):
+        return ()
+    if not _explicit_attachment_extensions_from_tool_scope(tool_results):
+        return ()
+    return scoped_artifact_extensions_from_tool_results(tool_results)
 
 
 def _explicit_attachment_extensions_from_tool_scope(
@@ -1456,6 +1487,7 @@ def _tool_flow_context_for_required_media(
     required_embedded_media_extensions: Iterable[str] | None,
     *,
     required_artifact_extensions: Iterable[str] | None = None,
+    requires_new_artifact_content: bool = False,
 ) -> dict[str, object] | None:
     media_extensions = normalize_artifact_media_required_extensions(required_embedded_media_extensions)
     artifact_extensions_list: list[str] = []
@@ -1474,6 +1506,8 @@ def _tool_flow_context_for_required_media(
     if artifact_extensions:
         context["required_artifact_extensions"] = list(artifact_extensions)
         context["requires_artifact_delivery"] = True
+    if requires_new_artifact_content:
+        context["requires_new_artifact_content"] = True
     return context or None
 
 
@@ -1738,14 +1772,12 @@ def _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision: o
 
 def _messaging_dispatch_is_no_active_independent(turn_dispatch_decision: object | None) -> bool:
     if turn_dispatch_decision is None:
-        return False
+        return True
     if getattr(turn_dispatch_decision, "dependency_turn_ids", None):
         return False
     disposition = getattr(turn_dispatch_decision, "disposition", None)
     disposition_value = str(getattr(disposition, "value", disposition) or "").strip()
-    if disposition_value != ConversationTurnDisposition.INDEPENDENT.value:
-        return False
-    return str(getattr(turn_dispatch_decision, "reason", "") or "").strip() == "no_active_turn"
+    return disposition_value == ConversationTurnDisposition.INDEPENDENT.value
 
 
 def _messaging_turn_fast_profile_candidate(
@@ -4397,8 +4429,10 @@ def _compact_unstructured_target_clarification_reply(
         "Decide whether a short user request is actionable by itself or is missing the target/set/object "
         "needed to answer without guessing. Return only JSON with keys needs_clarification, question, "
         "and confidence. Use semantic understanding across languages. Do not use prior chat context. "
-        "needs_clarification must be true only when the request asks for an action or selection but does "
-        "not specify what object, target, set, account item, file, task, or domain the action applies to. "
+        "needs_clarification must be true when the request asks for an action or selection but does not "
+        "specify what object, target, set, account item, file, task, or domain the action applies to. It must "
+        "also be true when the message refers to prior work or an earlier object but does not identify which "
+        "one, and choosing from history would require guessing. "
         "For greetings, thanks, small talk, or complete requests, set needs_clarification false."
     )
     user = json.dumps({"current_message": str(prompt or "")}, ensure_ascii=False, sort_keys=True)
@@ -4408,6 +4442,7 @@ def _compact_unstructured_target_clarification_reply(
             tools=[],
             max_tokens=120,
             system=system,
+            timeout=8,
         )
         from nullion.turn_dispatch_graph import _parse_json_object, _text_from_model_response
 
@@ -4427,6 +4462,48 @@ def _compact_unstructured_target_clarification_reply(
     if not question:
         question = "What should I use for that?"
     return _trim_context_text(question, 240)
+
+
+def _unanchored_compact_scope_lacks_target_evidence(
+    *,
+    user_message: str,
+    evidence: object,
+) -> bool:
+    if not _chat_message_is_compact_context_reply(user_message):
+        return False
+    if any(
+        (
+            bool(getattr(evidence, "has_url_target", False)),
+            bool(getattr(evidence, "has_attachments", False)),
+            bool(getattr(evidence, "context_linked", False)),
+            bool(getattr(evidence, "numbered_option_selected", False)),
+            bool(getattr(evidence, "artifact_requested", False)),
+            bool(tuple(getattr(evidence, "requested_extensions", ()) or ())),
+            bool(tuple(getattr(evidence, "existing_named_artifact_extensions", ()) or ())),
+            bool(tuple(getattr(evidence, "prior_tool_scopes", ()) or ())),
+        )
+    ):
+        return False
+    return True
+
+
+def _unanchored_compact_scope_clarification(
+    *,
+    user_message: str,
+    evidence: object,
+    decision: TurnToolScopeDecision,
+    model_client: object | None,
+) -> str | None:
+    del decision
+    if not _unanchored_compact_scope_lacks_target_evidence(
+        user_message=user_message,
+        evidence=evidence,
+    ):
+        return None
+    return _compact_unstructured_target_clarification_reply(
+        prompt=user_message,
+        model_client=model_client,
+    )
 
 
 def _compact_clarification_followup_history_context(
@@ -4716,10 +4793,10 @@ def _turn_result_should_retry_with_saved_history(result: object) -> bool:
         return False
     if getattr(result, "suspended_for_approval", False):
         return False
-    return bool(
-        _turn_result_used_history_search(result)
-        or _assistant_reply_has_numbered_choice_prompt(getattr(result, "final_text", None))
-    )
+    # A saved-history retry must be anchored by structured tool evidence. A
+    # numbered final response is valid user-visible content and is not proof
+    # that the model intended to resolve an earlier saved-chat reference.
+    return bool(_turn_result_used_history_search(result))
 
 
 _READ_ONLY_ACCOUNT_TOOL_NAMES = frozenset({"email_search", "email_read", "email_attachment_read", "calendar_list"})
@@ -5036,6 +5113,7 @@ def _local_file_reference_scope_decision_from_message(
     *,
     registry: object | None,
     allow_file_write_artifacts: bool = False,
+    allow_dedicated_artifact_tools: bool = False,
 ) -> TurnToolScopeDecision | None:
     filenames = _requested_output_filenames_from_texts(user_message)
     if not filenames:
@@ -5057,6 +5135,12 @@ def _local_file_reference_scope_decision_from_message(
         dict.fromkeys([
             *(name for name in _MODEL_SCOPE_FILE_TOOLS if name in available_tool_names),
             *(("file_write",) if file_write_artifact_requested else ()),
+            *(
+                name
+                for extension in requested_extensions
+                for name in _REPAIR_EXTENSION_TOOL_NAMES.get(extension, ())
+                if allow_dedicated_artifact_tools and name in available_tool_names
+            ),
         ])
     )
     if not requested_tool_names:
@@ -5865,8 +5949,76 @@ def _run_chat_turn_model_tool_request_retry(
         return initial_result, active_tool_registry, False
     registry_for_lookup = base_tool_registry or active_tool_registry
     retry_decision = _model_tool_request_decision_from_reply(initial_result, registry=registry_for_lookup)
+    if retry_decision is None and bool(getattr(initial_result, "raw_tool_payload_blocked", False)):
+        scoped_decision = getattr(active_tool_registry, "turn_tool_scope_decision", None)
+        scoped_tool_names = tuple(
+            dict.fromkeys(
+                str(name or "").strip()
+                for name in tuple(getattr(scoped_decision, "requested_tool_names", ()) or ())
+                if str(name or "").strip() and str(name or "").strip() != "request_tool_scope"
+            )
+        )
+        if scoped_decision is not None and scoped_tool_names:
+            retry_decision = replace(
+                scoped_decision,
+                requested_tool_names=scoped_tool_names,
+                required_tool_names=tuple(
+                    dict.fromkeys(
+                        [
+                            *tuple(getattr(scoped_decision, "required_tool_names", ()) or ()),
+                            *scoped_tool_names,
+                        ]
+                    )
+                ),
+                confidence=max(float(getattr(scoped_decision, "confidence", 0.0) or 0.0), 1.0),
+                valid=True,
+            )
     if retry_decision is None:
         return initial_result, active_tool_registry, False
+    active_decision = getattr(active_tool_registry, "turn_tool_scope_decision", None)
+    if active_decision is not None:
+        active_required_names = tuple(getattr(active_decision, "required_tool_names", ()) or ())
+        merged_required_names = tuple(
+            dict.fromkeys(
+                [
+                    *tuple(getattr(retry_decision, "required_tool_names", ()) or ()),
+                    *active_required_names,
+                ]
+            )
+        )
+        retry_decision = replace(
+            retry_decision,
+            web_action=(
+                getattr(active_decision, "web_action", "none")
+                if str(getattr(retry_decision, "web_action", "none") or "none") == "none"
+                else retry_decision.web_action
+            ),
+            requested_tool_names=tuple(
+                dict.fromkeys(
+                    [
+                        *tuple(getattr(retry_decision, "requested_tool_names", ()) or ()),
+                        *merged_required_names,
+                    ]
+                )
+            ),
+            required_tool_names=merged_required_names,
+            requested_artifact_extensions=tuple(
+                dict.fromkeys(
+                    [
+                        *tuple(getattr(retry_decision, "requested_artifact_extensions", ()) or ()),
+                        *tuple(getattr(active_decision, "requested_artifact_extensions", ()) or ()),
+                    ]
+                )
+            ),
+            required_embedded_media_extensions=tuple(
+                dict.fromkeys(
+                    [
+                        *tuple(getattr(retry_decision, "required_embedded_media_extensions", ()) or ()),
+                        *tuple(getattr(active_decision, "required_embedded_media_extensions", ()) or ()),
+                    ]
+                )
+            ),
+        )
     retry_tool_registry = _ToolRegistryWithoutRequestScope(
         ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=retry_decision)
     )
@@ -6012,10 +6164,12 @@ def _run_chat_turn_no_tool_scope_decision_retry(
         or unverified_media_hint
     )
     if (
-        _turn_result_has_substantive_outcome(initial_result)
+        (
+            _turn_result_has_substantive_outcome(initial_result)
+            or _turn_result_has_no_tool_progress(initial_result)
+        )
         and not structured_scope_hint
         and not assistant_recovery_hint
-        and not second_chance_scope_hint
     ):
         return initial_result, active_tool_registry, False
     image_generation_unconfigured = (
@@ -6073,6 +6227,24 @@ def _run_chat_turn_no_tool_scope_decision_retry(
                 mark_retry()
             return _image_generation_not_configured_result(initial_result), active_tool_registry, True
         return initial_result, active_tool_registry, False
+    clarification = _unanchored_compact_scope_clarification(
+        user_message=user_message,
+        evidence=evidence,
+        decision=decision,
+        model_client=model_client,
+    )
+    if clarification:
+        initial_result.final_text = clarification
+        initial_result.tool_results = []
+        initial_result.artifacts = []
+        initial_result.suspended_for_approval = False
+        if hasattr(initial_result, "approval_id"):
+            initial_result.approval_id = None
+        if hasattr(initial_result, "raw_tool_payload_blocked"):
+            initial_result.raw_tool_payload_blocked = False
+        if mark_retry is not None:
+            mark_retry()
+        return initial_result, active_tool_registry, True
     retry_tool_registry = _ToolRegistryWithoutRequestScope(
         ScopedTurnToolRegistry(registry_for_lookup, evidence=evidence, tool_scope_decision=decision)
     )
@@ -6086,6 +6258,27 @@ def _run_chat_turn_no_tool_scope_decision_retry(
     )
     if not retry_visible_tool_names:
         return initial_result, active_tool_registry, False
+    if (
+        CHAT_HISTORY_SEARCH_TOOL_NAME in retry_visible_tool_names
+        and _unanchored_compact_scope_lacks_target_evidence(
+            user_message=user_message,
+            evidence=evidence,
+        )
+    ):
+        initial_result.final_text = (
+            clarification
+            or "Which prior item do you mean? Please send its title, file, link, or reply to the relevant message."
+        )
+        initial_result.tool_results = []
+        initial_result.artifacts = []
+        initial_result.suspended_for_approval = False
+        if hasattr(initial_result, "approval_id"):
+            initial_result.approval_id = None
+        if hasattr(initial_result, "raw_tool_payload_blocked"):
+            initial_result.raw_tool_payload_blocked = False
+        if mark_retry is not None:
+            mark_retry()
+        return initial_result, active_tool_registry, True
     if len(retry_visible_tool_names) == 1 and runtime is not None:
         direct_result = _run_scoped_safe_read_tool_directly(
             runtime=runtime,
@@ -9396,6 +9589,103 @@ def _requested_artifact_extensions_from_registry(registry: object | None) -> tup
     return tuple(extensions)
 
 
+def _turn_scoped_attachment_extensions_for_registry(
+    requested_attachment_extensions: Iterable[str] | None,
+    registry: object | None,
+) -> tuple[str, ...]:
+    raw_extensions = tuple(
+        dict.fromkeys(
+            str(extension or "").strip().lower()
+            for extension in (requested_attachment_extensions or ())
+            if str(extension or "").strip()
+        )
+    )
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    typed_extensions = _requested_artifact_extensions_from_registry(registry)
+    excluded_extensions = {
+        str(extension or "").strip().lower()
+        for extension in tuple(getattr(decision, "excluded_artifact_extensions", ()) or ())
+        if str(extension or "").strip()
+    }
+    if decision is not None and bool(getattr(decision, "valid", False)) and (
+        typed_extensions or excluded_extensions
+    ):
+        if typed_extensions:
+            return tuple(
+                extension for extension in dict.fromkeys(typed_extensions) if extension not in excluded_extensions
+            )
+        return tuple(extension for extension in raw_extensions if extension not in excluded_extensions)
+    return tuple(dict.fromkeys([*raw_extensions, *typed_extensions]))
+
+
+def _merge_active_artifact_contract_into_scope_decision(
+    existing_file_decision: TurnToolScopeDecision,
+    active_decision: object | None,
+) -> TurnToolScopeDecision:
+    if active_decision is None or not bool(getattr(active_decision, "valid", False)) or not (
+        tuple(getattr(active_decision, "requested_artifact_extensions", ()) or ())
+        or tuple(getattr(active_decision, "excluded_artifact_extensions", ()) or ())
+    ):
+        return existing_file_decision
+    return replace(
+        existing_file_decision,
+        requested_tool_names=tuple(
+            dict.fromkeys(
+                [
+                    *tuple(getattr(active_decision, "requested_tool_names", ()) or ()),
+                    *existing_file_decision.requested_tool_names,
+                ]
+            )
+        ),
+        requested_artifact_extensions=tuple(
+            getattr(active_decision, "requested_artifact_extensions", ()) or ()
+        ),
+        excluded_artifact_extensions=tuple(
+            getattr(active_decision, "excluded_artifact_extensions", ()) or ()
+        ),
+        required_embedded_media_extensions=tuple(
+            getattr(active_decision, "required_embedded_media_extensions", ()) or ()
+        ),
+    )
+
+
+def _scope_decision_with_planned_embedded_media(
+    existing_decision: TurnToolScopeDecision,
+    *,
+    requested_attachment_extensions: Iterable[str] | None,
+    planned_embedded_media_extensions: Iterable[str] | None,
+) -> TurnToolScopeDecision:
+    scoped_extensions = _turn_scoped_attachment_extensions_for_registry(
+        requested_attachment_extensions,
+        SimpleNamespace(turn_tool_scope_decision=existing_decision),
+    )
+    excluded_extensions = set(existing_decision.excluded_artifact_extensions)
+    planned_media_extensions = tuple(
+        dict.fromkeys(
+            str(extension or "").strip().lower()
+            for extension in (planned_embedded_media_extensions or ())
+            if str(extension or "").strip()
+            and str(extension or "").strip().lower() not in excluded_extensions
+        )
+    )
+    return replace(
+        existing_decision,
+        requested_artifact_extensions=tuple(
+            dict.fromkeys([*scoped_extensions, *planned_media_extensions])
+        ),
+        required_embedded_media_extensions=tuple(
+            dict.fromkeys(
+                [
+                    *existing_decision.required_embedded_media_extensions,
+                    *planned_media_extensions,
+                ]
+            )
+        ),
+        confidence=max(float(existing_decision.confidence or 0.0), 1.0),
+        valid=True,
+    )
+
+
 def _planner_dispatch_artifact_extensions(
     registry: object | None,
     requested_attachment_extensions: Iterable[str] | None,
@@ -9529,6 +9819,51 @@ def _turn_still_needs_scoped_email_send(prompt: str, tool_results: list[ToolResu
     return not email_send_completed and (email_send_scoped or email_send_attempted)
 
 
+_SCOPED_ARTIFACT_PRODUCER_TOOLS = frozenset(
+    {"document_create", "file_write", "pdf_create", "pdf_edit", "presentation_create", "spreadsheet_create"}
+)
+
+
+def _missing_scoped_required_tool_names(tool_results: Iterable[ToolResult]) -> frozenset[str]:
+    results = list(tool_results or ())
+    latest_required: tuple[str, ...] = ()
+    for result in results:
+        if _tool_result_name(result) != "request_tool_scope":
+            continue
+        if normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        raw_required = output.get("required_tool_names")
+        if isinstance(raw_required, (list, tuple, set)):
+            latest_required = tuple(
+                dict.fromkeys(
+                    str(name or "").strip()
+                    for name in raw_required
+                    if str(name or "").strip()
+                )
+            )
+    if not latest_required:
+        return frozenset()
+    completed = {
+        _tool_result_name(result)
+        for result in results
+        if normalize_tool_status(_tool_result_status(result)) == "completed"
+    }
+    return frozenset(set(latest_required) - completed)
+
+
+def _turn_still_needs_scoped_required_tools(tool_results: Iterable[ToolResult]) -> bool:
+    return bool(_missing_scoped_required_tool_names(tool_results))
+
+
+def _turn_still_needs_scoped_required_non_artifact_tools(
+    tool_results: Iterable[ToolResult],
+) -> bool:
+    return bool(
+        _missing_scoped_required_tool_names(tool_results) - _SCOPED_ARTIFACT_PRODUCER_TOOLS
+    )
+
+
 def _completed_requested_artifact_paths_for_turn_result(
     runtime: PersistentRuntime,
     *,
@@ -9540,6 +9875,8 @@ def _completed_requested_artifact_paths_for_turn_result(
 ) -> tuple[str, ...]:
     tool_results = list(getattr(result, "tool_results", None) or [])
     if _turn_still_needs_scoped_email_send(prompt, tool_results):
+        return ()
+    if _turn_still_needs_scoped_required_tools(tool_results):
         return ()
     media_required_suffixes = set(
         _merge_required_embedded_media_extensions(required_embedded_media_extensions, tool_results)
@@ -9620,21 +9957,19 @@ def _completed_requested_artifact_paths_for_turn_result(
         completed_paths,
         requested_extensions=tuple(requested_extensions),
     )
+    normalized_requested_extensions = set(_normalized_requested_extensions(requested_extensions))
     prompt_requested_output_names = {
         name.lower()
         for name in _requested_output_filenames_from_texts(prompt)
+        if Path(name).suffix.lower() in normalized_requested_extensions
     }
-    requested_output_names = {
-        name.lower()
-        for name in _requested_output_filenames_from_texts(prompt, getattr(result, "final_text", None))
-    }
-    if requested_output_names:
+    if prompt_requested_output_names:
         completed_paths = [
             path
             for path in completed_paths
-            if Path(str(path)).name.lower() in requested_output_names
+            if Path(str(path)).name.lower() in prompt_requested_output_names
         ]
-        if prompt_requested_output_names and not prompt_requested_output_names.issubset(
+        if not prompt_requested_output_names.issubset(
             {Path(str(path)).name.lower() for path in completed_paths}
         ):
             return ()
@@ -9642,7 +9977,7 @@ def _completed_requested_artifact_paths_for_turn_result(
         completed_paths = _filter_paths_to_requested_output_filenames_if_present(
             prompt,
             completed_paths,
-            reply=getattr(result, "final_text", None),
+            reply=None,
         )
     if not _artifact_paths_satisfy_required_extension_counts(
         completed_paths,
@@ -9754,6 +10089,52 @@ def _turn_result_needs_page_read_after_open(
     return _turn_result_has_completed_tool(result, _DIRECT_OPEN_URL_TOOL_NAMES)
 
 
+def _direct_browser_page_read_after_open(
+    *,
+    initial_result: object,
+    registry: object,
+    principal_id: str | None,
+) -> ToolResult | None:
+    """Continue a typed browser-open result with a read-only page extraction."""
+
+    if not hasattr(registry, "invoke") or not _tool_spec_allows_direct_read_retry(
+        registry,
+        "browser_extract_text",
+    ):
+        return None
+    if _turn_result_has_completed_tool(initial_result, _BROWSER_READ_EVIDENCE_TOOLS):
+        return None
+    session_id = ""
+    for tool_result in reversed(list(getattr(initial_result, "tool_results", None) or [])):
+        if _tool_result_name(tool_result) not in _DIRECT_OPEN_URL_TOOL_NAMES:
+            continue
+        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
+            continue
+        output = _tool_result_output(tool_result)
+        session_id = str(output.get("session_id") or "").strip()
+        if session_id:
+            break
+    if not session_id:
+        return None
+    invocation = ToolInvocation(
+        invocation_id=f"browser-page-read-{uuid4().hex[:12]}",
+        tool_name="browser_extract_text",
+        principal_id=str(principal_id or ""),
+        arguments={"session_id": session_id},
+    )
+    try:
+        result = registry.invoke(invocation)
+    except Exception as exc:
+        return ToolResult(
+            invocation.invocation_id,
+            invocation.tool_name,
+            "failed",
+            {"reason": "browser_page_read_failed"},
+            error=str(exc),
+        )
+    return result if normalize_tool_status(result.status) == "completed" else None
+
+
 def _turn_result_has_completed_tool(result: object, tool_names: Iterable[str]) -> bool:
     allowed = {str(name or "").strip() for name in tool_names if str(name or "").strip()}
     if not allowed:
@@ -9818,6 +10199,26 @@ def _tool_scope_decision_requested_tool_names(registry: object | None) -> tuple[
         if name and name not in names:
             names.append(name)
     return tuple(names)
+
+
+def _tool_scope_decision_has_non_account_scope(registry: object | None) -> bool:
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None:
+        return False
+    requested_names = set(_tool_scope_decision_requested_tool_names(registry))
+    non_account_requested_names = requested_names.difference(
+        {*_READ_ONLY_ACCOUNT_TOOL_NAMES, "connector_request", "request_tool_scope"}
+    )
+    return bool(
+        non_account_requested_names
+        or getattr(decision, "allow_web_tools", False)
+        or getattr(decision, "allow_scheduler_tools", False)
+        or getattr(decision, "allow_skill_pack_tools", False)
+        or str(getattr(decision, "web_action", "none") or "none").strip().lower() != "none"
+        or str(getattr(decision, "scheduler_action", "none") or "none").strip().lower() != "none"
+        or tuple(getattr(decision, "requested_artifact_extensions", ()) or ())
+        or tuple(getattr(decision, "required_embedded_media_extensions", ()) or ())
+    )
 
 
 def _account_read_browser_followup_allowed(evidence: object | None, registry: object | None = None) -> bool:
@@ -10669,6 +11070,48 @@ def _run_chat_turn_schema_followup_tool_retry(
         )
         else ()
     )
+    if (
+        bool(getattr(evidence, "artifact_requested", False))
+        and _turn_result_has_completed_tool(initial_result, _BROWSER_READ_EVIDENCE_TOOLS)
+        and not _turn_still_needs_scoped_required_non_artifact_tools(
+            getattr(initial_result, "tool_results", None) or ()
+        )
+    ):
+        return initial_result, active_tool_registry, False
+    if page_read_followup_names and bool(getattr(evidence, "artifact_requested", False)):
+        direct_page_read_result = _direct_browser_page_read_after_open(
+            initial_result=initial_result,
+            registry=active_tool_registry,
+            principal_id=principal_id,
+        )
+        if (
+            direct_page_read_result is None
+            and base_tool_registry is not None
+            and base_tool_registry is not active_tool_registry
+        ):
+            direct_page_read_result = _direct_browser_page_read_after_open(
+                initial_result=initial_result,
+                registry=base_tool_registry,
+                principal_id=principal_id,
+            )
+        if direct_page_read_result is not None:
+            recovered_result = _merge_initial_turn_context_into_retry_result(
+                initial_result=initial_result,
+                retry_result=SimpleNamespace(
+                    turn_id=getattr(initial_result, "turn_id", None) or uuid4().hex,
+                    final_text=str(getattr(initial_result, "final_text", "") or ""),
+                    tool_results=[direct_page_read_result],
+                    suspended_for_approval=False,
+                    approval_id=None,
+                    artifacts=[],
+                    thinking_text=None,
+                    reached_iteration_limit=False,
+                    raw_tool_payload_blocked=False,
+                ),
+            )
+            if mark_retry is not None:
+                mark_retry()
+            return recovered_result, active_tool_registry, True
     explicit_followup_names = tuple(
         dict.fromkeys(
             [
@@ -10904,6 +11347,7 @@ def _run_chat_turn_account_read_retry(
     no_tool_account_scope_recovery = (
         not browser_account_fallback
         and not visible_account_retry
+        and not _tool_scope_decision_has_non_account_scope(active_tool_registry)
         and model_client is not None
         and bool(available_account_tool_names)
         and _turn_result_has_no_tool_or_artifact_outcome(initial_result)
@@ -11425,7 +11869,9 @@ def _plain_no_tool_common_retries_may_bypass(result: object, tool_registry: obje
             }
         except Exception:
             return False
-        substantive_visible_names = visible_names.difference({"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME})
+        substantive_visible_names = visible_names.difference(
+            {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME, *_PLAIN_DIRECT_SAFE_READ_TOOLS}
+        )
         if substantive_visible_names:
             return False
     if has_visible_tools and not visible_names:
@@ -11606,6 +12052,8 @@ def _run_chat_turn_common_retries(
             retried_local_system_fallback=False,
         )
 
+    if bool(getattr(result, "reached_iteration_limit", False)):
+        return _current_retry_result()
     if had_account_source_selection and not numbered_option_selected:
         return _current_retry_result()
     if _deferred_run_cron_receipt_reply(getattr(result, "tool_results", None)):
@@ -12039,36 +12487,6 @@ def _run_chat_turn_saved_history_retry(
     retry_history_context = automatic_history_context or build_history_context()
     if not retry_history_context:
         return initial_result, active_tool_registry, False
-    numbered_choice_retry = (
-        not used_history_search
-        and _assistant_reply_has_numbered_choice_prompt(getattr(initial_result, "final_text", None))
-    )
-    if numbered_choice_retry:
-        live_tool_names = [
-            name
-            for name in _saved_history_evidence_tool_names(
-                retry_history_context,
-                evidence_limit=_AUTO_HISTORY_SCOPE_EVIDENCE_LIMIT,
-            )
-            if name not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
-        ]
-        history_has_url = _saved_history_context_has_structured_url_reference(retry_history_context)
-        if not live_tool_names and not history_has_url:
-            return initial_result, active_tool_registry, False
-        anchored_current_turn = bool(
-            getattr(turn_tool_evidence, "context_linked", False)
-            or getattr(turn_tool_evidence, "slash_prefixed_literal", False)
-            or getattr(turn_tool_evidence, "numbered_option_selected", False)
-        )
-        available_retry_tool_names = _registry_tool_names(active_tool_registry).union(
-            _registry_tool_names(base_tool_registry)
-        )
-        if (
-            not anchored_current_turn
-            and not history_has_url
-            and not set(live_tool_names).intersection(available_retry_tool_names)
-        ):
-            return initial_result, active_tool_registry, False
     if used_history_search:
         live_tool_names = [
             name
@@ -12099,7 +12517,7 @@ def _run_chat_turn_saved_history_retry(
             "role": "system",
             "content": [{"type": "text", "text": retry_tool_scope_prompt}],
         })
-    if used_history_search or numbered_choice_retry:
+    if used_history_search:
         retry_live_prompt = _saved_history_live_verification_retry_prompt(retry_history_context)
         if retry_live_prompt:
             retry_history.append({
@@ -12921,8 +13339,15 @@ def _recent_conversation_has_structured_tool_evidence(
     if store is None or not conversation_id:
         return False
     try:
+        list_after_reset = getattr(store, "list_recent_conversation_events_after_reset", None)
         events = (
-            store.list_recent_conversation_events(
+            list_after_reset(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=limit,
+            )
+            if callable(list_after_reset)
+            else store.list_recent_conversation_events(
                 conversation_id,
                 event_type="conversation.chat_turn",
                 limit=limit,
@@ -12957,7 +13382,11 @@ def _compact_turn_has_recent_durable_tool_context(
     return _recent_conversation_has_structured_tool_evidence(
         runtime,
         conversation_id=conversation_id,
-        limit=_MAX_CHAT_TURNS,
+        # The visible transcript is intentionally short, but durable typed
+        # evidence can sit behind filler or failed scope-only turns. Search a
+        # bounded post-reset window before deciding that a compact reference
+        # has no recoverable target.
+        limit=max(_MAX_CHAT_TURNS, 50),
     )
 
 
@@ -13187,10 +13616,19 @@ def _recent_assistant_turn_has_structured_artifact_evidence(
     conversation_id: str,
 ) -> bool:
     try:
-        events = runtime.store.list_recent_conversation_events(
-            conversation_id,
-            event_type="conversation.chat_turn",
-            limit=1,
+        list_after_reset = getattr(runtime.store, "list_recent_conversation_events_after_reset", None)
+        events = (
+            list_after_reset(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=1,
+            )
+            if callable(list_after_reset)
+            else runtime.store.list_recent_conversation_events(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=1,
+            )
         )
     except Exception:
         return False
@@ -14385,6 +14823,7 @@ def _compact_message_only_delivery_contract_prompt() -> str:
         "- Reply directly in user-facing chat text. Answer the user's actual question first.\n"
         "- Prefer compact prose or tight short-line summaries; use bullets only when they improve scanning.\n"
         "- Keep internal tool names, raw payloads, files, paths, and implementation details out unless the user asked for them.\n"
+        "- If the current user explicitly asks for a no-tool response, do not call or request tools; answer directly within that constraint.\n"
         "- If you ask the user to choose from options, include exactly one numbered choice list so numeric replies map clearly.\n"
         "- Never answer only 'Done', 'OK', or 'Completed'. Include the requested answer or concrete result."
     )
@@ -14404,7 +14843,7 @@ def _chat_delivery_contract_prompt(
         str(principal_id or ""),
         _chat_settings_signature(_load_settings_if_available()),
         admin_local_app_targets_text or "",
-        "full",
+        "full_no_tool_precedence_v2",
     )
     with _CHAT_STABLE_CONTEXT_CACHE_LOCK:
         if cache_key in _CHAT_STABLE_CONTEXT_CACHE:
@@ -14440,10 +14879,13 @@ def _chat_delivery_contract_prompt(
         "- For typed .pptx or slide deck artifact requirements, use presentation_create with structured slides and existing image artifact paths. Do not use terminal_exec for normal presentation creation.\n"
         "- For document-like deliverables such as PDF, DOCX, PPTX, reports, itineraries, and decks, provide structured title/sections/slides/text pages so the artifact tool can produce a readable report-quality layout. Do not deliver raw browser screenshots, loose image attachments, or unformatted text dumps as a substitute for the requested formatted document.\n"
         "- When the current request or your structured plan contains multiple separate final deliverables, create every separate deliverable before finalizing. Do not collapse separately named outputs into one file, skip later deliverables, or say the requested files are attached until each planned final artifact exists and is included.\n"
+        "- Once shared source evidence is complete, create each currently visible final artifact before finalizing. The runtime may expose one remaining rich artifact format at a time to keep large structured tool payloads bounded; complete that visible producer, then continue to the next format.\n"
         "- For all user-facing replies, prefer a clear answer over raw notes, tool dumps, or transcript-style output: start with the outcome, then choose the layout from the content shape. Use compact prose or tight short-line summaries for a few facts; use separated grouped records or short sections for larger result sets; use bullets only when each bullet is a standalone point that improves scanning. Do not force every reply into bullets, and do not use Markdown tables on narrow chat surfaces when grouped records are more readable. When a section heading improves readability, start it with a relevant emoji, wrap the heading text in **bold**, and leave an empty line after the heading. Use platform-friendly **bold** for important labels, names, statuses, and final answers without over-boldening whole paragraphs. Keep internal tool names/details out unless they are directly useful or the user asked for them. Do not begin final chat replies with tool execution status; activity cards already show tool progress.\n"
         "- When tools return records for a user question, answer the user's actual question first. If the records are relevant evidence but do not prove the requested answer, say that directly before listing or summarizing records. Do not substitute a list of matching messages, events, files, search results, or connector rows for the answer.\n"
         "- If you ask the user to choose from options, include exactly one numbered choice list in the reply. Recommendations, explanatory steps, and evidence may still be included, but format them as bullets or prose so numeric replies always map to one clear selectable list.\n"
+        "- When structured source records include ranks or source indexes, distinguish those values from the response's own numbering. Label noncontiguous values as source ranks, and use bullets or contiguous 1..N numbering for recommendations or choices so rank gaps never look like missing answer items.\n"
         "- Instruction precedence for user-facing behavior: follow the user's current-turn request first; when it does not conflict, durable user preferences and Known user memory override generic defaults, profile hints, and examples. Do not let stale memory or prior chat context override a clear current request.\n"
+        "- If the current user explicitly asks for a no-tool response, do not call or request tools; answer directly within that constraint. Do not infer a live account, browser, file, scheduler, or other capability request from nearby nouns when the requested output is self-contained.\n"
         "- User preferences and explicit requested formats override the default reply style. If the user asks for raw output, terse output, JSON, a table, prose, or another specific style, follow that format while still protecting secrets and internal-only state.\n"
         "- For ordinary saved files, use this user's workspace file folder.\n"
         f"{workspace_storage_text}\n"
@@ -14592,16 +15034,9 @@ def _chat_capability_inventory_prompt(
 ) -> str | None:
     if tool_registry is None:
         tool_registry = getattr(runtime, "active_tool_registry", None)
-    active_connector_context = active_connector_provider_context_snapshot()
-    try:
-        from nullion import turn_context_policy as _turn_context_policy
-
-        live_connector_context = tuple(_turn_context_policy._active_connector_provider_context() or ())
-    except Exception:
-        live_connector_context = ()
-    if live_connector_context:
-        active_connector_context = live_connector_context
+    active_connector_context = active_connector_provider_context_snapshot(allow_runtime_load=False)
     cache_key = (
+        "direct_scope_routes_v1",
         _chat_runtime_cache_identity(runtime),
         _chat_tool_registry_signature(tool_registry),
         _chat_settings_signature(_load_settings_if_available()),
@@ -14639,8 +15074,34 @@ def _chat_capability_inventory_prompt(
         return None
     if not caps_text:
         return None
+    try:
+        registered_tool_names = {
+            str(getattr(spec, "name", "") or "")
+            for spec in registry.list_specs()
+        }
+    except Exception:
+        registered_tool_names = set()
+    direct_scope_routes = [
+        {
+            "tool_name": tool_name,
+            "scope_request": {
+                "capabilities": [capability],
+                "tool_names": [tool_name],
+            },
+        }
+        for tool_name, capability in (
+            ("weather_forecast", "weather"),
+            ("market_quote", "market_data"),
+            ("image_generate", "image_generation"),
+        )
+        if tool_name in registered_tool_names
+    ]
+    direct_scope_routes_text = json.dumps(direct_scope_routes, sort_keys=True, separators=(",", ":"))
     cached_text = (
         "Live capability inventory:\n"
+        f"Structured direct scope routes: {direct_scope_routes_text}\n"
+        "When a structured direct scope route can answer the current request, copy its scope_request exactly "
+        "instead of requesting generic web/browser scope.\n"
         "Use only the tools registered in this turn. When request_tool_scope is visible and the exact "
         "tool family needed for the user's request is not yet visible, call request_tool_scope first, then "
         "continue with the newly registered tools. When no tools are visible in this first pass but this "
@@ -16686,6 +17147,12 @@ def _direct_existing_named_workspace_artifact_action(
     paths = tuple(str(path or "").strip() for path in (existing_named_artifact_paths or ()) if str(path or "").strip())
     if not paths:
         return "use_tools"
+    # A structured relationship to the previous turn means the request is not
+    # self-contained.  Keep it on the normal tool path so source artifacts can
+    # be read and stale output filenames can be regenerated instead of letting
+    # the direct-delivery optimization attach an older file.
+    if structured_context_available:
+        return "use_tools"
     if (
         attachment_context_present
         or planner_requested
@@ -17269,8 +17736,17 @@ def _append_chat_artifacts_to_reply(
     principal_id: str | None = None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     required_attachment_extensions: tuple[str, ...] | list[str] | None = None,
+    required_embedded_media_extensions: tuple[str, ...] | list[str] | None = None,
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> str:
+    required_attachment_extensions = tuple(
+        dict.fromkeys(
+            [
+                *(required_attachment_extensions or ()),
+                *normalize_artifact_media_required_extensions(required_embedded_media_extensions),
+            ]
+        )
+    )
     can_resolve_reply_named_artifacts = bool(required_attachment_extensions or source_attachment_paths or principal_id)
     reply_named_artifact_paths = (
         ()
@@ -18359,7 +18835,11 @@ def _append_chat_artifacts_to_reply(
         if selected_paths == reply_media_paths and raw_reply_media_paths == reply_media_paths:
             return reply
         preserve_reply_caption = False
-    elif has_deliverable_artifact_descriptors or requested_file_search_delivery_paths or terminal_stdout_artifact_paths:
+    elif (
+        has_deliverable_artifact_descriptors
+        or requested_file_search_delivery_paths
+        or terminal_stdout_artifact_paths
+    ):
         preserve_reply_caption = False
     else:
         preserve_reply_caption = True
@@ -18392,8 +18872,16 @@ def _append_chat_artifacts_to_reply(
         )
         for path in file_write_paths
     )
+    reply_names_suppressed_artifacts = reply_names_suppressed_artifacts or any(
+        not _path_matches_identity_set(path, selected_descriptor_identities)
+        for path in _artifact_candidate_paths_from_reply(
+            reply,
+            principal_id=principal_id,
+            runtime=runtime,
+        )
+    )
     if (
-        preserve_reply_caption
+        (preserve_reply_caption and not reply_names_suppressed_artifacts)
         or (
             reply_names_selected_artifacts
             and not reply_names_suppressed_artifacts
@@ -18805,6 +19293,8 @@ def _needs_required_attachment_repair(
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> bool:
     if _completed_scheduler_mutation_tool_present(tool_results):
+        return False
+    if _turn_still_needs_scoped_required_tools(tool_results or ()):
         return False
     required_attachment_extensions = _merge_required_attachment_extensions(
         required_attachment_extensions,
@@ -19273,19 +19763,34 @@ def _missing_required_attachment_extensions_for_repair(
         return ()
     if _completed_tools_are_only_local_discovery(tool_results):
         return ()
+    excluded_repair_paths = {
+        str(Path(path).expanduser())
+        for path in (source_attachment_paths or ())
+        if str(path or "").strip()
+    }
+    excluded_repair_paths.update(
+        str(Path(path).expanduser())
+        for path in _local_discovery_paths_from_tool_results(tool_results)
+        if str(path or "").strip()
+    )
+    excluded_repair_paths.update(
+        str(Path(path).expanduser())
+        for path in _non_deliverable_artifact_descriptor_paths(tool_results)
+        if str(path or "").strip()
+    )
     existing = _existing_attachment_extensions_for_repair(
         runtime=runtime,
         principal_id=principal_id,
         tool_results=tool_results,
         artifact_paths=artifact_paths,
-        source_attachment_paths=source_attachment_paths,
+        source_attachment_paths=excluded_repair_paths,
     )
     existing_counts = _existing_attachment_extension_counts_for_repair(
         runtime=runtime,
         principal_id=principal_id,
         tool_results=tool_results,
         artifact_paths=artifact_paths,
-        source_attachment_paths=source_attachment_paths,
+        source_attachment_paths=excluded_repair_paths,
     )
     existing_with_embedded_media = _existing_embedded_media_attachment_extensions_for_repair(
         runtime=runtime,
@@ -19354,23 +19859,22 @@ def _repair_tool_registry_for_missing_attachment_extensions(
     if not requested_tools:
         return active_registry
     existing = existing_registry_decision or getattr(active_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
-    return ScopedTurnToolRegistry(
+    repair_registry = ScopedTurnToolRegistry(
         base_registry,
         evidence=build_turn_tool_evidence(
             user_message="structured missing attachment repair",
             conversation_result=None,
             requested_extensions=missing_extensions,
         ),
-            tool_scope_decision=TurnToolScopeDecision(
-                web_action=getattr(existing, "web_action", "none"),
-                scheduler_action=getattr(existing, "scheduler_action", "none"),
-                scheduler_toggle_enabled=getattr(existing, "scheduler_toggle_enabled", None),
-                scheduler_selection_policy=getattr(existing, "scheduler_selection_policy", "none"),
-                scheduler_target_scope=getattr(existing, "scheduler_target_scope", "none"),
-                skill_pack_action=getattr(existing, "skill_pack_action", "none"),
-            connector_app_ids=tuple(getattr(existing, "connector_app_ids", ()) or ()),
+        tool_scope_decision=TurnToolScopeDecision(
+            web_action="none",
+            scheduler_action="none",
+            scheduler_selection_policy="none",
+            scheduler_target_scope="none",
+            skill_pack_action="none",
+            connector_app_ids=(),
             requested_tool_names=requested_tools,
-            required_tool_names=tuple(getattr(existing, "required_tool_names", ()) or ()),
+            required_tool_names=requested_tools,
             requested_artifact_extensions=missing_extensions,
             required_embedded_media_extensions=tuple(
                 extension
@@ -19381,12 +19885,14 @@ def _repair_tool_registry_for_missing_attachment_extensions(
             valid=True,
         ),
     )
+    return _ToolRegistryWithoutRequestScope(repair_registry)
 
 
 def _required_attachment_repair_prompt(
     required_attachment_extensions: tuple[str, ...] | list[str],
     *,
     collected_media_paths: tuple[str, ...] | list[str] = (),
+    source_tool_results: list[ToolResult] | tuple[ToolResult, ...] = (),
 ) -> str:
     required = ", ".join(required_attachment_extensions) or "the requested attachment"
     media_paths = tuple(path for path in collected_media_paths if str(path or "").strip())
@@ -19397,12 +19903,37 @@ def _required_attachment_repair_prompt(
         if media_paths
         else ""
     )
+    source_evidence_results = [
+        result
+        for result in source_tool_results
+        if str(getattr(result, "tool_name", "") or "").strip()
+        not in {
+            "request_tool_scope",
+            "document_create",
+            "file_write",
+            "pdf_create",
+            "pdf_edit",
+            "presentation_create",
+            "spreadsheet_create",
+        }
+    ]
+    source_evidence = _compact_tool_results_for_context(source_evidence_results)
+    source_evidence_text = ""
+    if source_evidence:
+        encoded_evidence = json.dumps(source_evidence, ensure_ascii=False, sort_keys=True, default=str)
+        source_evidence_text = (
+            " Verified current-turn source evidence follows. Use it as the factual basis for every missing "
+            "artifact; do not replace successful results with unavailable placeholders and do not expose raw "
+            "tool payloads: "
+            + encoded_evidence[:12_000]
+            + "."
+        )
     return (
         f"Your previous response did not create the required {required} attachment. "
         "Continue the same user request now. Use the available tools to create and save the real requested "
         "artifact in the workspace artifact directory, then finish with the artifact attached. "
         "Create exactly the missing requested format or formats; do not create fallback artifacts in different formats."
-        f"{media_instruction} "
+        f"{media_instruction}{source_evidence_text} "
         "Do not switch models. Do not ask a clarification unless the artifact is impossible without the missing detail."
     )
 
@@ -19757,15 +20288,39 @@ def _materialize_requested_filename_aliases(
     if not requested:
         return [], []
     aliasable_paths = _last_mile_alias_source_paths(tool_results)
-    if tool_results and not aliasable_paths:
-        return [], []
     existing_paths = [
         Path(str(path)).expanduser()
         for path in artifact_paths
         if str(path or "").strip()
         and Path(str(path)).expanduser().is_file()
-        and (not aliasable_paths or str(Path(str(path)).expanduser()) in aliasable_paths)
     ]
+    if tool_results and not aliasable_paths:
+        deliverable_paths = {
+            str(Path(path).expanduser())
+            for result in tool_results
+            if normalize_tool_status(_tool_result_status(result)) == "completed"
+            for path in artifact_paths_from_output_descriptors(
+                _tool_result_output(result),
+                roles=ARTIFACT_DELIVERY_ROLES,
+            )
+        }
+        requested_by_extension: dict[str, list[str]] = {}
+        for filename in requested:
+            requested_by_extension.setdefault(Path(filename).suffix.lower(), []).append(filename)
+        candidates_by_extension: dict[str, list[Path]] = {}
+        for path in existing_paths:
+            if str(path) not in deliverable_paths:
+                continue
+            candidates_by_extension.setdefault(path.suffix.lower(), []).append(path)
+        aliasable_paths = {
+            str(candidates[0])
+            for extension, candidates in candidates_by_extension.items()
+            if len(candidates) == 1 and len(requested_by_extension.get(extension, ())) == 1
+        }
+    if tool_results:
+        existing_paths = [path for path in existing_paths if str(path) in aliasable_paths]
+        if not existing_paths:
+            return [], []
     existing_by_name = {path.name for path in existing_paths}
     results: list[ToolResult] = []
     paths: list[str] = []
@@ -21264,11 +21819,19 @@ def _completed_run_cron_receipt_reply(
 
 def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id: str) -> tuple[str, ...]:
     try:
-        events = runtime.store.list_recent_conversation_events(
-            conversation_id,
-            event_type="conversation.chat_turn",
-            limit=_MAX_RECENT_TOOL_CONTEXT_TURNS,
-        )
+        list_after_reset = getattr(runtime.store, "list_recent_conversation_events_after_reset", None)
+        if callable(list_after_reset):
+            events = list_after_reset(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=_MAX_RECENT_TOOL_CONTEXT_TURNS,
+            )
+        else:
+            events = runtime.store.list_recent_conversation_events(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=_MAX_RECENT_TOOL_CONTEXT_TURNS,
+            )
     except Exception:
         events = []
     scopes: list[str] = []
@@ -21313,6 +21876,13 @@ def _saved_conversation_history_available(runtime: PersistentRuntime, conversati
     if store is None:
         return False
     try:
+        if hasattr(store, "list_recent_conversation_events_after_reset"):
+            events = store.list_recent_conversation_events_after_reset(
+                conversation_id,
+                event_type="conversation.chat_turn",
+                limit=1,
+            )
+            return any(isinstance(event, dict) for event in events)
         if hasattr(store, "list_recent_conversation_events"):
             events = store.list_recent_conversation_events(
                 conversation_id,
@@ -22502,6 +23072,14 @@ def _render_chat_turn(
         prompt=prompt,
         effective_prompt=effective_prompt,
     )
+    literal_attachment_extensions = _literal_requested_attachment_extensions(effective_prompt)
+    literal_multi_artifact_contract = bool(
+        len(requested_attachment_extensions) > 1
+        and tuple(requested_attachment_extensions) == tuple(literal_attachment_extensions)
+        and not attachment_context_present
+        and extract_url_target(effective_prompt) is None
+        and not planner_requested
+    )
     attachment_extension_signal = bool(
         requested_attachment_extensions
         or attachment_context_present
@@ -22515,11 +23093,15 @@ def _render_chat_turn(
             prompt=effective_prompt,
             requested_extensions=requested_attachment_extensions,
         )
-        planned_embedded_media_extensions = _requested_embedded_media_extensions(
-            effective_prompt,
-            model_client=model_client if allow_attachment_model_planning else None,
-            allow_model_planning=allow_attachment_model_planning,
-            source_attachment_names=source_attachment_names,
+        planned_embedded_media_extensions = (
+            ()
+            if literal_multi_artifact_contract
+            else _requested_embedded_media_extensions(
+                effective_prompt,
+                model_client=model_client if allow_attachment_model_planning else None,
+                allow_model_planning=allow_attachment_model_planning,
+                source_attachment_names=source_attachment_names,
+            )
         )
         scope_requested_extensions = _inferred_scope_extensions_from_recent_artifacts(
             runtime,
@@ -22551,22 +23133,6 @@ def _render_chat_turn(
         else None
     )
     saved_history_available = _saved_conversation_history_available(runtime, conversation_id)
-    turn_tool_evidence = build_turn_tool_evidence(
-        user_message=effective_prompt,
-        conversation_result=conversation_result,
-        has_attachments=attachment_context_present,
-        requested_extensions=scope_requested_extensions,
-        existing_named_artifact_extensions=existing_named_artifact_extensions,
-        saved_history_available=saved_history_available,
-        numbered_option_selected=bool(numbered_option_context),
-        prior_tool_scopes=_recent_tool_scopes_for_context(runtime, conversation_id),
-    )
-    if activity_callback is not None and (
-        getattr(turn_tool_evidence, "has_url_target", False)
-        or getattr(turn_tool_evidence, "has_attachments", False)
-        or getattr(turn_tool_evidence, "artifact_requested", False)
-    ):
-        activity_callback({"id": "foreground-working-ack", "label": "Preparing work", "status": "running"})
     existing_named_artifact_action = _direct_existing_named_workspace_artifact_action(
         existing_named_artifact_paths=existing_named_artifact_paths,
         effective_prompt=effective_prompt,
@@ -22579,6 +23145,23 @@ def _render_chat_turn(
         model_client=model_client,
         structured_context_available=structured_followup_evidence,
     )
+    turn_tool_evidence = build_turn_tool_evidence(
+        user_message=effective_prompt,
+        conversation_result=conversation_result,
+        has_attachments=attachment_context_present,
+        requested_extensions=scope_requested_extensions,
+        existing_named_artifact_extensions=existing_named_artifact_extensions,
+        existing_named_artifact_requires_new_content=existing_named_artifact_action == "use_tools",
+        saved_history_available=saved_history_available,
+        numbered_option_selected=bool(numbered_option_context),
+        prior_tool_scopes=_recent_tool_scopes_for_context(runtime, conversation_id),
+    )
+    if activity_callback is not None and (
+        getattr(turn_tool_evidence, "has_url_target", False)
+        or getattr(turn_tool_evidence, "has_attachments", False)
+        or getattr(turn_tool_evidence, "artifact_requested", False)
+    ):
+        activity_callback({"id": "foreground-working-ack", "label": "Preparing work", "status": "running"})
     if existing_named_artifact_action in {"deliver", "list"}:
         direct_artifact_tool_result = _direct_existing_named_workspace_artifact_tool_result(
             existing_named_artifact_paths,
@@ -22645,6 +23228,11 @@ def _render_chat_turn(
         force_mini_agent_dispatch=False,
         turn_dispatch_decision=turn_dispatch_decision,
     )
+    if literal_multi_artifact_contract:
+        # Multiple literal output suffixes are already a structured artifact
+        # contract. Expose their exact producer tools without spending a
+        # classifier/planner call before the agent sees the request.
+        skip_tool_scope_decision = True
     if quoted_cron_name or mentions_current_cron_reference:
         skip_tool_scope_decision = False
     phase_tracker.emit(PHASE_SELECT_TOOLS, "running")
@@ -22746,56 +23334,81 @@ def _render_chat_turn(
         existing_file_decision = _local_file_reference_scope_decision_from_message(
             effective_prompt,
             registry=base_tool_registry,
-            allow_file_write_artifacts=False,
+            allow_file_write_artifacts=existing_named_artifact_action == "use_tools",
+            allow_dedicated_artifact_tools=existing_named_artifact_action == "use_tools",
         )
         if existing_file_decision is not None:
+            active_decision = getattr(active_turn_tool_registry, "turn_tool_scope_decision", None)
+            existing_file_decision = _merge_active_artifact_contract_into_scope_decision(
+                existing_file_decision,
+                active_decision,
+            )
             active_turn_tool_registry = ScopedTurnToolRegistry(
                 base_tool_registry,
                 evidence=turn_tool_evidence,
                 tool_scope_decision=existing_file_decision,
             )
+    elif _requested_output_filenames(effective_prompt):
+        # A concrete filename is structured file evidence but does not by
+        # itself say whether the user wants discovery or creation. Make both
+        # the read tools and exact suffix producer visible so the agent can
+        # resolve that distinction semantically in one turn.
+        named_file_decision = _local_file_reference_scope_decision_from_message(
+            effective_prompt,
+            registry=base_tool_registry,
+            allow_file_write_artifacts=True,
+            allow_dedicated_artifact_tools=True,
+        )
+        if named_file_decision is not None:
+            active_turn_tool_registry = ScopedTurnToolRegistry(
+                base_tool_registry,
+                evidence=turn_tool_evidence,
+                tool_scope_decision=replace(named_file_decision, required_tool_names=()),
+            )
     if planned_embedded_media_extensions:
         existing_decision = getattr(active_turn_tool_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
-        planned_attachment_extensions = tuple(
-            dict.fromkeys([
-                *getattr(existing_decision, "requested_artifact_extensions", ()),
-                *requested_attachment_extensions,
-                *planned_embedded_media_extensions,
-            ])
+        planned_decision = _scope_decision_with_planned_embedded_media(
+            existing_decision,
+            requested_attachment_extensions=requested_attachment_extensions,
+            planned_embedded_media_extensions=planned_embedded_media_extensions,
         )
-        planned_tool_names = tuple(getattr(existing_decision, "requested_tool_names", ()) or ())
         active_turn_tool_registry = ScopedTurnToolRegistry(
             base_tool_registry,
             evidence=turn_tool_evidence,
-            tool_scope_decision=TurnToolScopeDecision(
-                web_action=getattr(existing_decision, "web_action", "none"),
-                scheduler_action=getattr(existing_decision, "scheduler_action", "none"),
-                scheduler_toggle_enabled=getattr(existing_decision, "scheduler_toggle_enabled", None),
-                scheduler_selection_policy=getattr(existing_decision, "scheduler_selection_policy", "none"),
-                scheduler_target_scope=getattr(existing_decision, "scheduler_target_scope", "none"),
-                skill_pack_action=getattr(existing_decision, "skill_pack_action", "none"),
-                connector_app_ids=tuple(getattr(existing_decision, "connector_app_ids", ()) or ()),
-                requested_tool_names=planned_tool_names,
-                required_tool_names=tuple(getattr(existing_decision, "required_tool_names", ()) or ()),
-                requested_artifact_extensions=planned_attachment_extensions,
-                required_embedded_media_extensions=tuple(
-                    dict.fromkeys([
-                        *getattr(existing_decision, "required_embedded_media_extensions", ()),
-                        *planned_embedded_media_extensions,
-                    ])
-                ),
-                confidence=max(float(getattr(existing_decision, "confidence", 0.0) or 0.0), 1.0),
-                valid=True,
-            ),
+            tool_scope_decision=planned_decision,
         )
+    active_scope_decision = getattr(active_turn_tool_registry, "turn_tool_scope_decision", None)
+    if (
+        getattr(active_scope_decision, "requested_outcome", "unspecified") == "generated_media"
+        and "image_generate" not in _retry_available_tool_names(base_tool_registry)
+    ):
+        reply = _image_generation_not_configured_result(SimpleNamespace()).final_text
+        _remember_chat_turn(
+            runtime,
+            chat_id=chat_id,
+            user_message=prompt,
+            assistant_reply=reply,
+            conversation_turn_id=conversation_result.turn.turn_id,
+        )
+        _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
+        runtime.checkpoint()
+        _broadcast_new_workspace_approvals(runtime, before_ids=approval_ids_before, settings=settings)
+        _mark_timing("image_generation_not_configured")
+        _log_timing_if_slow(
+            "image_generation_not_configured",
+            conversation_id_value=conversation_id,
+            conversation_result_value=conversation_result,
+        )
+        _finish_latency("image_generation_not_configured")
+        return _append_runtime_nudges(runtime, prompt=prompt, reply=reply, conversation_id=conversation_id)
     phase_tracker.done(PHASE_SELECT_TOOLS, "tool_scope_registry")
     try:
         turn_latency.set(scoped_tool_count=len(active_turn_tool_registry.list_tool_definitions()))
     except Exception:
         pass
-    turn_scoped_attachment_extensions = (
-        *requested_attachment_extensions,
-        *_requested_artifact_extensions_from_registry(active_turn_tool_registry),
+    turn_scoped_attachment_extensions = _turn_scoped_attachment_extensions_for_registry(
+        requested_attachment_extensions,
+        active_turn_tool_registry,
     )
     turn_required_embedded_media_extensions = _required_embedded_media_extensions_from_tool_registry(
         active_turn_tool_registry
@@ -22803,6 +23416,7 @@ def _render_chat_turn(
     turn_tool_flow_context = _tool_flow_context_for_required_media(
         turn_required_embedded_media_extensions,
         required_artifact_extensions=turn_scoped_attachment_extensions,
+        requires_new_artifact_content=turn_tool_evidence.existing_named_artifact_requires_new_content,
     )
     agent_orchestrator = _orchestrator_with_interactive_fast_profile(
         agent_orchestrator,
@@ -23288,6 +23902,7 @@ def _render_chat_turn(
                     }
                 ],
             })
+            _mark_timing("context_delivery_contract")
             plain_no_user_tool_fast_path = _tool_registry_has_only_context_discovery_tools(active_turn_tool_registry)
             _capability_inventory_registry = (
                 base_tool_registry
@@ -23305,6 +23920,7 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": _capability_inventory}],
                 })
+            _mark_timing("context_capability_inventory")
             # Inject user preferences as first system message
             try:
                 from nullion.preferences import build_preferences_prompt, build_profile_prompt, load_preferences
@@ -23374,6 +23990,7 @@ def _render_chat_turn(
                         })
             except Exception:
                 pass
+            _mark_timing("context_preferences_connections")
             if memory_context:
                 orchestrator_conversation_history.append({
                     "role": "system",
@@ -23389,6 +24006,7 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": route_hints}],
                 })
+            _mark_timing("context_route_hints")
             recent_tool_context = (
                 None
                 if explicit_reply_anchor
@@ -23433,6 +24051,7 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": recent_tool_context}],
                 })
+            _mark_timing("context_recent_tools")
             compact_followup_guard = _compact_unstructured_followup_guard_prompt(
                 prompt=effective_prompt,
                 reply_context_prompt=reply_context_prompt,
@@ -23451,14 +24070,20 @@ def _render_chat_turn(
             if durable_tool_context_recovery:
                 compact_followup_guard = None
             compact_clarification_history_candidate = (
-                (compact_followup_guard is not None and structured_followup_evidence)
-                or (
-                    not durable_tool_context_recovery
-                    and not reply_context_prompt
-                    and not numbered_option_context
-                    and _chat_message_is_compact_context_reply(effective_prompt)
-                    and structured_followup_evidence
-                    and bool(previous_assistant_message)
+                (
+                    turn_is_context_linked(conversation_result)
+                    or _assistant_reply_has_numbered_choice_prompt(previous_assistant_message)
+                )
+                and (
+                    (compact_followup_guard is not None and structured_followup_evidence)
+                    or (
+                        not durable_tool_context_recovery
+                        and not reply_context_prompt
+                        and not numbered_option_context
+                        and _chat_message_is_compact_context_reply(effective_prompt)
+                        and structured_followup_evidence
+                        and bool(previous_assistant_message)
+                    )
                 )
             )
             compact_clarification_history_context = (
@@ -23470,6 +24095,7 @@ def _render_chat_turn(
                 if compact_clarification_history_candidate
                 else None
             )
+            _mark_timing("context_clarification_history")
             if compact_clarification_history_context:
                 compact_followup_guard = None
             visible_conversation_turns = _conversation_context_turns(
@@ -23498,6 +24124,7 @@ def _render_chat_turn(
                 if compact_followup_guard and structured_followup_evidence
                 else None
             )
+            _mark_timing("context_target_clarification")
             auto_include_saved_history = _should_auto_include_saved_chat_history(
                 conversation_result,
                 reply_context_prompt=reply_context_prompt,
@@ -23521,6 +24148,7 @@ def _render_chat_turn(
                 if auto_include_saved_history and compact_followup_guard is None
                 else None
             )
+            _mark_timing("context_saved_history")
             if automatic_history_context:
                 widened_tool_registry = _augment_tool_registry_from_saved_history_context(
                     active_turn_tool_registry,
@@ -23551,6 +24179,7 @@ def _render_chat_turn(
                     "role": "system",
                     "content": [{"type": "text", "text": compact_clarification_history_context}],
                 })
+            _mark_timing("context_history")
             if automatic_history_context or compact_clarification_history_context:
                 active_turn_tool_registry = with_conversation_history_tool(
                     active_turn_tool_registry,
@@ -23604,6 +24233,7 @@ def _render_chat_turn(
                     *orchestrator_conversation_history,
                 ]
                 _emit_skill_usage_activity(activity_callback, skill_uses)
+            _mark_timing("context_skill_hint")
             _mark_timing("context")
             phase_tracker.done(PHASE_BUILD_CONTEXT, "context")
             phase_tracker.emit(PHASE_START_MODEL, "running")
@@ -24111,7 +24741,6 @@ def _render_chat_turn(
                             auto_include_saved_history
                             or explicit_chat_command
                             or bool(getattr(turn_tool_evidence, "slash_prefixed_literal", False))
-                            or _assistant_reply_has_numbered_choice_prompt(getattr(turn_result, "final_text", None))
                         )
                     ),
                     build_history_context=_operator_saved_history_context,
@@ -24486,19 +25115,21 @@ def _render_chat_turn(
                                 rendered_reply=reply,
                                 completion_turn_id=conversation_result.turn.turn_id,
                             )
+                    requested_filename_alias_results, requested_filename_alias_paths = (
+                        _materialize_requested_filename_aliases(
+                            principal_id=principal_id,
+                            prompt=effective_prompt,
+                            artifact_paths=turn_result.artifacts,
+                            tool_results=turn_result.tool_results,
+                        )
+                    )
+                    if requested_filename_alias_results:
+                        turn_result.tool_results.extend(requested_filename_alias_results)
+                        activity_tool_results.extend(requested_filename_alias_results)
+                        turn_result.artifacts.extend(requested_filename_alias_paths)
                     completed_requested_artifact_locked = _lock_completed_requested_artifacts_if_ready()
-                    if not completed_requested_artifact_locked and _needs_required_attachment_repair(
-                        runtime,
-                        conversation_id=conversation_id,
-                        prompt=effective_prompt,
-                        reply=reply,
-                        tool_results=turn_result.tool_results,
-                        artifact_paths=turn_result.artifacts,
-                        principal_id=principal_id,
-                        required_attachment_extensions=turn_requested_attachment_extensions,
-                        required_embedded_media_extensions=turn_required_embedded_media_extensions,
-                        source_attachment_paths=source_attachment_paths,
-                    ):
+                    missing_repair_extensions: tuple[str, ...] = ()
+                    if not completed_requested_artifact_locked:
                         missing_repair_extensions = _missing_required_attachment_extensions_for_repair(
                             runtime,
                             prompt=effective_prompt,
@@ -24509,6 +25140,22 @@ def _render_chat_turn(
                             artifact_paths=turn_result.artifacts,
                             source_attachment_paths=source_attachment_paths,
                         )
+                    if (
+                        not completed_requested_artifact_locked
+                        and missing_repair_extensions
+                        and _needs_required_attachment_repair(
+                        runtime,
+                        conversation_id=conversation_id,
+                        prompt=effective_prompt,
+                        reply=reply,
+                        tool_results=turn_result.tool_results,
+                        artifact_paths=turn_result.artifacts,
+                        principal_id=principal_id,
+                        required_attachment_extensions=turn_requested_attachment_extensions,
+                        required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                        source_attachment_paths=source_attachment_paths,
+                        )
+                    ):
                         repair_tool_registry = _repair_tool_registry_for_missing_attachment_extensions(
                             base_registry=base_tool_registry,
                             active_registry=active_turn_tool_registry,
@@ -24526,6 +25173,7 @@ def _render_chat_turn(
                                 user_message=_required_attachment_repair_prompt(
                                     missing_repair_extensions or requested_attachment_extensions,
                                     collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
+                                    source_tool_results=turn_result.tool_results,
                                 ),
                                 conversation_history=repair_history,
                                 tool_registry=repair_tool_registry,
@@ -24610,18 +25258,8 @@ def _render_chat_turn(
                             reply_artifact_rendered = True
                             thinking_text = thinking_text or getattr(repair_result, "thinking_text", None)
                             completed_requested_artifact_locked = _lock_completed_requested_artifacts_if_ready()
-                            if not completed_requested_artifact_locked and _needs_required_attachment_repair(
-                                runtime,
-                                conversation_id=conversation_id,
-                                prompt=effective_prompt,
-                                reply=reply,
-                                tool_results=turn_result.tool_results,
-                                artifact_paths=turn_result.artifacts,
-                                principal_id=principal_id,
-                                required_attachment_extensions=turn_requested_attachment_extensions,
-                                required_embedded_media_extensions=turn_required_embedded_media_extensions,
-                                source_attachment_paths=source_attachment_paths,
-                            ):
+                            second_missing_repair_extensions: tuple[str, ...] = ()
+                            if not completed_requested_artifact_locked:
                                 second_missing_repair_extensions = _missing_required_attachment_extensions_for_repair(
                                     runtime,
                                     prompt=effective_prompt,
@@ -24632,6 +25270,22 @@ def _render_chat_turn(
                                     artifact_paths=turn_result.artifacts,
                                     source_attachment_paths=source_attachment_paths,
                                 )
+                            if (
+                                not completed_requested_artifact_locked
+                                and second_missing_repair_extensions
+                                and _needs_required_attachment_repair(
+                                runtime,
+                                conversation_id=conversation_id,
+                                prompt=effective_prompt,
+                                reply=reply,
+                                tool_results=turn_result.tool_results,
+                                artifact_paths=turn_result.artifacts,
+                                principal_id=principal_id,
+                                required_attachment_extensions=turn_requested_attachment_extensions,
+                                required_embedded_media_extensions=turn_required_embedded_media_extensions,
+                                source_attachment_paths=source_attachment_paths,
+                                )
+                            ):
                                 second_repair_tool_registry = _repair_tool_registry_for_missing_attachment_extensions(
                                     base_registry=base_tool_registry,
                                     active_registry=repair_tool_registry,
@@ -24648,6 +25302,7 @@ def _render_chat_turn(
                                         user_message=_required_attachment_repair_prompt(
                                             second_missing_repair_extensions or turn_requested_attachment_extensions,
                                             collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
+                                            source_tool_results=turn_result.tool_results,
                                         ),
                                         conversation_history=second_repair_history,
                                         tool_registry=second_repair_tool_registry,
@@ -24732,7 +25387,11 @@ def _render_chat_turn(
                                     reply_artifact_rendered = True
                                     thinking_text = thinking_text or getattr(second_repair_result, "thinking_text", None)
                                     _lock_completed_requested_artifacts_if_ready()
-                    if turn_outcome is TurnOutcome.SUCCESS and not _lock_completed_requested_artifacts_if_ready():
+                    if (
+                        turn_outcome is TurnOutcome.SUCCESS
+                        and not _turn_still_needs_scoped_required_tools(turn_result.tool_results)
+                        and not _lock_completed_requested_artifacts_if_ready()
+                    ):
                         last_mile_missing_extensions = _missing_required_attachment_extensions_for_repair(
                             runtime,
                             prompt=effective_prompt,
@@ -25610,7 +26269,12 @@ def handle_chat_operator_message(
             )
     elif is_new_command_text(message):
         conversation_id = _conversation_id_for_chat(chat_id)
-        reset_conversation_session(runtime, conversation_id, chat_id=chat_id)
+        reset_conversation_session(
+            runtime,
+            conversation_id,
+            chat_id=chat_id,
+            checkpoint=channel_name not in {"telegram", "slack", "discord"},
+        )
         reply = "Starting fresh."
     elif _normalize_command_head(message) == "/verbose":
         reply = _handle_verbose_command_for_chat(runtime, message, chat_id=chat_id) or "Usage: /verbose [on|off|status]"

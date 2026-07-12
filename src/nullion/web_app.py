@@ -17874,6 +17874,10 @@ def _web_delivery_artifact_paths(
 ) -> list[str]:
     explicitly_requested_extension = requested_extension
     explicitly_required_attachment_extensions = tuple(required_attachment_extensions or ())
+    authoritative_required_extensions = _web_merge_required_attachment_extensions(
+        explicitly_required_attachment_extensions,
+        (),
+    )
     normalized_required_extensions = _web_merge_required_attachment_extensions(
         required_attachment_extensions,
         tool_results,
@@ -17894,7 +17898,16 @@ def _web_delivery_artifact_paths(
         requested_extension,
         tool_results,
     )
-    if requested_extension:
+    if authoritative_required_extensions:
+        # The caller's typed final-deliverable contract is authoritative.
+        # Tool outputs may contain source files, sidecars, receipts, previews,
+        # or intermediate formats that must not widen the attachment package.
+        normalized_required_extensions = authoritative_required_extensions
+    elif requested_extension:
+        # A singular selected format likewise excludes incidental companion
+        # artifacts unless the caller supplied an explicit multi-format list.
+        normalized_required_extensions = (requested_extension,)
+    if requested_extension and authoritative_required_extensions:
         normalized_required_extensions = _web_merge_required_attachment_extensions(
             (*normalized_required_extensions, requested_extension),
             (),
@@ -18172,6 +18185,31 @@ def _web_delivery_artifact_paths(
                 ),
                 (),
             )
+    # Delivery-contract inference may observe every runtime artifact, including
+    # sidecars and intermediate companions. Re-apply the typed caller contract
+    # after that inference so it cannot widen the final attachment package.
+    if authoritative_required_extensions:
+        explicitly_selected_reply_extensions = (
+            tuple(
+                dict.fromkeys(
+                    Path(path).suffix.lower()
+                    for path in (*explicit_media_paths, *reply_artifact_paths)
+                    if Path(path).suffix
+                )
+            )
+            if explicitly_requested_extension is None
+            else ()
+        )
+        normalized_required_extensions = _web_merge_required_attachment_extensions(
+            (
+                *authoritative_required_extensions,
+                *((requested_extension,) if requested_extension else ()),
+                *explicitly_selected_reply_extensions,
+            ),
+            (),
+        )
+    elif requested_extension:
+        normalized_required_extensions = (requested_extension,)
     if normalized_required_extensions:
         required_file_write_artifacts = [
             path
@@ -22208,6 +22246,7 @@ def create_app(runtime, orchestrator, registry):
                 cron_runner=_cron_tool_runner,
                 default_delivery_channel="web",
                 default_delivery_target="web:operator",
+                skip_existing=True,
             )
     except Exception as _cron_err:
         logger.warning("Could not register cron tools: %s", _cron_err)
@@ -22240,6 +22279,9 @@ def create_app(runtime, orchestrator, registry):
             delivery_channel = normalize_cron_delivery_channel(body.get("delivery_channel")) or "web"
             delivery_target = str(body.get("delivery_target") or "").strip()
             html_image_delivery_mode = str(body.get("html_image_delivery_mode") or "").strip()
+            artifact_delivery_options = body.get("artifact_delivery_options")
+            if artifact_delivery_options is not None and not isinstance(artifact_delivery_options, dict):
+                return JSONResponse({"ok": False, "error": "artifact_delivery_options must be an object"}, status_code=400)
             if delivery_channel == "web" and not delivery_target:
                 delivery_target = "web:operator"
             if not name or not schedule or not task:
@@ -22254,6 +22296,7 @@ def create_app(runtime, orchestrator, registry):
                 delivery_channel=delivery_channel,
                 delivery_target=delivery_target,
                 html_image_delivery_mode=html_image_delivery_mode,
+                artifact_delivery_options=artifact_delivery_options,
             )
             return JSONResponse({"ok": True, "job": job.to_dict()})
         except Exception as exc:
@@ -22263,6 +22306,8 @@ def create_app(runtime, orchestrator, registry):
     async def update_cron_endpoint(cron_id: str, request: Request):
         try:
             body = await request.json()
+            if "artifact_delivery_options" in body and not isinstance(body.get("artifact_delivery_options"), dict):
+                return JSONResponse({"ok": False, "error": "artifact_delivery_options must be an object"}, status_code=400)
             if set(body.keys()) <= {"enabled"} and "enabled" in body:
                 from nullion.crons import toggle_cron
                 job = toggle_cron(cron_id, bool(body.get("enabled")))
@@ -22271,7 +22316,7 @@ def create_app(runtime, orchestrator, registry):
                 return JSONResponse({"ok": True, "job": job.to_dict()})
             from nullion.crons import update_cron
             job = update_cron(cron_id, **{k: v for k, v in body.items()
-                                          if k in {"name", "schedule", "task", "enabled", "workspace_id", "delivery_channel", "delivery_target", "html_image_delivery_mode"}})
+                                          if k in {"name", "schedule", "task", "enabled", "workspace_id", "delivery_channel", "delivery_target", "html_image_delivery_mode", "artifact_delivery_options"}})
             if job is None:
                 return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
             return JSONResponse({"ok": True, "job": job.to_dict()})
@@ -27668,6 +27713,8 @@ def _web_approval_required_payload(
     display_trigger_flow_label = ""
     display_is_web_request = False
     display_request_kind = ""
+    display_title = ""
+    display_copy = ""
     if approval_id and runtime is not None:
         try:
             store = getattr(runtime, "store", None)
@@ -27679,16 +27726,31 @@ def _web_approval_required_payload(
             display_label = display.label
             display_detail = display.detail
             display_is_web_request = display.is_web_request
+            display_title = display.title
+            display_copy = display.copy
             display_trigger_flow_label = _approval_trigger_flow_label_from_request(approval) or ""
             display_request_kind = str(getattr(approval, "request_kind", "") or "")
+    request_kind = str(result.get("request_kind") or display_request_kind or "")
+    visible_text = str(result.get("text") or "").strip()
+    if not visible_text:
+        if display_title or display_copy:
+            visible_text = "\n\n".join(part for part in (display_title, display_copy) if part).strip()
+        elif request_kind == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
+            visible_text = (
+                "This run reached its current tool budget before finishing. "
+                "Review the continuation card to grant more budget or stop the run."
+            )
+        else:
+            visible_text = "Nullion paused before continuing. Review the approval card to continue or deny the action."
     return {
         "type": "approval_required",
+        "text": visible_text,
         "approval_id": approval_id,
         "tool_name": result.get("tool_name") or display_label or default_tool_name,
         "tool_detail": result.get("tool_detail") or display_detail,
         "trigger_flow_label": result.get("trigger_flow_label") or display_trigger_flow_label,
         "is_web_request": bool(result.get("is_web_request") or display_is_web_request),
-        "request_kind": result.get("request_kind") or display_request_kind,
+        "request_kind": request_kind,
         "web_session_allow_label": _web_session_allow_duration_label(),
     }
 

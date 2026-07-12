@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -1734,9 +1735,11 @@ class BrowserTools:
         try:
             wait_for = getattr(self._backend, "wait_for")
             try:
-                _run(wait_for(session_id, selector, url_pattern, text, timeout))
+                inspect.signature(wait_for).bind(session_id, selector, url_pattern, text, timeout)
             except TypeError:
                 _run(wait_for(session_id, selector, url_pattern, timeout))
+            else:
+                _run(wait_for(session_id, selector, url_pattern, text, timeout))
             return _ok(invocation, {"waited_for": selector or url_pattern or text, "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"Wait failed: {e}")

@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import tempfile
+import threading
 import time as _time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 try:  # pragma: no cover - import guard
     from openai import OpenAI
+    from openai import APITimeoutError as _OpenAIAPITimeoutError
 except Exception:  # pragma: no cover - import guard
     OpenAI = None
+    _OpenAIAPITimeoutError = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - import guard
     import anthropic as _anthropic
@@ -27,6 +33,8 @@ except Exception:  # pragma: no cover - import guard
     _httpx = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+_CODEX_REFRESH_THREAD_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +187,105 @@ def _load_codex_auth_json_tokens() -> CodexTokenRefresh | None:
     return None
 
 
+def _load_persisted_codex_tokens() -> CodexTokenRefresh | None:
+    """Load the most recently persisted Codex token pair, if available.
+
+    Older installers recorded browser OAuth with ``provider=openai``.  The
+    dedicated ``keys.codex`` entry is therefore authoritative when present;
+    the top-level key is accepted only when it is recognizably a Codex JWT.
+    """
+    try:
+        from nullion.credential_store import load_encrypted_credentials
+
+        creds = load_encrypted_credentials() or {}
+    except Exception:
+        return None
+    keys = creds.get("keys")
+    if not isinstance(keys, dict):
+        keys = {}
+    access_token = keys.get("codex")
+    if not isinstance(access_token, str) or not access_token.strip():
+        candidate = creds.get("api_key")
+        access_token = candidate if isinstance(candidate, str) and _extract_chatgpt_account_id(candidate) else ""
+    refresh_token = creds.get("refresh_token")
+    access_token = access_token.strip() if isinstance(access_token, str) else ""
+    refresh_token = refresh_token.strip() if isinstance(refresh_token, str) else ""
+    if not access_token and not refresh_token:
+        return None
+    return CodexTokenRefresh(access_token=access_token, refresh_token=refresh_token or None)
+
+
+def _codex_tokens_are_usable(tokens: CodexTokenRefresh | None, *, expected_account_id: str | None) -> bool:
+    if tokens is None or not tokens.access_token or _jwt_is_expired(tokens.access_token):
+        return False
+    account_id = _extract_chatgpt_account_id(tokens.access_token)
+    if not account_id:
+        return False
+    return expected_account_id is None or account_id == expected_account_id
+
+
+def _shared_codex_token_sources() -> tuple[CodexTokenRefresh, ...]:
+    sources: list[CodexTokenRefresh] = []
+    for candidate in (_load_codex_auth_json_tokens(), _load_persisted_codex_tokens()):
+        if candidate is not None:
+            sources.append(candidate)
+    return tuple(sources)
+
+
+def _latest_usable_shared_codex_tokens(current_access_token: str) -> CodexTokenRefresh | None:
+    expected_account_id = _extract_chatgpt_account_id(current_access_token) or None
+    for candidate in _shared_codex_token_sources():
+        if (
+            candidate.access_token != current_access_token
+            and _codex_tokens_are_usable(candidate, expected_account_id=expected_account_id)
+        ):
+            return candidate
+    return None
+
+
+def _codex_refresh_lock_path() -> Path:
+    identity = "|".join(
+        (
+            str(Path.home()),
+            os.environ.get("NULLION_CODEX_AUTH_JSON", ""),
+            os.environ.get("CODEX_HOME", ""),
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"nullion-codex-oauth-{digest}.lock"
+
+
+@contextmanager
+def _codex_refresh_guard() -> Iterator[None]:
+    """Serialize rotating OAuth refreshes across threads and processes."""
+    with _CODEX_REFRESH_THREAD_LOCK:
+        lock_path = _codex_refresh_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            if os.name == "nt":  # pragma: no cover - exercised by Windows installer E2E
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _codex_token_expired_response(detail: str) -> bool:
     lowered = str(detail or "").lower()
     return "token_expired" in lowered or "authentication token is expired" in lowered
@@ -190,9 +297,17 @@ def _persist_codex_oauth_tokens(access_token: str, refresh_token: str | None = N
         from nullion.credential_store import load_encrypted_credentials, save_encrypted_credentials
 
         creds = load_encrypted_credentials() or {}
-        if creds.get("provider") != "codex":
-            return
-        creds["api_key"] = access_token
+        provider = str(creds.get("provider") or "").strip().lower()
+        current_api_key = creds.get("api_key")
+        if (
+            provider == "codex"
+            or not isinstance(current_api_key, str)
+            or not current_api_key.strip()
+            or _extract_chatgpt_account_id(current_api_key) is not None
+        ):
+            creds["api_key"] = access_token
+        if not provider:
+            creds["provider"] = "codex"
         if isinstance(refresh_token, str) and refresh_token.strip():
             creds["refresh_token"] = refresh_token.strip()
         keys = creds.get("keys")
@@ -205,6 +320,61 @@ def _persist_codex_oauth_tokens(access_token: str, refresh_token: str | None = N
         logger.debug("Could not persist refreshed Codex OAuth credentials", exc_info=True)
 
 
+def _refresh_codex_oauth_with_recovery(
+    current_access_token: str,
+    refresh_tokens: tuple[str, ...] | list[str],
+) -> CodexTokenRefresh:
+    """Refresh once while allowing peer processes to publish the rotation.
+
+    Refresh tokens are commonly single-use.  The inter-process guard plus the
+    shared-state reread prevents web, Telegram, and scheduler workers from
+    racing the same token.  External Codex auth and encrypted Nullion storage
+    remain fallback sources, so a stale environment variable cannot pin the
+    runtime to an already-consumed credential.
+    """
+    expected_account_id = _extract_chatgpt_account_id(current_access_token) or None
+    with _codex_refresh_guard():
+        shared = _latest_usable_shared_codex_tokens(current_access_token)
+        if shared is not None:
+            return shared
+
+        shared_sources = _shared_codex_token_sources()
+        candidates = tuple(
+            dict.fromkeys(
+                token.strip()
+                for token in (
+                    *(source.refresh_token or "" for source in shared_sources),
+                    *refresh_tokens,
+                )
+                if isinstance(token, str) and token.strip()
+            )
+        )
+        last_error: ModelClientConfigurationError | None = None
+        for candidate_refresh_token in candidates:
+            try:
+                refreshed = _refresh_codex_access_token(candidate_refresh_token)
+            except ModelClientConfigurationError as exc:
+                last_error = exc
+                # A peer may have completed the one-time rotation immediately
+                # before this request was rejected.  Re-read shared state before
+                # trying another candidate or surfacing the failure.
+                shared = _latest_usable_shared_codex_tokens(current_access_token)
+                if shared is not None:
+                    return shared
+                continue
+            refreshed_account_id = _extract_chatgpt_account_id(refreshed.access_token)
+            if expected_account_id is not None and refreshed_account_id != expected_account_id:
+                last_error = ModelClientConfigurationError(
+                    "Codex OAuth refresh returned credentials for a different account."
+                )
+                continue
+            _persist_codex_oauth_tokens(refreshed.access_token, refreshed.refresh_token)
+            return refreshed
+        if last_error is not None:
+            raise last_error
+        raise ModelClientConfigurationError("Codex OAuth has no refresh token available.")
+
+
 def _persist_codex_access_token(access_token: str) -> None:
     """Backward-compatible wrapper for older tests/extensions."""
     _persist_codex_oauth_tokens(access_token)
@@ -212,6 +382,21 @@ def _persist_codex_access_token(access_token: str) -> None:
 
 class ModelClientConfigurationError(RuntimeError):
     """Raised when model client configuration cannot be resolved."""
+
+
+class ModelClientTimeoutError(ModelClientConfigurationError):
+    """Raised when a provider call exceeds the caller's explicit time budget."""
+
+
+def is_model_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ModelClientTimeoutError)):
+        return True
+    if _OpenAIAPITimeoutError is not None and isinstance(exc, _OpenAIAPITimeoutError):
+        return True
+    if _httpx is not None and isinstance(exc, _httpx.TimeoutException):
+        return True
+    anthropic_timeout = getattr(_anthropic, "APITimeoutError", None)
+    return anthropic_timeout is not None and isinstance(exc, anthropic_timeout)
 
 
 _DEFAULT_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS = 700_000
@@ -781,9 +966,15 @@ class CodexResponsesModelClient:
 
     def _refresh_access_token_after_401(self) -> bool:
         refresh_token = self.refresh_token.strip() if isinstance(self.refresh_token, str) else ""
-        if not refresh_token:
-            return False
-        refreshed = _refresh_codex_access_token(refresh_token)
+        try:
+            refreshed = _refresh_codex_oauth_with_recovery(
+                self.api_key,
+                (refresh_token,) if refresh_token else (),
+            )
+        except ModelClientConfigurationError:
+            if not refresh_token:
+                return False
+            raise
         account_id = _extract_chatgpt_account_id(refreshed.access_token)
         if not account_id:
             raise ModelClientConfigurationError(
@@ -794,7 +985,6 @@ class CodexResponsesModelClient:
         self.account_id = account_id
         if refreshed.refresh_token:
             self.refresh_token = refreshed.refresh_token
-        _persist_codex_oauth_tokens(refreshed.access_token, refreshed.refresh_token)
         return True
 
     @staticmethod
@@ -1036,7 +1226,7 @@ class CodexResponsesModelClient:
                         resp.raise_for_status()
                         for raw_line in resp.iter_lines():
                             if deadline is not None and _time.monotonic() >= deadline:
-                                raise ModelClientConfigurationError(
+                                raise ModelClientTimeoutError(
                                     "Codex Responses request exceeded timeout budget while streaming."
                                 )
                             line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
@@ -1193,57 +1383,34 @@ def build_model_client_from_settings(
                 return True
             return False
 
-        local_codex_tokens = _load_codex_auth_json_tokens() if _needs_refresh(codex_token) else None
-        if (
-            local_codex_tokens is not None
-            and local_codex_tokens.access_token
-            and not _needs_refresh(local_codex_tokens.access_token)
-        ):
-            codex_token = local_codex_tokens.access_token
-            if local_codex_tokens.refresh_token:
-                refresh_token = local_codex_tokens.refresh_token
-
-        refresh_errors: list[str] = []
-        refresh_candidates = tuple(
-            dict.fromkeys(
-                token
-                for token in (
-                    refresh_token,
-                    local_codex_tokens.refresh_token if local_codex_tokens is not None else "",
+        refresh_error: str | None = None
+        if _needs_refresh(codex_token):
+            try:
+                refreshed = _refresh_codex_oauth_with_recovery(
+                    codex_token,
+                    (refresh_token,) if refresh_token else (),
                 )
-                if isinstance(token, str) and token.strip()
-            )
-        )
-        if _needs_refresh(codex_token) and refresh_candidates:
-            for candidate_refresh_token in refresh_candidates:
+                codex_token = refreshed.access_token
+                if refreshed.refresh_token:
+                    refresh_token = refreshed.refresh_token
+                # Keep the compatibility credentials writer synchronized for
+                # older installs that still read credentials.json.
                 try:
-                    refreshed = _refresh_codex_access_token(candidate_refresh_token)
-                    if refreshed.access_token:
-                        codex_token = refreshed.access_token
+                    from nullion.web_app import (
+                        _read_credentials_json,
+                        _write_credentials_json,
+                    )
+
+                    _creds = _read_credentials_json() or {}
+                    if _creds.get("provider") == "codex":
+                        _creds["api_key"] = codex_token
                         if refreshed.refresh_token:
-                            refresh_token = refreshed.refresh_token
-                        else:
-                            refresh_token = candidate_refresh_token
-                        _persist_codex_oauth_tokens(refreshed.access_token, refreshed.refresh_token)
-                        # Persist the fresh access token so subsequent runs (and
-                        # other processes) don't keep using stale OAuth credentials.
-                        try:
-                            from nullion.web_app import (
-                                _read_credentials_json,
-                                _write_credentials_json,
-                            )
-                            _creds = _read_credentials_json() or {}
-                            if _creds.get("provider") == "codex":
-                                _creds["api_key"] = codex_token
-                                if refreshed.refresh_token:
-                                    _creds["refresh_token"] = refreshed.refresh_token
-                                _write_credentials_json(_creds)
-                        except Exception:
-                            pass  # best-effort persistence
-                        break
-                except ModelClientConfigurationError as exc:
-                    refresh_errors.append(str(exc))
-        refresh_error = "; ".join(refresh_errors) if refresh_errors else None
+                            _creds["refresh_token"] = refreshed.refresh_token
+                        _write_credentials_json(_creds)
+                except Exception:
+                    pass  # best-effort compatibility persistence
+            except ModelClientConfigurationError as exc:
+                refresh_error = str(exc)
 
         if not codex_token:
             hint = f" Refresh attempt failed: {refresh_error}" if refresh_error else ""

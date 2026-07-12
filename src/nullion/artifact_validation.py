@@ -108,6 +108,90 @@ class _HtmlShapeParser(HTMLParser):
             self.classes.append(class_name)
 
 
+class _HtmlVisibleTextParser(HTMLParser):
+    _HIDDEN_TAGS = frozenset({"head", "script", "style", "template", "noscript"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:  # noqa: ARG002
+        if tag.lower() in self._HIDDEN_TAGS:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._HIDDEN_TAGS and self._hidden_depth:
+            self._hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden_depth and str(data or "").strip():
+            self.parts.append(str(data))
+
+
+def normalize_required_artifact_content_tokens(value: object) -> tuple[str, ...]:
+    raw_values = value if isinstance(value, (list, tuple, set, frozenset)) else ()
+    normalized: list[str] = []
+    for raw in raw_values:
+        token = " ".join(str(raw or "").split()).strip()
+        if not token or len(token) > 160 or token in normalized:
+            continue
+        normalized.append(token)
+        if len(normalized) >= 128:
+            break
+    return tuple(normalized)
+
+
+def missing_required_artifact_content_tokens(
+    content: str,
+    *,
+    suffix: str,
+    required_tokens: object,
+) -> tuple[str, ...]:
+    tokens = normalize_required_artifact_content_tokens(required_tokens)
+    if not tokens:
+        return ()
+    visible = str(content or "")
+    if str(suffix or "").strip().lower() in {".html", ".htm"}:
+        parser = _HtmlVisibleTextParser()
+        try:
+            parser.feed(visible)
+            parser.close()
+            visible = " ".join(parser.parts)
+        except Exception:
+            visible = ""
+    visible = " ".join(visible.split())
+    missing: list[str] = []
+    for token in tokens:
+        if re.fullmatch(r"[A-Za-z0-9._-]+", token):
+            found = re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])",
+                visible,
+                flags=re.IGNORECASE,
+            ) is not None
+        else:
+            found = token.casefold() in visible.casefold()
+        if not found:
+            missing.append(token)
+    return tuple(missing)
+
+
+def missing_required_artifact_content_tokens_from_path(
+    path: str | Path,
+    required_tokens: object,
+) -> tuple[str, ...]:
+    artifact_path = Path(path).expanduser()
+    try:
+        content = artifact_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return normalize_required_artifact_content_tokens(required_tokens)
+    return missing_required_artifact_content_tokens(
+        content,
+        suffix=artifact_path.suffix,
+        required_tokens=required_tokens,
+    )
+
+
 def validate_artifact_paths(paths: list[str] | tuple[str, ...]) -> ArtifactValidationResult:
     issues: list[ArtifactValidationIssue] = []
     for raw_path in dict.fromkeys(str(path or "").strip() for path in paths):
