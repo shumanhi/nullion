@@ -5986,6 +5986,7 @@ def _focus_tools_for_ready_artifact_production(
     required_extensions = _required_attachment_extensions_from_turn_state(state)
     if not required_extensions:
         return tool_registry
+    tool_results = tuple(tool_results)
     completed = _completed_tool_names(tool_results)
     source_evidence_tools = _ARTIFACT_SOURCE_EVIDENCE_TOOLS | {
         "calendar_list",
@@ -5995,18 +5996,44 @@ def _focus_tools_for_ready_artifact_production(
         "market_quote",
         "weather_forecast",
     }
+
+    def source_result_count() -> int:
+        """Count schema-backed source records, not merely tool invocations."""
+
+        total = 0
+        for result in tool_results:
+            if str(getattr(result, "tool_name", "") or "") not in source_evidence_tools:
+                continue
+            if normalize_tool_status(getattr(result, "status", None)) != "completed":
+                continue
+            output = getattr(result, "output", None)
+            if not isinstance(output, Mapping):
+                total += 1
+                continue
+            cardinalities = [1]
+            for key in ("item_count", "result_count", "record_count"):
+                value = output.get(key)
+                if isinstance(value, bool):
+                    continue
+                try:
+                    cardinalities.append(max(0, int(value)))
+                except (TypeError, ValueError):
+                    continue
+            cardinalities.extend(
+                len(value)
+                for value in output.values()
+                if isinstance(value, (list, tuple))
+            )
+            total += max(cardinalities)
+        return total
+
     if isinstance(flow_context, Mapping):
         try:
             minimum_source_results = max(0, int(flow_context.get("artifact_focus_min_source_results") or 0))
         except (TypeError, ValueError):
             minimum_source_results = 0
         if minimum_source_results:
-            source_result_count = sum(
-                1
-                for result in tool_results
-                if str(getattr(result, "tool_name", "") or "") in source_evidence_tools
-            )
-            if source_result_count < minimum_source_results:
+            if source_result_count() < minimum_source_results:
                 return tool_registry
     if not completed.intersection(source_evidence_tools):
         return tool_registry
