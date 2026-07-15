@@ -91,6 +91,8 @@ from nullion.tool_boundaries import extract_boundary_facts
 
 _WEB_FETCH_MAX_REDIRECTS = 5
 _WEB_FETCH_MAX_BODY_BYTES = 2_000_000
+_CONNECTOR_JSON_MAX_BODY_BYTES = 1_000_000
+_EMAIL_ATTACHMENT_CONNECTOR_MAX_BODY_BYTES = 36 * 1024 * 1024
 _FILE_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
 _BROWSER_IMAGE_COLLECT_MAX_IMAGES = 20
 _BROWSER_IMAGE_MAX_BYTES = 6_000_000
@@ -14619,9 +14621,19 @@ def _calendar_selected_results_payload(
     }
 
 
-def _connector_json_payload_from_response(response) -> dict[str, object]:
-    body = response.read(1_000_000).decode("utf-8", "ignore")
-    payload = json.loads(body or "{}")
+def _connector_json_payload_from_response(
+    response,
+    *,
+    max_body_bytes: int = _CONNECTOR_JSON_MAX_BODY_BYTES,
+) -> dict[str, object]:
+    body_bytes = response.read(max_body_bytes + 1)
+    if len(body_bytes) > max_body_bytes:
+        raise RuntimeError(f"connector response exceeded the {max_body_bytes}-byte limit")
+    body = body_bytes.decode("utf-8", "ignore")
+    try:
+        payload = json.loads(body or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("connector returned invalid JSON") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("connector returned non-object JSON")
     return payload
@@ -14635,6 +14647,7 @@ def _connector_json_request(
     params: dict[str, object] | None = None,
     method: str = "GET",
     json_payload: object | None = None,
+    max_response_bytes: int = _CONNECTOR_JSON_MAX_BODY_BYTES,
 ) -> dict[str, object]:
     connection = _connector_connection_for_invocation(invocation, provider_id)
     normalized_method = _connector_request_method(method)
@@ -14652,7 +14665,7 @@ def _connector_json_request(
     try:
         with _pinned_web_fetch_resolution(resolution):
             with opener.open(request, timeout=_connector_request_timeout_seconds()) as response:
-                return _connector_json_payload_from_response(response)
+                return _connector_json_payload_from_response(response, max_body_bytes=max_response_bytes)
     except urllib.error.HTTPError as exc:
         _output, error = _connector_http_error_output(
             exc,
@@ -15217,6 +15230,7 @@ def _build_connector_email_attachment_read_handler() -> ToolHandler:
                 invocation,
                 provider_id=provider_id,
                 url=f"{endpoint}/{quote(message_id, safe='')}/attachments/{quote(attachment_id, safe='')}",
+                max_response_bytes=_EMAIL_ATTACHMENT_CONNECTOR_MAX_BODY_BYTES,
             )
             data = _gmail_decode_attachment_bytes(payload.get("data"))
             if not data:
