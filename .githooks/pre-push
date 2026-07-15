@@ -44,9 +44,11 @@ else
   fi
 
   COVERAGE_FILE="$(mktemp "${TMPDIR:-/tmp}/nullion-coverage.XXXXXX")"
+  PRIVATE_TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/nullion-private-test-home.XXXXXX")"
   export COVERAGE_FILE
   cleanup_coverage() {
     rm -f "$COVERAGE_FILE"
+    rm -rf "$PRIVATE_TEST_HOME"
   }
   trap cleanup_coverage EXIT
 
@@ -75,7 +77,10 @@ PY
     "$PYTHON_CMD" -m pip install $missing_test_deps
   fi
   "$PYTHON_CMD" -m coverage erase
-  "$PYTHON_CMD" -m coverage run --source=src/nullion -m pytest -q "$TEST_PATH"
+  HOME="$PRIVATE_TEST_HOME" \
+  NULLION_HOME="$PRIVATE_TEST_HOME/.nullion" \
+  NULLION_ENV_FILE="$PRIVATE_TEST_HOME/.nullion/.env" \
+    "$PYTHON_CMD" -m coverage run --source=src/nullion -m pytest -q "$TEST_PATH"
   "$PYTHON_CMD" -m coverage report --fail-under=70
 fi
 

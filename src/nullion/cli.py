@@ -1778,18 +1778,20 @@ def _tray_status() -> None:
 
 def _remove_launchd_services(*, dry_run: bool) -> list[str]:
     actions: list[str] = []
-    if sys.platform != "darwin" and not any(_launchd_plist_for_label(label).exists() for label in _LAUNCHD_LABELS):
+    installed_services = [
+        (label, _launchd_plist_for_label(label))
+        for label in _LAUNCHD_LABELS
+        if _launchd_plist_for_label(label).exists()
+    ]
+    if not installed_services:
         return actions
     uid = os.getuid() if hasattr(os, "getuid") else None
     has_launchctl = shutil.which("launchctl") is not None
-    for label in _LAUNCHD_LABELS:
-        plist = _launchd_plist_for_label(label)
+    for label, plist in installed_services:
         if has_launchctl and uid is not None:
             _run_uninstall_subprocess(["launchctl", "bootout", f"gui/{uid}/{label}"], dry_run=dry_run)
-            if plist.exists():
-                _run_uninstall_subprocess(["launchctl", "unload", str(plist)], dry_run=dry_run)
-        if plist.exists():
-            actions.append(_remove_path(plist, dry_run=dry_run))
+            _run_uninstall_subprocess(["launchctl", "unload", str(plist)], dry_run=dry_run)
+        actions.append(_remove_path(plist, dry_run=dry_run))
     return actions
 
 
