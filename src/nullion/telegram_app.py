@@ -151,6 +151,7 @@ _FAST_OPERATOR_COMMAND_HEADS = frozenset(
     {
         "/help",
         "/models",
+        "/new",
         "/verbose",
         "/stream",
         "/streaming",
@@ -808,20 +809,45 @@ class _TelegramTextDeltaStreamer:
     def text(self) -> str:
         return "".join(self._parts)
 
-    async def _send_or_edit(self, text: str) -> bool:
-        rendered = sanitize_external_inline_markup(text or "")
+    @property
+    def has_sent_message(self) -> bool:
+        return self._sent_message is not None
+
+    @property
+    def sent_message(self):
+        return self._sent_message
+
+    async def _send_or_edit(self, text: str, *, final: bool = False) -> bool:
+        plain_text = sanitize_external_inline_markup(text or "")
+        rendered, formatting_kwargs = format_telegram_text(text) if final else (plain_text, {})
         if self._sent_message is None:
             reply_text = getattr(self._message, "reply_text", None)
             if reply_text is None:
                 return False
             self._sent_message = await retry_messaging_delivery_operation(
-                lambda: reply_text(rendered, do_quote=_should_quote_reply(_message_text_or_caption(self._message)))
+                lambda: reply_text(
+                    rendered,
+                    do_quote=_should_quote_reply(_message_text_or_caption(self._message)),
+                    **formatting_kwargs,
+                )
             )
             return True
         edit_text = getattr(self._sent_message, "edit_text", None)
         if edit_text is None:
             return False
-        await retry_messaging_delivery_operation(lambda: edit_text(rendered))
+        try:
+            if final:
+                await _edit_text_with_plain_fallback(
+                    edit_text,
+                    rendered,
+                    text,
+                    **formatting_kwargs,
+                )
+            else:
+                await retry_messaging_delivery_operation(lambda: edit_text(rendered))
+        except Exception as exc:
+            if not _is_telegram_message_not_modified_error(exc):
+                raise
         return True
 
     def emit(self, delta: str) -> None:
@@ -843,9 +869,7 @@ class _TelegramTextDeltaStreamer:
         text = str(final_text or "")
         if not text or self._sent_message is None:
             return False
-        if self._last_text == text:
-            return True
-        return await self._send_or_edit(text)
+        return await self._send_or_edit(text, final=True)
 
 
 def _is_valid_telegram_bot_token(value: str) -> bool:
@@ -4330,6 +4354,12 @@ class ChatOperatorService:
                     platform=platform,
                     text=text,
                     chat_id=chat_id,
+                    turn_id=(
+                        str(getattr(turn_dispatch_decision, "turn_id", None) or "").strip()
+                        or str(request_id or "").strip()
+                        or str(message_id or "").strip()
+                        or None
+                    ),
                     attachments=attachments,
                     settings=self.settings,
                     request_id=request_id,
@@ -5336,19 +5366,52 @@ class ChatOperatorService:
                 turn_outcome = "suppressed_by_planner_ack"
                 _log_turn_timing(turn_outcome)
                 return
-            if getattr(reply, "reply_already_sent", False):
+            streamed_plain_reply = bool(
+                handler_error is None
+                and isinstance(reply, str)
+                and text_streamer.has_sent_message
+                and decision_card is None
+                and _suggestion_markup is None
+                and not reply_artifact_paths
+            )
+            if getattr(reply, "reply_already_sent", False) or streamed_plain_reply:
                 await _stop_typing_keepalive(typing_keepalive_task)
                 typing_keepalive_task = None
-                if activity_finish_task is not None:
-                    await activity_finish_task
-                await text_streamer.finish(str(reply))
-                if ingress_checkpoint_deferred:
-                    await asyncio.to_thread(self.runtime.checkpoint)
-                    _cache_runtime_checkpoint_signature(self.runtime)
-                turn_outcome = "streamed_reply"
-                _mark_timing("delivery_complete")
-                _log_turn_timing(turn_outcome)
-                return
+                stream_delivery_ok = False
+                if streamed_plain_reply:
+                    try:
+                        stream_delivery_ok = await text_streamer.finish(str(reply))
+                    except Exception:
+                        logger.warning(
+                            "Telegram streamed final edit failed; falling back to primary delivery",
+                            exc_info=True,
+                        )
+                        stream_delivery_ok = False
+                    if stream_delivery_ok:
+                        streamed_delivery = prepare_reply_for_platform_delivery(
+                            str(reply),
+                            allow_attachments=False,
+                            delivery_contract=DeliveryContract.message_only(),
+                        )
+                        _record_telegram_delivery_receipt(
+                            message,
+                            streamed_delivery,
+                            transport_ok=True,
+                            request_id=request_id,
+                            delivered_message=text_streamer.sent_message,
+                        )
+                if not streamed_plain_reply:
+                    await text_streamer.finish(str(reply))
+                if getattr(reply, "reply_already_sent", False) or stream_delivery_ok:
+                    if activity_finish_task is not None:
+                        await activity_finish_task
+                    if ingress_checkpoint_deferred:
+                        await asyncio.to_thread(self.runtime.checkpoint)
+                        _cache_runtime_checkpoint_signature(self.runtime)
+                    turn_outcome = "streamed_reply"
+                    _mark_timing("delivery_complete")
+                    _log_turn_timing(turn_outcome)
+                    return
 
             message = getattr(update, "message", None)
             if message is None:
@@ -5401,6 +5464,13 @@ class ChatOperatorService:
                     streaming_mode=_telegram_streaming_mode(self.runtime, chat_id=chat_id_text),
                     final_only_streaming_mode=ChatStreamingMode.FINAL_ONLY,
                 )
+                if delivery_plan.delivery_contract.requires_attachment_delivery:
+                    logger.debug(
+                        "telegram artifact delivery plan request_id=%s artifact_names=%s required_extensions=%s",
+                        request_id,
+                        [Path(path).name for path in reply_artifact_paths],
+                        list(delivery_plan.delivery_contract.required_attachment_extensions),
+                    )
                 await _deliver_reply(
                     message,
                     reply,

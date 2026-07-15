@@ -1101,14 +1101,39 @@ async def _send_operator_telegram_delivery(
                 message_kwargs["disable_web_page_preview"] = True
             if parse_mode:
                 message_kwargs["parse_mode"] = parse_mode
-                message_text = text
+                chunks = [text]
             else:
-                message_text, formatting_kwargs = format_telegram_text(delivery.text or "")
-                message_kwargs.update(formatting_kwargs)
-            sent_message = await retry_messaging_delivery_operation(
-                lambda: bot.send_message(chat_id, message_text, **message_kwargs)
-            )
-            sent_message_id = getattr(sent_message, "message_id", None)
+                from nullion.telegram_app import _split_telegram_message_chunks
+
+                plain_chunks = _split_telegram_message_chunks(delivery.text or "", limit=3000)
+                chunks = []
+                for plain_chunk in plain_chunks:
+                    formatted_chunk, formatting_kwargs = format_telegram_text(plain_chunk)
+                    if len(formatted_chunk) > 4096 and len(plain_chunk) > 1:
+                        for smaller_chunk in _split_telegram_message_chunks(plain_chunk, limit=1500):
+                            smaller_formatted, smaller_kwargs = format_telegram_text(smaller_chunk)
+                            chunks.append((smaller_formatted, smaller_kwargs))
+                    else:
+                        chunks.append((formatted_chunk, formatting_kwargs))
+            sent_message_id = None
+            for index, chunk in enumerate(chunks):
+                if parse_mode:
+                    message_text = chunk
+                    chunk_kwargs = dict(message_kwargs)
+                else:
+                    message_text, formatting_kwargs = chunk
+                    chunk_kwargs = {**message_kwargs, **formatting_kwargs}
+                if index > 0:
+                    chunk_kwargs.pop("reply_markup", None)
+                sent_message = await retry_messaging_delivery_operation(
+                    lambda message_text=message_text, chunk_kwargs=chunk_kwargs: bot.send_message(
+                        chat_id,
+                        message_text,
+                        **chunk_kwargs,
+                    )
+                )
+                if sent_message_id is None:
+                    sent_message_id = getattr(sent_message, "message_id", None)
             receipt = build_platform_delivery_receipt(
                 channel="telegram",
                 target_id=str(chat_id),

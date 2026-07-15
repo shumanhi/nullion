@@ -109,7 +109,16 @@ def compact_list_crons_output_for_context(
     if isinstance(message, str) and message.strip():
         limit = max(0, int(message_limit or 0))
         if limit:
-            compact["message"] = re.sub(r"\s+", " ", message).strip()[:limit]
+            normalized_message = re.sub(r"\s+", " ", message).strip()
+            if len(normalized_message) <= limit:
+                compact["message"] = normalized_message
+            else:
+                # The structured rows above are the authoritative compact
+                # representation.  A blind prefix can end mid-item and later
+                # become a user-visible partial answer, so expose only typed
+                # truncation metadata when the full message does not fit.
+                compact["message_truncated"] = True
+                compact["message_character_count"] = len(normalized_message)
     return compact
 
 

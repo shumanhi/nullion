@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 import os
@@ -137,7 +137,7 @@ _EMBEDDED_MEDIA_ARTIFACT_EXTENSION_ALIASES = {
     ".xls": ".xlsx",
 }
 _EMBEDDED_MEDIA_ARTIFACT_EXTENSIONS = frozenset({".docx", ".html", ".pdf", ".pptx", ".xlsx"})
-_SCOPE_REQUIRED_TOOL_CANDIDATES = frozenset(
+_SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES = frozenset(
     {
         "archive_create",
         "archive_extract",
@@ -160,6 +160,31 @@ _SCOPE_REQUIRED_TOOL_CANDIDATES = frozenset(
         "update_cron",
         "update_reminder",
     }
+)
+_SCOPE_SOURCE_REQUIRED_TOOL_CANDIDATES = frozenset(
+    {
+        "browser_assert_page_state",
+        "browser_extract_items",
+        "browser_extract_text",
+        "browser_image_collect",
+        "browser_navigate",
+        "browser_open",
+        "browser_run_js",
+        "browser_screenshot",
+        "calendar_list",
+        "email_attachment_read",
+        "email_read",
+        "email_search",
+        "file_read",
+        "file_search",
+        "market_quote",
+        "weather_forecast",
+        "web_fetch",
+        "workspace_summary",
+    }
+)
+_SCOPE_REQUIRED_TOOL_CANDIDATES = (
+    _SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES | _SCOPE_SOURCE_REQUIRED_TOOL_CANDIDATES
 )
 _CONNECTOR_TOOLS = frozenset({"connector_request"})
 _CONNECTOR_CAPABILITY_TAGS = frozenset({"connector"})
@@ -209,6 +234,7 @@ _LOCAL_FILE_MUTATION_TOOLS = _LOCAL_FILE_TOOLS - _LOCAL_FILE_READ_TOOLS
 _LOCAL_FILE_LISTING_TOOLS = frozenset({"file_read", "file_search", "workspace_summary"})
 _LOCAL_SHELL_TOOLS = frozenset({"terminal_exec"})
 _SCOPE_REQUEST_TOOL_NAME = "request_tool_scope"
+_PLAIN_DIRECT_SAFE_READ_TOOLS = frozenset({"market_quote", "weather_forecast"})
 _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
     name=_SCOPE_REQUEST_TOOL_NAME,
     description=(
@@ -219,6 +245,10 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "scope so the runtime can report active sources and expose safe structured read tools. "
         "Include tool_names when the exact structured account tool is already known rather than widening "
         "a generic connector scope into every account tool. "
+        "When a successful result from an exact source or verification tool is essential to the requested "
+        "outcome, include that exact name in both tool_names and required_tool_names. This lets the runtime "
+        "prevent a confident final reply from bypassing missing source evidence and report a structurally "
+        "unavailable source when no compatible provider or registered tool exists. "
         "Use scheduler_* only for Nullion's own recurring jobs and "
         "reminders. If the current turn asks to manually start, trigger, run now, rerun, or otherwise execute "
         "an existing scheduled task, request scheduler_run with scheduler_action=\"run\" and include run_cron "
@@ -367,6 +397,15 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     ],
                 },
             },
+            "required_tool_names": {
+                "type": "array",
+                "description": (
+                    "Subset of tool_names whose successful current-turn result is essential before a final reply. "
+                    "Use this for an explicitly required public/account source or verification step. Artifact, "
+                    "scheduler, connector-write, and other action tools are already treated as required when exact."
+                ),
+                "items": {"type": "string"},
+            },
             "artifact_extensions": {
                 "type": "array",
                 "description": (
@@ -375,6 +414,14 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "the runtime validates the suffix and exposes the matching structured artifact tool. "
                     "If the artifact itself must contain embedded media, repeat that suffix in "
                     "embedded_media_artifact_extensions instead of relying on artifact_extensions alone."
+                ),
+                "items": {"type": "string", "enum": sorted(VALID_ATTACHMENT_EXTENSIONS)},
+            },
+            "excluded_artifact_extensions": {
+                "type": "array",
+                "description": (
+                    "Formats mentioned in the request that are not final deliverables, including source, intermediate, "
+                    "sidecar, example, or explicitly prohibited attachment formats. These override artifact_extensions."
                 ),
                 "items": {"type": "string", "enum": sorted(VALID_ATTACHMENT_EXTENSIONS)},
             },
@@ -442,8 +489,9 @@ _KNOWN_PRIOR_TOOL_SCOPES = frozenset(
 _WEB_ACTIONS = frozenset({"none", "open_url", "live_research", "browser_interaction"})
 _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
 _SKILL_PACK_ACTIONS = frozenset({"none", "reference", "connector"})
+_REQUESTED_OUTCOMES = frozenset({"unspecified", "generated_media"})
 _TOOL_SCOPE_DECISION_CACHE_NAMESPACE = "tool_scope.decision"
-_TOOL_SCOPE_DECISION_CACHE_VERSION = "v40"
+_TOOL_SCOPE_DECISION_CACHE_VERSION = "v49"
 _TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS = 24 * 60 * 60
 _SCOPE_CAPABILITY_ALIASES = {
     "browser": "web",
@@ -684,6 +732,7 @@ class TurnToolEvidence:
     has_email_address_target: bool = False
     requested_extensions: tuple[str, ...] = ()
     existing_named_artifact_extensions: tuple[str, ...] = ()
+    existing_named_artifact_requires_new_content: bool = False
     context_linked: bool = False
     saved_history_available: bool = False
     slash_prefixed_literal: bool = False
@@ -704,6 +753,7 @@ class TurnToolEvidence:
 
 @dataclass(frozen=True, slots=True)
 class TurnToolScopeDecision:
+    requested_outcome: str = "unspecified"
     web_action: str = "none"
     scheduler_action: str = "none"
     scheduler_toggle_enabled: bool | None = None
@@ -715,6 +765,7 @@ class TurnToolScopeDecision:
     requested_tool_names: tuple[str, ...] = ()
     required_tool_names: tuple[str, ...] = ()
     requested_artifact_extensions: tuple[str, ...] = ()
+    excluded_artifact_extensions: tuple[str, ...] = ()
     required_embedded_media_extensions: tuple[str, ...] = ()
     confidence: float = 0.0
     valid: bool = False
@@ -896,6 +947,9 @@ class ScopedTurnToolRegistry:
         return bool(tags.intersection(_SKILL_PACK_CAPABILITY_TAGS))
 
     def _is_plain_independent_turn(self) -> bool:
+        substantive_requested_tool_names = set(
+            self.turn_tool_scope_decision.requested_tool_names
+        ).difference(_PLAIN_DIRECT_SAFE_READ_TOOLS)
         return not (
             self._evidence.context_linked
             or self._evidence.has_url_target
@@ -907,7 +961,7 @@ class ScopedTurnToolRegistry:
             or self.turn_tool_scope_decision.allow_scheduler_tools
             or self.turn_tool_scope_decision.allow_connector_tools
             or self.turn_tool_scope_decision.allow_skill_pack_tools
-            or bool(self.turn_tool_scope_decision.requested_tool_names)
+            or bool(substantive_requested_tool_names)
             or bool(self.turn_tool_scope_decision.requested_artifact_extensions)
             or bool(self.turn_tool_scope_decision.required_embedded_media_extensions)
         )
@@ -998,7 +1052,7 @@ class ScopedTurnToolRegistry:
             return True
         if self._artifact_scheduler_scope_is_ambiguous():
             return False
-        if existing_named_extensions:
+        if existing_named_extensions and not self._evidence.existing_named_artifact_requires_new_content:
             if tool_name == "spreadsheet_create" and existing_named_extensions.intersection(_SPREADSHEET_EXTENSIONS):
                 return False
             if tool_name == "presentation_create" and existing_named_extensions.intersection(_PRESENTATION_EXTENSIONS):
@@ -1552,6 +1606,14 @@ class ScopedTurnToolRegistry:
                 if str(value or "").strip()
             )
         )
+        raw_required_tool_names = arguments.get("required_tool_names")
+        explicit_required_tool_names = {
+            str(value or "").strip()
+            for value in (
+                raw_required_tool_names if isinstance(raw_required_tool_names, list) else ()
+            )
+            if str(value or "").strip()
+        }
         embedded_media_extensions = _validated_scope_request_embedded_media_extensions(arguments)
         validated_artifact_extensions = list(
             _validated_artifact_extensions(arguments.get("artifact_extensions"))
@@ -1571,15 +1633,47 @@ class ScopedTurnToolRegistry:
         connector_write_tools = [
             tool_name for tool_name in exact_tool_names if tool_name in _CONNECTOR_FIRST_CLASS_WRITE_TOOLS
         ]
-        required_candidates = _SCOPE_REQUIRED_TOOL_CANDIDATES | (
+        implicit_required_candidates = _SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES | (
             _CONNECTOR_FIRST_CLASS_WRITE_TOOLS if len(connector_write_tools) == 1 else frozenset()
         )
         return tuple(
             tool_name
             for tool_name in exact_tool_names
-            if tool_name in available and tool_name in required_candidates
+            if (
+                tool_name in implicit_required_candidates
+                or (
+                    tool_name in explicit_required_tool_names
+                    and tool_name in _SCOPE_REQUIRED_TOOL_CANDIDATES
+                )
+            )
             and (tool_name not in _LOCAL_SHELL_TOOLS or not dedicated_artifact_tools)
         )
+
+    @staticmethod
+    def _required_web_entry_tool_for_scope(
+        tool_names: Iterable[str],
+        required_tool_names: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Require one callable public-web entry point when web scope is selected.
+
+        The capability itself is typed model output. Once selected, it must not
+        silently degrade into weather/market-only work while claiming that web
+        research was part of the completed request.
+        """
+
+        available = {str(name or "").strip() for name in tool_names if str(name or "").strip()}
+        required = {
+            str(name or "").strip()
+            for name in required_tool_names
+            if str(name or "").strip()
+        }
+        web_source_tools = {"web_fetch", "browser_navigate", "browser_open"}
+        if required.intersection(web_source_tools):
+            return ()
+        for candidate in ("web_fetch", "browser_navigate", "browser_open"):
+            if candidate in available:
+                return (candidate,)
+        return ()
 
     def _safe_connector_read_tools_for_active_sources(
         self,
@@ -1596,18 +1690,56 @@ class ScopedTurnToolRegistry:
         )
 
     def apply_scope_request(self, invocation: ToolInvocation) -> tuple[ToolResult, "ScopedTurnToolRegistry"]:
-        tool_names = self._tool_names_for_scope_request(invocation.arguments)
-        embedded_media_extensions = _validated_scope_request_embedded_media_extensions(invocation.arguments)
+        scope_arguments = dict(invocation.arguments)
+        explicit_artifact_extensions = _validated_artifact_extensions(scope_arguments.get("artifact_extensions"))
+        explicit_embedded_extensions = _validated_scope_request_embedded_media_extensions(scope_arguments)
+        explicit_excluded_extensions = _validated_artifact_extensions(
+            scope_arguments.get("excluded_artifact_extensions")
+        )
+        if not explicit_artifact_extensions and not explicit_embedded_extensions:
+            typed_artifact_extensions = tuple(
+                dict.fromkeys(
+                    [
+                        *self.turn_tool_scope_decision.requested_artifact_extensions,
+                        *self.turn_tool_scope_decision.required_embedded_media_extensions,
+                    ]
+                )
+            )
+            inherited_artifact_extensions = (
+                typed_artifact_extensions
+                if self.turn_tool_scope_decision.valid and typed_artifact_extensions
+                else tuple(dict.fromkeys(self._evidence.requested_extensions))
+            )
+            if inherited_artifact_extensions:
+                scope_arguments["artifact_extensions"] = list(inherited_artifact_extensions)
+        tool_names = self._tool_names_for_scope_request(scope_arguments)
+        embedded_media_extensions = _validated_scope_request_embedded_media_extensions(scope_arguments)
         artifact_extensions = tuple(
             dict.fromkeys(
                 [
-                    *_validated_artifact_extensions(invocation.arguments.get("artifact_extensions")),
+                    *_validated_artifact_extensions(scope_arguments.get("artifact_extensions")),
                     *embedded_media_extensions,
                 ]
             )
         )
+        excluded_artifact_extensions = tuple(
+            dict.fromkeys(
+                [
+                    *self.turn_tool_scope_decision.excluded_artifact_extensions,
+                    *explicit_excluded_extensions,
+                ]
+            )
+        )
+        if excluded_artifact_extensions:
+            excluded_set = set(excluded_artifact_extensions)
+            artifact_extensions = tuple(
+                extension for extension in artifact_extensions if extension not in excluded_set
+            )
+            embedded_media_extensions = tuple(
+                extension for extension in embedded_media_extensions if extension not in excluded_set
+            )
         required_tool_names = self._required_tool_names_for_scope_request(
-            invocation.arguments,
+            scope_arguments,
             tool_names,
         )
         if embedded_media_extensions and not _scope_tool_names_can_source_embedded_media(tool_names):
@@ -1657,6 +1789,15 @@ class ScopedTurnToolRegistry:
             requested_scheduler_target_scope = "none"
             requested_scheduler_toggle_enabled = None
         scheduler_mutation_scope = "scheduler_mutate" in capabilities
+        if "web" in capabilities and not scheduler_mutation_scope:
+            required_tool_names = tuple(
+                dict.fromkeys(
+                    [
+                        *required_tool_names,
+                        *self._required_web_entry_tool_for_scope(tool_names, required_tool_names),
+                    ]
+                )
+            )
         if scheduler_mutation_scope:
             artifact_extensions = ()
             embedded_media_extensions = ()
@@ -1961,10 +2102,12 @@ class ScopedTurnToolRegistry:
                 connector_source_user_requested=connector_source_user_requested,
                 requested_tool_names=merged_requested_tool_names,
                 required_tool_names=merged_required_tool_names,
-                requested_artifact_extensions=(
-                    *existing.requested_artifact_extensions,
-                    *artifact_extensions,
+                requested_artifact_extensions=tuple(
+                    extension
+                    for extension in dict.fromkeys([*existing.requested_artifact_extensions, *artifact_extensions])
+                    if extension not in set(excluded_artifact_extensions)
                 ),
+                excluded_artifact_extensions=excluded_artifact_extensions,
                 required_embedded_media_extensions=tuple(
                     dict.fromkeys([*existing.required_embedded_media_extensions, *embedded_media_extensions])
                 ),
@@ -1974,7 +2117,22 @@ class ScopedTurnToolRegistry:
         )
         callable_tool_names = tuple(tool_name for tool_name in tool_names if widened.can_invoke_tool(tool_name))
         callable_required_tool_names = tuple(
-            tool_name for tool_name in required_tool_names if widened.can_invoke_tool(tool_name)
+            tool_name for tool_name in merged_required_tool_names if widened.can_invoke_tool(tool_name)
+        )
+        unavailable_required_tool_names = tuple(
+            tool_name
+            for tool_name in merged_required_tool_names
+            if tool_name not in set(callable_required_tool_names)
+        )
+        connector_source_unavailable = bool(
+            "connector" in capabilities
+            and invocation.arguments.get("source_user_requested")
+            and not active_connector_providers
+        )
+        unavailable_tools = tuple(
+            sorted(_CONNECTOR_TYPED_TOOLS | _CONNECTOR_TOOLS)
+            if connector_source_unavailable
+            else ()
         )
         return (
             ToolResult(
@@ -1990,7 +2148,13 @@ class ScopedTurnToolRegistry:
                     "scheduler_target_scope": widened.turn_tool_scope_decision.scheduler_target_scope,
                     "available_tools": list(callable_tool_names),
                     "required_tool_names": list(callable_required_tool_names),
+                    "requested_required_tool_names": list(merged_required_tool_names),
+                    "unavailable_required_tool_names": list(unavailable_required_tool_names),
+                    "unavailable_tools": list(unavailable_tools),
+                    "unavailable_capabilities": ["connector"] if connector_source_unavailable else [],
+                    "connector_source_unavailable": connector_source_unavailable,
                     "artifact_extensions": list(artifact_extensions),
+                    "excluded_artifact_extensions": list(excluded_artifact_extensions),
                     "embedded_media_artifact_extensions": list(embedded_media_extensions),
                     "connector_app_ids": list(connector_app_ids),
                     "available_sources": available_sources,
@@ -2072,6 +2236,11 @@ def turn_is_context_linked(conversation_result: object | None) -> bool:
     if getattr(turn, "parent_turn_id", None) is not None:
         return True
     disposition = getattr(turn, "disposition", None)
+    disposition_value = str(getattr(disposition, "value", disposition) or "").strip()
+    if disposition_value == ConversationTurnDisposition.INDEPENDENT.value:
+        # The persisted turn relationship is authoritative. A stale task-frame
+        # continuation hint must not reopen history or tool scope after /new.
+        return False
     if disposition in _CONTEXT_LINK_DISPOSITIONS:
         return True
     try:
@@ -2102,6 +2271,7 @@ def build_turn_tool_evidence(
     has_attachments: bool = False,
     requested_extensions: Iterable[str] | None = None,
     existing_named_artifact_extensions: Iterable[str] | None = None,
+    existing_named_artifact_requires_new_content: bool = False,
     saved_history_available: bool = False,
     numbered_option_selected: bool = False,
     prior_tool_scopes: Iterable[str] | None = None,
@@ -2142,6 +2312,7 @@ def build_turn_tool_evidence(
         has_email_address_target=_has_email_address_target(user_message),
         requested_extensions=normalized_extensions,
         existing_named_artifact_extensions=normalized_existing_named_artifact_extensions,
+        existing_named_artifact_requires_new_content=bool(existing_named_artifact_requires_new_content),
         context_linked=turn_is_context_linked(conversation_result),
         saved_history_available=bool(saved_history_available),
         slash_prefixed_literal=is_slash_prefixed_literal_message(user_message),
@@ -2222,6 +2393,9 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
         return TurnToolScopeDecision()
     if not isinstance(payload, dict):
         return TurnToolScopeDecision()
+    requested_outcome = str(payload.get("requested_outcome") or "unspecified").strip().lower()
+    if requested_outcome not in _REQUESTED_OUTCOMES:
+        requested_outcome = "unspecified"
     web_action = str(payload.get("web_action") or "none").strip().lower()
     if web_action not in _WEB_ACTIONS:
         web_action = "none"
@@ -2258,11 +2432,21 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
             if str(tool_name or "").strip()
         )
     )
-    required_embedded_media_extensions = _validated_embedded_media_artifact_extensions(
-        payload.get("required_embedded_media_extensions")
+    excluded_artifact_extensions = _validated_artifact_extensions(
+        payload.get("excluded_artifact_extensions")
+    )
+    excluded_artifact_extension_set = set(excluded_artifact_extensions)
+    required_embedded_media_extensions = tuple(
+        extension
+        for extension in _validated_embedded_media_artifact_extensions(
+            payload.get("required_embedded_media_extensions")
+        )
+        if extension not in excluded_artifact_extension_set
     )
     validated_artifact_extensions = list(
-        _validated_artifact_extensions(payload.get("requested_artifact_extensions"))
+        extension
+        for extension in _validated_artifact_extensions(payload.get("requested_artifact_extensions"))
+        if extension not in excluded_artifact_extension_set
     )
     requested_artifact_extensions = tuple(
         [
@@ -2280,6 +2464,7 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
         confidence = 0.0
     connector_source_user_requested = bool(payload.get("connector_source_user_requested"))
     return TurnToolScopeDecision(
+        requested_outcome=requested_outcome,
         web_action=web_action,
         scheduler_action=scheduler_action,
         scheduler_toggle_enabled=scheduler_toggle_enabled,
@@ -2291,6 +2476,7 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
         requested_tool_names=requested_tool_names,
         required_tool_names=required_tool_names,
         requested_artifact_extensions=requested_artifact_extensions,
+        excluded_artifact_extensions=excluded_artifact_extensions,
         required_embedded_media_extensions=required_embedded_media_extensions,
         confidence=max(0.0, min(1.0, confidence)),
         valid=True,
@@ -2299,6 +2485,7 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
 
 def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str, object]:
     return {
+        "requested_outcome": decision.requested_outcome,
         "web_action": decision.web_action,
         "scheduler_action": decision.scheduler_action,
         "scheduler_toggle_enabled": decision.scheduler_toggle_enabled,
@@ -2310,6 +2497,7 @@ def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str
         "requested_tool_names": list(decision.requested_tool_names),
         "required_tool_names": list(decision.required_tool_names),
         "requested_artifact_extensions": list(decision.requested_artifact_extensions),
+        "excluded_artifact_extensions": list(decision.excluded_artifact_extensions),
         "required_embedded_media_extensions": list(decision.required_embedded_media_extensions),
         "confidence": decision.confidence,
         "valid": decision.valid,
@@ -2318,6 +2506,9 @@ def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str
 
 def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision | None:
     if not isinstance(payload, dict):
+        return None
+    requested_outcome = str(payload.get("requested_outcome") or "unspecified").strip().lower()
+    if requested_outcome not in _REQUESTED_OUTCOMES:
         return None
     web_action = str(payload.get("web_action") or "none").strip().lower()
     scheduler_action = str(payload.get("scheduler_action") or "none").strip().lower()
@@ -2351,11 +2542,21 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
             if str(tool_name or "").strip()
         )
     )
-    required_embedded_media_extensions = _validated_embedded_media_artifact_extensions(
-        payload.get("required_embedded_media_extensions")
+    excluded_artifact_extensions = _validated_artifact_extensions(
+        payload.get("excluded_artifact_extensions")
+    )
+    excluded_artifact_extension_set = set(excluded_artifact_extensions)
+    required_embedded_media_extensions = tuple(
+        extension
+        for extension in _validated_embedded_media_artifact_extensions(
+            payload.get("required_embedded_media_extensions")
+        )
+        if extension not in excluded_artifact_extension_set
     )
     validated_artifact_extensions = list(
-        _validated_artifact_extensions(payload.get("requested_artifact_extensions"))
+        extension
+        for extension in _validated_artifact_extensions(payload.get("requested_artifact_extensions"))
+        if extension not in excluded_artifact_extension_set
     )
     requested_artifact_extensions = tuple(
         [
@@ -2373,6 +2574,7 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
         confidence = 0.0
     connector_source_user_requested = bool(payload.get("connector_source_user_requested"))
     return TurnToolScopeDecision(
+        requested_outcome=requested_outcome,
         web_action=web_action,
         scheduler_action=scheduler_action,
         scheduler_toggle_enabled=scheduler_toggle_enabled,
@@ -2384,6 +2586,7 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
         requested_tool_names=requested_tool_names,
         required_tool_names=required_tool_names,
         requested_artifact_extensions=requested_artifact_extensions,
+        excluded_artifact_extensions=excluded_artifact_extensions,
         required_embedded_media_extensions=required_embedded_media_extensions,
         confidence=max(0.0, min(1.0, confidence)),
         valid=bool(payload.get("valid")),
@@ -2987,6 +3190,20 @@ def _validated_turn_tool_scope_decision(
         allow_connector=decision.skill_pack_action == "connector",
         active_connector_providers=active_connector_providers,
     )
+    image_generation_unavailable = (
+        decision.requested_outcome == "generated_media"
+        and "image_generate" not in {
+            str(getattr(spec, "name", "") or "")
+            for spec in registry.list_specs()
+        }
+    )
+    if image_generation_unavailable:
+        requested_tool_names = tuple(
+            tool_name
+            for tool_name in requested_tool_names
+            if tool_name not in _URL_BOUNDARY_TOOLS
+            and tool_name not in {"web_search", "browser_image_collect"}
+        )
     requested_extension_set = {
         str(extension or "").strip().lower()
         for extension in decision.requested_artifact_extensions
@@ -3013,10 +3230,34 @@ def _validated_turn_tool_scope_decision(
             required_embedded_media_extensions=decision.required_embedded_media_extensions,
         )
     )
-    trusted_requested_extensions = (
-        *evidence.requested_extensions,
-        *(decision.requested_artifact_extensions if trust_decision_artifact_contract else ()),
+    decision_artifact_extensions = (
+        tuple(decision.requested_artifact_extensions)
+        if trust_decision_artifact_contract
+        else ()
     )
+    trusted_requested_extensions = (
+        decision_artifact_extensions
+        if decision_artifact_extensions and len(set(evidence.requested_extensions)) > 1
+        else tuple(dict.fromkeys([*evidence.requested_extensions, *decision_artifact_extensions]))
+    )
+    trusted_excluded_extensions = tuple(
+        dict.fromkeys(
+            [
+                *decision.excluded_artifact_extensions,
+                *(
+                    extension
+                    for extension in evidence.requested_extensions
+                    if decision_artifact_extensions and extension not in set(trusted_requested_extensions)
+                ),
+            ]
+        )
+    )
+    if trusted_excluded_extensions:
+        trusted_requested_extensions = tuple(
+            extension
+            for extension in trusted_requested_extensions
+            if extension not in set(trusted_excluded_extensions)
+        )
     trusted_embedded_extensions = (
         decision.required_embedded_media_extensions
         if trust_decision_artifact_contract
@@ -3073,7 +3314,8 @@ def _validated_turn_tool_scope_decision(
         required_tool_names = tuple(dict.fromkeys([*required_tool_names, "email_send"]))
     if decision.skill_pack_action != "connector":
         return TurnToolScopeDecision(
-            web_action=decision.web_action,
+            requested_outcome=decision.requested_outcome,
+            web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
             if "toggle_cron" in requested_tool_names
@@ -3088,6 +3330,7 @@ def _validated_turn_tool_scope_decision(
             requested_tool_names=requested_tool_names,
             required_tool_names=required_tool_names,
             requested_artifact_extensions=trusted_requested_extensions,
+            excluded_artifact_extensions=trusted_excluded_extensions,
             required_embedded_media_extensions=trusted_embedded_extensions,
             confidence=decision.confidence,
             valid=decision.valid,
@@ -3095,7 +3338,8 @@ def _validated_turn_tool_scope_decision(
     providers = tuple(active_connector_providers)
     if not providers:
         return TurnToolScopeDecision(
-            web_action=decision.web_action,
+            requested_outcome=decision.requested_outcome,
+            web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
             if "toggle_cron" in requested_tool_names
@@ -3110,6 +3354,7 @@ def _validated_turn_tool_scope_decision(
             requested_tool_names=(),
             required_tool_names=(),
             requested_artifact_extensions=trusted_requested_extensions,
+            excluded_artifact_extensions=trusted_excluded_extensions,
             required_embedded_media_extensions=trusted_embedded_extensions,
             confidence=decision.confidence,
             valid=decision.valid,
@@ -3117,7 +3362,8 @@ def _validated_turn_tool_scope_decision(
     active_app_ids = set(_active_connector_app_ids_from_context(active_connector_providers))
     if not decision.connector_source_user_requested:
         return TurnToolScopeDecision(
-            web_action=decision.web_action,
+            requested_outcome=decision.requested_outcome,
+            web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
             if "toggle_cron" in requested_tool_names
@@ -3132,13 +3378,15 @@ def _validated_turn_tool_scope_decision(
             requested_tool_names=(),
             required_tool_names=(),
             requested_artifact_extensions=trusted_requested_extensions,
+            excluded_artifact_extensions=trusted_excluded_extensions,
             required_embedded_media_extensions=trusted_embedded_extensions,
             confidence=decision.confidence,
             valid=decision.valid,
         )
     if not active_app_ids:
         return TurnToolScopeDecision(
-            web_action=decision.web_action,
+            requested_outcome=decision.requested_outcome,
+            web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
             if "toggle_cron" in requested_tool_names
@@ -3155,6 +3403,7 @@ def _validated_turn_tool_scope_decision(
             requested_tool_names=requested_tool_names,
             required_tool_names=required_tool_names,
             requested_artifact_extensions=trusted_requested_extensions,
+            excluded_artifact_extensions=trusted_excluded_extensions,
             required_embedded_media_extensions=trusted_embedded_extensions,
             confidence=decision.confidence,
             valid=decision.valid,
@@ -3162,7 +3411,8 @@ def _validated_turn_tool_scope_decision(
     selected_app_ids = tuple(app_id for app_id in decision.connector_app_ids if app_id in active_app_ids)
     if not selected_app_ids:
         return TurnToolScopeDecision(
-            web_action=decision.web_action,
+            requested_outcome=decision.requested_outcome,
+            web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
             if "toggle_cron" in requested_tool_names
@@ -3177,12 +3427,14 @@ def _validated_turn_tool_scope_decision(
             requested_tool_names=(),
             required_tool_names=(),
             requested_artifact_extensions=trusted_requested_extensions,
+            excluded_artifact_extensions=trusted_excluded_extensions,
             required_embedded_media_extensions=trusted_embedded_extensions,
             confidence=decision.confidence,
             valid=decision.valid,
         )
     return TurnToolScopeDecision(
-        web_action=decision.web_action,
+        requested_outcome=decision.requested_outcome,
+        web_action="none" if image_generation_unavailable else decision.web_action,
         scheduler_action=decision.scheduler_action,
         scheduler_toggle_enabled=decision.scheduler_toggle_enabled
         if "toggle_cron" in requested_tool_names
@@ -3199,6 +3451,7 @@ def _validated_turn_tool_scope_decision(
         requested_tool_names=requested_tool_names,
         required_tool_names=required_tool_names,
         requested_artifact_extensions=trusted_requested_extensions,
+        excluded_artifact_extensions=trusted_excluded_extensions,
         required_embedded_media_extensions=trusted_embedded_extensions,
         confidence=decision.confidence,
         valid=decision.valid,
@@ -3276,6 +3529,78 @@ def _tool_scope_cache_key(
     }
 
 
+def _refine_ambiguous_artifact_extension_contract(
+    *,
+    model_client: object,
+    user_message: str,
+    evidence: TurnToolEvidence,
+    decision: TurnToolScopeDecision,
+) -> TurnToolScopeDecision:
+    candidates = tuple(dict.fromkeys(evidence.requested_extensions))
+    candidate_set = set(candidates)
+    if (
+        len(candidate_set) <= 1
+        or decision.excluded_artifact_extensions
+        or set(decision.requested_artifact_extensions) != candidate_set
+    ):
+        return decision
+    system = (
+        "Return only a JSON object with exactly these keys: "
+        '{"final_artifact_extensions":[".xlsx"],"excluded_artifact_extensions":[".json"]}. '
+        "Partition every candidate extension into exactly one list based on the user turn. "
+        "A final artifact is a file the user wants delivered or attached as an output. "
+        "Exclude inputs, sources, intermediates, sidecars, examples, and formats the user says not to create, "
+        "attach, or deliver. Do not omit a candidate and do not add extensions outside candidates."
+    )
+    prompt = {
+        "user_turn": user_message,
+        "candidate_extensions": list(candidates),
+    }
+    try:
+        response = model_client.create(
+            messages=[{"role": "user", "content": [{"type": "text", "text": json.dumps(prompt, ensure_ascii=False)}]}],
+            tools=[],
+            max_tokens=240,
+            system=system,
+            timeout=max(15.0, _tool_scope_classifier_timeout_seconds()),
+        )
+        response_text = _extract_response_text(response)
+        start = response_text.find("{")
+        end = response_text.rfind("}")
+        if start < 0 or end <= start:
+            return decision
+        payload = json.loads(response_text[start : end + 1])
+    except Exception:
+        logger.debug("Artifact extension contract refinement failed", exc_info=True)
+        return decision
+    if not isinstance(payload, dict):
+        return decision
+    final_extensions = _validated_artifact_extensions(payload.get("final_artifact_extensions"))
+    excluded_extensions = _validated_artifact_extensions(payload.get("excluded_artifact_extensions"))
+    final_set = set(final_extensions)
+    excluded_set = set(excluded_extensions)
+    if (
+        not final_set
+        or final_set & excluded_set
+        or final_set | excluded_set != candidate_set
+    ):
+        return decision
+    return replace(
+        decision,
+        requested_artifact_extensions=tuple(
+            extension for extension in candidates if extension in final_set
+        ),
+        excluded_artifact_extensions=tuple(
+            extension for extension in candidates if extension in excluded_set
+        ),
+        required_embedded_media_extensions=tuple(
+            extension
+            for extension in decision.required_embedded_media_extensions
+            if extension in final_set
+        ),
+    )
+
+
 def build_turn_tool_scope_decision(
     *,
     model_client: object | None,
@@ -3297,6 +3622,7 @@ def build_turn_tool_scope_decision(
         and getattr(evidence, "artifact_requested", False)
         and not getattr(evidence, "has_url_target", False)
         and not getattr(evidence, "has_attachments", False)
+        and len(set(getattr(evidence, "requested_extensions", ()) or ())) <= 1
     ):
         # Output-extension evidence is already enough for ScopedTurnToolRegistry
         # to expose the matching artifact tools. Keep the classifier out of the
@@ -3346,6 +3672,37 @@ def build_turn_tool_scope_decision(
                 registry=registry,
                 active_connector_providers=active_connector_providers,
             )
+    registered_special_tool_names = {
+        str(getattr(spec, "name", "") or "")
+        for spec in registry.list_specs()
+        if str(getattr(spec, "name", "") or "")
+    }
+    available_special_tool_scopes: list[str] = []
+    if registered_special_tool_names.intersection(_URL_BOUNDARY_TOOLS):
+        available_special_tool_scopes.append("web_or_browser")
+    if registered_special_tool_names.intersection(_SCHEDULER_TOOLS):
+        available_special_tool_scopes.append("scheduler")
+    if registered_special_tool_names.intersection(_SKILL_PACK_TOOLS):
+        available_special_tool_scopes.append("skill_pack_reference")
+    if registered_special_tool_names.intersection(_CONNECTOR_TOOLS | _CONNECTOR_TYPED_TOOLS):
+        available_special_tool_scopes.append("connector_gateway")
+    if registered_special_tool_names.intersection(_CONVERSATION_HISTORY_TOOLS):
+        available_special_tool_scopes.append("conversation_history")
+    if "weather_forecast" in registered_special_tool_names:
+        available_special_tool_scopes.append("weather")
+    if "market_quote" in registered_special_tool_names:
+        available_special_tool_scopes.append("market_data")
+    if "image_generate" in registered_special_tool_names:
+        available_special_tool_scopes.append("image_generation")
+    if registered_special_tool_names.intersection(_LOCAL_FILE_TOOLS | _ARCHIVE_TOOLS):
+        available_special_tool_scopes.append("local_files")
+    if registered_special_tool_names.intersection(_LOCAL_SHELL_TOOLS):
+        available_special_tool_scopes.append("local_shell")
+    unavailable_special_tool_scopes = [
+        scope
+        for scope in ("weather", "market_data", "image_generation")
+        if scope not in available_special_tool_scopes
+    ]
     prompt = {
         "surface": "ordinary_chat",
         "context_linked": evidence.context_linked,
@@ -3357,36 +3714,51 @@ def build_turn_tool_scope_decision(
         "prior_tool_scopes": list(evidence.prior_tool_scopes),
         "active_connector_providers": active_connector_providers,
         "installed_skill_pack_index": skill_pack_index,
-        "available_special_tool_scopes": [
-            "web_or_browser",
-            "scheduler",
-            "skill_pack_reference",
-            "connector_gateway",
-            "conversation_history",
-            "weather",
-            "market_data",
-            "image_generation",
-            "local_files",
-            "local_shell",
-        ],
+        "available_special_tool_scopes": available_special_tool_scopes,
+        "unavailable_special_tool_scopes": unavailable_special_tool_scopes,
+        "registered_special_tool_names": sorted(registered_special_tool_names),
+        "available_direct_read_tools": sorted(
+            {
+                str(getattr(spec, "name", "") or "")
+                for spec in registry.list_specs()
+            }.intersection({"calendar_list", "market_quote", "weather_forecast"})
+        ),
         "user_turn": user_message,
     }
     if assistant_no_tool_draft:
         prompt["assistant_no_tool_draft"] = str(assistant_no_tool_draft or "")[:1600]
     system = (
         "Return only a JSON object matching this schema: "
-        '{"web_action":"none|open_url|live_research|browser_interaction",'
+        '{"requested_outcome":"unspecified|generated_media",'
+        '"web_action":"none|open_url|live_research|browser_interaction",'
         '"scheduler_action":"none|inspect|run|mutate","scheduler_toggle_enabled":null,'
         '"scheduler_selection_policy":"none|user_selected|delegate_one",'
         '"scheduler_target_scope":"none|all_current_workspace",'
         '"skill_pack_action":"none|reference|connector","connector_app_ids":["normalized-app-id"],'
         '"connector_source_user_requested":false,'
-        '"requested_tool_names":["registered-tool-name"],"required_tool_names":["registered-write-tool-name"],'
-        '"requested_artifact_extensions":[".xlsx"],"required_embedded_media_extensions":[".xlsx"],'
+        '"requested_tool_names":["registered-tool-name"],"required_tool_names":["registered-tool-name"],'
+        '"requested_artifact_extensions":[".xlsx"],"excluded_artifact_extensions":[".json"],'
+        '"required_embedded_media_extensions":[".xlsx"],'
         '"confidence":0.0}. '
         "Use web_action=open_url for explicit URL/domain targets, live_research for requests that need current public information, "
         "and browser_interaction for a user-visible webpage workflow. "
+        "Put a tool in required_tool_names only when its successful structured result is essential to satisfy the current user turn, "
+        "and always include it in requested_tool_names too. This includes explicitly requested read/source tools as well as write or "
+        "delivery tools. A cross-domain request may require several independent read tools and several artifact tools. "
+        "When the user explicitly requires a current public webpage or web source as part of the result, choose an exact registered "
+        "web source tool such as browser_navigate or web_fetch and include it in both requested_tool_names and required_tool_names. "
+        "When the turn explicitly requires live calendar, weather, or market data and the matching exact tool is available, include "
+        "calendar_list, weather_forecast, or market_quote respectively in both lists. Do not mark optional or merely helpful tools as required. "
         "Use the weather scope and requested_tool_names=[\"weather_forecast\"] for live weather or forecast data when registered. "
+        "available_direct_read_tools is authoritative structured runtime evidence. When one of those exact tools directly answers "
+        "the user_turn, select it instead of generic web research. assistant_no_tool_draft is diagnostic evidence only and must not "
+        "override the tool family implied by the original user_turn and available_direct_read_tools. "
+        "available_special_tool_scopes and registered_special_tool_names are authoritative runtime evidence. Never select a tool family "
+        "listed in unavailable_special_tool_scopes, and never substitute a different capability family that changes the requested outcome. "
+        "In particular, public web/search results are not a substitute for newly generated visual media when image_generation is unavailable; "
+        "choose no web tools so the normal product response can explain the missing configured capability. "
+        "Set requested_outcome=generated_media whenever the requested final outcome is newly generated image or bitmap media; "
+        "otherwise use requested_outcome=unspecified. This outcome field is required even when the matching tool is unavailable. "
         "Do not choose weather merely because a request mentions a day, date, time, or location; choose weather only when the requested answer is meteorological. "
         "Use the market_data scope and requested_tool_names=[\"market_quote\"] for structured public ticker quote rows when registered. "
         "When active_connector_providers expose google-calendar/calendar_list and the requested answer is the user's calendar, events, schedule, or agenda, choose connector with connector_app_ids=[\"google-calendar\"] and requested_tool_names=[\"calendar_list\"]. "
@@ -3447,6 +3819,9 @@ def build_turn_tool_scope_decision(
         'Use requested_tool_names=["workspace_summary"] for workspace inventory/summarization when workspace_summary is registered. '
         "When a requested final deliverable has a file format, put the validated final suffix in "
         "requested_artifact_extensions and include the matching registered artifact tool in requested_tool_names. "
+        "Only include formats the user wants delivered as final outputs. Exclude formats mentioned solely as inputs, "
+        "source files, intermediate files, sidecars, examples, or files the user says must not be attached or delivered. "
+        "Put every such mentioned-but-not-deliverable format in excluded_artifact_extensions; exclusions override requested formats. "
         "When that final deliverable must contain requested media embedded inside the artifact itself, also put "
         "the matching suffix in required_embedded_media_extensions. "
         'Use requested_tool_names=["terminal_exec"] when the turn requires local shell execution, local system inspection, installed software/package changes, service/process control, environment/path checks, or other computer-level work and dedicated file tools are unavailable or insufficient. '
@@ -3472,6 +3847,30 @@ def build_turn_tool_scope_decision(
         )
     except Exception:
         logger.debug("Turn tool-scope decision failed; using structured fallback scope", exc_info=True)
+        if len(set(evidence.requested_extensions)) > 1:
+            fallback_decision = TurnToolScopeDecision(
+                requested_artifact_extensions=tuple(dict.fromkeys(evidence.requested_extensions)),
+                confidence=1.0,
+                valid=True,
+            )
+            refined_fallback = _refine_ambiguous_artifact_extension_contract(
+                model_client=model_client,
+                user_message=user_message,
+                evidence=evidence,
+                decision=fallback_decision,
+            )
+            if refined_fallback.excluded_artifact_extensions:
+                if cache_enabled:
+                    runtime_cache.set_json(
+                        _TOOL_SCOPE_DECISION_CACHE_NAMESPACE,
+                        cache_key,
+                        _tool_scope_decision_to_payload(refined_fallback),
+                        version=_TOOL_SCOPE_DECISION_CACHE_VERSION,
+                        ttl_seconds=_TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS,
+                        persistent=True,
+                        max_entries=128,
+                    )
+                return refined_fallback
         return TurnToolScopeDecision()
     decision = _validated_turn_tool_scope_decision(
         _parse_turn_tool_scope_decision(_extract_response_text(response)),
@@ -3481,6 +3880,12 @@ def build_turn_tool_scope_decision(
     )
     if not decision.valid:
         return TurnToolScopeDecision()
+    decision = _refine_ambiguous_artifact_extension_contract(
+        model_client=model_client,
+        user_message=user_message,
+        evidence=evidence,
+        decision=decision,
+    )
     if cache_enabled:
         runtime_cache.set_json(
             _TOOL_SCOPE_DECISION_CACHE_NAMESPACE,
@@ -3743,6 +4148,24 @@ def _plain_no_tool_fast_path_allowed(evidence: TurnToolEvidence) -> bool:
     )
 
 
+def _plain_direct_safe_read_tool_names(registry: object) -> tuple[str, ...]:
+    try:
+        specs = tuple(registry.list_specs())
+    except Exception:
+        return ()
+    names: list[str] = []
+    for spec in specs:
+        name = str(getattr(spec, "name", "") or "")
+        if name not in _PLAIN_DIRECT_SAFE_READ_TOOLS:
+            continue
+        if getattr(spec, "side_effect_class", None) != ToolSideEffectClass.READ:
+            continue
+        if bool(getattr(spec, "requires_approval", True)):
+            continue
+        names.append(name)
+    return tuple(sorted(names))
+
+
 def turn_tool_registry_for_evidence(
     registry: object,
     *,
@@ -3769,6 +4192,17 @@ def turn_tool_registry_for_evidence(
             evidence,
             user_message=user_message,
         ):
+            direct_safe_read_tools = _plain_direct_safe_read_tool_names(registry)
+            if direct_safe_read_tools:
+                return ScopedTurnToolRegistry(
+                    registry,
+                    evidence=evidence,
+                    tool_scope_decision=TurnToolScopeDecision(
+                        requested_tool_names=direct_safe_read_tools,
+                        confidence=1.0,
+                        valid=True,
+                    ),
+                )
             return PlainNoToolFastPathRegistry(registry)
         if _registry_has_scoped_special_tools(registry):
             return scoped_turn_tool_registry(

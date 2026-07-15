@@ -23,6 +23,7 @@ _QUOTE_PLACEHOLDER_PREFIX = "__NULLION_TELEGRAM_QUOTE_"
 _LINK_PLACEHOLDER_PREFIX = "__NULLION_TELEGRAM_LINK_"
 _LONG_VISIBLE_URL_CHARS = 72
 _URL_TRAILING_PUNCTUATION = ".,;:!?]}'\""
+_URL_TRAILING_MARKUP_DELIMITERS = ("***", "___", "**", "__")
 
 
 def _replace_fenced_code_blocks(text: str) -> tuple[str, list[str]]:
@@ -86,8 +87,22 @@ def _replace_links(text: str) -> tuple[str, list[str]]:
 
     def replace_raw(match: re.Match[str]) -> str:
         token = str(match.group(0) or "")
-        url = token.rstrip(_URL_TRAILING_PUNCTUATION)
-        suffix = token[len(url):]
+        url = token
+        suffix = ""
+        while url:
+            stripped = url.rstrip(_URL_TRAILING_PUNCTUATION)
+            if stripped != url:
+                suffix = f"{url[len(stripped):]}{suffix}"
+                url = stripped
+                continue
+            delimiter = next(
+                (candidate for candidate in _URL_TRAILING_MARKUP_DELIMITERS if url.endswith(candidate)),
+                None,
+            )
+            if delimiter is None:
+                break
+            url = url[: -len(delimiter)]
+            suffix = f"{delimiter}{suffix}"
         if not url:
             return token
         return f"{add_link(url, _telegram_link_label(url))}{suffix}"

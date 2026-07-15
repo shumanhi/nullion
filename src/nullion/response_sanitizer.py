@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from nullion.tips import IMAGE_GENERATION_SETUP_TIP, format_setup_tip
 from nullion.tools import ToolResult
@@ -85,6 +85,16 @@ _BROWSER_FORM_ACTION_TOOLS = frozenset(
         "browser_select_combobox",
     }
 )
+_BROWSER_FORM_INPUT_TOOLS = frozenset(
+    {
+        "browser_type_field",
+        "browser_type_id",
+        "browser_select_combobox",
+    }
+)
+_STRUCTURED_SOURCE_RECORD_KEYS = ("items", "results", "selected_results", "records")
+_STRUCTURED_SOURCE_RANK_KEYS = ("source_index", "source_rank")
+_SOURCE_RANK_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9/_?=&%.-])#(?P<rank>[1-9][0-9]*)")
 
 
 def _tool_result_completed(result: ToolResult) -> bool:
@@ -143,10 +153,22 @@ def sanitize_user_visible_reply(
         return _sanitize_reply_style(_sanitize_local_paths(image_generation_unavailable_reply))
     raw = _repair_collapsed_numbered_list_reply(raw)
     raw = _renumber_visible_numbered_list_reply(raw)
+    raw = _label_noncontiguous_structured_source_ranks(raw, results)
     raw = _repair_missing_requested_section_replies(requested_sections, raw, results)
     raw = _normalize_requested_section_reply_format(requested_sections, raw, results)
     raw = _prefix_account_tool_reply(raw, results)
     raw = _strip_leading_tool_status_paragraph(raw, results)
+    if browser_unverified_records := _browser_unverified_record_flow_reply(
+        results,
+        user_message=user_message,
+    ):
+        return _sanitize_local_paths(browser_unverified_records)
+    if browser_non_substantive_reply := _browser_non_substantive_extract_reply_over_drift(
+        raw,
+        results,
+        user_message=user_message,
+    ):
+        return _sanitize_local_paths(browser_non_substantive_reply)
     if _browser_grounded_reply_should_pass_through(raw, results):
         return _sanitize_local_paths(raw)
     if browser_incomplete_reply := _browser_incomplete_reply_over_generic_verified_state(
@@ -249,6 +271,65 @@ def sanitize_user_visible_reply(
         safe_raw_tool_payload_replacement(tool_results=results, source=source, parsed_payload=parsed),
         account_tool_family=_primary_account_tool_family(results),
     )
+
+
+def _structured_source_rank_values(results: Iterable[ToolResult]) -> set[int]:
+    ranks: set[int] = set()
+    for result in results:
+        if not _tool_result_completed(result):
+            continue
+        output = result.output if isinstance(result.output, Mapping) else {}
+        for key in _STRUCTURED_SOURCE_RECORD_KEYS:
+            records = output.get(key)
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, Mapping):
+                    continue
+                for rank_key in _STRUCTURED_SOURCE_RANK_KEYS:
+                    source_index = record.get(rank_key)
+                    if isinstance(source_index, bool):
+                        continue
+                    try:
+                        rank = int(source_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if rank > 0:
+                        ranks.add(rank)
+    return ranks
+
+
+def _label_noncontiguous_structured_source_ranks(text: str, results: Iterable[ToolResult]) -> str:
+    """Keep source ranks from looking like a broken response list.
+
+    Browser/catalog tools expose typed ``source_index`` values.  When a reply
+    selects non-adjacent records, bare ``#1``, ``#5`` style labels look like
+    skipped answer numbering.  The source metadata proves that those numbers
+    are ranks, so label them explicitly without inferring intent from prose.
+    """
+
+    source_ranks = _structured_source_rank_values(results)
+    if len(source_ranks) < 2:
+        return text
+    matches = list(_SOURCE_RANK_TOKEN_RE.finditer(text))
+    mentioned = [int(match.group("rank")) for match in matches]
+    unique_mentioned = list(dict.fromkeys(mentioned))
+    if len(unique_mentioned) < 2:
+        return text
+    known_mentions = {rank for rank in unique_mentioned if rank in source_ranks}
+    if len(known_mentions) < 2:
+        return text
+    ordered_known = sorted(known_mentions)
+    if all(right == left + 1 for left, right in zip(ordered_known, ordered_known[1:])):
+        return text
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix = text[max(0, match.start() - 20):match.start()]
+        if re.search(r"(?:source\s+)?rank\s*$", prefix, flags=re.IGNORECASE):
+            return match.group(0)
+        return f"source rank #{match.group('rank')}"
+
+    return _SOURCE_RANK_TOKEN_RE.sub(_replace, text)
 
 
 def _sanitize_reply_style(text: str | None, *, account_tool_family: str | None = None) -> str | None:
@@ -806,7 +887,8 @@ def _browser_evidence_tokens(value: object) -> set[str]:
 
 def _browser_reply_claims_stale_result_list(normalized_text: str) -> bool:
     return bool(
-        normalized_text.startswith("search leads i found")
+        normalized_text.startswith("source-backed points")
+        or normalized_text.startswith("search leads i found")
         or normalized_text.startswith("top matches i found")
         or normalized_text.startswith("results i found")
     )
@@ -836,6 +918,8 @@ def _browser_grounded_reply_should_pass_through(text: object, results: list[Tool
         return False
     normalized = _normalized_reply_text(text).casefold()
     if not normalized or "live-search blocker" in normalized:
+        return False
+    if _browser_reply_claims_stale_result_list(normalized):
         return False
     for extracted in _completed_browser_extract_texts(results, max_chars=2000):
         normalized_extract = _normalized_reply_text(extracted).casefold()
@@ -923,7 +1007,11 @@ def _cron_list_reply_over_empty_reminder_drift(text: str, results: list[ToolResu
             if isinstance(value, str) and value.strip() and _normalized_reply_text(value) in normalized_reply:
                 return None
     message = cron_output.get("message")
-    if isinstance(message, str) and message.strip():
+    if (
+        isinstance(message, str)
+        and message.strip()
+        and _cron_reply_mentions_every_scheduler_item(message, crons)
+    ):
         return message.strip()
     return None
 
@@ -1018,9 +1106,39 @@ def _compact_cron_list_reply(result: ToolResult) -> str | None:
     if not isinstance(crons, list):
         return None
     message = output.get("message")
-    if isinstance(message, str) and message.strip():
+    if isinstance(message, str) and message.strip() and not crons:
+        return message.strip()
+    if (
+        isinstance(message, str)
+        and message.strip()
+        and output.get("message_truncated") is not True
+        and _cron_reply_mentions_every_scheduler_item(message, crons)
+    ):
         return message.strip()
     return "No crons scheduled." if not crons else None
+
+
+def _cron_reply_mentions_every_scheduler_item(text: str, crons: list[object]) -> bool:
+    """Return true only when a candidate inventory covers every named row."""
+
+    normalized_reply = _normalized_reply_text(text)
+    if not normalized_reply:
+        return False
+    comparable = 0
+    for cron in crons:
+        if not isinstance(cron, Mapping):
+            continue
+        names = [
+            str(cron.get(key) or "").strip()
+            for key in ("name", "display_name")
+            if str(cron.get(key) or "").strip()
+        ]
+        if not names:
+            continue
+        comparable += 1
+        if not any(_normalized_reply_text(name) in normalized_reply for name in names):
+            return False
+    return comparable > 0
 
 
 def _scheduler_action_reply_over_read_drift(text: str, results: list[ToolResult]) -> str | None:
@@ -1527,7 +1645,11 @@ def _structured_tool_evidence_sections(
     if browser_items:
         browser_lines = _structured_output_lines(browser_items, kind="browser_item")
         if browser_lines:
-            heading = "Source-backed points" if prefer_browser_source_heading else "Top matches I found"
+            heading = (
+                "Most relevant public-source results I could verify"
+                if prefer_browser_source_heading
+                else "Relevant results"
+            )
             sections.append((heading, browser_lines, browser_items))
     elif not browser_item_records:
         web_items = _rank_structured_output_items(
@@ -1537,7 +1659,7 @@ def _structured_tool_evidence_sections(
         if web_items:
             web_lines = _structured_output_lines(web_items, kind="web_search")
             if web_lines:
-                sections.append(("Top matches I found", web_lines, web_items))
+                sections.append(("Relevant results", web_lines, web_items))
 
     for result in reversed(results):
         if result.status != "completed" or not isinstance(result.output, dict):
@@ -1596,7 +1718,7 @@ def _structured_tool_evidence_sections(
         if result.tool_name.startswith("browser_"):
             generic_items = _rank_structured_output_items(generic_items, kind="browser_item")
             generic_kind = "browser_item"
-            heading = "Source-backed points"
+            heading = "Most relevant public-source results I could verify"
         generic_lines = _structured_output_lines(generic_items, kind=generic_kind)
         if generic_lines:
             sections.append((heading, generic_lines, generic_items))
@@ -1752,7 +1874,7 @@ def _structured_output_item_line(index: int, item: Mapping[str, Any], *, kind: s
 
 def _structured_output_item_title(item: Mapping[str, Any], *, kind: str) -> str:
     if kind == "browser_item":
-        keys = ("compact_text", "summary", "title", "name", "link_text", "text")
+        keys = ("title", "name", "compact_text", "link_text", "summary", "text")
         max_chars = 128
     elif kind == "calendar":
         keys = ("summary", "title", "name")
@@ -1805,6 +1927,11 @@ def _structured_output_item_details(item: Mapping[str, Any], *, kind: str) -> st
                 value = _clip_browser_extract_item_text(candidate, max_chars=64)
                 if value:
                     values.append(value)
+        if not values:
+            compact_text = _clip_browser_extract_item_text(item.get("compact_text"), max_chars=160)
+            title = _structured_output_item_title(item, kind=kind)
+            if compact_text and _normalized_reply_text(compact_text) != _normalized_reply_text(title):
+                values.append(compact_text)
         return "; ".join(_dedupe_preserving_order(values)[:4])
     if kind == "email":
         values = []
@@ -2351,6 +2478,85 @@ def _browser_tools_attempted(results: list[ToolResult]) -> bool:
     return any(result.tool_name.startswith("browser_") for result in results)
 
 
+def _browser_navigation_url(result: ToolResult) -> str | None:
+    if result.tool_name != "browser_navigate" or not _tool_result_completed(result):
+        return None
+    output = result.output if isinstance(result.output, Mapping) else {}
+    for key in ("page_url", "url"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = output.get("result")
+    if isinstance(value, str):
+        match = re.search(r"https?://[^\s)]+", value)
+        if match:
+            return match.group(0).rstrip(".,")
+    return None
+
+
+def _browser_navigation_has_structured_query_state(result: ToolResult) -> bool:
+    url = _browser_navigation_url(result)
+    if not url:
+        return False
+    parsed = urlparse(url)
+    query_texts = [parsed.query]
+    if "?" in parsed.fragment:
+        query_texts.append(parsed.fragment.split("?", 1)[1])
+    parameters = [
+        pair
+        for query_text in query_texts
+        for pair in parse_qsl(query_text, keep_blank_values=True)
+    ]
+    return len(parameters) >= 2
+
+
+def _browser_unverified_record_flow_reply(
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> str | None:
+    flow_start_index: int | None = None
+    for index, result in enumerate(results):
+        if result.tool_name in _BROWSER_FORM_INPUT_TOOLS and _tool_result_completed(result):
+            flow_start_index = index
+        if _browser_navigation_has_structured_query_state(result):
+            flow_start_index = index
+    if flow_start_index is None:
+        return None
+    later_results = results[flow_start_index + 1 :]
+    if not any(
+        result.tool_name in {"browser_extract_text", "browser_extract_items"}
+        for result in later_results
+    ):
+        return None
+    for result in later_results:
+        output = result.output if isinstance(result.output, Mapping) else {}
+        if result.tool_name == "browser_assert_page_state" and _tool_result_completed(result):
+            state = output.get("result")
+            state_payload = state if isinstance(state, Mapping) else {}
+            if output.get("verified") is True or state_payload.get("ok") is True:
+                return None
+        if result.tool_name not in {"browser_extract_text", "browser_extract_items"}:
+            continue
+        if _mapping_flag_is_true(output, "records_verified") or _mapping_flag_is_true(output, "structured_records"):
+            return None
+        metadata = output.get("metadata")
+        if isinstance(metadata, Mapping) and (
+            _mapping_flag_is_true(metadata, "records_verified")
+            or _mapping_flag_is_true(metadata, "structured_records")
+        ):
+            return None
+    lines = [
+        "Live-search blocker: the browser filled part of the form, but the results page did not verify "
+        "the submitted inputs before exposing candidate records. I cannot safely present those records "
+        "as matching this request."
+    ]
+    request_context = _compact_browser_request_context(user_message)
+    if request_context:
+        lines.extend(["", f"Requested task: {request_context}"])
+    return "\n".join(lines)
+
+
 def _browser_empty_reply_over_missing_verified_records(
     text: str,
     results: list[ToolResult],
@@ -2595,7 +2801,7 @@ def _browser_extract_items_reply_over_blocker(
     if not lines:
         return None
     rendered = ["- " + line.replace("\n   ", "\n  ") for line in lines]
-    return "Source-backed points\n\n" + "\n\n".join(rendered)
+    return "Here are the most relevant public-source results I could verify:\n\n" + "\n\n".join(rendered)
 
 
 def _reply_matches_browser_extract_text(text: str, extracted_text: str) -> bool:
@@ -3054,7 +3260,7 @@ def _browser_source_backed_reply_from_extract_text(
     if not lines:
         return None
     source_label = _browser_source_label_for_extract_text(results, extracted_text) or _browser_source_label(results)
-    reply_lines = ["Source-backed points"]
+    reply_lines = ["Here are the most relevant details I could verify from the source:"]
     if source_label:
         reply_lines.extend(["", f"Source: {source_label}"])
     reply_lines.append("")
@@ -3318,6 +3524,12 @@ def _browser_extract_reply_from_raw_text(
 ) -> str:
     if _browser_extracted_text_looks_like_site_blocker(extracted_text):
         return _browser_unverified_search_result_blocker(results, user_message=user_message)
+    if _browser_extract_has_only_low_information_lines(extracted_text):
+        return _browser_raw_extract_dump_replacement(
+            results,
+            extracted_text=extracted_text,
+            user_message=user_message,
+        )
     catalog_records_allowed = _browser_raw_extract_catalog_records_allowed(
         results,
         extracted_text=extracted_text,
@@ -3364,7 +3576,7 @@ def _browser_extract_reply_from_raw_text(
     if catalog_reply and _browser_catalog_signal_score(extracted_text) >= 6:
         return catalog_reply
     source_label = _browser_source_label_for_extract_text(results, extracted_text) or _browser_source_label(results)
-    lines = ["Source-backed points"]
+    lines = ["Here are the most relevant details I could verify from the source:"]
     if source_label:
         lines.extend(["", f"Source: {source_label}"])
     lines.append("")
@@ -3646,6 +3858,8 @@ def _browser_general_summary_line_allowed(line: str) -> bool:
     text = _compact_browser_extract_line(line)
     if len(text) < 24:
         return False
+    if _browser_extract_line_is_structural_noise(text):
+        return False
     if _browser_site_blocker_line(text):
         return False
     words = re.findall(r"[\w.-]+", text, flags=re.UNICODE)
@@ -3833,7 +4047,11 @@ def _browser_extract_highlight_lines(
         _compact_browser_extract_line(line)
         for line in str(extracted_text or "").splitlines()
     ]
-    lines = [line for line in lines if len(line) >= 8]
+    lines = [
+        line
+        for line in lines
+        if len(line) >= 8 and not _browser_extract_line_is_structural_noise(line)
+    ]
     if not lines:
         return []
     scored: list[tuple[int, int, int, int, str]] = []
@@ -3870,6 +4088,83 @@ def _browser_extract_highlight_lines(
     return highlights
 
 
+def _browser_extract_line_is_structural_noise(line: object) -> bool:
+    """Return whether a raw browser line has legal/footer marker shape."""
+
+    text = _compact_browser_extract_line(line)
+    if not text:
+        return True
+    return text.lstrip().startswith(("©", "®", "™"))
+
+
+def _browser_extract_line_is_low_information(line: object) -> bool:
+    text = _compact_browser_extract_line(line)
+    if _browser_extract_line_is_structural_noise(text):
+        return True
+    words = re.findall(r"[\w.-]+", text, flags=re.UNICODE)
+    if len(words) > 3:
+        return False
+    if _CURRENCY_AMOUNT_RE.search(text):
+        return False
+    if re.search(r"\d", text) or re.search(r"https?://", text, flags=re.IGNORECASE):
+        return False
+    if "|" in text or ":" in text:
+        return False
+    return True
+
+
+def _browser_extract_has_only_low_information_lines(extracted_text: object) -> bool:
+    lines = [
+        _compact_browser_extract_line(line)
+        for line in str(extracted_text or "").splitlines()
+        if _compact_browser_extract_line(line)
+    ]
+    return bool(lines) and all(_browser_extract_line_is_low_information(line) for line in lines)
+
+
+def _browser_non_substantive_extract_reply_over_drift(
+    text: str,
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> str | None:
+    """Replace a reply that promotes raw heading/footer rows as findings."""
+
+    if _rank_structured_output_items(
+        _completed_browser_extract_item_records(results),
+        kind="browser_item",
+    ):
+        return None
+    visible = _normalized_reply_text(text).casefold()
+    if not visible:
+        return None
+    for result in results:
+        if result.tool_name != "browser_extract_text" or not _tool_result_completed(result):
+            continue
+        output = result.output if isinstance(result.output, dict) else {}
+        extracted = _browser_text_value_from_output(output, max_chars=20000)
+        if not extracted or _browser_raw_extract_has_substantive_result_evidence(
+            extracted,
+            allow_catalog_pairs=False,
+        ):
+            continue
+        raw_lines = [
+            _compact_browser_extract_line(line)
+            for line in extracted.splitlines()
+            if _compact_browser_extract_line(line)
+        ]
+        if not _browser_extract_has_only_low_information_lines(extracted):
+            continue
+        echoed_lines = [line for line in raw_lines if line.casefold() in visible]
+        if any(_browser_extract_line_is_structural_noise(line) for line in echoed_lines) or len(echoed_lines) >= 2:
+            return _browser_raw_extract_dump_replacement(
+                results,
+                extracted_text=extracted,
+                user_message=user_message,
+            )
+    return None
+
+
 def _browser_extract_substantive_evidence_lines(extracted_text: object, *, limit: int = 4) -> list[str]:
     raw_lines = [
         _compact_browser_extract_line(line)
@@ -3879,6 +4174,8 @@ def _browser_extract_substantive_evidence_lines(extracted_text: object, *, limit
     candidates: list[str] = []
     numeric_status_candidates: list[str] = []
     for line in raw_lines:
+        if _browser_extract_line_is_structural_noise(line):
+            continue
         if _CURRENCY_AMOUNT_RE.search(line):
             candidates.append(line)
         if re.match(
@@ -5371,7 +5668,6 @@ def _email_attachment_read_summary(output: Mapping[str, Any]) -> str:
     filename = str(output.get("filename") or "attachment").strip() or "attachment"
     mime_type = str(output.get("mime_type") or "").strip()
     size = output.get("size_bytes")
-    artifact_path = str(output.get("artifact_path") or "").strip()
     lines = [f"I found the email attachment: **{filename}**"]
     details: list[str] = []
     if mime_type:
@@ -5380,12 +5676,9 @@ def _email_attachment_read_summary(output: Mapping[str, Any]) -> str:
         details.append(f"{size} bytes")
     if details:
         lines.append(", ".join(details))
-    if artifact_path:
-        lines.append(f"Saved file: {artifact_path}")
     preview = str(output.get("text_preview") or "").strip()
     if preview:
-        lines.append("")
-        lines.append(f"Preview: {preview[:360].rstrip()}")
+        lines.append("Text was extracted for analysis; the raw document text is not pasted into chat.")
     return "\n".join(lines).strip()
 
 

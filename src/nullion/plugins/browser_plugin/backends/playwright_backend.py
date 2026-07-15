@@ -44,6 +44,65 @@ def _require_playwright() -> None:
         )
 
 
+def _system_chromium_executable() -> str | None:
+    """Return an installed Chromium-family executable for a clean fallback.
+
+    Playwright's Python package and its downloaded browser cache have separate
+    lifecycles.  Package upgrades or cache cleanup can therefore leave the
+    adapter importable while ``chromium.launch()`` points at a missing binary.
+    Reusing the browser discovery already used by the visible/CDP backend keeps
+    the fallback cross-platform without attaching to a user's normal profile.
+    """
+
+    try:
+        from nullion.plugins.browser_plugin.backends.auto_backend import _find_chrome
+
+        executable = _find_chrome()
+    except Exception:
+        logger.debug("Could not discover a system Chromium executable", exc_info=True)
+        return None
+    return str(executable).strip() if executable else None
+
+
+async def _launch_playwright_browser(chromium: Any, *, headless: bool) -> "Browser":
+    """Launch bundled Chromium, falling back to an installed clean browser.
+
+    ``executable_path`` still lets Playwright create an isolated temporary
+    profile, so this does not read or reuse the user's signed-in browser state.
+    """
+
+    system_executable = _system_chromium_executable()
+    bundled_executable = str(getattr(chromium, "executable_path", "") or "").strip()
+    bundled_exists = bool(bundled_executable and os.path.isfile(bundled_executable))
+
+    if bundled_executable and not bundled_exists and system_executable:
+        logger.warning(
+            "Playwright Chromium executable is missing; using installed browser executable %s",
+            system_executable,
+        )
+        return await chromium.launch(headless=headless, executable_path=system_executable)
+
+    try:
+        return await chromium.launch(headless=headless)
+    except Exception as bundled_error:
+        if system_executable and os.path.abspath(system_executable) != os.path.abspath(bundled_executable or ""):
+            logger.warning(
+                "Playwright Chromium launch failed; retrying with installed browser executable %s",
+                system_executable,
+            )
+            try:
+                return await chromium.launch(headless=headless, executable_path=system_executable)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    "No usable Chromium runtime could be launched. Reinstall the Playwright browser runtime "
+                    "or configure NULLION_BROWSER_PATH to an installed Chrome, Chromium, Brave, or Edge executable."
+                ) from fallback_error
+        raise RuntimeError(
+            "No usable Playwright Chromium runtime could be launched. Reinstall the Playwright browser runtime "
+            "or configure NULLION_BROWSER_PATH to an installed Chrome, Chromium, Brave, or Edge executable."
+        ) from bundled_error
+
+
 def _context_user_agent(browser_version: str) -> str:
     """Return a UA aligned with the actual bundled Chromium build."""
 
@@ -751,7 +810,7 @@ class PlaywrightBackend:
                 playwright_context_manager = _stealth_context_manager(playwright_context_manager)
             pw = await playwright_context_manager.__aenter__()
             self._playwright = playwright_context_manager
-            self._browser = await pw.chromium.launch(headless=self._headless)
+            self._browser = await _launch_playwright_browser(pw.chromium, headless=self._headless)
         return self._browser
 
     async def _get_page(self, session_id: str) -> "Page":

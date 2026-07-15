@@ -119,6 +119,8 @@ class PlatformDeliveryReceipt:
     message_id: str | None = None
     error: str | None = None
     created_at: datetime | None = None
+    delivered_text: str | None = None
+    attachment_names: tuple[str, ...] = ()
 
     def to_record(self) -> dict[str, object]:
         created_at = self.created_at or datetime.now(UTC)
@@ -136,6 +138,8 @@ class PlatformDeliveryReceipt:
             "message_id": self.message_id,
             "error": self.error,
             "created_at": created_at.isoformat(),
+            "delivered_text": self.delivered_text,
+            "attachment_names": list(self.attachment_names),
         }
 
 
@@ -281,13 +285,15 @@ def build_platform_delivery_receipt(
     message_id: str | None = None,
     error: str | None = None,
 ) -> PlatformDeliveryReceipt:
+    delivered_text = str(getattr(delivery, "text", None) or "").strip()
+    delivered_attachments = tuple(getattr(delivery, "attachments", ()) or ())
     return PlatformDeliveryReceipt(
         receipt_id=f"dr-{uuid4().hex}",
         channel=str(channel or "unknown"),
         target_id=None if target_id is None else str(target_id),
         status=delivery_receipt_status(delivery, transport_ok=transport_ok),
-        text_delivered=bool((getattr(delivery, "text", None) or "").strip()) and transport_ok,
-        attachment_count=len(tuple(getattr(delivery, "attachments", ()) or ())) if transport_ok else 0,
+        text_delivered=bool(delivered_text) and transport_ok,
+        attachment_count=len(delivered_attachments) if transport_ok else 0,
         attachment_required=bool(getattr(delivery, "requires_attachment_delivery", False)),
         unavailable_attachment_count=int(getattr(delivery, "unavailable_attachment_count", 0) or 0),
         pending_attachment_count=int(getattr(delivery, "pending_attachment_count", 0) or 0),
@@ -295,6 +301,12 @@ def build_platform_delivery_receipt(
         message_id=message_id,
         error=error,
         created_at=datetime.now(UTC),
+        delivered_text=delivered_text if transport_ok and delivered_text else None,
+        attachment_names=(
+            tuple(path.name for path in delivered_attachments if path.name)
+            if transport_ok
+            else ()
+        ),
     )
 
 
@@ -997,6 +1009,22 @@ def delivery_contract_for_turn(
         text,
         required_attachment_extensions=required_attachment_extensions,
     )
+    produced_artifact_extensions = tuple(
+        dict.fromkeys(
+            Path(str(path or "")).suffix.lower()
+            for path in (artifact_paths or ())
+            if str(path or "").strip() and Path(str(path or "")).suffix
+        )
+    )
+    if produced_artifact_extensions and (requires_attachment_delivery or required_extensions):
+        required_extensions = (
+            *tuple(
+                extension
+                for extension in produced_artifact_extensions
+                if extension not in set(required_extensions)
+            ),
+            *required_extensions,
+        )
     if requires_attachment_delivery:
         return DeliveryContract.attachment_required(
             source="task_contract",
