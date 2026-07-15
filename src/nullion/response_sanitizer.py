@@ -921,6 +921,12 @@ def _browser_grounded_reply_should_pass_through(text: object, results: list[Tool
         return False
     if _browser_reply_claims_stale_result_list(normalized):
         return False
+    exact_extract_dump = any(
+        normalized == _normalized_reply_text(extracted).casefold()
+        for extracted in _completed_browser_extract_texts(results, max_chars=20_000)
+    )
+    if not exact_extract_dump and _browser_reply_segments_are_grounded_in_extracts(text, results):
+        return True
     for extracted in _completed_browser_extract_texts(results, max_chars=2000):
         normalized_extract = _normalized_reply_text(extracted).casefold()
         if (
@@ -931,6 +937,40 @@ def _browser_grounded_reply_should_pass_through(text: object, results: list[Tool
         ):
             return True
     return False
+
+
+def _browser_reply_segments_are_grounded_in_extracts(text: object, results: list[ToolResult]) -> bool:
+    extracted_texts = _completed_browser_extract_texts(results, max_chars=20_000)
+    if not extracted_texts:
+        return False
+    evidence = "\n".join(extracted_texts)
+    evidence_tokens = _browser_evidence_tokens(evidence)
+    evidence_amounts = set(_CURRENCY_AMOUNT_RE.findall(evidence))
+    segments = [
+        segment.strip()
+        for segment in re.split(r"(?:\n+|(?<=[.!?])\s+)", str(text or ""))
+        if segment.strip()
+    ]
+    if not segments:
+        return False
+    grounded_segment_seen = False
+    for segment in segments:
+        segment_tokens = _browser_evidence_tokens(segment)
+        segment_amounts = set(_CURRENCY_AMOUNT_RE.findall(segment))
+        matched = segment_tokens & evidence_tokens
+        if segment_amounts & evidence_amounts and (
+            matched or (grounded_segment_seen and len(segment_tokens) <= 3)
+        ):
+            grounded_segment_seen = True
+            continue
+        if len(matched) >= 3 or len({token for token in matched if len(token) >= 5}) >= 2:
+            grounded_segment_seen = True
+            continue
+        if segment_tokens and segment_tokens <= evidence_tokens:
+            grounded_segment_seen = True
+            continue
+        return False
+    return True
 
 
 def _browser_visible_evidence_text_from_mapping(value: Mapping[str, Any]) -> str:

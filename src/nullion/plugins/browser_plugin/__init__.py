@@ -434,7 +434,12 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_assert_page_state",
-            "Verify the current page visibly contains required state and omits forbidden state before reporting a browser task complete. Use after form selection, price/result screens, and before screenshots that must prove the requested state.",
+            (
+                "Verify that the current rendered page, or an optional CSS-scoped region, contains required state "
+                "and omits forbidden state before reporting a browser task complete. Use a scope selector when "
+                "unrelated navigation, recommendations, or sidebars may contain forbidden text. An unverified "
+                "result is evidence to inspect another structured page surface, not proof that the task is blocked."
+            ),
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
@@ -443,6 +448,9 @@ def register_browser_tools(
                 "browser_extract_text",
                 "browser_extract_items",
                 "browser_snapshot",
+                "browser_find",
+                "browser_run_js",
+                "browser_wait_for",
                 "browser_screenshot",
             ),
             input_schema=_object_schema(
@@ -455,7 +463,14 @@ def register_browser_tools(
                     "forbidden": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Visible text or selected values that must not be present.",
+                        "description": "Visible text or selected values that must not be present inside the selected scope.",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": (
+                            "Optional CSS selector that limits both required and forbidden checks to one relevant "
+                            "page region. Omit only when the assertion intentionally applies to the whole page."
+                        ),
                     },
                 }
             ),

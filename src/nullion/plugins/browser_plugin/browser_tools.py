@@ -798,10 +798,15 @@ def _browser_select_combobox_script(
 """
 
 
-def _browser_assert_page_state_script(*, required: list[str], forbidden: list[str]) -> str:
+def _browser_assert_page_state_script(
+    *,
+    required: list[str],
+    forbidden: list[str],
+    selector: str | None = None,
+) -> str:
     return f"""
 (() => {{
-  const args = {json.dumps({"required": required, "forbidden": forbidden})};
+  const args = {json.dumps({"required": required, "forbidden": forbidden, "selector": selector})};
   const textOf = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
   const normalize = (value) => textOf(value).toLowerCase()
     .replace(/\\bwest\\b/g, 'w').replace(/\\beast\\b/g, 'e')
@@ -836,11 +841,41 @@ def _browser_assert_page_state_script(*, required: list[str], forbidden: list[st
       return true;
     }}).join(' '));
   }};
+  let scopeRoot = document.body;
+  if (args.selector) {{
+    try {{
+      scopeRoot = document.querySelector(args.selector);
+    }} catch (error) {{
+      return {{
+        ok: false,
+        reason: 'invalid_scope_selector',
+        selector: args.selector,
+        error: String(error && error.message ? error.message : error),
+        url: location.href,
+        title: document.title
+      }};
+    }}
+  }}
+  if (!scopeRoot) {{
+    return {{
+      ok: false,
+      reason: 'scope_not_found',
+      selector: args.selector,
+      url: location.href,
+      title: document.title
+    }};
+  }}
   const rawCandidates = [];
-  for (const el of Array.from(document.querySelectorAll('body, main, section, article, p, span, div, input, textarea, select, button, a, [role], [contenteditable="true"]'))) {{
-    if (el !== document.body && !visible(el)) continue;
+  if (!args.selector) rawCandidates.push(textOf(document.title));
+  rawCandidates.push(textOf(scopeRoot.innerText || scopeRoot.textContent));
+  const scopedNodes = [
+    scopeRoot,
+    ...Array.from(scopeRoot.querySelectorAll('main, section, article, p, span, div, input, textarea, select, button, a, [role], [contenteditable="true"]'))
+  ];
+  for (const el of scopedNodes) {{
+    if (el !== scopeRoot && !visible(el)) continue;
     const pieces = [];
-    if (el === document.body) {{
+    if (el === scopeRoot) {{
       pieces.push(textOf(el.innerText || el.textContent));
     }} else {{
       const label = labelFor(el);
@@ -869,8 +904,7 @@ def _browser_assert_page_state_script(*, required: list[str], forbidden: list[st
       seen.add(key);
       return true;
     }})
-    .sort((a, b) => normalize(a).length - normalize(b).length)
-    .slice(0, 80);
+    .sort((a, b) => normalize(a).length - normalize(b).length);
   const compatible = (expected, candidate) => {{
     const expectedNorm = normalize(expected);
     const candidateNorm = normalize(candidate);
@@ -904,7 +938,26 @@ def _browser_assert_page_state_script(*, required: list[str], forbidden: list[st
     if (meaningfulWordTokens.length === 1) return candidateTokens.has(meaningfulWordTokens[0]);
     return wordTokens.length > 0 && wordTokens.every((token) => candidateTokens.has(token));
   }};
-  const findMatch = (expected) => candidates.find((candidate) => compatible(expected, candidate)) || '';
+  const compactMatch = (expected, candidate) => {{
+    if (!candidate) return '';
+    const expectedText = textOf(expected).toLowerCase();
+    const candidateText = textOf(candidate);
+    const index = candidateText.toLowerCase().indexOf(expectedText);
+    if (index >= 0) {{
+      const start = Math.max(0, index - 100);
+      const end = Math.min(candidateText.length, index + expectedText.length + 180);
+      return `${{start > 0 ? '\u2026' : ''}}${{candidateText.slice(start, end)}}${{end < candidateText.length ? '\u2026' : ''}}`;
+    }}
+    return candidateText.length <= 320 ? candidateText : `${{candidateText.slice(0, 317)}}...`;
+  }};
+  const compactPreview = (candidate) => {{
+    const candidateText = textOf(candidate);
+    return candidateText.length <= 320 ? candidateText : `${{candidateText.slice(0, 317)}}...`;
+  }};
+  const findMatch = (expected) => {{
+    const candidate = candidates.find((value) => compatible(expected, value)) || '';
+    return compactMatch(expected, candidate);
+  }};
   const required = args.required.map((expected) => ({{expected, match: findMatch(expected)}}));
   const forbidden = args.forbidden.map((expected) => ({{expected, match: findMatch(expected)}}));
   const missing = required.filter((item) => !item.match);
@@ -917,7 +970,9 @@ def _browser_assert_page_state_script(*, required: list[str], forbidden: list[st
     forbidden,
     missing,
     forbidden_found: forbiddenFound,
-    candidates: candidates.slice(0, 20)
+    selector: args.selector || null,
+    candidate_count: candidates.length,
+    candidates: candidates.slice(0, 20).map(compactPreview)
   }};
 }})()
 """
@@ -1643,7 +1698,13 @@ class BrowserTools:
             text = _run(self._backend.extract_text(session_id, selector))
             return _ok(
                 invocation,
-                {"text": text, "length": len(text), "session_id": session_id, **self._connection_notice_output()},
+                {
+                    "text": text,
+                    "length": len(text),
+                    "selector": selector,
+                    "session_id": session_id,
+                    **self._connection_notice_output(),
+                },
             )
         except Exception as e:
             return _fail(invocation, f"Extract text failed: {e}")
@@ -1749,6 +1810,7 @@ class BrowserTools:
         raw_forbidden = invocation.arguments.get("forbidden") or invocation.arguments.get("forbidden_text") or []
         required = [str(raw_required)] if isinstance(raw_required, str) else [str(item) for item in raw_required if str(item).strip()]
         forbidden = [str(raw_forbidden)] if isinstance(raw_forbidden, str) else [str(item) for item in raw_forbidden if str(item).strip()]
+        selector = str(invocation.arguments.get("selector") or "").strip() or None
         if not required and not forbidden:
             return _fail(invocation, "Provide required or forbidden page text/state assertions")
         raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
@@ -1756,7 +1818,11 @@ class BrowserTools:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:
-            script = _browser_assert_page_state_script(required=required, forbidden=forbidden)
+            script = _browser_assert_page_state_script(
+                required=required,
+                forbidden=forbidden,
+                selector=selector,
+            )
             result = _run(
                 self._backend.run_js(
                     session_id,
@@ -1766,6 +1832,19 @@ class BrowserTools:
             if not isinstance(result, dict):
                 return _fail(invocation, "Page state assertion returned an invalid result.")
             if not result.get("ok"):
+                reason = str(result.get("reason") or "").strip()
+                if reason in {"invalid_scope_selector", "scope_not_found"}:
+                    return ToolResult(
+                        invocation_id=invocation.invocation_id,
+                        tool_name=invocation.tool_name,
+                        status="failed",
+                        output={"result": result, "session_id": session_id, "selector": selector},
+                        error=(
+                            "Page state assertion scope selector was invalid."
+                            if reason == "invalid_scope_selector"
+                            else "Page state assertion scope selector did not match an element."
+                        ),
+                    )
                 current_url = str(result.get("url") or "").strip()
                 if current_url in {"", "about:blank"}:
                     fallback_session_id = None if has_explicit_session else self._recent_active_session_id(
