@@ -169,6 +169,12 @@ def sanitize_user_visible_reply(
         user_message=user_message,
     ):
         return _sanitize_local_paths(browser_non_substantive_reply)
+    if browser_constrained_reply := _browser_reply_over_forbidden_page_evidence(
+        raw,
+        results,
+        user_message=user_message,
+    ):
+        return _sanitize_local_paths(browser_constrained_reply)
     if _browser_grounded_reply_should_pass_through(raw, results):
         return _sanitize_local_paths(raw)
     if browser_incomplete_reply := _browser_incomplete_reply_over_generic_verified_state(
@@ -939,6 +945,39 @@ def _browser_grounded_reply_should_pass_through(text: object, results: list[Tool
     return False
 
 
+def _browser_reply_over_forbidden_page_evidence(
+    text: str,
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> str | None:
+    """Rebuild a browser reply when it repeats typed page-assertion exclusions."""
+
+    forbidden_labels = _browser_forbidden_assertion_labels(results)
+    if not forbidden_labels:
+        return None
+    repeats_forbidden_label = any(
+        _browser_text_satisfies_probe(text, label) for label in forbidden_labels
+    )
+    repeats_superseded_evidence = _browser_reply_repeats_superseded_forbidden_detail(
+        text,
+        results,
+        forbidden_labels=tuple(forbidden_labels),
+    )
+    if not repeats_forbidden_label and not repeats_superseded_evidence:
+        return None
+    replacement = _browser_extract_items_reply_over_blocker(
+        results,
+        user_message=user_message,
+    )
+    if not replacement or any(
+        _browser_text_satisfies_probe(replacement, label)
+        for label in forbidden_labels
+    ):
+        return None
+    return replacement
+
+
 def _browser_reply_segments_are_grounded_in_extracts(text: object, results: list[ToolResult]) -> bool:
     extracted_texts = _completed_browser_extract_texts(results, max_chars=20_000)
     if not extracted_texts:
@@ -1490,6 +1529,27 @@ def _completed_browser_detail_records(
     user_message: str | None,
 ) -> list[Mapping[str, Any]]:
     query_terms = _browser_query_terms(user_message)
+    forbidden_labels = tuple(_browser_forbidden_assertion_labels(results))
+    records: list[Mapping[str, Any]] = []
+    for candidate in _completed_browser_detail_record_candidates(results):
+        record = dict(candidate)
+        evidence = _browser_detail_record_evidence(
+            record,
+            query_terms=query_terms,
+            forbidden_labels=forbidden_labels,
+        )
+        if evidence:
+            fields = record.get("fields")
+            copied_fields = dict(fields) if isinstance(fields, Mapping) else {}
+            copied_fields.setdefault("source_evidence", evidence)
+            record["fields"] = copied_fields
+        records.append(record)
+    return _browser_records_prefer_latest(records)
+
+
+def _completed_browser_detail_record_candidates(
+    results: list[ToolResult],
+) -> list[Mapping[str, Any]]:
     records: list[Mapping[str, Any]] = []
     for result in results:
         if result.tool_name != "browser_run_js" or not _tool_result_completed(result):
@@ -1514,44 +1574,140 @@ def _completed_browser_detail_records(
             continue
         if not _browser_extract_item_has_substantive_evidence(record):
             continue
-        evidence = _browser_detail_record_evidence(record, query_terms=query_terms)
-        if evidence:
-            fields = record.get("fields")
-            copied_fields = dict(fields) if isinstance(fields, Mapping) else {}
-            copied_fields.setdefault("source_evidence", evidence)
-            record["fields"] = copied_fields
         records.append(record)
     return records
+
+
+def _browser_detail_record_text_candidates(record: Mapping[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for value in record.values():
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+        elif isinstance(value, list):
+            candidates.extend(
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            )
+    return _dedupe_preserving_order(candidates)
 
 
 def _browser_detail_record_evidence(
     record: Mapping[str, Any],
     *,
     query_terms: tuple[str, ...],
+    forbidden_labels: tuple[str, ...] = (),
 ) -> str:
-    candidates: list[str] = []
-    for key in ("summary", "description", "text"):
-        value = record.get(key)
-        if isinstance(value, str) and value.strip():
-            candidates.append(value.strip())
-    for key in ("bullets", "facts", "highlights", "details", "matches"):
-        values = record.get(key)
-        if isinstance(values, list):
-            candidates.extend(str(value).strip() for value in values if str(value).strip())
+    title = _structured_output_item_title(record, kind="browser_item")
+    action_urls = {
+        _compact_account_text(record.get(key))
+        for key in _ACTION_URL_FIELD_KEYS
+        if _compact_account_text(record.get(key))
+    }
+    candidates = [
+        candidate
+        for candidate in _browser_detail_record_text_candidates(record)
+        if candidate != title and candidate not in action_urls
+    ]
+    if forbidden_labels:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not any(
+                _browser_text_satisfies_probe(candidate, label)
+                for label in forbidden_labels
+            )
+        ]
+    evidence_segments: list[str] = []
+    for candidate in candidates:
+        segments = [
+            segment.strip()
+            for segment in re.split(r"\n+", candidate)
+            if segment.strip()
+        ]
+        evidence_segments.extend(segments or [candidate])
+    candidates = _dedupe_preserving_order(evidence_segments)
     if not candidates:
         return ""
-    scored = [
-        (
-            sum(1 for term in query_terms if term and term in candidate.casefold()),
-            -index,
-            candidate,
-        )
-        for index, candidate in enumerate(candidates)
-    ]
-    score, _position, candidate = max(scored)
-    if query_terms and score <= 0:
+    evidence_terms = tuple(
+        term
+        for term in query_terms
+        if term not in _BROWSER_EVIDENCE_TOKEN_STOPWORDS
+    )
+    scored: list[tuple[int, int, int, str]] = []
+    for index, candidate in enumerate(candidates):
+        candidate_tokens = {
+            token.casefold()
+            for token in re.findall(r"[^\W_]+", candidate, flags=re.UNICODE)
+        }
+        match_count = sum(1 for term in evidence_terms if term in candidate_tokens)
+        density = match_count * 1000 // max(6, len(candidate_tokens))
+        scored.append((density, match_count, -index, candidate))
+    _density, score, _position, candidate = max(scored)
+    if evidence_terms and score <= 0:
         return ""
     return _clip_browser_extract_item_text(candidate, max_chars=180)
+
+
+def _browser_reply_repeats_superseded_forbidden_detail(
+    text: str,
+    results: list[ToolResult],
+    *,
+    forbidden_labels: tuple[str, ...],
+) -> bool:
+    records = _completed_browser_detail_record_candidates(results)
+    latest_by_identity: dict[str, tuple[int, Mapping[str, Any]]] = {}
+    for index, record in enumerate(records):
+        identity = _browser_record_identity(record)
+        if identity:
+            latest_by_identity[identity] = (index, record)
+    for index, record in enumerate(records):
+        identity = _browser_record_identity(record)
+        latest = latest_by_identity.get(identity)
+        if not identity or latest is None or latest[0] <= index:
+            continue
+        latest_text = "\n".join(_browser_detail_record_text_candidates(latest[1]))
+        for candidate in _browser_detail_record_text_candidates(record):
+            if not any(
+                _browser_text_satisfies_probe(candidate, label)
+                for label in forbidden_labels
+            ):
+                continue
+            if _browser_reply_has_unique_evidence_window(
+                text,
+                candidate=candidate,
+                latest_text=latest_text,
+            ):
+                return True
+    return False
+
+
+def _browser_reply_has_unique_evidence_window(
+    text: str,
+    *,
+    candidate: str,
+    latest_text: str,
+) -> bool:
+    reply_tokens = _browser_evidence_window_tokens(text)
+    candidate_tokens = _browser_evidence_window_tokens(candidate)
+    latest_tokens = _browser_evidence_window_tokens(latest_text)
+    if len(reply_tokens) < 4 or len(candidate_tokens) < 4:
+        return False
+    reply_normalized = " ".join(reply_tokens)
+    latest_normalized = " ".join(latest_tokens)
+    window_size = min(6, len(candidate_tokens))
+    for start in range(len(candidate_tokens) - window_size + 1):
+        window = " ".join(candidate_tokens[start : start + window_size])
+        if window in reply_normalized and window not in latest_normalized:
+            return True
+    return False
+
+
+def _browser_evidence_window_tokens(value: object) -> list[str]:
+    return [
+        str(int(token)) if token.isdecimal() else token
+        for token in re.findall(r"[^\W_]+", str(value or "").casefold(), flags=re.UNICODE)
+    ]
 
 
 def _browser_record_identity(item: Mapping[str, Any]) -> str:
@@ -1566,6 +1722,24 @@ def _browser_record_identity(item: Mapping[str, Any]) -> str:
         if parsed.scheme and parsed.netloc:
             return f"url:{parsed.netloc.casefold().removeprefix('www.')}:{parsed.path.rstrip('/').casefold()}"
     return ""
+
+
+def _browser_records_prefer_latest(
+    records: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Keep the latest completed inspection for each structured entity."""
+
+    deduped_reversed: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for item in reversed(list(records)):
+        identity = _browser_record_identity(item)
+        if identity and identity in seen:
+            continue
+        if identity:
+            seen.add(identity)
+        deduped_reversed.append(item)
+    deduped_reversed.reverse()
+    return deduped_reversed
 
 
 def _browser_result_records(
