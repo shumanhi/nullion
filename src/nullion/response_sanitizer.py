@@ -1368,6 +1368,8 @@ _QUOTE_PAGE_PRICE_RE = re.compile(r"^\d{1,4}(?:,\d{3})*(?:\.\d{1,4})?$")
 def _browser_text_value_from_output(output: Mapping[str, Any], *, max_chars: int) -> str | None:
     for key in ("text", "content", "result", "preview"):
         value = output.get(key)
+        if key == "preview" and _invalid_truncated_json_preview(output, value):
+            continue
         text = _browser_text_value_from_any(value)
         if text:
             return text[:max_chars]
@@ -1427,16 +1429,116 @@ def _completed_browser_extract_item_records(results: list[ToolResult]) -> list[M
         if result.tool_name != "browser_extract_items" or not _tool_result_completed(result):
             continue
         output = result.output if isinstance(result.output, dict) else {}
-        for key in ("items", "results", "records", "entries"):
-            values = output.get(key)
-            if not isinstance(values, list):
-                continue
-            for item in values:
-                if isinstance(item, Mapping):
-                    records.append(item)
-            if records:
-                break
+        items = _structured_evidence_items_from_mapping(output)
+        if not items and output.get("truncated") is True:
+            items = _partial_json_preview_mapping_items(output.get("preview"))
+        records.extend(items)
     return records
+
+
+def _completed_browser_detail_records(
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> list[Mapping[str, Any]]:
+    query_terms = _browser_query_terms(user_message)
+    records: list[Mapping[str, Any]] = []
+    for result in results:
+        if result.tool_name != "browser_run_js" or not _tool_result_completed(result):
+            continue
+        output = result.output if isinstance(result.output, Mapping) else {}
+        payload = output.get("result")
+        if not isinstance(payload, Mapping):
+            preview = output.get("preview")
+            if isinstance(preview, str) and preview.strip():
+                try:
+                    parsed_preview = json.loads(preview)
+                except Exception:
+                    parsed_preview = None
+                if isinstance(parsed_preview, Mapping):
+                    payload = parsed_preview.get("result")
+        if not isinstance(payload, Mapping):
+            continue
+        record = dict(payload)
+        if not _structured_output_item_title(record, kind="browser_item"):
+            continue
+        if not _structured_output_item_action_links(record):
+            continue
+        if not _browser_extract_item_has_substantive_evidence(record):
+            continue
+        evidence = _browser_detail_record_evidence(record, query_terms=query_terms)
+        if evidence:
+            fields = record.get("fields")
+            copied_fields = dict(fields) if isinstance(fields, Mapping) else {}
+            copied_fields.setdefault("source_evidence", evidence)
+            record["fields"] = copied_fields
+        records.append(record)
+    return records
+
+
+def _browser_detail_record_evidence(
+    record: Mapping[str, Any],
+    *,
+    query_terms: tuple[str, ...],
+) -> str:
+    candidates: list[str] = []
+    for key in ("summary", "description", "text"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+    for key in ("bullets", "facts", "highlights", "details", "matches"):
+        values = record.get(key)
+        if isinstance(values, list):
+            candidates.extend(str(value).strip() for value in values if str(value).strip())
+    if not candidates:
+        return ""
+    scored = [
+        (
+            sum(1 for term in query_terms if term and term in candidate.casefold()),
+            -index,
+            candidate,
+        )
+        for index, candidate in enumerate(candidates)
+    ]
+    score, _position, candidate = max(scored)
+    if query_terms and score <= 0:
+        return ""
+    return _clip_browser_extract_item_text(candidate, max_chars=180)
+
+
+def _browser_record_identity(item: Mapping[str, Any]) -> str:
+    title = _structured_output_item_title(item, kind="browser_item")
+    if title:
+        return f"title:{_normalized_reply_text(title).casefold()}"
+    for key in _ACTION_URL_FIELD_KEYS:
+        raw_url = _compact_account_text(item.get(key))
+        if not raw_url:
+            continue
+        parsed = urlparse(raw_url)
+        if parsed.scheme and parsed.netloc:
+            return f"url:{parsed.netloc.casefold().removeprefix('www.')}:{parsed.path.rstrip('/').casefold()}"
+    return ""
+
+
+def _browser_result_records(
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> list[Mapping[str, Any]]:
+    records = [
+        *_completed_browser_detail_records(results, user_message=user_message),
+        *_completed_browser_extract_item_records(results),
+    ]
+    deduped: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for item in records:
+        identity = _browser_record_identity(item)
+        if identity and identity in seen:
+            continue
+        if identity:
+            seen.add(identity)
+        deduped.append(item)
+    return deduped
 
 
 def _completed_web_search_result_records(results: list[ToolResult]) -> list[Mapping[str, Any]]:
@@ -1509,12 +1611,22 @@ def _rank_structured_output_items(
     return [item for _score, _index, item in concrete]
 
 
-def _browser_extract_item_query_text(item: Mapping[str, Any]) -> str:
+def _browser_extract_item_content_query_text(item: Mapping[str, Any]) -> str:
     return " ".join(
         _compact_account_text(item.get(key))
         for key in ("compact_text", "summary", "title", "name", "link_text", "text")
         if _compact_account_text(item.get(key))
     )
+
+
+def _browser_extract_item_query_text(item: Mapping[str, Any]) -> str:
+    values = [_browser_extract_item_content_query_text(item)]
+    values.extend(
+        _compact_account_text(item.get(key))
+        for key in _ACTION_URL_FIELD_KEYS
+        if _compact_account_text(item.get(key))
+    )
+    return " ".join(values)
 
 
 def _browser_extract_items_ranked_for_user_message(
@@ -1531,7 +1643,11 @@ def _browser_extract_items_ranked_for_user_message(
     scored_ranked: list[tuple[int, int, Mapping[str, Any]]] = []
     for index, item in enumerate(ranked):
         normalized_text = _normalized_reply_text(_browser_extract_item_query_text(item)).casefold()
+        normalized_content = _normalized_reply_text(_browser_extract_item_content_query_text(item)).casefold()
+        content_matches = {term for term in query_terms if term and term in normalized_content}
         matched_terms = {term for term in query_terms if term and term in normalized_text}
+        if not content_matches:
+            matched_terms.clear()
         scored_ranked.append((len(matched_terms), index, item))
     if not any(score > 0 for score, _index, _item in scored_ranked):
         return ranked
@@ -1843,6 +1959,70 @@ def _structured_evidence_items_from_mapping(
     return items
 
 
+_STRUCTURED_PREVIEW_ARRAY_KEYS = (
+    "selected_results",
+    "selected_records",
+    "selected_items",
+    "results",
+    "items",
+    "records",
+    "entries",
+)
+
+
+def _invalid_truncated_json_preview(output: Mapping[str, Any], value: object) -> bool:
+    if output.get("truncated") is not True or not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text.startswith(("{", "[")):
+        return False
+    try:
+        json.loads(text)
+    except Exception:
+        return True
+    return False
+
+
+def _partial_json_preview_mapping_items(
+    value: object,
+    *,
+    limit: int = 50,
+) -> list[Mapping[str, Any]]:
+    """Recover complete records from a size-bounded JSON array preview.
+
+    Tool transport may cap a valid structured payload in the middle of its last
+    record. Complete records before that boundary remain typed evidence and can
+    be decoded without repairing or guessing the incomplete suffix.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return []
+    decoder = json.JSONDecoder()
+    for key in _STRUCTURED_PREVIEW_ARRAY_KEYS:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*\[', value)
+        if match is None:
+            continue
+        cursor = match.end()
+        records: list[Mapping[str, Any]] = []
+        while cursor < len(value) and len(records) < limit:
+            while cursor < len(value) and value[cursor] in " \t\r\n,":
+                cursor += 1
+            if cursor >= len(value) or value[cursor] == "]":
+                break
+            try:
+                item, end = decoder.raw_decode(value, cursor)
+            except json.JSONDecodeError:
+                break
+            if end <= cursor:
+                break
+            cursor = end
+            if isinstance(item, Mapping):
+                records.append(item)
+        if records:
+            return records
+    return []
+
+
 def _summary_to_bullet_lines(summary: object) -> list[str]:
     lines: list[str] = []
     for raw_line in str(summary or "").splitlines():
@@ -1962,7 +2142,11 @@ def _structured_output_item_details(item: Mapping[str, Any], *, kind: str) -> st
                 if value:
                     values.append(value)
         price_candidates = item.get("price_candidates")
-        if isinstance(price_candidates, list):
+        has_explicit_price = any(
+            _compact_account_text(item.get(key))
+            for key in ("price_text", "price")
+        )
+        if not has_explicit_price and isinstance(price_candidates, list):
             for candidate in price_candidates[:3]:
                 value = _clip_browser_extract_item_text(candidate, max_chars=64)
                 if value:
@@ -2036,10 +2220,19 @@ def _structured_output_item_action_links(item: Mapping[str, Any]) -> list[str]:
 
 
 def _structured_output_item_action_label(item: Mapping[str, Any], *, fallback_key: str) -> str:
+    title = _structured_output_item_title(item, kind="browser_item")
+    normalized_title = _normalized_reply_text(title).casefold()
     for key in ("action_label", "label", "text", "link_text", "kind", "type", "role"):
-        value = _clip_browser_extract_item_text(item.get(key), max_chars=36)
-        if value and not _looks_like_url(value):
-            return value
+        raw_value = _compact_account_text(item.get(key))
+        if not raw_value or _looks_like_url(raw_value):
+            continue
+        normalized_value = _normalized_reply_text(raw_value).casefold()
+        if normalized_title and (
+            normalized_title.startswith(normalized_value)
+            or normalized_value.startswith(normalized_title)
+        ):
+            continue
+        return _clip_browser_extract_item_text(raw_value, max_chars=36)
     if fallback_key in {"website_url", "source_url"}:
         return "Source"
     if fallback_key in {"href", "link", "url"}:
@@ -2768,7 +2961,7 @@ def _browser_extract_items_reply_over_blocker(
     *,
     user_message: str | None,
 ) -> str | None:
-    records = _completed_browser_extract_item_records(results)
+    records = _browser_result_records(results, user_message=user_message)
     if not records:
         return None
     query_terms = _browser_query_terms(user_message)
@@ -2776,17 +2969,22 @@ def _browser_extract_items_reply_over_blocker(
     if ranked and query_terms:
         scored_ranked: list[tuple[int, int, Mapping[str, Any]]] = []
         for index, item in enumerate(ranked):
-            compact_text = " ".join(
-                _compact_account_text(item.get(key))
-                for key in ("compact_text", "summary", "title", "name", "link_text", "text")
-                if _compact_account_text(item.get(key))
-            )
+            compact_text = _browser_extract_item_query_text(item)
             normalized_text = _normalized_reply_text(compact_text).casefold()
+            content_text = _browser_extract_item_content_query_text(item)
+            normalized_content = _normalized_reply_text(content_text).casefold()
+            content_matches = {
+                term
+                for term in query_terms
+                if term and term in normalized_content
+            }
             matched_terms = {
                 term
                 for term in query_terms
                 if term and term in normalized_text
             }
+            if not content_matches:
+                matched_terms.clear()
             scored_ranked.append((len(matched_terms), index, item))
         if any(score > 0 for score, _index, _item in scored_ranked):
             minimum_matches = _minimum_browser_item_query_matches(query_terms)
@@ -2802,11 +3000,7 @@ def _browser_extract_items_reply_over_blocker(
     if not ranked:
         scored: list[tuple[int, int, Mapping[str, Any]]] = []
         for index, item in enumerate(records):
-            compact_text = " ".join(
-                _compact_account_text(item.get(key))
-                for key in ("compact_text", "summary", "title", "name", "link_text", "text")
-                if _compact_account_text(item.get(key))
-            )
+            compact_text = _browser_extract_item_query_text(item)
             normalized_text = _normalized_reply_text(compact_text).casefold()
             if len(normalized_text) < 40:
                 continue
@@ -2836,7 +3030,7 @@ def _browser_extract_items_reply_over_blocker(
             continue
         seen.add(key)
         lines.append(line)
-        if len(lines) >= 4:
+        if len(lines) >= 3:
             break
     if not lines:
         return None
