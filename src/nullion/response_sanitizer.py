@@ -1436,6 +1436,54 @@ def _completed_browser_extract_item_records(results: list[ToolResult]) -> list[M
     return records
 
 
+def _browser_result_record_constraint_text(item: Mapping[str, Any]) -> str:
+    values = [
+        _structured_output_item_title(item, kind="browser_item"),
+        *(
+            _compact_account_text(item.get(key))
+            for key in ("name", "link_text", "compact_text")
+        ),
+    ]
+    return " ".join(value for value in values if value)
+
+
+def _browser_records_allowed_by_assertion(
+    results: list[ToolResult],
+    records: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Apply typed page-assertion exclusions to candidate record identities."""
+
+    forbidden = _browser_forbidden_assertion_labels(results)
+    if not forbidden:
+        return list(records)
+    allowed: list[Mapping[str, Any]] = []
+    for item in records:
+        identity_text = _browser_result_record_constraint_text(item)
+        if identity_text and any(
+            _browser_text_satisfies_probe(identity_text, label)
+            for label in forbidden
+        ):
+            continue
+        allowed.append(item)
+    return allowed
+
+
+def _browser_forbidden_assertion_labels(results: list[ToolResult]) -> list[str]:
+    assertion = _latest_unverified_browser_assert_page_state(results)
+    if assertion is None:
+        return []
+    return _browser_assertion_forbidden_found_labels(assertion)
+
+
+def _completed_browser_extract_item_records_allowed_by_assertion(
+    results: list[ToolResult],
+) -> list[Mapping[str, Any]]:
+    return _browser_records_allowed_by_assertion(
+        results,
+        _completed_browser_extract_item_records(results),
+    )
+
+
 def _completed_browser_detail_records(
     results: list[ToolResult],
     *,
@@ -1525,10 +1573,14 @@ def _browser_result_records(
     *,
     user_message: str | None,
 ) -> list[Mapping[str, Any]]:
-    records = [
-        *_completed_browser_detail_records(results, user_message=user_message),
-        *_completed_browser_extract_item_records(results),
-    ]
+    detail_records = _completed_browser_detail_records(results, user_message=user_message)
+    extract_records = _completed_browser_extract_item_records(results)
+    records = (
+        detail_records
+        if detail_records and _browser_forbidden_assertion_labels(results)
+        else [*detail_records, *extract_records]
+    )
+    records = _browser_records_allowed_by_assertion(results, records)
     deduped: list[Mapping[str, Any]] = []
     seen: set[str] = set()
     for item in records:
@@ -1793,7 +1845,7 @@ def _structured_tool_evidence_sections(
     prefer_browser_source_heading: bool = False,
 ) -> list[tuple[str, list[str], list[Mapping[str, Any]]]]:
     sections: list[tuple[str, list[str], list[Mapping[str, Any]]]] = []
-    browser_item_records = _completed_browser_extract_item_records(results)
+    browser_item_records = _completed_browser_extract_item_records_allowed_by_assertion(results)
     browser_items = _browser_extract_items_ranked_for_user_message(
         browser_item_records,
         user_message=user_message,
@@ -1882,7 +1934,7 @@ def _structured_tool_evidence_sections(
 
 
 def _browser_structured_items_should_use_source_heading(text: str, results: list[ToolResult]) -> bool:
-    records = _completed_browser_extract_item_records(results)
+    records = _completed_browser_extract_item_records_allowed_by_assertion(results)
     if not records:
         return False
     if _latest_unverified_browser_assert_page_state(results) is not None:
@@ -2802,7 +2854,10 @@ def _browser_empty_reply_over_missing_verified_records(
         return None
     if not _browser_tools_attempted(results):
         return None
-    if _rank_structured_output_items(_completed_browser_extract_item_records(results), kind="browser_item"):
+    if _rank_structured_output_items(
+        _completed_browser_extract_item_records_allowed_by_assertion(results),
+        kind="browser_item",
+    ):
         return None
     if browser_extract_reply := _browser_extract_evidence_reply(results, user_message=user_message):
         return browser_extract_reply
@@ -2833,7 +2888,7 @@ def _browser_extract_item_evidence_text(item: Mapping[str, Any]) -> str:
 
 
 def _browser_low_quality_items_reply_over_top_matches(text: str, results: list[ToolResult]) -> str | None:
-    records = _completed_browser_extract_item_records(results)
+    records = _completed_browser_extract_item_records_allowed_by_assertion(results)
     if not records or _rank_structured_output_items(records, kind="browser_item"):
         return None
     normalized = _normalized_reply_text(text).casefold()
@@ -2923,7 +2978,7 @@ def _browser_extract_items_reply_over_ignored_rows(text: str, results: list[Tool
     if _has_completed_deliverable_artifact_result(results):
         return None
     items = _rank_structured_output_items(
-        _completed_browser_extract_item_records(results),
+        _completed_browser_extract_item_records_allowed_by_assertion(results),
         kind="browser_item",
     )
     if not items:
@@ -4661,7 +4716,7 @@ def _browser_missing_required_state_reply_over_structured_evidence(
 
 
 def _browser_items_satisfy_labels(results: list[ToolResult], labels: Iterable[str]) -> bool:
-    records = _completed_browser_extract_item_records(results)
+    records = _completed_browser_extract_item_records_allowed_by_assertion(results)
     if not records:
         return False
     text = "\n".join(_browser_extract_item_query_text(item) for item in records)
