@@ -29,7 +29,15 @@ _PROFILE_DEFINITIONS: dict[str, dict[str, str]] = {
     "browser": {
         "name": "browser_agent",
         "description": "Navigate, inspect, screenshot, or test browser-based workflows.",
-        "system_prompt": "Keep browser actions scoped, report visible state, and recover from navigation or capture failures.",
+        "system_prompt": (
+            "Keep browser actions scoped and preserve the active session while pursuing the requested outcome. "
+            "Treat one failed tool, selector, extraction, or assertion as a local path failure rather than a terminal "
+            "task blocker. Continue with semantically distinct structured browser surfaces that are available, such as "
+            "scoped text, structured items, stable element ids, page state, JavaScript inspection, snapshots, or a "
+            "direct source page. Prefer later, stronger structured evidence over an earlier negative observation. "
+            "Report a blocker only after viable alternatives have been attempted and the concrete external blocker "
+            "remains visible in runtime evidence."
+        ),
     },
     "doctor": {
         "name": "doctor_agent",

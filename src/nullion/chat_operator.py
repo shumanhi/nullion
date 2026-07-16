@@ -4940,10 +4940,6 @@ _BROWSER_ACCOUNT_FALLBACK_TOOLS = frozenset({
     "web_fetch",
     "web_search",
 })
-_BROWSER_VERIFICATION_BLOCKER_RE = re.compile(
-    r"\b(?:live-search blocker|verified result records|could not verify|couldn't verify)\b",
-    re.IGNORECASE,
-)
 
 
 def _turn_result_used_only_browser_account_fallback_tools(result: object) -> bool:
@@ -4953,17 +4949,6 @@ def _turn_result_used_only_browser_account_fallback_tools(result: object) -> boo
         if str(getattr(tool_result, "tool_name", "") or "") not in {"request_tool_scope", CHAT_HISTORY_SEARCH_TOOL_NAME}
     ]
     return bool(names) and all(name in _BROWSER_ACCOUNT_FALLBACK_TOOLS for name in names)
-
-
-def _turn_result_is_browser_verification_blocker(result: object) -> bool:
-    if getattr(result, "artifacts", None):
-        return False
-    if getattr(result, "suspended_for_approval", False):
-        return False
-    if not _turn_result_used_only_browser_account_fallback_tools(result):
-        return False
-    text = str(getattr(result, "final_text", "") or "")
-    return bool(text.strip() and _BROWSER_VERIFICATION_BLOCKER_RE.search(text))
 
 
 def _registry_has_request_tool_scope(registry: object | None) -> bool:
@@ -6135,8 +6120,6 @@ def _run_chat_turn_no_tool_scope_decision_retry(
             if registry is not None
         )
     ):
-        return initial_result, active_tool_registry, False
-    if _turn_result_is_browser_verification_blocker(initial_result):
         return initial_result, active_tool_registry, False
     if _turn_result_completed_account_read_is_sufficient_for_schema_followup(
         initial_result,
@@ -10065,6 +10048,18 @@ def _turn_result_has_completed_requested_url_open(
     return False
 
 
+def _turn_result_has_unverified_browser_state(result: object) -> bool:
+    for tool_result in list(getattr(result, "tool_results", None) or []):
+        if _tool_result_name(tool_result) != "browser_assert_page_state":
+            continue
+        status = normalize_tool_status(_tool_result_status(tool_result))
+        output = _tool_result_output(tool_result)
+        nested = output.get("result") if isinstance(output.get("result"), dict) else {}
+        if status in {"failed", "error"} or output.get("verified") is False or nested.get("ok") is False:
+            return True
+    return False
+
+
 def _turn_result_needs_page_read_after_open(
     result: object,
     *,
@@ -10073,20 +10068,17 @@ def _turn_result_needs_page_read_after_open(
 ) -> bool:
     decision = getattr(registry, "turn_tool_scope_decision", None)
     web_action = str(getattr(decision, "web_action", "none") or "none").strip().lower()
-    final_text = str(getattr(result, "final_text", "") or "").casefold()
-    internal_missing_evidence_blocker = (
-        "live-search blocker" in final_text
-        or "verified result records" in final_text
-    )
-    if web_action != "browser_interaction" and not internal_missing_evidence_blocker:
+    unverified_browser_state = _turn_result_has_unverified_browser_state(result)
+    opened_browser_page = _turn_result_has_completed_tool(result, _DIRECT_OPEN_URL_TOOL_NAMES)
+    if web_action != "browser_interaction" and not unverified_browser_state and not opened_browser_page:
         return False
-    if not getattr(evidence, "has_url_target", False) and not internal_missing_evidence_blocker:
+    if not getattr(evidence, "has_url_target", False) and not unverified_browser_state and not opened_browser_page:
         return False
     if getattr(result, "artifacts", None) or getattr(result, "suspended_for_approval", False):
         return False
-    if _turn_result_has_completed_tool(result, _BROWSER_READ_EVIDENCE_TOOLS):
+    if _turn_result_has_textual_or_verified_browser_evidence(result):
         return False
-    return _turn_result_has_completed_tool(result, _DIRECT_OPEN_URL_TOOL_NAMES)
+    return opened_browser_page
 
 
 def _direct_browser_page_read_after_open(
@@ -11443,13 +11435,6 @@ def _run_chat_turn_account_read_retry(
             and not source_retry_tool_names
         ):
                 return initial_result, active_tool_registry, False
-        if (
-            not tool_names
-            and no_tool_account_scope_recovery
-            and (numbered_option_selected or _assistant_reply_has_numbered_choice_prompt(getattr(initial_result, "final_text", None)))
-            and available_account_tool_names
-        ):
-            tool_names = available_account_tool_names
         if not bool(getattr(decision, "allow_connector_tools", False)) and not tool_names:
             return initial_result, active_tool_registry, False
         if not tool_names:
@@ -11458,7 +11443,12 @@ def _run_chat_turn_account_read_retry(
             decision,
             connector_app_ids=tuple(getattr(decision, "connector_app_ids", ()) or ())
             or _active_connector_app_ids_for_retry(),
-            connector_source_user_requested=True,
+            connector_source_user_requested=bool(
+                getattr(decision, "connector_source_user_requested", False)
+            ),
+            connector_source_evidence=str(
+                getattr(decision, "connector_source_evidence", "") or ""
+            ).strip(),
             skill_pack_action="connector",
             requested_tool_names=tool_names,
             required_tool_names=tuple(
@@ -13031,6 +13021,9 @@ def _augment_tool_registry_from_structured_tool_context(
         connector_source_user_requested=bool(
             connector_followup_requested or getattr(existing, "connector_source_user_requested", False)
         ),
+        connector_source_evidence=str(
+            getattr(existing, "connector_source_evidence", "") or ""
+        ).strip(),
         requested_tool_names=combined_requested,
         required_tool_names=tuple(getattr(existing, "required_tool_names", ()) or ()),
         requested_artifact_extensions=tuple(getattr(existing, "requested_artifact_extensions", ()) or ()),
@@ -13201,6 +13194,9 @@ def _augment_tool_registry_from_saved_history_context(
         connector_source_user_requested=bool(
             connector_followup_requested or getattr(existing, "connector_source_user_requested", False)
         ),
+        connector_source_evidence=str(
+            getattr(existing, "connector_source_evidence", "") or ""
+        ).strip(),
         requested_tool_names=combined_requested,
         required_tool_names=tuple(getattr(existing, "required_tool_names", ()) or ()),
         requested_artifact_extensions=tuple(getattr(existing, "requested_artifact_extensions", ()) or ()),
@@ -22579,10 +22575,16 @@ def _conversation_dispatch_kwargs(turn_dispatch_decision: object | None) -> dict
         for dependency_id in getattr(turn_dispatch_decision, "dependency_turn_ids", ()) or ()
         if str(dependency_id).strip()
     )
+    reason = str(getattr(turn_dispatch_decision, "reason", None) or "").strip()
+    if not dependency_turn_ids and reason == "no_active_turn":
+        # This only means no concurrent request is running. It is not evidence
+        # that the message cannot revise the just-completed conversation turn.
+        # Let persisted branch state and the gated relationship classifier decide.
+        return {}
     return {
         "dispatch_disposition": getattr(turn_dispatch_decision, "disposition", None),
         "dispatch_dependency_turn_ids": dependency_turn_ids,
-        "dispatch_reason": getattr(turn_dispatch_decision, "reason", None),
+        "dispatch_reason": reason or None,
     }
 
 

@@ -324,6 +324,15 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "an account source might be useful."
                 ),
             },
+            "source_evidence": {
+                "type": "string",
+                "description": (
+                    "For a new connected-source selection, copy the shortest exact substring from the current user "
+                    "turn that names or clearly selects that connected source. The runtime validates this against "
+                    "the current turn. Omit it only when typed conversation state already links this turn to a "
+                    "previously selected connector source."
+                ),
+            },
             "tool_names": {
                 "type": "array",
                 "description": (
@@ -491,7 +500,7 @@ _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
 _SKILL_PACK_ACTIONS = frozenset({"none", "reference", "connector"})
 _REQUESTED_OUTCOMES = frozenset({"unspecified", "generated_media"})
 _TOOL_SCOPE_DECISION_CACHE_NAMESPACE = "tool_scope.decision"
-_TOOL_SCOPE_DECISION_CACHE_VERSION = "v49"
+_TOOL_SCOPE_DECISION_CACHE_VERSION = "v50"
 _TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS = 24 * 60 * 60
 _SCOPE_CAPABILITY_ALIASES = {
     "browser": "web",
@@ -738,6 +747,7 @@ class TurnToolEvidence:
     slash_prefixed_literal: bool = False
     numbered_option_selected: bool = False
     prior_tool_scopes: tuple[str, ...] = ()
+    current_user_message: str = ""
 
     @property
     def artifact_requested(self) -> bool:
@@ -762,6 +772,7 @@ class TurnToolScopeDecision:
     skill_pack_action: str = "none"
     connector_app_ids: tuple[str, ...] = ()
     connector_source_user_requested: bool = False
+    connector_source_evidence: str = ""
     requested_tool_names: tuple[str, ...] = ()
     required_tool_names: tuple[str, ...] = ()
     requested_artifact_extensions: tuple[str, ...] = ()
@@ -1846,10 +1857,20 @@ class ScopedTurnToolRegistry:
             or self._evidence.numbered_option_selected
             or generic_single_connector_source_selected
         )
+        source_evidence = str(invocation.arguments.get("source_evidence") or "").strip()
+        normalized_source_evidence = " ".join(source_evidence.split()).casefold()
+        normalized_current_message = " ".join(self._evidence.current_user_message.split()).casefold()
+        source_evidence_verified = bool(
+            normalized_source_evidence
+            and normalized_current_message
+            and normalized_source_evidence in normalized_current_message
+        )
         connector_source_user_requested = (
-            (bool(invocation.arguments.get("source_user_requested")) and source_request_has_selected_target)
-            or typed_connector_tool_requested
-            or connector_write_tool_requested
+            (
+                bool(invocation.arguments.get("source_user_requested"))
+                and source_request_has_selected_target
+                and source_evidence_verified
+            )
             or (self._evidence.context_linked and self._evidence.has_prior_tool_scope("connector"))
             or self.turn_tool_scope_decision.connector_source_user_requested
         )
@@ -2024,6 +2045,11 @@ class ScopedTurnToolRegistry:
             and not bool(set(tool_names).intersection(_CONNECTOR_TYPED_TOOLS))
             and not connector_source_user_requested
         )
+        connector_source_evidence_required = bool(
+            "connector" in capabilities
+            and (typed_connector_tool_requested or connector_write_tool_requested)
+            and not connector_source_user_requested
+        )
         typed_connector_missing_selected_app_scope = (
             "connector" in capabilities
             and typed_connector_tool_requested
@@ -2033,6 +2059,7 @@ class ScopedTurnToolRegistry:
         missing_connector_app_scope = (
             "connector" in capabilities
             and (typed_connector_tool_requested or bool(requested_connector_app_ids))
+            and not connector_source_evidence_required
             and (
                 unmatched_requested_connector_app
                 or not connector_source_user_requested
@@ -2100,6 +2127,11 @@ class ScopedTurnToolRegistry:
                 skill_pack_action=skill_pack_action,
                 connector_app_ids=connector_app_ids,
                 connector_source_user_requested=connector_source_user_requested,
+                connector_source_evidence=(
+                    source_evidence
+                    if source_evidence_verified
+                    else existing.connector_source_evidence
+                ),
                 requested_tool_names=merged_requested_tool_names,
                 required_tool_names=merged_required_tool_names,
                 requested_artifact_extensions=tuple(
@@ -2159,9 +2191,16 @@ class ScopedTurnToolRegistry:
                     "connector_app_ids": list(connector_app_ids),
                     "available_sources": available_sources,
                     "source_selection_required": source_selection_required,
+                    "connector_source_evidence_required": connector_source_evidence_required,
+                    "source_evidence_verified": source_evidence_verified,
                     "active_connector_providers": list(active_connector_providers),
                     "missing_connector_app_scope": missing_connector_app_scope,
                     "message": (
+                        "Connected-account tools were not exposed because the request did not include verified "
+                        "current-turn source evidence. Retry only if the user selected that source, and include "
+                        "an exact source_evidence substring from the current user turn."
+                        if connector_source_evidence_required
+                        else (
                         "Active connected-account read sources are available. Ask the user to choose a source "
                         "before reading account data, then call request_tool_scope again with exact tool_names."
                         if source_selection_required
@@ -2175,6 +2214,7 @@ class ScopedTurnToolRegistry:
                         )
                         if missing_connector_app_scope
                         else "No registered tools matched the requested capability scope."
+                        )
                         )
                     ),
                     "suppress_activity": True,
@@ -2318,6 +2358,7 @@ def build_turn_tool_evidence(
         slash_prefixed_literal=is_slash_prefixed_literal_message(user_message),
         numbered_option_selected=bool(numbered_option_selected),
         prior_tool_scopes=normalized_prior_tool_scopes,
+        current_user_message=str(user_message or ""),
     )
 
 
@@ -2463,6 +2504,7 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
     except (TypeError, ValueError):
         confidence = 0.0
     connector_source_user_requested = bool(payload.get("connector_source_user_requested"))
+    connector_source_evidence = str(payload.get("connector_source_evidence") or "").strip()
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
         web_action=web_action,
@@ -2473,6 +2515,7 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
         skill_pack_action=skill_pack_action,
         connector_app_ids=connector_app_ids if skill_pack_action == "connector" else (),
         connector_source_user_requested=connector_source_user_requested,
+        connector_source_evidence=connector_source_evidence,
         requested_tool_names=requested_tool_names,
         required_tool_names=required_tool_names,
         requested_artifact_extensions=requested_artifact_extensions,
@@ -2494,6 +2537,7 @@ def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str
         "skill_pack_action": decision.skill_pack_action,
         "connector_app_ids": list(decision.connector_app_ids),
         "connector_source_user_requested": decision.connector_source_user_requested,
+        "connector_source_evidence": decision.connector_source_evidence,
         "requested_tool_names": list(decision.requested_tool_names),
         "required_tool_names": list(decision.required_tool_names),
         "requested_artifact_extensions": list(decision.requested_artifact_extensions),
@@ -2573,6 +2617,7 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
     except (TypeError, ValueError):
         confidence = 0.0
     connector_source_user_requested = bool(payload.get("connector_source_user_requested"))
+    connector_source_evidence = str(payload.get("connector_source_evidence") or "").strip()
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
         web_action=web_action,
@@ -2583,6 +2628,7 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
         skill_pack_action=skill_pack_action,
         connector_app_ids=connector_app_ids if skill_pack_action == "connector" else (),
         connector_source_user_requested=connector_source_user_requested,
+        connector_source_evidence=connector_source_evidence,
         requested_tool_names=requested_tool_names,
         required_tool_names=required_tool_names,
         requested_artifact_extensions=requested_artifact_extensions,
@@ -3184,10 +3230,36 @@ def _validated_turn_tool_scope_decision(
     registry,
     active_connector_providers: Iterable[object],
 ) -> TurnToolScopeDecision:
+    normalized_current_user_message = " ".join(
+        str(getattr(evidence, "current_user_message", "") or "").split()
+    ).casefold()
+    normalized_connector_source_evidence = " ".join(
+        str(getattr(decision, "connector_source_evidence", "") or "").split()
+    ).casefold()
+    connector_source_evidence_verified = bool(
+        normalized_connector_source_evidence
+        and normalized_current_user_message
+        and normalized_connector_source_evidence in normalized_current_user_message
+    )
+    prior_connector_source_selected = bool(
+        evidence.context_linked and evidence.has_prior_tool_scope("connector")
+    )
+    connector_source_user_requested = bool(
+        decision.connector_source_user_requested
+        and (connector_source_evidence_verified or prior_connector_source_selected)
+    )
+    connector_source_evidence = (
+        str(getattr(decision, "connector_source_evidence", "") or "").strip()
+        if connector_source_evidence_verified
+        else ""
+    )
     requested_tool_names = _validated_requested_tool_names(
         decision.requested_tool_names,
         registry=registry,
-        allow_connector=decision.skill_pack_action == "connector",
+        allow_connector=(
+            decision.skill_pack_action == "connector"
+            and connector_source_user_requested
+        ),
         active_connector_providers=active_connector_providers,
     )
     image_generation_unavailable = (
@@ -3360,7 +3432,7 @@ def _validated_turn_tool_scope_decision(
             valid=decision.valid,
         )
     active_app_ids = set(_active_connector_app_ids_from_context(active_connector_providers))
-    if not decision.connector_source_user_requested:
+    if not connector_source_user_requested:
         return TurnToolScopeDecision(
             requested_outcome=decision.requested_outcome,
             web_action="none" if image_generation_unavailable else decision.web_action,
@@ -3398,7 +3470,8 @@ def _validated_turn_tool_scope_decision(
             if decision.scheduler_action == "mutate"
             else "none",
             skill_pack_action=decision.skill_pack_action,
-            connector_source_user_requested=decision.connector_source_user_requested,
+            connector_source_user_requested=connector_source_user_requested,
+            connector_source_evidence=connector_source_evidence,
             connector_app_ids=(),
             requested_tool_names=requested_tool_names,
             required_tool_names=required_tool_names,
@@ -3447,7 +3520,8 @@ def _validated_turn_tool_scope_decision(
         else "none",
         skill_pack_action=decision.skill_pack_action,
         connector_app_ids=selected_app_ids,
-        connector_source_user_requested=decision.connector_source_user_requested,
+        connector_source_user_requested=connector_source_user_requested,
+        connector_source_evidence=connector_source_evidence,
         requested_tool_names=requested_tool_names,
         required_tool_names=required_tool_names,
         requested_artifact_extensions=trusted_requested_extensions,
@@ -3735,7 +3809,7 @@ def build_turn_tool_scope_decision(
         '"scheduler_selection_policy":"none|user_selected|delegate_one",'
         '"scheduler_target_scope":"none|all_current_workspace",'
         '"skill_pack_action":"none|reference|connector","connector_app_ids":["normalized-app-id"],'
-        '"connector_source_user_requested":false,'
+        '"connector_source_user_requested":false,"connector_source_evidence":"",'
         '"requested_tool_names":["registered-tool-name"],"required_tool_names":["registered-tool-name"],'
         '"requested_artifact_extensions":[".xlsx"],"excluded_artifact_extensions":[".json"],'
         '"required_embedded_media_extensions":[".xlsx"],'
@@ -3805,8 +3879,12 @@ def build_turn_tool_scope_decision(
         "Use requested_tool_names=[\"chat_history_search\"] when the answer may be in saved current-conversation turns that are not visible in the prompt context. "
         "Use connector only when the user explicitly asks this turn to use a connected external API/account/source, "
         "or this turn is linked to prior connector source selection. Set connector_source_user_requested=true only in those cases. "
+        "For a new source request, copy the shortest exact substring from user_turn that names or selects the connected source into "
+        "connector_source_evidence. The runtime rejects new connector scope when that exact evidence is absent from user_turn. "
+        "Leave connector_source_evidence empty only when typed context_linked and prior_tool_scopes already prove connector continuity. "
         "If numbered_option_selected is true, treat the selected option text in user_turn as the current structured user choice. "
-        "If that selected option is a connected source choice, connector_source_user_requested may be true. "
+        "If that selected option is a connected source choice, connector_source_user_requested may be true and the selected source "
+        "text must still be copied into connector_source_evidence. "
         "Do not choose connector merely because connected account data might be useful. "
         "When using connector for a named external app, account, or destination, include its normalized app id in connector_app_ids even if active_app_ids does not list it; "
         "if no active provider context advertises that app id through active_app_ids, skill_pack_id/reference_paths, or other structured provider metadata, do not fall back to a generic connector provider or shell. "
@@ -4003,6 +4081,7 @@ def _planner_materialized_registry(
             skill_pack_action=existing.skill_pack_action,
             connector_app_ids=existing.connector_app_ids,
             connector_source_user_requested=existing.connector_source_user_requested,
+            connector_source_evidence=existing.connector_source_evidence,
             requested_tool_names=tuple(
                 dict.fromkeys(
                     [
