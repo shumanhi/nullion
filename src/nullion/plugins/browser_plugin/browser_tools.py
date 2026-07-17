@@ -249,7 +249,6 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
     try {{
       const url = new URL(String(value || ''), location.href);
       if (!['http:', 'https:'].includes(url.protocol)) return '';
-      url.hash = '';
       return url.href;
     }} catch (_) {{
       return '';
@@ -296,18 +295,7 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
     }}
     return candidates.filter(Boolean).pop() || '';
   }};
-  const canonicalUrl = (value) => {{
-    const resolved = nestedHttpUrl(value) || absoluteUrl(value);
-    if (!resolved) return '';
-    try {{
-      const url = new URL(resolved);
-      url.hash = '';
-      if (pathDepth(url.href) >= 2) url.search = '';
-      return url.href;
-    }} catch (_) {{
-      return resolved;
-    }}
-  }};
+  const resolvedItemUrl = (value) => nestedHttpUrl(value) || absoluteUrl(value);
 	  const tokenSet = (value) => new Set((String(value || '').toLowerCase().match(/[\p{{L}}\p{{N}}]{{3,}}/gu) || []).slice(0, 50));
 	  const searchQueryTokens = (() => {{
 	    try {{
@@ -464,8 +452,8 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
     const snippets = numericSnippets(rawRootText);
     const prices = priceSnippets(rawRootText);
 	    const title = titleFrom(anchor, root, image);
-	    const canonical = canonicalUrl(url);
-	    const depth = pathDepth(canonical || url);
+	    const resolvedUrl = resolvedItemUrl(url);
+	    const depth = pathDepth(resolvedUrl || url);
 	    const titleImageOverlap = tokenOverlap(title, image.alt);
 	    const anchorTitleOverlap = tokenOverlap(anchor.innerText || anchor.textContent || '', title);
 	    if (!title && !image.url && compactText.length < 12) continue;
@@ -485,8 +473,8 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
     candidates.push({{
       score,
       source_index: sourceIndex,
-      url: canonical || url,
-      canonical_url: canonical,
+      url: resolvedUrl || url,
+      canonical_url: resolvedUrl || url,
       url_path_depth: depth,
       title,
       link_text: textOf(anchor.innerText || anchor.textContent || '', 140),
@@ -519,7 +507,7 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
     if (unique.length >= maxItems) break;
   }}
   const items = unique.map((item, index) => {{
-    const {{score, canonical_url, ...rest}} = item;
+    const {{score, ...rest}} = item;
     return {{...rest, source_index: index + 1}};
   }});
   return {{
