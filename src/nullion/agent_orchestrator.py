@@ -44,6 +44,8 @@ from nullion.prompt_injection import (
 from nullion.redaction import redact_value
 from nullion.response_sanitizer import (
     _account_tool_summary,
+    _browser_page_epoch_for_state_workflow_index,
+    _latest_browser_page_state_observation,
     is_raw_tool_payload_reply,
     is_safe_raw_tool_payload_replacement_reply,
     safe_raw_tool_payload_replacement,
@@ -5518,22 +5520,13 @@ def _browser_post_action_evidence_nudge(available_tools: Iterable[str]) -> str:
 
 
 def _latest_unverified_browser_page_state_index(tool_results: Iterable[ToolResult] | None) -> int | None:
-    latest_index: int | None = None
-    for index, result in enumerate(tool_results or ()):
-        if result.tool_name == "browser_wait_for" and normalize_tool_status(result.status) != "completed":
-            latest_index = index
-            continue
-        if result.tool_name != "browser_assert_page_state":
-            continue
-        if normalize_tool_status(result.status) != "completed":
-            latest_index = index
-            continue
-        output = result.output if isinstance(result.output, Mapping) else {}
-        state = output.get("result")
-        state_payload = state if isinstance(state, Mapping) else {}
-        if output.get("verified") is False or state_payload.get("ok") is False:
-            latest_index = index
-    return latest_index
+    materialized = list(tool_results or ())
+    observation = _latest_browser_page_state_observation(materialized)
+    if observation is None:
+        return _browser_page_epoch_for_state_workflow_index(materialized)
+    if observation[2]:
+        return None
+    return observation[0]
 
 
 def _browser_item_payload_has_substantive_evidence(output: object) -> bool:
