@@ -124,6 +124,7 @@ def register_browser_tools(
                 "browser_snapshot",
                 "browser_extract_text",
                 "browser_extract_items",
+                "browser_extract_detail",
                 "browser_click_element",
                 "browser_type_field",
                 "browser_wait_for",
@@ -248,7 +249,7 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
-            continuation_tools=("browser_run_js", "browser_image_collect"),
+            continuation_tools=("browser_extract_detail", "browser_run_js", "browser_image_collect"),
             input_schema=_object_schema(
                 {
                     "max_items": {
@@ -265,6 +266,32 @@ def register_browser_tools(
             ),
         ),
         tools.browser_extract_items,
+    )
+    registry.register(
+        _make_spec(
+            "browser_extract_detail",
+            (
+                "Read one authoritative detail record from the current rendered DOM with Nullion's fixed "
+                "typed extractor. Use this for a selected product, booking, venue, event, or other detail page; "
+                "do not use browser_run_js output as verified record evidence."
+            ),
+            risk=ToolRiskLevel.LOW,
+            side_effect=ToolSideEffectClass.READ,
+            timeout=10,
+            continuation_tools=("browser_assert_page_state", "browser_image_collect", "browser_screenshot"),
+            input_schema=_object_schema(
+                {
+                    "selector": {
+                        "type": "string",
+                        "description": (
+                            "Optional CSS selector limiting extraction to the verified detail region. "
+                            "Use the same scope as browser_assert_page_state when one is available."
+                        ),
+                    }
+                }
+            ),
+        ),
+        tools.browser_extract_detail,
     )
     registry.register(
         _make_spec(
@@ -447,6 +474,7 @@ def register_browser_tools(
                 "browser_navigate",
                 "browser_extract_text",
                 "browser_extract_items",
+                "browser_extract_detail",
                 "browser_snapshot",
                 "browser_find",
                 "browser_run_js",

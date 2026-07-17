@@ -818,6 +818,7 @@ _ARTIFACT_PRODUCER_DEFAULT_KINDS = {
 _ARTIFACT_SOURCE_TOOLS = frozenset(
     {
         "archive_extract",
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_image_collect",

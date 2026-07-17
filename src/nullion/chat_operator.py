@@ -1863,6 +1863,7 @@ _COMPACT_DELIVERY_CONTRACT_TOOL_NAMES = frozenset({
     "browser_click_element",
     "browser_click_id",
     "browser_close",
+    "browser_extract_detail",
     "browser_extract_items",
     "browser_extract_text",
     "browser_find",
@@ -4930,6 +4931,7 @@ _BROWSER_ACCOUNT_FALLBACK_TOOLS = frozenset({
     "browser_open",
     "browser_navigate",
     "browser_extract_text",
+    "browser_extract_detail",
     "browser_extract_items",
     "browser_find",
     "browser_snapshot",
@@ -9410,6 +9412,7 @@ _OPEN_URL_READ_FOLLOWUP_TOOLS = frozenset(
         "browser_open",
         "browser_navigate",
         "browser_extract_text",
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_assert_page_state",
         "file_download",
@@ -10000,6 +10003,7 @@ def _turn_result_used_tool(result: object, tool_name: str) -> bool:
 _BROWSER_READ_EVIDENCE_TOOLS = frozenset(
     {
         "browser_assert_page_state",
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_snapshot",
@@ -10145,7 +10149,7 @@ def _turn_result_has_textual_or_verified_browser_evidence(result: object) -> boo
             continue
         tool_name = _tool_result_name(tool_result)
         output = _tool_result_output(tool_result)
-        if tool_name in {"browser_extract_text", "web_fetch"}:
+        if tool_name in {"browser_extract_detail", "browser_extract_text", "web_fetch"}:
             return True
         if tool_name == "browser_assert_page_state" and bool(output.get("verified")):
             return True
@@ -10160,6 +10164,7 @@ _ACCOUNT_READ_SCHEMA_BROWSER_PENDING_TOOLS = frozenset({
     "browser_open",
     "browser_navigate",
     "browser_extract_text",
+    "browser_extract_detail",
     "browser_extract_items",
     "browser_assert_page_state",
     "browser_image_collect",
@@ -13145,6 +13150,7 @@ def _augment_tool_registry_from_saved_history_context(
             for name in (
                 "browser_navigate",
                 "browser_extract_text",
+                "browser_extract_detail",
                 "browser_extract_items",
                 "browser_open",
                 "web_fetch",

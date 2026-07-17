@@ -103,8 +103,39 @@ _BROWSER_PAGE_STATE_MUTATION_TOOLS = frozenset(
         "browser_type_field",
         "browser_type_id",
         "browser_select_combobox",
+        "browser_run_js",
     }
 )
+_BROWSER_DOM_DETAIL_SCHEMA_VERSION = 1
+_BROWSER_DOM_DETAIL_KIND = "browser_dom_detail"
+_BROWSER_DOM_DETAIL_ORIGIN = "runtime_owned_dom_extractor"
+_BROWSER_DISPLAY_SAFE_DETAIL_KEYS = (
+    "price_text",
+    "price",
+    "availability",
+    "rating",
+    "distance",
+    "address",
+    "location",
+    "phone",
+    "status",
+    "hours",
+)
+_BROWSER_DISPLAY_SAFE_EVIDENCE_KEYS = (
+    "compact_text",
+    "summary",
+    "description",
+    "detail",
+    "important",
+    "text",
+    "bullets",
+    "ingredients",
+    "features",
+    "details",
+)
+_BROWSER_DERIVED_EVIDENCE_KEY = "_nullion_display_evidence"
+_BROWSER_DERIVED_EVIDENCE_TRUST_KEY = "_nullion_display_evidence_trust"
+_BROWSER_DERIVED_EVIDENCE_TRUST = object()
 _STRUCTURED_SOURCE_RECORD_KEYS = ("items", "results", "selected_results", "records")
 _STRUCTURED_SOURCE_RANK_KEYS = ("source_index", "source_rank")
 _SOURCE_RANK_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9/_?=&%.-])#(?P<rank>[1-9][0-9]*)")
@@ -171,10 +202,40 @@ def sanitize_user_visible_reply(
     raw = _normalize_requested_section_reply_format(requested_sections, raw, results)
     raw = _prefix_account_tool_reply(raw, results)
     raw = _strip_leading_tool_status_paragraph(raw, results)
-    browser_results = _browser_visible_reply_results(results)
+    original_browser_results = _browser_visible_reply_results(results)
+    browser_action_receipt = _terminal_browser_action_receipt_reply(
+        raw,
+        original_browser_results,
+    )
+    expanded_results = _browser_results_with_typed_page_assertions(results)
+    if browser_verified_record_reply := _browser_verified_record_reply(
+        expanded_results,
+        user_message=user_message,
+    ):
+        authoritative_reply = _browser_reply_with_action_receipt(
+            browser_verified_record_reply,
+            browser_action_receipt,
+        )
+        authoritative_reply = _format_authoritative_browser_reply_sections(
+            authoritative_reply,
+            requested_sections=requested_sections,
+            results=expanded_results,
+        )
+        return _sanitize_local_paths(
+            authoritative_reply
+        )
+    if browser_action_receipt:
+        return _sanitize_local_paths(
+            _browser_reply_with_terminal_outcomes(
+                browser_action_receipt,
+                expanded_results,
+                user_message=user_message,
+            )
+        )
+    browser_results = _browser_visible_reply_results(expanded_results)
     if browser_recovery_incomplete := _browser_recovery_navigation_reply(
         browser_results,
-        original_results=results,
+        original_results=expanded_results,
         user_message=user_message,
     ):
         return _sanitize_local_paths(browser_recovery_incomplete)
@@ -183,6 +244,11 @@ def sanitize_user_visible_reply(
         user_message=user_message,
     ):
         return _sanitize_local_paths(browser_unverified_records)
+    if browser_stale_verified_state := _browser_post_assertion_mutation_blocker(
+        browser_results,
+        user_message=user_message,
+    ):
+        return _sanitize_local_paths(browser_stale_verified_state)
     if browser_non_substantive_reply := _browser_non_substantive_extract_reply_over_drift(
         raw,
         browser_results,
@@ -867,7 +933,18 @@ def _reply_is_grounded_in_completed_browser_evidence(text: str, results: list[To
             if _reply_has_token_overlap_with_browser_text(text, _browser_visible_evidence_text_from_mapping(output)):
                 return True
             continue
-        if result.tool_name in {"browser_run_js", "browser_assert_page_state"}:
+        if result.tool_name in {"browser_extract_detail", "browser_run_js"}:
+            records = _completed_browser_detail_record_candidates([result])
+            if records and any(
+                _reply_has_token_overlap_with_browser_text(
+                    text,
+                    _browser_visible_evidence_text_from_mapping(record),
+                )
+                for record in records
+            ):
+                return True
+            continue
+        if result.tool_name == "browser_assert_page_state":
             output = result.output if isinstance(result.output, Mapping) else {}
             if _reply_has_token_overlap_with_browser_text(text, _browser_visible_evidence_text_from_mapping(output)):
                 return True
@@ -1028,27 +1105,69 @@ def _browser_reply_over_forbidden_page_evidence(
 ) -> str | None:
     """Rebuild a browser reply when it repeats typed page-assertion exclusions."""
 
-    forbidden_labels = _browser_forbidden_assertion_labels(results)
+    assertion = _latest_browser_assert_page_state(results)
+    assertion_session_id = _browser_tool_session_id(assertion) if assertion is not None else ""
+    scoped_results = [
+        result
+        for result in results
+        if not result.tool_name.startswith("browser_")
+        or not assertion_session_id
+        or not _browser_tool_session_id(result)
+        or _browser_tool_session_id(result) == assertion_session_id
+    ]
+    forbidden_labels = _browser_forbidden_assertion_labels(scoped_results)
     if not forbidden_labels:
         return None
+    covered_scoped_record = any(
+        _reply_covers_verified_browser_record(text, record)
+        for record in _completed_browser_detail_record_candidates(scoped_results)
+    )
+    covered_other_session_record = any(
+        _reply_covers_verified_browser_record(text, record)
+        for result in results
+        if assertion_session_id
+        and _browser_tool_session_id(result)
+        and _browser_tool_session_id(result) != assertion_session_id
+        for record in _completed_browser_detail_record_candidates([result])
+    )
+    if covered_other_session_record and not covered_scoped_record:
+        return None
+    promotes_forbidden_record = any(
+        any(
+            _browser_text_satisfies_probe(
+                _browser_result_record_forbidden_text(record),
+                label,
+            )
+            for label in forbidden_labels
+        )
+        and _reply_covers_verified_browser_record(text, record)
+        for record in _completed_browser_detail_record_candidates(scoped_results)
+    )
     repeats_forbidden_label = any(
         _browser_text_satisfies_probe(text, label) for label in forbidden_labels
     )
+    if covered_other_session_record and not promotes_forbidden_record:
+        repeats_forbidden_label = False
     repeats_superseded_evidence = _browser_reply_repeats_superseded_forbidden_detail(
         text,
-        results,
+        scoped_results,
         forbidden_labels=tuple(forbidden_labels),
     )
-    if not repeats_forbidden_label and not repeats_superseded_evidence:
+    if not repeats_forbidden_label and not repeats_superseded_evidence and not promotes_forbidden_record:
         return None
     replacement = _browser_extract_items_reply_over_blocker(
-        results,
+        scoped_results,
         user_message=user_message,
     )
     if not replacement or any(
         _browser_text_satisfies_probe(replacement, label)
         for label in forbidden_labels
     ):
+        if promotes_forbidden_record:
+            return _browser_unverified_search_result_blocker(
+                results,
+                user_message=user_message,
+            )
         return None
     return replacement
 
@@ -1369,6 +1488,40 @@ def _reply_contains_action_receipt(text: str, receipt_text: str) -> bool:
     return False
 
 
+def _terminal_browser_action_receipt_reply(
+    text: str,
+    results: list[ToolResult],
+) -> str | None:
+    """Return only an exact typed receipt from the terminal browser action."""
+
+    if not results:
+        return None
+    terminal = results[-1]
+    if terminal.status != "completed" or terminal.tool_name not in _BROWSER_PAGE_STATE_MUTATION_TOOLS:
+        return None
+    if _result_foreground_reply_suppressed(terminal) or _result_is_deferred_background_receipt(terminal):
+        return None
+    output = terminal.output if isinstance(terminal.output, dict) else {}
+    receipt = output.get("action_receipt")
+    if not isinstance(receipt, Mapping) or receipt.get("type") != "action_receipt":
+        return None
+    if str(receipt.get("action") or "").strip() != terminal.tool_name:
+        return None
+    formatted = _format_action_receipt(output)
+    if not formatted:
+        return None
+    stripped_text = str(text or "").strip()
+    receipt_block = formatted.strip()
+    if not (
+        stripped_text == receipt_block
+        or stripped_text.startswith(receipt_block + "\n\n")
+        or stripped_text.endswith("\n\n" + receipt_block)
+        or f"\n\n{receipt_block}\n\n" in stripped_text
+    ):
+        return None
+    return formatted
+
+
 def _action_receipt_reply_over_drift(text: str, results: list[ToolResult]) -> str | None:
     scheduler_receipts: list[str] = []
     for result in results:
@@ -1429,8 +1582,7 @@ def _artifact_completion_reply_over_drift(text: str, results: list[ToolResult]) 
     if not paths:
         return None
     path_extensions = {Path(path).suffix.lower() for path in paths}
-    if any(extension not in path_extensions for extension in requested_extensions):
-        return None
+    missing_extensions = sorted(requested_extensions - path_extensions)
     normalized_reply = _normalized_reply_text(text)
     if any(_normalized_reply_text(Path(path).name) in normalized_reply for path in paths):
         return None
@@ -1439,6 +1591,17 @@ def _artifact_completion_reply_over_drift(text: str, results: list[ToolResult]) 
     lines = [f"Created the requested {joined}:"]
     for path in paths[:3]:
         lines.append(f"- `{Path(path).name}`")
+    if missing_extensions:
+        missing_labels = [
+            _artifact_suffix_label(extension.lstrip("."))
+            for extension in missing_extensions
+        ]
+        lines.extend(
+            [
+                "",
+                f"Still missing the requested {_join_human_labels(missing_labels)}.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -1551,14 +1714,88 @@ def _completed_browser_extract_item_records(results: list[ToolResult]) -> list[M
 
 
 def _browser_result_record_constraint_text(item: Mapping[str, Any]) -> str:
-    values = [
-        _structured_output_item_title(item, kind="browser_item"),
-        *(
-            _compact_account_text(item.get(key))
-            for key in ("name", "link_text", "compact_text")
-        ),
-    ]
-    return " ".join(value for value in values if value)
+    constraint_keys = (
+        "name",
+        "link_text",
+        "compact_text",
+        "status",
+        "availability",
+        "description",
+        "detail",
+        "bullets",
+        "ingredients",
+        "attributes",
+        "specifications",
+        "features",
+        "details",
+        "variant",
+        "variant_title",
+        "product_type",
+        "category",
+    )
+
+    def _record_scoped_values(value: object, *, depth: int = 0) -> list[str]:
+        if depth > 2:
+            return []
+        if isinstance(value, Mapping):
+            return []
+        if isinstance(value, (list, tuple, set)):
+            values = []
+            for nested_value in value:
+                values.extend(_record_scoped_values(nested_value, depth=depth + 1))
+            return values
+        compact = _compact_account_text(value)
+        return [compact] if compact else []
+
+    values = [_structured_output_item_title(item, kind="browser_item")]
+    for key in constraint_keys:
+        values.extend(_record_scoped_values(item.get(key)))
+    fields = item.get("fields")
+    if isinstance(fields, Mapping):
+        for key in constraint_keys:
+            values.extend(_record_scoped_values(fields.get(key)))
+    return " ".join(_dedupe_preserving_order(value for value in values if value))
+
+
+def _browser_result_record_forbidden_text(item: Mapping[str, Any]) -> str:
+    """Project record-local exclusion evidence without promoting nested claims.
+
+    Arbitrary ``browser_run_js`` mappings are not typed positive evidence. A
+    bounded walk of the declared attribute/specification containers is still
+    useful as a conservative veto so a nested product form cannot contradict a
+    typed forbidden page-state constraint.
+    """
+
+    values = [_browser_result_record_constraint_text(item)]
+    nested_values: list[str] = []
+
+    def _append_nested(value: object, *, depth: int = 0) -> None:
+        if depth > 3 or len(nested_values) >= 64:
+            return
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                _append_nested(nested, depth=depth + 1)
+                if len(nested_values) >= 64:
+                    break
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                _append_nested(nested, depth=depth + 1)
+                if len(nested_values) >= 64:
+                    break
+            return
+        compact = _compact_account_text(value)
+        if compact:
+            nested_values.append(compact[:240])
+
+    for key in ("attributes", "specifications"):
+        _append_nested(item.get(key))
+    fields = item.get("fields")
+    if isinstance(fields, Mapping):
+        for key in ("attributes", "specifications"):
+            _append_nested(fields.get(key))
+    values.extend(nested_values)
+    return " ".join(_dedupe_preserving_order(value for value in values if value))
 
 
 def _browser_records_allowed_by_assertion(
@@ -1572,7 +1809,7 @@ def _browser_records_allowed_by_assertion(
         return list(records)
     allowed: list[Mapping[str, Any]] = []
     for item in records:
-        identity_text = _browser_result_record_constraint_text(item)
+        identity_text = _browser_result_record_forbidden_text(item)
         if identity_text and any(
             _browser_text_satisfies_probe(identity_text, label)
             for label in forbidden
@@ -1603,41 +1840,74 @@ def _completed_browser_extract_item_records_allowed_by_assertion(
     )
 
 
+def _browser_extract_item_bindings_for_latest_verified_assertion(
+    results: list[ToolResult],
+) -> list[tuple[int, Mapping[str, Any]]]:
+    """Bind current-state extracted rows to their exact producer result."""
+
+    verified_bindings: list[tuple[int, Mapping[str, Any]]] = []
+    for session_id in _browser_session_ids(results):
+        scoped_entries = _browser_session_result_entries(results, session_id=session_id)
+        scoped_results = [result for _index, result in scoped_entries]
+        observation = _latest_browser_page_state_observation(scoped_results)
+        if observation is None or not observation[2]:
+            continue
+        assertion_index = observation[0]
+        applicable: list[tuple[int, int, list[Mapping[str, Any]]]] = []
+        for result_index, result in enumerate(scoped_results):
+            if result.tool_name != "browser_extract_items" or not _tool_result_completed(result):
+                continue
+            lower = min(assertion_index, result_index) + 1
+            upper = max(assertion_index, result_index)
+            if any(
+                _browser_mutation_applies_to_session(candidate, session_id=session_id)
+                for candidate in scoped_results[lower:upper]
+            ):
+                continue
+            latest_evidence_index = max(assertion_index, result_index)
+            if any(
+                _browser_mutation_applies_to_session(candidate, session_id=session_id)
+                for candidate in scoped_results[latest_evidence_index + 1 :]
+            ):
+                continue
+            records = _completed_browser_extract_item_records([result])
+            if records:
+                global_result_index = scoped_entries[result_index][0]
+                applicable.append((result_index, global_result_index, records))
+        if not applicable:
+            continue
+        latest_index = max(index for index, _global_index, _records in applicable)
+        global_result_index, latest_records = next(
+            (global_index, records)
+            for index, global_index, records in applicable
+            if index == latest_index
+        )
+        required_labels = _browser_latest_verified_required_labels(scoped_results)
+        allowed_records = _browser_records_allowed_by_assertion(scoped_results, latest_records)
+        verified_bindings.extend(
+            (global_result_index, record)
+            for record in allowed_records
+            if not required_labels
+            or all(
+                _browser_text_satisfies_probe(
+                    _browser_result_record_constraint_text(record),
+                    label,
+                )
+                for label in required_labels
+            )
+        )
+    return sorted(verified_bindings, key=lambda binding: binding[0])
+
+
 def _browser_extract_item_records_for_latest_verified_assertion(
     results: list[ToolResult],
 ) -> list[Mapping[str, Any]]:
-    """Return current-state result rows covered by the latest page assertion."""
+    """Return non-conflicting current-state rows verified in their sessions."""
 
-    assertion = _latest_verified_browser_assert_page_state(results)
-    if assertion is None:
+    bindings = _browser_extract_item_bindings_for_latest_verified_assertion(results)
+    if _browser_verified_record_bindings_conflict(bindings):
         return []
-    assertion_index = _tool_result_identity_index(results, assertion)
-    if assertion_index is None:
-        return []
-    assertion_session_id = _browser_tool_session_id(assertion)
-    applicable: list[tuple[int, list[Mapping[str, Any]]]] = []
-    for result_index, result in enumerate(results):
-        if result.tool_name != "browser_extract_items" or not _tool_result_completed(result):
-            continue
-        source_session_id = _browser_tool_session_id(result)
-        if assertion_session_id and source_session_id and assertion_session_id != source_session_id:
-            continue
-        applicable_session_id = assertion_session_id or source_session_id
-        lower = min(assertion_index, result_index) + 1
-        upper = max(assertion_index, result_index)
-        if any(
-            _browser_mutation_applies_to_session(candidate, session_id=applicable_session_id)
-            for candidate in results[lower:upper]
-        ):
-            continue
-        records = _completed_browser_extract_item_records([result])
-        if records:
-            applicable.append((result_index, records))
-    if not applicable:
-        return []
-    latest_index = max(index for index, _records in applicable)
-    latest_records = next(records for index, records in applicable if index == latest_index)
-    return _browser_records_allowed_by_assertion(results, latest_records)
+    return _browser_verified_records_prefer_latest(record for _index, record in bindings)
 
 
 def _completed_browser_detail_records(
@@ -1651,6 +1921,8 @@ def _completed_browser_detail_records(
     records: list[Mapping[str, Any]] = []
     for candidate in _completed_browser_detail_record_candidates(results):
         record = dict(candidate)
+        record.pop(_BROWSER_DERIVED_EVIDENCE_KEY, None)
+        record.pop(_BROWSER_DERIVED_EVIDENCE_TRUST_KEY, None)
         evidence = _browser_detail_record_evidence(
             record,
             query_terms=query_terms,
@@ -1658,35 +1930,81 @@ def _completed_browser_detail_records(
             required_labels=required_labels,
         )
         if evidence:
-            fields = record.get("fields")
-            copied_fields = dict(fields) if isinstance(fields, Mapping) else {}
-            copied_fields.setdefault("source_evidence", evidence)
-            record["fields"] = copied_fields
+            record[_BROWSER_DERIVED_EVIDENCE_KEY] = evidence
+            record[_BROWSER_DERIVED_EVIDENCE_TRUST_KEY] = _BROWSER_DERIVED_EVIDENCE_TRUST
         records.append(record)
     return _browser_records_prefer_latest(records)
+
+
+def _completed_browser_detail_record_candidates_with_sources(
+    results: list[ToolResult],
+) -> list[tuple[int, Mapping[str, Any]]]:
+    """Return each detail record with the exact tool result that produced it."""
+
+    candidates: list[tuple[int, Mapping[str, Any]]] = []
+    for result_index, result in enumerate(results):
+        candidates.extend(
+            (result_index, record)
+            for record in _completed_browser_detail_record_candidates([result])
+        )
+    return candidates
 
 
 def _completed_browser_detail_record_candidates(
     results: list[ToolResult],
 ) -> list[Mapping[str, Any]]:
+    """Return detail records only from the runtime-owned DOM producer.
+
+    ``browser_run_js.result`` is deliberately ignored. When that tool returns
+    a record-shaped mapping, BrowserTools may attach a separate
+    ``detail_extraction`` envelope produced by the same fixed DOM extractor as
+    ``browser_extract_detail``; only that envelope is eligible here.
+    """
+
     records: list[Mapping[str, Any]] = []
     for result in results:
-        if result.tool_name != "browser_run_js" or not _tool_result_completed(result):
+        if result.tool_name not in {"browser_extract_detail", "browser_run_js"}:
+            continue
+        if not _tool_result_completed(result):
             continue
         output = result.output if isinstance(result.output, Mapping) else {}
-        payload = output.get("result")
-        if not isinstance(payload, Mapping):
-            preview = output.get("preview")
-            if isinstance(preview, str) and preview.strip():
-                try:
-                    parsed_preview = json.loads(preview)
-                except Exception:
-                    parsed_preview = None
-                if isinstance(parsed_preview, Mapping):
-                    payload = parsed_preview.get("result")
+        payload: Mapping[str, Any] | object = (
+            output
+            if result.tool_name == "browser_extract_detail"
+            else output.get("detail_extraction")
+        )
         if not isinstance(payload, Mapping):
             continue
-        record = dict(payload)
+        if (
+            payload.get("schema_version") != _BROWSER_DOM_DETAIL_SCHEMA_VERSION
+            or payload.get("kind") != _BROWSER_DOM_DETAIL_KIND
+            or payload.get("origin") != _BROWSER_DOM_DETAIL_ORIGIN
+        ):
+            continue
+        if payload.get("record_scope") not in {"semantic_record", "selected_root"}:
+            continue
+        selector = payload.get("selector")
+        if selector is not None and not isinstance(selector, str):
+            continue
+        outer_session_id = _browser_tool_session_id(result)
+        nested_session_id = _compact_account_text(payload.get("session_id"))
+        if not outer_session_id or nested_session_id != outer_session_id:
+            continue
+        page = payload.get("page")
+        record_payload = payload.get("record")
+        if not isinstance(page, Mapping) or not isinstance(record_payload, Mapping):
+            continue
+        if not _compact_account_text(record_payload.get("title")):
+            continue
+        page_url = _browser_url_identity(page.get("url"))
+        record_urls = {
+            identity
+            for key in _ACTION_URL_FIELD_KEYS
+            if (identity := _browser_url_identity(record_payload.get(key)))
+        }
+        if not page_url or page_url not in record_urls:
+            continue
+        record = dict(record_payload)
         if not _structured_output_item_title(record, kind="browser_item"):
             continue
         if not _structured_output_item_action_links(record):
@@ -1697,18 +2015,34 @@ def _completed_browser_detail_record_candidates(
     return records
 
 
-def _browser_detail_record_text_candidates(record: Mapping[str, Any]) -> list[str]:
+def _browser_display_safe_record_evidence_candidates(
+    record: Mapping[str, Any],
+) -> list[str]:
+    """Return bounded scalar evidence only from the runtime-owned schema."""
+
     candidates: list[str] = []
-    for value in record.values():
-        if isinstance(value, str) and value.strip():
-            candidates.append(value.strip())
-        elif isinstance(value, list):
-            candidates.extend(
-                item.strip()
-                for item in value
-                if isinstance(item, str) and item.strip()
-            )
+
+    def _append(value: object, *, depth: int = 0) -> None:
+        if depth > 1 or len(candidates) >= 32 or isinstance(value, Mapping):
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested in list(value)[:12]:
+                _append(nested, depth=depth + 1)
+            return
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            return
+        for segment in str(value).splitlines()[:8]:
+            clipped = _clip_browser_extract_item_text(segment, max_chars=240)
+            if clipped:
+                candidates.append(clipped)
+
+    for key in (*_BROWSER_DISPLAY_SAFE_EVIDENCE_KEYS, *_BROWSER_DISPLAY_SAFE_DETAIL_KEYS):
+        _append(record.get(key))
     return _dedupe_preserving_order(candidates)
+
+
+def _browser_detail_record_text_candidates(record: Mapping[str, Any]) -> list[str]:
+    return _browser_display_safe_record_evidence_candidates(record)
 
 
 def _browser_detail_record_evidence(
@@ -1779,7 +2113,9 @@ def _browser_detail_record_evidence(
         )
         density = match_count * 1000 // max(6, len(candidate_tokens))
         scored.append((required_match_count, density, match_count, -index, candidate))
-    _required_score, _density, score, _position, candidate = max(scored)
+    required_score, _density, score, _position, candidate = max(scored)
+    if required_labels and required_score <= 0:
+        return ""
     if evidence_terms and score <= 0:
         return ""
     for label in required_labels:
@@ -1864,13 +2200,35 @@ def _browser_record_identity(item: Mapping[str, Any]) -> str:
     return ""
 
 
+def _browser_record_claim_identity(item: Mapping[str, Any]) -> str:
+    """Return the entity identity used to reconcile concrete browser claims.
+
+    An exact URL is the strongest identity the browser record schema currently
+    exposes. Presentation titles may legitimately vary between independent
+    reads of the same document, so they must not split price or status claims
+    for that URL into unrelated groups. Title is only a fallback when no URL
+    is available.
+    """
+
+    for key in _ACTION_URL_FIELD_KEYS:
+        identity = _browser_url_identity(item.get(key))
+        if identity:
+            encoded = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+            return f"url:{encoded}"
+    title = _structured_output_item_title(item, kind="browser_item")
+    normalized_title = _normalized_reply_text(title).casefold() if title else ""
+    return f"title:{normalized_title}" if normalized_title else ""
+
+
 def _browser_url_identity(value: object) -> tuple[str, ...]:
     """Return an opaque page identity without guessing which URL parts matter.
 
     Hosts and schemes are case-insensitive URL syntax. Paths, query values,
     query ordering, and fragments can all select a different document or SPA
     state, so they must remain byte-for-byte distinct unless a browser tool
-    eventually supplies a stronger typed document identity.
+    eventually supplies a stronger typed document identity. URL userinfo is
+    credential transport metadata, not document identity, and is excluded so
+    redacted links cannot evade conflict detection or verified-record dedupe.
     """
 
     raw_url = _compact_account_text(value)
@@ -1891,8 +2249,6 @@ def _browser_url_identity(value: object) -> tuple[str, ...]:
         scheme,
         host,
         str(port or ""),
-        str(parsed.username or ""),
-        str(parsed.password or ""),
         parsed.path or "/",
         parsed.params,
         parsed.query,
@@ -1916,108 +2272,701 @@ def _browser_assertion_page_url(assertion: ToolResult) -> str:
     return ""
 
 
+def _browser_assertion_scope_selector(assertion: ToolResult) -> str | None:
+    output = assertion.output if isinstance(assertion.output, Mapping) else {}
+    contract = output.get("contract")
+    if isinstance(contract, Mapping):
+        selector = contract.get("selector")
+        if isinstance(selector, str) and selector.strip():
+            return selector.strip()
+    for key in ("result", "state"):
+        payload = output.get(key)
+        if not isinstance(payload, Mapping):
+            continue
+        selector = payload.get("selector")
+        if isinstance(selector, str) and selector.strip():
+            return selector.strip()
+    return None
+
+
+def _browser_detail_extraction_selector(result: ToolResult) -> str | None:
+    output = result.output if isinstance(result.output, Mapping) else {}
+    payload = output if result.tool_name == "browser_extract_detail" else output.get("detail_extraction")
+    if not isinstance(payload, Mapping):
+        return None
+    selector = payload.get("selector")
+    return selector.strip() if isinstance(selector, str) and selector.strip() else None
+
+
 def _browser_tool_session_id(result: ToolResult) -> str:
     output = result.output if isinstance(result.output, Mapping) else {}
     return _compact_account_text(output.get("session_id"))
 
 
 def _browser_mutation_applies_to_session(result: ToolResult, *, session_id: str) -> bool:
-    if result.tool_name not in _BROWSER_PAGE_STATE_MUTATION_TOOLS or not _tool_result_completed(result):
+    if result.tool_name not in _BROWSER_PAGE_STATE_MUTATION_TOOLS:
         return False
     mutation_session_id = _browser_tool_session_id(result)
     return not session_id or not mutation_session_id or mutation_session_id == session_id
 
 
-def _browser_detail_source_matches_record(result: ToolResult, record: Mapping[str, Any]) -> bool:
-    if result.tool_name != "browser_run_js" or not _tool_result_completed(result):
-        return False
-    record_urls = {
-        identity
-        for key in _ACTION_URL_FIELD_KEYS
-        if (identity := _browser_url_identity(record.get(key)))
-    }
-    if not record_urls:
-        return False
-    record_title = _normalized_reply_text(
-        _structured_output_item_title(record, kind="browser_item")
-    ).casefold()
-    return any(
-        any(_browser_url_identity(candidate.get(key)) in record_urls for key in _ACTION_URL_FIELD_KEYS)
+def _browser_session_result_entries(
+    results: list[ToolResult],
+    *,
+    session_id: str,
+) -> list[tuple[int, ToolResult]]:
+    return [
+        (index, result)
+        for index, result in enumerate(results)
+        if result.tool_name.startswith("browser_")
         and (
-            not record_title
-            or _normalized_reply_text(
-                _structured_output_item_title(candidate, kind="browser_item")
-            ).casefold()
-            == record_title
+            _browser_tool_session_id(result) == session_id
+            or (
+                not _browser_tool_session_id(result)
+                and result.tool_name in _BROWSER_PAGE_STATE_MUTATION_TOOLS
+            )
         )
-        for candidate in _completed_browser_detail_record_candidates([result])
+    ]
+
+
+def _browser_session_ids(results: list[ToolResult]) -> list[str]:
+    return _dedupe_preserving_order(
+        _browser_tool_session_id(result)
+        for result in results
+        if result.tool_name.startswith("browser_")
     )
 
 
-def _browser_detail_record_bindings_for_latest_verified_assertion(
-    results: list[ToolResult],
-    records: Iterable[Mapping[str, Any]],
-) -> list[tuple[int, Mapping[str, Any]]]:
-    """Bind the newest applicable detail record to the latest verified page state."""
+def _browser_verified_session_ids(results: list[ToolResult]) -> set[str]:
+    verified: set[str] = set()
+    for session_id in _browser_session_ids(results):
+        scoped_results = [
+            result
+            for _index, result in _browser_session_result_entries(
+                results,
+                session_id=session_id,
+            )
+        ]
+        observation = _latest_browser_page_state_observation(scoped_results)
+        if observation is not None and observation[2]:
+            verified.add(session_id)
+    return verified
 
-    assertion = _latest_verified_browser_assert_page_state(results)
-    if assertion is None:
+
+def _browser_detail_record_bindings_for_verified_sessions(
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> list[tuple[int, Mapping[str, Any]]]:
+    """Bind records to their exact producer and latest typed state per session."""
+
+    source_candidates = _completed_browser_detail_record_candidates_with_sources(results)
+    if not source_candidates:
         return []
-    assertion_index = _tool_result_identity_index(results, assertion)
-    if assertion_index is None:
-        return []
-    asserted_url = _browser_url_identity(_browser_assertion_page_url(assertion))
-    if not asserted_url:
-        return []
-    assertion_session_id = _browser_tool_session_id(assertion)
-    required_labels = _browser_latest_verified_required_labels(results)
-    bindings: list[tuple[int, int, Mapping[str, Any]]] = []
-    for record in records:
-        if not any(
-            _browser_url_identity(record.get(key)) == asserted_url
-            for key in _ACTION_URL_FIELD_KEYS
-        ):
+    query_terms = _browser_query_terms(user_message)
+    verified_bindings: list[tuple[int, Mapping[str, Any]]] = []
+    for session_id in _browser_session_ids(results):
+        scoped_entries = _browser_session_result_entries(results, session_id=session_id)
+        scoped_results = [result for _index, result in scoped_entries]
+        observation = _latest_browser_page_state_observation(scoped_results)
+        if observation is None or not observation[2]:
             continue
-        record_text = "\n".join(_browser_detail_record_text_candidates(record))
-        required_match_count = sum(
-            1
-            for label in required_labels
-            if _browser_text_satisfies_probe(record_text, label)
-        )
-        for result_index in range(len(results) - 1, -1, -1):
+        assertion_local_index, assertion, _verified = observation
+        asserted_url = _browser_url_identity(_browser_assertion_page_url(assertion))
+        if not asserted_url:
+            continue
+        asserted_selector = _browser_assertion_scope_selector(assertion)
+        required_labels = _browser_latest_verified_required_labels(scoped_results)
+        forbidden_labels = _browser_forbidden_assertion_labels(scoped_results)
+        local_index_by_global = {
+            global_index: local_index
+            for local_index, (global_index, _result) in enumerate(scoped_entries)
+        }
+        candidates: list[tuple[int, int, Mapping[str, Any]]] = []
+        for result_index, raw_record in source_candidates:
             source_result = results[result_index]
-            if not _browser_detail_source_matches_record(source_result, record):
+            if _browser_tool_session_id(source_result) != session_id:
                 continue
-            source_session_id = _browser_tool_session_id(source_result)
-            if assertion_session_id and source_session_id and assertion_session_id != source_session_id:
-                continue
-            applicable_session_id = assertion_session_id or source_session_id
-            lower = min(assertion_index, result_index) + 1
-            upper = max(assertion_index, result_index)
-            if any(
-                _browser_mutation_applies_to_session(candidate, session_id=applicable_session_id)
-                for candidate in results[lower:upper]
+            if (
+                asserted_selector
+                and _browser_detail_extraction_selector(source_result) != asserted_selector
             ):
                 continue
-            bindings.append((required_match_count, result_index, record))
-            break
-    if not bindings:
-        return []
-    _score, result_index, record = max(bindings, key=lambda binding: (binding[1], binding[0]))
-    return [(result_index, record)]
+            source_local_index = local_index_by_global.get(result_index)
+            if source_local_index is None:
+                continue
+            record_urls = {
+                identity
+                for key in _ACTION_URL_FIELD_KEYS
+                if (identity := _browser_url_identity(raw_record.get(key)))
+            }
+            if asserted_url not in record_urls:
+                continue
+            record_text = _browser_result_record_constraint_text(raw_record)
+            required_match_count = sum(
+                1
+                for label in required_labels
+                if _browser_text_satisfies_probe(record_text, label)
+            )
+            if required_labels and required_match_count != len(required_labels):
+                continue
+            if any(
+                _browser_text_satisfies_probe(
+                    _browser_result_record_forbidden_text(raw_record),
+                    label,
+                )
+                for label in forbidden_labels
+            ):
+                continue
+            lower = min(assertion_local_index, source_local_index) + 1
+            upper = max(assertion_local_index, source_local_index)
+            if any(
+                _browser_mutation_applies_to_session(candidate, session_id=session_id)
+                for candidate in scoped_results[lower:upper]
+            ):
+                continue
+            latest_evidence_index = max(assertion_local_index, source_local_index)
+            if any(
+                _browser_mutation_applies_to_session(candidate, session_id=session_id)
+                for candidate in scoped_results[latest_evidence_index + 1 :]
+            ):
+                continue
+            record = dict(raw_record)
+            record.pop(_BROWSER_DERIVED_EVIDENCE_KEY, None)
+            record.pop(_BROWSER_DERIVED_EVIDENCE_TRUST_KEY, None)
+            evidence = _browser_detail_record_evidence(
+                record,
+                query_terms=query_terms,
+                forbidden_labels=tuple(forbidden_labels),
+                required_labels=tuple(required_labels),
+            )
+            if evidence:
+                record[_BROWSER_DERIVED_EVIDENCE_KEY] = evidence
+                record[_BROWSER_DERIVED_EVIDENCE_TRUST_KEY] = _BROWSER_DERIVED_EVIDENCE_TRUST
+            candidates.append((required_match_count, result_index, record))
+        if candidates:
+            _score, result_index, record = max(
+                candidates,
+                key=lambda candidate: (candidate[1], candidate[0]),
+            )
+            verified_bindings.append((result_index, record))
+    return sorted(verified_bindings, key=lambda binding: binding[0])
+
+
+def _browser_unbound_detail_matches_latest_verified_page(
+    results: list[ToolResult],
+) -> bool:
+    """Detect a current-page detail that failed only record affinity checks."""
+
+    source_candidates = _completed_browser_detail_record_candidates_with_sources(results)
+    for session_id in _browser_verified_session_ids(results):
+        scoped_entries = _browser_session_result_entries(results, session_id=session_id)
+        scoped_results = [result for _index, result in scoped_entries]
+        observation = _latest_browser_page_state_observation(scoped_results)
+        if observation is None or not observation[2]:
+            continue
+        assertion_index, assertion, _verified = observation
+        asserted_url = _browser_url_identity(_browser_assertion_page_url(assertion))
+        if not asserted_url:
+            continue
+        local_index_by_global = {
+            global_index: local_index
+            for local_index, (global_index, _result) in enumerate(scoped_entries)
+        }
+        for result_index, record in source_candidates:
+            if _browser_tool_session_id(results[result_index]) != session_id:
+                continue
+            source_index = local_index_by_global.get(result_index)
+            if source_index is None:
+                continue
+            record_urls = {
+                identity
+                for key in _ACTION_URL_FIELD_KEYS
+                if (identity := _browser_url_identity(record.get(key)))
+            }
+            if asserted_url not in record_urls:
+                continue
+            lower = min(assertion_index, source_index) + 1
+            upper = max(assertion_index, source_index)
+            latest_evidence_index = max(assertion_index, source_index)
+            if any(
+                _browser_mutation_applies_to_session(candidate, session_id=session_id)
+                for candidate in scoped_results[lower:upper]
+            ):
+                continue
+            if any(
+                _browser_mutation_applies_to_session(candidate, session_id=session_id)
+                for candidate in scoped_results[latest_evidence_index + 1 :]
+            ):
+                continue
+            return True
+    return False
+
+
+def _browser_verified_record_bindings_conflict(
+    bindings: Iterable[tuple[int, Mapping[str, Any]]],
+) -> bool:
+    """Reject conflicting concrete claims for one identity across verified reads."""
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for _result_index, record in bindings:
+        identity = _browser_record_claim_identity(record)
+        if identity:
+            grouped.setdefault(identity, []).append(record)
+
+    canonical_keys = {
+        "price": "price",
+        "price_text": "price",
+        **{
+            key: key
+            for key in _BROWSER_DISPLAY_SAFE_DETAIL_KEYS
+            if key not in {"price", "price_text"}
+        },
+    }
+
+    def _claims(record: Mapping[str, Any]) -> dict[str, set[str]]:
+        claims: dict[str, set[str]] = {}
+
+        def _add(key: str, raw_value: object) -> None:
+            value = _compact_account_text(raw_value)
+            if not value:
+                return
+            normalized = _normalized_reply_text(value).casefold()
+            if normalized:
+                claims.setdefault(key, set()).add(normalized)
+
+        for key in _BROWSER_DISPLAY_SAFE_DETAIL_KEYS:
+            _add(canonical_keys[key], record.get(key))
+        fields = record.get("fields")
+        if isinstance(fields, Mapping):
+            for key, raw_value in fields.items():
+                normalized_key = str(key).strip().casefold()
+                if normalized_key not in canonical_keys:
+                    continue
+                _add(canonical_keys[normalized_key], raw_value)
+        price_candidates = record.get("price_candidates")
+        if isinstance(price_candidates, list):
+            for candidate in price_candidates:
+                _add("price", candidate)
+        availability = claims.get("availability")
+        status = claims.get("status")
+        availability_status = {
+            *(availability or ()),
+            *(status or ()),
+        }
+        if availability_status:
+            claims["availability_status"] = availability_status
+        return claims
+
+    for records in grouped.values():
+        claim_sets = [_claims(record) for record in records]
+        if any(any(len(values) > 1 for values in claims.values()) for claims in claim_sets):
+            return True
+        for left_index, left in enumerate(claim_sets):
+            for right in claim_sets[left_index + 1 :]:
+                if any(left[key] != right[key] for key in left.keys() & right.keys()):
+                    return True
+    return False
+
+
+def _browser_record_has_explicit_price(record: Mapping[str, Any]) -> bool:
+    if any(_compact_account_text(record.get(key)) for key in ("price_text", "price")):
+        return True
+    fields = record.get("fields")
+    return isinstance(fields, Mapping) and any(
+        _compact_account_text(fields.get(key))
+        for key in ("price_text", "price")
+    )
 
 
 def _browser_detail_records_for_latest_verified_assertion(
     results: list[ToolResult],
-    records: Iterable[Mapping[str, Any]],
+    records: Iterable[Mapping[str, Any]] | None = None,
 ) -> list[Mapping[str, Any]]:
-    return [
-        record
-        for _result_index, record in _browser_detail_record_bindings_for_latest_verified_assertion(
+    del records
+    bindings = _browser_detail_record_bindings_for_verified_sessions(
+        results,
+        user_message=None,
+    )
+    if _browser_verified_record_bindings_conflict(bindings):
+        return []
+    return _browser_verified_records_prefer_latest(
+        record for _result_index, record in bindings
+    )
+
+
+def _browser_verified_record_reply(
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> str | None:
+    """Render only records with typed, producer-bound browser provenance."""
+
+    if not any(result.tool_name == "browser_assert_page_state" for result in results):
+        return None
+    detail_bindings = _browser_detail_record_bindings_for_verified_sessions(
+        results,
+        user_message=user_message,
+    )
+    extract_bindings = _browser_extract_item_bindings_for_latest_verified_assertion(results)
+    if _browser_verified_record_bindings_conflict([*detail_bindings, *extract_bindings]):
+        lines = [
+            "Live-search blocker: independent browser reads returned conflicting details for the same result, "
+            "so I did not choose one value as authoritative."
+        ]
+        request_context = _compact_browser_request_context(user_message)
+        if request_context:
+            lines.extend(["", f"Requested task: {request_context}"])
+        return _browser_reply_with_terminal_outcomes(
+            "\n".join(lines),
             results,
-            records,
+            user_message=user_message,
+        )
+    records = _browser_verified_records_prefer_latest(
+        record for _index, record in detail_bindings
+    )
+    if not records:
+        records = _browser_verified_records_prefer_latest(
+            record for _index, record in extract_bindings
+        )
+    if records:
+        lines = _structured_output_lines(records, kind="browser_item")
+        if lines:
+            heading = (
+                "I found a verified match:"
+                if len(lines) == 1
+                else "Here are the most relevant results I could verify:"
+            )
+            return _browser_reply_with_terminal_outcomes(
+                heading + "\n\n" + "\n\n".join(lines),
+                results,
+                user_message=user_message,
+            )
+    has_detail_candidates = bool(_completed_browser_detail_record_candidates(results))
+    has_extract_item_candidates = bool(_completed_browser_extract_item_records(results))
+    if has_detail_candidates or has_extract_item_candidates:
+        if missing_state_reply := _browser_missing_required_state_reply_over_structured_evidence(
+            results,
+            user_message=user_message,
+        ):
+            return _browser_reply_with_terminal_outcomes(
+                missing_state_reply,
+                results,
+                user_message=user_message,
+            )
+    if has_detail_candidates:
+        if _browser_verified_session_ids(results) and not _browser_unbound_detail_matches_latest_verified_page(
+            results
+        ):
+            return _browser_reply_with_terminal_outcomes(
+                _browser_unverified_search_result_blocker(
+                    results,
+                    user_message=user_message,
+                ),
+                results,
+                user_message=user_message,
+            )
+        return _browser_reply_with_terminal_outcomes(
+            _browser_unverified_search_result_blocker(
+                results,
+                user_message=user_message,
+            ),
+            results,
+            user_message=user_message,
+        )
+    if has_extract_item_candidates:
+        return _browser_reply_with_terminal_outcomes(
+            _browser_unverified_search_result_blocker(
+                results,
+                user_message=user_message,
+            ),
+            results,
+            user_message=user_message,
+        )
+    return None
+
+
+def _browser_reply_with_terminal_outcomes(
+    text: str,
+    results: list[ToolResult],
+    *,
+    user_message: str | None = None,
+) -> str:
+    sections = [str(text or "").strip()]
+    receipts: list[str] = []
+    requested_artifact_extensions = _requested_artifact_extensions_from_results(results)
+    artifact_completion = _artifact_completion_reply_over_drift("", results)
+    for result in results:
+        if (
+            result.status != "completed"
+            or result.tool_name.startswith("browser_")
+            or result.tool_name in _ACTION_RECEIPT_REPLY_EXCLUDED_TOOLS
+            or _result_foreground_reply_suppressed(result)
+            or _result_is_deferred_background_receipt(result)
+            or not isinstance(result.output, dict)
+        ):
+            continue
+        if _result_produced_requested_artifact(
+            result,
+            requested_artifact_extensions,
+        ):
+            continue
+        if formatted := _format_combined_terminal_receipt(result):
+            receipts.append(formatted)
+    sections.extend(
+        _browser_requested_structured_read_sections(
+            results,
+            user_message=user_message,
+        )
+    )
+    sections.extend(_dedupe_preserving_order(receipts))
+    if artifact_completion:
+        sections.append(artifact_completion)
+    return "\n\n".join(section for section in sections if section)
+
+
+def _format_combined_terminal_receipt(result: ToolResult) -> str | None:
+    """Render only public summaries from explicitly supported receipt families."""
+
+    output = result.output if isinstance(result.output, dict) else {}
+    receipt = output.get("action_receipt")
+    if not isinstance(receipt, Mapping):
+        return None
+    if result.tool_name == "email_send":
+        summary = _compact_account_text(receipt.get("summary") or output.get("message"))
+        if _combined_receipt_summary_has_internal_metadata(summary):
+            return "Email sent successfully."
+        return _clip_browser_extract_item_text(summary, max_chars=220) or "Email sent successfully."
+    if result.tool_name in _SCHEDULER_ACTION_TOOLS:
+        return _public_scheduler_combined_receipt(result, receipt)
+    if result.tool_name == "connector_request":
+        summary = _compact_account_text(receipt.get("summary") or output.get("message"))
+        if not summary or _combined_receipt_summary_has_internal_metadata(summary):
+            return "External service action completed."
+        return _clip_browser_extract_item_text(summary, max_chars=220) or "External service action completed."
+    return None
+
+
+def _combined_receipt_summary_has_internal_metadata(summary: object) -> bool:
+    text = _compact_account_text(summary)
+    if not text:
+        return False
+    return bool(
+        re.search(r"\b[a-z][a-z0-9+.-]{1,20}://", text, flags=re.IGNORECASE)
+        or re.search(r"(?<!\w)/(?:[^\s/]+/)+[^\s,;]+", text)
+        or re.search(r"\b[A-Za-z]:\\", text)
+        or re.search(
+            r"\b(?:(?:message|request|response|connector|object)[ _-]?)?id\s*[:=]",
+            text,
+            flags=re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(?:http\s+)?status(?:\s+code)?\s*[:=]?\s*\d{3}\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+_SCHEDULER_PUBLIC_RECEIPT_LABELS = {
+    "create_cron": ("Cron", "created"),
+    "update_cron": ("Cron", "updated"),
+    "delete_cron": ("Cron", "deleted"),
+    "toggle_cron": ("Cron", "updated"),
+    "run_cron": ("Scheduled task", "started"),
+    "set_reminder": ("Reminder", "created"),
+    "create_reminder": ("Reminder", "created"),
+    "update_reminder": ("Reminder", "updated"),
+    "delete_reminder": ("Reminder", "deleted"),
+}
+
+
+def _public_scheduler_combined_receipt(
+    result: ToolResult,
+    receipt: Mapping[str, Any],
+) -> str | None:
+    label = _SCHEDULER_PUBLIC_RECEIPT_LABELS.get(result.tool_name)
+    if label is None:
+        return None
+    output = result.output if isinstance(result.output, Mapping) else {}
+    object_name = _compact_account_text(
+        receipt.get("object_name") or output.get("name") or output.get("display_name")
+    )
+    if object_name and _combined_receipt_summary_has_internal_metadata(object_name):
+        object_name = ""
+    noun, action = label
+    if object_name:
+        safe_name = _clip_browser_extract_item_text(object_name, max_chars=120)
+        if safe_name:
+            return f"{noun} {action}: {safe_name}."
+    summary = _compact_account_text(receipt.get("summary") or output.get("message"))
+    if summary and not _combined_receipt_summary_has_internal_metadata(summary):
+        safe_summary = _clip_browser_extract_item_text(summary, max_chars=220)
+        if safe_summary:
+            return safe_summary
+    return f"{noun} {action}."
+
+
+_BROWSER_COMBINED_STRUCTURED_READ_TOOLS = frozenset(
+    {"calendar_list", "email_search", "email_read", "email_attachment_read", "file_search"}
+)
+
+
+def _browser_requested_structured_read_tool_names(results: list[ToolResult]) -> set[str]:
+    allowed: set[str] = set()
+    for result in results:
+        if result.tool_name != "request_tool_scope" or not _tool_result_completed(result):
+            continue
+        output = result.output if isinstance(result.output, Mapping) else {}
+        requested = output.get("requested_tool_names")
+        required = output.get("required_tool_names")
+        if not isinstance(requested, list) or not isinstance(required, list):
+            continue
+        requested_names = {str(name or "").strip() for name in requested}
+        required_names = {str(name or "").strip() for name in required}
+        if not any(name.startswith("browser_") for name in requested_names):
+            continue
+        allowed.update(
+            requested_names
+            & required_names
+            & _BROWSER_COMBINED_STRUCTURED_READ_TOOLS
+        )
+    return allowed
+
+
+def _browser_requested_structured_read_sections(
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> list[str]:
+    allowed = _browser_requested_structured_read_tool_names(results)
+    if not allowed:
+        return []
+    read_results = [
+        result
+        for result in results
+        if result.tool_name in allowed and _tool_result_completed(result)
+    ]
+    sections = _structured_tool_evidence_sections(
+        read_results,
+        user_message=user_message,
+    )
+    return [
+        f"{heading}\n\n" + "\n\n".join(lines[:4])
+        for heading, lines, _items in sections
+        if lines
+    ][:3]
+
+
+def _format_authoritative_browser_reply_sections(
+    text: str,
+    *,
+    requested_sections: Iterable[object] | None,
+    results: list[ToolResult],
+) -> str:
+    sections_request = _requested_visible_sections(requested_sections)
+    if not sections_request or "outcome" not in {section_id for section_id, _label in sections_request}:
+        return text
+    rendered: list[str] = []
+    for section_id, label in sections_request:
+        if section_id == "outcome":
+            content = text
+        elif section_id == "artifacts":
+            content = _artifact_results_section_summary(results)
+        else:
+            content = _section_repair_content(section_id, results)
+        if not content:
+            return text
+        rendered.append(f"{label}: {_clean_section_content_for_display(content)}")
+    return "\n\n".join(rendered)
+
+
+def _result_produced_requested_artifact(
+    result: ToolResult,
+    requested_extensions: set[str],
+) -> bool:
+    """Return whether artifact completion already represents this tool result."""
+
+    if not requested_extensions or not isinstance(result.output, Mapping):
+        return False
+    values: list[object] = []
+    for key in ("artifact_path", "path", "output_path"):
+        value = result.output.get(key)
+        if value:
+            values.append(value)
+    artifact_paths = result.output.get("artifact_paths")
+    if isinstance(artifact_paths, (list, tuple)):
+        values.extend(artifact_paths)
+    return any(
+        Path(str(value or "").strip()).suffix.lower() in requested_extensions
+        for value in values
+        if str(value or "").strip()
+    )
+
+
+def _browser_reply_with_action_receipt(text: str, receipt: str | None) -> str:
+    """Keep an exact terminal browser receipt beside independently valid outcomes."""
+
+    rendered = str(text or "").strip()
+    receipt_text = str(receipt or "").strip()
+    if not receipt_text or _reply_contains_action_receipt(rendered, receipt_text):
+        return rendered
+    return "\n\n".join(section for section in (rendered, receipt_text) if section)
+
+
+def _browser_post_assertion_mutation_blocker(
+    results: list[ToolResult],
+    *,
+    user_message: str | None,
+) -> str | None:
+    """Reject a verified page claim after an unresolved browser mutation."""
+
+    assertion = _latest_verified_browser_assert_page_state(results)
+    if assertion is None:
+        return None
+    assertion_index = _tool_result_identity_index(results, assertion)
+    if assertion_index is None:
+        return None
+    assertion_session_id = _browser_tool_session_id(assertion)
+    mutations = [
+        (index, result)
+        for index, result in enumerate(results[assertion_index + 1 :], start=assertion_index + 1)
+        if _browser_mutation_applies_to_session(
+            result,
+            session_id=assertion_session_id,
         )
     ]
+    if not mutations:
+        return None
+    latest_mutation_index = mutations[-1][0]
+    current_page_observations: list[ToolResult] = []
+    for result in results[latest_mutation_index + 1 :]:
+        if not _tool_result_completed(result):
+            continue
+        result_session_id = _browser_tool_session_id(result)
+        if assertion_session_id and result_session_id and assertion_session_id != result_session_id:
+            continue
+        if _completed_browser_detail_record_candidates([result]):
+            current_page_observations.append(result)
+    if not current_page_observations:
+        # A bare click does not prove navigation. Preserve action receipts and
+        # fresh extract evidence unless a typed current-page observation shows
+        # that the verified state no longer applies.
+        return None
+    bindings = _browser_detail_record_bindings_for_verified_sessions(
+        results,
+        user_message=user_message,
+    )
+    if any(result_index > latest_mutation_index for result_index, _record in bindings):
+        return None
+    lines = [
+        "Live-search blocker: the browser moved after the last verified page state, "
+        "and the current page did not produce a matching verified detail record."
+    ]
+    request_context = _compact_browser_request_context(user_message)
+    if request_context:
+        lines.extend(["", f"Requested task: {request_context}"])
+    return "\n".join(lines)
 
 
 def _reply_covers_verified_browser_record(text: object, record: Mapping[str, Any]) -> bool:
@@ -2053,26 +3002,54 @@ def _browser_records_prefer_latest(
     return deduped_reversed
 
 
+def _browser_verified_records_prefer_latest(
+    records: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Keep the latest verified read for each exact claim identity."""
+
+    deduped_reversed: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for item in reversed(list(records)):
+        identity = _browser_record_claim_identity(item)
+        if identity and identity in seen:
+            continue
+        if identity:
+            seen.add(identity)
+        deduped_reversed.append(item)
+    deduped_reversed.reverse()
+    return deduped_reversed
+
+
 def _browser_result_records(
     results: list[ToolResult],
     *,
     user_message: str | None,
 ) -> list[Mapping[str, Any]]:
     detail_records = _completed_browser_detail_records(results, user_message=user_message)
-    verified_detail_records = _browser_detail_records_for_latest_verified_assertion(
+    verified_detail_bindings = _browser_detail_record_bindings_for_verified_sessions(
         results,
-        detail_records,
+        user_message=user_message,
     )
-    verified_assertion = _latest_verified_browser_assert_page_state(results)
     extract_records = _completed_browser_extract_item_records(results)
-    verified_extract_records = _browser_extract_item_records_for_latest_verified_assertion(results)
-    records = (
-        (verified_detail_records or verified_extract_records)
-        if verified_assertion is not None
-        else detail_records
-        if detail_records and _browser_forbidden_assertion_labels(results)
-        else [*detail_records, *extract_records]
+    verified_extract_bindings = _browser_extract_item_bindings_for_latest_verified_assertion(results)
+    verified_records_conflict = _browser_verified_record_bindings_conflict(
+        [*verified_detail_bindings, *verified_extract_bindings]
     )
+    verified_detail_records = [record for _index, record in verified_detail_bindings]
+    verified_extract_records = [record for _index, record in verified_extract_bindings]
+    has_assertions = any(result.tool_name == "browser_assert_page_state" for result in results)
+    if verified_records_conflict:
+        records = []
+    elif _browser_verified_session_ids(results):
+        records = _browser_verified_records_prefer_latest(
+            verified_detail_records or verified_extract_records
+        )
+    elif has_assertions:
+        records = []
+    elif detail_records and _browser_forbidden_assertion_labels(results):
+        records = detail_records
+    else:
+        records = [*detail_records, *extract_records]
     records = _browser_records_allowed_by_assertion(results, records)
     deduped: list[Mapping[str, Any]] = []
     seen: set[str] = set()
@@ -2115,6 +3092,7 @@ _CONCRETE_RECORD_FIELD_KEYS = (
     "location",
     "rating",
     "price",
+    "availability",
     "distance",
     "phone",
     "date",
@@ -2229,14 +3207,60 @@ def _structured_output_item_quality_score(item: Mapping[str, Any], *, kind: str)
 
 
 def _browser_extract_item_has_substantive_evidence(item: Mapping[str, Any]) -> bool:
-    for key in ("price", "price_text", "rating", "distance", "address", "location", "phone", "status", "hours"):
+    for key in (
+        "price",
+        "price_text",
+        "availability",
+        "rating",
+        "distance",
+        "address",
+        "location",
+        "phone",
+        "status",
+        "hours",
+    ):
         if item.get(key) not in (None, "", [], {}):
             return True
-    for key in ("fields", "price_candidates"):
-        value = item.get(key)
-        if isinstance(value, Mapping) and any(field not in (None, "", [], {}) for field in value.values()):
-            return True
-        if isinstance(value, list) and any(field not in (None, "", [], {}) for field in value):
+    fields = item.get("fields")
+    if isinstance(fields, Mapping) and any(
+        fields.get(key) not in (None, "", [], {})
+        for key in _BROWSER_DISPLAY_SAFE_DETAIL_KEYS
+    ):
+        return True
+    price_candidates = item.get("price_candidates")
+    if isinstance(price_candidates, list) and any(
+        candidate not in (None, "", [], {})
+        for candidate in price_candidates
+    ):
+        return True
+    numeric_snippets = item.get("numeric_snippets")
+    if isinstance(numeric_snippets, list) and any(
+        snippet not in (None, "", [], {})
+        for snippet in numeric_snippets
+    ):
+        return True
+    title = _structured_output_item_title(item, kind="browser_item")
+    if not title or not _structured_output_item_action_links(item):
+        return False
+    reference_tokens = {
+        token.casefold()
+        for key in ("title", "name", "link_text")
+        for token in re.findall(
+            r"[^\W_]+",
+            _compact_account_text(item.get(key)),
+            flags=re.UNICODE,
+        )
+    }
+    for candidate in _browser_display_safe_record_evidence_candidates(item):
+        normalized_candidate = _normalized_reply_text(candidate).casefold()
+        if not normalized_candidate or _browser_extract_line_is_structural_noise(candidate):
+            continue
+        candidate_tokens = [
+            token.casefold()
+            for token in re.findall(r"[^\W_]+", candidate, flags=re.UNICODE)
+        ]
+        non_title_tokens = [token for token in candidate_tokens if token not in reference_tokens]
+        if len(non_title_tokens) >= 4:
             return True
     return False
 
@@ -2338,25 +3362,42 @@ def _structured_tool_evidence_sections(
     prefer_browser_source_heading: bool = False,
 ) -> list[tuple[str, list[str], list[Mapping[str, Any]]]]:
     sections: list[tuple[str, list[str], list[Mapping[str, Any]]]] = []
-    browser_detail_records = _completed_browser_detail_records(results, user_message=user_message)
-    verified_browser_bindings = _browser_detail_record_bindings_for_latest_verified_assertion(
+    verified_browser_bindings = _browser_detail_record_bindings_for_verified_sessions(
         results,
-        browser_detail_records,
+        user_message=user_message,
     )
-    verified_browser_records = [record for _result_index, record in verified_browser_bindings]
+    verified_browser_extract_bindings = _browser_extract_item_bindings_for_latest_verified_assertion(
+        results
+    )
+    verified_browser_conflict = _browser_verified_record_bindings_conflict(
+        [*verified_browser_bindings, *verified_browser_extract_bindings]
+    )
+    verified_browser_records = (
+        []
+        if verified_browser_conflict
+        else [record for _result_index, record in verified_browser_bindings]
+    )
     represented_browser_result_indexes = {
         result_index for result_index, _record in verified_browser_bindings
     }
-    verified_browser_assertion = _latest_verified_browser_assert_page_state(results)
-    verified_browser_extract_records = _browser_extract_item_records_for_latest_verified_assertion(results)
+    verified_browser_session_ids = _browser_verified_session_ids(results)
+    verified_browser_extract_records = (
+        []
+        if verified_browser_conflict
+        else [record for _result_index, record in verified_browser_extract_bindings]
+    )
     browser_item_records = (
-        (verified_browser_records or verified_browser_extract_records)
-        if verified_browser_assertion is not None
+        _browser_verified_records_prefer_latest(
+            [
+                *(verified_browser_records or verified_browser_extract_records),
+            ]
+        )
+        if verified_browser_session_ids
         else _completed_browser_extract_item_records_allowed_by_assertion(results)
     )
     browser_items = (
         browser_item_records
-        if verified_browser_assertion is not None
+        if verified_browser_session_ids
         else _browser_extract_items_ranked_for_user_message(
             browser_item_records,
             user_message=user_message,
@@ -2371,7 +3412,7 @@ def _structured_tool_evidence_sections(
                 else "Relevant results"
             )
             sections.append((heading, browser_lines, browser_items))
-    elif not browser_item_records and verified_browser_assertion is None:
+    elif not browser_item_records and not verified_browser_session_ids:
         web_items = _rank_structured_output_items(
             _completed_web_search_result_records(results),
             kind="web_search",
@@ -2388,13 +3429,20 @@ def _structured_tool_evidence_sections(
         if result.tool_name in {
             "connector_request",
             "web_search",
+            "browser_extract_detail",
             "browser_extract_items",
             "browser_extract_text",
+            "browser_run_js",
             "email_send",
         }:
             continue
-        if result.tool_name == "browser_run_js" and result_index in represented_browser_result_indexes:
-            continue
+        if result.tool_name == "browser_run_js":
+            if result_index in represented_browser_result_indexes:
+                continue
+            if any(candidate.tool_name == "browser_assert_page_state" for candidate in results):
+                result_session_id = _browser_tool_session_id(result)
+                if result_session_id not in verified_browser_session_ids:
+                    continue
         if result.tool_name == "email_read":
             summary = _email_read_summary(result.output)
             items = _structured_evidence_items_from_mapping(result.output, preferred_key="message")
@@ -2436,6 +3484,17 @@ def _structured_tool_evidence_sections(
         generic_items = _structured_evidence_items_from_mapping(result.output)
         if not generic_items:
             continue
+        if verified_browser_session_ids and result.tool_name == "browser_run_js":
+            # A verified detail supersedes linked alternatives. Supplemental
+            # rows remain visible only from a session whose own latest typed
+            # page-state observation is verified.
+            generic_items = [
+                item
+                for item in generic_items
+                if not _structured_output_item_action_links(item)
+            ]
+            if not generic_items:
+                continue
         generic_kind = "generic"
         heading = "Results I found"
         if result.tool_name.startswith("browser_"):
@@ -2661,7 +3720,16 @@ def _structured_output_item_line(index: int, item: Mapping[str, Any], *, kind: s
 
 def _structured_output_item_title(item: Mapping[str, Any], *, kind: str) -> str:
     if kind == "browser_item":
-        keys = ("title", "name", "compact_text", "link_text", "summary", "text")
+        keys = (
+            "productTitle",
+            "product_title",
+            "title",
+            "name",
+            "compact_text",
+            "link_text",
+            "summary",
+            "text",
+        )
         max_chars = 128
     elif kind == "calendar":
         keys = ("summary", "title", "name")
@@ -2698,21 +3766,25 @@ def _structured_output_item_details(item: Mapping[str, Any], *, kind: str) -> st
         return "; ".join(details[:2])
     if kind == "browser_item":
         values: list[str] = []
-        for key in ("price_text", "price", "rating", "distance", "address", "location", "phone", "status", "hours"):
+        for key in _BROWSER_DISPLAY_SAFE_DETAIL_KEYS:
             value = _clip_browser_extract_item_text(item.get(key), max_chars=64)
             if value:
                 values.append(value)
         fields = item.get("fields")
         if isinstance(fields, Mapping):
-            for field_value in fields.values():
-                value = _clip_browser_extract_item_text(field_value, max_chars=64)
+            for key in _BROWSER_DISPLAY_SAFE_DETAIL_KEYS:
+                value = _clip_browser_extract_item_text(fields.get(key), max_chars=64)
                 if value:
                     values.append(value)
+        if item.get(_BROWSER_DERIVED_EVIDENCE_TRUST_KEY) is _BROWSER_DERIVED_EVIDENCE_TRUST:
+            evidence = _clip_browser_extract_item_text(
+                item.get(_BROWSER_DERIVED_EVIDENCE_KEY),
+                max_chars=180,
+            )
+            if evidence:
+                values.append(evidence)
         price_candidates = item.get("price_candidates")
-        has_explicit_price = any(
-            _compact_account_text(item.get(key))
-            for key in ("price_text", "price")
-        )
+        has_explicit_price = _browser_record_has_explicit_price(item)
         if not has_explicit_price and isinstance(price_candidates, list):
             for candidate in price_candidates[:3]:
                 value = _clip_browser_extract_item_text(candidate, max_chars=64)
@@ -3433,19 +4505,44 @@ def _clip_browser_extract_item_text(value: object, *, max_chars: int) -> str:
 
 
 def _displayable_browser_extract_item_url(url: str) -> str:
-    if not url or len(url) > 120:
+    if not url:
         return ""
-    lowered = url.lower()
+    safe_url = _browser_url_without_userinfo(url)
+    if not safe_url or len(safe_url) > 120:
+        return ""
+    lowered = safe_url.lower()
     if "/maps/dir" in lowered or "/search?" in lowered or "google.com/maps" in lowered:
         return ""
-    return url
+    return safe_url
+
+
+def _browser_url_without_userinfo(url: str) -> str:
+    """Strip URL credentials before rendering a browser-owned link."""
+
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return ""
+    try:
+        parsed = urlparse(raw_url)
+        hostname = parsed.hostname
+    except (TypeError, ValueError):
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or not hostname:
+        return ""
+    if "@" not in parsed.netloc:
+        return raw_url
+    safe_netloc = parsed.netloc.rsplit("@", 1)[-1]
+    if not safe_netloc:
+        return ""
+    return parsed._replace(netloc=safe_netloc).geturl()
 
 
 def _displayable_evidence_source_label(url: str) -> str:
-    if not url:
+    safe_url = _browser_url_without_userinfo(url)
+    if not safe_url:
         return ""
-    match = re.match(r"https?://([^/?#]+)", url.strip(), flags=re.IGNORECASE)
-    host = match.group(1) if match else url.split("/", 1)[0]
+    match = re.match(r"https?://([^/?#]+)", safe_url, flags=re.IGNORECASE)
+    host = match.group(1) if match else safe_url.split("/", 1)[0]
     host = host.lower().removeprefix("www.")
     if not host or len(host) > 42:
         return ""
@@ -4952,11 +6049,17 @@ def _browser_non_substantive_extract_reply_over_drift(
 ) -> str | None:
     """Replace a reply that promotes raw heading/footer rows as findings."""
 
-    if _rank_structured_output_items(
-        _completed_browser_extract_item_records(results),
-        kind="browser_item",
-    ):
+    item_records = _completed_browser_extract_item_records(results)
+    if any(_browser_extract_item_has_substantive_evidence(item) for item in item_records):
         return None
+    if item_records and any(
+        result.tool_name.startswith("browser_") and not _tool_result_completed(result)
+        for result in results
+    ):
+        return _browser_unverified_search_result_blocker(
+            results,
+            user_message=user_message,
+        )
     visible = _normalized_reply_text(text).casefold()
     if not visible:
         return None
@@ -5198,7 +6301,15 @@ def _latest_completed_browser_extract_text(results: list[ToolResult], *, max_cha
     return None
 
 
-_BROWSER_PAGE_EPOCH_RESET_TOOLS = frozenset({"browser_navigate", "browser_open"})
+_BROWSER_PAGE_EPOCH_RESET_TOOLS = _BROWSER_PAGE_STATE_MUTATION_TOOLS
+_BROWSER_TYPED_EVIDENCE_READ_TOOLS = frozenset(
+    {
+        "browser_run_js",
+        "browser_extract_detail",
+        "browser_extract_items",
+        "browser_extract_text",
+    }
+)
 
 
 def _browser_assertion_verified_outcome(result: ToolResult) -> bool:
@@ -5218,6 +6329,127 @@ def _browser_assertion_verified_outcome(result: ToolResult) -> bool:
     return False
 
 
+def _typed_assertion_contract_labels(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    labels: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        labels.append(item.strip())
+    return labels
+
+
+def _typed_assertion_state_labels(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    labels: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        expected = item.get("expected")
+        if not isinstance(expected, str) or not expected.strip():
+            return None
+        labels.append(expected.strip())
+    return labels
+
+
+def _typed_assertion_state_matches(value: object) -> list[tuple[str, str]] | None:
+    if not isinstance(value, list):
+        return None
+    matches: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        expected = item.get("expected")
+        match = item.get("match")
+        if not isinstance(expected, str) or not expected.strip() or not isinstance(match, str):
+            return None
+        matches.append((expected.strip(), match.strip()))
+    return matches
+
+
+def _typed_page_assertion_from_browser_evidence(result: ToolResult) -> ToolResult | None:
+    """Validate the browser-owned page assertion attached to an evidence read."""
+
+    if result.tool_name not in _BROWSER_TYPED_EVIDENCE_READ_TOOLS or not _tool_result_completed(result):
+        return None
+    output = result.output if isinstance(result.output, Mapping) else {}
+    payload = output.get("page_state_assertion")
+    if not isinstance(payload, Mapping):
+        return None
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        return None
+    if payload.get("kind") != "page_state_assertion":
+        return None
+    outer_session_id = _compact_account_text(output.get("session_id"))
+    nested_session_id = _compact_account_text(payload.get("session_id"))
+    if not outer_session_id or nested_session_id != outer_session_id:
+        return None
+    verified = payload.get("verified")
+    state = payload.get("result")
+    contract = payload.get("contract")
+    if not isinstance(verified, bool) or not isinstance(state, Mapping) or not isinstance(contract, Mapping):
+        return None
+    state_ok = state.get("ok")
+    if not isinstance(state_ok, bool) or verified is not state_ok:
+        return None
+    required = _typed_assertion_contract_labels(contract.get("required"))
+    forbidden = _typed_assertion_contract_labels(contract.get("forbidden"))
+    required_matches = _typed_assertion_state_matches(state.get("required"))
+    forbidden_matches = _typed_assertion_state_matches(state.get("forbidden"))
+    state_required = [expected for expected, _match in required_matches] if required_matches is not None else None
+    state_forbidden = [expected for expected, _match in forbidden_matches] if forbidden_matches is not None else None
+    state_missing = _typed_assertion_state_labels(state.get("missing"))
+    state_forbidden_found = _typed_assertion_state_labels(state.get("forbidden_found"))
+    if (
+        required is None
+        or forbidden is None
+        or state_required != required
+        or state_forbidden != forbidden
+        or not (required or forbidden)
+    ):
+        return None
+    expected_missing = [expected for expected, match in required_matches or () if not match]
+    expected_forbidden_found = [expected for expected, match in forbidden_matches or () if match]
+    if state_missing != expected_missing or state_forbidden_found != expected_forbidden_found:
+        return None
+    if verified and (expected_missing or expected_forbidden_found):
+        return None
+    contract_selector = contract.get("selector")
+    state_selector = state.get("selector")
+    if contract_selector is not None and contract_selector != "" and not isinstance(contract_selector, str):
+        return None
+    if state_selector is not None and state_selector != "" and not isinstance(state_selector, str):
+        return None
+    if (str(contract_selector or "").strip() or None) != (str(state_selector or "").strip() or None):
+        return None
+    if verified and not _browser_url_identity(state.get("url") or state.get("page_url")):
+        return None
+    return ToolResult(
+        invocation_id=f"{result.invocation_id}:page-state",
+        tool_name="browser_assert_page_state",
+        status="completed",
+        output={
+            "verified": verified,
+            "result": dict(state),
+            "session_id": outer_session_id,
+            "schema_version": 1,
+            "derived_from_evidence_read": result.tool_name,
+        },
+    )
+
+
+def _browser_results_with_typed_page_assertions(results: list[ToolResult]) -> list[ToolResult]:
+    expanded: list[ToolResult] = []
+    for result in results:
+        expanded.append(result)
+        if assertion := _typed_page_assertion_from_browser_evidence(result):
+            expanded.append(assertion)
+    return expanded
+
+
 def _browser_page_epoch_for_state_workflow_index(
     results: Iterable[ToolResult],
 ) -> int | None:
@@ -5229,7 +6461,6 @@ def _browser_page_epoch_for_state_workflow_index(
             index
             for index in range(len(materialized) - 1, -1, -1)
             if materialized[index].tool_name in _BROWSER_PAGE_EPOCH_RESET_TOOLS
-            and _tool_result_completed(materialized[index])
         ),
         None,
     )
@@ -5283,10 +6514,8 @@ def _browser_recovery_navigation_reply(
         result_session_id = _browser_tool_session_id(result)
         if reset_session_id and result_session_id and reset_session_id != result_session_id:
             continue
-        if result.tool_name == "browser_run_js":
-            output = result.output if isinstance(result.output, Mapping) else {}
-            if isinstance(output.get("result"), Mapping):
-                return None
+        if _completed_browser_detail_record_candidates([result]):
+            return None
         if result.tool_name == "browser_extract_items":
             output = result.output if isinstance(result.output, Mapping) else {}
             if any(isinstance(output.get(key), list) and output.get(key) for key in ("items", "results", "records")):
@@ -5313,7 +6542,7 @@ def _latest_browser_page_state_observation(
     materialized = list(results)
     for index in range(len(materialized) - 1, -1, -1):
         result = materialized[index]
-        if result.tool_name in _BROWSER_PAGE_EPOCH_RESET_TOOLS and _tool_result_completed(result):
+        if result.tool_name in _BROWSER_PAGE_EPOCH_RESET_TOOLS:
             return None
         if result.tool_name == "browser_wait_for" and not _tool_result_completed(result):
             return index, result, False
@@ -5324,7 +6553,7 @@ def _latest_browser_page_state_observation(
 
 def _latest_browser_assert_page_state(results: list[ToolResult]) -> ToolResult | None:
     for result in reversed(results):
-        if result.tool_name in _BROWSER_PAGE_EPOCH_RESET_TOOLS and _tool_result_completed(result):
+        if result.tool_name in _BROWSER_PAGE_EPOCH_RESET_TOOLS:
             return None
         if result.tool_name == "browser_assert_page_state":
             return result
@@ -5420,12 +6649,15 @@ def _browser_text_satisfies_probe(text: object, probe: object) -> bool:
     normalized_probe = _browser_probe_normalized_text(probe)
     if not normalized_text or not normalized_probe:
         return False
-    if normalized_probe in normalized_text:
-        return True
     probe_tokens = normalized_probe.split()
     if not probe_tokens:
         return False
-    return all(token in normalized_text.split() for token in probe_tokens)
+    text_tokens = normalized_text.split()
+    if len(probe_tokens) == 1:
+        return probe_tokens[0] in text_tokens
+    if normalized_probe in normalized_text:
+        return True
+    return all(token in text_tokens for token in probe_tokens)
 
 
 def _browser_probe_normalized_text(value: object) -> str:
@@ -5663,7 +6895,7 @@ _ACCOUNT_CONNECTOR_DIAGNOSTIC_SENTENCE_RE = re.compile(
 _INTERNAL_TOOL_NAME_RE = re.compile(
     r"\b(?:"
     r"calendar_list|connector_request|email_attachment_read|email_read|email_search|email_send|skill_pack_read|"
-    r"browser_extract_items|browser_extract_text|browser_navigate|browser_open|browser_run_js|browser_screenshot|"
+    r"browser_extract_detail|browser_extract_items|browser_extract_text|browser_navigate|browser_open|browser_run_js|browser_screenshot|"
     r"terminal_exec|file_read|file_write"
     r")\b"
 )
@@ -5671,7 +6903,7 @@ _INTERNAL_TOOL_NAME_SENTENCE_RE = re.compile(
     r"(?:(?:^|(?<=[.!?])\s+))"
     r"[^.!?\n]*"
     r"(?:calendar_list|connector_request|email_attachment_read|email_read|email_search|email_send|skill_pack_read|"
-    r"browser_extract_items|browser_extract_text|browser_navigate|browser_open|browser_run_js|browser_screenshot|"
+    r"browser_extract_detail|browser_extract_items|browser_extract_text|browser_navigate|browser_open|browser_run_js|browser_screenshot|"
     r"terminal_exec|file_read|file_write)"
     r"[^.!?\n]*[.!?]?",
     flags=re.IGNORECASE,

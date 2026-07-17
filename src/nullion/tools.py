@@ -2621,6 +2621,16 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
             },
             "additionalProperties": False,
         },
+        "browser_extract_detail": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector limiting extraction to the verified detail region.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "audio_transcribe": {
             "type": "object",
             "properties": {
@@ -16869,6 +16879,7 @@ def register_browser_plugin(
                 continuation_tools=(
                     "browser_snapshot",
                     "browser_extract_text",
+                    "browser_extract_detail",
                     "browser_extract_items",
                     "browser_run_js",
                 ),

@@ -79,6 +79,7 @@ _FOCUSED_ARTIFACT_EVIDENCE_MAX_CHARS = 20_000
 _ALWAYS_COMPACT_MODEL_TOOL_OUTPUTS = frozenset(
     {
         "archive_extract",
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_image_collect",
@@ -137,6 +138,7 @@ _ARTIFACT_REQUIRED_TOOL_EXTENSION_HINTS = {
 }
 _ARTIFACT_COMPLETION_INSPECTION_TOOLS = frozenset(
     {
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_snapshot",
@@ -246,6 +248,7 @@ _WEB_SOURCE_TOOLS = frozenset(
         "browser_open",
         "browser_navigate",
         "browser_snapshot",
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_scroll",
@@ -257,10 +260,9 @@ _WEB_SOURCE_TOOLS = frozenset(
         "web_fetch",
     }
 )
-_BROWSER_SESSION_TURN_LOCK = threading.RLock()
-_BROWSER_SESSION_TOOL_PREFIX = "browser_"
 _WEB_SEARCH_COMPLETION_EVIDENCE_TOOLS = frozenset(
     {
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_run_js",
@@ -268,6 +270,7 @@ _WEB_SEARCH_COMPLETION_EVIDENCE_TOOLS = frozenset(
     }
 )
 _WEB_SEARCH_CONTINUATION_TOOL_ORDER = (
+    "browser_extract_detail",
     "browser_extract_items",
     "browser_extract_text",
     "web_fetch",
@@ -284,10 +287,13 @@ _BROWSER_FORM_ACTION_TOOLS = frozenset(
         "browser_select_combobox",
     }
 )
-_BROWSER_FORM_ACTION_EVIDENCE_TOOLS = frozenset({"browser_extract_items", "browser_run_js", "web_fetch"})
+_BROWSER_FORM_ACTION_EVIDENCE_TOOLS = frozenset(
+    {"browser_extract_detail", "browser_extract_items", "browser_run_js", "web_fetch"}
+)
 _BROWSER_POST_ACTION_EVIDENCE_TOOLS = frozenset(
     {
         "browser_assert_page_state",
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_find",
@@ -298,6 +304,7 @@ _BROWSER_POST_ACTION_EVIDENCE_TOOLS = frozenset(
     }
 )
 _BROWSER_FORM_ACTION_CONTINUATION_TOOL_ORDER = (
+    "browser_extract_detail",
     "browser_extract_items",
     "browser_run_js",
     "browser_snapshot",
@@ -309,6 +316,7 @@ _BROWSER_FORM_ACTION_CONTINUATION_TOOL_ORDER = (
     "request_tool_scope",
 )
 _BROWSER_PAGE_STATE_CONTINUATION_TOOL_ORDER = (
+    "browser_extract_detail",
     "browser_run_js",
     "browser_snapshot",
     "browser_click_id",
@@ -320,6 +328,7 @@ _BROWSER_PAGE_STATE_CONTINUATION_TOOL_ORDER = (
     "request_tool_scope",
 )
 _BROWSER_LOW_QUALITY_ITEMS_CONTINUATION_TOOL_ORDER = (
+    "browser_extract_detail",
     "browser_run_js",
     "browser_extract_text",
     "browser_snapshot",
@@ -332,6 +341,7 @@ _BROWSER_LOW_QUALITY_ITEMS_CONTINUATION_TOOL_ORDER = (
 )
 _BROWSER_ACTIVE_WORKFLOW_RESET_TOOLS = frozenset({"browser_close"})
 _BROWSER_POST_ACTION_EVIDENCE_CONTINUATION_TOOL_ORDER = (
+    "browser_extract_detail",
     "browser_run_js",
     "browser_snapshot",
     "browser_wait_for",
@@ -344,52 +354,8 @@ _BROWSER_POST_ACTION_EVIDENCE_CONTINUATION_TOOL_ORDER = (
 )
 
 
-def _tool_definition_name(definition: object) -> str:
-    if isinstance(definition, Mapping):
-        return str(definition.get("name") or "").strip()
-    return str(getattr(definition, "name", "") or "").strip()
-
-
-def _tool_registry_has_browser_session_tools(tool_registry: object | None) -> bool:
-    if tool_registry is None:
-        return False
-    definitions: Iterable[object] = ()
-    list_definitions = getattr(tool_registry, "list_tool_definitions", None)
-    if callable(list_definitions):
-        try:
-            definitions = list_definitions()
-        except Exception:
-            definitions = ()
-    if not definitions:
-        list_specs = getattr(tool_registry, "list_specs", None)
-        if callable(list_specs):
-            try:
-                definitions = list_specs()
-            except Exception:
-                definitions = ()
-    return any(
-        _tool_definition_name(definition).startswith(_BROWSER_SESSION_TOOL_PREFIX)
-        for definition in definitions or ()
-    )
-
-
-def _acquire_browser_session_turn_lock_if_needed(tool_registry: object | None) -> bool:
-    if not _tool_registry_has_browser_session_tools(tool_registry):
-        return False
-    started_at = time.perf_counter()
-    _BROWSER_SESSION_TURN_LOCK.acquire()
-    waited_ms = (time.perf_counter() - started_at) * 1000
-    if waited_ms >= 250:
-        logger.info("agent browser session turn lock waited %.1fms", waited_ms)
-    return True
-
-
-def _release_browser_session_turn_lock(acquired: bool) -> None:
-    if acquired:
-        _BROWSER_SESSION_TURN_LOCK.release()
-
-
 _WEB_ARTIFACT_WORKFLOW_COMPANION_TOOLS = (
+    "browser_extract_detail",
     "browser_extract_items",
     "browser_run_js",
     "web_fetch",
@@ -406,6 +372,7 @@ _ARTIFACT_SOURCE_EVIDENCE_TOOLS = frozenset(
 _ARTIFACT_CONTENT_EVIDENCE_TOOLS = frozenset(
     {
         "archive_extract",
+        "browser_extract_detail",
         "browser_extract_items",
         "browser_extract_text",
         "browser_run_js",
@@ -3897,7 +3864,8 @@ def _browser_completion_has_structured_risk(tool_results: Iterable[ToolResult]) 
                         and later.output.get("verified") is True
                     )
                     or (
-                        str(getattr(later, "tool_name", "") or "") in {"browser_run_js", "web_fetch"}
+                        str(getattr(later, "tool_name", "") or "")
+                        in {"browser_extract_detail", "browser_run_js", "web_fetch"}
                         and isinstance(later.output, Mapping)
                         and any(value not in (None, "", [], {}) for value in later.output.values())
                     )
@@ -5583,7 +5551,7 @@ def _browser_page_state_evidence_after_failure(
             if _browser_extract_text_has_substantive_evidence(result.output):
                 return True
             continue
-        if result.tool_name in {"browser_run_js", "web_fetch"}:
+        if result.tool_name in {"browser_extract_detail", "browser_run_js", "web_fetch"}:
             return True
     return False
 
@@ -5736,6 +5704,7 @@ def _browser_active_workflow_reset_guard_result(
                 "Do not close or reset it yet; inspect the current page and continue from the existing controls."
             ),
             "next_tools": [
+                "browser_extract_detail",
                 "browser_run_js",
                 "browser_snapshot",
                 "browser_click_id",
@@ -6224,6 +6193,7 @@ def _focus_tools_for_ready_artifact_production(
     browser_record_evidence_completed = bool(
         completed.intersection(
             {
+                "browser_extract_detail",
                 "browser_extract_items",
                 "browser_extract_text",
                 "browser_run_js",
@@ -9610,52 +9580,55 @@ class AgentOrchestrator:
         messages = list(conversation_history)
         messages.append({"role": "user", "content": user_content_blocks or [{"type": "text", "text": user_message}]})
         doctor_threshold = _tool_loop_doctor_threshold()
-        browser_lock_acquired = _acquire_browser_session_turn_lock_if_needed(tool_registry)
+        cleanup_scope = f"turn-{uuid4().hex}"
+        initial_state: _AgentTurnGraphState = {
+            "orchestrator": self,
+            "conversation_id": conversation_id,
+            "principal_id": principal_id,
+            "user_message": user_message,
+            "messages": messages,
+            "tool_registry": tool_registry,
+            "runtime_store": runtime_store,
+            "max_iterations": max_iterations,
+            "tool_result_callback": tool_result_callback,
+            "foreground_event_callback": foreground_event_callback,
+            "text_delta_callback": text_delta_callback,
+            "cancellation_checker": cancellation_checker,
+            "tool_flow_context": dict(tool_flow_context or {}) or None,
+            "cleanup_scope": cleanup_scope,
+            "cleanup_done": False,
+            "tool_results": [],
+            "artifacts": [],
+            "foreground_tool_ack_emitted": False,
+            "iterations": 0,
+            "doctor_threshold": doctor_threshold,
+            "next_doctor_notice_at": doctor_threshold,
+            "post_tool_delivery_nudged": False,
+            "artifact_tool_delivery_nudged": False,
+            "raw_tool_payload_nudge_count": 0,
+            "browser_low_quality_items_continuation_nudged": False,
+            "completion_review_count": 0,
+            "completion_review_unresolved_requirements": [],
+            "repeated_failure_limit": _repeated_tool_failure_limit(),
+            "failure_fingerprints": {},
+            "tool_recovery_scopes_attempted": [],
+            "completed_invocation_signatures": [],
+            "thinking_parts": [],
+            "initial_tool_content": None,
+            "enable_repeated_failure_guard": True,
+            "enable_doctor_notifications": True,
+            "use_authoritative_completion_text": True,
+        }
+        final_state: Mapping[str, object] | None = None
         try:
             final_state = _compiled_agent_turn_graph().invoke(
-                {
-                    "orchestrator": self,
-                    "conversation_id": conversation_id,
-                    "principal_id": principal_id,
-                    "user_message": user_message,
-                    "messages": messages,
-                    "tool_registry": tool_registry,
-                    "runtime_store": runtime_store,
-                    "max_iterations": max_iterations,
-                    "tool_result_callback": tool_result_callback,
-                    "foreground_event_callback": foreground_event_callback,
-                    "text_delta_callback": text_delta_callback,
-                    "cancellation_checker": cancellation_checker,
-                    "tool_flow_context": dict(tool_flow_context or {}) or None,
-                    "cleanup_scope": f"turn-{uuid4().hex}",
-                    "cleanup_done": False,
-                    "tool_results": [],
-                    "artifacts": [],
-                    "foreground_tool_ack_emitted": False,
-                    "iterations": 0,
-                    "doctor_threshold": doctor_threshold,
-                    "next_doctor_notice_at": doctor_threshold,
-                    "post_tool_delivery_nudged": False,
-                    "artifact_tool_delivery_nudged": False,
-                    "raw_tool_payload_nudge_count": 0,
-                    "browser_low_quality_items_continuation_nudged": False,
-                    "completion_review_count": 0,
-                    "completion_review_unresolved_requirements": [],
-                    "repeated_failure_limit": _repeated_tool_failure_limit(),
-                    "failure_fingerprints": {},
-                    "tool_recovery_scopes_attempted": [],
-                    "completed_invocation_signatures": [],
-                    "thinking_parts": [],
-                    "initial_tool_content": None,
-                    "enable_repeated_failure_guard": True,
-                    "enable_doctor_notifications": True,
-                    "use_authoritative_completion_text": True,
-                },
+                initial_state,
                 config=_agent_turn_graph_config(max_iterations),
             )
         finally:
-            _release_browser_session_turn_lock(browser_lock_acquired)
-        result = final_state.get("result")
+            if not final_state or not bool(final_state.get("cleanup_done")):
+                _run_tool_cleanup_hooks(tool_registry, cleanup_scope)
+        result = final_state.get("result") if final_state is not None else None
         if isinstance(result, TurnResult):
             return result
         raise RuntimeError("Agent turn graph finished without a TurnResult")
@@ -9704,50 +9677,53 @@ class AgentOrchestrator:
             ):
                 initial_tool_content = list(content)
 
-        browser_lock_acquired = _acquire_browser_session_turn_lock_if_needed(tool_registry)
+        cleanup_scope = f"turn-{uuid4().hex}"
+        initial_state: _AgentTurnGraphState = {
+            "orchestrator": self,
+            "conversation_id": conversation_id,
+            "principal_id": principal_id,
+            "user_message": user_message,
+            "messages": messages,
+            "tool_registry": tool_registry,
+            "runtime_store": runtime_store,
+            "max_iterations": max_iterations,
+            "tool_result_callback": tool_result_callback,
+            "foreground_event_callback": foreground_event_callback,
+            "tool_flow_context": dict(tool_flow_context or {}) or None,
+            "cleanup_scope": cleanup_scope,
+            "cleanup_done": False,
+            "tool_results": [],
+            "artifacts": [],
+            "foreground_tool_ack_emitted": False,
+            "iterations": 0,
+            "doctor_threshold": _tool_loop_doctor_threshold(),
+            "next_doctor_notice_at": _tool_loop_doctor_threshold(),
+            "post_tool_delivery_nudged": False,
+            "artifact_tool_delivery_nudged": False,
+            "raw_tool_payload_nudge_count": 0,
+            "browser_low_quality_items_continuation_nudged": False,
+            "completion_review_count": 0,
+            "completion_review_unresolved_requirements": [],
+            "repeated_failure_limit": _repeated_tool_failure_limit(),
+            "failure_fingerprints": {},
+            "tool_recovery_scopes_attempted": [],
+            "completed_invocation_signatures": [],
+            "thinking_parts": [],
+            "initial_tool_content": initial_tool_content,
+            "enable_repeated_failure_guard": False,
+            "enable_doctor_notifications": False,
+            "use_authoritative_completion_text": False,
+        }
+        final_state: Mapping[str, object] | None = None
         try:
             final_state = _compiled_agent_turn_graph().invoke(
-                {
-                    "orchestrator": self,
-                    "conversation_id": conversation_id,
-                    "principal_id": principal_id,
-                    "user_message": user_message,
-                    "messages": messages,
-                    "tool_registry": tool_registry,
-                    "runtime_store": runtime_store,
-                    "max_iterations": max_iterations,
-                    "tool_result_callback": tool_result_callback,
-                    "foreground_event_callback": foreground_event_callback,
-                    "tool_flow_context": dict(tool_flow_context or {}) or None,
-                    "cleanup_scope": f"turn-{uuid4().hex}",
-                    "cleanup_done": False,
-                    "tool_results": [],
-                    "artifacts": [],
-                    "foreground_tool_ack_emitted": False,
-                    "iterations": 0,
-                    "doctor_threshold": _tool_loop_doctor_threshold(),
-                    "next_doctor_notice_at": _tool_loop_doctor_threshold(),
-                    "post_tool_delivery_nudged": False,
-                    "artifact_tool_delivery_nudged": False,
-                    "raw_tool_payload_nudge_count": 0,
-                    "browser_low_quality_items_continuation_nudged": False,
-                    "completion_review_count": 0,
-                    "completion_review_unresolved_requirements": [],
-                    "repeated_failure_limit": _repeated_tool_failure_limit(),
-                    "failure_fingerprints": {},
-                    "tool_recovery_scopes_attempted": [],
-                    "completed_invocation_signatures": [],
-                    "thinking_parts": [],
-                    "initial_tool_content": initial_tool_content,
-                    "enable_repeated_failure_guard": False,
-                    "enable_doctor_notifications": False,
-                    "use_authoritative_completion_text": False,
-                },
+                initial_state,
                 config=_agent_turn_graph_config(max_iterations),
             )
         finally:
-            _release_browser_session_turn_lock(browser_lock_acquired)
-        result = final_state.get("result")
+            if not final_state or not bool(final_state.get("cleanup_done")):
+                _run_tool_cleanup_hooks(tool_registry, cleanup_scope)
+        result = final_state.get("result") if final_state is not None else None
         if isinstance(result, TurnResult):
             return result
         raise RuntimeError("Agent turn graph finished without a TurnResult")

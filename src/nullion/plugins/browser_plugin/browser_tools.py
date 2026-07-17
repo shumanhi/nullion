@@ -10,6 +10,8 @@ import os
 import re
 import threading
 import time
+import weakref
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -516,6 +518,302 @@ def _browser_extract_items_script(*, max_items: int = 30, selector: str | None =
 	    query_tokens: searchQueryTokens,
 	    item_count: items.length,
 	    items,
+  }};
+}})()
+"""
+
+
+_BROWSER_DOM_DETAIL_SCHEMA_VERSION = 1
+_BROWSER_DOM_DETAIL_KIND = "browser_dom_detail"
+_BROWSER_DOM_DETAIL_ORIGIN = "runtime_owned_dom_extractor"
+
+
+def _browser_extract_detail_script(*, selector: str | None = None) -> str:
+    """Build the fixed, runtime-owned current-page detail extractor.
+
+    The model may choose a CSS scope, but it cannot provide or alter the
+    extraction program. This keeps authoritative record fields separate from
+    arbitrary ``browser_run_js`` return values.
+    """
+
+    return f"""
+(() => {{
+  const rootSelector = {json.dumps(selector or "")};
+  const compact = (value, limit = 1200) => String(value || '')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .slice(0, limit);
+  const visible = (element) => {{
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  }};
+  const initialRoot = rootSelector
+    ? document.querySelector(rootSelector)
+    : (document.querySelector('main, [role="main"]') || document.body);
+  if (!initialRoot) {{
+    return {{
+      ok: false,
+      reason: 'scope_not_found',
+      selector: rootSelector || null,
+      page: {{url: location.href, title: document.title}},
+    }};
+  }}
+  const headingSelectors = '[itemprop="name"], h1, [role="heading"][aria-level="1"]';
+  const priceSelectors = 'meta[itemprop="price"], [itemprop="price"], [data-price], [class*="price" i], [id*="price" i]';
+  const candidateRoots = Array.from(initialRoot.querySelectorAll(
+    'article, [role="article"], [role="listitem"], [itemscope]'
+  )).filter((element) => {{
+    if (!visible(element)) return false;
+    const heading = element.querySelector(headingSelectors);
+    const link = element.querySelector('a[href]');
+    const price = element.querySelector(priceSelectors);
+    return Boolean(heading && (link || price));
+  }});
+  const primaryHeadings = Array.from(initialRoot.querySelectorAll(
+    'h1, [role="heading"][aria-level="1"]'
+  )).filter(visible);
+  if (primaryHeadings.length > 1) {{
+    return {{
+      ok: false,
+      reason: 'ambiguous_detail_scope',
+      selector: rootSelector || null,
+      candidate_count: primaryHeadings.length,
+      page: {{url: location.href, title: document.title}},
+    }};
+  }}
+  const titleElement = primaryHeadings[0]
+    || Array.from(initialRoot.querySelectorAll('[itemprop="name"]')).find(visible)
+    || null;
+  if (!titleElement) {{
+    const visibleRecordLinks = Array.from(initialRoot.querySelectorAll('a[href]'))
+      .filter((element) => visible(element) && compact(element.textContent, 300));
+    return {{
+      ok: false,
+      reason: visibleRecordLinks.length > 1
+        ? 'ambiguous_detail_scope'
+        : 'missing_primary_detail_title',
+      selector: rootSelector || null,
+      candidate_count: visibleRecordLinks.length,
+      page: {{url: location.href, title: document.title}},
+    }};
+  }}
+  const containingCandidate = titleElement
+    ? candidateRoots.find((candidate) => candidate.contains(titleElement))
+    : null;
+  let primaryContainer = null;
+  if (primaryHeadings.length === 1 && titleElement) {{
+    const candidate = titleElement.closest('section, article, [role="article"], [itemscope]');
+    if (
+      candidate
+      && initialRoot.contains(candidate)
+      && candidate.querySelector(
+        `${{priceSelectors}}, [itemprop="description"], [class*="availability" i], [id*="availability" i]`
+      )
+    ) {{
+      primaryContainer = candidate;
+    }}
+  }}
+  const root = containingCandidate || primaryContainer || initialRoot;
+  const recordLikePeerGroups = new Map();
+  if (root === initialRoot && !containingCandidate && !primaryContainer) {{
+    for (const anchor of Array.from(root.querySelectorAll('a[href]')).filter(visible)) {{
+      const anchorText = compact(anchor.textContent, 300);
+      if (!anchorText) continue;
+      let container = anchor.parentElement;
+      while (container && container !== root) {{
+        const containerText = compact(container.innerText || container.textContent, 1600);
+        const visibleLinks = Array.from(container.querySelectorAll('a[href]')).filter(visible);
+        if (
+          visibleLinks.length <= 3
+          && containerText.length >= anchorText.length + 20
+          && containerText.length <= 1400
+        ) {{
+          const parent = container.parentElement;
+          if (parent) {{
+            const peers = recordLikePeerGroups.get(parent) || new Set();
+            peers.add(container);
+            recordLikePeerGroups.set(parent, peers);
+          }}
+          break;
+        }}
+        container = container.parentElement;
+      }}
+    }}
+  }}
+  const repeatedRecordLikePeers = Math.max(
+    0,
+    ...Array.from(recordLikePeerGroups.values()).map((peers) => peers.size),
+  );
+  const linkedSubheadings = Array.from(root.querySelectorAll(
+    'h1 a[href], h2 a[href], h3 a[href], [itemprop="name"] a[href], [role="heading"] a[href]'
+  ))
+    .filter(visible);
+  const namedRecordSignals = Array.from(root.querySelectorAll('[itemprop="name"]')).filter(visible);
+  const unrelatedCandidateWithoutPrimaryScope = Boolean(
+    primaryHeadings.length === 1
+    && candidateRoots.length
+    && !containingCandidate
+    && !primaryContainer
+  );
+  if (
+    (!primaryContainer && candidateRoots.length > 1)
+    || linkedSubheadings.length > 1
+    || namedRecordSignals.length > 1
+    || repeatedRecordLikePeers > 1
+    || unrelatedCandidateWithoutPrimaryScope
+  ) {{
+    return {{
+      ok: false,
+      reason: 'ambiguous_detail_scope',
+      selector: rootSelector || null,
+      candidate_count: Math.max(
+        candidateRoots.length,
+        linkedSubheadings.length,
+        repeatedRecordLikePeers,
+      ),
+      page: {{url: location.href, title: document.title}},
+    }};
+  }}
+  const firstVisible = (selectors) => {{
+    for (const query of selectors) {{
+      for (const element of Array.from(root.querySelectorAll(query))) {{
+        if (!visible(element)) continue;
+        const value = compact(element.getAttribute('content') || element.textContent, 800);
+        if (value) return value;
+      }}
+    }}
+    return '';
+  }};
+  const firstContent = (selectors) => {{
+    for (const query of selectors) {{
+      const element = root.querySelector(query);
+      if (!element) continue;
+      const value = compact(
+        element.getAttribute('content') ||
+        element.getAttribute('value') ||
+        element.getAttribute('aria-label') ||
+        element.textContent,
+        1200,
+      );
+      if (value) return value;
+    }}
+    return '';
+  }};
+  const title = compact(
+    titleElement && root.contains(titleElement)
+      ? (titleElement.getAttribute('content') || titleElement.textContent)
+      : '',
+    800,
+  );
+  const allPriceElements = Array.from(root.querySelectorAll(priceSelectors));
+  const structuredPriceElements = allPriceElements.filter((element) =>
+    element.matches('meta[itemprop="price"], [itemprop="price"], [data-price]')
+  );
+  const priceElements = (structuredPriceElements.length
+    ? structuredPriceElements
+    : allPriceElements
+  ).filter((element, _index, candidates) =>
+    !candidates.some((candidate) => candidate !== element && candidate.contains(element))
+  );
+  const priceValue = (element) => compact(
+    element.getAttribute('content')
+    || element.getAttribute('value')
+    || element.getAttribute('data-price')
+    || element.getAttribute('aria-label')
+    || element.textContent,
+    160,
+  );
+  const completePriceValue = (value, structured = false) => {{
+    const hasCurrencySymbol = /[$€£¥₹₩₽₺₫₪₦₱₲₴₵₡₭₮₼₾]/.test(value);
+    const hasDecimalAmount = /\\d[\\d\\s]*[.,]\\d{{1,4}}/.test(value);
+    const hasCurrencyCode = /(?:[A-Z]{{3}}\\s*\\d|\\d[\\d\\s.,]*\\s*[A-Z]{{3}})/.test(value);
+    return Boolean(
+      /\\d/.test(value)
+      && (structured || hasCurrencySymbol || hasDecimalAmount || hasCurrencyCode)
+    );
+  }};
+  const semanticallyExposed = (element, boundary) => {{
+    let current = element;
+    while (current && current !== boundary) {{
+      if (current.getAttribute && current.getAttribute('aria-hidden') === 'true') return false;
+      const style = window.getComputedStyle(current);
+      if (style.visibility === 'hidden' || style.display === 'none') return false;
+      current = current.parentElement;
+    }}
+    return true;
+  }};
+  const priceCandidates = [];
+  for (const element of priceElements) {{
+    if (element.tagName !== 'META' && !visible(element)) continue;
+    const isStructuredPrice = element.matches(
+      'meta[itemprop="price"], [itemprop="price"], [data-price]'
+    );
+    const atomicElements = Array.from(element.querySelectorAll('*'))
+      .filter((candidate) => semanticallyExposed(candidate, element))
+      .map((candidate) => ({{
+        element: candidate,
+        value: priceValue(candidate),
+        structured: candidate.matches(
+          'meta[itemprop="price"], [itemprop="price"], [data-price]'
+        ),
+      }}))
+      .filter((candidate) => completePriceValue(candidate.value, candidate.structured));
+    const deepestAtomicElements = atomicElements.filter(
+      (candidate) => !atomicElements.some(
+        (other) => other !== candidate && candidate.element.contains(other.element)
+      )
+    );
+    const values = deepestAtomicElements.length
+      ? Array.from(new Set(deepestAtomicElements.map((candidate) => candidate.value)))
+      : [priceValue(element)];
+    for (const value of values) {{
+      if (!completePriceValue(value, isStructuredPrice)) continue;
+      if (!priceCandidates.includes(value)) priceCandidates.push(value);
+    }}
+    if (priceCandidates.length >= 8) break;
+  }}
+  const availability = firstContent([
+    'link[itemprop="availability"]',
+    'meta[itemprop="availability"]',
+    '[itemprop="availability"]',
+    '[class*="availability" i]',
+    '[id*="availability" i]',
+  ]);
+  const rating = firstContent([
+    'meta[itemprop="ratingValue"]',
+    '[itemprop="ratingValue"]',
+    '[data-rating]',
+  ]);
+  const description = firstContent([
+    '[itemprop="description"]',
+    'meta[name="description"]',
+    'meta[property="og:description"]',
+  ]);
+  const bullets = [];
+  for (const element of Array.from(root.querySelectorAll('li'))) {{
+    if (!visible(element)) continue;
+    const value = compact(element.textContent, 360);
+    if (!value || bullets.includes(value)) continue;
+    bullets.push(value);
+    if (bullets.length >= 12) break;
+  }}
+  const details = compact(root.innerText || root.textContent, 2400);
+  const record = {{title, url: location.href}};
+  if (priceCandidates.length === 1) record.price = priceCandidates[0];
+  if (priceCandidates.length > 1) record.price_candidates = priceCandidates;
+  if (availability) record.availability = availability;
+  if (rating) record.rating = rating;
+  if (description) record.description = description;
+  if (bullets.length) record.bullets = bullets;
+  if (details) record.details = details;
+  return {{
+    ok: Boolean(title && location.href),
+    selector: rootSelector || null,
+    record_scope: containingCandidate ? 'semantic_record' : 'selected_root',
+    page: {{url: location.href, title: document.title}},
+    record,
   }};
 }})()
 """
@@ -1047,6 +1345,27 @@ def _principal_allows_private_host_navigation(principal_id: str | None) -> bool:
         return False
 
 
+def _serialized_browser_operation(method):
+    """Keep page mutations and their typed evidence observations atomic."""
+
+    @wraps(method)
+    def _wrapped(self, invocation: ToolInvocation, *args, **kwargs):
+        session_id = self._session_id(invocation)
+        resolved = getattr(self._resolved_session_local, "by_invocation", None)
+        if not isinstance(resolved, dict):
+            resolved = {}
+            self._resolved_session_local.by_invocation = resolved
+        invocation_key = id(invocation)
+        resolved[invocation_key] = session_id
+        try:
+            with self._session_operation_lock(session_id):
+                return method(self, invocation, *args, **kwargs)
+        finally:
+            resolved.pop(invocation_key, None)
+
+    return _wrapped
+
+
 class BrowserTools:
     """Sync wrappers around the async backend, registered as kernel tools."""
 
@@ -1060,59 +1379,58 @@ class BrowserTools:
         self._active_sessions_by_principal: dict[str, tuple[str, float]] = {}
         self._element_snapshot_lock = threading.Lock()
         self._element_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
+        self._page_assertion_lock = threading.Lock()
+        self._page_assertion_contracts: dict[tuple[str, str], dict[str, object]] = {}
+        self._session_operation_locks_lock = threading.Lock()
+        self._session_operation_locks: weakref.WeakValueDictionary[str, threading.RLock] = (
+            weakref.WeakValueDictionary()
+        )
+        self._resolved_session_local = threading.local()
 
     def _session_id(self, invocation: ToolInvocation) -> str:
+        resolved = getattr(self._resolved_session_local, "by_invocation", None)
+        if isinstance(resolved, dict):
+            cached_session_id = resolved.get(id(invocation))
+            if isinstance(cached_session_id, str) and cached_session_id:
+                return cached_session_id
         raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
+        context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        bound_session_id = str(context.get("browser_session_id") or "").strip()
+        if bound_session_id:
+            return bound_session_id
         if self._uses_shared_default_session():
-            workspace_session_id = self._workspace_browser_session_id(invocation)
-            active_session_id = self._recent_active_session_id(invocation)
+            if raw_session_id == DEFAULT_AGENT_BROWSER_SESSION_ID:
+                return DEFAULT_AGENT_BROWSER_SESSION_ID
             if raw_session_id and raw_session_id != "default":
-                if self._shared_session_prefers_workspace_scope(invocation, workspace_session_id):
-                    if active_session_id:
-                        return active_session_id
-                    return workspace_session_id
-                return raw_session_id
+                return self._scoped_model_session_id(invocation, raw_session_id)
+            active_session_id = self._recent_active_session_id(invocation)
             if active_session_id:
                 return active_session_id
-            return workspace_session_id
+            scope = self._active_session_key(invocation)
+            digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+            return f"task-{digest}"
         if raw_session_id and raw_session_id != "default":
-            return raw_session_id
+            return self._scoped_model_session_id(invocation, raw_session_id)
         scope = self._cleanup_scope(invocation)
         digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
         return f"default-{digest}"
 
-    def _workspace_browser_session_id(self, invocation: ToolInvocation) -> str:
+    @staticmethod
+    def _scoped_model_session_id(invocation: ToolInvocation, raw_session_id: str) -> str:
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
-        workspace_id = str(context.get("workspace_id") or "").strip()
-        if not workspace_id:
-            try:
-                from nullion.connections import workspace_id_for_principal
-
-                workspace_id = str(workspace_id_for_principal(invocation.principal_id) or "").strip()
-            except Exception:
-                workspace_id = ""
-        if not workspace_id:
-            workspace_id = "workspace_admin"
-        try:
-            from nullion.workspace_storage import sanitize_workspace_id
-
-            workspace_id = sanitize_workspace_id(workspace_id)
-        except Exception:
-            workspace_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", workspace_id).strip("-") or "workspace_admin"
-        if workspace_id == "workspace_admin":
-            return DEFAULT_AGENT_BROWSER_SESSION_ID
-        digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:16]
-        return f"workspace-{digest}"
-
-    def _shared_session_prefers_workspace_scope(
-        self,
-        invocation: ToolInvocation,
-        workspace_session_id: str,
-    ) -> bool:
-        context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
-        if str(context.get("workspace_id") or "").strip():
-            return True
-        return workspace_session_id != DEFAULT_AGENT_BROWSER_SESSION_ID
+        browser_scope = str(context.get("browser_session_scope") or "").strip()
+        scope = f"browser_session_scope:{browser_scope}" if browser_scope else ""
+        if not scope:
+            scope = str(invocation.capsule_id or "").strip()
+        if not scope:
+            for key in ("request_id", "turn_id"):
+                if value := str(context.get(key) or "").strip():
+                    scope = f"{key}:{value}"
+                    break
+        if not scope:
+            scope = str(invocation.principal_id or "global")
+        digest = hashlib.sha256(f"{scope}\0{raw_session_id}".encode("utf-8")).hexdigest()[:16]
+        return f"task-{digest}"
 
     def _cleanup_scope(self, invocation: ToolInvocation) -> str:
         return str(invocation.capsule_id or invocation.principal_id or "global")
@@ -1140,7 +1458,7 @@ class BrowserTools:
     def _remember_session(self, invocation: ToolInvocation, session_id: str) -> None:
         if invocation.tool_name != "browser_assert_page_state":
             self._remember_active_session(invocation, session_id)
-        if self._uses_shared_default_session():
+        if self._uses_shared_default_session() and session_id == DEFAULT_AGENT_BROWSER_SESSION_ID:
             return
         scope = self._cleanup_scope(invocation)
         with self._cleanup_lock:
@@ -1148,15 +1466,20 @@ class BrowserTools:
 
     def _active_session_keys(self, invocation: ToolInvocation) -> tuple[str, ...]:
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
-        keys: list[str] = []
-        for key in ("browser_session_scope", "conversation_id", "chat_id", "request_id"):
+        browser_scope = str(context.get("browser_session_scope") or "").strip()
+        if browser_scope:
+            return (f"browser_session_scope:{browser_scope}",)
+        capsule_id = str(invocation.capsule_id or "").strip()
+        if capsule_id:
+            return (f"capsule_id:{capsule_id}",)
+        for key in ("request_id", "turn_id"):
             value = str(context.get(key) or "").strip()
             if value:
-                keys.append(f"{key}:{value}")
+                return (f"{key}:{value}",)
         principal_key = str(invocation.principal_id or "").strip()
         if principal_key:
-            keys.append(principal_key)
-        return tuple(dict.fromkeys(keys or ["global"]))
+            return (principal_key,)
+        return ("global",)
 
     def _active_session_key(self, invocation: ToolInvocation) -> str:
         return self._active_session_keys(invocation)[0]
@@ -1195,8 +1518,306 @@ class BrowserTools:
                     empty_scopes.append(scope)
             for scope in empty_scopes:
                 self._sessions_by_scope.pop(scope, None)
+        with self._active_session_lock:
+            stale_keys = [
+                key
+                for key, (active_session_id, _remembered_at) in self._active_sessions_by_principal.items()
+                if active_session_id == session_id
+            ]
+            for key in stale_keys:
+                self._active_sessions_by_principal.pop(key, None)
         with self._element_snapshot_lock:
             self._element_snapshots.pop(session_id, None)
+        self._forget_page_assertion_contract(session_id)
+
+    @staticmethod
+    def _page_assertion_scope_id(invocation: ToolInvocation) -> str:
+        context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        if browser_scope := str(context.get("browser_session_scope") or "").strip():
+            return f"browser_session_scope:{browser_scope}"
+        if capsule_id := str(invocation.capsule_id or "").strip():
+            return capsule_id
+        for key in ("request_id", "turn_id"):
+            if value := str(context.get(key) or "").strip():
+                return f"{key}:{value}"
+        return ""
+
+    def _session_operation_lock(self, session_id: str) -> threading.RLock:
+        with self._session_operation_locks_lock:
+            return self._session_operation_locks.setdefault(session_id, threading.RLock())
+
+    def _forget_page_assertion_contract(self, session_id: str, *, scope_id: str | None = None) -> None:
+        with self._page_assertion_lock:
+            keys = [
+                key
+                for key in self._page_assertion_contracts
+                if key[0] == session_id and (scope_id is None or key[1] == scope_id)
+            ]
+            for key in keys:
+                self._page_assertion_contracts.pop(key, None)
+
+    def _forget_page_assertion_scope(self, scope_id: str) -> None:
+        if not scope_id:
+            return
+        with self._page_assertion_lock:
+            keys = [key for key in self._page_assertion_contracts if key[1] == scope_id]
+            for key in keys:
+                self._page_assertion_contracts.pop(key, None)
+
+    def _remember_page_assertion_contract(
+        self,
+        invocation: ToolInvocation,
+        session_id: str,
+        *,
+        required: list[str],
+        forbidden: list[str],
+        selector: str | None,
+    ) -> None:
+        scope_id = self._page_assertion_scope_id(invocation)
+        if not scope_id:
+            return
+        contract: dict[str, object] = {
+            "required": tuple(required),
+            "forbidden": tuple(forbidden),
+            "selector": selector,
+        }
+        with self._page_assertion_lock:
+            self._page_assertion_contracts[(session_id, scope_id)] = contract
+
+    def _current_page_assertion(
+        self,
+        invocation: ToolInvocation,
+        session_id: str,
+    ) -> dict[str, object] | None:
+        """Re-run the turn-scoped typed contract at the evidence-read boundary.
+
+        This observation is taken immediately after the browser returns the
+        candidate evidence. It therefore verifies the page that produced that
+        evidence instead of guessing whether an earlier click was an anchor,
+        a navigation, or an application route.
+        """
+
+        scope_id = self._page_assertion_scope_id(invocation)
+        if not scope_id:
+            return None
+        with self._page_assertion_lock:
+            cached = self._page_assertion_contracts.get((session_id, scope_id))
+            contract = dict(cached) if isinstance(cached, dict) else None
+        if contract is None:
+            return None
+        required = [str(value) for value in contract.get("required", ())]
+        forbidden = [str(value) for value in contract.get("forbidden", ())]
+        selector_value = contract.get("selector")
+        selector = str(selector_value) if selector_value else None
+        assertion_script = _browser_assert_page_state_script(required=required, forbidden=forbidden, selector=selector)
+        try:
+            result = _run(self._backend.run_js(session_id, assertion_script))
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "reason": "current_page_assertion_failed",
+                "error": _compact_failure_message(exc),
+                "required": [{"expected": value, "match": ""} for value in required],
+                "forbidden": [{"expected": value, "match": ""} for value in forbidden],
+                "missing": [{"expected": value, "match": ""} for value in required],
+                "forbidden_found": [],
+                "selector": selector,
+            }
+        if not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "reason": "invalid_current_page_assertion_result",
+                "required": [{"expected": value, "match": ""} for value in required],
+                "forbidden": [{"expected": value, "match": ""} for value in forbidden],
+                "missing": [{"expected": value, "match": ""} for value in required],
+                "forbidden_found": [],
+                "selector": selector,
+            }
+        result = self._canonical_page_assertion_result(
+            result,
+            required=required,
+            forbidden=forbidden,
+            selector=selector,
+        )
+        return {
+            "schema_version": 1,
+            "kind": "page_state_assertion",
+            "session_id": session_id,
+            "verified": result.get("ok") is True,
+            "contract": {
+                "required": required,
+                "forbidden": forbidden,
+                "selector": selector,
+            },
+            "result": result,
+        }
+
+    @staticmethod
+    def _assertion_selector(assertion: dict[str, object] | None) -> str | None:
+        if not isinstance(assertion, dict):
+            return None
+        contract = assertion.get("contract")
+        if not isinstance(contract, dict):
+            return None
+        selector = contract.get("selector")
+        return str(selector).strip() if isinstance(selector, str) and selector.strip() else None
+
+    def _runtime_dom_detail_extraction(
+        self,
+        session_id: str,
+        *,
+        selector: str | None,
+    ) -> dict[str, object] | None:
+        """Return only a record produced by Nullion's fixed DOM extractor."""
+
+        result = _run(
+            self._backend.run_js(
+                session_id,
+                _browser_extract_detail_script(selector=selector),
+            )
+        )
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return None
+        record = result.get("record")
+        page = result.get("page")
+        if not isinstance(record, dict) or not isinstance(page, dict):
+            return None
+        record_scope = str(result.get("record_scope") or "").strip()
+        if record_scope not in {"semantic_record", "selected_root"}:
+            return None
+        title = str(record.get("title") or "").strip()
+        url = str(record.get("url") or "").strip()
+        if not title or not url:
+            return None
+        substantive_keys = (
+            "price_text",
+            "price",
+            "price_candidates",
+            "availability",
+            "rating",
+            "description",
+            "details",
+            "bullets",
+            "ingredients",
+            "features",
+        )
+        if not any(record.get(key) for key in substantive_keys):
+            return None
+        return {
+            "schema_version": _BROWSER_DOM_DETAIL_SCHEMA_VERSION,
+            "kind": _BROWSER_DOM_DETAIL_KIND,
+            "origin": _BROWSER_DOM_DETAIL_ORIGIN,
+            "session_id": session_id,
+            "selector": selector,
+            "record_scope": record_scope,
+            "page": dict(page),
+            "record": dict(record),
+        }
+
+    @staticmethod
+    def _mapping_has_detail_record_shape(value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        has_title = any(
+            str(value.get(key) or "").strip()
+            for key in ("title", "name", "productTitle", "product_title")
+        )
+        has_url = any(
+            str(value.get(key) or "").strip()
+            for key in ("url", "href", "link", "action_url", "booking_url")
+        )
+        has_detail = any(
+            value.get(key)
+            for key in (
+                "price_text",
+                "price",
+                "price_candidates",
+                "availability",
+                "rating",
+                "description",
+                "details",
+                "bullets",
+                "ingredients",
+                "features",
+            )
+        )
+        return bool(has_title and has_url and has_detail)
+
+    @staticmethod
+    def _canonical_page_assertion_result(
+        result: dict[str, object],
+        *,
+        required: list[str],
+        forbidden: list[str],
+        selector: str | None,
+    ) -> dict[str, object]:
+        """Echo the cached contract in every typed revalidation outcome."""
+
+        normalized = dict(result)
+
+        def _states(key: str, labels: list[str]) -> tuple[list[dict[str, str]], bool]:
+            raw_states = result.get(key)
+            by_label: dict[str, str] = {}
+            schema_valid = isinstance(raw_states, list)
+            if isinstance(raw_states, list):
+                for raw_state in raw_states:
+                    if not isinstance(raw_state, dict):
+                        schema_valid = False
+                        continue
+                    expected = str(raw_state.get("expected") or "").strip()
+                    if expected not in labels or expected in by_label:
+                        schema_valid = False
+                        continue
+                    raw_match = raw_state.get("match")
+                    if not isinstance(raw_match, str):
+                        schema_valid = False
+                    by_label[expected] = str(raw_match or "").strip()
+            schema_valid = schema_valid and len(by_label) == len(labels)
+            return (
+                [
+                    {"expected": label, "match": by_label.get(label, "")}
+                    for label in labels
+                ],
+                schema_valid,
+            )
+
+        required_states, required_schema_valid = _states("required", required)
+        forbidden_states, forbidden_schema_valid = _states("forbidden", forbidden)
+        normalized["required"] = required_states
+        normalized["forbidden"] = forbidden_states
+        normalized["selector"] = selector
+        missing_labels = {
+            state["expected"]
+            for state in required_states
+            if not state["match"]
+        }
+        normalized["missing"] = [
+            {"expected": label, "match": ""}
+            for label in required
+            if label in missing_labels
+        ]
+        forbidden_found_labels = {
+            state["expected"]
+            for state in forbidden_states
+            if state["match"]
+        }
+        forbidden_matches = {
+            state["expected"]: state["match"]
+            for state in forbidden_states
+        }
+        normalized["forbidden_found"] = [
+            {"expected": label, "match": forbidden_matches.get(label, "")}
+            for label in forbidden
+            if label in forbidden_found_labels
+        ]
+        normalized["ok"] = (
+            result.get("ok") is True
+            and required_schema_valid
+            and forbidden_schema_valid
+            and not missing_labels
+            and not forbidden_found_labels
+        )
+        return normalized
 
     def _remember_element_snapshot(self, session_id: str, snapshot: dict[str, Any]) -> None:
         elements = snapshot.get("elements")
@@ -1291,6 +1912,11 @@ class BrowserTools:
         return target
 
     def close_tracked_sessions(self, scope_id: str | None = None) -> None:
+        if scope_id is None:
+            with self._page_assertion_lock:
+                self._page_assertion_contracts.clear()
+        else:
+            self._forget_page_assertion_scope(str(scope_id))
         with self._cleanup_lock:
             if scope_id is None:
                 session_ids = {
@@ -1301,23 +1927,49 @@ class BrowserTools:
                 self._sessions_by_scope.clear()
             else:
                 session_ids = set(self._sessions_by_scope.pop(str(scope_id), set()))
+                sessions_still_in_use = {
+                    session_id
+                    for scoped_session_ids in self._sessions_by_scope.values()
+                    for session_id in scoped_session_ids
+                }
+                session_ids.difference_update(sessions_still_in_use)
         for session_id in sorted(session_ids):
-            try:
-                _run(self._backend.close_session(session_id))
-            except Exception:
-                continue
+            with self._session_operation_lock(session_id):
+                with self._cleanup_lock:
+                    if any(
+                        session_id in scoped_session_ids
+                        for scoped_session_ids in self._sessions_by_scope.values()
+                    ):
+                        continue
+                try:
+                    _run(self._backend.close_session(session_id))
+                except Exception:
+                    pass
+                with self._cleanup_lock:
+                    if any(
+                        session_id in scoped_session_ids
+                        for scoped_session_ids in self._sessions_by_scope.values()
+                    ):
+                        continue
+                self._forget_session(session_id)
 
     # ── Tools ─────────────────────────────────────────────────────────────────
 
+    @_serialized_browser_operation
     def browser_open(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
+        self._forget_page_assertion_contract(
+            session_id,
+            scope_id=self._page_assertion_scope_id(invocation),
+        )
         try:
             result = _run(self._backend.open(session_id))
             return _ok(invocation, {"result": result, "session_id": session_id, **self._connection_notice_output()})
         except Exception as e:
             return _fail(invocation, f"Open failed: {e}")
 
+    @_serialized_browser_operation
     def browser_navigate(self, invocation: ToolInvocation) -> ToolResult:
         url = invocation.arguments.get("url", "")
         if not url:
@@ -1335,12 +1987,17 @@ class BrowserTools:
 
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
+        self._forget_page_assertion_contract(
+            session_id,
+            scope_id=self._page_assertion_scope_id(invocation),
+        )
         try:
             result = _run(self._backend.navigate(session_id, navigate_url))
             return _ok(invocation, {"result": result, "session_id": session_id, **self._connection_notice_output()})
         except Exception as e:
             return _fail(invocation, f"Navigation failed: {e}")
 
+    @_serialized_browser_operation
     def browser_click(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector", "")
         if not selector:
@@ -1349,10 +2006,12 @@ class BrowserTools:
         self._remember_session(invocation, session_id)
         try:
             _run(self._backend.click(session_id, str(selector)))
-            return _ok(invocation, {"clicked": selector, "session_id": session_id})
+            output: dict[str, object] = {"clicked": selector, "session_id": session_id}
+            return _ok(invocation, output)
         except Exception as e:
             return _fail(invocation, f"Click failed: {e}")
 
+    @_serialized_browser_operation
     def browser_click_element(self, invocation: ToolInvocation) -> ToolResult:
         target = {
             key: invocation.arguments.get(key)
@@ -1376,10 +2035,12 @@ class BrowserTools:
             else:
                 selector = str(target.get("selector") or target.get("label") or target.get("text") or target.get("name") or "")
                 _run(self._backend.click(session_id, selector))
-            return _ok(invocation, {"clicked": target, "session_id": session_id})
+            output: dict[str, object] = {"clicked": target, "session_id": session_id}
+            return _ok(invocation, output)
         except Exception as e:
             return _fail(invocation, f"Click failed: {e}")
 
+    @_serialized_browser_operation
     def browser_type(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector", "")
         text = invocation.arguments.get("text", "")
@@ -1393,6 +2054,7 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Type failed: {e}")
 
+    @_serialized_browser_operation
     def browser_type_field(self, invocation: ToolInvocation) -> ToolResult:
         text = invocation.arguments.get("text", "")
         target = {
@@ -1419,6 +2081,7 @@ class BrowserTools:
                 self._field_failure_output(session_id=session_id, target=target, text=text, error=e),
             )
 
+    @_serialized_browser_operation
     def browser_snapshot(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
@@ -1435,6 +2098,7 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Snapshot failed: {e}")
 
+    @_serialized_browser_operation
     def browser_extract_items(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
@@ -1462,10 +2126,44 @@ class BrowserTools:
                 "url": result.get("url"),
                 "title": result.get("title"),
             }
-            return _ok(invocation, {"page": page, "items": items, "item_count": len(items), "session_id": session_id})
+            output: dict[str, object] = {
+                "page": page,
+                "items": items,
+                "item_count": len(items),
+                "session_id": session_id,
+            }
+            if assertion := self._current_page_assertion(invocation, session_id):
+                output["page_state_assertion"] = assertion
+            return _ok(invocation, output)
         except Exception as e:
             return _fail(invocation, f"Item extraction failed: {e}")
 
+    @_serialized_browser_operation
+    def browser_extract_detail(self, invocation: ToolInvocation) -> ToolResult:
+        selector = invocation.arguments.get("selector")
+        if selector is not None and not isinstance(selector, str):
+            return _fail(invocation, "selector must be a string")
+        normalized_selector = selector.strip() if isinstance(selector, str) and selector.strip() else None
+        session_id = self._session_id(invocation)
+        self._remember_session(invocation, session_id)
+        try:
+            extraction = self._runtime_dom_detail_extraction(
+                session_id,
+                selector=normalized_selector,
+            )
+            if extraction is None:
+                return _fail(
+                    invocation,
+                    "The current page did not expose a substantive detail record in the selected DOM scope.",
+                )
+            output = dict(extraction)
+            if assertion := self._current_page_assertion(invocation, session_id):
+                output["page_state_assertion"] = assertion
+            return _ok(invocation, output)
+        except Exception as e:
+            return _fail(invocation, f"Detail extraction failed: {e}")
+
+    @_serialized_browser_operation
     def browser_click_id(self, invocation: ToolInvocation) -> ToolResult:
         element_id = str(invocation.arguments.get("element_id") or "").strip()
         if not element_id:
@@ -1484,23 +2182,30 @@ class BrowserTools:
                 if target and callable(click_element):
                     try:
                         _run(click_element(session_id, target))
+                        output: dict[str, object] = {
+                            "clicked": element_id,
+                            "session_id": session_id,
+                            "recovered_by": "cached_semantic_target",
+                            "target": target,
+                            "previous_error": reason,
+                        }
                         return _ok(
                             invocation,
-                            {
-                                "clicked": element_id,
-                                "session_id": session_id,
-                                "recovered_by": "cached_semantic_target",
-                                "target": target,
-                                "previous_error": reason,
-                            },
+                            output,
                         )
                     except Exception as fallback_error:
                         return _fail(invocation, f"Click failed: {reason}; fallback failed: {fallback_error}")
                 return _fail(invocation, f"Click failed: {reason}")
-            return _ok(invocation, {"result": result, "clicked": element_id, "session_id": session_id})
+            output: dict[str, object] = {
+                "result": result,
+                "clicked": element_id,
+                "session_id": session_id,
+            }
+            return _ok(invocation, output)
         except Exception as e:
             return _fail(invocation, f"Click failed: {e}")
 
+    @_serialized_browser_operation
     def browser_type_id(self, invocation: ToolInvocation) -> ToolResult:
         element_id = str(invocation.arguments.get("element_id") or "").strip()
         text = str(invocation.arguments.get("text") or "")
@@ -1633,6 +2338,7 @@ class BrowserTools:
                 ),
             )
 
+    @_serialized_browser_operation
     def browser_select_combobox(self, invocation: ToolInvocation) -> ToolResult:
         query = str(invocation.arguments.get("query") or "").strip()
         expected_text = str(invocation.arguments.get("expected_text") or query).strip()
@@ -1678,25 +2384,27 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Combobox selection failed: {e}")
 
+    @_serialized_browser_operation
     def browser_extract_text(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector") or None
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:
             text = _run(self._backend.extract_text(session_id, selector))
-            return _ok(
-                invocation,
-                {
-                    "text": text,
-                    "length": len(text),
-                    "selector": selector,
-                    "session_id": session_id,
-                    **self._connection_notice_output(),
-                },
-            )
+            output: dict[str, object] = {
+                "text": text,
+                "length": len(text),
+                "selector": selector,
+                "session_id": session_id,
+                **self._connection_notice_output(),
+            }
+            if assertion := self._current_page_assertion(invocation, session_id):
+                output["page_state_assertion"] = assertion
+            return _ok(invocation, output)
         except Exception as e:
             return _fail(invocation, f"Extract text failed: {e}")
 
+    @_serialized_browser_operation
     def browser_screenshot(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
@@ -1759,6 +2467,7 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Screenshot failed: {e}")
 
+    @_serialized_browser_operation
     def browser_scroll(self, invocation: ToolInvocation) -> ToolResult:
         direction = str(invocation.arguments.get("direction", "down"))
         if direction not in {"up", "down"}:
@@ -1772,6 +2481,7 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Scroll failed: {e}")
 
+    @_serialized_browser_operation
     def browser_wait_for(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector") or None
         url_pattern = invocation.arguments.get("url_pattern") or None
@@ -1793,18 +2503,37 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Wait failed: {e}")
 
+    @_serialized_browser_operation
     def browser_assert_page_state(self, invocation: ToolInvocation) -> ToolResult:
         raw_required = invocation.arguments.get("required") or invocation.arguments.get("required_text") or []
         raw_forbidden = invocation.arguments.get("forbidden") or invocation.arguments.get("forbidden_text") or []
-        required = [str(raw_required)] if isinstance(raw_required, str) else [str(item) for item in raw_required if str(item).strip()]
-        forbidden = [str(raw_forbidden)] if isinstance(raw_forbidden, str) else [str(item) for item in raw_forbidden if str(item).strip()]
+        required = (
+            [raw_required.strip()]
+            if isinstance(raw_required, str) and raw_required.strip()
+            else [str(item).strip() for item in raw_required if str(item).strip()]
+            if not isinstance(raw_required, str)
+            else []
+        )
+        forbidden = (
+            [raw_forbidden.strip()]
+            if isinstance(raw_forbidden, str) and raw_forbidden.strip()
+            else [str(item).strip() for item in raw_forbidden if str(item).strip()]
+            if not isinstance(raw_forbidden, str)
+            else []
+        )
         selector = str(invocation.arguments.get("selector") or "").strip() or None
         if not required and not forbidden:
             return _fail(invocation, "Provide required or forbidden page text/state assertions")
         raw_session_id = str(invocation.arguments.get("session_id", "") or "").strip()
-        has_explicit_session = bool(raw_session_id and raw_session_id != "default")
+        context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+        bound_session_id = str(context.get("browser_session_id") or "").strip()
+        has_explicit_session = bool(
+            bound_session_id or (raw_session_id and raw_session_id != "default")
+        )
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
+        assertion_scope_id = self._page_assertion_scope_id(invocation)
+        self._forget_page_assertion_contract(session_id, scope_id=assertion_scope_id)
         try:
             script = _browser_assert_page_state_script(
                 required=required,
@@ -1819,6 +2548,12 @@ class BrowserTools:
             )
             if not isinstance(result, dict):
                 return _fail(invocation, "Page state assertion returned an invalid result.")
+            result = self._canonical_page_assertion_result(
+                result,
+                required=required,
+                forbidden=forbidden,
+                selector=selector,
+            )
             if not result.get("ok"):
                 reason = str(result.get("reason") or "").strip()
                 if reason in {"invalid_scope_selector", "scope_not_found"}:
@@ -1845,12 +2580,22 @@ class BrowserTools:
                         except Exception:
                             fallback_result = None
                         if isinstance(fallback_result, dict):
+                            fallback_result = self._canonical_page_assertion_result(
+                                fallback_result,
+                                required=required,
+                                forbidden=forbidden,
+                                selector=selector,
+                            )
                             fallback_url = str(fallback_result.get("url") or "").strip()
                             if fallback_result.get("ok") or fallback_url not in {"", "about:blank"}:
                                 session_id = fallback_session_id
                                 result = fallback_result
                                 current_url = fallback_url
                                 self._remember_active_session(invocation, session_id)
+                                self._forget_page_assertion_contract(
+                                    session_id,
+                                    scope_id=assertion_scope_id,
+                                )
                     if current_url in {"", "about:blank"} and not result.get("ok"):
                         return _fail(
                             invocation,
@@ -1880,10 +2625,18 @@ class BrowserTools:
                             "session_id": session_id,
                         },
                     )
+            self._remember_page_assertion_contract(
+                invocation,
+                session_id,
+                required=required,
+                forbidden=forbidden,
+                selector=selector,
+            )
             return _ok(invocation, {"result": result, "verified": True, "session_id": session_id})
         except Exception as e:
             return _fail(invocation, f"Page state assertion failed: {e}")
 
+    @_serialized_browser_operation
     def browser_find(self, invocation: ToolInvocation) -> ToolResult:
         selector = invocation.arguments.get("selector", "")
         if not selector:
@@ -1896,6 +2649,7 @@ class BrowserTools:
         except Exception as e:
             return _fail(invocation, f"Find failed: {e}")
 
+    @_serialized_browser_operation
     def browser_run_js(self, invocation: ToolInvocation) -> ToolResult:
         script = invocation.arguments.get("script", "")
         if not script:
@@ -1911,15 +2665,34 @@ class BrowserTools:
                     raise
                 wrapped_script = f"async () => {{\n{script_text}\n}}"
                 result = _run(self._backend.run_js(session_id, wrapped_script))
-            return _ok(invocation, {"result": result, "session_id": session_id})
+            output: dict[str, object] = {"result": result, "session_id": session_id}
+            assertion = self._current_page_assertion(invocation, session_id)
+            if assertion:
+                output["page_state_assertion"] = assertion
+            if self._mapping_has_detail_record_shape(result):
+                extraction = self._runtime_dom_detail_extraction(
+                    session_id,
+                    selector=self._assertion_selector(assertion),
+                )
+                if extraction is not None:
+                    # This is a separate runtime-owned observation. Never mark
+                    # the arbitrary JavaScript mapping itself as verified.
+                    output["detail_extraction"] = extraction
+            return _ok(invocation, output)
         except Exception as e:
-            return _fail(invocation, f"JavaScript execution failed: {e}")
+            return _fail(
+                invocation,
+                f"JavaScript execution failed: {e}",
+                {"session_id": session_id},
+            )
 
+    @_serialized_browser_operation
     def browser_close(self, invocation: ToolInvocation) -> ToolResult:
         session_id = self._session_id(invocation)
         try:
             _run(self._backend.close_session(session_id))
-            self._forget_session(session_id)
             return _ok(invocation, {"closed": session_id})
         except Exception as e:
             return _fail(invocation, f"Close failed: {e}")
+        finally:
+            self._forget_session(session_id)
