@@ -670,7 +670,12 @@ def _browser_item_handoff_records_from_tool_results(
         if status not in {"completed", "success", "succeeded"}:
             continue
         tool_name = str(getattr(result, "tool_name", "") or "").strip()
-        if tool_name not in {"browser_extract_items", "browser_extract_text", "browser_run_js"}:
+        if tool_name not in {
+            "browser_extract_detail",
+            "browser_extract_items",
+            "browser_extract_text",
+            "browser_run_js",
+        }:
             continue
         for item in _browser_item_candidates_from_value(getattr(result, "output", None)):
             normalized = _normalized_browser_item_record(item)
@@ -1149,7 +1154,12 @@ def _browser_item_records_from_tool_results(tool_results: list[Any], *, limit: i
         if status not in {"completed", "success", "succeeded"}:
             continue
         tool_name = str(getattr(result, "tool_name", "") or "").strip()
-        if tool_name not in {"browser_extract_items", "browser_extract_text", "browser_run_js"}:
+        if tool_name not in {
+            "browser_extract_detail",
+            "browser_extract_items",
+            "browser_extract_text",
+            "browser_run_js",
+        }:
             continue
         for item in _browser_item_candidates_from_value(getattr(result, "output", None)):
             record = _normalized_browser_item_record(item)
@@ -1364,6 +1374,7 @@ def _browser_item_candidates_from_value(value: Any, *, depth: int = 0) -> list[d
             candidates.append(dict(value))
         for key in (
             "items",
+            "record",
             "records",
             "rows",
             "data",
@@ -3281,7 +3292,13 @@ def _deep_agent_graph_config(config) -> dict[str, Any]:
     needs_long_graph = bool(
         getattr(task, "context_key_out", None)
         or metadata.get("requires_artifact_delivery")
-        or {"browser_extract_items", "browser_extract_text", "browser_run_js", "browser_image_collect"}.intersection(
+        or {
+            "browser_extract_detail",
+            "browser_extract_items",
+            "browser_extract_text",
+            "browser_run_js",
+            "browser_image_collect",
+        }.intersection(
             allowed_tools
         )
     )

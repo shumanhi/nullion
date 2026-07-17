@@ -21,7 +21,7 @@ import re
 from types import SimpleNamespace
 from typing import Any
 from urllib.request import Request, urlopen
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 from nullion.plugins.browser_plugin.browser_config import DEFAULT_AGENT_BROWSER_SESSION_ID
 from nullion.plugins.browser_plugin.browser_session import (
@@ -37,7 +37,6 @@ except ImportError:
 
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
-_BLANK_PAGE_URLS = frozenset({"", "about:blank", "chrome://newtab/", "brave://newtab/"})
 _TYPE_TEXT_TIMEOUT_MS = 3_000
 _CLICK_TIMEOUT_MS = 5_000
 
@@ -47,6 +46,13 @@ def _require_playwright() -> None:
         raise RuntimeError(
             "Playwright is not installed. Run: pip install playwright"
         )
+
+
+def _page_url(page: object) -> str:
+    try:
+        return str(getattr(page, "url", "") or "").strip()
+    except Exception:
+        return ""
 
 
 def normalized_cdp_url(raw_url: str | None = None) -> str:
@@ -60,44 +66,6 @@ def normalized_cdp_url(raw_url: str | None = None) -> str:
         netloc = f"127.0.0.1:{port}"
         return urlunparse(parsed._replace(netloc=netloc))
     return url
-
-
-def _page_url(page: object) -> str:
-    try:
-        return str(getattr(page, "url", "") or "").strip()
-    except Exception:
-        return ""
-
-
-def _page_is_blank(page: object) -> bool:
-    return _page_url(page).lower() in _BLANK_PAGE_URLS
-
-
-async def _close_page_quietly(page: object) -> None:
-    close = getattr(page, "close", None)
-    if not callable(close):
-        return
-    try:
-        result = close()
-        if asyncio.iscoroutine(result):
-            await result
-    except Exception:
-        pass
-
-
-async def _prune_extra_blank_pages(pages: list[object]) -> list[object]:
-    open_pages = [page for page in pages if not page.is_closed()]
-    if len(open_pages) <= 1:
-        return open_pages
-    nonblank_pages = [page for page in open_pages if not _page_is_blank(page)]
-    blank_pages = [page for page in open_pages if _page_is_blank(page)]
-    keep_blank = [] if nonblank_pages else blank_pages[-1:]
-    keep = [*nonblank_pages, *keep_blank]
-    for page in blank_pages:
-        if page in keep_blank:
-            continue
-        await _close_page_quietly(page)
-    return keep
 
 
 def _json_url(cdp_url: str, path: str) -> str:
@@ -132,6 +100,27 @@ async def _async_new_cdp_target(cdp_url: str) -> dict[str, object] | None:
     return await asyncio.to_thread(create)
 
 
+async def _async_close_cdp_target(cdp_url: str, target_id: str) -> bool:
+    """Close a raw-CDP target instead of merely detaching its websocket."""
+
+    normalized_target_id = str(target_id or "").strip()
+    if not normalized_target_id:
+        return False
+
+    def close() -> bool:
+        request = Request(
+            _json_url(cdp_url, f"/json/close/{quote(normalized_target_id, safe='')}"),
+            headers={"Accept": "application/json, text/plain"},
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return int(getattr(response, "status", 200) or 200) < 400
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(close)
+
+
 async def _async_page_targets_or_new(cdp_url: str) -> list[dict[str, object]]:
     targets = [
         target
@@ -142,7 +131,9 @@ async def _async_page_targets_or_new(cdp_url: str) -> list[dict[str, object]]:
         return targets
     target = await _async_new_cdp_target(cdp_url)
     if target and str(target.get("type") or "") == "page":
-        return [target]
+        owned_target = dict(target)
+        owned_target["_nullion_owned_target"] = True
+        return [owned_target]
     return []
 
 
@@ -1054,10 +1045,18 @@ class _RawCDPClient:
 
 
 class _RawCDPPage:
-    def __init__(self, target: dict[str, object]) -> None:
+    def __init__(
+        self,
+        target: dict[str, object],
+        *,
+        cdp_url: str = "",
+        close_target_on_close: bool = False,
+    ) -> None:
         self.target_id = str(target.get("id") or "")
         self.url = str(target.get("url") or "")
         self._client = _RawCDPClient(str(target.get("webSocketDebuggerUrl") or ""))
+        self._cdp_url = str(cdp_url or "").strip()
+        self._close_target_on_close = close_target_on_close
         self._closed = False
 
     def is_closed(self) -> bool:
@@ -1266,20 +1265,44 @@ class _RawCDPPage:
             pass
 
     async def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
-        await self._client.close()
+        try:
+            target_closed = False
+            if self._close_target_on_close and self._cdp_url and self.target_id:
+                target_closed = await _async_close_cdp_target(self._cdp_url, self.target_id)
+            if self._close_target_on_close and not target_closed:
+                try:
+                    await self._client.send("Page.close", timeout=2)
+                except Exception:
+                    pass
+        finally:
+            await self._client.close()
 
 
 class _RawCDPContext:
     def __init__(self, cdp_url: str, targets: list[dict[str, object]]) -> None:
         self.cdp_url = cdp_url
-        self.pages = [_RawCDPPage(target) for target in targets if target.get("webSocketDebuggerUrl")]
+        self.pages = [
+            _RawCDPPage(
+                target,
+                cdp_url=cdp_url,
+                close_target_on_close=target.get("_nullion_owned_target") is True,
+            )
+            for target in targets
+            if target.get("webSocketDebuggerUrl")
+        ]
 
     async def new_page(self) -> "_RawCDPPage":
         target = await _async_new_cdp_target(self.cdp_url)
         if not target or not target.get("webSocketDebuggerUrl"):
             raise RuntimeError("Connected to CDP, but could not create a new browser tab.")
-        page = _RawCDPPage(target)
+        page = _RawCDPPage(
+            target,
+            cdp_url=self.cdp_url,
+            close_target_on_close=True,
+        )
         self.pages.append(page)
         return page
 
@@ -1314,7 +1337,29 @@ class CDPBackend:
         self._playwright = None
         self._browser: "Browser | _RawCDPBrowser | None" = None
         self._pages: dict[str, "Page | _RawCDPPage"] = {}
+        self._owned_page_ids: set[int] = set()
         self._lock = asyncio.Lock()
+
+    def _owned_pages(self) -> set[int]:
+        owned_page_ids = getattr(self, "_owned_page_ids", None)
+        if not isinstance(owned_page_ids, set):
+            owned_page_ids = set()
+            self._owned_page_ids = owned_page_ids
+        return owned_page_ids
+
+    def _remember_backend_owned_pages(self, browser: "Browser | _RawCDPBrowser") -> None:
+        owned_page_ids = self._owned_pages()
+        for context in browser.contexts:
+            for page in context.pages:
+                if getattr(page, "_close_target_on_close", False) is True:
+                    owned_page_ids.add(id(page))
+
+    def _forget_raw_context_page(self, page: "Page | _RawCDPPage") -> None:
+        browser = getattr(self, "_browser", None)
+        if not isinstance(browser, _RawCDPBrowser):
+            return
+        for context in browser.contexts:
+            context.pages[:] = [candidate for candidate in context.pages if candidate is not page]
 
     @staticmethod
     def _new_page_unsupported_error(exc: Exception) -> RuntimeError:
@@ -1323,24 +1368,15 @@ class CDPBackend:
             "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
         )
 
-    @staticmethod
-    def _requires_dedicated_page(session_id: str) -> bool:
-        del session_id
-        return False
-
     async def _ensure_raw_browser(self) -> "_RawCDPBrowser":
         browser = _RawCDPBrowser(self._cdp_url)
         self._browser = await browser.refresh()
+        self._remember_backend_owned_pages(browser)
         return browser
 
     async def _ensure_browser(self) -> "Browser | _RawCDPBrowser":
         if self._browser is None or not self._browser.is_connected():
-            targets = await _async_page_targets_or_new(self._cdp_url)
-            if not targets:
-                raise RuntimeError(
-                    "Connected to CDP, but no browser page target was available and a new tab could not be created. "
-                    "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
-                )
+            await _async_cdp_targets(self._cdp_url)
             pw = await async_playwright().__aenter__()
             self._playwright = pw
             try:
@@ -1350,7 +1386,9 @@ class CDPBackend:
                 )
             except Exception as exc:
                 try:
-                    await pw.__aexit__(None, None, None)
+                    stop = getattr(pw, "stop", None)
+                    if callable(stop):
+                        await stop()
                 except Exception:
                     pass
                 self._playwright = None
@@ -1359,9 +1397,12 @@ class CDPBackend:
 
     async def _get_page(self, session_id: str) -> "Page | _RawCDPPage":
         async with self._lock:
+            owned_page_ids = self._owned_pages()
             cached = self._pages.get(session_id)
             if cached is not None and cached.is_closed():
                 self._pages.pop(session_id, None)
+                owned_page_ids.discard(id(cached))
+                self._forget_raw_context_page(cached)
             if session_id not in self._pages:
                 browser = await self._ensure_browser()
                 # Use the first existing context (the user's real browser session)
@@ -1373,37 +1414,42 @@ class CDPBackend:
                         "Connected to CDP, but no visible browser context was available. "
                         "Open a normal Chrome, Brave, or Edge tab in the remote-debugging browser and try again."
                     )
-                pages = await _prune_extra_blank_pages(list(ctx.pages))
+                pages = [page for page in ctx.pages if not page.is_closed()]
+                assigned_page_ids = {id(page) for page in self._pages.values()}
+                unassigned_owned_pages = [
+                    page
+                    for page in pages
+                    if id(page) in owned_page_ids and id(page) not in assigned_page_ids
+                ]
                 if session_id == DEFAULT_AGENT_BROWSER_SESSION_ID:
-                    if pages:
-                        self._pages[session_id] = pages[-1]
+                    user_pages = [page for page in pages if id(page) not in owned_page_ids]
+                    if user_pages:
+                        self._pages[session_id] = user_pages[-1]
+                    elif unassigned_owned_pages:
+                        self._pages[session_id] = unassigned_owned_pages[-1]
                     else:
                         try:
-                            self._pages[session_id] = await ctx.new_page()
+                            page = await ctx.new_page()
+                            owned_page_ids.add(id(page))
+                            self._pages[session_id] = page
                         except Exception as exc:
                             message = str(exc)
                             if "Browser context management is not supported" in message:
                                 raise self._new_page_unsupported_error(exc) from exc
                             raise
                 else:
-                    reusable_pages = [
-                        page
-                        for page in pages
-                        if _page_is_blank(page)
-                    ]
-                    if reusable_pages and not self._requires_dedicated_page(session_id):
-                        self._pages[session_id] = reusable_pages[-1]
-                        return self._pages[session_id]
-                    try:
-                        self._pages[session_id] = await ctx.new_page()
-                    except Exception as exc:
-                        message = str(exc)
-                        if "Browser context management is not supported" in message:
-                            if self._requires_dedicated_page(session_id) or not pages:
+                    if unassigned_owned_pages:
+                        self._pages[session_id] = unassigned_owned_pages[-1]
+                    else:
+                        try:
+                            page = await ctx.new_page()
+                            owned_page_ids.add(id(page))
+                            self._pages[session_id] = page
+                        except Exception as exc:
+                            message = str(exc)
+                            if "Browser context management is not supported" in message:
                                 raise self._new_page_unsupported_error(exc) from exc
-                            self._pages[session_id] = pages[-1]
-                            return self._pages[session_id]
-                        raise
+                            raise
         return self._pages[session_id]
 
     # ── BrowserBackend protocol ───────────────────────────────────────────────
@@ -1617,13 +1663,48 @@ class CDPBackend:
                 await page.close()
             except Exception:
                 pass
+            finally:
+                self._owned_pages().discard(id(page))
+                self._forget_raw_context_page(page)
 
     async def shutdown(self) -> None:
-        for session_id in list(self._pages):
-            await self.close_session(session_id)
-        # Don't close the browser itself — it's the user's existing window
+        owned_page_ids = self._owned_pages()
+        for session_id, page in list(self._pages.items()):
+            if id(page) in owned_page_ids:
+                await self.close_session(session_id)
+                continue
+            async with self._lock:
+                if self._pages.get(session_id) is page:
+                    self._pages.pop(session_id, None)
+            if isinstance(page, _RawCDPPage):
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                finally:
+                    self._forget_raw_context_page(page)
+        current_browser = getattr(self, "_browser", None)
+        raw_browser = current_browser if isinstance(current_browser, _RawCDPBrowser) else None
+        if raw_browser is not None:
+            for context in raw_browser.contexts:
+                for page in list(context.pages):
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    finally:
+                        owned_page_ids.discard(id(page))
+                context.pages.clear()
+        # Detach from the user's browser without closing borrowed tabs or the browser itself.
         if self._playwright:
             try:
-                await self._playwright.__aexit__(None, None, None)
+                stop = getattr(self._playwright, "stop", None)
+                if callable(stop):
+                    await stop()
             except Exception:
                 pass
+            finally:
+                self._playwright = None
+        self._pages.clear()
+        owned_page_ids.clear()
+        self._browser = None

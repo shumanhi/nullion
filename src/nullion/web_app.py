@@ -832,6 +832,7 @@ _BROWSER_TOOL_NAMES = (
     "browser_type_id",
     "browser_select_combobox",
     "browser_snapshot",
+    "browser_extract_detail",
     "browser_extract_items",
     "browser_extract_text",
     "browser_screenshot",
