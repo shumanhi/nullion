@@ -543,11 +543,355 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     .replace(/\\s+/g, ' ')
     .trim()
     .slice(0, limit);
-  const visible = (element) => {{
-    if (!element) return false;
-    const style = window.getComputedStyle(element);
+  const paintAlphaIsZero = (value) => {{
+    const normalized = String(value || '').trim().toLocaleLowerCase();
+    if (!normalized || normalized === 'none') return false;
+    if (normalized === 'transparent') return true;
+    if (/(?:rgba|hsla)\\([^)]*[,/]\\s*(?:0(?:\\.0*)?|\\.0+)\\s*\\)$/u.test(normalized)) {{
+      return true;
+    }}
+    return /\\/\\s*(?:0(?:\\.0*)?|\\.0+)(?:%\\s*)?\\)$/u.test(normalized);
+  }};
+  const paintValueIsFullyTransparent = (value) => {{
+    const normalized = String(value || '').trim().toLocaleLowerCase();
+    if (!normalized || normalized === 'none' || normalized === 'transparent') return true;
+    const colors = normalized.match(/(?:rgba|hsla|color|oklch|oklab|lab|lch)\\([^)]*\\)/gu) || [];
+    return Boolean(colors.length && colors.every(paintAlphaIsZero));
+  }};
+  const paintCssLayers = (value) => {{
+    const layers = [];
+    let depth = 0;
+    let current = '';
+    for (const character of String(value || '')) {{
+      if (character === '(') depth += 1;
+      if (character === ')') depth = Math.max(0, depth - 1);
+      if (character === ',' && depth === 0) {{
+        layers.push(current.trim());
+        current = '';
+        continue;
+      }}
+      current += character;
+    }}
+    if (current.trim() || !layers.length) layers.push(current.trim());
+    return layers.filter(Boolean);
+  }};
+  const paintCssTokens = (value) => {{
+    const tokens = [];
+    let depth = 0;
+    let current = '';
+    for (const character of String(value || '').trim()) {{
+      if (/\\s/u.test(character) && depth === 0) {{
+        if (current) tokens.push(current);
+        current = '';
+        continue;
+      }}
+      current += character;
+      if (character === '(') depth += 1;
+      if (character === ')') depth = Math.max(0, depth - 1);
+    }}
+    if (current) tokens.push(current);
+    return tokens;
+  }};
+  const paintNumericCssValue = (token, basis, {{autoValue = basis}} = {{}}) => {{
+    const normalized = String(token || '').trim().toLocaleLowerCase();
+    if (normalized === 'auto') return autoValue;
+    const calcMatch = normalized.match(
+      /^calc\\(\\s*([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))%\\s*([+-])\\s*([0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)px\\s*\\)$/u
+    );
+    if (calcMatch) {{
+      return (
+        basis * Number(calcMatch[1]) / 100
+        + Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1)
+      );
+    }}
+    const match = normalized.match(
+      /^([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))(px|%)?$/u
+    );
+    if (!match) return Number.NaN;
+    const amount = Number(match[1]);
+    if (!match[2] && amount !== 0) return Number.NaN;
+    return match[2] === '%' ? basis * amount / 100 : amount;
+  }};
+  const paintImageSize = (value, rect) => {{
+    const tokens = paintCssTokens(value || 'auto');
+    if (!tokens.length) return null;
+    if (tokens.length === 1 && /^(?:cover|contain)$/u.test(tokens[0])) {{
+      return [rect.width, rect.height];
+    }}
+    const width = paintNumericCssValue(tokens[0], rect.width);
+    const height = paintNumericCssValue(tokens[1] || 'auto', rect.height);
+    if (![width, height].every(Number.isFinite)) return null;
+    return [width, height];
+  }};
+  const paintPositionComponent = (token) => {{
+    const normalized = String(token || '').trim().toLocaleLowerCase();
+    if (normalized === 'center') return {{percent: 0.5, pixels: 0}};
+    if (normalized === 'left' || normalized === 'top') return {{percent: 0, pixels: 0}};
+    if (normalized === 'right' || normalized === 'bottom') return {{percent: 1, pixels: 0}};
+    const calcMatch = normalized.match(
+      /^calc\\(\\s*([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))%\\s*([+-])\\s*([0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)px\\s*\\)$/u
+    );
+    if (calcMatch) {{
+      return {{
+        percent: Number(calcMatch[1]) / 100,
+        pixels: Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1),
+      }};
+    }}
+    const match = normalized.match(
+      /^([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))(px|%)?$/u
+    );
+    if (!match) return null;
+    const amount = Number(match[1]);
+    if (!match[2] && amount !== 0) return null;
+    return match[2] === '%'
+      ? {{percent: amount / 100, pixels: 0}}
+      : {{percent: 0, pixels: amount}};
+  }};
+  const paintEdgePositionComponent = (edge, distance) => {{
+    const anchor = paintPositionComponent(edge);
+    const offset = paintNumericCssValue(distance, 0, {{autoValue: Number.NaN}});
+    if (!anchor || !Number.isFinite(offset)) return null;
+    const reverse = edge === 'right' || edge === 'bottom';
+    return {{percent: anchor.percent, pixels: reverse ? -offset : offset}};
+  }};
+  const paintBackgroundPosition = (value) => {{
+    const tokens = paintCssTokens(value || '0% 0%');
+    if (
+      tokens.length >= 4
+      && /^(?:left|right)$/u.test(tokens[0])
+      && /^(?:top|bottom)$/u.test(tokens[2])
+    ) {{
+      return [
+        paintEdgePositionComponent(tokens[0], tokens[1]),
+        paintEdgePositionComponent(tokens[2], tokens[3]),
+      ];
+    }}
+    if (tokens.length === 1) {{
+      if (/^(?:top|bottom)$/u.test(tokens[0])) {{
+        return [paintPositionComponent('center'), paintPositionComponent(tokens[0])];
+      }}
+      return [paintPositionComponent(tokens[0]), paintPositionComponent('center')];
+    }}
+    return [
+      paintPositionComponent(tokens[0] || '0%'),
+      paintPositionComponent(tokens[1] || '0%'),
+    ];
+  }};
+  const paintRepeatedAxes = (value) => {{
+    const tokens = paintCssTokens(value || 'repeat').map((token) => token.toLocaleLowerCase());
+    if (tokens[0] === 'repeat-x') return [true, false];
+    if (tokens[0] === 'repeat-y') return [false, true];
+    const repeats = (token) => token !== 'no-repeat';
+    return [repeats(tokens[0] || 'repeat'), repeats(tokens[1] || tokens[0] || 'repeat')];
+  }};
+  const paintLayerGeometryCanPaint = (size, position, repeat, rect) => {{
+    const container = [rect.width, rect.height];
+    const imageSize = paintImageSize(size, rect);
+    const offsets = paintBackgroundPosition(position);
+    const repeats = paintRepeatedAxes(repeat);
+    if (
+      !imageSize
+      || offsets.some((offset) => !offset)
+      || container.some((dimension) => !(dimension > 0))
+    ) return false;
+    return imageSize.every((dimension, axis) => {{
+      if (!(dimension > 0)) return false;
+      if (repeats[axis]) return true;
+      const offset = (
+        (container[axis] - dimension) * offsets[axis].percent
+        + offsets[axis].pixels
+      );
+      return offset < container[axis] && offset + dimension > 0;
+    }});
+  }};
+  const filterSuppressesPaint = (value) => Array.from(
+    String(value || '').matchAll(/opacity\\(\\s*([0-9.]+)\\s*(%)?\\s*\\)/giu)
+  ).some((match) => Number(match[1]) <= 0);
+  const maskSuppressesPaint = (image, size, position, repeat, rect) => {{
+    const imageLayers = paintCssLayers(image);
+    if (!imageLayers.length || imageLayers.every((layer) => layer === 'none')) return false;
+    const sizeLayers = paintCssLayers(size || 'auto');
+    const positionLayers = paintCssLayers(position || '0% 0%');
+    const repeatLayers = paintCssLayers(repeat || 'repeat');
+    const layerValue = (layers, index, fallback) => (
+      layers.length ? layers[index % layers.length] : fallback
+    );
+    return imageLayers.every((layer, index) => (
+      layer === 'none'
+      || paintValueIsFullyTransparent(layer)
+      || !paintLayerGeometryCanPaint(
+        layerValue(sizeLayers, index, 'auto'),
+        layerValue(positionLayers, index, '0% 0%'),
+        layerValue(repeatLayers, index, 'repeat'),
+        rect,
+      )
+    ));
+  }};
+  const cssInsetValue = (token, basis) => {{
+    const match = String(token || '').match(/^(-?[0-9.]+)(%|px)?$/u);
+    if (!match) return Number.NaN;
+    return match[2] === '%' ? Number(match[1]) * basis / 100 : Number(match[1]);
+  }};
+  const clipPathSuppressesPaint = (value, rect) => {{
+    const normalized = String(value || '').trim();
+    const inset = normalized.match(/^inset\\(([^)]*)\\)/iu);
+    if (inset) {{
+      const tokens = inset[1].trim().split(/\\s+/u).filter(Boolean);
+      if (!tokens.length || tokens.some((token) => token.includes('round'))) return false;
+      const sides = tokens.length === 1
+        ? [tokens[0], tokens[0], tokens[0], tokens[0]]
+        : tokens.length === 2
+          ? [tokens[0], tokens[1], tokens[0], tokens[1]]
+          : tokens.length === 3
+            ? [tokens[0], tokens[1], tokens[2], tokens[1]]
+            : tokens.slice(0, 4);
+      const top = cssInsetValue(sides[0], rect.height);
+      const right = cssInsetValue(sides[1], rect.width);
+      const bottom = cssInsetValue(sides[2], rect.height);
+      const left = cssInsetValue(sides[3], rect.width);
+      return [top, right, bottom, left].every(Number.isFinite)
+        && (top + bottom >= rect.height || left + right >= rect.width);
+    }}
+    const radial = normalized.match(/^(?:circle|ellipse)\\(\\s*([^\\s,)]+)/iu);
+    if (radial) {{
+      const radius = cssInsetValue(radial[1], Math.min(rect.width, rect.height));
+      if (Number.isFinite(radius) && radius <= 0) return true;
+    }}
+    const polygon = normalized.match(/^polygon\\((.*)\\)$/iu);
+    if (polygon) {{
+      const points = polygon[1].split(',').map((point) => {{
+        const coordinates = point.trim().split(/\\s+/u);
+        return [
+          cssInsetValue(coordinates[0], rect.width),
+          cssInsetValue(coordinates[1], rect.height),
+        ];
+      }}).filter((point) => point.every(Number.isFinite));
+      if (points.length >= 3) {{
+        const twiceArea = Math.abs(points.reduce((area, point, index) => {{
+          const next = points[(index + 1) % points.length];
+          return area + point[0] * next[1] - next[0] * point[1];
+        }}, 0));
+        if (twiceArea <= 1e-7) return true;
+      }}
+    }}
+    const path = normalized.match(
+      /^path\\(\\s*(?:(?:evenodd|nonzero)\\s*,\\s*)?["']([^"']*)["']\\s*\\)$/iu
+    );
+    if (path) {{
+      const commands = path[1].match(/[a-z]/giu) || [];
+      if (
+        !commands.length
+        || commands.every((command) => command.toLocaleLowerCase() === 'm')
+      ) return true;
+    }}
+    return false;
+  }};
+  const legacyClipSuppressesPaint = (value) => {{
+    const normalized = String(value || '').trim();
+    if (!normalized || normalized === 'auto') return false;
+    const numbers = normalized.match(/-?[0-9.]+/g) || [];
+    if (numbers.length < 4) return false;
+    const [top, right, bottom, left] = numbers.slice(0, 4).map(Number);
+    return bottom <= top || right <= left;
+  }};
+  const transformSuppressesPaint = (value) => {{
+    const normalized = String(value || '').trim();
+    if (!normalized || normalized === 'none') return false;
+    try {{
+      const matrix = new DOMMatrixReadOnly(normalized);
+      return Math.hypot(matrix.m11, matrix.m12, matrix.m13) <= 1e-7
+        || Math.hypot(matrix.m21, matrix.m22, matrix.m23) <= 1e-7;
+    }} catch (_error) {{
+      return false;
+    }}
+  }};
+  const styleSuppressesPaint = (element, style) => {{
     const rect = element.getBoundingClientRect();
-    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+    return filterSuppressesPaint(style.filter)
+      || maskSuppressesPaint(
+        style.maskImage,
+        style.maskSize,
+        style.maskPosition,
+        style.maskRepeat,
+        rect,
+      )
+      || maskSuppressesPaint(
+        style.webkitMaskImage,
+        style.webkitMaskSize,
+        style.webkitMaskPosition,
+        style.webkitMaskRepeat,
+        rect,
+      )
+      || transformSuppressesPaint(style.transform)
+      || clipPathSuppressesPaint(style.clipPath, rect)
+      || legacyClipSuppressesPaint(style.clip);
+  }};
+  const paintVisible = (element) => {{
+    if (!element) return false;
+    const elementRect = element.getBoundingClientRect();
+    let clippedLeft = elementRect.left;
+    let clippedRight = elementRect.right;
+    let clippedTop = elementRect.top;
+    let clippedBottom = elementRect.bottom;
+    let current = element;
+    while (current && current.nodeType === Node.ELEMENT_NODE) {{
+      const currentStyle = window.getComputedStyle(current);
+      if (
+        currentStyle.visibility === 'hidden'
+        || currentStyle.display === 'none'
+        || currentStyle.contentVisibility === 'hidden'
+        || Number.parseFloat(currentStyle.opacity) === 0
+        || styleSuppressesPaint(current, currentStyle)
+      ) return false;
+      const currentRect = current.getBoundingClientRect();
+      if (
+        currentStyle.position === 'fixed'
+        && (
+          currentRect.right <= 0
+          || currentRect.left >= window.innerWidth
+          || currentRect.bottom <= 0
+          || currentRect.top >= window.innerHeight
+        )
+      ) return false;
+      const clipsX = /^(?:hidden|clip)$/u.test(currentStyle.overflowX);
+      const clipsY = /^(?:hidden|clip)$/u.test(currentStyle.overflowY);
+      if (clipsX) {{
+        clippedLeft = Math.max(clippedLeft, currentRect.left);
+        clippedRight = Math.min(clippedRight, currentRect.right);
+      }}
+      if (clipsY) {{
+        clippedTop = Math.max(clippedTop, currentRect.top);
+        clippedBottom = Math.min(clippedBottom, currentRect.bottom);
+      }}
+      if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) return false;
+      if (
+        (clipsX || clipsY)
+        && currentRect.width <= 1
+        && currentRect.height <= 1
+      ) return false;
+      if (
+        typeof current.checkVisibility === 'function'
+        && !current.checkVisibility({{
+          checkOpacity: true,
+          checkVisibilityCSS: true,
+          contentVisibilityAuto: true,
+        }})
+      ) return false;
+      current = current.parentElement;
+    }}
+    const rect = elementRect;
+    return rect.width > 0
+      && rect.height > 0
+      && rect.right + window.scrollX > 0
+      && rect.bottom + window.scrollY > 0;
+  }};
+  const visible = (element) => {{
+    let current = element;
+    while (current && current.nodeType === Node.ELEMENT_NODE) {{
+      if (current.getAttribute('aria-hidden') === 'true') return false;
+      current = current.parentElement;
+    }}
+    return paintVisible(element);
   }};
   const initialRoot = rootSelector
     ? document.querySelector(rootSelector)
@@ -561,7 +905,7 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     }};
   }}
   const headingSelectors = '[itemprop="name"], h1, [role="heading"][aria-level="1"]';
-  const priceSelectors = 'meta[itemprop="price"], [itemprop="price"], [data-price], [class*="price" i], [id*="price" i]';
+  const priceSelectors = '[itemprop~="price"], [data-price], [class*="price" i], [id*="price" i]';
   const candidateRoots = Array.from(initialRoot.querySelectorAll(
     'article, [role="article"], [role="listitem"], [itemscope]'
   )).filter((element) => {{
@@ -604,18 +948,83 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     : null;
   let primaryContainer = null;
   if (primaryHeadings.length === 1 && titleElement) {{
-    const candidate = titleElement.closest('section, article, [role="article"], [itemscope]');
-    if (
-      candidate
-      && initialRoot.contains(candidate)
-      && candidate.querySelector(
-        `${{priceSelectors}}, [itemprop="description"], [class*="availability" i], [id*="availability" i]`
-      )
-    ) {{
-      primaryContainer = candidate;
+    const detailEvidenceSelectors = `${{priceSelectors}}, [itemprop="description"], [itemprop="availability"], [class*="availability" i], [id*="availability" i]`;
+    const hasSubstantiveDetailEvidence = (candidate) =>
+      Array.from(candidate.querySelectorAll(detailEvidenceSelectors)).some((element) => {{
+        const value = compact(
+          element.getAttribute('content')
+          || element.getAttribute('value')
+          || element.getAttribute('data-price')
+          || element.getAttribute('aria-label')
+          || element.getAttribute('href')
+          || element.textContent,
+          600,
+        );
+        return Boolean(value && (element.matches('meta, link') || visible(element)));
+      }});
+    let candidate = titleElement.parentElement;
+    while (candidate && initialRoot.contains(candidate)) {{
+      if (candidate !== initialRoot && hasSubstantiveDetailEvidence(candidate)) {{
+        primaryContainer = candidate;
+        break;
+      }}
+      if (candidate === initialRoot) break;
+      candidate = candidate.parentElement;
     }}
   }}
   const root = containingCandidate || primaryContainer || initialRoot;
+  const availabilitySelectors = [
+    '[itemprop="availability"]',
+    '[class*="availability" i]',
+    '[id*="availability" i]',
+  ];
+  const availabilityBelongsToSelectedRecord = (element) => {{
+    if (candidateRoots.some((candidate) => (
+      candidate.contains(element)
+      && !candidate.contains(titleElement)
+    ))) return false;
+    let current = element.parentElement;
+    while (current && initialRoot.contains(current)) {{
+      if (current.contains(titleElement)) return true;
+      const hasLinkedRecordIdentity = Array.from(current.querySelectorAll(
+        'h1 a[href], h2 a[href], h3 a[href], [role="heading"] a[href], [itemprop="name"] a[href]'
+      )).some(visible);
+      const hasPriceEvidence = Array.from(current.querySelectorAll(priceSelectors)).some(
+        (price) => price.matches('meta, link') || visible(price)
+      );
+      if (hasLinkedRecordIdentity && hasPriceEvidence) return false;
+      current = current.parentElement;
+    }}
+    return true;
+  }};
+  let availabilityScope = root;
+  if (root !== initialRoot && root.contains(titleElement)) {{
+    let candidate = root.parentElement;
+    while (candidate && initialRoot.contains(candidate)) {{
+      const hasEligibleSiblingAvailability = availabilitySelectors.some(
+        (selector) => Array.from(candidate.querySelectorAll(selector)).some((element) => {{
+          if (root.contains(element) || !availabilityBelongsToSelectedRecord(element)) {{
+            return false;
+          }}
+          const value = compact(
+            element.getAttribute('content')
+            || element.getAttribute('href')
+            || element.getAttribute('value')
+            || element.getAttribute('aria-label')
+            || element.textContent,
+            600,
+          );
+          return Boolean(value && (element.matches('meta, link') || visible(element)));
+        }})
+      );
+      if (hasEligibleSiblingAvailability) {{
+        availabilityScope = candidate;
+        break;
+      }}
+      if (candidate === initialRoot) break;
+      candidate = candidate.parentElement;
+    }}
+  }}
   const recordLikePeerGroups = new Map();
   if (root === initialRoot && !containingCandidate && !primaryContainer) {{
     for (const anchor of Array.from(root.querySelectorAll('a[href]')).filter(visible)) {{
@@ -686,101 +1095,1439 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     }}
     return '';
   }};
-  const firstContent = (selectors) => {{
+  const firstContent = (
+    selectors,
+    {{
+      requirePaintedDom = false,
+      preferCurrent = false,
+      returnMatch = false,
+      scope = root,
+      candidateFilter = null,
+    }} = {{}},
+  ) => {{
+    const candidates = [];
+    const seen = new Set();
     for (const query of selectors) {{
-      const element = root.querySelector(query);
-      if (!element) continue;
-      const value = compact(
-        element.getAttribute('content') ||
-        element.getAttribute('value') ||
-        element.getAttribute('aria-label') ||
-        element.textContent,
-        1200,
-      );
-      if (value) return value;
+      for (const element of Array.from(scope.querySelectorAll(query))) {{
+        if (seen.has(element) || (candidateFilter && !candidateFilter(element))) continue;
+        seen.add(element);
+        candidates.push(element);
+      }}
     }}
-    return '';
+    const structuredStateRank = (element) => {{
+      let hasExplicitState = false;
+      let isSelected = false;
+      if (element.hasAttribute('aria-current')) {{
+        hasExplicitState = true;
+        const value = element.getAttribute('aria-current')?.trim().toLocaleLowerCase() || '';
+        if (value && value !== 'false') isSelected = true;
+      }}
+      if (element.hasAttribute('aria-selected')) {{
+        hasExplicitState = true;
+        if (element.getAttribute('aria-selected')?.trim().toLocaleLowerCase() === 'true') {{
+          isSelected = true;
+        }}
+      }}
+      for (const attribute of ['data-current', 'data-selected']) {{
+        if (!element.hasAttribute(attribute)) continue;
+        hasExplicitState = true;
+        const value = element.getAttribute(attribute)?.trim().toLocaleLowerCase() || '';
+        if (value !== 'false' && value !== '0') isSelected = true;
+      }}
+      if (isSelected) return 2;
+      return hasExplicitState ? 0 : null;
+    }};
+    const inheritedStructuredStateRank = (element) => {{
+      let current = element;
+      while (current && scope.contains(current)) {{
+        const rank = structuredStateRank(current);
+        if (rank !== null) return rank;
+        if (current === scope) break;
+        current = current.parentElement;
+      }}
+      return 1;
+    }};
+    const orderedCandidates = preferCurrent
+      ? candidates
+          .map((element, index) => ({{
+            element,
+            index,
+            rank: inheritedStructuredStateRank(element),
+          }}))
+          .sort((left, right) => right.rank - left.rank || left.index - right.index)
+          .map((candidate) => candidate.element)
+      : candidates;
+    for (const element of orderedCandidates) {{
+        const structuredMetadata = element.matches('meta, link');
+        if (requirePaintedDom && !structuredMetadata) {{
+          const value = paintedText(element, 1200);
+          if (value) return returnMatch ? {{value, element}} : value;
+          continue;
+        }}
+        const value = compact(
+          element.getAttribute('content') ||
+          (element.matches('link') ? element.getAttribute('href') : '') ||
+          element.getAttribute('value') ||
+          element.getAttribute('aria-label') ||
+          element.textContent,
+          1200,
+        );
+        if (value) return returnMatch ? {{value, element}} : value;
+    }}
+    return returnMatch ? null : '';
+  }};
+  const textNodeIsPainted = (node) => {{
+    const parent = node && node.parentElement;
+    if (!parent || !paintVisible(parent)) return false;
+    const value = String(node.nodeValue || '');
+    if (!value.trim()) return false;
+    const style = window.getComputedStyle(parent);
+    const shadow = String(style.textShadow || '').trim();
+    const strokeWidth = Number.parseFloat(style.webkitTextStrokeWidth || '0');
+    const shadowPaints = shadow !== 'none' && !paintValueIsFullyTransparent(shadow);
+    const strokePaints = strokeWidth > 0
+      && !paintValueIsFullyTransparent(style.webkitTextStrokeColor);
+    const cssLayers = (value) => {{
+      const layers = [];
+      let depth = 0;
+      let current = '';
+      for (const character of String(value || '')) {{
+        if (character === '(') depth += 1;
+        if (character === ')') depth = Math.max(0, depth - 1);
+        if (character === ',' && depth === 0) {{
+          layers.push(current.trim());
+          current = '';
+          continue;
+        }}
+        current += character;
+      }}
+      if (current.trim() || !layers.length) layers.push(current.trim());
+      return layers.filter(Boolean);
+    }};
+    const clipLayers = cssLayers(
+      style.webkitBackgroundClip || style.backgroundClip
+    );
+    const cssTokens = (value) => {{
+      const tokens = [];
+      let depth = 0;
+      let current = '';
+      for (const character of String(value || '').trim()) {{
+        if (/\s/u.test(character) && depth === 0) {{
+          if (current) tokens.push(current);
+          current = '';
+          continue;
+        }}
+        current += character;
+        if (character === '(') depth += 1;
+        if (character === ')') depth = Math.max(0, depth - 1);
+      }}
+      if (current) tokens.push(current);
+      return tokens;
+    }};
+    const numericCssValue = (token, basis, {{autoValue = basis}} = {{}}) => {{
+      const normalized = String(token || '').trim().toLocaleLowerCase();
+      if (normalized === 'auto') return autoValue;
+      const calcMatch = normalized.match(
+        /^calc\(\s*([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))%\s*([+-])\s*([0-9]+(?:\.[0-9]*)?|\.[0-9]+)px\s*\)$/u
+      );
+      if (calcMatch) {{
+        return (
+          basis * Number(calcMatch[1]) / 100
+          + Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1)
+        );
+      }}
+      const match = normalized.match(
+        /^([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(px|%)?$/u
+      );
+      if (!match) return Number.NaN;
+      const amount = Number(match[1]);
+      if (!match[2] && amount !== 0) return Number.NaN;
+      return match[2] === '%' ? basis * amount / 100 : amount;
+    }};
+    const backgroundImageSize = (value, rect) => {{
+      const tokens = cssTokens(value || 'auto');
+      if (!tokens.length) return null;
+      if (tokens.length === 1 && /^(?:cover|contain)$/u.test(tokens[0])) {{
+        return [rect.width, rect.height];
+      }}
+      const width = numericCssValue(tokens[0], rect.width);
+      const height = numericCssValue(tokens[1] || 'auto', rect.height);
+      if (![width, height].every(Number.isFinite)) return null;
+      return [width, height];
+    }};
+    const positionComponent = (token, axis) => {{
+      const normalized = String(token || '').trim().toLocaleLowerCase();
+      if (normalized === 'center') return {{percent: 0.5, pixels: 0}};
+      if (normalized === 'left' || normalized === 'top') {{
+        return {{percent: 0, pixels: 0}};
+      }}
+      if (normalized === 'right' || normalized === 'bottom') {{
+        return {{percent: 1, pixels: 0}};
+      }}
+      const calcMatch = normalized.match(
+        /^calc\(\s*([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))%\s*([+-])\s*([0-9]+(?:\.[0-9]*)?|\.[0-9]+)px\s*\)$/u
+      );
+      if (calcMatch) {{
+        return {{
+          percent: Number(calcMatch[1]) / 100,
+          pixels: Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1),
+        }};
+      }}
+      const match = normalized.match(
+        /^([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(px|%)?$/u
+      );
+      if (!match) return null;
+      const amount = Number(match[1]);
+      if (!match[2] && amount !== 0) return null;
+      return match[2] === '%'
+        ? {{percent: amount / 100, pixels: 0}}
+        : {{percent: 0, pixels: amount}};
+    }};
+    const edgePositionComponent = (edge, distance, axis) => {{
+      const anchor = positionComponent(edge, axis);
+      const offset = numericCssValue(distance, 0, {{autoValue: Number.NaN}});
+      if (!anchor || !Number.isFinite(offset)) return null;
+      const reverse = edge === 'right' || edge === 'bottom';
+      return {{percent: anchor.percent, pixels: reverse ? -offset : offset}};
+    }};
+    const backgroundPosition = (value) => {{
+      const tokens = cssTokens(value || '0% 0%');
+      if (
+        tokens.length >= 4
+        && /^(?:left|right)$/u.test(tokens[0])
+        && /^(?:top|bottom)$/u.test(tokens[2])
+      ) {{
+        return [
+          edgePositionComponent(tokens[0], tokens[1], 'x'),
+          edgePositionComponent(tokens[2], tokens[3], 'y'),
+        ];
+      }}
+      if (tokens.length === 1) {{
+        if (/^(?:top|bottom)$/u.test(tokens[0])) {{
+          return [positionComponent('center', 'x'), positionComponent(tokens[0], 'y')];
+        }}
+        return [positionComponent(tokens[0], 'x'), positionComponent('center', 'y')];
+      }}
+      return [
+        positionComponent(tokens[0] || '0%', 'x'),
+        positionComponent(tokens[1] || '0%', 'y'),
+      ];
+    }};
+    const repeatedAxes = (value) => {{
+      const tokens = cssTokens(value || 'repeat').map((token) => token.toLocaleLowerCase());
+      if (tokens[0] === 'repeat-x') return [true, false];
+      if (tokens[0] === 'repeat-y') return [false, true];
+      const repeats = (token) => token !== 'no-repeat';
+      return [repeats(tokens[0] || 'repeat'), repeats(tokens[1] || tokens[0] || 'repeat')];
+    }};
+    const backgroundLayerCanPaint = (size, position, repeat, rect) => {{
+      const container = [rect.width, rect.height];
+      const imageSize = backgroundImageSize(size, rect);
+      const offsets = backgroundPosition(position);
+      const repeats = repeatedAxes(repeat);
+      if (
+        !imageSize
+        || offsets.some((offset) => !offset)
+        || container.some((dimension) => !(dimension > 0))
+      ) return false;
+      return imageSize.every((dimension, axis) => {{
+        if (!(dimension > 0)) return false;
+        if (repeats[axis]) return true;
+        const offset = (
+          (container[axis] - dimension) * offsets[axis].percent
+          + offsets[axis].pixels
+        );
+        return offset < container[axis] && offset + dimension > 0;
+      }});
+    }};
+    const imageLayers = cssLayers(style.backgroundImage);
+    const sizeLayers = cssLayers(style.backgroundSize || 'auto');
+    const positionLayers = cssLayers(style.backgroundPosition || '0% 0%');
+    const repeatLayers = cssLayers(style.backgroundRepeat || 'repeat');
+    const parentRect = parent.getBoundingClientRect();
+    const layerValue = (layers, index, fallback) => (
+      layers.length ? layers[index % layers.length] : fallback
+    );
+    const backgroundImagePaints = imageLayers.some((image, index) => (
+      layerValue(clipLayers, index, '').toLocaleLowerCase() === 'text'
+      && !paintValueIsFullyTransparent(image)
+      && backgroundLayerCanPaint(
+        layerValue(sizeLayers, index, 'auto'),
+        layerValue(positionLayers, index, '0% 0%'),
+        layerValue(repeatLayers, index, 'repeat'),
+        parentRect,
+      )
+    ));
+    const colorClip = layerValue(
+      clipLayers,
+      Math.max(0, imageLayers.length - 1),
+      '',
+    ).toLocaleLowerCase();
+    const backgroundPaints = backgroundImagePaints || (
+      colorClip === 'text'
+      && !paintValueIsFullyTransparent(style.backgroundColor)
+    );
+    const textFillIsTransparent = Boolean(
+      style.webkitTextFillColor
+      && paintAlphaIsZero(style.webkitTextFillColor)
+    );
+    if (
+      (paintAlphaIsZero(style.color) || textFillIsTransparent)
+      && !shadowPaints
+      && !strokePaints
+      && !backgroundPaints
+    ) return false;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    return Array.from(range.getClientRects()).some((rect) => (
+      rect.width > 0
+      && rect.height > 0
+      && rect.right + window.scrollX > 0
+      && rect.bottom + window.scrollY > 0
+    ));
+  }};
+  const paintedText = (element, limit = 160) => {{
+    const values = [];
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {{
+      if (textNodeIsPainted(walker.currentNode)) {{
+        values.push(walker.currentNode.nodeValue || '');
+      }}
+    }}
+    return compact(values.join(''), limit);
   }};
   const title = compact(
     titleElement && root.contains(titleElement)
-      ? (titleElement.getAttribute('content') || titleElement.textContent)
+      ? (titleElement.getAttribute('content') || paintedText(titleElement, 800))
       : '',
     800,
   );
-  const allPriceElements = Array.from(root.querySelectorAll(priceSelectors));
-  const structuredPriceElements = allPriceElements.filter((element) =>
-    element.matches('meta[itemprop="price"], [itemprop="price"], [data-price]')
-  );
-  const priceElements = (structuredPriceElements.length
-    ? structuredPriceElements
-    : allPriceElements
-  ).filter((element, _index, candidates) =>
-    !candidates.some((candidate) => candidate !== element && candidate.contains(element))
-  );
-  const priceValue = (element) => compact(
-    element.getAttribute('content')
-    || element.getAttribute('value')
-    || element.getAttribute('data-price')
-    || element.getAttribute('aria-label')
-    || element.textContent,
-    160,
-  );
-  const completePriceValue = (value, structured = false) => {{
-    const hasCurrencySymbol = /[$€£¥₹₩₽₺₫₪₦₱₲₴₵₡₭₮₼₾]/.test(value);
-    const hasDecimalAmount = /\\d[\\d\\s]*[.,]\\d{{1,4}}/.test(value);
-    const hasCurrencyCode = /(?:[A-Z]{{3}}\\s*\\d|\\d[\\d\\s.,]*\\s*[A-Z]{{3}})/.test(value);
-    return Boolean(
-      /\\d/.test(value)
-      && (structured || hasCurrencySymbol || hasDecimalAmount || hasCurrencyCode)
+  const priceValue = (element) => {{
+    const accessibleValue = element.getAttribute('aria-label');
+    return compact(
+      element.getAttribute('content')
+      || element.getAttribute('data-price')
+      || element.getAttribute('value')
+      || (
+        accessibleValue
+        && accessiblePriceHasPaintedCorroboration(element, accessibleValue)
+          ? accessibleValue
+          : ''
+      )
+      || paintedText(element, 160),
+      160,
     );
   }};
+  const amountPattern = '\\\\p{{Nd}}(?:[\\\\p{{Nd}}\\\\s.,\\'’٬٫]*\\\\p{{Nd}})?';
+  const priceDecimalDigitMap = new Map(
+    Array.from({{length: 10}}, (_unused, digit) => [String(digit), String(digit)])
+  );
+  if (typeof Intl.supportedValuesOf === 'function') {{
+    for (const numberingSystem of Intl.supportedValuesOf('numberingSystem')) {{
+      try {{
+        const formatter = new Intl.NumberFormat('en', {{
+          numberingSystem,
+          useGrouping: false,
+          maximumFractionDigits: 0,
+        }});
+        for (let digit = 0; digit <= 9; digit += 1) {{
+          const rendered = formatter.format(digit).normalize('NFKC');
+          const digits = Array.from(rendered).filter((character) => /\\p{{Nd}}/u.test(character));
+          if (digits.length === 1) priceDecimalDigitMap.set(digits[0], String(digit));
+        }}
+      }} catch (_error) {{
+        // Ignore numbering systems that this browser cannot format.
+      }}
+    }}
+  }}
+  const canonicalPriceDigits = (value) => Array.from(String(value || ''))
+    .map((character) => priceDecimalDigitMap.get(character) || character)
+    .join('');
+  const supportedCurrencyCodes = new Set(
+    typeof Intl.supportedValuesOf === 'function'
+      ? Intl.supportedValuesOf('currency').map((value) => String(value).toUpperCase())
+      : []
+  );
+  const validLocaleTag = (value) => {{
+    const locale = String(value || '').trim();
+    if (!locale) return '';
+    try {{
+      return new Intl.Locale(locale).toString();
+    }} catch (_error) {{
+      return '';
+    }}
+  }};
+  const declaredPageLocale = validLocaleTag(
+    document.documentElement && document.documentElement.lang
+  );
+  const pageLocales = declaredPageLocale
+    ? [declaredPageLocale]
+    : Array.from(new Set([
+      ...(Array.isArray(navigator.languages) ? navigator.languages : []),
+      navigator.language,
+    ].map(validLocaleTag).filter(Boolean)));
+  const pageRegionCurrencyCodes = (() => {{
+    const codes = new Set();
+    for (const locale of pageLocales) {{
+      try {{
+        const region = new Intl.Locale(locale).maximize().region;
+        if (!region) continue;
+        for (const code of supportedCurrencyCodes) {{
+          if (code.startsWith(region)) codes.add(code);
+        }}
+      }} catch (_error) {{
+        // Ignore invalid or unsupported page locale tags.
+      }}
+    }}
+    return codes;
+  }})();
+  const canonicalCurrencyMarker = (value) => String(value || '')
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[\\s\\p{{Cf}}\\p{{P}}]+/gu, '')
+    .trim();
+  const currencyLocales = (code) => {{
+    const locales = new Set(pageLocales);
+    try {{
+      locales.add(
+        new Intl.Locale('und-' + String(code || '').slice(0, 2))
+          .maximize()
+          .toString()
+      );
+    }} catch (_error) {{
+      // Some non-geographic currency codes do not imply a usable locale.
+    }}
+    if (!locales.size) locales.add(undefined);
+    return locales;
+  }};
+  const currencyMarkerOwners = (() => {{
+    const owners = new Map();
+    const add = (value, code) => {{
+      const marker = canonicalCurrencyMarker(value);
+      if (!marker) return;
+      if (!owners.has(marker)) owners.set(marker, new Set());
+      owners.get(marker).add(code);
+    }};
+    for (const code of supportedCurrencyCodes) {{
+      add(code, code);
+      for (const locale of currencyLocales(code)) {{
+        for (const currencyDisplay of ['symbol', 'narrowSymbol', 'name']) {{
+          try {{
+            const part = new Intl.NumberFormat(locale, {{
+              style: 'currency', currency: code, currencyDisplay,
+            }}).formatToParts(1).find((candidate) => candidate.type === 'currency');
+            if (!part || !part.value) continue;
+            add(part.value, code);
+            if (/\\p{{Sc}}/u.test(part.value)) {{
+              add(code.slice(0, 2) + part.value, code);
+            }}
+            const letterRuns = part.value.match(/\\p{{L}}+/gu) || [];
+            const terminalRun = letterRuns[letterRuns.length - 1] || '';
+            const characters = Array.from(terminalRun);
+            if (characters.some((character) => character.codePointAt(0) > 127)) {{
+              for (let length = 3; length <= Math.min(4, characters.length); length += 1) {{
+                add(characters.slice(0, length).join(''), code);
+              }}
+            }}
+            if (/[\\p{{Script=Han}}\\p{{Script=Hangul}}]/u.test(terminalRun)) {{
+              add(terminalRun, code);
+            }}
+            if (/\\p{{Script=Han}}/u.test(terminalRun) && characters.length > 1) {{
+              add(characters[characters.length - 1], code);
+            }}
+          }} catch (_error) {{
+            // Ignore unsupported locale/currency display combinations.
+          }}
+        }}
+      }}
+    }}
+    return owners;
+  }})();
+  const localizedCurrencyMarker = (value) => (
+    currencyMarkerOwners.has(canonicalCurrencyMarker(value))
+  );
+  const validCurrencyMarker = (value) => {{
+    const marker = String(value || '').trim();
+    if (!marker) return false;
+    if (/^(?:[A-Z]{{3}})$/u.test(marker)) {{
+      return supportedCurrencyCodes.has(marker.toUpperCase());
+    }}
+    if (/^[A-Za-z]$/u.test(marker)) return false;
+    return localizedCurrencyMarker(marker);
+  }};
+  const normalizedCompletePriceValue = (
+    value,
+    structured = false,
+    strongVisual = false,
+  ) => {{
+    const normalized = String(value || '').normalize('NFKC').trim();
+    if (!/\\p{{Nd}}/u.test(normalized)) return '';
+    const amountOnly = new RegExp('^(?:' + amountPattern + ')$', 'u');
+    if (amountOnly.test(normalized)) {{
+      if (structured) return normalized;
+      return (
+        strongVisual
+        && new RegExp('[.,٫]\\\\p{{Nd}}{{1,4}}$', 'u').test(normalized)
+      ) ? normalized : '';
+    }}
+    const prefixed = normalized.match(
+      new RegExp('^(.+?)\\\\s*(' + amountPattern + ')$', 'u')
+    );
+    if (prefixed && validCurrencyMarker(prefixed[1])) {{
+      const marker = prefixed[1].trim();
+      if (/\\p{{Sc}}/u.test(marker)) {{
+        return marker + prefixed[2].replace(/\\s*([.,٫])\\s*/gu, '$1');
+      }}
+      return normalized;
+    }}
+    const suffixed = normalized.match(
+      new RegExp('^(' + amountPattern + ')\\\\s*(.+?)$', 'u')
+    );
+    if (suffixed && validCurrencyMarker(suffixed[2])) return normalized;
+
+    const markerCandidates = (segment, fromEnd) => {{
+      const characters = Array.from(segment);
+      const candidates = [];
+      for (let index = 0; index < characters.length; index += 1) {{
+        const rawMarker = (
+          fromEnd
+            ? characters.slice(index).join('')
+            : characters.slice(0, characters.length - index).join('')
+        );
+        const marker = rawMarker.trim();
+        const boundaryCharacter = fromEnd
+          ? characters[index - 1]
+          : characters[characters.length - index];
+        const asciiLetterMarker = /[A-Za-z]/u.test(marker);
+        if (
+          marker
+          && validCurrencyMarker(marker)
+          && !(
+            asciiLetterMarker
+            && boundaryCharacter
+            && /[\\p{{L}}\\p{{N}}]/u.test(boundaryCharacter)
+          )
+        ) {{
+          candidates.push({{
+            marker,
+            consumedLength: Array.from(rawMarker).length,
+          }});
+        }}
+      }}
+      candidates.sort(
+        (left, right) => (
+          Array.from(right.marker).length - Array.from(left.marker).length
+        )
+      );
+      return candidates;
+    }};
+    const hasSubstantiveRemainder = (value) => /[\\p{{L}}\\p{{N}}\\p{{Sc}}]/u.test(
+      String(value || '')
+    );
+    const amountMatches = Array.from(
+      normalized.matchAll(new RegExp(amountPattern, 'gu'))
+    );
+    const monetaryTokens = [];
+    for (const match of amountMatches) {{
+      const amount = match[0];
+      const start = Number(match.index || 0);
+      const end = start + amount.length;
+      const beforeMarkers = markerCandidates(normalized.slice(0, start), true);
+      if (beforeMarkers.length) {{
+        monetaryTokens.push({{
+          marker: beforeMarkers[0].marker,
+          markerBefore: true,
+          start: start - beforeMarkers[0].consumedLength,
+          end,
+          amount,
+        }});
+      }}
+      const afterText = normalized.slice(end);
+      const afterMarkers = markerCandidates(afterText, false);
+      if (afterMarkers.length) {{
+        monetaryTokens.push({{
+          marker: afterMarkers[0].marker,
+          markerBefore: false,
+          start,
+          end: end + afterMarkers[0].consumedLength,
+          amount,
+        }});
+      }}
+    }}
+    const uniqueTokens = monetaryTokens.filter((token, index, tokens) => (
+      tokens.findIndex((candidate) => (
+        candidate.start === token.start
+        && candidate.end === token.end
+        && canonicalCurrencyMarker(candidate.marker) === canonicalCurrencyMarker(token.marker)
+      )) === index
+    ));
+    if (uniqueTokens.length !== 1) return '';
+    const token = uniqueTokens[0];
+    const beforeRemainder = normalized.slice(0, Math.max(0, token.start));
+    const afterRemainder = normalized.slice(token.end);
+    if (hasSubstantiveRemainder(afterRemainder)) return '';
+    const strongVisualLeadingLabel = (
+      strongVisual
+      && !/\\p{{Nd}}/u.test(beforeRemainder)
+    );
+    if (
+      hasSubstantiveRemainder(beforeRemainder)
+      && !/\\p{{L}}/u.test(token.marker)
+      // An exact price field may include a nonnumeric label before one terminal amount.
+      && !strongVisualLeadingLabel
+    ) return '';
+    return normalized.slice(Math.max(0, token.start), token.end).trim();
+  }};
+  const completePriceValue = (value, structured = false, strongVisual = false) => Boolean(
+    normalizedCompletePriceValue(value, structured, strongVisual)
+  );
+  const accessiblePriceHasPaintedCorroboration = (element, value) => {{
+    const normalized = normalizedCompletePriceValue(value, false, false);
+    const rendered = paintedText(element, 160);
+    if (!normalized || !rendered) return false;
+    const normalizedDigits = canonicalPriceDigits(normalized).replace(/[^0-9]/g, '');
+    const renderedDigits = canonicalPriceDigits(rendered).replace(/[^0-9]/g, '');
+    if (!normalizedDigits || normalizedDigits !== renderedDigits) return false;
+    const marker = canonicalCurrencyMarker(
+      canonicalPriceDigits(normalized).replace(/[0-9\\s.,'’٬٫]/g, '')
+    );
+    const renderedMarker = canonicalCurrencyMarker(
+      canonicalPriceDigits(rendered).replace(/[0-9\\s.,'’٬٫]/g, '')
+    );
+    return Boolean(marker && renderedMarker.includes(marker));
+  }};
+  const accessiblePriceHasPaintedMonetaryContext = (element) => Boolean(
+    normalizedCompletePriceValue(paintedText(element, 160), false, true)
+  );
   const semanticallyExposed = (element, boundary) => {{
     let current = element;
     while (current && current !== boundary) {{
       if (current.getAttribute && current.getAttribute('aria-hidden') === 'true') return false;
       const style = window.getComputedStyle(current);
-      if (style.visibility === 'hidden' || style.display === 'none') return false;
+      if (
+        style.visibility === 'hidden'
+        || style.display === 'none'
+        || style.contentVisibility === 'hidden'
+        || Number.parseFloat(style.opacity) === 0
+        || styleSuppressesPaint(current, style)
+      ) return false;
+      if (
+        typeof current.checkVisibility === 'function'
+        && !current.checkVisibility({{
+          checkOpacity: true,
+          checkVisibilityCSS: true,
+          contentVisibilityAuto: true,
+        }})
+      ) return false;
       current = current.parentElement;
     }}
     return true;
   }};
-  const priceCandidates = [];
-  for (const element of priceElements) {{
-    if (element.tagName !== 'META' && !visible(element)) continue;
-    const isStructuredPrice = element.matches(
-      'meta[itemprop="price"], [itemprop="price"], [data-price]'
+  const matchedPriceElements = Array.from(root.querySelectorAll(priceSelectors));
+  const allPriceElements = [
+    ...matchedPriceElements.filter((element) => element.matches('[itemprop~="price"], [data-price]')).slice(0, 80),
+    ...matchedPriceElements.filter((element) => !element.matches('[itemprop~="price"], [data-price]')).slice(0, 160),
+  ].filter((element, index, elements) => elements.indexOf(element) === index);
+  const isAttributePrice = (element) => element.matches(
+    '[itemprop~="price"], [data-price]'
+  );
+  const isExactVisualPrice = (element) => Boolean(
+    Array.from(element.classList || []).some((name) => name.toLocaleLowerCase() === 'price')
+    || String(element.id || '').toLocaleLowerCase() === 'price'
+  );
+  const isStrongVisualPrice = (element) => element.matches(priceSelectors);
+  const schemaAwarePriceValue = (element, explicitValue = null) => {{
+    const value = explicitValue === null ? priceValue(element) : compact(explicitValue, 160);
+    if (!element.matches('[itemprop~="price"]')) return value;
+    const owner = element.closest('[itemscope]') || element.parentElement;
+    if (!owner || !root.contains(owner)) return value;
+    const currencyElement = Array.from(
+      owner.querySelectorAll('[itemprop~="priceCurrency"]')
+    ).find((candidate) => candidate.closest('[itemscope]') === owner);
+    if (!currencyElement) return value;
+    const currency = compact(
+      currencyElement.getAttribute('content')
+      || currencyElement.getAttribute('value')
+      || currencyElement.textContent,
+      16,
+    ).toUpperCase();
+    if (!supportedCurrencyCodes.has(currency)) return value;
+    if (!new RegExp('^(?:' + amountPattern + ')$', 'u').test(value)) return value;
+    return currency + ' ' + value;
+  }};
+  const ambiguousSplitAmount = (element, value) => {{
+    if (/[.,٫]\\s*\\p{{Nd}}{{1,4}}(?:\\D*)$/u.test(String(value || ''))) return false;
+    const directNumericTextParts = Array.from(element.childNodes || []).filter(
+      (candidate) => (
+        candidate.nodeType === Node.TEXT_NODE
+        && /\\p{{Nd}}/u.test(String(candidate.nodeValue || ''))
+      )
     );
-    const atomicElements = Array.from(element.querySelectorAll('*'))
-      .filter((candidate) => semanticallyExposed(candidate, element))
+    const numericLeaves = Array.from(element.querySelectorAll('*')).filter((candidate) => {{
+      if (!semanticallyExposed(candidate, element)) return false;
+      if (!/^\\p{{Nd}}+$/u.test(String(candidate.textContent || '').trim())) return false;
+      return !Array.from(candidate.children).some(
+        (child) => /\\p{{Nd}}/u.test(String(child.textContent || ''))
+      );
+    }});
+    return directNumericTextParts.length + numericLeaves.length >= 2;
+  }};
+  const rawPriceSources = [];
+  const addRawPriceSource = (element, value, source, structured, rendered) => {{
+    const strictNormalizedValue = normalizedCompletePriceValue(
+      value,
+      structured,
+      false,
+    );
+    const labeledVisual = Boolean(
+      !strictNormalizedValue
+      && !structured
+      && isStrongVisualPrice(element)
+    );
+    const normalizedValue = strictNormalizedValue || (
+      labeledVisual
+        ? normalizedCompletePriceValue(value, false, true)
+        : ''
+    );
+    if (!normalizedValue) return;
+    if (labeledVisual && !isExactVisualPrice(element)) {{
+      const marker = canonicalCurrencyMarker(
+        canonicalPriceDigits(normalizedValue).replace(/[0-9\\s.,'’٬٫]/g, '')
+      );
+      if (!marker || !validCurrencyMarker(marker)) return;
+    }}
+    if (rendered && ambiguousSplitAmount(element, normalizedValue)) return;
+    if (rawPriceSources.some(
+      (candidate) => candidate.element === element && candidate.value === normalizedValue
+    )) return;
+    rawPriceSources.push({{
+      element,
+      value: normalizedValue,
+      source,
+      structured,
+      labeledVisual,
+    }});
+  }};
+  for (const element of allPriceElements.filter(isAttributePrice)) {{
+    if (element.tagName !== 'META' && !paintVisible(element)) continue;
+    addRawPriceSource(
+      element,
+      schemaAwarePriceValue(element),
+      element.matches('[itemprop~="price"]') ? 'schema_property' : 'dom_attribute',
+      true,
+      false,
+    );
+  }}
+  const visualPriceRoots = allPriceElements
+    .filter((element) => !isAttributePrice(element))
+    .filter((element, _index, candidates) =>
+      !candidates.some((candidate) => candidate !== element && candidate.contains(element))
+  );
+  for (const element of visualPriceRoots) {{
+    if (!paintVisible(element)) continue;
+    const atomicElements = [element, ...Array.from(element.querySelectorAll('*'))]
+      .filter((candidate) => semanticallyExposed(candidate, root))
       .map((candidate) => ({{
         element: candidate,
-        value: priceValue(candidate),
-        structured: candidate.matches(
-          'meta[itemprop="price"], [itemprop="price"], [data-price]'
-        ),
+        value: schemaAwarePriceValue(candidate),
+        structured: isAttributePrice(candidate),
       }}))
-      .filter((candidate) => completePriceValue(candidate.value, candidate.structured));
+      .filter((candidate) => completePriceValue(
+        candidate.value,
+        candidate.structured,
+        isStrongVisualPrice(candidate.element),
+      ) && !ambiguousSplitAmount(candidate.element, candidate.value));
     const deepestAtomicElements = atomicElements.filter(
       (candidate) => !atomicElements.some(
         (other) => other !== candidate && candidate.element.contains(other.element)
       )
     );
-    const values = deepestAtomicElements.length
-      ? Array.from(new Set(deepestAtomicElements.map((candidate) => candidate.value)))
-      : [priceValue(element)];
-    for (const value of values) {{
-      if (!completePriceValue(value, isStructuredPrice)) continue;
-      if (!priceCandidates.includes(value)) priceCandidates.push(value);
+    const sources = deepestAtomicElements.length
+      ? deepestAtomicElements
+      : [{{element, value: priceValue(element), structured: false}}];
+    for (const source of sources) {{
+      addRawPriceSource(
+        source.element,
+        source.value,
+        source.structured ? 'dom_attribute' : 'rendered_dom',
+        source.structured,
+        !source.structured,
+      );
     }}
-    if (priceCandidates.length >= 8) break;
   }}
-  const availability = firstContent([
-    'link[itemprop="availability"]',
-    'meta[itemprop="availability"]',
-    '[itemprop="availability"]',
+  for (const element of allPriceElements) {{
+    if (element.tagName === 'META' || !paintVisible(element)) continue;
+    const renderedValue = paintedText(element, 160);
+    if (renderedValue) {{
+      addRawPriceSource(element, renderedValue, 'rendered_dom', false, true);
+    }}
+    const ariaValue = compact(element.getAttribute('aria-label'), 160);
+    if (ariaValue && accessiblePriceHasPaintedMonetaryContext(element)) {{
+      addRawPriceSource(element, ariaValue, 'accessibility_attribute', false, false);
+    }}
+    const dataValue = compact(element.getAttribute('data-price'), 160);
+    if (dataValue) {{
+      addRawPriceSource(element, dataValue, 'dom_attribute', true, false);
+    }}
+  }}
+  const schemaTypeName = (element) => {{
+    const types = String(element.getAttribute('itemtype') || '').split(/\s+/).filter(Boolean);
+    for (const type of types) {{
+      const name = String(type.split(/[\/#]/).filter(Boolean).pop() || '').toLowerCase();
+      if (name === 'offer' || name === 'product') return name;
+    }}
+    return '';
+  }};
+  const schemaPriceRole = (element) => {{
+    if (!element.matches('[itemprop~="price"]')) return '';
+    let current = element;
+    while (current && root.contains(current)) {{
+      const typeName = schemaTypeName(current);
+      if (typeName === 'offer') return 'schema_offer_price';
+      if (typeName === 'product') return 'schema_product_price';
+      if (current !== element && current.matches('[itemprop~="offers"]')) {{
+        return 'schema_offer_price';
+      }}
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    return '';
+  }};
+  const selectedProductOwner = (() => {{
+    let current = titleElement;
+    while (current && root.contains(current)) {{
+      if (schemaTypeName(current) === 'product') return current;
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    return null;
+  }})();
+  const directSelectionState = (element) => {{
+    if (element.tagName === 'LABEL' && element.control) {{
+      const delegated = directSelectionState(element.control);
+      return delegated ? {{...delegated, group: element}} : null;
+    }}
+    const role = String(element.getAttribute('role') || '').toLocaleLowerCase();
+    const nativeRadio = element.matches('input[type="radio"]');
+    const nativeOption = element.matches('option');
+    const offerControl = nativeRadio || nativeOption || role === 'radio' || role === 'option';
+    if (!offerControl) return null;
+    let state = '';
+    for (const attribute of ['aria-selected', 'aria-checked']) {{
+      const value = element.getAttribute(attribute);
+      if (value === 'true') state = 'selected';
+      if (value === 'false') state = 'unselected';
+      if (state) break;
+    }}
+    if (!state && nativeRadio) state = element.checked ? 'selected' : 'unselected';
+    if (!state && nativeOption) state = element.selected ? 'selected' : 'unselected';
+    return state ? {{state, group: element, control: element}} : null;
+  }};
+  const offerControlHasPeers = (control) => {{
+    if (!control) return false;
+    if (control.matches('option')) {{
+      return Boolean(control.closest('select')?.querySelectorAll('option').length >= 2);
+    }}
+    if (control.matches('input[type="radio"]')) {{
+      const name = String(control.getAttribute('name') || '');
+      if (name) {{
+        const peers = Array.from(root.querySelectorAll('input[type="radio"]'))
+          .filter((candidate) => String(candidate.getAttribute('name') || '') === name);
+        if (peers.length >= 2) return true;
+      }}
+    }}
+    let current = control.parentElement;
+    let depth = 0;
+    while (current && root.contains(current) && current !== root && depth < 4) {{
+      const peers = current.querySelectorAll(
+        'input[type="radio"], option, [role="radio"], [role="option"]'
+      );
+      if (peers.length >= 2) return true;
+      current = current.parentElement;
+      depth += 1;
+    }}
+    return false;
+  }};
+  const nearestLocalControl = (element, selector) => {{
+    let current = element.parentElement;
+    let depth = 0;
+    while (current && root.contains(current) && current !== root && depth < 4) {{
+      if (current.contains(titleElement)) break;
+      const controls = Array.from(current.querySelectorAll(selector));
+      const localPrices = Array.from(current.querySelectorAll(priceSelectors));
+      if (controls.length === 1 && localPrices.length === 1) {{
+        return {{control: controls[0], group: current}};
+      }}
+      current = current.parentElement;
+      depth += 1;
+    }}
+    return null;
+  }};
+  const selectionContext = (element) => {{
+    let current = element;
+    while (current && root.contains(current)) {{
+      const directState = directSelectionState(current);
+      if (directState && offerControlHasPeers(directState.control)) return directState;
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    const local = nearestLocalControl(
+      element,
+      'input[type="radio"], option, [role="radio"], [role="option"]',
+    );
+    if (local) {{
+      const state = directSelectionState(local.control);
+      if (state && offerControlHasPeers(state.control)) return {{...state, group: local.group}};
+    }}
+    return {{state: '', group: null}};
+  }};
+  const nonOfferControlContext = (element) => {{
+    let current = element;
+    while (current && root.contains(current)) {{
+      const role = String(current.getAttribute('role') || '').toLocaleLowerCase();
+      if (
+        role === 'checkbox'
+        || role === 'switch'
+        || current.matches('input[type="checkbox"]')
+      ) return true;
+      if (
+        (role === 'radio' || role === 'option' || current.matches('input[type="radio"], option'))
+        && !offerControlHasPeers(current)
+      ) return true;
+      if (
+        current.tagName === 'LABEL'
+        && current.control
+        && current.control.matches('input[type="checkbox"]')
+      ) return true;
+      if (
+        current.tagName === 'LABEL'
+        && current.control
+        && current.control.matches('input[type="radio"]')
+        && !offerControlHasPeers(current.control)
+      ) return true;
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    let local = element.parentElement;
+    let depth = 0;
+    while (local && root.contains(local) && local !== root && depth < 4) {{
+      if (local.contains(titleElement)) break;
+      const localCheckboxes = Array.from(
+        local.querySelectorAll('input[type="checkbox"], [role="checkbox"], [role="switch"]')
+      );
+      const localPrices = Array.from(local.querySelectorAll(priceSelectors));
+      const hasDirectCheckbox = localCheckboxes.some(
+        (candidate) => candidate.parentElement === local
+      );
+      if (
+        localCheckboxes.length === 1
+        && localPrices.length >= 1
+        && (hasDirectCheckbox || localPrices.length === 1)
+      ) return true;
+      local = local.parentElement;
+      depth += 1;
+    }}
+    const localRadio = nearestLocalControl(
+      element,
+      'input[type="radio"], option, [role="radio"], [role="option"]',
+    );
+    return Boolean(
+      localRadio
+      && !offerControlHasPeers(localRadio.control)
+    );
+  }};
+  const distinctRecordIsland = (element) => {{
+    let current = element;
+    while (current && root.contains(current)) {{
+      const isBoundary = current.matches(
+        'article, li, [role="article"], [role="listitem"], [itemprop~="itemListElement"], [itemscope]'
+      );
+      const schemaType = schemaTypeName(current);
+      const offerRelation = current.closest('[itemprop~="offers"]');
+      const isOwnedOffer = Boolean(
+        selectedProductOwner
+        && offerRelation
+        && selectedProductOwner.contains(offerRelation)
+        && (
+          schemaType === 'offer'
+          || current.matches('[itemprop~="offers"]')
+        )
+      );
+      if (isBoundary && !current.contains(titleElement)) {{
+        if (isOwnedOffer) {{
+          current = current.parentElement;
+          continue;
+        }}
+        const recordHeading = current.querySelector(
+          'h1, h2, h3, [role="heading"], [itemprop~="name"]'
+        );
+        const selection = selectionContext(element);
+        const isSelectableOfferBoundary = Boolean(
+          selection.group
+          && current.contains(selection.group)
+          && !current.querySelector('a[href]')
+        );
+        if (isSelectableOfferBoundary) {{
+          current = current.parentElement;
+          continue;
+        }}
+        const ownRecordSignal = Boolean(
+          schemaType === 'offer'
+          || current.matches('[itemprop~="itemListElement"]')
+          || recordHeading
+          || current.querySelector('a[href]')
+        );
+        if (ownRecordSignal) return true;
+      }}
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    return false;
+  }};
+  const struckOrListValue = (element) => {{
+    let current = element;
+    while (current && root.contains(current)) {{
+      if (current.matches('s, del, [itemprop~="highPrice"], [itemprop~="lowPrice"]')) return true;
+      const style = window.getComputedStyle(current);
+      if (String(style.textDecorationLine || style.textDecoration || '').includes('line-through')) {{
+        return true;
+      }}
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    return false;
+  }};
+  const visualProminence = (element) => {{
+    if (element.tagName === 'META' || !paintVisible(element)) return null;
+    const visibleParts = [element, ...Array.from(element.querySelectorAll('*'))]
+      .filter((candidate) => paintVisible(candidate) && semanticallyExposed(candidate, root));
+    let prominentPart = element;
+    let prominentScore = 0;
+    for (const candidate of visibleParts) {{
+      const candidateStyle = window.getComputedStyle(candidate);
+      const candidateSize = Number.parseFloat(candidateStyle.fontSize) || 0;
+      const candidateParsedWeight = Number.parseFloat(candidateStyle.fontWeight);
+      const candidateWeight = Number.isFinite(candidateParsedWeight)
+        ? candidateParsedWeight
+        : (candidateStyle.fontWeight === 'bold' ? 700 : 400);
+      const candidateScore = candidateSize
+        * (0.75 + Math.min(900, Math.max(100, candidateWeight)) / 1600);
+      if (candidateScore > prominentScore) {{
+        prominentPart = candidate;
+        prominentScore = candidateScore;
+      }}
+    }}
+    const style = window.getComputedStyle(prominentPart);
+    const rect = element.getBoundingClientRect();
+    const fontSize = Number.parseFloat(style.fontSize) || 0;
+    const parsedWeight = Number.parseFloat(style.fontWeight);
+    const fontWeight = Number.isFinite(parsedWeight)
+      ? parsedWeight
+      : (style.fontWeight === 'bold' ? 700 : 400);
+    return {{
+      font_size_px: Math.round(fontSize * 100) / 100,
+      font_weight: Math.round(fontWeight),
+      area_px2: Math.round(Math.max(0, rect.width * rect.height)),
+      score: prominentScore,
+    }};
+  }};
+  const priceObservations = rawPriceSources.slice(0, 40).map((source) => {{
+    const selection = selectionContext(source.element);
+    const schemaRole = schemaPriceRole(source.element);
+    const role = schemaRole
+      || (selection.state === 'selected' ? 'selected_offer_price' : 'primary_record_price');
+    const reasons = [];
+    if (distinctRecordIsland(source.element)) reasons.push('distinct_record_island');
+    if (struckOrListValue(source.element)) reasons.push('struck_or_list_value');
+    if (selection.state === 'unselected') reasons.push('explicitly_unselected_offer');
+    if (nonOfferControlContext(source.element)) reasons.push('non_offer_control_price');
+    return {{
+      ...source,
+      role,
+      roleRank: schemaRole ? 3 : (selection.state === 'selected' ? 2 : 1),
+      selectionState: selection.state,
+      selectionGroup: selection.group,
+      prominence: visualProminence(source.element),
+      reasons,
+      eligible: reasons.length === 0,
+    }};
+  }});
+  const nearestCommonAncestor = (left, right) => {{
+    const ancestors = new Set();
+    let current = left;
+    while (current && root.contains(current)) {{
+      ancestors.add(current);
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    current = right;
+    while (current && root.contains(current)) {{
+      if (ancestors.has(current)) return current;
+      if (current === root) break;
+      current = current.parentElement;
+    }}
+    return null;
+  }};
+  const distanceToAncestor = (element, ancestor) => {{
+    let distance = 0;
+    let current = element;
+    while (current && current !== ancestor) {{
+      distance += 1;
+      current = current.parentElement;
+    }}
+    return current === ancestor ? distance : Number.POSITIVE_INFINITY;
+  }};
+  const sameLocalPriceContext = (left, right) => {{
+    if (left.selectionGroup || right.selectionGroup) {{
+      return Boolean(
+        left.selectionGroup
+        && right.selectionGroup
+        && left.selectionGroup === right.selectionGroup
+      );
+    }}
+    const ancestor = nearestCommonAncestor(left.element, right.element);
+    if (!ancestor) return false;
+    return distanceToAncestor(left.element, ancestor) + distanceToAncestor(right.element, ancestor) <= 6;
+  }};
+  const samePriceEvidenceContext = (left, right) => {{
+    if (sameLocalPriceContext(left, right)) return true;
+    return Boolean(
+      (
+        left.roleRank === 3
+        && right.role === 'primary_record_price'
+        && !right.selectionGroup
+      )
+      || (
+        right.roleRank === 3
+        && left.role === 'primary_record_price'
+        && !left.selectionGroup
+      )
+    );
+  }};
+  const priceAmountIdentity = (value) => {{
+    let numeric = (
+      canonicalPriceDigits(String(value || '').normalize('NFKC'))
+        .match(/[0-9]+(?:[.,'’٬٫][0-9]+)*/g) || []
+    ).join('').replace(/[\\s'’٬]/g, '').replace(/٫/g, '.');
+    if (!numeric) return '';
+    const lastDot = numeric.lastIndexOf('.');
+    const lastComma = numeric.lastIndexOf(',');
+    let decimalIndex = -1;
+    if (lastDot >= 0 && lastComma >= 0) {{
+      decimalIndex = Math.max(lastDot, lastComma);
+    }} else {{
+      const separatorIndex = Math.max(lastDot, lastComma);
+      if (separatorIndex >= 0) {{
+        const trailingDigits = numeric.length - separatorIndex - 1;
+        const separatorCount = (numeric.match(/[.,]/g) || []).length;
+        if (separatorCount === 1 && trailingDigits === 3) {{
+          return 'ambiguous:' + numeric;
+        }}
+        if (trailingDigits > 0 && trailingDigits !== 3) decimalIndex = separatorIndex;
+      }}
+    }}
+    let whole;
+    let fraction = '';
+    if (decimalIndex >= 0) {{
+      whole = numeric.slice(0, decimalIndex).replace(/[.,]/g, '');
+      fraction = numeric.slice(decimalIndex + 1).replace(/[.,]/g, '').replace(/0+$/, '');
+    }} else {{
+      whole = numeric.replace(/[.,]/g, '');
+    }}
+    whole = whole.replace(/^0+/, '') || '0';
+    return fraction ? whole + '.' + fraction : whole;
+  }};
+  const priceMarkerIdentity = (value) => canonicalCurrencyMarker(
+    canonicalPriceDigits(String(value || '').normalize('NFKC'))
+      .replace(/[0-9\\s.,'’٬٫]/g, '')
+  );
+  const priceMarkerOwners = (value) => {{
+    const marker = priceMarkerIdentity(value);
+    return marker ? (currencyMarkerOwners.get(marker) || new Set()) : new Set();
+  }};
+  const priceEvidenceConflicts = (leftValue, rightValue) => {{
+    const leftAmount = priceAmountIdentity(leftValue);
+    const rightAmount = priceAmountIdentity(rightValue);
+    if (!leftAmount || !rightAmount) return false;
+    if (leftAmount !== rightAmount) return true;
+    const leftMarker = priceMarkerIdentity(leftValue);
+    const rightMarker = priceMarkerIdentity(rightValue);
+    if (!leftMarker || !rightMarker) return false;
+    const leftOwners = priceMarkerOwners(leftValue);
+    const rightOwners = priceMarkerOwners(rightValue);
+    if (leftOwners.size && rightOwners.size) {{
+      const ambiguousLocalizedMarker = (marker, owners) => Boolean(
+        marker
+        && /\\p{{L}}/u.test(marker)
+        && !/\\p{{Sc}}/u.test(marker)
+        && owners.size > 1
+      );
+      const leftAmbiguous = ambiguousLocalizedMarker(leftMarker, leftOwners);
+      const rightAmbiguous = ambiguousLocalizedMarker(rightMarker, rightOwners);
+      if (
+        [...leftOwners].some((code) => rightOwners.has(code))
+        && !leftAmbiguous
+        && !rightAmbiguous
+      ) return false;
+      const ambiguousRegionalMarker = (marker, owners, otherOwners) => Boolean(
+        ambiguousLocalizedMarker(marker, owners)
+        && [...otherOwners].some((code) => pageRegionCurrencyCodes.has(code))
+      );
+      if (
+        ambiguousRegionalMarker(leftMarker, leftOwners, rightOwners)
+        || ambiguousRegionalMarker(rightMarker, rightOwners, leftOwners)
+      ) return false;
+      return true;
+    }}
+    return leftMarker !== rightMarker;
+  }};
+  for (const candidate of priceObservations) {{
+    if (!candidate.labeledVisual) continue;
+    const hasIndependentTypedOwnerPrice = priceObservations.some((other) => (
+      other !== candidate
+      && other.structured
+      && !other.labeledVisual
+      && other.eligible
+      && samePriceEvidenceContext(candidate, other)
+    ));
+    if (!hasIndependentTypedOwnerPrice) {{
+      candidate.reasons.push('uncorroborated_labeled_visual_price');
+      candidate.eligible = false;
+    }}
+  }}
+  let hasPriceConflict = false;
+  for (const selected of priceObservations) {{
+    if (
+      !selected.eligible
+      || selected.role !== 'selected_offer_price'
+      || !selected.selectionGroup
+    ) continue;
+    for (const primary of priceObservations) {{
+      if (
+        !primary.eligible
+        || primary.role !== 'primary_record_price'
+        || primary.selectionGroup
+      ) continue;
+      const ambiguityRank = Math.max(selected.roleRank, primary.roleRank);
+      selected.roleRank = ambiguityRank;
+      primary.roleRank = ambiguityRank;
+      selected.priceConflict = true;
+      primary.priceConflict = true;
+      hasPriceConflict = true;
+    }}
+  }}
+  for (let leftIndex = 0; leftIndex < priceObservations.length; leftIndex += 1) {{
+    const left = priceObservations[leftIndex];
+    if (!left.eligible) continue;
+    for (let rightIndex = leftIndex + 1; rightIndex < priceObservations.length; rightIndex += 1) {{
+      const right = priceObservations[rightIndex];
+      if (!right.eligible || !samePriceEvidenceContext(left, right)) continue;
+      const evidenceChannelsConflict = left.element === right.element
+        || left.roleRank === 3
+        || right.roleRank === 3;
+      if (!evidenceChannelsConflict) continue;
+      if (!priceEvidenceConflicts(left.value, right.value)) continue;
+      const conflictRank = Math.max(left.roleRank, right.roleRank);
+      left.roleRank = conflictRank;
+      right.roleRank = conflictRank;
+      left.priceConflict = true;
+      right.priceConflict = true;
+      hasPriceConflict = true;
+    }}
+  }}
+  const preliminaryStrongestPriceRole = Math.max(
+    0,
+    ...priceObservations
+      .filter((candidate) => candidate.eligible && !candidate.priceConflict)
+      .map((candidate) => candidate.roleRank),
+  );
+  const preliminaryLeaders = priceObservations.filter(
+    (candidate) => (
+      candidate.eligible
+      && !candidate.priceConflict
+      && candidate.roleRank === preliminaryStrongestPriceRole
+    )
+  );
+  const preliminaryLeaderValues = Array.from(new Set(
+    preliminaryLeaders.map((candidate) => candidate.value)
+  ));
+  if (preliminaryLeaderValues.length === 1) {{
+    const leaderValue = preliminaryLeaderValues[0];
+    const compatibleAliases = priceObservations.filter((candidate) => (
+      candidate.eligible
+      && !candidate.priceConflict
+      && candidate.value !== leaderValue
+      && !priceEvidenceConflicts(leaderValue, candidate.value)
+    ));
+    let aliasesConflict = false;
+    for (let leftIndex = 0; leftIndex < compatibleAliases.length; leftIndex += 1) {{
+      for (
+        let rightIndex = leftIndex + 1;
+        rightIndex < compatibleAliases.length;
+        rightIndex += 1
+      ) {{
+        if (priceEvidenceConflicts(
+          compatibleAliases[leftIndex].value,
+          compatibleAliases[rightIndex].value,
+        )) {{
+          aliasesConflict = true;
+        }}
+      }}
+    }}
+    if (aliasesConflict) {{
+      for (const candidate of [...preliminaryLeaders, ...compatibleAliases]) {{
+        candidate.roleRank = preliminaryStrongestPriceRole;
+        candidate.priceConflict = true;
+      }}
+      hasPriceConflict = true;
+    }}
+  }}
+  for (const candidate of priceObservations) {{
+    if (
+      !candidate.eligible
+      || !candidate.prominence
+      || candidate.roleRank === 3
+      || candidate.priceConflict
+    ) continue;
+    const dominantPeer = priceObservations.find((other) => {{
+      if (
+        other === candidate
+        || !other.eligible
+        || other.priceConflict
+        || !other.prominence
+        || other.roleRank !== candidate.roleRank
+        || other.value === candidate.value
+        || !sameLocalPriceContext(candidate, other)
+      ) return false;
+      return Boolean(
+        other.prominence.font_size_px >= candidate.prominence.font_size_px * 1.35
+        || (
+          other.prominence.score >= candidate.prominence.score * 1.35
+          && other.prominence.font_size_px > candidate.prominence.font_size_px
+        )
+      );
+    }});
+    if (dominantPeer) {{
+      candidate.reasons.push('subordinate_visual_prominence');
+      candidate.eligible = false;
+    }}
+  }}
+  const strongestPriceRole = Math.max(
+    0,
+    ...priceObservations.filter((candidate) => candidate.eligible).map((candidate) => candidate.roleRank),
+  );
+  const strongestPriceValues = [];
+  for (const candidate of priceObservations) {{
+    if (!candidate.eligible || candidate.roleRank !== strongestPriceRole) continue;
+    if (!strongestPriceValues.includes(candidate.value)) {{
+      strongestPriceValues.push(candidate.value);
+    }}
+    if (strongestPriceValues.length >= 8) break;
+  }}
+  const strongestValuesAreEquivalent = strongestPriceValues.every(
+    (left, leftIndex) => strongestPriceValues.slice(leftIndex + 1).every(
+      (right) => !priceEvidenceConflicts(left, right)
+    )
+  );
+  const priceCandidates = strongestValuesAreEquivalent
+    ? strongestPriceValues.slice(0, 1)
+    : [...strongestPriceValues];
+  const priceAliases = strongestValuesAreEquivalent
+    ? strongestPriceValues.slice(1)
+    : [];
+  if (priceCandidates.length === 1) {{
+    const selectedPrice = priceCandidates[0];
+    for (const candidate of priceObservations) {{
+      if (
+        !candidate.eligible
+        || candidate.priceConflict
+        || candidate.value === selectedPrice
+        || priceEvidenceConflicts(selectedPrice, candidate.value)
+        || priceAliases.some((alias) => priceEvidenceConflicts(alias, candidate.value))
+      ) continue;
+      if (!priceAliases.includes(candidate.value)) priceAliases.push(candidate.value);
+      if (priceAliases.length >= 8) break;
+    }}
+  }}
+  const auditPriceObservations = priceObservations.slice(0, 24).map((candidate) => {{
+    const status = candidate.reasons.length
+      ? 'excluded'
+      : (candidate.roleRank === strongestPriceRole ? 'current_candidate' : 'superseded_role');
+    const observation = {{
+      value: candidate.value,
+      source: candidate.source,
+      role: candidate.role,
+      role_rank: candidate.roleRank,
+      status,
+      reasons: [...candidate.reasons],
+    }};
+    if (candidate.selectionState) observation.offer_state = candidate.selectionState;
+    if (candidate.priceConflict) observation.conflict = true;
+    if (candidate.prominence) {{
+      observation.prominence = {{
+        font_size_px: candidate.prominence.font_size_px,
+        font_weight: candidate.prominence.font_weight,
+        area_px2: candidate.prominence.area_px2,
+      }};
+    }}
+    return observation;
+  }});
+  const availabilityMatch = firstContent([
+    '[itemprop="availability"]:not(meta):not(link)',
     '[class*="availability" i]',
     '[id*="availability" i]',
-  ]);
+  ], {{
+    requirePaintedDom: true,
+    preferCurrent: true,
+    returnMatch: true,
+    scope: availabilityScope,
+    candidateFilter: availabilityBelongsToSelectedRecord,
+  }}) || firstContent([
+    'link[itemprop="availability"]',
+    'meta[itemprop="availability"]',
+  ], {{
+    returnMatch: true,
+    scope: availabilityScope,
+    candidateFilter: availabilityBelongsToSelectedRecord,
+  }});
+  const availabilitySourceUrl = (() => {{
+    if (!availabilityMatch) return '';
+    if (availabilityMatch.element.matches('link')) {{
+      return String(availabilityMatch.element.href || availabilityMatch.value || '');
+    }}
+    if (!availabilityMatch.element.matches('meta')) return '';
+    const value = String(availabilityMatch.value || '').trim();
+    if (!/^(?:[a-z][a-z0-9+.-]*:|\/\/)/iu.test(value)) return '';
+    try {{
+      return new URL(value, location.href).href;
+    }} catch (_error) {{
+      return '';
+    }}
+  }})();
+  const structuredUriLabel = (value) => {{
+    try {{
+      const parsed = new URL(value, location.href);
+      const pathParts = parsed.pathname.split('/').filter(Boolean);
+      const encoded = parsed.hash.slice(1) || pathParts[pathParts.length - 1] || '';
+      const decoded = decodeURIComponent(encoded);
+      return compact(
+        decoded
+          .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
+          .replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
+          .replace(/[-_]+/gu, ' '),
+        240,
+      ) || compact(value, 240);
+    }} catch (_error) {{
+      return compact(value, 240);
+    }}
+  }};
+  const availability = availabilityMatch
+    ? (
+        availabilitySourceUrl
+          ? structuredUriLabel(availabilitySourceUrl)
+          : availabilityMatch.value
+      )
+    : '';
   const rating = firstContent([
     'meta[itemprop="ratingValue"]',
     '[itemprop="ratingValue"]',
@@ -791,19 +2538,62 @@ def _browser_extract_detail_script(*, selector: str | None = None) -> str:
     'meta[name="description"]',
     'meta[property="og:description"]',
   ]);
+  const visibleTextWithoutPrices = (boundary, limit) => {{
+    const values = [];
+    const walker = document.createTreeWalker(boundary, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {{
+      const parent = walker.currentNode.parentElement;
+      if (!parent || !textNodeIsPainted(walker.currentNode)) continue;
+      const priceContainer = parent.closest(priceSelectors);
+      if (priceContainer && boundary.contains(priceContainer)) continue;
+      const value = compact(walker.currentNode.nodeValue, 600);
+      if (value) values.push(value);
+    }}
+    return compact(values.join(' '), limit);
+  }};
   const bullets = [];
   for (const element of Array.from(root.querySelectorAll('li'))) {{
     if (!visible(element)) continue;
-    const value = compact(element.textContent, 360);
+    const value = visibleTextWithoutPrices(element, 360);
     if (!value || bullets.includes(value)) continue;
     bullets.push(value);
     if (bullets.length >= 12) break;
   }}
-  const details = compact(root.innerText || root.textContent, 2400);
+  const details = visibleTextWithoutPrices(root, 2400);
   const record = {{title, url: location.href}};
-  if (priceCandidates.length === 1) record.price = priceCandidates[0];
+  if (priceCandidates.length === 1) {{
+    let displayPrice = priceCandidates[0];
+    const displayAliases = [...priceAliases];
+    if (!priceMarkerIdentity(displayPrice)) {{
+      const markedAliasIndex = displayAliases.findIndex(
+        (candidate) => Boolean(priceMarkerIdentity(candidate))
+      );
+      if (markedAliasIndex >= 0) {{
+        const structuredAmount = displayPrice;
+        displayPrice = displayAliases.splice(markedAliasIndex, 1)[0];
+        displayAliases.unshift(structuredAmount);
+      }}
+    }}
+    record.price = displayPrice;
+    const displayPriceOwners = Array.from(priceMarkerOwners(displayPrice)).sort();
+    if (displayPriceOwners.length) record.price_currency_codes = displayPriceOwners;
+    if (displayAliases.length) {{
+      record.price_aliases = displayAliases;
+      const aliasCurrencyCodes = {{}};
+      for (const alias of displayAliases) {{
+        const owners = Array.from(priceMarkerOwners(alias)).sort();
+        if (owners.length) aliasCurrencyCodes[alias] = owners;
+      }}
+      if (Object.keys(aliasCurrencyCodes).length) {{
+        record.price_alias_currency_codes = aliasCurrencyCodes;
+      }}
+    }}
+  }}
   if (priceCandidates.length > 1) record.price_candidates = priceCandidates;
+  if (priceCandidates.length > 1 && hasPriceConflict) record.price_conflict = true;
+  if (auditPriceObservations.length) record.price_observations = auditPriceObservations;
   if (availability) record.availability = availability;
+  if (availabilitySourceUrl) record.availability_source_url = availabilitySourceUrl;
   if (rating) record.rating = rating;
   if (description) record.description = description;
   if (bullets.length) record.bullets = bullets;
@@ -1094,29 +2884,633 @@ def _browser_assert_page_state_script(
 (() => {{
   const args = {json.dumps({"required": required, "forbidden": forbidden, "selector": selector})};
   const textOf = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-  const normalize = (value) => textOf(value).toLowerCase()
-    .replace(/\\bwest\\b/g, 'w').replace(/\\beast\\b/g, 'e')
-    .replace(/\\bnorth\\b/g, 'n').replace(/\\bsouth\\b/g, 's')
-    .replace(/[^a-z0-9]+/g, ' ').trim();
-  const tokens = (value) => normalize(value).split(/\\s+/).filter(Boolean);
+  const unicodeText = (value) => textOf(value).normalize('NFKC').toLocaleLowerCase();
+  const decimalDigitMap = new Map(
+    Array.from({{length: 10}}, (_unused, digit) => [String(digit), String(digit)])
+  );
+  if (typeof Intl.supportedValuesOf === 'function') {{
+    for (const numberingSystem of Intl.supportedValuesOf('numberingSystem')) {{
+      try {{
+        const formatter = new Intl.NumberFormat('en', {{
+          numberingSystem,
+          useGrouping: false,
+          maximumFractionDigits: 0,
+        }});
+        for (let digit = 0; digit <= 9; digit += 1) {{
+          const rendered = formatter.format(digit).normalize('NFKC');
+          const digits = Array.from(rendered).filter((character) => /\\p{{Nd}}/u.test(character));
+          if (digits.length === 1) decimalDigitMap.set(digits[0], String(digit));
+        }}
+      }} catch (_error) {{
+        // Ignore numbering systems that this browser cannot format.
+      }}
+    }}
+  }}
+  const canonicalDigits = (value) => Array.from(String(value || ''))
+    .map((character) => decimalDigitMap.get(character) || character)
+    .join('');
+  const tokenList = (value) => (
+    unicodeText(value).match(/[\\p{{L}}]+|[\\p{{N}}]+/gu) || []
+  ).map((token) => canonicalDigits(token));
+  const normalize = (value) => tokenList(value).join(' ');
+  const tokens = (value) => tokenList(value);
+  const assertionPaintAlphaIsZero = (value) => {{
+    const normalized = String(value || '').trim().toLocaleLowerCase();
+    if (!normalized || normalized === 'none') return false;
+    if (normalized === 'transparent') return true;
+    if (/(?:rgba|hsla)\\([^)]*[,/]\\s*(?:0(?:\\.0*)?|\\.0+)\\s*\\)$/u.test(normalized)) {{
+      return true;
+    }}
+    return /\\/\\s*(?:0(?:\\.0*)?|\\.0+)(?:%\\s*)?\\)$/u.test(normalized);
+  }};
+  const assertionPaintValueIsFullyTransparent = (value) => {{
+    const normalized = String(value || '').trim().toLocaleLowerCase();
+    if (!normalized || normalized === 'none' || normalized === 'transparent') return true;
+    const colors = normalized.match(/(?:rgba|hsla|color|oklch|oklab|lab|lch)\\([^)]*\\)/gu) || [];
+    return Boolean(colors.length && colors.every(assertionPaintAlphaIsZero));
+  }};
+  const assertionPaintCssLayers = (value) => {{
+    const layers = [];
+    let depth = 0;
+    let current = '';
+    for (const character of String(value || '')) {{
+      if (character === '(') depth += 1;
+      if (character === ')') depth = Math.max(0, depth - 1);
+      if (character === ',' && depth === 0) {{
+        layers.push(current.trim());
+        current = '';
+        continue;
+      }}
+      current += character;
+    }}
+    if (current.trim() || !layers.length) layers.push(current.trim());
+    return layers.filter(Boolean);
+  }};
+  const assertionPaintCssTokens = (value) => {{
+    const tokens = [];
+    let depth = 0;
+    let current = '';
+    for (const character of String(value || '').trim()) {{
+      if (/\\s/u.test(character) && depth === 0) {{
+        if (current) tokens.push(current);
+        current = '';
+        continue;
+      }}
+      current += character;
+      if (character === '(') depth += 1;
+      if (character === ')') depth = Math.max(0, depth - 1);
+    }}
+    if (current) tokens.push(current);
+    return tokens;
+  }};
+  const assertionPaintNumericCssValue = (
+    token,
+    basis,
+    {{autoValue = basis}} = {{}},
+  ) => {{
+    const normalized = String(token || '').trim().toLocaleLowerCase();
+    if (normalized === 'auto') return autoValue;
+    const calcMatch = normalized.match(
+      /^calc\\(\\s*([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))%\\s*([+-])\\s*([0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)px\\s*\\)$/u
+    );
+    if (calcMatch) {{
+      return (
+        basis * Number(calcMatch[1]) / 100
+        + Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1)
+      );
+    }}
+    const match = normalized.match(
+      /^([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))(px|%)?$/u
+    );
+    if (!match) return Number.NaN;
+    const amount = Number(match[1]);
+    if (!match[2] && amount !== 0) return Number.NaN;
+    return match[2] === '%' ? basis * amount / 100 : amount;
+  }};
+  const assertionPaintImageSize = (value, rect) => {{
+    const tokens = assertionPaintCssTokens(value || 'auto');
+    if (!tokens.length) return null;
+    if (tokens.length === 1 && /^(?:cover|contain)$/u.test(tokens[0])) {{
+      return [rect.width, rect.height];
+    }}
+    const width = assertionPaintNumericCssValue(tokens[0], rect.width);
+    const height = assertionPaintNumericCssValue(tokens[1] || 'auto', rect.height);
+    if (![width, height].every(Number.isFinite)) return null;
+    return [width, height];
+  }};
+  const assertionPaintPositionComponent = (token) => {{
+    const normalized = String(token || '').trim().toLocaleLowerCase();
+    if (normalized === 'center') return {{percent: 0.5, pixels: 0}};
+    if (normalized === 'left' || normalized === 'top') return {{percent: 0, pixels: 0}};
+    if (normalized === 'right' || normalized === 'bottom') return {{percent: 1, pixels: 0}};
+    const calcMatch = normalized.match(
+      /^calc\\(\\s*([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))%\\s*([+-])\\s*([0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)px\\s*\\)$/u
+    );
+    if (calcMatch) {{
+      return {{
+        percent: Number(calcMatch[1]) / 100,
+        pixels: Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1),
+      }};
+    }}
+    const match = normalized.match(
+      /^([+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))(px|%)?$/u
+    );
+    if (!match) return null;
+    const amount = Number(match[1]);
+    if (!match[2] && amount !== 0) return null;
+    return match[2] === '%'
+      ? {{percent: amount / 100, pixels: 0}}
+      : {{percent: 0, pixels: amount}};
+  }};
+  const assertionPaintEdgePositionComponent = (edge, distance) => {{
+    const anchor = assertionPaintPositionComponent(edge);
+    const offset = assertionPaintNumericCssValue(
+      distance,
+      0,
+      {{autoValue: Number.NaN}},
+    );
+    if (!anchor || !Number.isFinite(offset)) return null;
+    const reverse = edge === 'right' || edge === 'bottom';
+    return {{percent: anchor.percent, pixels: reverse ? -offset : offset}};
+  }};
+  const assertionPaintBackgroundPosition = (value) => {{
+    const tokens = assertionPaintCssTokens(value || '0% 0%');
+    if (
+      tokens.length >= 4
+      && /^(?:left|right)$/u.test(tokens[0])
+      && /^(?:top|bottom)$/u.test(tokens[2])
+    ) {{
+      return [
+        assertionPaintEdgePositionComponent(tokens[0], tokens[1]),
+        assertionPaintEdgePositionComponent(tokens[2], tokens[3]),
+      ];
+    }}
+    if (tokens.length === 1) {{
+      if (/^(?:top|bottom)$/u.test(tokens[0])) {{
+        return [
+          assertionPaintPositionComponent('center'),
+          assertionPaintPositionComponent(tokens[0]),
+        ];
+      }}
+      return [
+        assertionPaintPositionComponent(tokens[0]),
+        assertionPaintPositionComponent('center'),
+      ];
+    }}
+    return [
+      assertionPaintPositionComponent(tokens[0] || '0%'),
+      assertionPaintPositionComponent(tokens[1] || '0%'),
+    ];
+  }};
+  const assertionPaintRepeatedAxes = (value) => {{
+    const tokens = assertionPaintCssTokens(value || 'repeat').map(
+      (token) => token.toLocaleLowerCase()
+    );
+    if (tokens[0] === 'repeat-x') return [true, false];
+    if (tokens[0] === 'repeat-y') return [false, true];
+    const repeats = (token) => token !== 'no-repeat';
+    return [repeats(tokens[0] || 'repeat'), repeats(tokens[1] || tokens[0] || 'repeat')];
+  }};
+  const assertionPaintLayerGeometryCanPaint = (size, position, repeat, rect) => {{
+    const container = [rect.width, rect.height];
+    const imageSize = assertionPaintImageSize(size, rect);
+    const offsets = assertionPaintBackgroundPosition(position);
+    const repeats = assertionPaintRepeatedAxes(repeat);
+    if (
+      !imageSize
+      || offsets.some((offset) => !offset)
+      || container.some((dimension) => !(dimension > 0))
+    ) return false;
+    return imageSize.every((dimension, axis) => {{
+      if (!(dimension > 0)) return false;
+      if (repeats[axis]) return true;
+      const offset = (
+        (container[axis] - dimension) * offsets[axis].percent
+        + offsets[axis].pixels
+      );
+      return offset < container[axis] && offset + dimension > 0;
+    }});
+  }};
+  const assertionFilterSuppressesPaint = (value) => Array.from(
+    String(value || '').matchAll(/opacity\\(\\s*([0-9.]+)\\s*(%)?\\s*\\)/giu)
+  ).some((match) => Number(match[1]) <= 0);
+  const assertionMaskSuppressesPaint = (image, size, position, repeat, rect) => {{
+    const imageLayers = assertionPaintCssLayers(image);
+    if (!imageLayers.length || imageLayers.every((layer) => layer === 'none')) return false;
+    const sizeLayers = assertionPaintCssLayers(size || 'auto');
+    const positionLayers = assertionPaintCssLayers(position || '0% 0%');
+    const repeatLayers = assertionPaintCssLayers(repeat || 'repeat');
+    const layerValue = (layers, index, fallback) => (
+      layers.length ? layers[index % layers.length] : fallback
+    );
+    return imageLayers.every((layer, index) => (
+      layer === 'none'
+      || assertionPaintValueIsFullyTransparent(layer)
+      || !assertionPaintLayerGeometryCanPaint(
+        layerValue(sizeLayers, index, 'auto'),
+        layerValue(positionLayers, index, '0% 0%'),
+        layerValue(repeatLayers, index, 'repeat'),
+        rect,
+      )
+    ));
+  }};
+  const assertionCssInsetValue = (token, basis) => {{
+    const match = String(token || '').match(/^(-?[0-9.]+)(%|px)?$/u);
+    if (!match) return Number.NaN;
+    return match[2] === '%' ? Number(match[1]) * basis / 100 : Number(match[1]);
+  }};
+  const assertionClipPathSuppressesPaint = (value, rect) => {{
+    const normalized = String(value || '').trim();
+    const inset = normalized.match(/^inset\\(([^)]*)\\)/iu);
+    if (inset) {{
+      const parts = inset[1].trim().split(/\\s+/u).filter(Boolean);
+      if (!parts.length || parts.some((part) => part.includes('round'))) return false;
+      const sides = parts.length === 1
+        ? [parts[0], parts[0], parts[0], parts[0]]
+        : parts.length === 2
+          ? [parts[0], parts[1], parts[0], parts[1]]
+          : parts.length === 3
+            ? [parts[0], parts[1], parts[2], parts[1]]
+            : parts.slice(0, 4);
+      const top = assertionCssInsetValue(sides[0], rect.height);
+      const right = assertionCssInsetValue(sides[1], rect.width);
+      const bottom = assertionCssInsetValue(sides[2], rect.height);
+      const left = assertionCssInsetValue(sides[3], rect.width);
+      return [top, right, bottom, left].every(Number.isFinite)
+        && (top + bottom >= rect.height || left + right >= rect.width);
+    }}
+    const radial = normalized.match(/^(?:circle|ellipse)\\(\\s*([^\\s,)]+)/iu);
+    if (radial) {{
+      const radius = assertionCssInsetValue(radial[1], Math.min(rect.width, rect.height));
+      if (Number.isFinite(radius) && radius <= 0) return true;
+    }}
+    const polygon = normalized.match(/^polygon\\((.*)\\)$/iu);
+    if (polygon) {{
+      const points = polygon[1].split(',').map((point) => {{
+        const coordinates = point.trim().split(/\\s+/u);
+        return [
+          assertionCssInsetValue(coordinates[0], rect.width),
+          assertionCssInsetValue(coordinates[1], rect.height),
+        ];
+      }}).filter((point) => point.every(Number.isFinite));
+      if (points.length >= 3) {{
+        const twiceArea = Math.abs(points.reduce((area, point, index) => {{
+          const next = points[(index + 1) % points.length];
+          return area + point[0] * next[1] - next[0] * point[1];
+        }}, 0));
+        if (twiceArea <= 1e-7) return true;
+      }}
+    }}
+    const path = normalized.match(
+      /^path\\(\\s*(?:(?:evenodd|nonzero)\\s*,\\s*)?["']([^"']*)["']\\s*\\)$/iu
+    );
+    if (path) {{
+      const commands = path[1].match(/[a-z]/giu) || [];
+      if (
+        !commands.length
+        || commands.every((command) => command.toLocaleLowerCase() === 'm')
+      ) return true;
+    }}
+    return false;
+  }};
+  const assertionLegacyClipSuppressesPaint = (value) => {{
+    const normalized = String(value || '').trim();
+    if (!normalized || normalized === 'auto') return false;
+    const numbers = normalized.match(/-?[0-9.]+/g) || [];
+    if (numbers.length < 4) return false;
+    const [top, right, bottom, left] = numbers.slice(0, 4).map(Number);
+    return bottom <= top || right <= left;
+  }};
+  const assertionTransformSuppressesPaint = (value) => {{
+    const normalized = String(value || '').trim();
+    if (!normalized || normalized === 'none') return false;
+    try {{
+      const matrix = new DOMMatrixReadOnly(normalized);
+      return Math.hypot(matrix.m11, matrix.m12, matrix.m13) <= 1e-7
+        || Math.hypot(matrix.m21, matrix.m22, matrix.m23) <= 1e-7;
+    }} catch (_error) {{
+      return false;
+    }}
+  }};
+  const assertionStyleSuppressesPaint = (element, style) => {{
+    const rect = element.getBoundingClientRect();
+    return assertionFilterSuppressesPaint(style.filter)
+      || assertionMaskSuppressesPaint(
+        style.maskImage,
+        style.maskSize,
+        style.maskPosition,
+        style.maskRepeat,
+        rect,
+      )
+      || assertionMaskSuppressesPaint(
+        style.webkitMaskImage,
+        style.webkitMaskSize,
+        style.webkitMaskPosition,
+        style.webkitMaskRepeat,
+        rect,
+      )
+      || assertionTransformSuppressesPaint(style.transform)
+      || assertionClipPathSuppressesPaint(style.clipPath, rect)
+      || assertionLegacyClipSuppressesPaint(style.clip);
+  }};
+  const assertionPaintVisible = (el) => {{
+    const elementRect = el.getBoundingClientRect();
+    let clippedLeft = elementRect.left;
+    let clippedRight = elementRect.right;
+    let clippedTop = elementRect.top;
+    let clippedBottom = elementRect.bottom;
+    let current = el;
+    while (current && current.nodeType === Node.ELEMENT_NODE) {{
+      const style = window.getComputedStyle(current);
+      if (
+        style.visibility === 'hidden'
+        || style.display === 'none'
+        || style.contentVisibility === 'hidden'
+        || Number.parseFloat(style.opacity) === 0
+        || assertionStyleSuppressesPaint(current, style)
+      ) return false;
+      const currentRect = current.getBoundingClientRect();
+      if (
+        style.position === 'fixed'
+        && (
+          currentRect.right <= 0
+          || currentRect.left >= window.innerWidth
+          || currentRect.bottom <= 0
+          || currentRect.top >= window.innerHeight
+        )
+      ) return false;
+      const clipsX = /^(?:hidden|clip)$/u.test(style.overflowX);
+      const clipsY = /^(?:hidden|clip)$/u.test(style.overflowY);
+      if (clipsX) {{
+        clippedLeft = Math.max(clippedLeft, currentRect.left);
+        clippedRight = Math.min(clippedRight, currentRect.right);
+      }}
+      if (clipsY) {{
+        clippedTop = Math.max(clippedTop, currentRect.top);
+        clippedBottom = Math.min(clippedBottom, currentRect.bottom);
+      }}
+      if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) return false;
+      if (
+        (clipsX || clipsY)
+        && currentRect.width <= 1
+        && currentRect.height <= 1
+      ) return false;
+      if (
+        typeof current.checkVisibility === 'function'
+        && !current.checkVisibility({{
+          checkOpacity: true,
+          checkVisibilityCSS: true,
+          contentVisibilityAuto: true,
+        }})
+      ) return false;
+      current = current.parentElement;
+    }}
+    const rect = elementRect;
+    return rect.width > 0
+      && rect.height > 0
+      && rect.right + window.scrollX > 0
+      && rect.bottom + window.scrollY > 0;
+  }};
   const visible = (el) => {{
-    const style = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+    let current = el;
+    while (current && current.nodeType === Node.ELEMENT_NODE) {{
+      if (current.getAttribute('aria-hidden') === 'true') return false;
+      current = current.parentElement;
+    }}
+    return assertionPaintVisible(el);
+  }};
+  const assertionTextNodeIsPainted = (node) => {{
+    const parent = node && node.parentElement;
+    if (!parent || !assertionPaintVisible(parent) || !String(node.nodeValue || '').trim()) return false;
+    const style = window.getComputedStyle(parent);
+    const shadow = String(style.textShadow || '').trim();
+    const strokeWidth = Number.parseFloat(style.webkitTextStrokeWidth || '0');
+    const shadowPaints = shadow !== 'none'
+      && !assertionPaintValueIsFullyTransparent(shadow);
+    const strokePaints = strokeWidth > 0
+      && !assertionPaintValueIsFullyTransparent(style.webkitTextStrokeColor);
+    const cssLayers = (value) => {{
+      const layers = [];
+      let depth = 0;
+      let current = '';
+      for (const character of String(value || '')) {{
+        if (character === '(') depth += 1;
+        if (character === ')') depth = Math.max(0, depth - 1);
+        if (character === ',' && depth === 0) {{
+          layers.push(current.trim());
+          current = '';
+          continue;
+        }}
+        current += character;
+      }}
+      if (current.trim() || !layers.length) layers.push(current.trim());
+      return layers.filter(Boolean);
+    }};
+    const clipLayers = cssLayers(
+      style.webkitBackgroundClip || style.backgroundClip
+    );
+    const cssTokens = (value) => {{
+      const tokens = [];
+      let depth = 0;
+      let current = '';
+      for (const character of String(value || '').trim()) {{
+        if (/\s/u.test(character) && depth === 0) {{
+          if (current) tokens.push(current);
+          current = '';
+          continue;
+        }}
+        current += character;
+        if (character === '(') depth += 1;
+        if (character === ')') depth = Math.max(0, depth - 1);
+      }}
+      if (current) tokens.push(current);
+      return tokens;
+    }};
+    const numericCssValue = (token, basis, {{autoValue = basis}} = {{}}) => {{
+      const normalized = String(token || '').trim().toLocaleLowerCase();
+      if (normalized === 'auto') return autoValue;
+      const calcMatch = normalized.match(
+        /^calc\(\s*([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))%\s*([+-])\s*([0-9]+(?:\.[0-9]*)?|\.[0-9]+)px\s*\)$/u
+      );
+      if (calcMatch) {{
+        return (
+          basis * Number(calcMatch[1]) / 100
+          + Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1)
+        );
+      }}
+      const match = normalized.match(
+        /^([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(px|%)?$/u
+      );
+      if (!match) return Number.NaN;
+      const amount = Number(match[1]);
+      if (!match[2] && amount !== 0) return Number.NaN;
+      return match[2] === '%' ? basis * amount / 100 : amount;
+    }};
+    const backgroundImageSize = (value, rect) => {{
+      const tokens = cssTokens(value || 'auto');
+      if (!tokens.length) return null;
+      if (tokens.length === 1 && /^(?:cover|contain)$/u.test(tokens[0])) {{
+        return [rect.width, rect.height];
+      }}
+      const width = numericCssValue(tokens[0], rect.width);
+      const height = numericCssValue(tokens[1] || 'auto', rect.height);
+      if (![width, height].every(Number.isFinite)) return null;
+      return [width, height];
+    }};
+    const positionComponent = (token, axis) => {{
+      const normalized = String(token || '').trim().toLocaleLowerCase();
+      if (normalized === 'center') return {{percent: 0.5, pixels: 0}};
+      if (normalized === 'left' || normalized === 'top') {{
+        return {{percent: 0, pixels: 0}};
+      }}
+      if (normalized === 'right' || normalized === 'bottom') {{
+        return {{percent: 1, pixels: 0}};
+      }}
+      const calcMatch = normalized.match(
+        /^calc\(\s*([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))%\s*([+-])\s*([0-9]+(?:\.[0-9]*)?|\.[0-9]+)px\s*\)$/u
+      );
+      if (calcMatch) {{
+        return {{
+          percent: Number(calcMatch[1]) / 100,
+          pixels: Number(calcMatch[3]) * (calcMatch[2] === '-' ? -1 : 1),
+        }};
+      }}
+      const match = normalized.match(
+        /^([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(px|%)?$/u
+      );
+      if (!match) return null;
+      const amount = Number(match[1]);
+      if (!match[2] && amount !== 0) return null;
+      return match[2] === '%'
+        ? {{percent: amount / 100, pixels: 0}}
+        : {{percent: 0, pixels: amount}};
+    }};
+    const edgePositionComponent = (edge, distance, axis) => {{
+      const anchor = positionComponent(edge, axis);
+      const offset = numericCssValue(distance, 0, {{autoValue: Number.NaN}});
+      if (!anchor || !Number.isFinite(offset)) return null;
+      const reverse = edge === 'right' || edge === 'bottom';
+      return {{percent: anchor.percent, pixels: reverse ? -offset : offset}};
+    }};
+    const backgroundPosition = (value) => {{
+      const tokens = cssTokens(value || '0% 0%');
+      if (
+        tokens.length >= 4
+        && /^(?:left|right)$/u.test(tokens[0])
+        && /^(?:top|bottom)$/u.test(tokens[2])
+      ) {{
+        return [
+          edgePositionComponent(tokens[0], tokens[1], 'x'),
+          edgePositionComponent(tokens[2], tokens[3], 'y'),
+        ];
+      }}
+      if (tokens.length === 1) {{
+        if (/^(?:top|bottom)$/u.test(tokens[0])) {{
+          return [positionComponent('center', 'x'), positionComponent(tokens[0], 'y')];
+        }}
+        return [positionComponent(tokens[0], 'x'), positionComponent('center', 'y')];
+      }}
+      return [
+        positionComponent(tokens[0] || '0%', 'x'),
+        positionComponent(tokens[1] || '0%', 'y'),
+      ];
+    }};
+    const repeatedAxes = (value) => {{
+      const tokens = cssTokens(value || 'repeat').map((token) => token.toLocaleLowerCase());
+      if (tokens[0] === 'repeat-x') return [true, false];
+      if (tokens[0] === 'repeat-y') return [false, true];
+      const repeats = (token) => token !== 'no-repeat';
+      return [repeats(tokens[0] || 'repeat'), repeats(tokens[1] || tokens[0] || 'repeat')];
+    }};
+    const backgroundLayerCanPaint = (size, position, repeat, rect) => {{
+      const container = [rect.width, rect.height];
+      const imageSize = backgroundImageSize(size, rect);
+      const offsets = backgroundPosition(position);
+      const repeats = repeatedAxes(repeat);
+      if (
+        !imageSize
+        || offsets.some((offset) => !offset)
+        || container.some((dimension) => !(dimension > 0))
+      ) return false;
+      return imageSize.every((dimension, axis) => {{
+        if (!(dimension > 0)) return false;
+        if (repeats[axis]) return true;
+        const offset = (
+          (container[axis] - dimension) * offsets[axis].percent
+          + offsets[axis].pixels
+        );
+        return offset < container[axis] && offset + dimension > 0;
+      }});
+    }};
+    const imageLayers = cssLayers(style.backgroundImage);
+    const sizeLayers = cssLayers(style.backgroundSize || 'auto');
+    const positionLayers = cssLayers(style.backgroundPosition || '0% 0%');
+    const repeatLayers = cssLayers(style.backgroundRepeat || 'repeat');
+    const parentRect = parent.getBoundingClientRect();
+    const layerValue = (layers, index, fallback) => (
+      layers.length ? layers[index % layers.length] : fallback
+    );
+    const backgroundImagePaints = imageLayers.some((image, index) => (
+      layerValue(clipLayers, index, '').toLocaleLowerCase() === 'text'
+      && !assertionPaintValueIsFullyTransparent(image)
+      && backgroundLayerCanPaint(
+        layerValue(sizeLayers, index, 'auto'),
+        layerValue(positionLayers, index, '0% 0%'),
+        layerValue(repeatLayers, index, 'repeat'),
+        parentRect,
+      )
+    ));
+    const colorClip = layerValue(
+      clipLayers,
+      Math.max(0, imageLayers.length - 1),
+      '',
+    ).toLocaleLowerCase();
+    const backgroundPaints = backgroundImagePaints || (
+      colorClip === 'text'
+      && !assertionPaintValueIsFullyTransparent(style.backgroundColor)
+    );
+    const textFillIsTransparent = Boolean(
+      style.webkitTextFillColor
+      && assertionPaintAlphaIsZero(style.webkitTextFillColor)
+    );
+    if (
+      (assertionPaintAlphaIsZero(style.color) || textFillIsTransparent)
+      && !shadowPaints
+      && !strokePaints
+      && !backgroundPaints
+    ) return false;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    return Array.from(range.getClientRects()).some((rect) => (
+      rect.width > 0
+      && rect.height > 0
+      && rect.right + window.scrollX > 0
+      && rect.bottom + window.scrollY > 0
+    ));
+  }};
+  const visibleText = (el) => {{
+    const parts = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {{
+      if (assertionTextNodeIsPainted(node)) parts.push(node.nodeValue || '');
+      node = walker.nextNode();
+    }}
+    return textOf(parts.join(' '));
   }};
   const labelFor = (el) => {{
     const pieces = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('title')];
-    if (el.labels) for (const label of el.labels) pieces.push(textOf(label.innerText || label.textContent));
+    if (el.labels) for (const label of el.labels) pieces.push(visibleText(label));
     const id = el.getAttribute('id');
     if (id) {{
       const label = document.querySelector(`label[for="${{CSS.escape(id)}}"]`);
-      if (label) pieces.push(textOf(label.innerText || label.textContent));
+      if (label) pieces.push(visibleText(label));
     }}
     const labelledBy = el.getAttribute('aria-labelledby');
     if (labelledBy) {{
       for (const labelId of labelledBy.split(/\\s+/)) {{
         const label = document.getElementById(labelId);
-        if (label) pieces.push(textOf(label.innerText || label.textContent));
+        if (label) pieces.push(visibleText(label));
       }}
     }}
     const seen = new Set();
@@ -1153,7 +3547,7 @@ def _browser_assert_page_state_script(
   }}
   const rawCandidates = [];
   if (!args.selector) rawCandidates.push(textOf(document.title));
-  rawCandidates.push(textOf(scopeRoot.innerText || scopeRoot.textContent));
+  rawCandidates.push(visibleText(scopeRoot));
   const scopedNodes = [
     scopeRoot,
     ...Array.from(scopeRoot.querySelectorAll('main, section, article, p, span, div, input, textarea, select, button, a, [role], [contenteditable="true"]'))
@@ -1162,10 +3556,10 @@ def _browser_assert_page_state_script(
     if (el !== scopeRoot && !visible(el)) continue;
     const pieces = [];
     if (el === scopeRoot) {{
-      pieces.push(textOf(el.innerText || el.textContent));
+      pieces.push(visibleText(el));
     }} else {{
       const label = labelFor(el);
-      const text = textOf(el.innerText || el.textContent);
+      const text = visibleText(el);
       const value = 'value' in el ? textOf(el.value) : '';
       if (label && value) pieces.push(`${{label}} ${{value}}`);
       if (label && text) pieces.push(`${{label}} ${{text}}`);
@@ -1173,7 +3567,7 @@ def _browser_assert_page_state_script(
       if (text) pieces.push(text);
       if (el.tagName.toLowerCase() === 'select') {{
         const selected = el.selectedOptions && el.selectedOptions[0]
-          ? textOf(el.selectedOptions[0].innerText || el.selectedOptions[0].textContent)
+          ? visibleText(el.selectedOptions[0])
           : '';
         if (selected) pieces.push(selected);
       }}
@@ -1191,38 +3585,393 @@ def _browser_assert_page_state_script(
       return true;
     }})
     .sort((a, b) => normalize(a).length - normalize(b).length);
+  const amountPattern = '\\\\p{{Nd}}(?:[\\\\p{{Nd}}\\\\s.,\\'’٬٫]*\\\\p{{Nd}})?';
+  const amountIdentity = (value) => {{
+    const identity = Array.from(String(value || ''))
+      .map((character) => decimalDigitMap.get(character) || character)
+      .join('')
+      .replace(/[\\s,\\'’٬]/g, '')
+      .replace(/٫/g, '.');
+    if ((identity.match(/\\./g) || []).length === 1) {{
+      const [rawWhole, rawFraction] = identity.split('.');
+      const whole = rawWhole.replace(/^0+/, '') || '0';
+      const fraction = rawFraction.replace(/0+$/, '');
+      return fraction ? whole + '.' + fraction : whole;
+    }}
+    return identity.replace(/^0+/, '') || '0';
+  }};
+  const markerIdentity = (value) => String(value || '')
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[\\s\\p{{Cf}}\\p{{P}}]+/gu, '');
+  const assertionCurrencyCodes = new Set(
+    typeof Intl.supportedValuesOf === 'function'
+      ? Intl.supportedValuesOf('currency').map((value) => String(value).toUpperCase())
+      : []
+  );
+  const assertionValidLocaleTag = (value) => {{
+    const locale = String(value || '').trim();
+    if (!locale) return '';
+    try {{
+      return new Intl.Locale(locale).toString();
+    }} catch (_error) {{
+      return '';
+    }}
+  }};
+  const assertionDeclaredPageLocale = assertionValidLocaleTag(
+    document.documentElement && document.documentElement.lang
+  );
+  const assertionPageLocales = assertionDeclaredPageLocale
+    ? [assertionDeclaredPageLocale]
+    : Array.from(new Set([
+      ...(Array.isArray(navigator.languages) ? navigator.languages : []),
+      navigator.language,
+    ].map(assertionValidLocaleTag).filter(Boolean)));
+  const assertionRegionCurrencies = (() => {{
+    const codes = new Set();
+    for (const locale of assertionPageLocales) {{
+      try {{
+        const region = new Intl.Locale(locale).maximize().region;
+        if (!region) continue;
+        for (const code of assertionCurrencyCodes) {{
+          if (code.startsWith(region)) codes.add(code);
+        }}
+      }} catch (_error) {{
+        // Ignore invalid or unsupported page locale tags.
+      }}
+    }}
+    return codes;
+  }})();
+  const assertionCurrencySymbolCache = new Map();
+  const assertionCurrencyLocales = (code) => {{
+    const locales = new Set(assertionPageLocales);
+    try {{
+      locales.add(
+        new Intl.Locale('und-' + String(code || '').slice(0, 2))
+          .maximize()
+          .toString()
+      );
+    }} catch (_error) {{
+      // Some non-geographic currency codes do not imply a usable locale.
+    }}
+    if (!locales.size) locales.add(undefined);
+    return locales;
+  }};
+  const runtimeCurrencyMarkers = (code) => {{
+    if (assertionCurrencySymbolCache.has(code)) {{
+      return assertionCurrencySymbolCache.get(code);
+    }}
+    const markers = new Set([markerIdentity(code)]);
+    if (assertionCurrencyCodes.has(code)) {{
+      for (const locale of assertionCurrencyLocales(code)) {{
+        for (const currencyDisplay of ['symbol', 'narrowSymbol']) {{
+          try {{
+            const part = new Intl.NumberFormat(locale, {{
+              style: 'currency', currency: code, currencyDisplay,
+            }}).formatToParts(1).find((candidate) => candidate.type === 'currency');
+            if (!part || !part.value) continue;
+            const marker = markerIdentity(part.value);
+            if (marker) markers.add(marker);
+            if (/\\p{{Sc}}/u.test(part.value)) {{
+              markers.add(markerIdentity(code.slice(0, 2) + part.value));
+            }}
+          }} catch (_error) {{
+            // Ignore unsupported locale/currency combinations.
+          }}
+        }}
+      }}
+    }}
+    assertionCurrencySymbolCache.set(code, markers);
+    return markers;
+  }};
+  const assertionLocalizedOwnerCache = new Map();
+  const localizedCurrencyMarkerOwners = (targetMarker) => {{
+    if (assertionLocalizedOwnerCache.has(targetMarker)) {{
+      return assertionLocalizedOwnerCache.get(targetMarker);
+    }}
+    const owners = new Set();
+    for (const code of assertionCurrencyCodes) {{
+      for (const locale of assertionCurrencyLocales(code)) {{
+        for (const currencyDisplay of ['symbol', 'narrowSymbol', 'name']) {{
+          try {{
+            const part = new Intl.NumberFormat(locale, {{
+              style: 'currency', currency: code, currencyDisplay,
+            }}).formatToParts(1).find((candidate) => candidate.type === 'currency');
+            if (!part || !part.value) continue;
+            const candidates = new Set([markerIdentity(part.value)]);
+            if (/\\p{{Sc}}/u.test(part.value)) {{
+              candidates.add(markerIdentity(code.slice(0, 2) + part.value));
+            }}
+            const letterRuns = part.value.match(/\\p{{L}}+/gu) || [];
+            const terminalRun = letterRuns[letterRuns.length - 1] || '';
+            const characters = Array.from(terminalRun);
+            if (characters.some((character) => character.codePointAt(0) > 127)) {{
+              for (let length = 3; length <= Math.min(4, characters.length); length += 1) {{
+                candidates.add(markerIdentity(characters.slice(0, length).join('')));
+              }}
+            }}
+            if (/[\\p{{Script=Han}}\\p{{Script=Hangul}}]/u.test(terminalRun)) {{
+              candidates.add(markerIdentity(terminalRun));
+            }}
+            if (/\\p{{Script=Han}}/u.test(terminalRun) && characters.length > 1) {{
+              candidates.add(markerIdentity(characters[characters.length - 1]));
+            }}
+            if (candidates.has(targetMarker)) owners.add(code);
+          }} catch (_error) {{
+            // Ignore unsupported locale/currency combinations.
+          }}
+        }}
+      }}
+    }}
+    assertionLocalizedOwnerCache.set(targetMarker, owners);
+    return owners;
+  }};
+  const currencyMarkersCompatible = (leftMarker, rightMarker) => {{
+    if (leftMarker === rightMarker) return true;
+    const leftIsCode = /^[a-z]{{3}}$/u.test(leftMarker);
+    const rightIsCode = /^[a-z]{{3}}$/u.test(rightMarker);
+    const codeMarker = leftIsCode ? leftMarker : (rightIsCode ? rightMarker : '');
+    const localizedMarker = leftIsCode ? rightMarker : (rightIsCode ? leftMarker : '');
+    if (!codeMarker || !localizedMarker) return false;
+    const code = codeMarker.toUpperCase();
+    const prefixedSymbol = localizedMarker.match(/^([a-z]{{1,2}})(\\p{{Sc}})$/u);
+    if (prefixedSymbol && !codeMarker.startsWith(prefixedSymbol[1])) return false;
+    if (runtimeCurrencyMarkers(code).has(localizedMarker)) return true;
+    const owners = localizedCurrencyMarkerOwners(localizedMarker);
+    if (owners.size === 1 && owners.has(code)) return true;
+    return Boolean(
+      /\\p{{L}}/u.test(localizedMarker)
+      && !/\\p{{Sc}}/u.test(localizedMarker)
+      && owners.size > 1
+      && assertionRegionCurrencies.has(code)
+    );
+  }};
+  const semanticIdentities = (value) => {{
+    const raw = unicodeText(value);
+    const percents = new Set();
+    const markers = new Set();
+    const percentAfter = new RegExp('(' + amountPattern + ')\\\\s*[%٪]', 'gu');
+    const percentBefore = new RegExp('[%٪]\\\\s*(' + amountPattern + ')', 'gu');
+    for (const pattern of [percentAfter, percentBefore]) {{
+      for (const match of raw.matchAll(pattern)) percents.add(amountIdentity(match[1]));
+    }}
+    const markerIsSemantic = (marker) => Boolean(
+      marker
+      && (
+        /^(?:(?:\\p{{L}}{{1,2}})?\\p{{Sc}}|\\p{{Sc}}(?:\\p{{L}}{{1,2}})?)$/u.test(marker)
+        || (
+          /^[a-z]{{3}}$/u.test(marker)
+          && assertionCurrencyCodes.has(marker.toUpperCase())
+        )
+        || localizedCurrencyMarkerOwners(marker).size
+      )
+    );
+    const adjacentCurrencyMarker = (segment, fromEnd) => {{
+      const characters = Array.from(segment);
+      const limit = Math.min(24, characters.length);
+      const candidates = [];
+      for (let length = 1; length <= limit; length += 1) {{
+        const rawMarker = fromEnd
+          ? characters.slice(characters.length - length).join('')
+          : characters.slice(0, length).join('');
+        const marker = markerIdentity(rawMarker);
+        const boundaryCharacter = fromEnd
+          ? characters[characters.length - length - 1]
+          : characters[length];
+        if (
+          markerIsSemantic(marker)
+          && !(
+            /[a-z]/u.test(marker)
+            && boundaryCharacter
+            && /[\\p{{L}}\\p{{N}}]/u.test(boundaryCharacter)
+          )
+        ) {{
+          candidates.push({{marker, length}});
+        }}
+      }}
+      candidates.sort((left, right) => right.length - left.length);
+      return candidates.length ? candidates[0].marker : '';
+    }};
+    for (const match of raw.matchAll(new RegExp(amountPattern, 'gu'))) {{
+      const amount = amountIdentity(match[0]);
+      if (!amount) continue;
+      const start = Number(match.index || 0);
+      const end = start + match[0].length;
+      const beforeMarker = adjacentCurrencyMarker(raw.slice(0, start), true);
+      const afterMarker = adjacentCurrencyMarker(raw.slice(end), false);
+      if (beforeMarker) markers.add(beforeMarker + ':' + amount);
+      if (afterMarker) markers.add(afterMarker + ':' + amount);
+    }}
+    return {{percents, markers}};
+  }};
+  const semanticCompatible = (expected, candidate) => {{
+    const wanted = semanticIdentities(expected);
+    const found = semanticIdentities(candidate);
+    return [...wanted.percents].every((identity) => found.percents.has(identity))
+      && [...wanted.markers].every((identity) => {{
+        if (found.markers.has(identity)) return true;
+        const separator = identity.lastIndexOf(':');
+        if (separator < 0) return false;
+        const wantedMarker = identity.slice(0, separator);
+        const wantedAmount = identity.slice(separator + 1);
+        return [...found.markers].some((candidateIdentity) => {{
+          const candidateSeparator = candidateIdentity.lastIndexOf(':');
+          if (candidateSeparator < 0) return false;
+          const candidateMarker = candidateIdentity.slice(0, candidateSeparator);
+          const candidateAmount = candidateIdentity.slice(candidateSeparator + 1);
+          return candidateAmount === wantedAmount
+            && currencyMarkersCompatible(wantedMarker, candidateMarker);
+        }});
+      }});
+  }};
+  const hasAmbiguousNumericDate = (value) => {{
+    const raw = canonicalDigits(textOf(value));
+    return Array.from(raw.matchAll(
+      /(?<![0-9])([0-9]{{1,2}})[\\/.-]([0-9]{{1,2}})[\\/.-]([0-9]{{4}})(?![0-9])/gu
+    )).some((match) => (
+      Number(match[1]) >= 1
+      && Number(match[1]) <= 12
+      && Number(match[2]) >= 1
+      && Number(match[2]) <= 12
+    ));
+  }};
+  const dateSignatures = (value) => {{
+    const raw = canonicalDigits(textOf(value));
+    if (hasAmbiguousNumericDate(raw)) return new Set();
+    const parts = raw.match(/[\\p{{L}}]+|[\\p{{N}}]+/gu) || [];
+    const dateCandidates = [raw];
+    for (let start = 0; start < parts.length; start += 1) {{
+      for (let length = 3; length <= 5 && start + length <= parts.length; length += 1) {{
+        const slice = parts.slice(start, start + length);
+        const numericCount = slice.filter((part) => /\\p{{N}}/u.test(part)).length;
+        if (numericCount >= 2 && slice.some((part) => /^\\p{{N}}{{4}}$/u.test(part))) {{
+          dateCandidates.push(slice.join(' '));
+        }}
+      }}
+    }}
+    const signatures = new Set();
+    const validatedDateSignature = (candidate) => {{
+      const normalizedCandidate = canonicalDigits(textOf(candidate));
+      let year = 0;
+      let month = 0;
+      let day = 0;
+      const yearFirst = normalizedCandidate.match(
+        /^([0-9]{{4}})[\\/.-]([0-9]{{1,2}})[\\/.-]([0-9]{{1,2}})$/u
+      );
+      const yearLast = normalizedCandidate.match(
+        /^([0-9]{{1,2}})[\\/.-]([0-9]{{1,2}})[\\/.-]([0-9]{{4}})$/u
+      );
+      const localizedYearFirst = normalizedCandidate.match(
+        /^([0-9]{{4}})[\\p{{L}}\\s]+([0-9]{{1,2}})[\\p{{L}}\\s]+([0-9]{{1,2}})[\\p{{L}}\\s]*$/u
+      );
+      if (yearFirst || localizedYearFirst) {{
+        const matched = yearFirst || localizedYearFirst;
+        year = Number(matched[1]);
+        month = Number(matched[2]);
+        day = Number(matched[3]);
+      }} else if (yearLast) {{
+        const first = Number(yearLast[1]);
+        const second = Number(yearLast[2]);
+        year = Number(yearLast[3]);
+        if (first <= 12 && second > 12) {{
+          month = first;
+          day = second;
+        }} else if (first > 12 && second <= 12) {{
+          day = first;
+          month = second;
+        }} else {{
+          return '';
+        }}
+      }} else {{
+        const candidateParts = normalizedCandidate.match(
+          /[\\p{{L}}]+|[0-9]+/gu
+        ) || [];
+        const yearTokens = candidateParts.filter(
+          (part) => /^[0-9]{{4}}$/u.test(part)
+        );
+        const dayTokens = candidateParts.filter(
+          (part) => (
+            /^[0-9]{{1,2}}$/u.test(part)
+            && Number(part) >= 1
+            && Number(part) <= 31
+          )
+        );
+        if (yearTokens.length !== 1 || dayTokens.length !== 1) return '';
+        const timestamp = Date.parse(normalizedCandidate);
+        if (!Number.isFinite(timestamp)) return '';
+        const parsed = new Date(timestamp);
+        year = Number(yearTokens[0]);
+        month = parsed.getUTCMonth() + 1;
+        day = Number(dayTokens[0]);
+        if (parsed.getUTCFullYear() !== year || parsed.getUTCDate() !== day) return '';
+      }}
+      const validated = new Date(Date.UTC(year, month - 1, day));
+      if (
+        validated.getUTCFullYear() !== year
+        || validated.getUTCMonth() + 1 !== month
+        || validated.getUTCDate() !== day
+      ) return '';
+      return [year, month, day].join('-');
+    }};
+    for (const candidate of dateCandidates) {{
+      if (!/\\p{{N}}{{4}}/u.test(candidate)) continue;
+      const signature = validatedDateSignature(candidate);
+      if (signature) signatures.add(signature);
+    }}
+    return signatures;
+  }};
+  const adjacentScriptContains = (candidate, expected) => {{
+    let start = candidate.indexOf(expected);
+    while (start >= 0) {{
+      const before = start > 0 ? candidate[start - 1] : '';
+      const afterIndex = start + expected.length;
+      const after = afterIndex < candidate.length ? candidate[afterIndex] : '';
+      const expectedStartsNumeric = /^[0-9]/u.test(expected);
+      const expectedEndsNumeric = /[0-9]$/u.test(expected);
+      if (
+        !(expectedStartsNumeric && /[0-9]/u.test(before))
+        && !(expectedEndsNumeric && /[0-9]/u.test(after))
+      ) return true;
+      start = candidate.indexOf(expected, start + 1);
+    }}
+    return false;
+  }};
   const compatible = (expected, candidate) => {{
     const expectedNorm = normalize(expected);
     const candidateNorm = normalize(candidate);
     if (!expectedNorm || !candidateNorm) return false;
-    if (candidateNorm.includes(expectedNorm)) return true;
-    const expectedTokens = new Set(tokens(expected));
-    const candidateTokens = new Set(tokens(candidate));
-    const numericTokens = [...expectedTokens].filter((token) => /\\d/.test(token));
-    const wordTokens = [...expectedTokens].filter((token) => !/\\d/.test(token));
-    const meaningfulWordTokens = wordTokens.filter((token) => token.length >= 3);
-    if (numericTokens.length) {{
-      const monthNumbers = {{
-        jan: '1', january: '1', feb: '2', february: '2', mar: '3', march: '3',
-        apr: '4', april: '4', may: '5', jun: '6', june: '6',
-        jul: '7', july: '7', aug: '8', august: '8', sep: '9', sept: '9', september: '9',
-        oct: '10', october: '10', nov: '11', november: '11', dec: '12', december: '12'
-      }};
-      const normalizeNumber = (token) => String(parseInt(token, 10));
-      const candidateNumberTokens = new Set(
-        [...candidateTokens]
-          .filter((token) => /\\d/.test(token))
-          .map((token) => normalizeNumber(token))
-      );
-      for (const token of candidateTokens) {{
-        if (monthNumbers[token]) candidateNumberTokens.add(monthNumbers[token]);
-      }}
-      if (!numericTokens.every((token) => candidateNumberTokens.has(normalizeNumber(token)))) return false;
-      return !meaningfulWordTokens.length || meaningfulWordTokens.some((token) => candidateTokens.has(token));
+    const expectedRaw = canonicalDigits(unicodeText(expected));
+    const candidateRaw = canonicalDigits(unicodeText(candidate));
+    const hasAdjacencyScript = /[\\p{{Script=Han}}\\p{{Script=Hiragana}}\\p{{Script=Katakana}}]/u
+      .test(expectedRaw);
+    if (hasAdjacencyScript && adjacentScriptContains(candidateRaw, expectedRaw)) return true;
+    if (hasAmbiguousNumericDate(expected) || hasAmbiguousNumericDate(candidate)) {{
+      return (' ' + candidateNorm + ' ').includes(' ' + expectedNorm + ' ');
     }}
-    if (meaningfulWordTokens.length > 1) return meaningfulWordTokens.every((token) => candidateTokens.has(token));
-    if (meaningfulWordTokens.length === 1) return candidateTokens.has(meaningfulWordTokens[0]);
-    return wordTokens.length > 0 && wordTokens.every((token) => candidateTokens.has(token));
+    const expectedDates = dateSignatures(expected);
+    const expectedIsLocalizedNumericDate = /^\\s*\\p{{Nd}}{{4}}[\\p{{L}}\\s]+\\p{{Nd}}{{1,2}}[\\p{{L}}\\s]+\\p{{Nd}}{{1,2}}[\\p{{L}}\\s]*$/u
+      .test(unicodeText(expected));
+    if (
+      expectedDates.size
+      && (tokens(expected).length <= 3 || expectedIsLocalizedNumericDate)
+      && [...dateSignatures(candidate)].some((signature) => expectedDates.has(signature))
+    ) return true;
+    if (!semanticCompatible(expected, candidate)) return false;
+    const expectedSemanticMarkers = semanticIdentities(expected).markers;
+    const expectedMarkerTokens = new Set();
+    for (const identity of expectedSemanticMarkers) {{
+      const separator = identity.lastIndexOf(':');
+      if (separator < 0) continue;
+      for (const token of tokens(identity.slice(0, separator))) {{
+        expectedMarkerTokens.add(token);
+      }}
+    }}
+    const expectedTokens = tokens(expected).filter(
+      (token) => !expectedMarkerTokens.has(token)
+    );
+    const candidateTokens = new Set(tokens(candidate));
+    if (expectedTokens.length === 1) return candidateTokens.has(expectedTokens[0]);
+    return expectedTokens.every((token) => candidateTokens.has(token));
   }};
   const compactMatch = (expected, candidate) => {{
     if (!candidate) return '';
@@ -1583,6 +4332,19 @@ class BrowserTools:
         }
         with self._page_assertion_lock:
             self._page_assertion_contracts[(session_id, scope_id)] = contract
+
+    def _remembered_page_assertion_selector(
+        self,
+        invocation: ToolInvocation,
+        session_id: str,
+    ) -> str | None:
+        scope_id = self._page_assertion_scope_id(invocation)
+        if not scope_id:
+            return None
+        with self._page_assertion_lock:
+            contract = self._page_assertion_contracts.get((session_id, scope_id))
+            selector = contract.get("selector") if isinstance(contract, dict) else None
+        return str(selector).strip() if isinstance(selector, str) and selector.strip() else None
 
     def _current_page_assertion(
         self,
@@ -2146,6 +4908,8 @@ class BrowserTools:
         normalized_selector = selector.strip() if isinstance(selector, str) and selector.strip() else None
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
+        if normalized_selector is None:
+            normalized_selector = self._remembered_page_assertion_selector(invocation, session_id)
         try:
             extraction = self._runtime_dom_detail_extraction(
                 session_id,
