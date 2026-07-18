@@ -15,7 +15,10 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlparse
@@ -139,6 +142,18 @@ _BROWSER_DERIVED_EVIDENCE_TRUST = object()
 _STRUCTURED_SOURCE_RECORD_KEYS = ("items", "results", "selected_results", "records")
 _STRUCTURED_SOURCE_RANK_KEYS = ("source_index", "source_rank")
 _SOURCE_RANK_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9/_?=&%.-])#(?P<rank>[1-9][0-9]*)")
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserTerminalRevalidationContext:
+    """Exact browser state needed for one bounded terminal evidence refresh."""
+
+    session_id: str
+    page_url: str
+    selector: str | None
+    required: tuple[str, ...]
+    forbidden: tuple[str, ...]
+    invalidating_invocation_id: str | None
 
 
 def _tool_result_completed(result: ToolResult) -> bool:
@@ -1637,9 +1652,41 @@ _CURRENCY_AMOUNT_RE = re.compile(
     r"(?<![\w])(?:[$€£₹]\s?\d[\d,]*(?:\.\d{1,2})?|\d[\d,]*(?:\.\d{1,2})?\s?(?:USD|EUR|GBP))(?![\w])",
     flags=re.IGNORECASE,
 )
+_BROWSER_PRICE_AMOUNT_PATTERN = r"\d(?:[\d\s.,'’٬٫]*\d)?"
 _QUOTE_PAGE_TITLE_RE = re.compile(r"^(?P<name>.+?)\s+\((?P<symbol>[A-Z][A-Z0-9.]{1,7})\)\s*$")
 _QUOTE_PAGE_SYMBOL_EXCHANGE_RE = re.compile(r"^(?P<symbol>[A-Z][A-Z0-9.]{1,7})\s*:\s*[A-Z][A-Z0-9.]{1,10}$")
 _QUOTE_PAGE_PRICE_RE = re.compile(r"^\d{1,4}(?:,\d{3})*(?:\.\d{1,4})?$")
+
+
+@lru_cache(maxsize=1)
+def _browser_currency_symbol_class() -> str:
+    """Return the runtime Unicode Sc category as a regex character class."""
+
+    symbols = "".join(
+        chr(codepoint)
+        for codepoint in range(0x110000)
+        if unicodedata.category(chr(codepoint)) == "Sc"
+    )
+    return f"[{re.escape(symbols)}]"
+
+
+@lru_cache(maxsize=1)
+def _browser_currency_marker_pattern() -> str:
+    return (
+        rf"(?:(?:[A-Z]{{1,3}}\s*)?{_browser_currency_symbol_class()}|[A-Z]{{3}})"
+    )
+
+
+@lru_cache(maxsize=1)
+def _browser_complete_price_token_re() -> re.Pattern[str]:
+    marker = _browser_currency_marker_pattern()
+    return re.compile(
+        r"(?<![\w])(?:"
+        rf"{marker}\s*{_BROWSER_PRICE_AMOUNT_PATTERN}"
+        rf"|{_BROWSER_PRICE_AMOUNT_PATTERN}\s*{marker}"
+        r")(?![\w])",
+        flags=re.IGNORECASE,
+    )
 
 
 def _browser_text_value_from_output(output: Mapping[str, Any], *, max_chars: int) -> str | None:
@@ -1713,11 +1760,120 @@ def _completed_browser_extract_item_records(results: list[ToolResult]) -> list[M
     return records
 
 
+def _browser_record_suppressed_price_values(item: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return structurally rejected prices that must not leak through prose."""
+
+    def _price_tokens(value: object) -> tuple[str, ...]:
+        text = _compact_account_text(value)
+        tokens = tuple(
+            re.sub(r"\s+", " ", match.group(0)).strip()
+            for match in _browser_complete_price_token_re().finditer(text)
+        )
+        if tokens:
+            return tokens
+        has_unicode_currency_symbol = any(
+            unicodedata.category(character) == "Sc"
+            for character in text
+        )
+        if (
+            len(text) <= 64
+            and re.search(r"\d", text)
+            and (
+                has_unicode_currency_symbol
+                or (
+                    re.search(r"[^\W\d_]", text, flags=re.UNICODE)
+                    and "%" not in text
+                )
+            )
+        ):
+            return (text,)
+        if (
+            re.fullmatch(_BROWSER_PRICE_AMOUNT_PATTERN, text)
+            and re.search(r"[.,]\d{1,4}$", text)
+        ):
+            return (text,)
+        return ()
+
+    def _price_parts(value: str) -> tuple[str, str]:
+        marker = re.sub(r"[\d\s.,'’٬٫]", "", value).casefold()
+        amount = re.sub(r"[^\d.,'’٬٫]", "", value)
+        return marker, amount
+
+    observations = item.get("price_observations")
+    if not isinstance(observations, list):
+        return ()
+    current_price_values: list[object] = [
+        item.get("price"),
+        item.get("price_text"),
+    ]
+    aliases = item.get("price_aliases")
+    if isinstance(aliases, (list, tuple, set)):
+        current_price_values.extend(aliases)
+    current_values = {
+        _price_parts(token)
+        for value in current_price_values
+        for token in _price_tokens(value)
+    }
+    suppressed: list[str] = []
+    for observation in observations[:40]:
+        if not isinstance(observation, Mapping):
+            continue
+        status = _compact_account_text(observation.get("status"))
+        value = _compact_account_text(observation.get("value"))
+        if not value or status == "current_candidate":
+            continue
+        for token in _price_tokens(value):
+            marker, amount = _price_parts(token)
+            same_current_value = any(
+                current_amount == amount
+                and (
+                    not marker
+                    or (bool(current_marker) and marker == current_marker)
+                )
+                for current_marker, current_amount in current_values
+            )
+            if not same_current_value:
+                suppressed.append(token)
+    return tuple(
+        sorted(
+            _dedupe_preserving_order(suppressed),
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def _browser_record_text_without_suppressed_prices(
+    item: Mapping[str, Any],
+    value: object,
+) -> str:
+    text = _compact_account_text(value)
+    for suppressed in _browser_record_suppressed_price_values(item):
+        normalized = re.sub(r"\s+", " ", suppressed).strip()
+        escaped = re.escape(normalized).replace(r"\ ", r"\s*")
+        if re.fullmatch(_BROWSER_PRICE_AMOUNT_PATTERN, normalized):
+            marker = _browser_currency_marker_pattern()
+            escaped = (
+                rf"(?:{marker}\s*)?{escaped}"
+                rf"(?:\s*{marker})?"
+            )
+        text = re.sub(
+            rf"(?<![\w\d]){escaped}(?![\w\d]|[.,'’٬٫]\d|\s*%)",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _browser_result_record_constraint_text(item: Mapping[str, Any]) -> str:
     constraint_keys = (
         "name",
         "link_text",
         "compact_text",
+        "price",
+        "price_text",
+        "price_aliases",
         "status",
         "availability",
         "description",
@@ -1744,7 +1900,7 @@ def _browser_result_record_constraint_text(item: Mapping[str, Any]) -> str:
             for nested_value in value:
                 values.extend(_record_scoped_values(nested_value, depth=depth + 1))
             return values
-        compact = _compact_account_text(value)
+        compact = _browser_record_text_without_suppressed_prices(item, value)
         return [compact] if compact else []
 
     values = [_structured_output_item_title(item, kind="browser_item")]
@@ -1754,7 +1910,7 @@ def _browser_result_record_constraint_text(item: Mapping[str, Any]) -> str:
     if isinstance(fields, Mapping):
         for key in constraint_keys:
             values.extend(_record_scoped_values(fields.get(key)))
-    return " ".join(_dedupe_preserving_order(value for value in values if value))
+    return " | ".join(_dedupe_preserving_order(value for value in values if value))
 
 
 def _browser_result_record_forbidden_text(item: Mapping[str, Any]) -> str:
@@ -1882,18 +2038,21 @@ def _browser_extract_item_bindings_for_latest_verified_assertion(
             for index, global_index, records in applicable
             if index == latest_index
         )
-        required_labels = _browser_latest_verified_required_labels(scoped_results)
+        required_label_groups = _browser_latest_verified_required_label_groups(scoped_results)
         allowed_records = _browser_records_allowed_by_assertion(scoped_results, latest_records)
         verified_bindings.extend(
             (global_result_index, record)
             for record in allowed_records
-            if not required_labels
+            if not required_label_groups
             or all(
-                _browser_text_satisfies_probe(
-                    _browser_result_record_constraint_text(record),
-                    label,
+                any(
+                    _browser_text_satisfies_probe(
+                        _browser_result_record_constraint_text(record),
+                        alias,
+                    )
+                    for alias in label_group
                 )
-                for label in required_labels
+                for label_group in required_label_groups
             )
         )
     return sorted(verified_bindings, key=lambda binding: binding[0])
@@ -2032,7 +2191,11 @@ def _browser_display_safe_record_evidence_candidates(
         if not isinstance(value, (str, int, float)) or isinstance(value, bool):
             return
         for segment in str(value).splitlines()[:8]:
-            clipped = _clip_browser_extract_item_text(segment, max_chars=240)
+            sanitized_segment = _browser_record_text_without_suppressed_prices(
+                record,
+                segment,
+            )
+            clipped = _clip_browser_extract_item_text(sanitized_segment, max_chars=240)
             if clipped:
                 candidates.append(clipped)
 
@@ -2220,6 +2383,65 @@ def _browser_record_claim_identity(item: Mapping[str, Any]) -> str:
     return f"title:{normalized_title}" if normalized_title else ""
 
 
+def _browser_record_normalized_fingerprint(item: Mapping[str, Any]) -> str:
+    """Return a stable, schema-neutral identity for one extracted record.
+
+    Candidate completeness is a record-level invariant: a verified assertion
+    for one row cannot silently validate a sibling row produced by the same
+    extraction.  The fingerprint therefore retains the complete typed record
+    shape while normalizing mapping order, Unicode/whitespace presentation,
+    and URL transport syntax.  Runtime-derived display evidence is excluded
+    because bindings may add it after selecting the original producer row.
+    """
+
+    excluded_keys = {
+        _BROWSER_DERIVED_EVIDENCE_KEY,
+        _BROWSER_DERIVED_EVIDENCE_TRUST_KEY,
+    }
+
+    def _normalize(value: object, *, field_name: str = "") -> object:
+        if field_name in _ACTION_URL_FIELD_KEYS:
+            url_identity = _browser_url_identity(value)
+            if url_identity:
+                return {"url_identity": list(url_identity)}
+        if isinstance(value, Mapping):
+            normalized_items: list[tuple[str, object]] = []
+            for raw_key, nested in value.items():
+                key = unicodedata.normalize("NFKC", str(raw_key)).strip().casefold()
+                if not key or key in excluded_keys:
+                    continue
+                normalized_items.append((key, _normalize(nested, field_name=key)))
+            normalized_items.sort(key=lambda pair: pair[0])
+            return {key: nested for key, nested in normalized_items}
+        if isinstance(value, (list, tuple)):
+            return [_normalize(nested) for nested in value]
+        if isinstance(value, (set, frozenset)):
+            normalized_values = [_normalize(nested) for nested in value]
+            return sorted(
+                normalized_values,
+                key=lambda nested: json.dumps(
+                    nested,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return re.sub(
+            r"\s+",
+            " ",
+            unicodedata.normalize("NFKC", str(value)),
+        ).strip().casefold()
+
+    return json.dumps(
+        _normalize(item),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _browser_url_identity(value: object) -> tuple[str, ...]:
     """Return an opaque page identity without guessing which URL parts matter.
 
@@ -2254,6 +2476,22 @@ def _browser_url_identity(value: object) -> tuple[str, ...]:
         parsed.query,
         parsed.fragment,
     )
+
+
+def browser_urls_share_document_identity(
+    expected_url: object,
+    observed_url: object,
+) -> bool:
+    """Return whether two explicit URLs identify the exact same browser state.
+
+    This intentionally preserves path, query ordering/values, and fragments;
+    callers must not treat a same-host navigation as proof that the original
+    document is still open.  Empty or malformed URLs never establish identity.
+    """
+
+    expected_identity = _browser_url_identity(expected_url)
+    observed_identity = _browser_url_identity(observed_url)
+    return bool(expected_identity and expected_identity == observed_identity)
 
 
 def _browser_assertion_page_url(assertion: ToolResult) -> str:
@@ -2376,7 +2614,8 @@ def _browser_detail_record_bindings_for_verified_sessions(
         if not asserted_url:
             continue
         asserted_selector = _browser_assertion_scope_selector(assertion)
-        required_labels = _browser_latest_verified_required_labels(scoped_results)
+        required_label_groups = _browser_latest_verified_required_label_groups(scoped_results)
+        required_labels = [label_group[0] for label_group in required_label_groups]
         forbidden_labels = _browser_forbidden_assertion_labels(scoped_results)
         local_index_by_global = {
             global_index: local_index
@@ -2405,10 +2644,16 @@ def _browser_detail_record_bindings_for_verified_sessions(
             record_text = _browser_result_record_constraint_text(raw_record)
             required_match_count = sum(
                 1
-                for label in required_labels
-                if _browser_text_satisfies_probe(record_text, label)
+                for label_group in required_label_groups
+                if any(
+                    _browser_text_satisfies_probe(record_text, alias)
+                    for alias in label_group
+                )
             )
-            if required_labels and required_match_count != len(required_labels):
+            if (
+                required_label_groups
+                and required_match_count != len(required_label_groups)
+            ):
                 continue
             if any(
                 _browser_text_satisfies_probe(
@@ -2451,6 +2696,340 @@ def _browser_detail_record_bindings_for_verified_sessions(
             )
             verified_bindings.append((result_index, record))
     return sorted(verified_bindings, key=lambda binding: binding[0])
+
+
+def browser_terminal_revalidation_contexts(
+    tool_results: Iterable[ToolResult | Mapping[str, Any] | object] | None,
+) -> tuple[BrowserTerminalRevalidationContext, ...]:
+    """Return exact typed browser states that need terminal refreshes.
+
+    This never revives stale evidence. It only identifies a runtime-owned
+    detail record and a verified assertion that referred to the same physical
+    session and page, but could not bind because their selectors differed or a
+    same-session browser mutation separated or followed them. At most one
+    context is returned per physical browser session.
+    """
+
+    results = _browser_results_with_typed_page_assertions(_coerce_tool_results(tool_results))
+    if not results:
+        return ()
+    current_binding_sessions = {
+        _browser_tool_session_id(results[result_index])
+        for result_index, _record in _browser_detail_record_bindings_for_verified_sessions(
+            results,
+            user_message=None,
+        )
+        if 0 <= result_index < len(results)
+    }
+    source_candidates = _completed_browser_detail_record_candidates_with_sources(results)
+    if not source_candidates:
+        return ()
+
+    latest_assertion_index_by_session: dict[str, int] = {}
+    latest_sessionless_assertion_index = -1
+    for result_index, result in enumerate(results):
+        if result.tool_name != "browser_assert_page_state":
+            continue
+        session_id = _browser_tool_session_id(result)
+        if session_id:
+            latest_assertion_index_by_session[session_id] = result_index
+        else:
+            latest_sessionless_assertion_index = result_index
+
+    contexts: list[BrowserTerminalRevalidationContext] = []
+    context_sessions: set[str] = set()
+    for assertion_index in range(len(results) - 1, -1, -1):
+        assertion = results[assertion_index]
+        if assertion.tool_name != "browser_assert_page_state" or not _browser_assertion_verified_outcome(assertion):
+            continue
+        session_id = _browser_tool_session_id(assertion)
+        if session_id in current_binding_sessions or session_id in context_sessions:
+            continue
+        # A newer assertion is authoritative even when it failed.  Falling
+        # through to an older, weaker verified contract would resurrect stale
+        # evidence and can incorrectly complete the turn after a mutation.
+        if latest_assertion_index_by_session.get(session_id) != assertion_index:
+            continue
+        # A sessionless assertion cannot safely be assigned to one of several
+        # physical sessions.  When it is newer, fail closed for every older
+        # scoped contract instead of guessing and reviving stale evidence.
+        if latest_sessionless_assertion_index > assertion_index:
+            continue
+        asserted_page_url = _browser_assertion_page_url(assertion)
+        asserted_url = _browser_url_identity(asserted_page_url)
+        if not session_id or not asserted_url:
+            continue
+        selector = _browser_assertion_scope_selector(assertion)
+        output = assertion.output if isinstance(assertion.output, Mapping) else {}
+        required: list[str] = []
+        for key in ("result", "state"):
+            payload = output.get(key)
+            if isinstance(payload, Mapping):
+                required = _browser_assertion_confirmed_labels(payload)
+                if required:
+                    break
+        forbidden = _browser_assertion_declared_forbidden_labels(assertion)
+
+        for source_index, record in reversed(source_candidates):
+            source_result = results[source_index]
+            if _browser_tool_session_id(source_result) != session_id:
+                continue
+            record_urls = {
+                identity
+                for key in _ACTION_URL_FIELD_KEYS
+                if (identity := _browser_url_identity(record.get(key)))
+            }
+            if asserted_url not in record_urls:
+                continue
+            record_text = _browser_result_record_constraint_text(record)
+            if required and not all(
+                _browser_text_satisfies_probe(record_text, label)
+                for label in required
+            ):
+                continue
+            if any(
+                _browser_text_satisfies_probe(
+                    _browser_result_record_forbidden_text(record),
+                    label,
+                )
+                for label in forbidden
+            ):
+                continue
+
+            lower = min(assertion_index, source_index) + 1
+            upper = max(assertion_index, source_index)
+            intervening_mutations = [
+                candidate
+                for candidate in results[lower:upper]
+                if _browser_mutation_applies_to_session(candidate, session_id=session_id)
+            ]
+            later_mutations = [
+                candidate
+                for candidate in results[max(assertion_index, source_index) + 1 :]
+                if _browser_mutation_applies_to_session(candidate, session_id=session_id)
+            ]
+            selector_mismatch = bool(
+                selector
+                and _browser_detail_extraction_selector(source_result) != selector
+            )
+            invalidating_mutations = [*intervening_mutations, *later_mutations]
+            if not selector_mismatch and not invalidating_mutations:
+                continue
+            latest_mutation = invalidating_mutations[-1] if invalidating_mutations else None
+            contexts.append(
+                BrowserTerminalRevalidationContext(
+                    session_id=session_id,
+                    page_url=asserted_page_url,
+                    selector=selector,
+                    required=tuple(required),
+                    forbidden=tuple(forbidden),
+                    invalidating_invocation_id=(
+                        str(latest_mutation.invocation_id or "").strip() or None
+                        if latest_mutation is not None
+                        else None
+                    ),
+                )
+            )
+            context_sessions.add(session_id)
+            break
+    return tuple(contexts)
+
+
+def browser_terminal_revalidation_context(
+    tool_results: Iterable[ToolResult | Mapping[str, Any] | object] | None,
+) -> BrowserTerminalRevalidationContext | None:
+    """Return the newest exact browser state that needs a terminal refresh."""
+
+    contexts = browser_terminal_revalidation_contexts(tool_results)
+    return contexts[0] if contexts else None
+
+
+def browser_page_state_assertion_is_verified(
+    result: ToolResult | Mapping[str, Any] | object,
+) -> bool:
+    """Return whether one typed page-state assertion positively verified."""
+
+    values = _coerce_tool_results([result])
+    return bool(
+        values
+        and values[0].tool_name == "browser_assert_page_state"
+        and _browser_assertion_verified_outcome(values[0])
+    )
+
+
+def _browser_terminal_revalidation_binding_matches_document(
+    result: ToolResult,
+    record: Mapping[str, Any],
+) -> bool:
+    """Require every terminal receipt surface to identify the same document."""
+
+    output = result.output if isinstance(result.output, Mapping) else {}
+    if "terminal_revalidation" not in output:
+        # Ordinary, non-terminal evidence keeps its existing binding contract.
+        return True
+    terminal_metadata = output.get("terminal_revalidation")
+    if not isinstance(terminal_metadata, Mapping):
+        return False
+    expected_session_id = _compact_account_text(terminal_metadata.get("session_id"))
+    if not expected_session_id:
+        return False
+    expected_url = _compact_account_text(terminal_metadata.get("page_url"))
+    if not _browser_url_identity(expected_url):
+        return False
+    raw_expected_selector = terminal_metadata.get("selector")
+    if raw_expected_selector is not None and not isinstance(
+        raw_expected_selector, str
+    ):
+        return False
+    expected_selector = str(raw_expected_selector or "").strip()
+    expected_required = _typed_assertion_contract_labels(
+        terminal_metadata.get("required")
+    )
+    expected_forbidden = _typed_assertion_contract_labels(
+        terminal_metadata.get("forbidden")
+    )
+    if (
+        expected_required is None
+        or expected_forbidden is None
+        or not (expected_required or expected_forbidden)
+    ):
+        return False
+
+    payload: object = (
+        output
+        if result.tool_name == "browser_extract_detail"
+        else output.get("detail_extraction")
+    )
+    if not isinstance(payload, Mapping):
+        return False
+    observed_session_ids = [
+        _browser_tool_session_id(result),
+        _compact_account_text(payload.get("session_id")),
+    ]
+    if any(
+        not observed_session_id or observed_session_id != expected_session_id
+        for observed_session_id in observed_session_ids
+    ):
+        return False
+    if expected_selector:
+        detail_selector = (
+            str(payload.get("selector") or "").strip()
+            if isinstance(payload.get("selector"), str)
+            else ""
+        )
+        if detail_selector != expected_selector:
+            return False
+    page = payload.get("page")
+    if not isinstance(page, Mapping):
+        return False
+    page_urls = [
+        value
+        for key in ("url", "page_url")
+        if (value := _compact_account_text(page.get(key)))
+    ]
+    if not page_urls or not all(
+        browser_urls_share_document_identity(expected_url, page_url)
+        for page_url in page_urls
+    ):
+        return False
+
+    record_urls = [
+        value
+        for key in _ACTION_URL_FIELD_KEYS
+        if (value := _compact_account_text(record.get(key)))
+    ]
+    if not record_urls or not all(
+        browser_urls_share_document_identity(expected_url, record_url)
+        for record_url in record_urls
+    ):
+        return False
+
+    embedded_assertion = output.get("page_state_assertion")
+    if result.tool_name == "browser_extract_detail" and embedded_assertion is None:
+        return False
+    if embedded_assertion is not None:
+        if _typed_page_assertion_from_browser_evidence(result) is None:
+            return False
+        if not isinstance(embedded_assertion, Mapping):
+            return False
+        assertion_session_id = _compact_account_text(
+            embedded_assertion.get("session_id")
+        )
+        if assertion_session_id != expected_session_id:
+            return False
+        assertion_urls: list[str] = []
+        assertion_selectors: list[str] = []
+        assertion_contract = embedded_assertion.get("contract")
+        if not isinstance(assertion_contract, Mapping):
+            return False
+        assertion_required = _typed_assertion_contract_labels(
+            assertion_contract.get("required")
+        )
+        assertion_forbidden = _typed_assertion_contract_labels(
+            assertion_contract.get("forbidden")
+        )
+        if (
+            assertion_required != expected_required
+            or assertion_forbidden != expected_forbidden
+        ):
+            return False
+        assertion_selectors.append(
+            str(assertion_contract.get("selector") or "").strip()
+            if isinstance(assertion_contract.get("selector"), str)
+            else ""
+        )
+        for key in ("result", "state"):
+            assertion_state = embedded_assertion.get(key)
+            if not isinstance(assertion_state, Mapping):
+                continue
+            assertion_selectors.append(
+                str(assertion_state.get("selector") or "").strip()
+                if isinstance(assertion_state.get("selector"), str)
+                else ""
+            )
+            assertion_urls.extend(
+                value
+                for url_key in ("url", "page_url")
+                if (value := _compact_account_text(assertion_state.get(url_key)))
+            )
+        if not assertion_urls or not all(
+            browser_urls_share_document_identity(expected_url, assertion_url)
+            for assertion_url in assertion_urls
+        ):
+            return False
+        if (
+            not assertion_selectors
+            or any(
+                assertion_selector != expected_selector
+                for assertion_selector in assertion_selectors
+            )
+        ):
+            return False
+    return True
+
+
+def browser_terminal_revalidation_result_is_verified(
+    tool_results: Iterable[ToolResult | Mapping[str, Any] | object] | None,
+    *,
+    invocation_id: str,
+) -> bool:
+    """Require the refreshed producer result to own a current typed binding."""
+
+    results = _browser_results_with_typed_page_assertions(_coerce_tool_results(tool_results))
+    if not results or not invocation_id:
+        return False
+    for result_index, record in _browser_detail_record_bindings_for_verified_sessions(
+        results,
+        user_message=None,
+    ):
+        if not 0 <= result_index < len(results):
+            continue
+        result = results[result_index]
+        if str(result.invocation_id or "") != invocation_id:
+            continue
+        if _browser_terminal_revalidation_binding_matches_document(result, record):
+            return True
+    return False
 
 
 def _browser_unbound_detail_matches_latest_verified_page(
@@ -2548,6 +3127,10 @@ def _browser_verified_record_bindings_conflict(
         if isinstance(price_candidates, list):
             for candidate in price_candidates:
                 _add("price", candidate)
+        price_aliases = record.get("price_aliases")
+        if isinstance(price_aliases, (list, tuple, set)):
+            for alias in price_aliases:
+                _add("price", alias)
         availability = claims.get("availability")
         status = claims.get("status")
         availability_status = {
@@ -2558,14 +3141,202 @@ def _browser_verified_record_bindings_conflict(
             claims["availability_status"] = availability_status
         return claims
 
+    def _price_values(record: Mapping[str, Any]) -> list[str]:
+        values: list[str] = []
+
+        def _append(raw_value: object) -> None:
+            value = _compact_account_text(raw_value)
+            if value and value not in values:
+                values.append(value)
+
+        _append(record.get("price"))
+        _append(record.get("price_text"))
+        fields = record.get("fields")
+        if isinstance(fields, Mapping):
+            _append(fields.get("price"))
+            _append(fields.get("price_text"))
+        for key in ("price_candidates", "price_aliases"):
+            raw_values = record.get(key)
+            if isinstance(raw_values, (list, tuple, set)):
+                for raw_value in raw_values:
+                    _append(raw_value)
+        return values
+
+    def _price_value_identities(value: object) -> set[tuple[str, str]]:
+        identities = _browser_probe_price_identities(value)
+        if identities:
+            return identities
+        normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if re.fullmatch(_BROWSER_PRICE_AMOUNT_PATTERN, normalized):
+            return {("", _browser_probe_amount_identity(normalized))}
+        return set()
+
+    def _price_values_compatible(left: object, right: object) -> bool:
+        if _normalized_reply_text(left).casefold() == _normalized_reply_text(right).casefold():
+            return True
+        left_identities = _price_value_identities(left)
+        right_identities = _price_value_identities(right)
+        return bool(
+            left_identities
+            and right_identities
+            and any(
+                left_amount == right_amount
+                and (
+                    not left_marker
+                    or not right_marker
+                    or _browser_probe_currency_markers_compatible(
+                        left_marker,
+                        right_marker,
+                    )
+                )
+                for left_marker, left_amount in left_identities
+                for right_marker, right_amount in right_identities
+            )
+        )
+
+    def _price_sets_overlap(left: Iterable[object], right: Iterable[object]) -> bool:
+        return any(
+            _price_values_compatible(left_value, right_value)
+            for left_value in left
+            for right_value in right
+        )
+
+    def _has_incompatible_price_pair(values: Iterable[object]) -> bool:
+        materialized = list(values)
+        return any(
+            not _price_values_compatible(left, right)
+            for left_index, left in enumerate(materialized)
+            for right in materialized[left_index + 1 :]
+        )
+
+    def _explicit_price_currency_codes(value: object) -> set[str]:
+        return {
+            match.group(0).upper()
+            for match in re.finditer(
+                r"(?<![A-Za-z])[A-Za-z]{3}(?![A-Za-z])",
+                str(value or ""),
+            )
+        }
+
     for records in grouped.values():
         claim_sets = [_claims(record) for record in records]
-        if any(any(len(values) > 1 for values in claims.values()) for claims in claim_sets):
-            return True
-        for left_index, left in enumerate(claim_sets):
-            for right in claim_sets[left_index + 1 :]:
-                if any(left[key] != right[key] for key in left.keys() & right.keys()):
+        record_price_values = [_price_values(record) for record in records]
+        for record, claims, _all_price_values in zip(
+            records,
+            claim_sets,
+            record_price_values,
+            strict=True,
+        ):
+            if any(
+                key != "price" and len(values) > 1
+                for key, values in claims.items()
+            ):
+                return True
+            def _normalized_price_values(raw_values: Iterable[object]) -> set[str]:
+                return {
+                    normalized
+                    for raw_value in raw_values
+                    if (
+                        normalized := _normalized_reply_text(
+                            _compact_account_text(raw_value)
+                        ).casefold()
+                    )
+                }
+
+            primary_price_values: list[object] = [
+                record.get("price"),
+                record.get("price_text"),
+            ]
+            fields = record.get("fields")
+            if isinstance(fields, Mapping):
+                primary_price_values.extend(
+                    [fields.get("price"), fields.get("price_text")]
+                )
+            normalized_primary_prices = _normalized_price_values(primary_price_values)
+            if _has_incompatible_price_pair(normalized_primary_prices):
+                return True
+            price_aliases = record.get("price_aliases")
+            normalized_aliases = _normalized_price_values(
+                price_aliases if isinstance(price_aliases, (list, tuple, set)) else ()
+            )
+            primary_currency_codes = {
+                code
+                for primary_value in primary_price_values
+                for code in _explicit_price_currency_codes(primary_value)
+            }
+            alias_owner_payload = record.get("price_alias_currency_codes")
+            for raw_alias in (
+                price_aliases if isinstance(price_aliases, (list, tuple, set)) else ()
+            ):
+                alias_currency_codes = _explicit_price_currency_codes(raw_alias)
+                if (
+                    primary_currency_codes
+                    and alias_currency_codes
+                    and primary_currency_codes.isdisjoint(alias_currency_codes)
+                ):
                     return True
+                if primary_currency_codes:
+                    for marker, _amount in _browser_probe_price_identities(raw_alias):
+                        prefix = "".join(
+                            character for character in marker if character.isalpha()
+                        )
+                        has_currency_symbol = any(
+                            unicodedata.category(character) == "Sc"
+                            for character in marker
+                        )
+                        if (
+                            has_currency_symbol
+                            and len(prefix) == 2
+                            and not any(
+                                code.casefold().startswith(prefix.casefold())
+                                for code in primary_currency_codes
+                            )
+                        ):
+                            return True
+                if isinstance(alias_owner_payload, Mapping):
+                    raw_owners = alias_owner_payload.get(str(raw_alias))
+                    owners = {
+                        str(owner).strip().upper()
+                        for owner in raw_owners
+                        if str(owner).strip()
+                    } if isinstance(raw_owners, (list, tuple, set)) else set()
+                    if (
+                        primary_currency_codes
+                        and owners
+                        and primary_currency_codes.isdisjoint(owners)
+                    ):
+                        return True
+            price_candidates = record.get("price_candidates")
+            normalized_candidates = _normalized_price_values(
+                price_candidates if isinstance(price_candidates, list) else ()
+            )
+            if _has_incompatible_price_pair(normalized_candidates):
+                return True
+            if _has_incompatible_price_pair(normalized_aliases):
+                return True
+            if (
+                normalized_candidates
+                and normalized_primary_prices
+                and not _price_sets_overlap(
+                    normalized_candidates,
+                    normalized_primary_prices | normalized_aliases,
+                )
+            ):
+                return True
+        for left_index, left in enumerate(claim_sets):
+            for right_index, right in enumerate(
+                claim_sets[left_index + 1 :],
+                start=left_index + 1,
+            ):
+                for key in left.keys() & right.keys():
+                    if key == "price":
+                        if not _price_sets_overlap(
+                            record_price_values[left_index],
+                            record_price_values[right_index],
+                        ):
+                            return True
+                    elif left[key] != right[key]:
+                        return True
     return False
 
 
@@ -5273,6 +6044,107 @@ def _browser_evidence_reply_is_blocker(reply: object) -> bool:
     return "live-search blocker" in normalized or "verified result records" in normalized
 
 
+def browser_tool_evidence_is_unfulfilled(
+    tool_results: Iterable[ToolResult | Mapping[str, Any] | object] | None,
+) -> bool:
+    """Return an incomplete browser outcome from typed runtime evidence only.
+
+    Product routing must not depend on the language used in the final reply.
+    This predicate therefore considers current page-state assertions, terminal
+    refresh requirements, and verified record conflicts rather than prose.
+    """
+
+    results = _browser_results_with_typed_page_assertions(
+        _coerce_tool_results(tool_results)
+    )
+    if not results:
+        return False
+    if browser_terminal_revalidation_contexts(results):
+        return True
+    observation = _latest_browser_page_state_observation(results)
+    if observation is not None and not observation[2]:
+        assertion = observation[1]
+        missing = _browser_assertion_missing_required_labels(assertion)
+        if not (
+            missing
+            and _browser_missing_required_state_superseded_by_later_extract(
+                results,
+                assertion=assertion,
+                missing=missing,
+            )
+        ):
+            return True
+    detail_bindings = _browser_detail_record_bindings_for_verified_sessions(
+        results,
+        user_message=None,
+    )
+    extract_bindings = _browser_extract_item_bindings_for_latest_verified_assertion(
+        results
+    )
+    bindings = [*detail_bindings, *extract_bindings]
+    if _browser_verified_record_bindings_conflict(bindings):
+        return True
+    detail_candidates = _completed_browser_detail_record_candidates_with_sources(
+        results
+    )
+    extract_candidates = [
+        (result_index, record)
+        for result_index, result in enumerate(results)
+        for record in _completed_browser_extract_item_records([result])
+    ]
+    candidates_by_session_and_producer: dict[
+        tuple[str, int], list[Mapping[str, Any]]
+    ] = {}
+    latest_candidate_producer_by_session: dict[str, int] = {}
+    for result_index, record in [*detail_candidates, *extract_candidates]:
+        session_id = _browser_tool_session_id(results[result_index])
+        candidates_by_session_and_producer.setdefault(
+            (session_id, result_index),
+            [],
+        ).append(record)
+        latest_candidate_producer_by_session[session_id] = max(
+            result_index,
+            latest_candidate_producer_by_session.get(session_id, -1),
+        )
+
+    bindings_by_producer: dict[int, list[Mapping[str, Any]]] = {}
+    for result_index, record in bindings:
+        bindings_by_producer.setdefault(result_index, []).append(record)
+
+    for session_id, producer_index in latest_candidate_producer_by_session.items():
+        candidates = candidates_by_session_and_producer.get(
+            (session_id, producer_index),
+            [],
+        )
+        scoped_results = (
+            [
+                result
+                for result in results
+                if _browser_tool_session_id(result) == session_id
+            ]
+            if session_id
+            else results
+        )
+        allowed_candidates = _browser_records_allowed_by_assertion(
+            scoped_results,
+            candidates,
+        )
+        candidate_counts: dict[str, int] = {}
+        for record in allowed_candidates:
+            fingerprint = _browser_record_normalized_fingerprint(record)
+            candidate_counts[fingerprint] = candidate_counts.get(fingerprint, 0) + 1
+        binding_counts: dict[str, int] = {}
+        for record in bindings_by_producer.get(producer_index, []):
+            fingerprint = _browser_record_normalized_fingerprint(record)
+            binding_counts[fingerprint] = binding_counts.get(fingerprint, 0) + 1
+        if any(
+            binding_counts.get(fingerprint, 0) < count
+            for fingerprint, count in candidate_counts.items()
+        ):
+            return True
+    return False
+
+
 def _browser_quote_reply_from_extracts(
     results: list[ToolResult],
     *,
@@ -5891,30 +6763,50 @@ def _browser_assertion_source_label(state_payload: Mapping[str, Any]) -> str | N
     return None
 
 
-def _browser_assertion_confirmed_labels(state_payload: Mapping[str, Any]) -> list[str]:
-    labels: list[str] = []
-    seen: set[str] = set()
+def _browser_assertion_confirmed_label_groups(
+    state_payload: Mapping[str, Any],
+) -> list[tuple[str, ...]]:
+    """Return each required value with its browser-verified visible alias."""
+
+    groups: list[tuple[str, ...]] = []
+    seen_expected: set[str] = set()
     required = state_payload.get("required")
     if not isinstance(required, list):
-        return labels
+        return groups
     for item in required:
         if not isinstance(item, Mapping):
             continue
-        value = item.get("expected")
-        if not isinstance(value, str):
+        expected = item.get("expected")
+        if not isinstance(expected, str):
             continue
-        label = re.sub(r"\s+", " ", value).strip()
-        if len(label) < 3:
+        expected_label = re.sub(r"\s+", " ", expected).strip()
+        if len(expected_label) < 3:
             continue
-        normalized = label.casefold()
-        if normalized in seen:
+        normalized_expected = expected_label.casefold()
+        if normalized_expected in seen_expected:
             continue
-        seen.add(normalized)
-        labels.append(label)
-    return labels
+        seen_expected.add(normalized_expected)
+
+        aliases = [expected_label]
+        matched = item.get("match")
+        if isinstance(matched, str):
+            matched_label = re.sub(r"\s+", " ", matched).strip()
+            if len(matched_label) >= 3 and matched_label.casefold() != normalized_expected:
+                aliases.append(matched_label)
+        groups.append(tuple(aliases))
+    return groups
 
 
-def _browser_latest_verified_required_labels(results: list[ToolResult]) -> list[str]:
+def _browser_assertion_confirmed_labels(state_payload: Mapping[str, Any]) -> list[str]:
+    return [
+        label_group[0]
+        for label_group in _browser_assertion_confirmed_label_groups(state_payload)
+    ]
+
+
+def _browser_latest_verified_required_label_groups(
+    results: list[ToolResult],
+) -> list[tuple[str, ...]]:
     assertion = _latest_verified_browser_assert_page_state(results)
     if assertion is None:
         return []
@@ -5922,10 +6814,17 @@ def _browser_latest_verified_required_labels(results: list[ToolResult]) -> list[
     for key in ("result", "state"):
         payload = output.get(key)
         if isinstance(payload, Mapping):
-            labels = _browser_assertion_confirmed_labels(payload)
-            if labels:
-                return labels
+            groups = _browser_assertion_confirmed_label_groups(payload)
+            if groups:
+                return groups
     return []
+
+
+def _browser_latest_verified_required_labels(results: list[ToolResult]) -> list[str]:
+    return [
+        label_group[0]
+        for label_group in _browser_latest_verified_required_label_groups(results)
+    ]
 
 
 _DOMAIN_LIKE_RE = re.compile(r"\b(?:https?://)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b", re.IGNORECASE)
@@ -6644,26 +7543,335 @@ def _tool_result_identity_index(results: list[ToolResult], target: ToolResult) -
     return None
 
 
+def _browser_probe_amount_identity(value: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    characters: list[str] = []
+    for character in normalized:
+        if character.isdecimal():
+            characters.append(str(unicodedata.decimal(character)))
+        elif character == "٫":
+            characters.append(".")
+        elif character in {" ", "\t", "\r", "\n", ",", "'", "’", "٬"}:
+            continue
+        else:
+            characters.append(character)
+    identity = "".join(characters)
+    if identity.count(".") == 1:
+        whole, fraction = identity.split(".", 1)
+        whole = whole.lstrip("0") or "0"
+        fraction = fraction.rstrip("0")
+        return f"{whole}.{fraction}" if fraction else whole
+    return identity.lstrip("0") or "0"
+
+
+def _browser_probe_percentage_identities(value: object) -> set[str]:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    amount = _BROWSER_PRICE_AMOUNT_PATTERN
+    identities: set[str] = set()
+    for pattern in (
+        rf"(?P<amount>{amount})\s*[%٪]",
+        rf"[%٪]\s*(?P<amount>{amount})",
+    ):
+        for match in re.finditer(pattern, text):
+            identities.add(_browser_probe_amount_identity(match.group("amount")))
+    return identities
+
+
+def _browser_probe_marker_is_semantic(value: str) -> bool:
+    marker = value.strip().rstrip(".")
+    if not marker:
+        return False
+    if any(unicodedata.category(character) == "Sc" for character in marker):
+        return True
+    if re.fullmatch(r"[A-Z]{3}", marker, flags=re.IGNORECASE):
+        return True
+    letters = [character for character in marker if character.isalpha()]
+    return bool(
+        letters
+        and len(letters) <= 4
+        and any(ord(character) > 127 for character in letters)
+    )
+
+
+def _browser_probe_marker_identity(value: str) -> str:
+    return (
+        unicodedata.normalize("NFKC", value)
+        .casefold()
+        .replace(" ", "")
+        .rstrip(".")
+    )
+
+
+def _browser_probe_price_identities(value: object) -> set[tuple[str, str]]:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    amount = _BROWSER_PRICE_AMOUNT_PATTERN
+    identities: set[tuple[str, str]] = set()
+    patterns = (
+        (rf"(?P<marker>[^\s\d]{{1,8}})\s*(?P<amount>{amount})", True),
+        (rf"(?P<amount>{amount})\s*(?P<marker>[^\s\d]{{1,8}})", False),
+    )
+    for pattern, marker_before in patterns:
+        for match in re.finditer(pattern, text):
+            marker = match.group("marker")
+            if marker_before and not (
+                any(unicodedata.category(character) == "Sc" for character in marker)
+                or re.fullmatch(r"[A-Z]{3}", marker.strip(), flags=re.IGNORECASE)
+            ):
+                continue
+            if not _browser_probe_marker_is_semantic(marker):
+                continue
+            amount_identity = _browser_probe_amount_identity(match.group("amount"))
+            marker_identity = _browser_probe_marker_identity(marker)
+            if marker_before or not any(ord(character) > 127 for character in marker_identity):
+                identities.add((marker_identity, amount_identity))
+                continue
+            characters = list(marker_identity)
+            for length in range(1, min(4, len(characters)) + 1):
+                candidate = "".join(characters[:length])
+                if _browser_probe_marker_is_semantic(candidate):
+                    identities.add((candidate, amount_identity))
+    return identities
+
+
+def _browser_probe_currency_markers_compatible(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    left_is_code = bool(re.fullmatch(r"[a-z]{3}", left))
+    right_is_code = bool(re.fullmatch(r"[a-z]{3}", right))
+    code = left if left_is_code else right if right_is_code else ""
+    localized = right if left_is_code else left if right_is_code else ""
+    if not code or not localized:
+        return False
+    prefix = "".join(character for character in localized if character.isalpha())
+    has_currency_symbol = any(
+        unicodedata.category(character) == "Sc"
+        for character in localized
+    )
+    return bool(
+        has_currency_symbol
+        and len(prefix) == 2
+        and code[:2] == prefix
+    )
+
+
+def _browser_probe_price_identities_satisfied(
+    expected: set[tuple[str, str]],
+    observed: set[tuple[str, str]],
+) -> bool:
+    return all(
+        any(
+            expected_amount == observed_amount
+            and _browser_probe_currency_markers_compatible(
+                expected_marker,
+                observed_marker,
+            )
+            for observed_marker, observed_amount in observed
+        )
+        for expected_marker, expected_amount in expected
+    )
+
+
+def _browser_probe_canonical_raw(value: object) -> str:
+    return "".join(
+        str(unicodedata.decimal(character)) if character.isdecimal() else character
+        for character in unicodedata.normalize("NFKC", str(value or "")).casefold()
+    )
+
+
+def _browser_probe_has_ambiguous_numeric_date(value: object) -> bool:
+    return any(
+        1 <= int(match.group(1)) <= 12
+        and 1 <= int(match.group(2)) <= 12
+        for match in re.finditer(
+            r"(?<!\d)(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})(?!\d)",
+            _browser_probe_canonical_raw(value),
+        )
+    )
+
+
+def _browser_probe_date_signatures(value: object) -> set[tuple[int, int, int]]:
+    if _browser_probe_has_ambiguous_numeric_date(value):
+        return set()
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = "".join(
+        str(unicodedata.decimal(character)) if character.isdecimal() else character
+        for character in normalized
+    )
+    candidates = {normalized.strip()}
+    candidates.update(
+        match.group(0)
+        for match in re.finditer(
+            r"(?<!\d)\d{1,4}[./-]\d{1,2}[./-]\d{1,4}(?!\d)",
+            normalized,
+        )
+    )
+    candidates.update(
+        match.group(0)
+        for match in re.finditer(
+            r"(?<!\w)\d{1,2}\s+[^\W\d_]{3,16},?\s+\d{4}(?!\d)",
+            normalized,
+            flags=re.UNICODE,
+        )
+    )
+    candidates.update(
+        match.group(0)
+        for match in re.finditer(
+            r"(?<!\w)[^\W\d_]{3,16}\s+\d{1,2},?\s+\d{4}(?!\d)",
+            normalized,
+            flags=re.UNICODE,
+        )
+    )
+    formats = (
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y.%m.%d",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%d %b, %Y",
+        "%d %B, %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    )
+    signatures: set[tuple[int, int, int]] = set()
+    for candidate in candidates:
+        localized_numeric = re.fullmatch(
+            r"\s*(\d{4})[^\W\d_]+(\d{1,2})[^\W\d_]+(\d{1,2})[^\W\d_]*\s*",
+            candidate,
+            flags=re.UNICODE,
+        )
+        if localized_numeric:
+            try:
+                parsed = datetime(
+                    int(localized_numeric.group(1)),
+                    int(localized_numeric.group(2)),
+                    int(localized_numeric.group(3)),
+                )
+            except ValueError:
+                pass
+            else:
+                signatures.add((parsed.year, parsed.month, parsed.day))
+                continue
+        for date_format in formats:
+            try:
+                parsed = datetime.strptime(candidate, date_format)
+            except ValueError:
+                continue
+            signatures.add((parsed.year, parsed.month, parsed.day))
+            break
+    return signatures
+
+
+def _browser_probe_allows_adjacent_script(value: object) -> bool:
+    for character in unicodedata.normalize("NFKC", str(value or "")):
+        name = unicodedata.name(character, "")
+        if (
+            name.startswith("CJK ")
+            or "IDEOGRAPH" in name
+            or name.startswith("HIRAGANA ")
+            or name.startswith("KATAKANA ")
+        ):
+            return True
+    return False
+
+
+def _browser_probe_adjacent_script_match(text: object, probe: object) -> bool:
+    candidate = _browser_probe_canonical_raw(text)
+    expected = _browser_probe_canonical_raw(probe)
+    if not expected:
+        return False
+    start = candidate.find(expected)
+    while start >= 0:
+        before = candidate[start - 1] if start > 0 else ""
+        after_index = start + len(expected)
+        after = candidate[after_index] if after_index < len(candidate) else ""
+        if not (
+            (expected[0].isdecimal() and before.isdecimal())
+            or (expected[-1].isdecimal() and after.isdecimal())
+        ):
+            return True
+        start = candidate.find(expected, start + 1)
+    return False
+
+
 def _browser_text_satisfies_probe(text: object, probe: object) -> bool:
     normalized_text = _browser_probe_normalized_text(text)
     normalized_probe = _browser_probe_normalized_text(probe)
     if not normalized_text or not normalized_probe:
         return False
-    probe_tokens = normalized_probe.split()
+    if (
+        _browser_probe_allows_adjacent_script(probe)
+        and _browser_probe_adjacent_script_match(text, probe)
+    ):
+        return True
+    if (
+        _browser_probe_has_ambiguous_numeric_date(probe)
+        or _browser_probe_has_ambiguous_numeric_date(text)
+    ):
+        return f" {normalized_probe} " in f" {normalized_text} "
+    expected_dates = _browser_probe_date_signatures(probe)
+    probe_text = unicodedata.normalize("NFKC", str(probe or ""))
+    expected_is_localized_numeric_date = bool(
+        re.fullmatch(
+            r"\s*\d{4}[^\W\d_]+\d{1,2}[^\W\d_]+\d{1,2}[^\W\d_]*\s*",
+            probe_text,
+            flags=re.UNICODE,
+        )
+    )
+    if (
+        expected_dates
+        and (
+            len(normalized_probe.split()) <= 3
+            or expected_is_localized_numeric_date
+        )
+        and expected_dates.intersection(_browser_probe_date_signatures(text))
+    ):
+        return True
+    expected_percentages = _browser_probe_percentage_identities(probe)
+    if not expected_percentages.issubset(_browser_probe_percentage_identities(text)):
+        return False
+    expected_prices = _browser_probe_price_identities(probe)
+    if not _browser_probe_price_identities_satisfied(
+        expected_prices,
+        _browser_probe_price_identities(text),
+    ):
+        return False
+    price_marker_tokens = {
+        token
+        for marker, _amount in expected_prices
+        for token in _browser_probe_normalized_text(marker).split()
+    }
+    probe_tokens = [
+        token
+        for token in normalized_probe.split()
+        if token not in price_marker_tokens
+    ]
     if not probe_tokens:
         return False
     text_tokens = normalized_text.split()
     if len(probe_tokens) == 1:
         return probe_tokens[0] in text_tokens
-    if normalized_probe in normalized_text:
-        return True
-    return all(token in text_tokens for token in probe_tokens)
+    text_token_set = set(text_tokens)
+    return all(token in text_token_set for token in probe_tokens)
 
 
 def _browser_probe_normalized_text(value: object) -> str:
-    tokens = re.findall(r"[a-z0-9]+", str(value or "").casefold())
+    tokens = re.findall(
+        r"[^\W\d_]+|\d+",
+        unicodedata.normalize("NFKC", str(value or "")).casefold(),
+        flags=re.UNICODE,
+    )
     normalized_tokens = [
-        str(int(token)) if token.isdecimal() else token
+        (
+            "".join(str(unicodedata.decimal(character)) for character in token)
+            if token.isdecimal()
+            else token
+        )
         for token in tokens
     ]
     return " ".join(normalized_tokens)

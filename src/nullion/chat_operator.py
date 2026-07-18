@@ -178,7 +178,11 @@ from nullion.response_fulfillment_contract import (
     normalize_artifact_media_required_extensions,
     scoped_artifact_extensions_from_tool_results,
 )
-from nullion.response_sanitizer import sanitize_user_visible_reply
+from nullion.response_sanitizer import (
+    browser_terminal_revalidation_result_is_verified,
+    browser_tool_evidence_is_unfulfilled,
+    sanitize_user_visible_reply,
+)
 from nullion.redaction import redact_value
 from nullion.scheduler_context_compaction import compact_list_crons_output_for_context
 from nullion.screenshot_delivery import ScreenshotDeliveryResult
@@ -2536,7 +2540,7 @@ def _resume_turn_from_snapshot(
     model_client: object | None,
     agent_orchestrator: object | None,
     settings: NullionSettings | None = None,
-) -> str | None:
+) -> tuple[str, TurnOutcome] | None:
     """Resume an orchestrator turn using the stored messages snapshot."""
     snapshot = suspended_turn.messages_snapshot
     if not snapshot:
@@ -2563,14 +2567,19 @@ def _resume_turn_from_snapshot(
         message_id=suspended_turn.message_id,
     )
     if screenshot_reply is not None:
-        return screenshot_reply
+        return screenshot_reply, TurnOutcome.SUCCESS
     direct_tool_result = execute_approved_pending_tool_call(
         runtime,
         suspended_turn,
         tool_registry=runtime.active_tool_registry or ToolRegistry(),
     )
     if direct_tool_result is not None:
-        return _approved_pending_tool_resume_reply(direct_tool_result)
+        return (
+            _approved_pending_tool_resume_reply(direct_tool_result),
+            TurnOutcome.SUCCESS
+            if normalize_tool_status(direct_tool_result.status) == "completed"
+            else TurnOutcome.PARTIAL,
+        )
     if agent_orchestrator is None:
         return None
     resume_max_iterations = max_iterations_from_resume_token(getattr(suspended_turn, "resume_token", None))
@@ -2669,26 +2678,51 @@ def _resume_turn_from_snapshot(
         return None
     if result.suspended_for_approval:
         approval_id = result.approval_id
-        reply, _is_suspended = _approval_marker_reply_if_actionable(runtime, approval_id)
-        return reply
-    if getattr(result, "reached_iteration_limit", False):
-        next_approval_id = _store_agent_turn_limit_extension_suspended_turn(
-            runtime,
-            conversation_id=suspended_turn.conversation_id or "telegram:resume",
-            chat_id=suspended_turn.chat_id,
-            message=suspended_turn.message,
-            request_id=suspended_turn.request_id,
-            message_id=suspended_turn.message_id,
-            messages_snapshot=snapshot,
-            current_max_iterations=resume_max_iterations or default_agent_turn_max_iterations(),
-            tool_results=result.tool_results,
+        reply, is_suspended = _approval_marker_reply_if_actionable(runtime, approval_id)
+        return (
+            reply,
+            TurnOutcome.SUSPENDED if is_suspended else TurnOutcome.SUCCESS,
         )
-        if next_approval_id:
-            reply, _is_suspended = _approval_marker_reply_if_actionable(runtime, next_approval_id)
-            return reply
+    result_reply = result.final_text or "Done."
+    result_outcome = (
+        TurnOutcome.SUCCESS
+        if getattr(result, "response_fulfilled", None) is not False
+        else TurnOutcome.PARTIAL
+    )
+    if getattr(result, "reached_iteration_limit", False):
+        limit_evidence_reply = _turn_limit_evidence_reply(
+            user_message=user_msg_content,
+            final_text=result.final_text,
+            tool_results=result.tool_results,
+            response_fulfilled=getattr(result, "response_fulfilled", None),
+        )
+        if limit_evidence_reply is not None:
+            result_reply = limit_evidence_reply
+            result_outcome = TurnOutcome.SUCCESS
+        else:
+            next_approval_id = _store_agent_turn_limit_extension_suspended_turn(
+                runtime,
+                conversation_id=suspended_turn.conversation_id or "telegram:resume",
+                chat_id=suspended_turn.chat_id,
+                message=suspended_turn.message,
+                request_id=suspended_turn.request_id,
+                message_id=suspended_turn.message_id,
+                messages_snapshot=snapshot,
+                current_max_iterations=resume_max_iterations or default_agent_turn_max_iterations(),
+                tool_results=result.tool_results,
+            )
+            if next_approval_id:
+                reply, is_suspended = _approval_marker_reply_if_actionable(runtime, next_approval_id)
+                return (
+                    reply,
+                    TurnOutcome.SUSPENDED if is_suspended else TurnOutcome.SUCCESS,
+                )
+            return _turn_limit_continuation_persistence_failure()
+    elif getattr(result, "response_fulfilled", None) is False:
+        result_reply, result_outcome = _unfulfilled_turn_reply()
     resumed_reply = _append_chat_artifacts_to_reply(
         runtime,
-        reply=result.final_text or "Done.",
+        reply=result_reply,
         artifact_paths=result.artifacts,
         prompt=user_msg_content,
         conversation_id=suspended_turn.conversation_id,
@@ -2704,11 +2738,16 @@ def _resume_turn_from_snapshot(
         artifact_paths=result.artifacts,
         principal_id=principal_id,
     )
-    return append_activity_trace_to_reply(
-        resumed_reply,
-        tool_results=result.tool_results,
-        suspended_for_approval=False,
-        enabled=activity_trace_enabled_for_chat(runtime, chat_id=suspended_turn.chat_id),
+    if getattr(result, "response_fulfilled", None) is False:
+        resumed_reply, result_outcome = _unfulfilled_turn_reply()
+    return (
+        append_activity_trace_to_reply(
+            resumed_reply,
+            tool_results=result.tool_results,
+            suspended_for_approval=False,
+            enabled=activity_trace_enabled_for_chat(runtime, chat_id=suspended_turn.chat_id),
+        ),
+        result_outcome,
     )
 
 
@@ -2741,14 +2780,15 @@ def resume_approved_telegram_request(
             )
             runtime.checkpoint()
             return resumed_reply
-        resumed_reply = _resume_turn_from_snapshot(
+        resumed_turn_result = _resume_turn_from_snapshot(
             runtime,
             suspended_turn=suspended_turn,
             model_client=model_client,
             agent_orchestrator=agent_orchestrator,
             settings=settings,
         )
-        if resumed_reply is None:
+        resumed_outcome: TurnOutcome | None = None
+        if resumed_turn_result is None:
             # Fallback: replay original message through full pipeline
             replay_message = suspended_turn.message
             active_prompt = _active_task_frame_prompt(runtime, chat_id=suspended_turn.chat_id or chat_id)
@@ -2764,10 +2804,16 @@ def resume_approved_telegram_request(
                 model_client=model_client,
                 agent_orchestrator=agent_orchestrator,
             )
+        else:
+            resumed_reply, resumed_outcome = resumed_turn_result
         runtime.store.remove_suspended_turn(approval_id)
         # Persist the resumed result in chat history so future turns see the real
         # outcome rather than a stale "Tool approval requested" placeholder.
-        _is_resumed_suspension = isinstance(resumed_reply, str) and resumed_reply.startswith("Tool approval requested")
+        _is_resumed_suspension = resumed_outcome is TurnOutcome.SUSPENDED or (
+            resumed_outcome is None
+            and isinstance(resumed_reply, str)
+            and resumed_reply.startswith("Tool approval requested")
+        )
         if resumed_reply and not _is_resumed_suspension:
             effective_chat_id = suspended_turn.chat_id or chat_id
             user_message = _chat_prompt_for_message(suspended_turn.message) or suspended_turn.message
@@ -2778,7 +2824,10 @@ def resume_approved_telegram_request(
                 user_message=user_message,
                 assistant_reply=resumed_reply,
             )
-            _complete_resumed_task_frame(runtime, suspended_turn=suspended_turn)
+            if resumed_outcome is TurnOutcome.PARTIAL:
+                _reopen_resumed_task_frame(runtime, suspended_turn=suspended_turn)
+            else:
+                _complete_resumed_task_frame(runtime, suspended_turn=suspended_turn)
         runtime.checkpoint()
         return resumed_reply
     if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
@@ -2840,6 +2889,34 @@ def _complete_resumed_task_frame(
     )
     runtime.store.add_task_frame(updated)
     runtime.store.set_active_task_frame_id(conversation_id, None)
+
+
+def _reopen_resumed_task_frame(
+    runtime: PersistentRuntime,
+    *,
+    suspended_turn: SuspendedTurn,
+) -> None:
+    """Keep an incomplete resumed task active after continuation persistence fails."""
+
+    conversation_id = suspended_turn.conversation_id
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return
+    frame_id = runtime.store.get_active_task_frame_id(conversation_id)
+    if not isinstance(frame_id, str) or not frame_id:
+        return
+    frame = runtime.store.get_task_frame(frame_id)
+    if frame is None:
+        return
+    status = getattr(frame, "status", None)
+    if status is not TaskFrameStatus.WAITING_APPROVAL and str(status) != TaskFrameStatus.WAITING_APPROVAL.value:
+        return
+    runtime.store.add_task_frame(
+        replace(
+            frame,
+            status=TaskFrameStatus.ACTIVE,
+            updated_at=datetime.now(UTC),
+        )
+    )
 
 
 def _suspended_turn_matches_conversation(
@@ -14369,7 +14446,14 @@ def _turn_limit_evidence_reply(
     user_message: str | None,
     final_text: str | None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...],
+    response_fulfilled: bool | None = None,
 ) -> str | None:
+    # A successful read proves only that some page evidence was available; it
+    # does not prove that the user's whole request was satisfied.  At the hard
+    # iteration boundary, accept a terminal answer only when the orchestrator
+    # has made the typed fulfillment decision explicitly.
+    if response_fulfilled is not True:
+        return None
     sanitized = sanitize_user_visible_reply(
         user_message=user_message,
         reply=final_text or "",
@@ -14379,15 +14463,25 @@ def _turn_limit_evidence_reply(
     text = str(sanitized or "").strip()
     if not text:
         return None
-    normalized = re.sub(r"\s+", " ", text.casefold()).strip()
-    generic_limit_markers = (
-        "i could not complete the request before the tool loop limit",
-        "tool budget was reached before the request could finish",
-        "doctor recommends more tool budget",
-    )
-    if any(marker in normalized for marker in generic_limit_markers):
+    if browser_tool_evidence_is_unfulfilled(tool_results):
         return None
     return text
+
+
+def _turn_limit_continuation_persistence_failure() -> tuple[str, TurnOutcome]:
+    return (
+        "I couldn't complete this within the current tool budget, and I couldn't save a continuation request. "
+        "The task is still incomplete.",
+        TurnOutcome.PARTIAL,
+    )
+
+
+def _unfulfilled_turn_reply() -> tuple[str, TurnOutcome]:
+    return (
+        "I don't have enough verified evidence to give you a reliable answer yet. "
+        "The task is still open.",
+        TurnOutcome.PARTIAL,
+    )
 
 
 def _latest_completed_tool_result(
@@ -24847,6 +24941,7 @@ def _render_chat_turn(
                         user_message=effective_prompt,
                         final_text=turn_result.final_text,
                         tool_results=turn_result.tool_results,
+                        response_fulfilled=turn_result.response_fulfilled,
                     )
                     if limit_evidence_reply:
                         reply = limit_evidence_reply
@@ -24871,8 +24966,9 @@ def _render_chat_turn(
                             reply, _turn_limit_approval_live = _approval_marker_reply_if_actionable(runtime, approval_id)
                             turn_outcome = TurnOutcome.SUSPENDED if _turn_limit_approval_live else TurnOutcome.SUCCESS
                         else:
-                            reply = turn_result.final_text or "Tool budget was reached before the request could finish."
-                            turn_outcome = TurnOutcome.SUCCESS
+                            reply, turn_outcome = _turn_limit_continuation_persistence_failure()
+                elif getattr(turn_result, "response_fulfilled", None) is False:
+                    reply, turn_outcome = _unfulfilled_turn_reply()
                 elif turn_result.suspended_for_approval:
                     reply, _turn_approval_live = _approval_marker_reply_for_turn_result(
                         runtime,
@@ -25207,12 +25303,15 @@ def _render_chat_turn(
                         if repair_result is not None:
                             _mark_timing("repair_model_tools")
                             activity_tool_results.extend(list(repair_result.tool_results))
+                            if getattr(repair_result, "response_fulfilled", None) is False:
+                                turn_result.response_fulfilled = False
                         if repair_result is not None and getattr(repair_result, "reached_iteration_limit", False):
                             combined_tool_results = [*turn_result.tool_results, *list(repair_result.tool_results)]
                             limit_evidence_reply = _turn_limit_evidence_reply(
                                 user_message=effective_prompt,
                                 final_text=repair_result.final_text,
                                 tool_results=combined_tool_results,
+                                response_fulfilled=repair_result.response_fulfilled,
                             )
                             if limit_evidence_reply:
                                 reply = limit_evidence_reply
@@ -25235,6 +25334,8 @@ def _render_chat_turn(
                                 if approval_id:
                                     reply, _repair_limit_approval_live = _approval_marker_reply_if_actionable(runtime, approval_id)
                                     turn_outcome = TurnOutcome.SUSPENDED if _repair_limit_approval_live else turn_outcome
+                                else:
+                                    reply, turn_outcome = _turn_limit_continuation_persistence_failure()
                         elif repair_result is not None and repair_result.suspended_for_approval:
                             reply, _repair_approval_live = _approval_marker_reply_for_turn_result(
                                 runtime,
@@ -25336,12 +25437,15 @@ def _render_chat_turn(
                                 if second_repair_result is not None:
                                     _mark_timing("second_repair_model_tools")
                                     activity_tool_results.extend(list(second_repair_result.tool_results))
+                                    if getattr(second_repair_result, "response_fulfilled", None) is False:
+                                        turn_result.response_fulfilled = False
                                 if second_repair_result is not None and getattr(second_repair_result, "reached_iteration_limit", False):
                                     combined_tool_results = [*turn_result.tool_results, *list(second_repair_result.tool_results)]
                                     limit_evidence_reply = _turn_limit_evidence_reply(
                                         user_message=effective_prompt,
                                         final_text=second_repair_result.final_text,
                                         tool_results=combined_tool_results,
+                                        response_fulfilled=second_repair_result.response_fulfilled,
                                     )
                                     if limit_evidence_reply:
                                         reply = limit_evidence_reply
@@ -25364,6 +25468,8 @@ def _render_chat_turn(
                                         if approval_id:
                                             reply, _second_repair_limit_approval_live = _approval_marker_reply_if_actionable(runtime, approval_id)
                                             turn_outcome = TurnOutcome.SUSPENDED if _second_repair_limit_approval_live else turn_outcome
+                                        else:
+                                            reply, turn_outcome = _turn_limit_continuation_persistence_failure()
                                 elif second_repair_result is not None and second_repair_result.suspended_for_approval:
                                     reply, _second_repair_approval_live = _approval_marker_reply_for_turn_result(
                                         runtime,
@@ -25648,6 +25754,12 @@ def _render_chat_turn(
                     tool_results=activity_tool_results,
                     source="agent",
                 )
+            if (
+                not _turn_is_suspended
+                and getattr(locals().get("turn_result"), "response_fulfilled", None) is False
+                and not getattr(locals().get("turn_result"), "reached_iteration_limit", False)
+            ):
+                reply, turn_outcome = _unfulfilled_turn_reply()
             visible_reply = append_activity_trace_to_reply(
                 reply,
                 tool_results=activity_tool_results,

@@ -17819,7 +17819,7 @@ def _build_list_crons_handler():
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="completed",
-                output={"crons": [], "message": "No crons scheduled."},
+                output={"crons": [], "count": 0, "message": "No crons scheduled."},
                 error=None,
             )
         lines = []
@@ -17859,7 +17859,11 @@ def _build_list_crons_handler():
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"crons": crons, "message": f"{header}\n\n" + "\n\n".join(lines)},
+            output={
+                "crons": crons,
+                "count": len(crons),
+                "message": f"{header}\n\n" + "\n\n".join(lines),
+            },
             error=None,
         )
     return handle
