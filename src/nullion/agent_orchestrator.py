@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from nullion.browser_capture_contract import capture_only_scope, completed_capture_paths, conversation_navigation, delivered_capture_paths
+
 import asyncio
 import base64
 import inspect
@@ -1779,6 +1781,8 @@ def _turn_still_needs_scoped_email_send(state: Mapping[str, Any]) -> bool:
 def _completed_required_artifact_paths_for_turn(state: Mapping[str, Any], artifacts: Iterable[str]) -> tuple[str, ...]:
     if _turn_still_needs_scoped_email_send(state):
         return ()
+    if capture_only_scope(getattr(state.get("tool_registry"), "turn_tool_scope_decision", None), state.get("tool_results")):
+        return completed_capture_paths(getattr(state.get("tool_registry"), "turn_tool_scope_decision", None), state.get("tool_results"))
     media_required_extensions = set(_required_embedded_media_extensions_from_turn_state(state))
     required_extensions = tuple(
         dict.fromkeys([
@@ -3961,6 +3965,10 @@ def _completion_review_required(
     results = list(tool_results)
     if not results:
         return False
+    if (
+        completed_capture_paths(getattr(state.get("tool_registry"), "turn_tool_scope_decision", None), results)
+    ):
+        return False
     has_failed_or_unverified_result = False
     for index, result in enumerate(results):
         status = normalize_tool_status(getattr(result, "status", None))
@@ -5792,6 +5800,8 @@ def _required_attachment_extensions_from_turn_scope(tool_registry: object | None
     scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
     if scheduler_action == "mutate":
         return ()
+    if capture_only_scope(decision):
+        return (".png",)
     return tuple(
         dict.fromkeys(
             str(extension or "").strip().lower()
@@ -9120,7 +9130,13 @@ def _complete_agent_turn(
     if missing_scope_action and not suspended_for_approval:
         final_text = _missing_scope_action_final_reply(missing_scope_action)
         response_fulfilled = False
-    if _agent_browser_tool_evidence_is_unfulfilled(state.get("tool_results")):
+    capture_fulfilled = bool(
+        completed_capture_paths(getattr(tool_registry, "turn_tool_scope_decision", None), state.get("tool_results"))
+        or delivered_capture_paths(getattr(tool_registry, "turn_tool_scope_decision", None), state.get("tool_results"), str(final_text or ""))
+    )
+    if capture_fulfilled and not suspended_for_approval and not missing_scope_action:
+        response_fulfilled = True
+    elif _agent_browser_tool_evidence_is_unfulfilled(state.get("tool_results")):
         response_fulfilled = False
     cleanup_scope = state.get("cleanup_scope") or f"turn-{uuid4().hex}"
     if not cleanup_done and tool_registry is not None:
@@ -9311,13 +9327,25 @@ def _execute_agent_turn_tool_uses(
             tool_input,
             user_message=state.get("user_message") or user_message,
         )
+        invocation_context = dict(state.get("tool_flow_context") or {})
+        prior_navigation = None
+        if tool_name in {"browser_open", "browser_screenshot"} and not any(
+            result.tool_name.startswith("browser_") for result in tool_results
+        ):
+            from nullion.task_frames import extract_url_target
+            if extract_url_target(user_message) is None:
+                previous = conversation_navigation(runtime_store, conversation_id)
+                raw_session = invocation_arguments.get("session_id")
+                if previous is not None and raw_session in (None, "", "default", previous.output["session_id"]):
+                    prior_navigation = previous
+                    invocation_context["browser_session_id"] = previous.output["session_id"]
         invocation = ToolInvocation(
             invocation_id=f"orchestrator-{uuid4().hex}",
             tool_name=tool_name,
             principal_id=principal_id,
             arguments=invocation_arguments,
             capsule_id=cleanup_scope,
-            flow_context=dict(state.get("tool_flow_context") or {}) or None,
+            flow_context=invocation_context or None,
         )
         if tool_name == "request_tool_scope":
             apply_scope_request = getattr(tool_registry, "apply_scope_request", None)
@@ -9613,6 +9641,8 @@ def _execute_agent_turn_tool_uses(
                     error=str(exc),
                 )
         tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
+        if prior_navigation is not None and result.status == "completed" and isinstance(result.output, dict):
+            result.output["navigation_receipt"] = dict(prior_navigation.output)
         tool_results.append(result)
         email_attachment_guard_result = _email_attachment_artifact_guard_result(
             state,

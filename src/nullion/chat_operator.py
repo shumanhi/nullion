@@ -77,6 +77,7 @@ from nullion.chat_attachments import (
     unavailable_chat_attachment_names,
 )
 from nullion.chat_backend import ChatBackendUnavailableError, generate_chat_reply
+from nullion.browser_capture_contract import capture_only_scope, completed_capture_paths, conversation_navigation, delivered_capture_paths
 from nullion.chat_response_contract import (
     ChatResponseContract,
     ChatTurnStateSnapshot,
@@ -8767,16 +8768,18 @@ def _direct_open_url_tool_name(
         if allow_screenshot_artifact_contract
         else _DIRECT_OPEN_URL_TOOL_NAMES | _DIRECT_OPEN_URL_VALIDATION_TOOL_NAMES
     )
+    if web_action == "open_url" and not allow_screenshot_artifact_contract:
+        allowed_tool_names = allowed_tool_names | {"browser_extract_text"}
     if web_action not in {"open_url", "browser_interaction"}:
         if not requested_tool_names or not set(requested_tool_names).issubset(allowed_tool_names):
             return None
     if web_action == "browser_interaction" and not requested_tool_names:
         return None
-    if (
-        web_action != "open_url"
-        and requested_tool_names
-        and not set(requested_tool_names).issubset(allowed_tool_names)
-    ):
+    if requested_tool_names and not set(requested_tool_names).issubset(allowed_tool_names):
+        return None
+    required_names = set(getattr(decision, "required_tool_names", ()) or ())
+    performed_names = _DIRECT_OPEN_URL_TOOL_NAMES | ({"browser_screenshot"} if allow_screenshot_artifact_contract else set())
+    if required_names - performed_names:
         return None
     requested_artifact_extensions = {
         str(extension or "").strip().lower()
@@ -8790,13 +8793,9 @@ def _direct_open_url_tool_name(
     if tuple(getattr(decision, "required_embedded_media_extensions", ()) or ()):
         return None
     available = _registry_tool_names(registry)
-    for tool_name in requested_tool_names:
-        if tool_name in _DIRECT_OPEN_URL_TOOL_NAMES and tool_name in available:
-            return tool_name
-    for tool_name in ("browser_navigate", "browser_open"):
-        if tool_name in available:
-            return tool_name
-    return None
+    # This path has a URL target. browser_open only focuses a session and
+    # cannot satisfy navigation, even when the scope planner selected it.
+    return "browser_navigate" if "browser_navigate" in available else None
 
 
 def _run_open_url_tool_directly(
@@ -8822,6 +8821,7 @@ def _run_open_url_tool_directly(
         principal_id=str(principal_id or ""),
         arguments={"url": target.value},
         capsule_id=None,
+        flow_context={"browser_session_scope": str(turn_id or uuid4().hex)},
     )
     result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=registry)
     if tool_result_callback is not None:
@@ -8845,6 +8845,7 @@ def _run_open_url_tool_directly(
                 base_registry=base_registry,
                 open_tool_name=tool_name,
                 principal_id=principal_id,
+                browser_session_id=str(output.get("session_id") or "") or None,
                 tool_result_callback=tool_result_callback,
             )
         )
@@ -8877,6 +8878,7 @@ def _run_direct_open_read_continuation(
     base_registry: object | None,
     open_tool_name: str,
     principal_id: str | None,
+    browser_session_id: str | None = None,
     tool_result_callback: Callable[[ToolResult], None] | None = None,
 ) -> ToolResult | None:
     registry_for_lookup = base_registry or open_registry
@@ -8906,6 +8908,7 @@ def _run_direct_open_read_continuation(
         principal_id=str(principal_id or ""),
         arguments={},
         capsule_id=None,
+        flow_context={"browser_session_id": browser_session_id} if browser_session_id else {},
     )
     try:
         result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=read_registry)
@@ -8955,34 +8958,16 @@ def _direct_browser_screenshot_allowed(registry: object) -> bool:
     if "browser_screenshot" not in _registry_tool_names(registry):
         return False
     decision = getattr(registry, "turn_tool_scope_decision", None)
-    requested_tool_names = {
-        str(name or "").strip()
-        for name in tuple(getattr(decision, "requested_tool_names", ()) or ())
-        if str(name or "").strip()
-    }
-    required_tool_names = {
-        str(name or "").strip()
-        for name in tuple(getattr(decision, "required_tool_names", ()) or ())
-        if str(name or "").strip()
-    }
-    requested_extensions = {
-        str(extension or "").strip().lower()
-        for extension in tuple(getattr(decision, "requested_artifact_extensions", ()) or ())
-        if str(extension or "").strip()
-    }
-    embedded_extensions = {
-        str(extension or "").strip().lower()
-        for extension in tuple(getattr(decision, "required_embedded_media_extensions", ()) or ())
-        if str(extension or "").strip()
-    }
-    if embedded_extensions:
+    if not capture_only_scope(decision):
         return False
-    if requested_extensions and not requested_extensions.issubset({".png"}):
-        return False
-    return (
-        "browser_screenshot" in required_tool_names
-        or ".png" in requested_extensions
-    )
+    names = set(getattr(decision, "requested_tool_names", ()) or ()) | set(
+        getattr(decision, "required_tool_names", ()) or ())
+    return not names - {"browser_navigate", "browser_open", "browser_screenshot"}
+
+
+def _conversation_browser_navigation(runtime: PersistentRuntime, conversation_id: str | None) -> ToolResult | None:
+    """Find a navigation receipt without crossing a conversation or session."""
+    return conversation_navigation(runtime.store, conversation_id)
 
 
 def _run_browser_screenshot_tool_directly(
@@ -8992,13 +8977,25 @@ def _run_browser_screenshot_tool_directly(
     principal_id: str | None,
     turn_id: str | None,
     user_message: str = "",
+    conversation_id: str | None = None,
     tool_result_callback: Callable[[ToolResult], None] | None = None,
 ) -> object | None:
     if not _direct_browser_screenshot_allowed(registry):
         return None
     decision = getattr(registry, "turn_tool_scope_decision", None)
     tool_results: list[ToolResult] = []
+    flow_context = {"browser_session_scope": str(turn_id or uuid4().hex)}
     target = extract_url_target(user_message)
+    prior_navigation = None
+    if target is None:
+        names = set(getattr(decision, "requested_tool_names", ()) or ()) | set(
+            getattr(decision, "required_tool_names", ()) or ())
+        if names != {"browser_screenshot"}:
+            return None
+        prior_navigation = _conversation_browser_navigation(runtime, conversation_id)
+        if prior_navigation is None:
+            return None
+        flow_context["browser_session_id"] = str(prior_navigation.output["session_id"])
     if target is not None and target.value:
         open_tool_name = _direct_open_url_tool_name(
             registry,
@@ -9014,12 +9011,17 @@ def _run_browser_screenshot_tool_directly(
                     principal_id=str(principal_id or ""),
                     arguments={"url": target.value},
                     capsule_id=None,
+                    flow_context=dict(flow_context),
                 ),
                 registry=registry,
             )
             if tool_result_callback is not None:
                 tool_result_callback(open_result)
             tool_results.append(open_result)
+            if isinstance(open_result.output, dict):
+                session_id = str(open_result.output.get("session_id") or "").strip()
+                if session_id:
+                    flow_context["browser_session_id"] = session_id
             if normalize_tool_status(open_result.status) != "completed":
                 output = open_result.output if isinstance(open_result.output, dict) else {}
                 return SimpleNamespace(
@@ -9042,13 +9044,19 @@ def _run_browser_screenshot_tool_directly(
         principal_id=str(principal_id or ""),
         arguments={"mode": "viewport"},
         capsule_id=None,
+        flow_context=dict(flow_context),
     )
     result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=registry)
+    if prior_navigation is not None and result.status == "completed" and isinstance(result.output, dict):
+        result.output["navigation_receipt"] = dict(prior_navigation.output)
     if tool_result_callback is not None:
         tool_result_callback(result)
     tool_results.append(result)
     output = result.output if isinstance(result.output, dict) else {}
-    artifacts = sorted(_browser_screenshot_artifact_paths(tool_results))
+    # Historical navigation is verification evidence, not a tool executed in
+    # this turn. Keep it out of the current activity and persisted tool list.
+    evidence = ([prior_navigation] if prior_navigation is not None else []) + tool_results
+    artifacts = list(completed_capture_paths(decision, evidence))
     if normalize_tool_status(result.status) == "completed" and artifacts:
         final_text = "Here’s the screenshot."
     else:
@@ -9806,6 +9814,10 @@ def _planner_dispatch_artifact_extensions(
 def _turn_result_has_completed_requested_artifact(result: object, registry: object | None) -> bool:
     tool_results = list(getattr(result, "tool_results", None) or [])
     decision = getattr(registry, "turn_tool_scope_decision", None)
+    if delivered_capture_paths(decision, tool_results, str(getattr(result, "final_text", "") or "")):
+        return True
+    if capture_only_scope(decision, tool_results):
+        return bool(completed_capture_paths(decision, tool_results))
     registry_media_extensions = (
         normalize_artifact_media_required_extensions(
             getattr(decision, "required_embedded_media_extensions", ()) or ()
@@ -11074,7 +11086,7 @@ def _run_chat_turn_schema_followup_tool_retry(
     user_message: str | None = None,
 ) -> tuple[object, object, bool]:
     registry_for_lookup = base_tool_registry or active_tool_registry
-    if _turn_result_has_completed_requested_artifact(initial_result, registry_for_lookup):
+    if _turn_result_has_completed_requested_artifact(initial_result, active_tool_registry):
         return initial_result, active_tool_registry, False
     direct_retry_result = _direct_required_source_resource_retry(
         initial_result=initial_result,
@@ -23520,6 +23532,11 @@ def _render_chat_turn(
         required_artifact_extensions=turn_scoped_attachment_extensions,
         requires_new_artifact_content=turn_tool_evidence.existing_named_artifact_requires_new_content,
     )
+    turn_tool_flow_context = dict(turn_tool_flow_context or {})
+    turn_tool_flow_context.update(
+        browser_session_scope=conversation_result.turn.turn_id,
+        browser_session_owner=f"conversation:{conversation_id}",
+    )
     agent_orchestrator = _orchestrator_with_interactive_fast_profile(
         agent_orchestrator,
         enabled=fast_profile_candidate,
@@ -23830,6 +23847,7 @@ def _render_chat_turn(
             principal_id=principal_id,
             turn_id=conversation_result.turn.turn_id,
             user_message=effective_prompt,
+            conversation_id=conversation_id,
             tool_result_callback=_record_tool_activity if activity_callback is not None else None,
         )
     if direct_structured_browser_result is not None:
@@ -24736,6 +24754,7 @@ def _render_chat_turn(
                             principal_id=principal_id,
                             turn_id=conversation_result.turn.turn_id,
                             user_message=effective_prompt,
+                            conversation_id=conversation_id,
                             tool_result_callback=_record_tool_activity if activity_callback is not None else None,
                         )
                         if direct_browser_screenshot_result is not None:

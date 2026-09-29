@@ -795,13 +795,16 @@ class PlaywrightBackend:
 
     BACKEND_NAME = "playwright"
 
-    def __init__(self) -> None:
+    def __init__(self, *, headless: bool | None = None) -> None:
         _require_playwright()
         self._playwright = None
         self._browser: "Browser | None" = None
         self._pages: dict[str, "Page"] = {}
         self._lock = asyncio.Lock()
-        self._headless = os.environ.get("NULLION_BROWSER_HEADLESS", "true").lower() != "false"
+        self._headless = (
+            os.environ.get("NULLION_BROWSER_HEADLESS", "true").lower() != "false"
+            if headless is None else headless
+        )
 
     async def _ensure_browser(self) -> "Browser":
         if self._browser is None or not self._browser.is_connected():

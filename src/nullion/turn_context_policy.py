@@ -1027,6 +1027,12 @@ class ScopedTurnToolRegistry:
             return self._should_collect_embedded_web_media_without_shell()
         if tool_name == "browser_screenshot":
             return (
+                (
+                    self.turn_tool_scope_decision.valid
+                    and tool_name in self.turn_tool_scope_decision.requested_tool_names
+                    and (self._evidence.has_url_target or self._evidence.has_prior_tool_scope("web"))
+                )
+                or
                 _browser_visual_capture_allowed_by_extensions(
                     tool_name,
                     requested_extensions=trusted_requested_extensions,
@@ -1208,6 +1214,12 @@ class ScopedTurnToolRegistry:
         if tool_name == "file_read" and self._evidence.slash_prefixed_literal and not self._evidence.has_attachments:
             return False
         if tool_name in _URL_BOUNDARY_TOOLS:
+            if (
+                tool_name == "browser_navigate"
+                and self._evidence.has_url_target
+                and self.turn_tool_scope_decision.web_action == "open_url"
+            ):
+                return True
             if (
                 tool_name == "browser_screenshot"
                 and self._evidence.has_url_target
@@ -1484,6 +1496,7 @@ class ScopedTurnToolRegistry:
                     for tool_name in exact_for_capability
                     if tool_name not in _BROWSER_VISUAL_CAPTURE_TOOLS
                     or self._browser_visual_capture_allowed(tool_name, exact_requested_extensions)
+                    or (tool_name == "browser_screenshot" and self._evidence.has_prior_tool_scope("web"))
                 )
             if exact_for_capability:
                 exact_available = tuple(tool_name for tool_name in exact_for_capability if tool_name in available)
@@ -1805,7 +1818,11 @@ class ScopedTurnToolRegistry:
             requested_scheduler_target_scope = "none"
             requested_scheduler_toggle_enabled = None
         scheduler_mutation_scope = "scheduler_mutate" in capabilities
-        if "web" in capabilities and not scheduler_mutation_scope:
+        contextual_capture = (
+            set(scope_arguments.get("tool_names") or ()) == {"browser_screenshot"}
+            and self._evidence.has_prior_tool_scope("web")
+        )
+        if "web" in capabilities and not scheduler_mutation_scope and not contextual_capture:
             required_tool_names = tuple(
                 dict.fromkeys(
                     [
@@ -2186,6 +2203,7 @@ class ScopedTurnToolRegistry:
                     "available_tools": list(callable_tool_names),
                     "required_tool_names": list(callable_required_tool_names),
                     "requested_required_tool_names": list(merged_required_tool_names),
+                    "explicit_tool_names": sorted(set(existing.requested_tool_names) | explicitly_requested_tools),
                     "unavailable_required_tool_names": list(unavailable_required_tool_names),
                     "unavailable_tools": list(unavailable_tools),
                     "unavailable_capabilities": ["connector"] if connector_source_unavailable else [],

@@ -4126,6 +4126,7 @@ class BrowserTools:
         self._sessions_by_scope: dict[str, set[str]] = {}
         self._active_session_lock = threading.Lock()
         self._active_sessions_by_principal: dict[str, tuple[str, float]] = {}
+        self._issued_sessions_by_scope: dict[str, set[str]] = {}
         self._element_snapshot_lock = threading.Lock()
         self._element_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
         self._page_assertion_lock = threading.Lock()
@@ -4147,6 +4148,15 @@ class BrowserTools:
         bound_session_id = str(context.get("browser_session_id") or "").strip()
         if bound_session_id:
             return bound_session_id
+        # Tools return physical session IDs. Reusing one in its owning scope
+        # must not hash it again as a new model-chosen alias.
+        if raw_session_id:
+            with self._active_session_lock:
+                if any(
+                    raw_session_id in self._issued_sessions_by_scope.get(key, ())
+                    for key in self._active_session_keys(invocation)
+                ):
+                    return raw_session_id
         if self._uses_shared_default_session():
             if raw_session_id == DEFAULT_AGENT_BROWSER_SESSION_ID:
                 return DEFAULT_AGENT_BROWSER_SESSION_ID
@@ -4160,7 +4170,7 @@ class BrowserTools:
             return f"task-{digest}"
         if raw_session_id and raw_session_id != "default":
             return self._scoped_model_session_id(invocation, raw_session_id)
-        scope = self._cleanup_scope(invocation)
+        scope = str(context.get("browser_session_scope") or self._cleanup_scope(invocation))
         digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
         return f"default-{digest}"
 
@@ -4212,6 +4222,10 @@ class BrowserTools:
         scope = self._cleanup_scope(invocation)
         with self._cleanup_lock:
             self._sessions_by_scope.setdefault(scope, set()).add(session_id)
+            context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+            owner = str(context.get("browser_session_owner") or "").strip()
+            if owner:
+                self._sessions_by_scope.setdefault(owner, set()).add(session_id)
 
     def _active_session_keys(self, invocation: ToolInvocation) -> tuple[str, ...]:
         context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
@@ -4241,6 +4255,7 @@ class BrowserTools:
             remembered_at = time.monotonic()
             for key in self._active_session_keys(invocation):
                 self._active_sessions_by_principal[key] = (session_id, remembered_at)
+                self._issued_sessions_by_scope.setdefault(key, set()).add(session_id)
 
     def _recent_active_session_id(self, invocation: ToolInvocation, *, exclude: str | None = None) -> str | None:
         now = time.monotonic()
@@ -4268,6 +4283,10 @@ class BrowserTools:
             for scope in empty_scopes:
                 self._sessions_by_scope.pop(scope, None)
         with self._active_session_lock:
+            for key in list(self._issued_sessions_by_scope):
+                self._issued_sessions_by_scope[key].discard(session_id)
+                if not self._issued_sessions_by_scope[key]:
+                    del self._issued_sessions_by_scope[key]
             stale_keys = [
                 key
                 for key, (active_session_id, _remembered_at) in self._active_sessions_by_principal.items()
@@ -4727,6 +4746,14 @@ class BrowserTools:
         )
         try:
             result = _run(self._backend.open(session_id))
+            # Explicitly opening a page transfers a lease to its caller. Turn
+            # cleanup must not close the page the user was asked to keep open.
+            # Navigation-only worker sessions still follow capsule cleanup.
+            context = invocation.flow_context if isinstance(invocation.flow_context, dict) else {}
+            owner = str(context.get("browser_session_owner") or invocation.principal_id or "").strip()
+            if owner:
+                with self._cleanup_lock:
+                    self._sessions_by_scope.setdefault(owner, set()).add(session_id)
             return _ok(invocation, {"result": result, "session_id": session_id, **self._connection_notice_output()})
         except Exception as e:
             return _fail(invocation, f"Open failed: {e}")
@@ -5178,6 +5205,11 @@ class BrowserTools:
         try:
             screenshot = _run(self._backend.screenshot(session_id, mode=mode))
             if isinstance(screenshot, BrowserScreenshotResult):
+                if screenshot.page_url == "about:blank":
+                    return _fail(
+                        invocation,
+                        "Screenshot session has no loaded page. Navigate in this session before capturing it.",
+                    )
                 png_bytes = screenshot.data
                 screenshot_metadata = {
                     "mode": screenshot.mode,
