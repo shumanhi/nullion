@@ -417,8 +417,9 @@ class AutoBackend:
 
     def _make_playwright(self) -> Any:
         from nullion.plugins.browser_plugin.backends.playwright_backend import PlaywrightBackend
-        os.environ["NULLION_BROWSER_HEADLESS"] = "true"
-        return PlaywrightBackend()
+        # Fallback belongs to this backend instance. Changing the environment
+        # also changes BrowserTools' session routing during the same request.
+        return PlaywrightBackend(headless=True)
 
     # ── Delegate all BrowserBackend protocol methods ──────────────────────────
 
