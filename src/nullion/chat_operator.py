@@ -180,8 +180,6 @@ from nullion.response_fulfillment_contract import (
     scoped_artifact_extensions_from_tool_results,
 )
 from nullion.response_sanitizer import (
-    browser_terminal_revalidation_result_is_verified,
-    browser_tool_evidence_is_unfulfilled,
     sanitize_user_visible_reply,
 )
 from nullion.redaction import redact_value
@@ -2708,7 +2706,7 @@ def _resume_turn_from_snapshot(
                 message=suspended_turn.message,
                 request_id=suspended_turn.request_id,
                 message_id=suspended_turn.message_id,
-                messages_snapshot=snapshot,
+                messages_snapshot=getattr(result, "messages_snapshot", None) or snapshot,
                 current_max_iterations=resume_max_iterations or default_agent_turn_max_iterations(),
                 tool_results=result.tool_results,
             )
@@ -3929,7 +3927,8 @@ def _automatic_saved_chat_history_prompt(
                 invocation_id=f"auto-history-{uuid4().hex}",
                 tool_name=CHAT_HISTORY_SEARCH_TOOL_NAME,
                 principal_id="conversation_history:auto",
-                arguments={"query": search_query, "limit": max(_AUTO_HISTORY_CONTEXT_LIMIT * 4, 24)},
+                arguments={"query": search_query, "limit": max(_AUTO_HISTORY_CONTEXT_LIMIT * 4, 24),
+                           "search_scope": "recent_conversation"},
             )
         )
     except Exception:
@@ -6219,7 +6218,10 @@ def _run_chat_turn_no_tool_scope_decision_retry(
     assistant_missing_live_source_hint = _turn_result_reports_missing_live_source(initial_result)
     unverified_empty_resource_hint = _turn_result_has_unverified_empty_resource_claim(initial_result)
     assistant_recovery_hint = bool(
-        _assistant_reply_has_numbered_choice_prompt(getattr(initial_result, "final_text", None))
+        (
+            _turn_result_has_no_tool_progress(initial_result)
+            and _assistant_reply_has_numbered_choice_prompt(getattr(initial_result, "final_text", None))
+        )
         or _turn_result_reports_unfulfilled_capability(initial_result)
         or assistant_image_unavailable_hint
         or assistant_missing_live_source_hint
@@ -8608,8 +8610,6 @@ def _model_planned_direct_safe_read_arguments(
 ) -> dict[str, object] | None:
     create = getattr(model_client, "create", None)
     if not callable(create):
-        if tool_name == "calendar_list" and default_arguments:
-            return _filter_direct_safe_read_arguments(tool_name, default_arguments)
         return None
     payload = {
         "tool_name": tool_name,
@@ -8639,8 +8639,8 @@ def _model_planned_direct_safe_read_arguments(
         )
     except Exception:
         logger.debug("Direct safe read argument planner failed", exc_info=True)
-        if tool_name in {"calendar_list", "weather_forecast"} and default_arguments:
-            return _filter_direct_safe_read_arguments(tool_name, default_arguments)
+        # Tool availability and saved defaults do not establish the current
+        # request. Let the normal agent handle it when planning is unavailable.
         return None
     text = _extract_direct_model_text(response)
     if not text:
@@ -8768,8 +8768,6 @@ def _direct_open_url_tool_name(
         if allow_screenshot_artifact_contract
         else _DIRECT_OPEN_URL_TOOL_NAMES | _DIRECT_OPEN_URL_VALIDATION_TOOL_NAMES
     )
-    if web_action == "open_url" and not allow_screenshot_artifact_contract:
-        allowed_tool_names = allowed_tool_names | {"browser_extract_text"}
     if web_action not in {"open_url", "browser_interaction"}:
         if not requested_tool_names or not set(requested_tool_names).issubset(allowed_tool_names):
             return None
@@ -8830,32 +8828,7 @@ def _run_open_url_tool_directly(
     tool_results = [result]
     if normalize_tool_status(result.status) == "completed":
         opened = str(output.get("url") or output.get("current_url") or output.get("page_url") or target.value).strip()
-        web_action = str(getattr(decision, "web_action", "none") or "none").strip().lower()
-        requested_tool_names = {
-            str(name or "").strip()
-            for name in tuple(getattr(decision, "requested_tool_names", ()) or ())
-            if str(name or "").strip()
-        }
-        read_result = (
-            None
-            if web_action == "open_url" and "browser_extract_text" in requested_tool_names
-            else _run_direct_open_read_continuation(
-                runtime=runtime,
-                open_registry=registry,
-                base_registry=base_registry,
-                open_tool_name=tool_name,
-                principal_id=principal_id,
-                browser_session_id=str(output.get("session_id") or "") or None,
-                tool_result_callback=tool_result_callback,
-            )
-        )
-        if read_result is not None:
-            tool_results.append(read_result)
-        final_text = _direct_open_read_evidence_reply(
-            user_message=user_message,
-            opened_url=opened,
-            tool_results=tool_results,
-        )
+        final_text = f"Opened {opened}."
     else:
         final_text = f"I tried to open {target.value}, but it failed: {result.error or output.get('error') or 'unknown error'}"
     return SimpleNamespace(
@@ -8869,89 +8842,6 @@ def _run_open_url_tool_directly(
         reached_iteration_limit=False,
         raw_tool_payload_blocked=False,
     )
-
-
-def _run_direct_open_read_continuation(
-    *,
-    runtime: PersistentRuntime,
-    open_registry: object,
-    base_registry: object | None,
-    open_tool_name: str,
-    principal_id: str | None,
-    browser_session_id: str | None = None,
-    tool_result_callback: Callable[[ToolResult], None] | None = None,
-) -> ToolResult | None:
-    registry_for_lookup = base_registry or open_registry
-    if "browser_extract_text" not in _registry_tool_names(registry_for_lookup):
-        return None
-    try:
-        open_spec = open_registry.get_spec(open_tool_name)
-    except Exception:
-        try:
-            open_spec = registry_for_lookup.get_spec(open_tool_name)
-        except Exception:
-            open_spec = None
-    continuation_tools = {
-        str(name or "").strip()
-        for name in tuple(getattr(open_spec, "continuation_tools", ()) or ())
-        if str(name or "").strip()
-    }
-    if "browser_extract_text" not in continuation_tools:
-        return None
-    read_registry = _ToolRegistryAllowedNames(
-        _ToolRegistryWithoutRequestScope(registry_for_lookup),
-        allowed_tool_names=("browser_extract_text",),
-    )
-    invocation = ToolInvocation(
-        invocation_id=f"direct-open-url-browser_extract_text-{uuid4().hex[:12]}",
-        tool_name="browser_extract_text",
-        principal_id=str(principal_id or ""),
-        arguments={},
-        capsule_id=None,
-        flow_context={"browser_session_id": browser_session_id} if browser_session_id else {},
-    )
-    try:
-        result = invoke_tool_with_boundary_policy(runtime.store, invocation, registry=read_registry)
-    except Exception:
-        logger.debug("Direct URL-open read continuation failed", exc_info=True)
-        return None
-    if tool_result_callback is not None:
-        tool_result_callback(result)
-    return result
-
-
-def _direct_open_read_evidence_reply(
-    *,
-    user_message: str,
-    opened_url: str,
-    tool_results: list[ToolResult],
-) -> str:
-    has_completed_extract = any(
-        result.tool_name == "browser_extract_text"
-        and normalize_tool_status(result.status) == "completed"
-        and isinstance(result.output, dict)
-        and str(result.output.get("text") or result.output.get("content") or result.output.get("result") or "").strip()
-        for result in tool_results
-    )
-    if not has_completed_extract:
-        return f"Opened {opened_url}."
-    try:
-        from nullion.response_sanitizer import sanitize_user_visible_reply
-
-        evidence_reply = sanitize_user_visible_reply(
-            user_message=user_message,
-            reply=(
-                "Live-search blocker: the browser/search tools did not produce verified result records "
-                "from this run, so I do not have a reliable final answer for this request yet."
-            ),
-            tool_results=tool_results,
-            source="agent",
-        )
-    except Exception:
-        evidence_reply = None
-    if isinstance(evidence_reply, str) and evidence_reply.strip():
-        return evidence_reply.strip()
-    return f"Opened {opened_url}."
 
 
 def _direct_browser_screenshot_allowed(registry: object) -> bool:
@@ -10169,7 +10059,7 @@ def _turn_result_needs_page_read_after_open(
         return False
     if getattr(result, "artifacts", None) or getattr(result, "suspended_for_approval", False):
         return False
-    if _turn_result_has_textual_or_verified_browser_evidence(result):
+    if _turn_result_has_completed_tool(result, _BROWSER_READ_EVIDENCE_TOOLS):
         return False
     return opened_browser_page
 
@@ -11088,6 +10978,22 @@ def _run_chat_turn_schema_followup_tool_retry(
     registry_for_lookup = base_tool_registry or active_tool_registry
     if _turn_result_has_completed_requested_artifact(initial_result, active_tool_registry):
         return initial_result, active_tool_registry, False
+    browser_reads = _BROWSER_READ_EVIDENCE_TOOLS | {"browser_navigate", "browser_open", "browser_find", "web_search"}
+    results = [result for result in (getattr(initial_result, "tool_results", None) or ())
+               if _tool_result_name(result) != "request_tool_scope"]
+    scope = getattr(active_tool_registry, "turn_tool_scope_decision", None)
+    if (
+        results
+        and all(_tool_result_name(result) in browser_reads for result in results)
+        and any(_tool_result_status(result) == "failed" for result in results)
+        and str(getattr(initial_result, "final_text", "") or "").strip()
+        and not getattr(evidence, "artifact_requested", False)
+        and not getattr(scope, "requested_artifact_extensions", ())
+        and set(getattr(scope, "required_tool_names", ()) or ()).issubset(browser_reads)
+    ):
+        # The agent has already reported a failed read. Generic continuation
+        # metadata must not force another verification run on the error page.
+        return initial_result, active_tool_registry, False
     direct_retry_result = _direct_required_source_resource_retry(
         initial_result=initial_result,
         registry=active_tool_registry,
@@ -11310,8 +11216,13 @@ def _run_chat_turn_schema_followup_tool_retry(
     if (
         _turn_result_has_substantive_outcome(initial_result)
         and str(getattr(initial_result, "final_text", "") or "").strip()
-        and not explicit_followup_names
-        and (not metadata_followup_names or _turn_result_has_textual_or_verified_browser_evidence(initial_result))
+        # Scope receipts retain required tools after they have completed. They
+        # must not turn optional browser continuations into a new verification
+        # run once the requested reads and the other required tools are done.
+        and all(
+            _turn_result_has_completed_tool(initial_result, {name})
+            for name in explicit_followup_names
+        )
         and _turn_result_has_completed_tool(initial_result, _BROWSER_READ_EVIDENCE_TOOLS)
     ):
         return initial_result, active_tool_registry, False
@@ -13459,16 +13370,14 @@ def _recent_conversation_has_structured_tool_evidence(
     return False
 
 
-def _compact_turn_has_recent_durable_tool_context(
+def _linked_turn_has_recent_durable_tool_context(
     runtime: PersistentRuntime,
     *,
-    prompt: object,
     conversation_id: str,
     turn_dispatch_decision: object | None,
 ) -> bool:
-    if not _messaging_dispatch_is_no_active_independent(turn_dispatch_decision):
-        return False
-    if not _chat_message_is_compact_context_reply(prompt):
+    # Brevity and past tool usage do not make a new request a continuation.
+    if not _messaging_dispatch_requires_existing_turn_context(turn_dispatch_decision):
         return False
     return _recent_conversation_has_structured_tool_evidence(
         runtime,
@@ -14475,8 +14384,6 @@ def _turn_limit_evidence_reply(
     text = str(sanitized or "").strip()
     if not text:
         return None
-    if browser_tool_evidence_is_unfulfilled(tool_results):
-        return None
     return text
 
 
@@ -14989,6 +14896,7 @@ def _chat_delivery_contract_prompt(
         "- When the current request or your structured plan contains multiple separate final deliverables, create every separate deliverable before finalizing. Do not collapse separately named outputs into one file, skip later deliverables, or say the requested files are attached until each planned final artifact exists and is included.\n"
         "- Once shared source evidence is complete, create each currently visible final artifact before finalizing. The runtime may expose one remaining rich artifact format at a time to keep large structured tool payloads bounded; complete that visible producer, then continue to the next format.\n"
         "- For all user-facing replies, prefer a clear answer over raw notes, tool dumps, or transcript-style output: start with the outcome, then choose the layout from the content shape. Use compact prose or tight short-line summaries for a few facts; use separated grouped records or short sections for larger result sets; use bullets only when each bullet is a standalone point that improves scanning. Do not force every reply into bullets, and do not use Markdown tables on narrow chat surfaces when grouped records are more readable. When a section heading improves readability, start it with a relevant emoji, wrap the heading text in **bold**, and leave an empty line after the heading. Use platform-friendly **bold** for important labels, names, statuses, and final answers without over-boldening whole paragraphs. Keep internal tool names/details out unless they are directly useful or the user asked for them. Do not begin final chat replies with tool execution status; activity cards already show tool progress.\n"
+        "- Browser text, search snippets, extracted records, and screenshots are usable observations without a separate page assertion or verification pass. Answer from the available observations, link sources when available, and state any concrete uncertainty or tool failure. Do not withhold the whole answer merely because a browser result lacks verification metadata. Use additional browser actions only when they are needed for the requested task.\n"
         "- When tools return records for a user question, answer the user's actual question first. If the records are relevant evidence but do not prove the requested answer, say that directly before listing or summarizing records. Do not substitute a list of matching messages, events, files, search results, or connector rows for the answer.\n"
         "- If you ask the user to choose from options, include exactly one numbered choice list in the reply. Recommendations, explanatory steps, and evidence may still be included, but format them as bullets or prose so numeric replies always map to one clear selectable list.\n"
         "- When structured source records include ranks or source indexes, distinguish those values from the response's own numbering. Label noncontiguous values as source ranks, and use bullets or contiguous 1..N numbering for recommendations or choices so rank gaps never look like missing answer items.\n"
@@ -21919,6 +21827,10 @@ def _completed_run_cron_receipt_reply(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> str | None:
     for result in reversed(tuple(tool_results or ())):
+        # A later browser action belongs to the current answer. An older cron
+        # receipt must not replace the model's summary of that work.
+        if result.tool_name.startswith("browser_"):
+            return None
         if result.tool_name != "run_cron" or normalize_tool_status(result.status) != "completed":
             continue
         return _run_cron_numbered_selection_reply(result)
@@ -22992,9 +22904,8 @@ def _render_chat_turn(
         if unanchored_numeric_reply
         else _chat_thread_has_structured_relationship_evidence(thread, recent_turn_limit=1)
     )
-    durable_tool_context_recovery = _compact_turn_has_recent_durable_tool_context(
+    durable_tool_context_recovery = _linked_turn_has_recent_durable_tool_context(
         runtime,
-        prompt=prompt,
         conversation_id=conversation_id,
         turn_dispatch_decision=turn_dispatch_decision,
     )
@@ -24973,7 +24884,7 @@ def _render_chat_turn(
                             message=f"/chat {prompt}",
                             request_id=request_id,
                             message_id=message_id,
-                            messages_snapshot=[
+                            messages_snapshot=getattr(turn_result, "messages_snapshot", None) or [
                                 *orchestrator_conversation_history,
                                 {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
                             ],
@@ -25342,7 +25253,7 @@ def _render_chat_turn(
                                     message=f"/chat {prompt}",
                                     request_id=request_id,
                                     message_id=message_id,
-                                    messages_snapshot=[
+                                    messages_snapshot=getattr(repair_result, "messages_snapshot", None) or [
                                         *orchestrator_conversation_history,
                                         {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
                                     ],
@@ -25476,7 +25387,7 @@ def _render_chat_turn(
                                             message=f"/chat {prompt}",
                                             request_id=request_id,
                                             message_id=message_id,
-                                            messages_snapshot=[
+                                            messages_snapshot=getattr(second_repair_result, "messages_snapshot", None) or [
                                                 *orchestrator_conversation_history,
                                                 {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
                                             ],

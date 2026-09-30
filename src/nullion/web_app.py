@@ -6655,6 +6655,10 @@ function clearPendingTerminalReply(turnId = null) {
     return;
   }
   _pendingTerminalReplyRecoveries.clear();
+  if (_terminalReplyHistoryRefreshTimer) {
+    clearTimeout(_terminalReplyHistoryRefreshTimer);
+    _terminalReplyHistoryRefreshTimer = null;
+  }
   if (_pendingTerminalReplyRecoveryKickTimer) {
     clearTimeout(_pendingTerminalReplyRecoveryKickTimer);
     _pendingTerminalReplyRecoveryKickTimer = null;
@@ -7855,7 +7859,7 @@ async function connect() {
       let data = {};
       try { data = JSON.parse(event.data || '{}'); } catch (_) { return; }
       if (data.type === 'chunk') {
-        appendBotChunk(data.text || '', data.turn_id || null);
+        if (!data.turn_id || !_finishedTurnIds.has(data.turn_id)) appendBotChunk(data.text || '', data.turn_id || null);
       } else if (data.type === 'notice') {
         const noticeKind = String(data.notice_kind || data.id || '');
         addAssistantNotice('Nullion', data.text || '', data.turn_id || null, {
@@ -7887,6 +7891,7 @@ async function connect() {
         if (!stoppedTurnIds.length) finishTurnUi();
         refreshDashboard();
       } else if (data.type === 'done') {
+        if (data.turn_id && _finishedTurnIds.has(data.turn_id) && isVisibleAnswerBubble(findBotBubbleByTurnId(data.turn_id))) return;
         const doneTurnId = data.turn_id || '__current__';
         _messageMetadataByTurn.set(doneTurnId, {
           artifacts: data.artifacts || [],
@@ -8566,7 +8571,7 @@ function appendBotChunk(chunk, turnId = null) {
 }
 
 function finalizeBotMsg(fallback = null, isError = false, turnId = null) {
-  let bubble = turnId ? _botTurnBubbles.get(turnId) : botMsgEl;
+  let bubble = turnId ? (_botTurnBubbles.get(turnId) || findBotBubbleByTurnId(turnId)) : botMsgEl;
   if (bubble && fallback) {
     const activity = detachRunActivity(bubble);
     bubble.classList.remove('typing-bubble', 'status-bubble', 'has-run-activity');
@@ -9003,6 +9008,21 @@ function refreshConversationAfterMissingTerminalReply(attempt = 0, minCount = nu
   _terminalReplyHistoryRefreshTimer = setTimeout(async () => {
     _terminalReplyHistoryRefreshTimer = null;
     try {
+      if (_pendingTerminalReplyRecoveries.size) {
+        const turnIds = Array.from(_pendingTerminalReplyRecoveries.keys());
+        const convId = conversationId;
+        const data = await fetch(`/api/chat/history/${encodeURIComponent(convId)}?turn_ids=${encodeURIComponent(JSON.stringify(turnIds))}`).then(r => r.json());
+        if (convId !== conversationId) return;
+        for (const reply of data.terminal_replies || []) {
+          if (!_pendingTerminalReplyRecoveries.has(reply.turn_id)) continue;
+          _messageMetadataByTurn.set(reply.turn_id, { artifacts: reply.artifacts || [] });
+          const bubble = finalizeBotMsg(reply.text, false, reply.turn_id);
+          addArtifactLinks(bubble, reply.artifacts || []);
+          finishTurnUi(reply.turn_id);
+        }
+        if (_pendingTerminalReplyRecoveries.size && attempt < 90) refreshConversationAfterMissingTerminalReply(attempt + 1, baselineCount);
+        return;
+      }
       const data = await fetch(`/api/chat/history/${encodeURIComponent(conversationId)}?sync_runtime=1`).then(r => r.json());
       const msgs = data.messages || [];
       if (historyHasNewBotReply(msgs, baselineCount)) {
@@ -16165,6 +16185,7 @@ async function clearConversation() {
 
 // Reset the chat UI without changing conversationId (shared helper)
 function resetWebConversationUI() {
+  clearPendingTerminalReply();
   _chatSaveEnabled = false;
   document.getElementById('messages').innerHTML = '';
   _taskStatusBubbles = new Map();
@@ -22336,11 +22357,36 @@ def create_app(runtime, orchestrator, registry):
     from nullion.chat_store import get_chat_store as _get_chat_store
 
     @app.get("/api/chat/history/{conv_id}")
-    async def get_chat_history(conv_id: str, date: str = "", sync_runtime: str = ""):
+    async def get_chat_history(conv_id: str, date: str = "", sync_runtime: str = "", turn_ids: str = ""):
         """Return the last 300 messages for a conversation (creates record if new)."""
         try:
             if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                 return JSONResponse({"ok": False, "error": "date must be YYYY-MM-DD"}, status_code=400)
+            if turn_ids:
+                requested_ids = json.loads(turn_ids)
+                if not isinstance(requested_ids, list) or len(requested_ids) > 50 or any(
+                    not isinstance(value, str) or not value or len(value) > 256 for value in requested_ids
+                ):
+                    raise ValueError("turn_ids must contain at most 50 nonempty turn ids")
+                wanted = set(requested_ids)
+                events = runtime.store.list_recent_conversation_events(
+                    conv_id, event_type="conversation.chat_turn", limit=200,
+                )
+                replies = []
+                for event in reversed(events):
+                    if event.get("turn_id") not in wanted or not str(event.get("assistant_reply") or "").strip():
+                        continue
+                    wanted.discard(event["turn_id"])
+                    from nullion.chat_store import _artifact_metadata_from_runtime_turn
+                    metadata = _artifact_metadata_from_runtime_turn(event) or {}
+                    if event.get("artifacts"):
+                        metadata["artifacts"] = event["artifacts"]
+                    hydrated = _hydrate_chat_history_media(runtime, [{
+                        "role": "bot", "text": event["assistant_reply"], "metadata": metadata,
+                    }], principal_id=conv_id)
+                    replies.append({"turn_id": event["turn_id"], "text": redact_text(event["assistant_reply"]),
+                                    "artifacts": hydrated[0].get("artifacts", []) if hydrated else []})
+                return JSONResponse({"ok": True, "terminal_replies": replies})
             store = _get_chat_store()
             if str(sync_runtime or "").strip().lower() in {"1", "true", "yes"}:
                 _sync_runtime_chat_history_to_store(runtime, store)
@@ -30828,7 +30874,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             conversation_id=conversation_id,
             user_text=user_text,
             request_id=getattr(suspended_turn, "request_id", None),
-            messages_snapshot=suspended_turn.messages_snapshot
+            messages_snapshot=getattr(result, "messages_snapshot", None) or suspended_turn.messages_snapshot
             or [{"role": "user", "content": [{"type": "text", "text": user_text}]}],
             current_max_iterations=resume_max_iterations or default_agent_turn_max_iterations(),
             tool_results=list(getattr(result, "tool_results", []) or []),

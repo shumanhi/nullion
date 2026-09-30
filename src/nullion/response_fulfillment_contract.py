@@ -1986,6 +1986,18 @@ def evaluate_response_fulfillment(
         required_extension,
     )
     completed_tool_names_for_requirements = set(completed_tool_names)
+    # A failed browser read is a terminal observation the model can explain.
+    # Requiring that read to succeed replaces its useful error with a generic
+    # unfinished-task message and forces more reads of the same error page.
+    browser_read_tools = {
+        "browser_navigate", "browser_open", "browser_extract_text",
+        "browser_extract_items", "browser_extract_detail", "browser_snapshot",
+        "browser_find", "browser_assert_page_state", "web_search", "web_fetch",
+    }
+    required_tools.difference_update(
+        result.tool_name for result, status in normalized_results
+        if status == "failed" and result.tool_name in browser_read_tools
+    )
     if "file_write" in required_tools and "file_patch" in completed_tool_names and valid_artifacts:
         completed_tool_names_for_requirements.add("file_write")
     missing: list[str] = []

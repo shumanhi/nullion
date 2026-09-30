@@ -996,7 +996,7 @@ class PlaywrightBackend:
             conditions.append(
                 page.wait_for_function(
                     "(needle) => (document.body?.innerText || '').toLowerCase().includes(String(needle || '').toLowerCase())",
-                    text,
+                    arg=text,
                     timeout=timeout_ms,
                 )
             )
