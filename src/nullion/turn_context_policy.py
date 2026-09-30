@@ -2123,7 +2123,7 @@ class ScopedTurnToolRegistry:
             existing.web_action
             if scheduler_mutation_scope
             else "live_research"
-            if "web" in capabilities
+            if "web" in capabilities and existing.web_action == "none"
             else existing.web_action
         )
         skill_pack_action = existing.skill_pack_action

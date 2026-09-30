@@ -59,6 +59,11 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
                 "minimum": 1,
                 "maximum": _MAX_HISTORY_RETURN_LIMIT,
             },
+            "search_scope": {
+                "type": "string",
+                "enum": ["workspace", "recent_conversation"],
+                "description": "Search workspace history, or only the recent current conversation for lightweight turn context.",
+            },
         },
         "additionalProperties": False,
     },
@@ -839,20 +844,24 @@ def _chat_history_search_result(
     arguments = invocation.arguments or {}
     query = str(arguments.get("query") or "").strip()
     limit = _coerce_limit(arguments.get("limit"))
-    full_history = bool(query)
+    recent_conversation_only = arguments.get("search_scope") == "recent_conversation"
+    full_history = bool(query) and not recent_conversation_only
     workspace_id = str(workspace_id or _workspace_id_for_conversation(conversation_id)).strip()
-    events = _conversation_events_after_reset(
-        runtime,
-        store,
-        conversation_id,
-        full_history=full_history,
-        workspace_id=workspace_id,
-    )
+    if recent_conversation_only:
+        events = store.list_recent_conversation_events_after_reset(
+            conversation_id, event_type="conversation.chat_turn", limit=_MAX_HISTORY_SCAN_LIMIT,
+        )
+        events = [event for event in events if _event_matches_workspace(event, workspace_id=workspace_id)]
+    else:
+        events = _conversation_events_after_reset(
+            runtime, store, conversation_id,
+            full_history=full_history, workspace_id=workspace_id,
+        )
     selected, fallback_to_recent = _ranked_history_events(
         events,
         query=query,
         limit=limit,
-        fallback_to_recent_on_no_match=not full_history,
+        fallback_to_recent_on_no_match=not bool(query),
     )
     structured_selected = _ranked_structured_reference_events(
         events,
@@ -888,7 +897,7 @@ def _chat_history_search_result(
             "query": query,
             "match_count": len(records),
             "searched_turn_count": len(events),
-            "searched_scope": "full_workspace_after_reset" if full_history else "recent_workspace_after_reset",
+            "searched_scope": "recent_conversation_after_reset" if recent_conversation_only else "full_workspace_after_reset" if full_history else "recent_workspace_after_reset",
             "fallback_to_recent": fallback_to_recent,
             "matches": records,
             "structured_matches": structured_records,

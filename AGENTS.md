@@ -110,14 +110,11 @@
 - If no pin exists for a repo, follow the normal user-named branch and git workflow rules below.
 - The local ops dashboard at `/Users/himanc/Projects/nullion-test/scripts/local_ops_dashboard.py` is the source of truth for creating, changing, and clearing pinned branches.
 
-## Bug Tracker Workflow
+## Bug Tracking
 
-- The local ops dashboard uses one paired work-branch pin to represent the matching `nullion/<name>` app branch, `nullion-test/<name>` test branch, and QA tracker workbook.
-- When the local ops dashboard creates a paired work branch, it appends a shared `--hh-mm-am/pm` suffix to the app branch, test branch, and pinned QA tracker workbook filename.
-- The tracker workbook lives in `/Users/himanc/Projects/agents-worksapce/nullion-ops` with the `bug_rtracker_` filename prefix.
-- Before fixing a bug on a pinned app branch, open the pinned QA workbook, or that branch's `bug_rtracker_*.xlsx` workbook, and update or add the matching Bug Tracker row.
-- When a bug fix is ready for QA, update the workbook's `Status`, `Implementation Notes`, `QA Status`, `QA Checks`, and `Last Updated` fields.
-- Do not overwrite or regenerate an existing branch tracker workbook; preserve existing rows and QA notes.
+- Do not create, open, or update Excel/Numbers QA trackers or bug-tracker spreadsheets as part of development, testing, or release work unless the user explicitly asks for a spreadsheet.
+- Keep bug findings, implementation notes, verification results, and blockers in the task or a concise text report. Spreadsheet updates are not a prerequisite for fixing, testing, pushing, or releasing changes.
+- Preserve existing tracker files; do not delete or regenerate them.
 
 ## Prod, Stage, And Dev Safety
 
@@ -171,8 +168,8 @@
 - The app pre-commit hook runs the private suite in `../nullion-test/tests` with coverage unless `NULLION_SKIP_PRIVATE_TESTS=1` is set.
 - Every bug fix must include the right test layers before it is marked ready: a focused regression test for the changed code path and, when the bug affected a user-visible workflow, an E2E test in `nullion-test` proving the real product boundary that failed.
 - Integration tests may supplement the E2E, but they do not replace it for user-visible workflow bugs unless an E2E cannot be written.
-- If a required E2E cannot be written, record the concrete reason in the QA tracker and final handoff instead of silently skipping it.
-- While implementing, run focused tests for the touched path only. Do not run the full private suite, all tests, or broad E2E matrix until all code, test, and tracker updates for the current request are complete and targeted checks are green.
+- If a required E2E cannot be written, record the concrete reason in the final handoff instead of silently skipping it.
+- While implementing, run focused tests for the touched path only. Do not run the full private suite, all tests, or broad E2E matrix until all code and test updates for the current request are complete and targeted checks are green.
 - After all work for the current request is complete, run the broadest relevant local verification once, or report the exact blocker before push, merge, or final handoff.
 - Before declaring a branch ready to push or asking for paid push approval, run the same Docker E2E command shape that the PR suite will run from `nullion-test`, not a hand-picked subset. At minimum, for app changes that can affect cron delivery, connector/tool registration, chat routing, Telegram/Web/Slack/Discord delivery, artifacts, installer behavior, or shared runtime behavior, run `scripts/e2e-docker.sh` with the full CI-relevant E2E set, including `tests/e2e/test_branch_regression_contracts.py`, `tests/e2e/test_provider_tool_matrix_contracts.py`, `tests/e2e/test_real_workflow_api_contracts.py`, `tests/e2e/test_telegram_runtime_performance_contracts.py`, and `tests/e2e/test_web_surface_contracts.py`, with `NULLION_APP_REPO` pointed at the app checkout under test. If the exact CI Docker command cannot be run locally, stop and report that gap before any push.
 - Do not treat a narrower local Docker slice as equivalent to CI. If only a subset was run, name it as partial coverage and do not present the branch as likely to pass GitHub until the omitted CI E2E files are either run locally or the user explicitly accepts the paid CI risk.

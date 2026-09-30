@@ -50,9 +50,7 @@ from nullion.response_sanitizer import (
     _browser_page_epoch_for_state_workflow_index,
     _latest_browser_page_state_observation,
     browser_page_state_assertion_is_verified,
-    browser_terminal_revalidation_contexts,
     browser_terminal_revalidation_result_is_verified,
-    browser_tool_evidence_is_unfulfilled,
     browser_urls_share_document_identity,
     is_raw_tool_payload_reply,
     is_safe_raw_tool_payload_replacement_reply,
@@ -2375,6 +2373,31 @@ def _compact_tool_output_for_model_context(tool_name: str, output: object) -> ob
     safe_output = _json_safe_tool_value(output)
     if not isinstance(safe_output, dict):
         return _truncate_text(str(safe_output or ""), 12_000)
+    if tool_name == "browser_extract_items" and isinstance(safe_output.get("items"), list):
+        # Keep every record and meaningful value. Browser extraction repeats
+        # URLs/labels and empty optional fields; these need no model tokens.
+        aliases = {"canonical_url": "url", "link_text": "title"}
+        records = []
+        omitted_aliases = {}
+        for item in safe_output["items"]:
+            if not isinstance(item, dict):
+                records.append(item)
+                continue
+            record = {key: value for key, value in item.items() if value not in (None, "", [], {})}
+            for alias, target in aliases.items():
+                if alias in record and target in record and record[alias] == record[target]:
+                    del record[alias]
+                    omitted_aliases[alias] = f"{target} when identical"
+            records.append(record)
+        safe_output = {**safe_output, "items": records}
+        if omitted_aliases:
+            safe_output["field_aliases"] = omitted_aliases
+    if tool_name in {"browser_extract_items", "browser_extract_detail", "browser_run_js"}:
+        # Repair summaries sample lists to eight records. Normal browser work
+        # needs the complete observations, including exact links and fields.
+        # Keep those observations whenever they fit the existing model budget.
+        if len(json.dumps(safe_output, ensure_ascii=False, sort_keys=True)) <= _model_tool_result_max_chars() - 2_000:
+            return safe_output
     if tool_name == "browser_extract_text":
         raw_text = safe_output.get("text")
         if not isinstance(raw_text, str) or not raw_text.strip():
@@ -3811,10 +3834,6 @@ _COMPLETION_CONTROL_ONLY_TOOLS = frozenset(
         "browser_type_id",
         "browser_select_combobox",
         "browser_wait_for",
-        "browser_run_js",
-        "browser_snapshot",
-        "browser_extract_text",
-        "browser_extract_items",
         "browser_close",
     }
 )
@@ -3997,22 +4016,13 @@ def _completion_review_required(
         scope_contract["unavailable_required_tool_names"]
         or scope_contract["connector_source_unavailable"]
     )
-    has_unbound_browser_evidence = _agent_browser_tool_evidence_is_unfulfilled(results)
     if not (
         has_failed_or_unverified_result
         or has_missing_required_result
         or has_unavailable_required_result
-        or has_unbound_browser_evidence
     ):
         return False
-    has_artifact_contract = _browser_completion_has_explicit_artifact_contract(state, results)
-    has_browser_risk = (
-        _browser_completion_has_structured_risk(results)
-        or has_unbound_browser_evidence
-    )
-    if not (has_artifact_contract or has_browser_risk):
-        return False
-    return True
+    return _browser_completion_has_explicit_artifact_contract(state, results)
 
 
 def _completion_review_artifact_evidence(
@@ -5176,20 +5186,6 @@ def _completion_review_evidence_result_is_positive(
         return False
     if result.tool_name == "browser_assert_page_state":
         return browser_page_state_assertion_is_verified(result)
-    if result.tool_name == "browser_extract_detail":
-        record = output.get("record")
-        if (
-            output.get("kind") != "browser_dom_detail"
-            or output.get("origin") != "runtime_owned_dom_extractor"
-            or not isinstance(record, Mapping)
-            or not _completion_review_record_has_substantive_value(record)
-        ):
-            return False
-        if tool_results is not None:
-            return browser_terminal_revalidation_result_is_verified(
-                tool_results,
-                invocation_id=str(result.invocation_id or "").strip(),
-            )
     return True
 
 
@@ -8206,6 +8202,7 @@ class TurnResult:
     artifact_delivery_required: bool = False
     artifact_delivery_satisfied: bool = True
     required_artifact_extensions: list[str] = field(default_factory=list)
+    messages_snapshot: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -8826,253 +8823,6 @@ def _cancelled_agent_turn_update(state: _AgentTurnGraphState) -> dict[str, objec
     return _complete_agent_turn(state, final_text="Stopped by /stop.")
 
 
-def _run_terminal_browser_revalidation(
-    state: _AgentTurnGraphState,
-) -> ToolResult | None:
-    """Perform one assertion-bound detail refresh before terminal delivery."""
-
-    contexts = browser_terminal_revalidation_contexts(state.get("tool_results"))
-    if not contexts:
-        return None
-    tool_registry = state.get("tool_registry")
-    if tool_registry is None:
-        return None
-    try:
-        tool_registry.get_spec("browser_extract_detail")
-        tool_registry.get_spec("browser_assert_page_state")
-    except KeyError:
-        return None
-    try:
-        tool_registry.get_spec("browser_navigate")
-        can_restore_expected_page = True
-    except KeyError:
-        can_restore_expected_page = False
-    attempt_keys = list(state.get("browser_terminal_revalidation_attempt_keys") or [])
-    context = None
-    attempt_key = ""
-    for candidate in contexts:
-        candidate_key = json.dumps(
-            {
-                "session_id": candidate.session_id,
-                "page_url": candidate.page_url,
-                "selector": candidate.selector,
-                "required": candidate.required,
-                "forbidden": candidate.forbidden,
-                "invalidating_invocation_id": candidate.invalidating_invocation_id,
-            },
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        if candidate_key not in attempt_keys:
-            context = candidate
-            attempt_key = candidate_key
-            break
-    if context is None:
-        return None
-    attempt_keys.append(attempt_key)
-    state["browser_terminal_revalidation_attempt_keys"] = attempt_keys
-
-    flow_context = dict(state.get("tool_flow_context") or {})
-    flow_context["browser_session_id"] = context.session_id
-    flow_context["browser_terminal_revalidation"] = True
-
-    def _invoke(invocation: ToolInvocation) -> ToolResult:
-        started_at = time.perf_counter()
-        runtime_store = state.get("runtime_store")
-        try:
-            if runtime_store is not None:
-                from nullion.runtime import invoke_tool_with_boundary_policy
-
-                result = invoke_tool_with_boundary_policy(
-                    runtime_store,
-                    invocation,
-                    registry=tool_registry,
-                )
-            else:
-                result = tool_registry.invoke(invocation)
-        except Exception as exc:
-            result = ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="failed",
-                output={
-                    "reason": "browser_terminal_revalidation_failed",
-                    "session_id": context.session_id,
-                },
-                error=str(exc),
-            )
-        duration_ms = (time.perf_counter() - started_at) * 1000
-        if isinstance(result.output, dict):
-            # This is a runtime-owned receipt, not tool-controlled output. A
-            # page may return untrusted data using the same key, so always
-            # overwrite it with the exact context selected before invocation.
-            result.output["terminal_revalidation"] = {
-                "page_url": context.page_url,
-                "selector": context.selector,
-                "session_id": context.session_id,
-                "required": list(context.required),
-                "forbidden": list(context.forbidden),
-                "invalidating_invocation_id": context.invalidating_invocation_id,
-            }
-        tool_results = list(state.get("tool_results") or [])
-        tool_results.append(result)
-        state["tool_results"] = tool_results
-        callback = state.get("tool_result_callback")
-        if callback is not None:
-            try:
-                callback(result)
-            except Exception:
-                logger.debug("Terminal browser revalidation callback failed", exc_info=True)
-        if runtime_store is not None:
-            _record_agent_tool_timing(
-                runtime_store,
-                conversation_id=state["conversation_id"],
-                iteration=int(state.get("iterations") or 0),
-                invocation=invocation,
-                result=result,
-                duration_ms=duration_ms,
-                artifact_count=0,
-            )
-        return result
-
-    assertion_arguments: dict[str, object] = {
-        "session_id": context.session_id,
-        "required": list(context.required),
-        "forbidden": list(context.forbidden),
-    }
-    if context.selector:
-        assertion_arguments["selector"] = context.selector
-    def _assert_expected_page_state() -> ToolResult:
-        return _invoke(
-            ToolInvocation(
-                invocation_id=f"browser-terminal-revalidation-assert-{uuid4().hex}",
-                tool_name="browser_assert_page_state",
-                principal_id=state["principal_id"],
-                arguments=assertion_arguments,
-                capsule_id=state.get("cleanup_scope"),
-                flow_context=flow_context,
-            )
-        )
-
-    def _asserted_page_url(result: ToolResult) -> str:
-        output = result.output if isinstance(result.output, Mapping) else {}
-        for key in ("result", "state"):
-            payload = output.get(key)
-            if not isinstance(payload, Mapping):
-                continue
-            url = str(payload.get("url") or payload.get("page_url") or "").strip()
-            if url:
-                return url
-        return ""
-
-    assertion_result = _assert_expected_page_state()
-    if not browser_page_state_assertion_is_verified(assertion_result):
-        return assertion_result
-    asserted_page_url = _asserted_page_url(assertion_result)
-    if not browser_urls_share_document_identity(
-        expected_url=context.page_url,
-        observed_url=asserted_page_url,
-    ):
-        if not can_restore_expected_page:
-            return assertion_result
-        navigation_result = _invoke(
-            ToolInvocation(
-                invocation_id=f"browser-terminal-revalidation-navigate-{uuid4().hex}",
-                tool_name="browser_navigate",
-                principal_id=state["principal_id"],
-                arguments={"url": context.page_url},
-                capsule_id=state.get("cleanup_scope"),
-                flow_context=flow_context,
-            )
-        )
-        if normalize_tool_status(navigation_result.status) != "completed":
-            return navigation_result
-        assertion_result = _assert_expected_page_state()
-        if not browser_page_state_assertion_is_verified(assertion_result):
-            return assertion_result
-        asserted_page_url = _asserted_page_url(assertion_result)
-        if not browser_urls_share_document_identity(
-            expected_url=context.page_url,
-            observed_url=asserted_page_url,
-        ):
-            return assertion_result
-
-    detail_arguments: dict[str, object] = {"session_id": context.session_id}
-    if context.selector:
-        detail_arguments["selector"] = context.selector
-    return _invoke(
-        ToolInvocation(
-            invocation_id=f"browser-terminal-revalidation-detail-{uuid4().hex}",
-            tool_name="browser_extract_detail",
-            principal_id=state["principal_id"],
-            arguments=detail_arguments,
-            capsule_id=state.get("cleanup_scope"),
-            flow_context=flow_context,
-        )
-    )
-
-
-def _run_all_terminal_browser_revalidations(
-    state: _AgentTurnGraphState,
-) -> list[ToolResult]:
-    """Refresh each stale physical session once for its current boundary."""
-
-    maximum_attempts = len(browser_terminal_revalidation_contexts(state.get("tool_results")))
-    results: list[ToolResult] = []
-    for _index in range(maximum_attempts):
-        result = _run_terminal_browser_revalidation(state)
-        if result is None:
-            break
-        results.append(result)
-    return results
-
-
-def _agent_browser_tool_evidence_is_unfulfilled(
-    tool_results: Iterable[ToolResult] | None,
-) -> bool:
-    """Preserve unbound substantive evidence across physical browser sessions.
-
-    The shared sanitizer permits older exploratory evidence to be superseded by
-    a later verified binding.  That is valid within one physical browser
-    session, where later navigation replaces earlier page state, but it must not
-    let a verified result from session B erase an unbound result from session A.
-    """
-
-    results = list(tool_results or [])
-    if browser_tool_evidence_is_unfulfilled(results):
-        return True
-
-    latest_substantive_detail_by_session: dict[str, ToolResult] = {}
-    for result in results:
-        if (
-            result.tool_name != "browser_extract_detail"
-            or normalize_tool_status(result.status) != "completed"
-        ):
-            continue
-        output = result.output if isinstance(result.output, Mapping) else {}
-        if (
-            output.get("kind") != "browser_dom_detail"
-            or output.get("origin") != "runtime_owned_dom_extractor"
-        ):
-            continue
-        record = output.get("record")
-        if not isinstance(record, Mapping) or not record:
-            continue
-        session_id = str(output.get("session_id") or "").strip()
-        if not session_id:
-            continue
-        latest_substantive_detail_by_session[session_id] = result
-
-    return any(
-        not browser_terminal_revalidation_result_is_verified(
-            results,
-            invocation_id=str(result.invocation_id or "").strip(),
-        )
-        for result in latest_substantive_detail_by_session.values()
-    )
-
-
 def _complete_agent_turn(
     state: _AgentTurnGraphState,
     *,
@@ -9089,38 +8839,6 @@ def _complete_agent_turn(
         tool_results=list(state.get("tool_results") or []),
     ):
         response_fulfilled = False
-    terminal_contexts_before = ()
-    terminal_revalidation_results: list[ToolResult] = []
-    if not suspended_for_approval and not _agent_turn_was_cancelled(state):
-        terminal_contexts_before = browser_terminal_revalidation_contexts(
-            state.get("tool_results")
-        )
-        terminal_revalidation_results = _run_all_terminal_browser_revalidations(state)
-    if terminal_contexts_before:
-        final_text = sanitize_user_visible_reply(
-            user_message=state.get("user_message"),
-            reply=final_text or "",
-            tool_results=list(state.get("tool_results") or []),
-            source="agent",
-        )
-        terminal_contexts_after = browser_terminal_revalidation_contexts(
-            state.get("tool_results")
-        )
-        terminal_results_verified = bool(terminal_revalidation_results) and all(
-            result.tool_name == "browser_extract_detail"
-            and result.status == "completed"
-            and browser_terminal_revalidation_result_is_verified(
-                state.get("tool_results"),
-                invocation_id=result.invocation_id,
-            )
-            for result in terminal_revalidation_results
-        )
-        if (
-            terminal_contexts_after
-            or not terminal_results_verified
-            or _agent_browser_tool_evidence_is_unfulfilled(state.get("tool_results"))
-        ):
-            response_fulfilled = False
     cleanup_done = bool(state.get("cleanup_done"))
     tool_registry = state.get("tool_registry")
     missing_scope_action = _scheduler_action_contract_missing(
@@ -9136,8 +8854,6 @@ def _complete_agent_turn(
     )
     if capture_fulfilled and not suspended_for_approval and not missing_scope_action:
         response_fulfilled = True
-    elif _agent_browser_tool_evidence_is_unfulfilled(state.get("tool_results")):
-        response_fulfilled = False
     cleanup_scope = state.get("cleanup_scope") or f"turn-{uuid4().hex}"
     if not cleanup_done and tool_registry is not None:
         _run_tool_cleanup_hooks(tool_registry, cleanup_scope)
@@ -9167,6 +8883,7 @@ def _complete_agent_turn(
             artifact_delivery_required=artifact_delivery_required,
             artifact_delivery_satisfied=artifact_delivery_satisfied,
             required_artifact_extensions=required_artifact_extensions,
+            messages_snapshot=list(state.get("messages") or []) if reached_iteration_limit else [],
         ),
     }
 
@@ -9936,9 +9653,13 @@ def _execute_agent_turn_tool_uses(
         if completed_artifact_update is not None:
             return completed_artifact_update
 
+        from nullion.task_frames import extract_url_target
+
         allow_direct_data_tool_completion = (
             not _state_is_scheduled_task_run(state)
             and not _turn_has_artifact_delivery_contract(state)
+            and extract_url_target(user_message) is None
+            and _scope_required_tool_names(tool_registry, tool_results).issubset({result.tool_name})
         )
         weather_completion_text = (
             _weather_forecast_completion_text(result) if allow_direct_data_tool_completion else None
@@ -10211,8 +9932,6 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
             state.get("conversation_id"),
             len(state.get("tool_results") or []),
         )
-        if not _agent_turn_was_cancelled(state):
-            _run_all_terminal_browser_revalidations(state)
         tool_results = list(state.get("tool_results") or [])
         missing_scope_action = _scheduler_action_contract_missing(
             tool_registry=state.get("tool_registry"),
@@ -10717,122 +10436,6 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                     update["missing_required_tool_nudge_count"] = required_tool_nudge_count + 1
                 return update
             final_text = decision.reply
-    browser_post_action_evidence_nudge_count = int(state.get("browser_post_action_evidence_nudge_count") or 0)
-    if tool_results and browser_post_action_evidence_nudge_count < 3:
-        continuation_tools = _browser_post_action_evidence_continuation_tools(
-            tool_results=tool_results,
-            tool_registry=state.get("tool_registry"),
-        )
-        if continuation_tools:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": _browser_post_action_evidence_nudge(continuation_tools)}],
-                }
-            )
-            return {"messages": messages, "browser_post_action_evidence_nudge_count": browser_post_action_evidence_nudge_count + 1}
-    if tool_results and not state.get("search_evidence_continuation_nudged", False):
-        continuation_tools = _web_search_evidence_continuation_tools(
-            tool_results=tool_results,
-            tool_registry=state.get("tool_registry"),
-        )
-        if continuation_tools:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": _web_search_evidence_continuation_nudge(continuation_tools)}],
-                }
-            )
-            return {"messages": messages, "search_evidence_continuation_nudged": True}
-    if tool_results and not state.get("browser_form_action_continuation_nudged", False):
-        continuation_tools = _browser_form_action_continuation_tools(
-            tool_results=tool_results,
-            tool_registry=state.get("tool_registry"),
-        )
-        if continuation_tools:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": _browser_form_action_continuation_nudge(continuation_tools)}],
-                }
-            )
-            return {"messages": messages, "browser_form_action_continuation_nudged": True}
-    if tool_results and not state.get("browser_page_state_continuation_nudged", False):
-        continuation_tools = _browser_page_state_continuation_tools(
-            tool_results=tool_results,
-            tool_registry=state.get("tool_registry"),
-        )
-        if continuation_tools:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": _browser_page_state_continuation_nudge(continuation_tools)}],
-                }
-            )
-            return {"messages": messages, "browser_page_state_continuation_nudged": True}
-    if tool_results and not state.get("browser_low_quality_items_continuation_nudged", False):
-        continuation_tools = _browser_low_quality_items_continuation_tools(
-            tool_results=tool_results,
-            tool_registry=state.get("tool_registry"),
-        )
-        if continuation_tools:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": _conversation_visible_content(content) or [{"type": "text", "text": final_text or ""}],
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": _browser_low_quality_items_continuation_nudge(continuation_tools),
-                        }
-                    ],
-                }
-            )
-            return {"messages": messages, "browser_low_quality_items_continuation_nudged": True}
-    terminal_contexts_before = ()
-    terminal_revalidation_results: list[ToolResult] = []
-    if not _agent_turn_was_cancelled(state):
-        terminal_contexts_before = browser_terminal_revalidation_contexts(
-            state.get("tool_results")
-        )
-        terminal_revalidation_results = _run_all_terminal_browser_revalidations(state)
-    if terminal_contexts_before:
-        tool_results = list(state.get("tool_results") or [])
-        final_text = sanitize_user_visible_reply(
-            user_message=state["user_message"],
-            reply=final_text or "",
-            tool_results=tool_results,
-            source="agent",
-        )
     if (
         tool_results
         and int(state.get("raw_tool_payload_nudge_count") or 0) < 1
@@ -10934,23 +10537,6 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         tool_results=tool_results,
         source="agent",
     )
-    terminal_contexts_after = browser_terminal_revalidation_contexts(tool_results)
-    terminal_results_verified = bool(terminal_revalidation_results) and all(
-        result.tool_name == "browser_extract_detail"
-        and result.status == "completed"
-        and browser_terminal_revalidation_result_is_verified(
-            tool_results,
-            invocation_id=result.invocation_id,
-        )
-        for result in terminal_revalidation_results
-    )
-    if _agent_browser_tool_evidence_is_unfulfilled(tool_results) or terminal_contexts_after or (
-        terminal_contexts_before
-        and (
-            not terminal_results_verified
-        )
-    ):
-        response_fulfilled = False
     try:
         from nullion.artifacts import materialize_inline_html_reply_artifact
 

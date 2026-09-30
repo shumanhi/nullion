@@ -217,127 +217,17 @@ def sanitize_user_visible_reply(
     raw = _normalize_requested_section_reply_format(requested_sections, raw, results)
     raw = _prefix_account_tool_reply(raw, results)
     raw = _strip_leading_tool_status_paragraph(raw, results)
-    original_browser_results = _browser_visible_reply_results(results)
-    browser_action_receipt = _terminal_browser_action_receipt_reply(
-        raw,
-        original_browser_results,
-    )
-    expanded_results = _browser_results_with_typed_page_assertions(results)
-    if browser_verified_record_reply := _browser_verified_record_reply(
-        expanded_results,
-        user_message=user_message,
+    # Browser observations inform the agent's answer; they are not a second
+    # completion gate. Keep presentation and raw-payload protection below, but
+    # never replace an answer because a page lacks assertion-bound records.
+    if _browser_tools_attempted(results) and raw.strip() and not is_raw_tool_payload_reply(
+        reply=raw, tool_results=results,
     ):
-        authoritative_reply = _browser_reply_with_action_receipt(
-            browser_verified_record_reply,
-            browser_action_receipt,
+        return _sanitize_reply_style(
+            _sanitize_local_paths(raw),
+            account_tool_family=_primary_account_tool_family(results),
         )
-        authoritative_reply = _format_authoritative_browser_reply_sections(
-            authoritative_reply,
-            requested_sections=requested_sections,
-            results=expanded_results,
-        )
-        return _sanitize_local_paths(
-            authoritative_reply
-        )
-    if browser_action_receipt:
-        return _sanitize_local_paths(
-            _browser_reply_with_terminal_outcomes(
-                browser_action_receipt,
-                expanded_results,
-                user_message=user_message,
-            )
-        )
-    browser_results = _browser_visible_reply_results(expanded_results)
-    if browser_recovery_incomplete := _browser_recovery_navigation_reply(
-        browser_results,
-        original_results=expanded_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_recovery_incomplete)
-    if browser_unverified_records := _browser_unverified_record_flow_reply(
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_unverified_records)
-    if browser_stale_verified_state := _browser_post_assertion_mutation_blocker(
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_stale_verified_state)
-    if browser_non_substantive_reply := _browser_non_substantive_extract_reply_over_drift(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_non_substantive_reply)
-    if browser_constrained_reply := _browser_reply_over_forbidden_page_evidence(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_constrained_reply)
-    if _browser_grounded_reply_should_pass_through(raw, browser_results):
-        return _sanitize_local_paths(raw)
-    if browser_incomplete_reply := _browser_incomplete_reply_over_generic_verified_state(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_incomplete_reply)
-    if browser_extract_reply := _browser_extract_evidence_reply_over_blocker(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_extract_reply)
-    if browser_prior_catalog_reply := _browser_catalog_reply_over_prior_extract_dump(raw, browser_results):
-        return _sanitize_local_paths(browser_prior_catalog_reply)
-    if browser_catalog_reply := _browser_catalog_reply_over_raw_extract_dump(raw, browser_results):
-        return _sanitize_local_paths(browser_catalog_reply)
-    if browser_extract_dump_reply := _browser_extract_dump_reply_over_raw_extract(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_extract_dump_reply)
-    if browser_empty_reply := _browser_empty_reply_over_missing_verified_records(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_empty_reply)
-    if browser_withheld_extract_reply := _browser_withheld_raw_page_reply_over_extract(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_withheld_extract_reply)
-    if browser_verified_state_reply := _browser_verified_state_reply_over_tool_status(raw, browser_results):
-        return _sanitize_local_paths(browser_verified_state_reply)
-    if browser_prior_catalog_reply := _browser_catalog_reply_over_prior_extract_dump(raw, browser_results):
-        return _sanitize_local_paths(browser_prior_catalog_reply)
-    if browser_catalog_reply := _browser_catalog_reply_over_raw_extract_dump(raw, browser_results):
-        return _sanitize_local_paths(browser_catalog_reply)
-    if browser_extract_dump_reply := _browser_extract_dump_reply_over_raw_extract(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_extract_dump_reply)
-    if browser_better_extract_reply := _browser_reply_over_wrong_browser_extract(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_better_extract_reply)
-    if browser_extract_reply := _browser_extract_text_reply_over_assertion_drift(
-        raw,
-        browser_results,
-        user_message=user_message,
-    ):
-        return _sanitize_local_paths(browser_extract_reply)
-    if browser_low_quality_reply := _browser_low_quality_items_reply_over_top_matches(raw, browser_results):
-        return _sanitize_local_paths(browser_low_quality_reply)
+    browser_results = results
     if action_receipt_reply := _action_receipt_reply_over_drift(raw, results):
         return _sanitize_local_paths(action_receipt_reply)
     if scheduler_action_reply := _scheduler_action_reply_over_read_drift(raw, results):
@@ -4050,11 +3940,8 @@ def _structured_tool_evidence_reply_over_ignored_results(
         return None
     if _parse_bare_structured_payload(text) is not None:
         return None
-    if missing_state_reply := _browser_missing_required_state_reply_over_structured_evidence(
-        results,
-        user_message=user_message,
-    ):
-        return missing_state_reply
+    if _browser_tools_attempted(results) and str(text or "").strip():
+        return None
     sections = _structured_tool_evidence_sections(
         results,
         user_message=user_message,
@@ -5069,13 +4956,7 @@ def _web_search_reply_over_ignored_results(
     if _browser_recovery_should_preserve_model_reply(text, results):
         return None
     if _browser_tools_attempted(results):
-        if browser_extract_reply := _browser_extract_evidence_reply(results, user_message=user_message):
-            if not _reply_matches_browser_extract_text(text, browser_extract_reply):
-                return browser_extract_reply
-            return None
-        if _browser_reply_is_nonverifying_explanation(text):
-            return None
-        return _browser_unverified_search_result_blocker(results, user_message=user_message)
+        return None
     browser_item_records = _completed_browser_extract_item_records(results)
     if browser_item_records and not _rank_structured_output_items(browser_item_records, kind="browser_item"):
         return None
