@@ -1103,6 +1103,8 @@ class ScopedTurnToolRegistry:
             return False
         scheduler_action = str(self.turn_tool_scope_decision.scheduler_action or "").strip().lower()
         requested_tool_names = set(self.turn_tool_scope_decision.requested_tool_names)
+        if tool_name in {"delete_cron", "delete_reminder"} and tool_name not in requested_tool_names:
+            return False
         is_scheduler_tool = self._is_scheduler_tool_name(tool_name)
         if (
             tool_name in _LOCAL_FILE_MUTATION_TOOLS
@@ -1534,8 +1536,6 @@ class ScopedTurnToolRegistry:
                         "list_reminders",
                         "create_cron",
                         "update_cron",
-                        "delete_cron",
-                        "delete_reminder",
                         "toggle_cron",
                         "set_reminder",
                         "update_reminder",

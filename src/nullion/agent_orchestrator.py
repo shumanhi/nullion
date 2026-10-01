@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nullion.browser_capture_contract import capture_only_scope, completed_capture_paths, conversation_navigation, delivered_capture_paths
+from nullion.browser_capture_contract import capture_only_scope, completed_capture_paths, conversation_navigation, delivered_capture_paths, repaired_browser_results
 
 import asyncio
 import base64
@@ -1318,6 +1318,12 @@ def _tool_approval_context_from_invocation(
                 "tool_permission_scope": str(getattr(spec, "permission_scope", "") or ""),
             }
         )
+    if invocation.tool_name == "delete_cron":
+        from nullion.crons import get_cron
+
+        job = get_cron(str(invocation.arguments.get("id") or ""))
+        if job is not None and job.workspace_id == context["workspace_id"]:
+            context["scheduler_target"] = {"id": job.id, "name": job.name}
     if invocation.tool_name == "email_send":
         try:
             from nullion.tools import _email_html_preview_path_for_invocation
@@ -3902,7 +3908,7 @@ def _completion_review_scope_contract(
 def _browser_completion_has_structured_risk(tool_results: Iterable[ToolResult]) -> bool:
     """Return whether a browser/web path contains typed failure or unverified state."""
 
-    results = list(tool_results)
+    results = list(repaired_browser_results(tool_results))
 
     def verified_terminal_detail(result: ToolResult) -> bool:
         return (
@@ -3981,7 +3987,7 @@ def _completion_review_required(
     """Gate semantic review behind structured execution risk, never prompt wording."""
     if int(state.get("completion_review_count") or 0) > _COMPLETION_REVIEW_MAX_ATTEMPTS:
         return False
-    results = list(tool_results)
+    results = list(repaired_browser_results(tool_results))
     if not results:
         return False
     if (
@@ -6351,6 +6357,14 @@ def _tool_failure_fingerprint(*, result: ToolResult, invocation_signature: str) 
     if result.status == "completed":
         return None
     output = result.output if isinstance(result.output, dict) else {}
+    from nullion.tool_repair_contract import tool_repair_kind
+    if repair_kind := tool_repair_kind(result):
+        # Correctable calls stay available, but varying their arguments or
+        # translated error text must not evade the bounded failure guard.
+        return json.dumps({
+            "tool_name": result.tool_name, "reason": output["reason"],
+            "repair_kind": repair_kind, "session_id": output.get("session_id"),
+        }, sort_keys=True, default=str)
     failure_shape: dict[str, Any] = {
         "invocation": invocation_signature,
         "status": result.status,
@@ -7875,6 +7889,9 @@ def _scope_recovery_capabilities_for_failed_result(result: ToolResult) -> tuple[
 
 
 def _should_block_failed_tool_during_recovery(result: ToolResult) -> bool:
+    from nullion.tool_repair_contract import tool_repair_kind
+    if tool_repair_kind(result):
+        return False
     output = result.output if isinstance(result.output, dict) else {}
     reason = str(output.get("reason") or "").strip().lower()
     tool_name = str(result.tool_name or "").strip().lower()
@@ -8941,6 +8958,15 @@ def _execute_agent_turn_tool_uses(
             logger.debug("Tool result callback failed", exc_info=True)
 
     def _completed_required_artifact_update() -> dict[str, Any] | None:
+        decision = getattr(tool_registry, "turn_tool_scope_decision", None)
+        if (
+            getattr(decision, "valid", False)
+            and any(r.tool_name == "browser_screenshot" and r.status == "completed" for r in tool_results)
+            and not capture_only_scope(decision, tool_results)
+        ):
+            # A capture may be evidence for other requested work. Let the model
+            # answer that work from the collected evidence before finalizing.
+            return None
         artifact_completion_state = dict(state)
         artifact_completion_state.update(
             {"user_message": user_message, "tool_results": tool_results, "artifacts": artifacts}
@@ -9333,6 +9359,14 @@ def _execute_agent_turn_tool_uses(
             )
         if guarded_result is None:
             guarded_result = _scheduler_creation_guard_result(invocation, tool_results)
+        if guarded_result is None and tool_name == "delete_cron":
+            from nullion.scheduler_deletion_contract import scheduler_deletion_guard_result
+
+            guarded_result = scheduler_deletion_guard_result(
+                invocation,
+                user_message=str(state.get("user_message") or user_message),
+                model_client=getattr(state.get("orchestrator"), "model_client", None),
+            )
         if guarded_result is None:
             guarded_result = _browser_active_workflow_reset_guard_result(invocation, tool_results)
         if guarded_result is not None:
@@ -9821,7 +9855,8 @@ def _execute_agent_turn_tool_uses(
             if failure_fingerprint is not None:
                 failure_fingerprints[failure_fingerprint] = failure_fingerprints.get(failure_fingerprint, 0) + 1
                 repeated_count = failure_fingerprints[failure_fingerprint]
-                recovery_update = _maybe_widen_scope_after_repeated_tool_failure(
+                from nullion.tool_repair_contract import tool_repair_kind
+                recovery_update = None if tool_repair_kind(result) else _maybe_widen_scope_after_repeated_tool_failure(
                     state,
                     result=result,
                     tool_registry=tool_registry,

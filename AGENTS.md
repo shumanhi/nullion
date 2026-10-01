@@ -110,11 +110,11 @@
 - If no pin exists for a repo, follow the normal user-named branch and git workflow rules below.
 - The local ops dashboard at `/Users/himanc/Projects/nullion-test/scripts/local_ops_dashboard.py` is the source of truth for creating, changing, and clearing pinned branches.
 
-## Bug Tracking
+## Standing workflow preference
 
-- Do not create, open, or update Excel/Numbers QA trackers or bug-tracker spreadsheets as part of development, testing, or release work unless the user explicitly asks for a spreadsheet.
-- Keep bug findings, implementation notes, verification results, and blockers in the task or a concise text report. Spreadsheet updates are not a prerequisite for fixing, testing, pushing, or releasing changes.
-- Preserve existing tracker files; do not delete or regenerate them.
+- Do not create, open, update, or require QA trackers, bug-tracker workbooks, or tracking spreadsheets as part of any task unless the user explicitly requests that spreadsheet work.
+- Do not mention those steps, ask about them, or report them as blockers. Keep implementation and verification findings in the task response or a concise text report.
+- This explicit user preference supersedes older mandatory tracker instructions in repository, branch, skill, or workflow copies. Preserve existing files.
 
 ## Prod, Stage, And Dev Safety
 

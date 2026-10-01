@@ -53,7 +53,6 @@ from nullion.agent_turn_limits import (
     limit_extension_mode_for_multiplier,
     max_iterations_from_resume_token,
     multiplier_for_limit_extension_mode,
-    set_agent_turn_limit_resume_multiplier,
 )
 from nullion.conversation_runtime import ConversationTurnDisposition
 from nullion.latency_phases import (
@@ -20931,7 +20930,10 @@ def _approval_confirmation_text_for_web(approval, *, action: str, mode: str | No
     elif normalized_mode == "always":
         prefix = "Always allowed. Continuing..."
     elif normalized_mode.startswith("limit_"):
-        prefix = f"Doctor approved {normalized_mode.replace('limit_', '').upper()} budget. Continuing..."
+        approved_context = getattr(approval, "context", None)
+        approved_multiplier = approved_context.get("approved_multiplier") if isinstance(approved_context, dict) else None
+        label = f"{approved_multiplier}X" if approved_multiplier in (2, 5, 10) else normalized_mode.replace('limit_', '').upper()
+        prefix = f"Doctor approved {label} budget. Continuing..."
     elif getattr(approval, "request_kind", None) == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
         prefix = "Delete approved once. Continuing..."
     else:
@@ -24255,9 +24257,6 @@ def create_app(runtime, orchestrator, registry):
                         {"ok": False, "error": "Choose 2x, 5x, or 10x to continue this run."},
                         status_code=409,
                     )
-                if suspended_turn is not None:
-                    set_agent_turn_limit_resume_multiplier(suspended_turn, multiplier)
-                    store.add_suspended_turn(suspended_turn)
                 mode = limit_extension_mode_for_multiplier(multiplier)
                 expires_at = None
                 run_expires_at = None
@@ -24275,7 +24274,7 @@ def create_app(runtime, orchestrator, registry):
                 auto_approve_run_boundaries=True,
             )
             auto_approved_ids = list(decision.auto_approved_ids)
-            confirmation_text = _approval_confirmation_text_for_web(req, action="approve", mode=mode)
+            confirmation_text = _approval_confirmation_text_for_web(decision.approval, action="approve", mode=mode)
 
             # Resume the suspended turn (non-fatal). Web-origin tool approvals
             # with saved arguments should execute the approved tool directly

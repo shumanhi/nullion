@@ -8,7 +8,9 @@ from typing import Any, Callable, Iterable
 
 from nullion.agent_turn_limits import (
     AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
+    max_iterations_from_resume_token,
     multiplier_for_limit_extension_mode,
+    set_agent_turn_limit_resume_multiplier,
 )
 from nullion.approvals import (
     ApprovalRequest,
@@ -175,6 +177,17 @@ def approve_request_with_mode(
         actor="operator",
         reason=approval_decision_reason(mode=normalized_mode, source=source),
     )
+
+    if multiplier := multiplier_for_limit_extension_mode(normalized_mode):
+        suspended = store.get_suspended_turn(approval_id)
+        if suspended is not None:
+            budget = set_agent_turn_limit_resume_multiplier(suspended, multiplier)
+            store.add_suspended_turn(suspended)
+            approved = replace(approved, context={
+                **approval_context(approved), "approved_multiplier": multiplier,
+                "approved_max_iterations": max_iterations_from_resume_token(suspended.resume_token) or budget,
+            })
+            store.add_approval_request(approved)
 
     auto_approved_ids: list[str] = []
     if is_run_wide_web and auto_approve_run_boundaries:
