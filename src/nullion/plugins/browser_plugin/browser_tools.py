@@ -4170,6 +4170,9 @@ class BrowserTools:
             return f"task-{digest}"
         if raw_session_id and raw_session_id != "default":
             return self._scoped_model_session_id(invocation, raw_session_id)
+        active_session_id = self._recent_active_session_id(invocation)
+        if active_session_id:
+            return active_session_id
         scope = str(context.get("browser_session_scope") or self._cleanup_scope(invocation))
         digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
         return f"default-{digest}"
@@ -5201,7 +5204,11 @@ class BrowserTools:
         self._remember_session(invocation, session_id)
         mode = str(invocation.arguments.get("mode") or "auto").strip().lower()
         if mode not in {"auto", "viewport", "full_page"}:
-            return _fail(invocation, "mode must be one of: auto, viewport, full_page")
+            return _fail(invocation, "mode must be one of: auto, viewport, full_page", {
+                "reason": "invalid_tool_arguments", "session_id": session_id,
+                "recovery": {"kind": "correct_arguments", "retry_tool_name": invocation.tool_name,
+                             "argument_constraints": {"mode": {"enum": ["auto", "viewport", "full_page"]}}},
+            })
         try:
             screenshot = _run(self._backend.screenshot(session_id, mode=mode))
             if isinstance(screenshot, BrowserScreenshotResult):
@@ -5209,6 +5216,16 @@ class BrowserTools:
                     return _fail(
                         invocation,
                         "Screenshot session has no loaded page. Navigate in this session before capturing it.",
+                        {
+                            "reason": "tool_precondition_unmet", "session_id": session_id,
+                            "page_url": screenshot.page_url,
+                            "recovery": {
+                                "kind": "repair_precondition", "retry_tool_name": invocation.tool_name,
+                                "required_tool_names": ["browser_navigate"],
+                                "retry_arguments": {"session_id": session_id, "mode": mode},
+                                "precondition": {"kind": "loaded_page", "session_id": session_id},
+                            },
+                        },
                     )
                 png_bytes = screenshot.data
                 screenshot_metadata = {
@@ -5284,7 +5301,11 @@ class BrowserTools:
         text = invocation.arguments.get("text") or None
         timeout = float(invocation.arguments.get("timeout", 10.0))
         if not selector and not url_pattern and not text:
-            return _fail(invocation, "Provide selector, url_pattern, or text")
+            return _fail(invocation, "Provide selector, url_pattern, or text", {
+                "reason": "invalid_tool_arguments", "session_id": self._session_id(invocation),
+                "recovery": {"kind": "correct_arguments", "retry_tool_name": invocation.tool_name,
+                             "argument_constraints": {"at_least_one": ["selector", "url_pattern", "text"]}},
+            })
         session_id = self._session_id(invocation)
         self._remember_session(invocation, session_id)
         try:

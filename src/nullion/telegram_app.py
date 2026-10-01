@@ -22,7 +22,6 @@ from nullion.agent_turn_limits import (
     AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
     limit_extension_mode_for_multiplier,
     multiplier_for_limit_extension_action,
-    set_agent_turn_limit_resume_multiplier,
 )
 from nullion.approval_display import (
     approval_display_from_request,
@@ -3667,6 +3666,9 @@ def _approval_decision_messages(approval, action: str) -> tuple[str, str]:
     detail_suffix = _approval_decision_detail_suffix(detail)
     multiplier = multiplier_for_limit_extension_action(action)
     if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND and multiplier is not None:
+        context = getattr(approval, "context", None)
+        if isinstance(context, dict) and context.get("approved_multiplier") in (2, 5, 10):
+            multiplier = context["approved_multiplier"]
         return (
             f"Doctor approved {multiplier}x tool budget",
             f"✅ {emoji} Doctor approved {multiplier}x tool budget. Continuing...{detail_suffix}",
@@ -3760,16 +3762,13 @@ def _execute_decision_action(
                     "Already handled",
                     "✅ 🩺 Doctor already approved this tool budget. I won't run the request again.",
                 )
-            if suspended_turn is not None:
-                set_agent_turn_limit_resume_multiplier(suspended_turn, multiplier)
-                service.runtime.store.add_suspended_turn(suspended_turn)
-            approve_request_with_mode(
+            decision = approve_request_with_mode(
                 service.runtime,
                 record_id,
                 mode=limit_extension_mode_for_multiplier(multiplier),
                 source="Telegram",
             )
-            return _approval_decision_messages(approval, action)
+            return _approval_decision_messages(decision.approval, action)
         if getattr(approval, "request_kind", None) == "boundary_policy":
             if action == "allow_session":
                 approve_request_with_mode(

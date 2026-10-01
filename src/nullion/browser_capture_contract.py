@@ -19,6 +19,32 @@ def _capture_results(tool_results: object) -> tuple:
         for result in (tool_results or ())
     )
 
+def repaired_browser_results(tool_results: object) -> tuple:
+    """Ignore a correctable failure only after its same-session repair completes."""
+    from nullion.tool_repair_contract import tool_repair_kind
+
+    results = _capture_results(tool_results)
+    unresolved = []
+    for index, result in enumerate(results):
+        kind = tool_repair_kind(result) if result.tool_name in CAPTURE_TOOLS else None
+        output = result.output if isinstance(result.output, Mapping) else {}
+        session_id = output.get("session_id")
+        repaired = False
+        if kind and session_id:
+            prerequisites = set(output["recovery"].get("required_tool_names") or ())
+            for candidate in results[index + 1:]:
+                candidate_output = candidate.output if isinstance(candidate.output, Mapping) else {}
+                if candidate.status != "completed" or candidate_output.get("session_id") != session_id:
+                    continue
+                if candidate.tool_name == result.tool_name and not prerequisites:
+                    repaired = True
+                    break
+                prerequisites.discard(candidate.tool_name)
+        if not repaired:
+            unresolved.append(result)
+    return tuple(unresolved)
+
+
 def conversation_navigation(store: object, conversation_id: str | None):
     """Return owned navigation evidence only while later browser activity agrees."""
     read_events = getattr(store, "list_conversation_events", None)
@@ -75,7 +101,7 @@ def capture_only_scope(decision: object, tool_results: object = ()) -> bool:
 
 
 def completed_capture_paths(decision: object, tool_results: object) -> tuple[str, ...]:
-    results = _capture_results(tool_results)
+    results = repaired_browser_results(tool_results)
     if not capture_only_scope(decision, results):
         return ()
     if any(r.status != "completed" or r.tool_name not in CAPTURE_TOOLS | {"request_tool_scope"} for r in results):
@@ -88,7 +114,7 @@ def completed_capture_paths(decision: object, tool_results: object) -> tuple[str
 
 def delivered_capture_paths(decision: object, tool_results: object, final_text: str) -> tuple[str, ...]:
     """Accept a model-declared attachment only when its capture is verified."""
-    results = _capture_results(tool_results)
+    results = repaired_browser_results(tool_results)
     if getattr(decision, "valid", False) and not capture_only_scope(decision, results):
         return ()
     if any(r.status != "completed" or r.tool_name not in CAPTURE_TOOLS | {"request_tool_scope"} for r in results):
@@ -105,7 +131,7 @@ def delivered_capture_paths(decision: object, tool_results: object, final_text: 
 
 def verified_capture_paths(tool_results: object) -> tuple[str, ...]:
     """Require a real PNG from the last browser operation in a loaded session."""
-    browser_results = [r for r in _capture_results(tool_results) if str(getattr(r, "tool_name", "")).startswith("browser_")]
+    browser_results = [r for r in repaired_browser_results(tool_results) if str(getattr(r, "tool_name", "")).startswith("browser_")]
     if not browser_results:
         return ()
     capture = browser_results[-1]

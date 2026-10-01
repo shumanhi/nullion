@@ -439,6 +439,7 @@ def approval_display_from_request(approval: Any) -> ApprovalDisplay:
     tool_name = _tool_name_for(approval, context)
     if is_agent_turn_limit_extension_request(approval):
         current_limit = _string(context.get("current_max_iterations"))
+        approved_limit = _string(context.get("approved_max_iterations"))
         tool_count = _string(context.get("tool_result_count"))
         source_label = _conversation_source_label(context.get("conversation_id") or getattr(approval, "requested_by", ""))
         requested_extensions = context.get("requested_extensions")
@@ -450,10 +451,14 @@ def approval_display_from_request(approval: Any) -> ApprovalDisplay:
         detail_parts = []
         if source_label:
             detail_parts.append(source_label)
-        if current_limit:
-            detail_parts.append(f"Current turn budget: {current_limit} model/tool-loop iteration(s)")
+        if approved_limit:
+            detail_parts.append(f"Approved continuation budget: {approved_limit} model rounds")
+            if current_limit:
+                detail_parts.append(f"Previous budget: {current_limit} model rounds")
+        elif current_limit:
+            detail_parts.append(f"Current turn budget: {current_limit} model rounds")
         if tool_count:
-            detail_parts.append(f"Tool steps already attempted: {tool_count}")
+            detail_parts.append(f"Tool result records so far (including recovery): {tool_count}")
         detail = "\n".join(detail_parts).strip() or "The current agent turn budget was reached."
         if extension_text:
             detail = f"{detail}{extension_text}"
@@ -465,6 +470,21 @@ def approval_display_from_request(approval: Any) -> ApprovalDisplay:
             is_web_request=source_label == "Source: Web",
         )
     label = approval_label_for_tool(tool_name)
+    if tool_name == "delete_cron":
+        target = context.get("scheduler_target")
+        target = target if isinstance(target, dict) else {}
+        arguments = context.get("tool_arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        target_id = _string(target.get("id") or arguments.get("id"))
+        target_name = _string(target.get("name"))
+        return ApprovalDisplay(
+            label="delete this scheduled task",
+            detail=f"Scheduled task: {target_name or 'Name unavailable'}\nID: {target_id or 'Unknown'}\n"
+                   "This removes the job and stops all future scheduled runs.",
+            title="⚠️ Delete this scheduled task?",
+            copy="Review the named task. Approve once to delete it, or deny to keep it.",
+            is_web_request=False,
+        )
     if tool_name == "email_send":
         detail = _email_send_review_detail(context) or _metadata_detail(context) or "Email draft details were not provided."
         return ApprovalDisplay(

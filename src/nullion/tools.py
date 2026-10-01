@@ -5808,6 +5808,12 @@ class ToolExecutor:
             "tool_permission_scope": spec.permission_scope,
             "tool_arguments": tool_arguments,
         }
+        if invocation.tool_name == "delete_cron":
+            from nullion.crons import get_cron
+
+            job = get_cron(str(invocation.arguments.get("id") or ""))
+            if job is not None and job.workspace_id == workspace_id:
+                approval_context["scheduler_target"] = {"id": job.id, "name": job.name}
         if invocation.tool_name == "email_send":
             preview_path = _email_html_preview_path_for_invocation(invocation)
             if preview_path:
