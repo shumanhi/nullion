@@ -21853,10 +21853,9 @@ def create_app(runtime, orchestrator, registry):
 
     def _record_cron_delivery_chat_turn(
         job,
-        *,
         conversation_id: str,
         delivery_channel: str,
-        delivery_target: str = "",
+        delivery_target: str,
         delivered_text: str,
     ) -> None:
         try:
@@ -21868,6 +21867,9 @@ def create_app(runtime, orchestrator, registry):
                 delivery_target=delivery_target,
                 delivered_text=delivered_text,
             )
+            # The scheduler saves its job state after this callback. Persist the
+            # terminal chat event first so a later store refresh cannot lose it.
+            runtime.checkpoint(force=True)
         except Exception:
             logger.debug("Could not persist scheduled-task delivery context turn", exc_info=True)
 
@@ -22078,8 +22080,7 @@ def create_app(runtime, orchestrator, registry):
         """Fire a cron by sending its task string through a synthetic agent turn."""
         try:
             result = _run_cron_agent_turn(job, label="Scheduled task")
-            if isinstance(result, dict) and (result.get("cron_delivery_failed") or result.get("cron_run_failed")):
-                raise RuntimeError("cron delivery failed")
+            return result
         except Exception as exc:
             logger.warning("Cron fire error [%s]: %s", job.id, exc)
             raise

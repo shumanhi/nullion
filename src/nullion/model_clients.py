@@ -1141,7 +1141,26 @@ class CodexResponsesModelClient:
                     "input": parsed,
                 })
         stop_reason = "tool_use" if has_tool else "end_turn"
-        return {"stop_reason": stop_reason, "content": content_blocks}
+        return {"stop_reason": stop_reason, "content": content_blocks,
+                "completion": CodexResponsesModelClient._completion_metadata(data)}
+
+    @staticmethod
+    def _completion_metadata(data: dict[str, Any]) -> dict[str, Any]:
+        status = data.get("status")
+        details = data.get("incomplete_details")
+        usage = data.get("usage")
+        metadata: dict[str, Any] = {}
+        if status in {"completed", "incomplete", "failed", "cancelled"}:
+            metadata["status"] = status
+        if isinstance(details, dict) and details.get("reason") in {"max_output_tokens", "content_filter"}:
+            metadata["reason"] = details["reason"]
+        if isinstance(usage, dict):
+            metadata["usage"] = {key: usage[key] for key in ("input_tokens", "output_tokens", "total_tokens")
+                                 if isinstance(usage.get(key), int)}
+            output_details = usage.get("output_tokens_details")
+            if isinstance(output_details, dict) and isinstance(output_details.get("reasoning_tokens"), int):
+                metadata["usage"]["reasoning_tokens"] = output_details["reasoning_tokens"]
+        return metadata
 
     def create(
         self,
@@ -1201,6 +1220,7 @@ class CodexResponsesModelClient:
                 text_parts: list[str] = []
                 thinking_parts: list[str] = []
                 tool_blocks: list[dict[str, Any]] = []
+                completion: dict[str, Any] = {}
                 # track in-progress function call by item index
                 fn_calls: dict[int, dict[str, Any]] = {}
                 deadline = (_time.monotonic() + float(timeout)) if timeout and timeout > 0 else None
@@ -1241,7 +1261,11 @@ class CodexResponsesModelClient:
                                 continue
 
                             etype = ev.get("type", "")
-                            if etype == "response.completed":
+                            if etype in {"response.completed", "response.incomplete", "response.failed"}:
+                                terminal = ev.get("response")
+                                terminal = dict(terminal) if isinstance(terminal, dict) else {}
+                                terminal.setdefault("status", etype.split(".", 1)[1])
+                                completion = self._completion_metadata(terminal)
                                 break
 
                             if etype == "response.output_text.delta":
@@ -1314,7 +1338,7 @@ class CodexResponsesModelClient:
             content_blocks.extend(tool_blocks)
 
             stop_reason = "tool_use" if tool_blocks else "end_turn"
-            return {"stop_reason": stop_reason, "content": content_blocks}
+            return {"stop_reason": stop_reason, "content": content_blocks, "completion": completion}
 
         try:
             try:
