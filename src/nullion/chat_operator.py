@@ -551,6 +551,19 @@ def _chat_model_issue_reply(runtime: PersistentRuntime, *, message: str, model_c
         status = str(action.get("status") or "").strip().lower()
         if status != "pending":
             continue
+        # A pending investigation is durable administrative state, not a
+        # permanent connectivity verdict. Apply the same freshness window as
+        # health signals so yesterday's failed check cannot freeze new turns.
+        recorded_at = action.get("updated_at") or action.get("created_at")
+        if recorded_at:
+            try:
+                observed = datetime.fromisoformat(str(recorded_at))
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=UTC)
+            except (TypeError, ValueError):
+                continue
+            if (datetime.now(UTC) - observed).total_seconds() > _MODEL_ISSUE_SIGNAL_MAX_AGE_SECONDS:
+                continue
         reply = _model_issue_reply_for_doctor_record(action)
         if reply is not None:
             if _recover_stale_model_issue_if_possible(runtime, model_client):
