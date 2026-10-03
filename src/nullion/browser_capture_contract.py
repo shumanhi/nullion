@@ -59,6 +59,12 @@ def conversation_navigation(store: object, conversation_id: str | None):
                 continue
             output = result.get("output") or {}
             current_session = output.get("session_id") if isinstance(output, Mapping) else None
+            if (result.get("status") == "failed" and current_session
+                    and output.get("page_state_preserved") is True):
+                if session_id is not None and current_session != session_id:
+                    return None
+                session_id = current_session
+                continue
             if result.get("status") != "completed" or not current_session:
                 return None
             if session_id is not None and current_session != session_id:

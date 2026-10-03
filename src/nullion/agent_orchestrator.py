@@ -6251,11 +6251,11 @@ def _agent_model_timeout_seconds() -> float:
 
 
 def _artifact_model_timeout_seconds() -> float:
-    raw_value = os.environ.get("NULLION_ARTIFACT_MODEL_TIMEOUT_SECONDS", "90").strip()
+    raw_value = os.environ.get("NULLION_ARTIFACT_MODEL_TIMEOUT_SECONDS", "120").strip()
     try:
         timeout = float(raw_value)
     except ValueError:
-        return 90.0
+        return 120.0
     return min(180.0, max(30.0, timeout))
 
 
@@ -8219,6 +8219,7 @@ class TurnResult:
     artifact_delivery_required: bool = False
     artifact_delivery_satisfied: bool = True
     required_artifact_extensions: list[str] = field(default_factory=list)
+    response_presentation: dict[str, object] = field(default_factory=dict)
     messages_snapshot: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -8280,6 +8281,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     response: dict[str, Any]
     content: list[dict[str, Any]]
     stop_reason: str | None
+    response_presentation: dict[str, object]
     result: TurnResult
 
 
@@ -8900,6 +8902,7 @@ def _complete_agent_turn(
             artifact_delivery_required=artifact_delivery_required,
             artifact_delivery_satisfied=artifact_delivery_satisfied,
             required_artifact_extensions=required_artifact_extensions,
+            response_presentation=dict(state.get("response_presentation") or {}),
             messages_snapshot=list(state.get("messages") or []) if reached_iteration_limit else [],
         ),
     }
@@ -10094,10 +10097,15 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
         create_kwargs["text_delta_callback"] = text_delta_callback
     model_create = state["orchestrator"].model_client.create
     focused_artifact_model_call = _is_focused_artifact_model_registry(model_tool_registry)
+    flow_context = state.get("tool_flow_context")
+    scheduled_file_report = isinstance(flow_context, Mapping) and (
+        flow_context.get("scheduled_task_run") is True
+        and flow_context.get("requires_artifact_delivery") is True
+    )
     if _model_create_accepts_timeout(model_create):
         create_kwargs["timeout"] = (
             max(_agent_model_timeout_seconds(), _artifact_model_timeout_seconds())
-            if focused_artifact_model_call
+            if focused_artifact_model_call or scheduled_file_report
             else _agent_model_timeout_seconds()
         )
     model_started_at = time.perf_counter()
@@ -10566,12 +10574,15 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
             response_fulfilled = False
         else:
             response_fulfilled = True
+    response_presentation: dict[str, object] = {}
     final_text = sanitize_user_visible_reply(
         user_message=state["user_message"],
         reply=final_text,
         tool_results=tool_results,
         source="agent",
+        presentation_metadata=response_presentation,
     )
+    state["response_presentation"] = response_presentation
     try:
         from nullion.artifacts import materialize_inline_html_reply_artifact
 

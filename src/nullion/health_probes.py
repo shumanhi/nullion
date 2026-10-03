@@ -80,20 +80,20 @@ def _model_probe_error_details(exc: Exception) -> dict[str, object]:
 
 
 def make_model_api_probe(model_client) -> "ProbeFunc":
-    """Probe the model API with a minimal 1-token completion."""
+    """Probe model connectivity with a small, valid completion budget."""
 
     def _probe() -> ProbeResult:
         try:
             t0 = time.monotonic()
             # Pass only the arguments every model client supports.
-            # Clients like CodexResponsesModelClient don't accept max_tokens.
+            # Keep clients without an explicit completion budget compatible.
             create_kwargs: dict = {
                 "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
                 "tools": [],
             }
             import inspect as _inspect
             if "max_tokens" in _inspect.signature(model_client.create).parameters:
-                create_kwargs["max_tokens"] = 1
+                create_kwargs["max_tokens"] = 16
             model_client.create(**create_kwargs)
             return ProbeResult(
                 service_id="model_api",

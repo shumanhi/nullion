@@ -4949,6 +4949,7 @@ class BrowserTools:
                 return _fail(
                     invocation,
                     "The current page did not expose a substantive detail record in the selected DOM scope.",
+                    {"session_id": session_id, "page_state_preserved": True},
                 )
             output = dict(extraction)
             if assertion := self._current_page_assertion(invocation, session_id):

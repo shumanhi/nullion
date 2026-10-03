@@ -21234,9 +21234,22 @@ def create_app(runtime, orchestrator, registry):
             if str(path or "").strip()
         ]
         tool_results = list(getattr(result, "tool_results", ()) or ())
+        # The shared turn has already selected its output. Only ask a model
+        # to disambiguate format when that output contains artifact evidence.
+        # Plain replies must not pay for another provider call during delivery.
+        has_artifact_evidence = bool(
+            artifact_paths
+            or reply_artifact_paths
+            or getattr(result, "artifacts", None)
+            or artifact_paths_from_tool_results(tool_results)
+        )
         requested_attachment_extension = plan_attachment_format(
             user_text,
-            model_client=getattr(orchestrator, "model_client", None),
+            model_client=(
+                getattr(orchestrator, "model_client", None)
+                if has_artifact_evidence
+                else None
+            ),
         ).extension
         materialized_artifact_paths = _materialize_fetch_artifact_for_web(
             runtime,
@@ -21853,10 +21866,9 @@ def create_app(runtime, orchestrator, registry):
 
     def _record_cron_delivery_chat_turn(
         job,
-        *,
         conversation_id: str,
         delivery_channel: str,
-        delivery_target: str = "",
+        delivery_target: str,
         delivered_text: str,
     ) -> None:
         try:
@@ -21868,6 +21880,9 @@ def create_app(runtime, orchestrator, registry):
                 delivery_target=delivery_target,
                 delivered_text=delivered_text,
             )
+            # The scheduler saves its job state after this callback. Persist the
+            # terminal chat event first so a later store refresh cannot lose it.
+            runtime.checkpoint(force=True)
         except Exception:
             logger.debug("Could not persist scheduled-task delivery context turn", exc_info=True)
 
@@ -22078,8 +22093,7 @@ def create_app(runtime, orchestrator, registry):
         """Fire a cron by sending its task string through a synthetic agent turn."""
         try:
             result = _run_cron_agent_turn(job, label="Scheduled task")
-            if isinstance(result, dict) and (result.get("cron_delivery_failed") or result.get("cron_run_failed")):
-                raise RuntimeError("cron delivery failed")
+            return result
         except Exception as exc:
             logger.warning("Cron fire error [%s]: %s", job.id, exc)
             raise
