@@ -837,7 +837,7 @@ class CronScheduler:
 
     def __init__(
         self,
-        fire_fn: Callable[[CronJob], None],
+        fire_fn: Callable[[CronJob], object],
         tick_interval: float = 30.0,
     ) -> None:
         self._fire = fire_fn
@@ -908,8 +908,22 @@ class CronScheduler:
                 save_crons(jobs)
                 changed = False  # already saved
                 try:
-                    self._fire(job)
-                    job.last_result = "ok"
+                    result = self._fire(job)
+                    if isinstance(result, dict):
+                        outcome = result.get("execution_outcome") or {}
+                        if result.get("suspended_for_approval"):
+                            job.last_result = "waiting_for_approval"
+                        elif result.get("cron_run_cancelled"):
+                            job.last_result = "cancelled"
+                        elif (result.get("cron_run_failed") or result.get("cron_report_failed") or result.get("cron_delivery_failed")
+                              or (isinstance(outcome, dict) and outcome.get("execution_succeeded") is False)):
+                            job.last_result = f"error: {result.get('reason') or 'scheduled task incomplete'}"
+                        elif result.get("cron_delivery_partial_success"):
+                            job.last_result = "partial_success"
+                        else:
+                            job.last_result = "ok"
+                    else:
+                        job.last_result = "ok"
                 except Exception as exc:
                     log.warning("Cron %r [%s] fire error: %s", job.name, job.id, exc)
                     job.last_result = f"error: {exc}"

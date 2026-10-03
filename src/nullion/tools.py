@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import bz2
 import csv
+import copy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from email.message import EmailMessage
@@ -1614,7 +1615,7 @@ _TERMINAL_DELIVERABLE_ARTIFACT_EXTENSIONS = frozenset(VALID_ATTACHMENT_EXTENSION
 _MAX_TERMINAL_DISCOVERED_ARTIFACTS = 25
 _MAX_TERMINAL_ARTIFACT_SCAN_ENTRIES = 10000
 
-_CRON_TOOL_PROPERTIES: dict[str, dict[str, str]] = {
+_CRON_TOOL_PROPERTIES: dict[str, dict[str, object]] = {
     "id": {"type": "string", "description": "Cron job id. Required for update operations."},
     "name": {"type": "string", "description": "Human-readable cron name."},
     "schedule": {"type": "string", "description": "Cron schedule expression."},
@@ -1627,16 +1628,27 @@ _CRON_TOOL_PROPERTIES: dict[str, dict[str, str]] = {
         "type": "string",
         "description": "HTML image delivery mode: linked, auto, or self_contained.",
     },
+    "artifact_delivery_options": {
+        "type": "object",
+        "description": "Persist the scheduled deliverable contract. Supply required_artifact_extensions and requires_attachment_delivery when a file is requested; text must not replace a required file.",
+        "properties": {
+            "requires_attachment_delivery": {"type": "boolean"},
+            "required_artifact_extensions": {"type": "array", "items": {"type": "string"}},
+            "required_artifact_content_tokens": {"type": "array", "items": {"type": "string"}},
+            "deliver_required_extensions_only": {"type": "boolean"},
+        },
+        "additionalProperties": False,
+    },
 }
 
 
 def _cron_tool_properties() -> dict[str, object]:
-    return {name: dict(schema) for name, schema in _CRON_TOOL_PROPERTIES.items()}
+    return copy.deepcopy(_CRON_TOOL_PROPERTIES)
 
 
 def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
     def cron_tool_properties() -> dict[str, object]:
-        return {name: dict(schema) for name, schema in _CRON_TOOL_PROPERTIES.items()}
+        return copy.deepcopy(_CRON_TOOL_PROPERTIES)
 
     schemas: dict[str, dict[str, object]] = {
         "create_cron": {
@@ -17592,6 +17604,10 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
         task     = str(args.get("task", "")).strip()
         enabled  = bool(args.get("enabled", True))
         html_image_delivery_mode = str(args.get("html_image_delivery_mode") or "").strip()
+        artifact_options = args.get("artifact_delivery_options")
+        if artifact_options is not None and not isinstance(artifact_options, dict):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {},
+                              "artifact_delivery_options must be an object")
         workspace_id = _workspace_id_from_invocation(invocation, args)
         context_channel, context_target = _current_delivery_context_defaults()
         if not context_channel or not context_target:
@@ -17650,6 +17666,8 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
                 "workspace_id": workspace_id,
                 "html_image_delivery_mode": html_image_delivery_mode,
             }
+            if artifact_options is not None:
+                updates["artifact_delivery_options"] = dict(artifact_options)
             try:
                 job = update_cron(existing.id, **updates)
             except Exception as exc:
@@ -17742,6 +17760,7 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
                 delivery_target=delivery_target,
                 html_image_delivery_mode=html_image_delivery_mode,
                 workspace_id=workspace_id,
+                artifact_delivery_options=artifact_options,
             )
         except Exception as exc:
             return ToolResult(
@@ -18044,6 +18063,7 @@ def _build_update_cron_handler():
             "delivery_target",
             "workspace_id",
             "html_image_delivery_mode",
+            "artifact_delivery_options",
         )
         updates: dict[str, object] = {}
         for field in mutable_fields:
@@ -18052,6 +18072,9 @@ def _build_update_cron_handler():
             value = args[field]
             if field in {"name", "schedule", "task", "delivery_channel", "delivery_target", "workspace_id", "html_image_delivery_mode"}:
                 value = str(value or "").strip()
+            if field == "artifact_delivery_options" and not isinstance(value, dict):
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {},
+                                  "artifact_delivery_options must be an object")
             updates[field] = value
         if not updates:
             return ToolResult(
@@ -18845,7 +18868,12 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
         runner_failed = False
         runner_failure_reason = ""
         if isinstance(runner_output, dict):
-            if runner_output.get("reached_iteration_limit"):
+            outcome = runner_output.get("execution_outcome") or {}
+            if (runner_output.get("cron_run_failed") or runner_output.get("cron_report_failed")
+                or (isinstance(outcome, dict) and outcome.get("execution_succeeded") is False)):
+                runner_failed = True
+                runner_failure_reason = str(runner_output.get("reason") or "cron_report_incomplete")
+            elif runner_output.get("reached_iteration_limit"):
                 runner_failed = True
                 runner_failure_reason = "cron_run_reached_iteration_limit"
             elif runner_output.get("cron_delivery_failed"):
@@ -18996,7 +19024,7 @@ def _build_run_cron_handler(cron_runner: Callable[..., str | dict[str, object] |
                     if runner_failure_reason == "cron_run_internal_tool_output_leaked"
                     else "Cron run did not deliver its result to the configured platform."
                     if runner_failure_reason.startswith("cron_delivery") or runner_failure_reason.startswith("cron_run")
-                    else "Cron run is waiting for approval."
+                    else "Cron run did not complete its requested result."
                 ),
             )
         return ToolResult(

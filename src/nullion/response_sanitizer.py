@@ -15,6 +15,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -170,7 +171,48 @@ def user_requested_raw_output(user_message: str | None) -> bool:
     return False
 
 
+_PRESENTATION_CANDIDATES: ContextVar[list[tuple[str, str]] | None] = ContextVar("reply_presentations", default=None)
+
+
+def _source_presentation(text: str | None, kind: str = "source_summary") -> str | None:
+    candidates = _PRESENTATION_CANDIDATES.get()
+    if candidates is not None and text:
+        candidates.append((kind, text))
+    return text
+
+
 def sanitize_user_visible_reply(
+    *, user_message: str | None, reply: str | None,
+    tool_results: Iterable[ToolResult | Mapping[str, Any] | object] | None = None,
+    requested_sections: Iterable[object] | None = None, source: str = "agent",
+    presentation_metadata: dict[str, object] | None = None,
+) -> str | None:
+    """Keep the producer's source-summary provenance separate from final copy."""
+    if presentation_metadata is not None and tool_results is not None:
+        tool_results = list(tool_results)
+    candidates: list[tuple[str, str]] = []
+    token = _PRESENTATION_CANDIDATES.set(candidates if presentation_metadata is not None else None)
+    try:
+        result = _sanitize_user_visible_reply(user_message=user_message, reply=reply,
+            tool_results=tool_results, requested_sections=requested_sections, source=source)
+        if presentation_metadata is not None:
+            results = _coerce_tool_results(tool_results)
+            for kind, candidate in reversed(candidates):
+                visible = _sanitize_reply_style(_sanitize_local_paths(candidate))
+                prefixed = _sanitize_reply_style(
+                    _sanitize_local_paths(_strip_leading_tool_status_paragraph(
+                        _prefix_account_tool_reply(candidate, results), results)),
+                    account_tool_family=_primary_account_tool_family(results),
+                )
+                if result and result in {visible, prefixed}:
+                    presentation_metadata.update(kind=kind, fulfillment_satisfied=False)
+                    break
+        return result
+    finally:
+        _PRESENTATION_CANDIDATES.reset(token)
+
+
+def _sanitize_user_visible_reply(
     *,
     user_message: str | None,
     reply: str | None,
@@ -237,7 +279,7 @@ def sanitize_user_visible_reply(
         browser_results,
         user_message=user_message,
     ):
-        return _sanitize_local_paths(structured_evidence_reply)
+        return _source_presentation(_sanitize_local_paths(structured_evidence_reply))
     if web_search_reply := _web_search_reply_over_ignored_results(
         raw,
         browser_results,
@@ -8687,6 +8729,10 @@ def _structured_internal_tool_state_reply(
 
 
 def _account_tool_summary(results: list[ToolResult], *, user_message: str | None = None) -> str | None:
+    return _source_presentation(_build_account_tool_summary(results, user_message=user_message))
+
+
+def _build_account_tool_summary(results: list[ToolResult], *, user_message: str | None = None) -> str | None:
     primary_family: str | None = None
     for result in results:
         if result.status != "completed" or not isinstance(result.output, dict):
@@ -8944,7 +8990,7 @@ def _email_read_summary(output: Mapping[str, Any]) -> str:
     if snippet:
         lines.append("")
         lines.append(f"Preview: {snippet[:360].rstrip()}")
-    return "\n".join(lines).strip()
+    return _source_presentation("\n".join(lines).strip(), "source_preview")
 
 
 def _email_attachment_read_summary(output: Mapping[str, Any]) -> str:
