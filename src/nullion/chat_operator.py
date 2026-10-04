@@ -2731,7 +2731,7 @@ def _resume_turn_from_snapshot(
                 )
             return _turn_limit_continuation_persistence_failure()
     elif getattr(result, "response_fulfilled", None) is False:
-        result_reply, result_outcome = _unfulfilled_turn_reply()
+        result_reply, result_outcome = _unfulfilled_turn_reply(result)
     resumed_reply = _append_chat_artifacts_to_reply(
         runtime,
         reply=result_reply,
@@ -2751,7 +2751,7 @@ def _resume_turn_from_snapshot(
         principal_id=principal_id,
     )
     if getattr(result, "response_fulfilled", None) is False:
-        resumed_reply, result_outcome = _unfulfilled_turn_reply()
+        resumed_reply, result_outcome = _unfulfilled_turn_reply(result)
     return (
         append_activity_trace_to_reply(
             resumed_reply,
@@ -3906,6 +3906,21 @@ def _conversation_context_turns(
         # follow-ups without asking the user to repeat themselves.
         return list(thread[-_MAX_CHAT_TURNS:])
     return []
+
+
+def _conversation_parent_is_visible(
+    runtime: PersistentRuntime,
+    conversation_result: object,
+    thread: list[dict[str, str]],
+) -> bool:
+    parent_id = getattr(getattr(conversation_result, "turn", None), "parent_turn_id", None)
+    get_turn = getattr(runtime.store, "get_conversation_turn", None)
+    if not parent_id or not callable(get_turn):
+        return False
+    parent = get_turn(parent_id)
+    if parent is None:
+        return False
+    return any(past.get("user") == parent.user_message for past in thread)
 
 
 def _automatic_saved_chat_history_prompt(
@@ -6287,7 +6302,11 @@ def _run_chat_turn_no_tool_scope_decision_retry(
             )
             decision = build_turn_tool_scope_decision(
                 model_client=scope_model_client,
-                user_message=user_message,
+                user_message=(
+                    _scope_retry_user_message_with_visible_context(user_message, base_history)
+                    if bool(getattr(evidence, "context_linked", False))
+                    else user_message
+                ),
                 evidence=evidence,
                 registry=registry_for_lookup,
                 force_model_decision=True,
@@ -7983,16 +8002,6 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
     )
     if not available_mutation_tool_names:
         return initial_result, active_tool_registry, False
-    scheduler_decision_tool_names = tuple(
-        name
-        for name in sorted(available_tool_names)
-        if name in _SCHEDULER_MUTATION_RETRY_TOOLS
-        or name in {"list_crons", "list_reminders"}
-    )
-    scheduler_decision_registry = _ToolRegistryAllowedNames(
-        _ToolRegistryWithoutRequestScope(registry_for_lookup),
-        allowed_tool_names=scheduler_decision_tool_names,
-    )
     if any(_turn_result_used_tool(initial_result, name) for name in available_mutation_tool_names):
         return initial_result, active_tool_registry, False
     if getattr(initial_result, "artifacts", None):
@@ -8009,10 +8018,8 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
         action="mutate",
         available_tool_names=available_tool_names,
     )
-    scheduler_read_only_attempt = (
-        existing_decision is not None
-        and _turn_result_used_only_scheduler_read_tools(initial_result)
-    )
+    if existing_decision is None and not _turn_result_used_only_scheduler_read_tools(initial_result):
+        return initial_result, active_tool_registry, False
     scheduler_read_only_scope_candidate = (
         existing_decision is None
         and _turn_result_used_only_scheduler_read_tools(initial_result)
@@ -8021,22 +8028,9 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
         scheduler_read_only_scope_candidate
         and _turn_result_reports_unfulfilled_capability(initial_result)
     )
-    scheduler_setup_clarification_attempt = (
-        _turn_result_has_no_tool_progress(initial_result)
-        and _turn_result_reports_scheduler_setup_clarification(initial_result, registry=registry_for_lookup)
-    )
-    scheduler_no_tool_unfulfilled_attempt = (
-        _turn_result_has_no_tool_progress(initial_result)
-        and _turn_result_reports_unfulfilled_capability(initial_result)
-    )
     if not (
-        context_only_attempt
-        or scheduler_read_only_attempt
-        or scheduler_read_only_scope_candidate
-        or scheduler_read_only_unfulfilled_attempt
-        or scheduler_setup_clarification_attempt
-        or scheduler_no_tool_unfulfilled_attempt
-        or (existing_decision is not None and _turn_result_has_no_tool_progress(initial_result))
+        _turn_result_used_only_scheduler_read_tools(initial_result)
+        or (existing_decision is not None and (context_only_attempt or _turn_result_has_no_tool_progress(initial_result)))
     ):
         return initial_result, active_tool_registry, False
 
@@ -8049,7 +8043,7 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
                 model_client=model_client,
                 user_message=_scope_retry_user_message_with_visible_context(user_message, base_history),
                 evidence=evidence,
-                registry=scheduler_decision_registry,
+                registry=registry_for_lookup,
                 force_model_decision=True,
                 assistant_no_tool_draft=assistant_no_tool_draft,
             )
@@ -8075,36 +8069,19 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
     if (
         scheduler_action != "mutate"
         and not requested_mutation_tool_names
-        and (
-            scheduler_read_only_scope_candidate
-            or scheduler_read_only_unfulfilled_attempt
-            or scheduler_setup_clarification_attempt
-            or scheduler_no_tool_unfulfilled_attempt
-        )
+        and scheduler_read_only_scope_candidate
     ):
-        recovery_user_message = (
-            _scheduler_read_only_recovery_user_message(
-                user_message,
-                initial_result,
-                available_mutation_tool_names=available_mutation_tool_names,
-            )
-            if scheduler_read_only_scope_candidate or scheduler_read_only_unfulfilled_attempt
-            else (
-                "Scheduler mutation recovery classifier.\n"
-                "The previous assistant draft did not use any scheduler mutation tool.\n"
-                "Return a structured scheduler mutation decision only if the current user turn requires existing "
-                "scheduler objects to end in a different enabled/disabled/active/inactive state. Otherwise return "
-                "inspect or none.\n\n"
-                "Current user turn:\n"
-                f"{str(user_message or '').strip()}"
-            )
+        recovery_user_message = _scheduler_read_only_recovery_user_message(
+            _scope_retry_user_message_with_visible_context(user_message, base_history),
+            initial_result,
+            available_mutation_tool_names=available_mutation_tool_names,
         )
         try:
             recovery_decision = build_turn_tool_scope_decision(
                 model_client=model_client,
                 user_message=recovery_user_message,
                 evidence=evidence,
-                registry=scheduler_decision_registry,
+                registry=registry_for_lookup,
                 force_model_decision=True,
                 assistant_no_tool_draft=assistant_no_tool_draft,
             )
@@ -12037,6 +12014,26 @@ def _run_chat_turn_common_retries(
     def _mark(name: str) -> Callable[[], None]:
         return (lambda: mark_retry(name)) if mark_retry is not None else (lambda: None)
 
+    scheduler_mutation_recovery_states: set[tuple[object, ...]] = set()
+
+    def _scheduler_mutation_recovery_may_run() -> bool:
+        if retried_scheduler_mutation_fallback:
+            return False
+        # A rejected scope decision is also an attempted recovery. Reconsider
+        # only after new structured scope or tool evidence arrives.
+        recovery_state = (
+            id(getattr(tool_registry, "turn_tool_scope_decision", None)),
+            id(getattr(base_tool_registry, "turn_tool_scope_decision", None)),
+            tuple(
+                (getattr(item, "invocation_id", None), _tool_result_name(item), _tool_result_status(item))
+                for item in list(getattr(result, "tool_results", None) or [])
+            ),
+        )
+        if recovery_state in scheduler_mutation_recovery_states:
+            return False
+        scheduler_mutation_recovery_states.add(recovery_state)
+        return True
+
     def _completed_requested_artifact_ready() -> bool:
         return any(
             _turn_result_has_completed_requested_artifact(result, registry)
@@ -12109,18 +12106,19 @@ def _run_chat_turn_common_retries(
             return _current_retry_result()
         if _turn_result_used_any_scheduler_action_tool(result):
             return _current_retry_result()
-        result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
-            initial_result=result,
-            base_history=base_history,
-            active_tool_registry=tool_registry,
-            base_tool_registry=base_tool_registry,
-            model_client=model_client,
-            user_message=user_message,
-            evidence=evidence,
-            run_turn=run_turn,
-            mark_retry=_mark("scheduler_mutation_fallback_retry"),
-            principal_id=principal_id,
-        )
+        if _scheduler_mutation_recovery_may_run():
+            result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+                initial_result=result,
+                base_history=base_history,
+                active_tool_registry=tool_registry,
+                base_tool_registry=base_tool_registry,
+                model_client=model_client,
+                user_message=user_message,
+                evidence=evidence,
+                run_turn=run_turn,
+                mark_retry=_mark("scheduler_mutation_fallback_retry"),
+                principal_id=principal_id,
+            )
         if _completed_requested_artifact_ready():
             return _current_retry_result()
         if _turn_result_used_any_scheduler_action_tool(result):
@@ -12180,18 +12178,19 @@ def _run_chat_turn_common_retries(
         if registry is not None
     ):
         return _current_retry_result()
-    result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
-        initial_result=result,
-        base_history=base_history,
-        active_tool_registry=tool_registry,
-        base_tool_registry=base_tool_registry,
-        model_client=model_client,
-        user_message=user_message,
-        evidence=evidence,
-        run_turn=run_turn,
-        mark_retry=_mark("scheduler_mutation_fallback_retry"),
-        principal_id=principal_id,
-    )
+    if _scheduler_mutation_recovery_may_run():
+        result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+            initial_result=result,
+            base_history=base_history,
+            active_tool_registry=tool_registry,
+            base_tool_registry=base_tool_registry,
+            model_client=model_client,
+            user_message=user_message,
+            evidence=evidence,
+            run_turn=run_turn,
+            mark_retry=_mark("scheduler_mutation_fallback_retry"),
+            principal_id=principal_id,
+        )
     if _completed_requested_artifact_ready():
         return _current_retry_result()
     if _turn_result_used_any_scheduler_action_tool(result):
@@ -12231,18 +12230,19 @@ def _run_chat_turn_common_retries(
         if registry is not None
     ):
         return _current_retry_result()
-    result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
-        initial_result=result,
-        base_history=base_history,
-        active_tool_registry=tool_registry,
-        base_tool_registry=base_tool_registry,
-        model_client=model_client,
-        user_message=user_message,
-        evidence=evidence,
-        run_turn=run_turn,
-        mark_retry=_mark("scheduler_mutation_fallback_retry"),
-        principal_id=principal_id,
-    )
+    if _scheduler_mutation_recovery_may_run():
+        result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+            initial_result=result,
+            base_history=base_history,
+            active_tool_registry=tool_registry,
+            base_tool_registry=base_tool_registry,
+            model_client=model_client,
+            user_message=user_message,
+            evidence=evidence,
+            run_turn=run_turn,
+            mark_retry=_mark("scheduler_mutation_fallback_retry"),
+            principal_id=principal_id,
+        )
     if _completed_requested_artifact_ready():
         return _current_retry_result()
     if _turn_result_used_any_scheduler_action_tool(result):
@@ -12369,18 +12369,19 @@ def _run_chat_turn_common_retries(
         user_message=user_message,
     ):
         return _current_retry_result()
-    result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
-        initial_result=result,
-        base_history=base_history,
-        active_tool_registry=tool_registry,
-        base_tool_registry=base_tool_registry,
-        model_client=model_client,
-        user_message=user_message,
-        evidence=evidence,
-        run_turn=run_turn,
-        mark_retry=_mark("scheduler_mutation_fallback_retry"),
-        principal_id=principal_id,
-    )
+    if _scheduler_mutation_recovery_may_run():
+        result, tool_registry, retried_scheduler_mutation_fallback = _run_chat_turn_scheduler_mutation_fallback_retry(
+            initial_result=result,
+            base_history=base_history,
+            active_tool_registry=tool_registry,
+            base_tool_registry=base_tool_registry,
+            model_client=model_client,
+            user_message=user_message,
+            evidence=evidence,
+            run_turn=run_turn,
+            mark_retry=_mark("scheduler_mutation_fallback_retry"),
+            principal_id=principal_id,
+        )
     if _completed_requested_artifact_ready():
         return _current_retry_result()
     if _scheduler_common_retries_may_bypass(
@@ -14408,10 +14409,13 @@ def _turn_limit_continuation_persistence_failure() -> tuple[str, TurnOutcome]:
     )
 
 
-def _unfulfilled_turn_reply() -> tuple[str, TurnOutcome]:
+def _unfulfilled_turn_reply(result: object | None = None) -> tuple[str, TurnOutcome]:
+    # Only the structured terminal failure is safe to retain. An unfulfilled
+    # model draft may still claim success or contain an unrelated tool payload.
+    failure_reply = getattr(result, "completion_failure_reply", None)
     return (
-        "I don't have enough verified evidence to give you a reliable answer yet. "
-        "The task is still open.",
+        failure_reply if isinstance(failure_reply, str) and failure_reply.strip()
+        else "I couldn’t finish this request. No usable result was produced.",
         TurnOutcome.PARTIAL,
     )
 
@@ -22269,13 +22273,15 @@ def _append_runtime_nudges(
     prompt: str,
     reply: str,
     conversation_id: str | None = None,
+    outcome: TurnOutcome | None = None,
 ) -> str:
-    reply = _last_mile_artifact_fulfillment_reply(
-        runtime,
-        prompt=prompt,
-        reply=reply,
-        conversation_id=conversation_id,
-    )
+    if outcome is not TurnOutcome.PARTIAL:
+        reply = _last_mile_artifact_fulfillment_reply(
+            runtime,
+            prompt=prompt,
+            reply=reply,
+            conversation_id=conversation_id,
+        )
     _pop_learned_skills_notification(runtime, conversation_id=conversation_id)
     return reply
 
@@ -24102,7 +24108,8 @@ def _render_chat_turn(
                 numbered_option_context=numbered_option_context,
                 has_prior_context=bool(previous_assistant_message or thread),
             )
-            if explicit_chat_command or bool(getattr(turn_tool_evidence, "slash_prefixed_literal", False)):
+            parent_context_visible = _conversation_parent_is_visible(runtime, conversation_result, thread)
+            if parent_context_visible or explicit_chat_command or bool(getattr(turn_tool_evidence, "slash_prefixed_literal", False)):
                 compact_followup_guard = None
             if compact_followup_guard and _registry_has_exact_current_context_tool_scope(active_turn_tool_registry):
                 compact_followup_guard = None
@@ -24114,7 +24121,8 @@ def _render_chat_turn(
             if durable_tool_context_recovery:
                 compact_followup_guard = None
             compact_clarification_history_candidate = (
-                (
+                not parent_context_visible
+                and (
                     turn_is_context_linked(conversation_result)
                     or _assistant_reply_has_numbered_choice_prompt(previous_assistant_message)
                 )
@@ -24175,11 +24183,11 @@ def _render_chat_turn(
                 numbered_option_context=numbered_option_context,
                 requested_extensions=requested_attachment_extensions,
             )
-            if explicit_reply_anchor:
+            if explicit_reply_anchor or parent_context_visible:
                 auto_include_saved_history = False
             if compact_clarification_history_context:
                 auto_include_saved_history = True
-            if durable_tool_context_recovery and not explicit_reply_anchor:
+            if durable_tool_context_recovery and not explicit_reply_anchor and not parent_context_visible:
                 auto_include_saved_history = True
             automatic_history_context = (
                 _automatic_saved_chat_history_prompt(
@@ -24911,7 +24919,7 @@ def _render_chat_turn(
                         else:
                             reply, turn_outcome = _turn_limit_continuation_persistence_failure()
                 elif getattr(turn_result, "response_fulfilled", None) is False:
-                    reply, turn_outcome = _unfulfilled_turn_reply()
+                    reply, turn_outcome = _unfulfilled_turn_reply(turn_result)
                 elif turn_result.suspended_for_approval:
                     reply, _turn_approval_live = _approval_marker_reply_for_turn_result(
                         runtime,
@@ -25702,7 +25710,7 @@ def _render_chat_turn(
                 and getattr(locals().get("turn_result"), "response_fulfilled", None) is False
                 and not getattr(locals().get("turn_result"), "reached_iteration_limit", False)
             ):
-                reply, turn_outcome = _unfulfilled_turn_reply()
+                reply, turn_outcome = _unfulfilled_turn_reply(locals().get("turn_result"))
             visible_reply = append_activity_trace_to_reply(
                 reply,
                 tool_results=activity_tool_results,
@@ -25804,7 +25812,9 @@ def _render_chat_turn(
                     logger.debug("Unable to checkpoint conversation events after chat turn", exc_info=True)
             if suppress_runtime_nudges:
                 return visible_reply
-            nudged_reply = _append_runtime_nudges(runtime, prompt=prompt, reply=visible_reply, conversation_id=conversation_id)
+            nudged_reply = _append_runtime_nudges(
+                runtime, prompt=prompt, reply=visible_reply, conversation_id=conversation_id, outcome=turn_outcome,
+            )
             if getattr(visible_reply, "reply_already_sent", False) and nudged_reply == str(visible_reply):
                 return visible_reply
             return nudged_reply

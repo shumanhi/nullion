@@ -5575,7 +5575,7 @@ def _completion_review_open_task_reply(decision: _CompletionReviewDecision) -> s
             "1. Approve the pending action.\n"
             "2. Cancel it."
         )
-    return f"I couldn't fully complete this yet because {requirements}. The task is still open."
+    return f"I couldn't complete this request because {requirements}."
 
 
 def _missing_artifact_delivery_nudge(missing_requirements: tuple[str, ...]) -> str:
@@ -8221,6 +8221,7 @@ class TurnResult:
     required_artifact_extensions: list[str] = field(default_factory=list)
     response_presentation: dict[str, object] = field(default_factory=dict)
     messages_snapshot: list[dict[str, Any]] = field(default_factory=list)
+    completion_failure_reply: str | None = None
 
 
 @dataclass(slots=True)
@@ -8852,6 +8853,7 @@ def _complete_agent_turn(
     raw_tool_payload_blocked: bool = False,
     response_fulfilled: bool | None = None,
     model_timed_out: bool = False,
+    completion_failure_reply: str | None = None,
 ) -> dict[str, object]:
     if response_fulfilled is not True and _completion_review_required(
         state,
@@ -8866,6 +8868,7 @@ def _complete_agent_turn(
     )
     if missing_scope_action and not suspended_for_approval:
         final_text = _missing_scope_action_final_reply(missing_scope_action)
+        completion_failure_reply = final_text
         response_fulfilled = False
     capture_fulfilled = bool(
         completed_capture_paths(getattr(tool_registry, "turn_tool_scope_decision", None), state.get("tool_results"))
@@ -8898,6 +8901,7 @@ def _complete_agent_turn(
             reached_iteration_limit=reached_iteration_limit,
             raw_tool_payload_blocked=raw_tool_payload_blocked,
             response_fulfilled=response_fulfilled,
+            completion_failure_reply=completion_failure_reply if response_fulfilled is False else None,
             model_timed_out=model_timed_out,
             artifact_delivery_required=artifact_delivery_required,
             artifact_delivery_satisfied=artifact_delivery_satisfied,
@@ -10015,6 +10019,7 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
             final_text=final_text,
             reached_iteration_limit=True,
             response_fulfilled=response_fulfilled,
+            completion_failure_reply=final_text if response_fulfilled is False else None,
         )
     iterations += 1
     tool_registry = state["tool_registry"]
@@ -10145,13 +10150,15 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
                     for requirement in (state.get("completion_review_unresolved_requirements") or ())
                     if str(requirement or "").strip()
                 ) or ("the current run reached its time limit before I could verify the requested outcome",)
+                timeout_failure_reply = _completion_review_open_task_reply(
+                    _CompletionReviewDecision("blocked", unresolved)
+                )
                 return _complete_agent_turn(
                     state,
-                    final_text=_completion_review_open_task_reply(
-                        _CompletionReviewDecision("blocked", unresolved)
-                    ),
+                    final_text=timeout_failure_reply,
                     response_fulfilled=False,
                     model_timed_out=True,
+                    completion_failure_reply=timeout_failure_reply,
                 )
     assert isinstance(response, dict)
     model_duration_ms = (time.perf_counter() - model_started_at) * 1000
@@ -10602,6 +10609,7 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         final_text=final_text,
         raw_tool_payload_blocked=raw_payload_like,
         response_fulfilled=response_fulfilled,
+        completion_failure_reply=final_text if completion_review is not None and response_fulfilled is False else None,
     )
 
 
