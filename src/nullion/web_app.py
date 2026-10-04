@@ -19929,6 +19929,10 @@ def _store_web_agent_turn_limit_extension_approval(
             ),
         )
         store.add_approval_request(approval)
+        resume_token = build_agent_turn_limit_resume_token(current_max_iterations=current_max_iterations)
+        head = store.get_conversation_head(conversation_id)
+        if head and head.get("active_turn_id"):
+            resume_token["conversation_turn_id"] = head["active_turn_id"]
         store.add_suspended_turn(
             SuspendedTurn(
                 approval_id=approval.approval_id,
@@ -19943,7 +19947,7 @@ def _store_web_agent_turn_limit_extension_approval(
                 messages_snapshot=messages_snapshot
                 or [{"role": "user", "content": [{"type": "text", "text": user_text}]}],
                 pending_tool_calls=[],
-                resume_token=build_agent_turn_limit_resume_token(current_max_iterations=current_max_iterations),
+                resume_token=resume_token,
             )
         )
         try:
@@ -30775,9 +30779,11 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             "artifacts": artifacts,
         }
 
-    user_text = _last_user_text_from_snapshot(suspended_turn.messages_snapshot)
+    # The snapshot can end with a runtime recovery instruction in a user-role
+    # message. The suspended request is the durable source of the user's intent.
+    user_text = str(suspended_turn.message or "").removeprefix("/chat ").strip()
     if not user_text:
-        user_text = str(suspended_turn.message or "").removeprefix("/chat ").strip()
+        user_text = _last_user_text_from_snapshot(suspended_turn.messages_snapshot)
     if not user_text:
         return None
 
@@ -30991,7 +30997,8 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         )
         if local_discovery_reply:
             final_text = local_discovery_reply
-    conversation_turn_id = getattr(result, "turn_id", None)
+    resume_token = getattr(suspended_turn, "resume_token", None) or {}
+    conversation_turn_id = resume_token.get("conversation_turn_id") or getattr(result, "turn_id", None)
     if not isinstance(conversation_turn_id, str) or not conversation_turn_id.strip():
         conversation_turn_id = _last_web_conversation_turn_id(runtime, conversation_id=conversation_id)
     _remember_web_chat_turn(
