@@ -51,7 +51,7 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Optional search text. Leave empty to return the most recent saved turns.",
+                "description": "Optional focused topic or phrase from the earlier user message. Avoid combining generic action verbs into a broad query. Leave empty to return the most recent saved turns.",
             },
             "limit": {
                 "type": "integer",
@@ -734,21 +734,23 @@ def _ranked_history_events(
         event["_history_context"] = context
         selected_by_index[index] = event
 
-    for score, index, event in scored:
-        selected_event = dict(event)
-        selected_event["_history_match_score"] = score
-        existing_current = selected_by_index.get(index)
-        existing_current_score = existing_current.get("_history_match_score") if existing_current else None
-        if not isinstance(existing_current_score, int) or existing_current_score <= score:
-            selected_by_index[index] = selected_event
+    # Direct matches have priority over nearby context. Previously one match's
+    # neighbours filled the limit before older direct evidence was considered.
+    for score, index, event in scored[:limit]:
+        selected_by_index[index] = {**event, "_history_match_score": score}
+    for score, index, _event in scored[:limit]:
+        if len(selected_by_index) >= limit:
+            break
         for offset in range(1, _MATCH_CONTEXT_PREVIOUS_TURNS + 1):
+            if len(selected_by_index) >= limit:
+                break
             context = "previous_turn" if offset == 1 else f"previous_turn_{offset}"
             _select_context_event(index - offset, score=score, context=context)
         for offset in range(1, _MATCH_CONTEXT_FOLLOWING_TURNS + 1):
+            if len(selected_by_index) >= limit:
+                break
             context = "following_turn" if offset == 1 else f"following_turn_{offset}"
             _select_context_event(index + offset, score=score, context=context)
-        if len(selected_by_index) >= limit:
-            break
     selected = list(selected_by_index.values())
     selected.sort(
         key=lambda event: (
@@ -868,20 +870,13 @@ def _chat_history_search_result(
         query=query,
         limit=min(_MAX_HISTORY_RETURN_LIMIT, max(limit, 12)),
     )
+    # Structured references are supplemental evidence. Keep plain direct
+    # matches too; only drop unrelated surrounding context when a structured
+    # candidate is present, so its tool payload cannot contaminate the answer.
     if query and structured_selected:
-        structured_identities = {
-            _history_event_identity(event)
-            for event in structured_selected
-        }
-        selected = [
-            event
-            for event in selected
-            if _history_event_identity(event) in structured_identities
-        ]
-        if not selected:
-            selected = structured_selected[:limit]
-        else:
-            selected = selected[:limit]
+        structured_identities = {_history_event_identity(event) for event in structured_selected}
+        selected = [event for event in selected if not event.get("_history_context")
+                    or _history_event_identity(event) in structured_identities]
     records = [_event_record(event, index=index) for index, event in enumerate(selected, start=1)]
     structured_records = [
         _event_record(event, index=index)
@@ -921,10 +916,12 @@ class ConversationHistoryToolRegistry:
         conversation_id: str,
         workspace_id: str | None = None,
     ) -> None:
-        self._delegate = delegate
+        from nullion.personal_tasks import PersonalTaskToolRegistry
+
         self._runtime = runtime
         self._conversation_id = conversation_id
         self._workspace_id = str(workspace_id or _workspace_id_for_conversation(conversation_id)).strip()
+        self._delegate = PersonalTaskToolRegistry(delegate, runtime=runtime, workspace_id=self._workspace_id)
 
     def get_spec(self, name: str):
         if name == CHAT_HISTORY_SEARCH_TOOL_NAME:

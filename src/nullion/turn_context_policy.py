@@ -153,6 +153,7 @@ _SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES = frozenset(
         "file_write",
         "image_generate",
         "pdf_create",
+        "personal_task_save",
         "pdf_edit",
         "presentation_create",
         "run_cron",
@@ -182,6 +183,7 @@ _SCOPE_SOURCE_REQUIRED_TOOL_CANDIDATES = frozenset(
         "file_read",
         "file_search",
         "market_quote",
+        "personal_tasks_list",
         "weather_forecast",
         "web_fetch",
         "workspace_summary",
@@ -260,11 +262,13 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "request scheduler_run, not scheduler_read. Use scheduler_selection_policy=\"user_selected\" when the "
         "task id, number, name, or linked task state is already identified; use \"delegate_one\" only when the "
         "agent should choose exactly one eligible task from structured list_crons output. "
+        "Use personal_tasks for the persistent personal task list. Include personal_task_save explicitly only "
+        "for a user-authorized addition, edit, completion, archival, or restoration. "
         "Use conversation_history for saved turns in the current chat that are older "
         "than the visible prompt context. Use web for public websites, live public lookups, and public source data "
         "that will be written into a local artifact such as CSV, HTML, PDF, DOCX, or XLSX. Use skill_pack only "
         "when detailed installed-pack reference docs are needed. Capabilities: web, "
-        "scheduler_read, scheduler_run, scheduler_mutate, connector, skill_pack, conversation_history, weather, "
+        "scheduler_read, scheduler_run, scheduler_mutate, connector, skill_pack, conversation_history, personal_tasks, weather, "
         "market_data, "
         "image_generation, local_files, local_shell. "
         "When scheduler_run should run exactly one eligible scheduled task chosen from structured list_crons output, "
@@ -289,7 +293,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "source metadata and safe structured read tools unless tool_names names exact structured "
                     "account tools; "
                     "scheduler_read/run/mutate exposes Nullion cron/reminder "
-                    "tools only; conversation_history exposes saved turns in the current chat; "
+                    "tools only; personal_tasks exposes the durable task list; conversation_history exposes saved turns in the current chat; "
                 "web exposes public web/browser tools; browser is accepted as an alias for web; skill_pack exposes exact "
                     "installed skill-pack docs; weather, market_data, and image_generation expose their direct tools; "
                     "local_files exposes structured local file read/search tools by default and write/artifact "
@@ -307,6 +311,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "connector",
                         "skill_pack",
                         "conversation_history",
+                        "personal_tasks",
                         "weather",
                         "market_data",
                         "image_generation",
@@ -498,7 +503,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
     capability_tags=("scope_request",),
 )
 _KNOWN_PRIOR_TOOL_SCOPES = frozenset(
-    {"connector", "conversation_history", "scheduler", "scheduler_mutate", "scheduler_read", "scheduler_run", "skill_pack", "web"}
+    {"connector", "conversation_history", "scheduler", "scheduler_mutate", "scheduler_read", "scheduler_run", "skill_pack", "personal_tasks", "web"}
 )
 _WEB_ACTIONS = frozenset({"none", "open_url", "live_research", "browser_interaction"})
 _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
@@ -615,6 +620,8 @@ def _exact_scope_tools_for_capability(capability: str, tool_names: Iterable[str]
         capability_tools = _SKILL_PACK_TOOLS
     elif capability == "conversation_history":
         capability_tools = _CONVERSATION_HISTORY_TOOLS
+    elif capability == "personal_tasks":
+        capability_tools = frozenset({"personal_tasks_list", "personal_task_save"})
     elif capability == "weather":
         capability_tools = frozenset({"weather_forecast"})
     elif capability == "market_data":
@@ -1072,6 +1079,8 @@ class ScopedTurnToolRegistry:
         existing_named_extensions = set(self._evidence.existing_named_artifact_extensions)
         if tool_name == _SCOPE_REQUEST_TOOL_NAME:
             return True
+        if tool_name in {"personal_tasks_list", "personal_task_save"}:
+            return tool_name in self.turn_tool_scope_decision.requested_tool_names
         if self._artifact_scheduler_scope_is_ambiguous():
             return False
         if existing_named_extensions and not self._evidence.existing_named_artifact_requires_new_content:
@@ -1552,6 +1561,8 @@ class ScopedTurnToolRegistry:
                 requested.extend(sorted(_SKILL_PACK_TOOLS))
             elif capability == "conversation_history":
                 requested.extend(sorted(_CONVERSATION_HISTORY_TOOLS))
+            elif capability == "personal_tasks":
+                requested.append("personal_tasks_list")
             elif capability == "weather":
                 requested.append("weather_forecast")
             elif capability == "market_data":
@@ -3785,6 +3796,8 @@ def build_turn_tool_scope_decision(
         available_special_tool_scopes.append("connector_gateway")
     if registered_special_tool_names.intersection(_CONVERSATION_HISTORY_TOOLS):
         available_special_tool_scopes.append("conversation_history")
+    if registered_special_tool_names.intersection({"personal_tasks_list", "personal_task_save"}):
+        available_special_tool_scopes.append("personal_tasks")
     if "weather_forecast" in registered_special_tool_names:
         available_special_tool_scopes.append("weather")
     if "market_quote" in registered_special_tool_names:
@@ -4306,6 +4319,10 @@ def turn_tool_registry_for_evidence(
                         valid=True,
                     ),
                 )
+            if any("personal_tasks" in getattr(spec, "capability_tags", ()) for spec in registry.list_specs()):
+                # Built-in persistent tasks must be discoverable on a first turn.
+                # Expose only the scope request; do not classify or read task data.
+                return ScopedTurnToolRegistry(registry, evidence=evidence)
             return PlainNoToolFastPathRegistry(registry)
         if _registry_has_scoped_special_tools(registry):
             return scoped_turn_tool_registry(

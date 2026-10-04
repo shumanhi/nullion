@@ -21,7 +21,7 @@ from nullion.artifacts import artifact_path_for_generated_workspace_file, path_i
 from nullion.plugins.browser_plugin.browser_config import DEFAULT_AGENT_BROWSER_SESSION_ID
 from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy, BrowserPolicyViolation
 from nullion.plugins.browser_plugin.browser_session import BrowserBackend, BrowserScreenshotResult, BrowserSessionPool
-from nullion.tools import ToolInvocation, ToolResult
+from nullion.tools import ToolInvocation, ToolResult, tool_execution_remaining_seconds
 from nullion.workspace_storage import workspace_storage_roots_for_principal
 
 
@@ -4053,7 +4053,8 @@ def _run(coro) -> Any:
         loop = _ensure_browser_loop()
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         try:
-            return future.result(timeout=60)
+            remaining = tool_execution_remaining_seconds()
+            return future.result(timeout=min(60.0, remaining) if remaining is not None else 60.0)
         except Exception:
             future.cancel()
             raise
@@ -4106,10 +4107,22 @@ def _serialized_browser_operation(method):
             self._resolved_session_local.by_invocation = resolved
         invocation_key = id(invocation)
         resolved[invocation_key] = session_id
+        lock = self._session_operation_lock(session_id)
+        remaining = tool_execution_remaining_seconds()
+        acquired = lock.acquire(timeout=remaining) if remaining is not None else lock.acquire()
         try:
-            with self._session_operation_lock(session_id):
-                return method(self, invocation, *args, **kwargs)
+            if not acquired:
+                return _fail(invocation, "Browser operation timed out waiting for the session.",
+                             {"reason": "handler_timeout", "session_id": session_id})
+            result = method(self, invocation, *args, **kwargs)
+            remaining = tool_execution_remaining_seconds()
+            if result.status == "failed" and remaining is not None and remaining <= 0:
+                return _fail(invocation, "Browser operation timed out.",
+                             {"reason": "handler_timeout", "session_id": session_id})
+            return result
         finally:
+            if acquired:
+                lock.release()
             resolved.pop(invocation_key, None)
 
     return _wrapped

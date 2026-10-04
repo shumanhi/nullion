@@ -10,7 +10,7 @@ AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND = "agent_turn_limit_extension"
 AGENT_TURN_LIMIT_EXTENSION_ACTION = "extend_agent_turn_limit"
 AGENT_TURN_LIMIT_EXTENSION_TOOL_NAME = "doctor_extend_agent_turn_limit"
 AGENT_TURN_LIMIT_EXTENSION_MULTIPLIERS = (2, 5, 10)
-DEFAULT_AGENT_TURN_MAX_ITERATIONS = 24
+DEFAULT_AGENT_TURN_MAX_ITERATIONS = 48
 
 
 def default_agent_turn_max_iterations() -> int:
@@ -19,7 +19,7 @@ def default_agent_turn_max_iterations() -> int:
         limit = int(raw_value)
     except ValueError:
         return DEFAULT_AGENT_TURN_MAX_ITERATIONS
-    return min(40, max(1, limit))
+    return min(96, max(1, limit))
 
 
 def limit_extension_mode_for_multiplier(multiplier: int) -> str:

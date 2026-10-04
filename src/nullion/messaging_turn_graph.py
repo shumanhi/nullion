@@ -1429,6 +1429,8 @@ def _latest_stored_turn_delivery_evidence(
 _ATTACHMENT_FAILURE_TEXTS = {
     "I couldn't attach the requested file. The task is still open.",
     "I couldn't attach all of the requested files. The task is still open.",
+    "I couldn't attach the requested file.",
+    "I couldn't attach all of the requested files.",
 }
 
 

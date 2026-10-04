@@ -1722,6 +1722,8 @@ def _reply_is_internal_missing_tool_scope_leak(reply: str) -> bool:
 def _reply_is_artifact_attachment_failure_reply(reply: str) -> bool:
     text = _text_from_value(reply).strip()
     return text in {
+        "I couldn't attach the requested file.",
+        "I couldn't attach all of the requested files.",
         "I couldn't attach the requested file. The task is still open.",
         "I couldn't attach all of the requested files. The task is still open.",
     }
@@ -1847,6 +1849,25 @@ def _reply_is_failed_artifact_producer_setup_reply(
         if setup_reply and normalized_text == setup_reply.rstrip("."):
             return True
     return False
+
+
+def operation_failure_reply(tool_results: Iterable[ToolResult]) -> str:
+    """Explain typed failures without leaking provider payloads or promising a retry."""
+    failures = [result for result in tool_results if normalize_tool_status(result.status) in {"failed", "denied"}]
+    browser_failures = [result for result in failures if result.tool_name.startswith("browser_")]
+    if browser_failures:
+        reasons = {result.output.get("reason") for result in browser_failures
+                   if isinstance(result.output, dict) and isinstance(result.output.get("reason"), str)}
+        if "handler_timeout" in reasons:
+            return "I couldn't finish because a browser step timed out. The requested result wasn't confirmed."
+        if "browser_action_failed" in reasons:
+            return "I couldn't finish because the page interaction failed. The requested result wasn't confirmed."
+        return "I couldn't finish because the browser operation failed. The requested result wasn't confirmed."
+    if any(result.status == "denied" for result in failures):
+        return "I couldn't complete the request because the required action wasn't authorized."
+    if failures:
+        return "I couldn't complete the request because a required step failed."
+    return "I couldn't complete the request because a required step didn't run."
 
 
 def evaluate_response_fulfillment(
@@ -2062,12 +2083,12 @@ def evaluate_response_fulfillment(
         attachment_missing = bool(missing_attachments)
         if attachment_missing:
             response = (
-                "I couldn't attach all of the requested files. The task is still open."
+                "I couldn't attach all of the requested files."
                 if existing_deliverables and (len(missing_attachments) > 1 or len(explicit_required_extensions) > 1)
-                else "I couldn't attach the requested file. The task is still open."
+                else "I couldn't attach the requested file."
             )
         elif attempted_tool_names:
-            response = "I couldn't complete the requested operation. The task is still open."
+            response = operation_failure_reply(result for result, _status in normalized_results)
         else:
             response = "I need more output before this task can be completed."
         return ResponseFulfillmentDecision(False, response, tuple(missing))

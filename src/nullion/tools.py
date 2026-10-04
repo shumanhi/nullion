@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
+import asyncio
 import bz2
 import csv
 import copy
@@ -1548,21 +1550,39 @@ def _tool_handler_timeout_result(invocation: ToolInvocation, *, timeout_seconds:
     )
 
 
+_TOOL_EXECUTION_DEADLINE: ContextVar[float | None] = ContextVar("tool_execution_deadline", default=None)
+
+
+def tool_execution_remaining_seconds() -> float | None:
+    """Remaining registered handler budget, shared with cooperative adapters."""
+    deadline = _TOOL_EXECUTION_DEADLINE.get()
+    return None if deadline is None else max(0.0, deadline - perf_counter())
+
+
 def _invoke_tool_handler_with_timeout(
     spec: ToolSpec,
     handler: ToolHandler,
     invocation: ToolInvocation,
 ) -> ToolResult:
     timeout_seconds = _tool_handler_timeout_seconds(spec)
+    deadline = perf_counter() + timeout_seconds if timeout_seconds is not None else None
+
+    def _call_handler() -> ToolResult:
+        token = _TOOL_EXECUTION_DEADLINE.set(deadline)
+        try:
+            return handler(invocation)
+        finally:
+            _TOOL_EXECUTION_DEADLINE.reset(token)
+
     if timeout_seconds is None or not _tool_handler_should_use_timeout_worker(spec):
-        return handler(invocation)
+        return _call_handler()
 
     complete = threading.Event()
     result_box: dict[str, object] = {}
 
     def _run_handler() -> None:
         try:
-            result_box["result"] = handler(invocation)
+            result_box["result"] = _call_handler()
         except BaseException as exc:  # pragma: no cover - re-raised on caller thread
             result_box["exception"] = exc
         finally:
@@ -2209,9 +2229,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 },
                 "text_pages": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {"type": "string"},
                     "description": (
-                        "Optional report text pages to render into the PDF with extractable text and clickable URL links. "
+                        "Report text or Markdown pages to render into the PDF with extractable text, formatted headings/tables, and clickable URL links. "
                         "For reports/tables/cards that include names, prices, citations, listing links, or other "
                         "readable content, put that content here; image_paths alone creates an image-only PDF. "
                         "For multi-item reports with images, prefer one text page per image in matching order. "
@@ -2220,6 +2241,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                 },
                 "html_pages": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {"type": "string"},
                     "description": (
                         "Optional static HTML page fragments for designed PDFs that need custom visual layout, real tables, "
@@ -2248,6 +2270,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
                     "description": "Optional page size. Defaults to letter.",
                 },
             },
+            "anyOf": [
+                {"required": [field], "properties": {field: {"minItems": 1}}}
+                for field in ("image_paths", "screenshot_paths", "text_pages", "html_pages")
+            ],
             "additionalProperties": False,
         },
         "pdf_edit": {
@@ -10095,41 +10121,22 @@ def _normalize_pdf_report_text(text: str) -> str:
 
 
 def _pdf_text_html(text: str) -> str:
-    normalized = _normalize_pdf_report_text(text)
+    # Parse before escaping: escaping an entire line before detecting links
+    # double-escaped query strings and the old URL pattern truncated fragments.
+    # Raw HTML is escaped by the renderer; Markdown cannot execute scripts.
+    import mistune
 
-    def replace_url(match: re.Match[str]) -> str:
-        url = match.group(0)
-        trailing = ""
-        while url and url[-1] in ".,);]":
-            trailing = url[-1] + trailing
-            url = url[:-1]
-        safe_url = html.escape(url, quote=True)
-        return f'<a href="{safe_url}">{safe_url}</a>{html.escape(trailing)}'
+    class ReportRenderer(mistune.HTMLRenderer):
+        def image(self, text: str, url: str, title: str | None = None) -> str:
+            # Text reports do not grant network/file access for embedded media.
+            # Images must pass the existing image_paths/HTML media boundary.
+            return self.link(text or "Image", url, title)
 
-    def line_html(line: str) -> str:
-        escaped = html.escape(line)
-        return _TEXT_ARTIFACT_URL_RE.sub(replace_url, escaped)
-
-    lines = [line.strip() for line in normalized.splitlines()]
-    blocks: list[str] = []
-    index = 0
-    while index < len(lines or [""]):
-        line = (lines or [""])[index]
-        table_html, next_index = _pdf_markdown_table_html(lines, index, line_html=line_html)
-        if table_html:
-            blocks.append(table_html)
-            index = next_index
-            continue
-        if line.startswith(("- ", "* ")):
-            blocks.append(f"<p class=\"bullet\">{line_html(line[2:].strip()) or '&nbsp;'}</p>")
-        elif re.match(r"^\d+[\).]\s+", line):
-            blocks.append(f"<p class=\"bullet\">{line_html(line)}</p>")
-        elif line.endswith(":") and len(line) <= 90:
-            blocks.append(f"<h2>{line_html(line[:-1])}</h2>")
-        else:
-            blocks.append(f"<p>{line_html(line) or '&nbsp;'}</p>")
-        index += 1
-    return "".join(blocks)
+    markdown = mistune.create_markdown(
+        renderer=ReportRenderer(escape=True), hard_wrap=True, plugins=["table", "url"],
+    )
+    rendered = markdown(_normalize_pdf_report_text(text))
+    return rendered.replace("<table>", '<table class="report-table">')
 
 
 def _pdf_markdown_table_html(
@@ -10269,6 +10276,19 @@ def _save_text_pdf_with_chromium(
     image_paths: list[Path],
     page_size_name: str,
 ) -> bool:
+    # Approval continuations can execute a synchronous tool on an async host.
+    # Playwright's sync API rejects that host loop; render in a worker instead
+    # of silently degrading the report to image pages.
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="nullion-pdf") as executor:
+            return executor.submit(
+                _save_text_pdf_with_chromium, path, title=title, text_pages=text_pages,
+                image_paths=image_paths, page_size_name=page_size_name,
+            ).result()
     executable = _pdf_chromium_executable()
     if executable is None:
         return False
@@ -10319,7 +10339,10 @@ def _save_text_pdf_with_chromium(
         ".report-image-grid figure{float:none;margin:0;}"
         ".report-image-grid .report-image{max-height:1.38in;}"
         ".report-image{max-width:2.35in;max-height:2.2in;object-fit:contain;display:block;}"
-        "h2{font-size:14px;margin:13px 0 7px;color:#1f2937;} p{font-size:11.5px;line-height:1.45;margin:0 0 8px;}"
+        ".text{font-size:11.5px;line-height:1.45;} .text h1{font-size:18px;margin:13px 0 8px;}"
+        "h2{font-size:14px;margin:13px 0 7px;color:#1f2937;} h3,h4,h5,h6{font-size:12px;margin:11px 0 6px;}"
+        "p{font-size:11.5px;line-height:1.45;margin:0 0 8px;} ul,ol{padding-left:22px;} li{margin-bottom:5px;}"
+        "pre{white-space:pre-wrap;overflow-wrap:anywhere;} blockquote{border-left:3px solid #d1d5db;padding-left:10px;}"
         ".bullet{padding-left:14px;text-indent:-10px;} .bullet:before{content:'• ';color:#2563eb;font-weight:bold;}"
         ".report-table{width:100%;border-collapse:collapse;margin:10px 0 14px;font-size:10.5px;line-height:1.3;}"
         ".report-table th{background:#f1f5f9;color:#111827;text-align:left;font-weight:700;}"
@@ -10546,6 +10569,16 @@ def _save_html_pdf_with_chromium(
     screenshot_paths: list[Path] | tuple[Path, ...] = (),
     page_size_name: str,
 ) -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="nullion-pdf") as executor:
+            return executor.submit(
+                _save_html_pdf_with_chromium, path, title=title, html_pages=html_pages,
+                image_paths=image_paths, screenshot_paths=screenshot_paths, page_size_name=page_size_name,
+            ).result()
     executable = _pdf_chromium_executable()
     if executable is None:
         return False
@@ -10782,7 +10815,19 @@ def _build_pdf_create_handler(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
-                output={},
+                output={
+                    "reason": "invalid_tool_arguments",
+                    "recovery": {
+                        "kind": "correct_arguments",
+                        "retry_tool_name": invocation.tool_name,
+                        "argument_constraints": {
+                            "anyOf": [
+                                {"required": [field], "properties": {field: {"type": "array", "minItems": 1}}}
+                                for field in ("image_paths", "screenshot_paths", "text_pages", "html_pages")
+                            ],
+                        },
+                    },
+                },
                 error="pdf_create requires at least one image_paths, screenshot_paths, text_pages, or html_pages entry",
             )
 

@@ -440,6 +440,41 @@ def _httpx_transient_exception_types() -> tuple[type[BaseException], ...]:
     return tuple(dict.fromkeys(exceptions))
 
 
+def _deadline_response_lines(response: object, deadline: float) -> Iterator[str]:
+    """Check the streaming budget before buffering a complete provider line.
+
+    A peer can keep an HTTP read alive by sending chunks without a newline.
+    Checking only iter_lines would never observe those chunks or the deadline.
+    """
+    def check_budget() -> None:
+        if _time.monotonic() >= deadline:
+            raise ModelClientTimeoutError(
+                "Codex Responses request exceeded timeout budget while streaming."
+            )
+
+    iter_text = getattr(response, "iter_text", None)
+    if not callable(iter_text):
+        for line in response.iter_lines():
+            check_budget()
+            yield line
+        return
+    pending = ""
+    for chunk in iter_text():
+        check_budget()
+        pending += chunk
+        lines = pending.splitlines(keepends=True)
+        pending = ""
+        for index, line in enumerate(lines):
+            # Retain an unfinished line and a trailing CR until its next chunk.
+            if index == len(lines) - 1 and not line.endswith("\n"):
+                pending = line
+            else:
+                yield line.rstrip("\r\n")
+    check_budget()
+    if pending:
+        yield pending.rstrip("\r\n")
+
+
 def _chat_completions_input_budget_chars() -> int:
     raw_value = os.environ.get("NULLION_CHAT_COMPLETIONS_INPUT_BUDGET_CHARS")
     if raw_value is None:
@@ -1221,6 +1256,17 @@ class CodexResponsesModelClient:
         if converted_tools:
             body["tools"] = converted_tools
 
+        # The default HTTP timeout also bounds the whole call, including retries.
+        # A read timeout alone restarts after each incoming chunk.
+        timeout_budget = float(timeout) if timeout and timeout > 0 else 120.0
+        request_deadline = _time.monotonic() + timeout_budget
+
+        def remaining_budget() -> float:
+            remaining = request_deadline - _time.monotonic()
+            if remaining <= 0:
+                raise ModelClientTimeoutError("Codex Responses request exceeded timeout budget.")
+            return remaining
+
         def _invoke(payload: dict[str, Any]) -> dict[str, Any]:
             for attempt in range(2):
                 text_parts: list[str] = []
@@ -1229,9 +1275,7 @@ class CodexResponsesModelClient:
                 completion: dict[str, Any] = {}
                 # track in-progress function call by item index
                 fn_calls: dict[int, dict[str, Any]] = {}
-                deadline = (_time.monotonic() + float(timeout)) if timeout and timeout > 0 else None
-
-                with _httpx.Client(timeout=float(timeout or 120.0)) as client:
+                with _httpx.Client(timeout=remaining_budget()) as client:
                     with client.stream("POST", self._ENDPOINT, json=payload, headers=self._headers()) as resp:
                         if resp.status_code >= 400:
                             detail = resp.read().decode("utf-8", errors="replace")
@@ -1250,11 +1294,7 @@ class CodexResponsesModelClient:
                                 f"Codex Responses request failed with HTTP {resp.status_code}: {detail or resp.reason_phrase}"
                             )
                         resp.raise_for_status()
-                        for raw_line in resp.iter_lines():
-                            if deadline is not None and _time.monotonic() >= deadline:
-                                raise ModelClientTimeoutError(
-                                    "Codex Responses request exceeded timeout budget while streaming."
-                                )
+                        for raw_line in _deadline_response_lines(resp, request_deadline):
                             line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
                             if not line.startswith("data: "):
                                 continue

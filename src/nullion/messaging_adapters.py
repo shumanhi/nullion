@@ -42,7 +42,7 @@ from nullion.task_frames import TaskFrameStatus
 
 
 logger = logging.getLogger(__name__)
-WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
+WORKING_ACK_TEXT = "⌛ On it."
 
 
 def should_emit_separate_working_ack(
@@ -199,7 +199,7 @@ class DeliveryContract:
 
 
 _ATTACHMENT_UNAVAILABLE_REPLY = (
-    "I couldn't attach the requested file. The task is still open."
+    "I couldn't attach the requested file."
 )
 _ATTACHMENT_UPLOAD_FAILED_REPLY = (
     "I couldn't upload the requested attachment to this platform. "

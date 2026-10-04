@@ -66,6 +66,7 @@ from nullion.messaging_delivery_contract import (
 )
 from nullion.telegram_turn_graph import plan_telegram_post_run_delivery
 from nullion.turn_dispatch_graph import AsyncTurnDispatchTracker, TurnDispatchDecision
+from nullion.conversation_runtime import ConversationTurnDisposition
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
 from nullion.policy import permission_scope_principal
 from nullion.chat_streaming import (
@@ -3967,12 +3968,11 @@ def _execute_doctor_command(service: "ChatOperatorService", *, command: str, act
 
 def _natural_overlap_ack(prompt: str, *, dispatch_decision: TurnDispatchDecision | None = None) -> str:
     if dispatch_decision is not None and dispatch_decision.should_wait:
-        variants = (
-            "Got it — I’ll use that after the active task is ready.",
-            "Okay — I’ll attach that to the active task.",
-            "On it — I’ll continue from the active result.",
-        )
-        return variants[sum(ord(char) for char in prompt.strip().lower()) % len(variants)]
+        if dispatch_decision.disposition is ConversationTurnDisposition.REVISE:
+            return "Got it — I’ll update the current request with that."
+        if dispatch_decision.disposition is ConversationTurnDisposition.INTERRUPT:
+            return "Got it — I’ll replace the current request with that."
+        return "Got it — I’ll continue from the current request."
     return ""
 
 
