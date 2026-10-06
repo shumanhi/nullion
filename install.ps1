@@ -1755,6 +1755,9 @@ Write-Ok "Nullion installed."
 Add-UserPathEntry $NULLION_SCRIPTS_DIR
 
 [void](Install-PlaywrightRuntime)
+Write-Info "Installing visual browser navigation in its own environment..."
+& $VENV_PYTHON (Join-Path $SOURCE_DIR "src\nullion\plugins\browser_plugin\browser_use_setup.py") --home $NULLION_DIR
+if ($LASTEXITCODE -ne 0) { throw "Visual browser navigation setup failed." }
 
 $NULLION_KEY_STORAGE = Choose-KeyStorage
 Initialize-KeyStorage $NULLION_KEY_STORAGE

@@ -42,7 +42,7 @@ from nullion.task_frames import TaskFrameStatus
 
 
 logger = logging.getLogger(__name__)
-WORKING_ACK_TEXT = "⌛ On it."
+WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
 
 
 def should_emit_separate_working_ack(

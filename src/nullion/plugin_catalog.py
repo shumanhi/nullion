@@ -82,6 +82,7 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
         tools=(
             "browser_open",
             "browser_navigate",
+            "browser_run_task",
             "browser_snapshot",
             "browser_click_element",
             "browser_click_id",
@@ -102,13 +103,19 @@ PLUGIN_CATALOG: tuple[PluginCatalogEntry, ...] = (
                 notes="Local browser automation backend.",
             ),
             PluginProviderCatalogEntry(
+                provider_id="browser_use_provider",
+                name="Browser Use (optional)",
+                status="available",
+                notes="Visual task navigation using the configured chat model and an isolated browser profile.",
+            ),
+            PluginProviderCatalogEntry(
                 provider_id="cdp_browser_provider",
                 name="Chrome/Brave CDP",
                 status="available",
                 notes="Connects to a configured local browser debug session.",
             ),
         ),
-        setup_hint="Set NULLION_BROWSER_ENABLED=true, choose NULLION_BROWSER_BACKEND=auto, playwright, or cdp, and set NULLION_BROWSER_PREFERRED plus NULLION_BROWSER_CDP_URL when using a visible browser.",
+        setup_hint="Install Browser Use in an isolated Python environment and set NULLION_BROWSER_USE_PYTHON for optional visual task navigation. Set NULLION_BROWSER_ENABLED=true, choose NULLION_BROWSER_BACKEND=auto, playwright, or cdp, and set NULLION_BROWSER_PREFERRED plus NULLION_BROWSER_CDP_URL when using a visible browser.",
     ),
     PluginCatalogEntry(
         plugin_id="workspace_plugin",

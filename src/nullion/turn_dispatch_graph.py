@@ -167,7 +167,9 @@ def _model_turn_disposition(
     response = create(
         messages=[{"role": "user", "content": [{"type": "text", "text": user}]}],
         tools=[],
-        max_tokens=120,
+        # The budget includes reasoning as well as the typed JSON decision.
+        # 120 tokens can truncate an otherwise valid semantic relationship.
+        max_tokens=512,
         system=system,
     )
     payload = _parse_json_object(_text_from_model_response(response))

@@ -1250,6 +1250,8 @@ PY
 verify_python_runtime
 
 install_playwright_runtime || true
+print_info "Installing visual browser navigation in its own environment..."
+"$VENV_DIR/bin/python" "$SOURCE_DIR/src/nullion/plugins/browser_plugin/browser_use_setup.py" --home "$NULLION_INSTALL_DIR"
 if ! verify_python_runtime; then
     repair_pydantic_runtime
     if ! verify_python_runtime; then

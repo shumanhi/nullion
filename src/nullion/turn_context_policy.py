@@ -51,6 +51,7 @@ _URL_BOUNDARY_TOOLS = frozenset(
         "browser_click_id",
         "browser_open",
         "browser_navigate",
+        "browser_run_task",
         "browser_extract_text",
         "browser_extract_detail",
         "browser_extract_items",
@@ -74,6 +75,7 @@ _URL_BOUNDARY_TOOLS = frozenset(
 _BROWSER_INTERACTION_SCOPE_TOOLS = (
     "browser_open",
     "browser_navigate",
+    "browser_run_task",
     "browser_extract_text",
     "browser_extract_detail",
     "browser_extract_items",
@@ -94,6 +96,7 @@ _OPEN_URL_SCOPE_TOOLS = frozenset(
     {
         "browser_open",
         "browser_navigate",
+        "browser_run_task",
         "browser_extract_text",
         "browser_extract_detail",
         "browser_extract_items",
@@ -173,6 +176,7 @@ _SCOPE_SOURCE_REQUIRED_TOOL_CANDIDATES = frozenset(
         "browser_extract_text",
         "browser_image_collect",
         "browser_navigate",
+        "browser_run_task",
         "browser_open",
         "browser_run_js",
         "browser_screenshot",
@@ -377,6 +381,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "web_fetch",
                         "browser_open",
                         "browser_navigate",
+                        "browser_run_task",
                         "browser_click",
                         "browser_click_element",
                         "browser_click_id",
@@ -1707,10 +1712,10 @@ class ScopedTurnToolRegistry:
             for name in required_tool_names
             if str(name or "").strip()
         }
-        web_source_tools = {"web_fetch", "browser_navigate", "browser_open"}
+        web_source_tools = {"web_fetch", "browser_navigate", "browser_open", "browser_run_task"}
         if required.intersection(web_source_tools):
             return ()
-        for candidate in ("web_fetch", "browser_navigate", "browser_open"):
+        for candidate in ("web_fetch", "browser_navigate", "browser_open", "browser_run_task"):
             if candidate in available:
                 return (candidate,)
         return ()
@@ -4056,6 +4061,7 @@ _PLANNER_ARTIFACT_SCOPE_TOOLS = (
     "archive_create",
     "archive_extract",
     "browser_navigate",
+    "browser_run_task",
     "browser_extract_text",
     "browser_extract_detail",
     "browser_extract_items",

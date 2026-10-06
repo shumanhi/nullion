@@ -558,7 +558,7 @@ def _build_runtime_service_from_settings(
         try:
             os.environ["NULLION_BROWSER_BACKEND"] = browser_backend
             from nullion.plugins.browser_plugin import register_browser_tools
-            register_browser_tools(active_tool_registry)
+            register_browser_tools(active_tool_registry, model_client_getter=lambda: getattr(service, "model_client", None))
             logger.info("Browser plugin registered for Telegram (backend=%s)", browser_backend)
         except Exception:
             logger.warning("Could not register browser plugin for Telegram.", exc_info=True)

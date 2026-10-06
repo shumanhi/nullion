@@ -4031,7 +4031,7 @@ def _ensure_browser_loop() -> asyncio.AbstractEventLoop:
         return loop
 
 
-def _run(coro) -> Any:
+def _run(coro, *, timeout_seconds: float = 60.0) -> Any:
     """Run a browser coroutine on one shared loop.
 
     Browser backends keep session state and async locks. Running each sync tool
@@ -4054,7 +4054,7 @@ def _run(coro) -> Any:
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         try:
             remaining = tool_execution_remaining_seconds()
-            return future.result(timeout=min(60.0, remaining) if remaining is not None else 60.0)
+            return future.result(timeout=min(timeout_seconds, remaining) if remaining is not None else timeout_seconds)
         except Exception:
             future.cancel()
             raise
