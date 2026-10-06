@@ -181,25 +181,25 @@ def _model_turn_disposition(
     if confidence < 0.55:
         return None
     explicit_field = payload.get("target_is_explicit")
-    target_is_explicit = (
-        bool(active_turn_followup_evidence)
-        if explicit_field is None
-        else bool(explicit_field)
-    )
+    target_is_explicit = explicit_field is True
     if relationship == "follow_up":
-        if not active_turn_followup_evidence:
+        # An active request is itself typed runtime evidence. A validated
+        # semantic target can link ordinary follow-ups without requiring a
+        # URL, filename, or attachment in either message. Ambiguous assent
+        # still needs a stronger runtime anchor.
+        if not (active_turn_followup_evidence or target_is_explicit):
             return None
         target_index = payload.get("target_index")
-        if target_index is None and len(active_turn_texts) == 1:
+        if target_index is None and len(active_turn_texts) == 1 and active_turn_followup_evidence:
             target_index = 0
-        try:
-            target_index = int(target_index)
-        except Exception:
+        if not isinstance(target_index, int) or isinstance(target_index, bool):
             return None
         allowed_target_indexes = {int(item["index"]) for item in active_payload}
         if target_index not in allowed_target_indexes:
             return None
         effect = str(payload.get("effect") or "continue").strip().lower()
+        if effect not in {"continue", "revise", "interrupt"}:
+            return None
         if effect == "revise":
             return _StructuredTurnDisposition(
                 ConversationTurnDisposition.REVISE,

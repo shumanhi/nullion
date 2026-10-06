@@ -368,11 +368,21 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_extract_text",
-            "Extract visible text from the page or a specific element (CSS selector).",
+            (
+                "Extract visible text from the page or a specific element (CSS selector). "
+                "Check the observed page against the requested inputs and constraints. A loaded URL or generic "
+                "landing page does not prove a search was submitted or filters applied. When matching records are "
+                "missing, inspect interactive elements and complete the form or use another available source. "
+                "Collect every requested comparison side before producing the final report."
+            ),
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
-            continuation_tools=("browser_run_js", "browser_image_collect", "browser_screenshot"),
+            continuation_tools=(
+                "browser_snapshot", "browser_type_id", "browser_click_id", "browser_select_combobox",
+                "browser_assert_page_state", "browser_extract_items", "browser_extract_detail",
+                "browser_run_js", "browser_image_collect", "browser_screenshot",
+            ),
             input_schema=_object_schema(
                 {
                     "selector": {

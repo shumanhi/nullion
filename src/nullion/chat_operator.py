@@ -243,9 +243,9 @@ from nullion.workspace_storage import format_workspace_storage_for_prompt
 logger = logging.getLogger(__name__)
 
 _BROWSER_AGENT_TURN_MAX_ITERATIONS_ENV = "NULLION_BROWSER_AGENT_TURN_MAX_ITERATIONS"
-_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 24
+_BROWSER_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 48
 _COMPLEX_AGENT_TURN_MAX_ITERATIONS_ENV = "NULLION_COMPLEX_AGENT_TURN_MAX_ITERATIONS"
-_COMPLEX_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 24
+_COMPLEX_AGENT_TURN_DEFAULT_MAX_ITERATIONS = 48
 _WEB_OR_BROWSER_TOOL_NAMES = frozenset({"web_fetch", "web_search"})
 
 
@@ -11211,6 +11211,11 @@ def _run_chat_turn_schema_followup_tool_retry(
         # run once the requested reads and the other required tools are done.
         and all(
             _turn_result_has_completed_tool(initial_result, {name})
+            or (
+                name in browser_reads
+                and any(_tool_result_name(result) == name and _tool_result_status(result) == "failed"
+                        for result in results)
+            )
             for name in explicit_followup_names
         )
         and _turn_result_has_completed_tool(initial_result, _BROWSER_READ_EVIDENCE_TOOLS)
@@ -11259,7 +11264,9 @@ def _run_chat_turn_schema_followup_tool_retry(
         connector_app_ids=_active_connector_app_ids_for_retry() if connector_followup_requested else (),
         connector_source_user_requested=connector_followup_requested,
         requested_tool_names=followup_tool_names,
-        required_tool_names=followup_tool_names,
+        # Continuation metadata describes alternatives, not an all-tools checklist.
+        # Preserve real obligations from structured scope/output contracts only.
+        required_tool_names=tuple(name for name in explicit_followup_names if name in followup_tool_names),
         confidence=1.0,
         valid=True,
     )
@@ -14933,6 +14940,10 @@ def _chat_delivery_contract_prompt(
         "- If a tool only finds candidates, previews, or metadata, continue with its registered continuation tool or the next safe structured capability before finalizing. Search/list is not enough when the user asked to open, read, update, run, send, attach, schedule, or otherwise act on the target.\n"
         "- Do not end a turn by saying a registered tool is unavailable while request_tool_scope is visible. Request the matching scope, use the resulting tool ladder, and only report unavailability after the scoped tool itself returns a concrete failure or denial.\n"
         "- If a repeatable workflow required local shell fallback or connector setup, Builder may propose or save a reusable skill/workflow for future turns. A saved skill is a reusable procedure, not write/delete permission; modifying or deleting user data still requires explicit confirmation or an approval flow.\n"
+        "- Personal task items require personal_task_save and a successful persisted receipt before claiming they were saved or changed. "
+        "Use personal_tasks_list to read the durable list. When it is empty but prior items were discussed, search saved history "
+        "before claiming there are no items; report any recovered item with its source turn and restore only user-authorized items. "
+        "A preference to maintain a list is not the list itself. Do not invent example items as saved tasks.\n"
         "- When the needed detail may be in earlier turns of this same conversation but is not visible in the prompt context, request conversation_history scope and use chat_history_search before asking the user to resend it.\n"
         "- For browser shopping or cart work, treat prior screenshot, attachment, or conversation-derived merchant and item names as target evidence. Reuse the active browser session when available, search or open pages using those exact known names, and continue through reasonable page-discovery attempts before asking the user for a direct link. Adding requested items to a cart is allowed; do not submit checkout, payment, purchase, booking, or order placement without explicit approval.\n"
         "- Do not say the chat platform cannot attach files. Nullion will attach completed artifact files after your turn.\n"
@@ -18112,7 +18123,7 @@ def _append_chat_artifacts_to_reply(
             if not _path_matches_identity_set(path, suppressed_non_delivery_identities)
         )
     if requested_extensions and suppressed_media_directive_removed and not explicit_artifact_paths:
-        return "I couldn't attach the requested file. The task is still open."
+        return "I couldn't attach the requested file."
     if suppress_unrequested_image_delivery:
         explicit_artifact_paths = tuple(
             path
@@ -18127,7 +18138,7 @@ def _append_chat_artifacts_to_reply(
         and suppressed_non_delivery_paths
     ):
         if requested_extensions:
-            return "I couldn't attach the requested file. The task is still open."
+            return "I couldn't attach the requested file."
         reply = _strip_media_directives_from_context(reply).strip() or reply
         reply_has_media_directives = False
     initial_reply_media_paths = tuple(str(path) for path in initial_reply_candidate_paths)
@@ -18755,9 +18766,9 @@ def _append_chat_artifacts_to_reply(
     )
     if not descriptors:
         if requested_extensions and reply_has_media_directives:
-            return "I couldn't attach the requested file. The task is still open."
+            return "I couldn't attach the requested file."
         if requested_extensions and partial_last_mile_paths:
-            return "I couldn't attach the requested file. The task is still open."
+            return "I couldn't attach the requested file."
         if reply_is_browser_text_dump:
             completed_requested_paths = _completed_requested_artifact_paths_from_tool_results(
                 tool_results,
@@ -19019,11 +19030,13 @@ def _incomplete_artifact_delivery_reply(
         return None
     artifact_kind = frame.finish.required_artifact_kind or frame.output.artifact_kind or "file"
     label = "screenshot" if artifact_kind in {"png", ".png"} else f"{artifact_kind} attachment"
-    return f"I couldn't attach the requested {label}. The task is still open."
+    return f"I couldn't attach the requested {label}."
 
 
 _ARTIFACT_FULFILLMENT_FAILURE_REPLIES = frozenset(
     {
+        "I couldn't attach the requested file.",
+        "I couldn't attach all of the requested files.",
         "I couldn't attach the requested file. The task is still open.",
         "I couldn't attach all of the requested files. The task is still open.",
     }
@@ -21676,7 +21689,29 @@ def _compact_tool_output_for_context(
     return compact
 
 
-def _recent_tool_context_prompt(runtime: PersistentRuntime, conversation_id: str) -> str | None:
+def _tool_context_lineage(
+    runtime: PersistentRuntime, conversation_id: str, anchor_turn_id: str | None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Bound follow-up tool evidence to the resolved request's ancestry."""
+    turn_ids: set[str] = set()
+    branch_ids: set[str] = set()
+    turn_id = str(anchor_turn_id or "").strip()
+    for _ in range(_MAX_CHAT_TURNS):
+        if not turn_id or turn_id in turn_ids:
+            break
+        turn = runtime.store.get_conversation_turn(turn_id)
+        if turn is None or turn.conversation_id != conversation_id:
+            break
+        turn_ids.add(turn_id)
+        branch_ids.add(turn.branch_id)
+        turn_id = str(turn.parent_turn_id or "").strip()
+    return frozenset(turn_ids), frozenset(branch_ids)
+
+
+def _recent_tool_context_prompt(
+    runtime: PersistentRuntime, conversation_id: str, *, anchor_turn_id: str | None = None,
+) -> str | None:
+    lineage_turn_ids, lineage_branch_ids = _tool_context_lineage(runtime, conversation_id, anchor_turn_id)
     try:
         events = runtime.store.list_recent_conversation_events(
             conversation_id,
@@ -21688,6 +21723,8 @@ def _recent_tool_context_prompt(runtime: PersistentRuntime, conversation_id: str
     records: list[dict[str, object]] = []
     for event in events:
         if not isinstance(event, dict):
+            continue
+        if anchor_turn_id and event.get("turn_id") not in lineage_turn_ids:
             continue
         tool_results = event.get("tool_results")
         if not isinstance(tool_results, list) or not tool_results:
@@ -21705,6 +21742,8 @@ def _recent_tool_context_prompt(runtime: PersistentRuntime, conversation_id: str
     except Exception:
         frames = []
     for frame in frames:
+        if anchor_turn_id and getattr(frame, "branch_id", None) not in lineage_branch_ids:
+            continue
         metadata = getattr(frame, "metadata", {}) or {}
         last_outcome = metadata.get("last_outcome") if isinstance(metadata, dict) else None
         if not isinstance(last_outcome, dict):
@@ -21854,7 +21893,10 @@ def _completed_run_cron_receipt_reply(
     return None
 
 
-def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id: str) -> tuple[str, ...]:
+def _recent_tool_scopes_for_context(
+    runtime: PersistentRuntime, conversation_id: str, *, anchor_turn_id: str | None = None,
+) -> tuple[str, ...]:
+    lineage_turn_ids, _ = _tool_context_lineage(runtime, conversation_id, anchor_turn_id)
     try:
         list_after_reset = getattr(runtime.store, "list_recent_conversation_events_after_reset", None)
         if callable(list_after_reset):
@@ -21874,6 +21916,8 @@ def _recent_tool_scopes_for_context(runtime: PersistentRuntime, conversation_id:
     scopes: list[str] = []
     for event in events:
         if not isinstance(event, dict):
+            continue
+        if anchor_turn_id and event.get("turn_id") not in lineage_turn_ids:
             continue
         tool_results = event.get("tool_results")
         if not isinstance(tool_results, list):
@@ -23198,7 +23242,9 @@ def _render_chat_turn(
         existing_named_artifact_requires_new_content=existing_named_artifact_action == "use_tools",
         saved_history_available=saved_history_available,
         numbered_option_selected=bool(numbered_option_context),
-        prior_tool_scopes=_recent_tool_scopes_for_context(runtime, conversation_id),
+        prior_tool_scopes=_recent_tool_scopes_for_context(
+            runtime, conversation_id, anchor_turn_id=conversation_result.turn.parent_turn_id,
+        ),
     )
     if activity_callback is not None and (
         getattr(turn_tool_evidence, "has_url_target", False)
@@ -24061,7 +24107,9 @@ def _render_chat_turn(
                 None
                 if explicit_reply_anchor
                 else (
-                    _recent_tool_context_prompt(runtime, conversation_id)
+                    _recent_tool_context_prompt(
+                        runtime, conversation_id, anchor_turn_id=conversation_result.turn.parent_turn_id,
+                    )
                     if _should_include_recent_tool_context(
                         conversation_result,
                         structured_followup_evidence=(
@@ -24918,7 +24966,10 @@ def _render_chat_turn(
                             turn_outcome = TurnOutcome.SUSPENDED if _turn_limit_approval_live else TurnOutcome.SUCCESS
                         else:
                             reply, turn_outcome = _turn_limit_continuation_persistence_failure()
-                elif getattr(turn_result, "response_fulfilled", None) is False:
+                elif (
+                    getattr(turn_result, "response_fulfilled", None) is False
+                    and not deferred_scheduler_receipt_reply
+                ):
                     reply, turn_outcome = _unfulfilled_turn_reply(turn_result)
                 elif turn_result.suspended_for_approval:
                     reply, _turn_approval_live = _approval_marker_reply_for_turn_result(
@@ -25709,6 +25760,7 @@ def _render_chat_turn(
                 not _turn_is_suspended
                 and getattr(locals().get("turn_result"), "response_fulfilled", None) is False
                 and not getattr(locals().get("turn_result"), "reached_iteration_limit", False)
+                and not locals().get("deferred_scheduler_receipt_reply")
             ):
                 reply, turn_outcome = _unfulfilled_turn_reply(locals().get("turn_result"))
             visible_reply = append_activity_trace_to_reply(
@@ -25789,15 +25841,21 @@ def _render_chat_turn(
             phase_tracker.done(PHASE_SAVE_CONVERSATION, "save")
             turn_latency.mark("save_done", once=True)
             _mark_timing("save_deferred" if defer_checkpoint else "save")
+            latency_outcome = "completed" if turn_outcome is TurnOutcome.SUCCESS else turn_outcome.value
+            if latency_outcome == "completed" and any(
+                normalize_tool_status(_tool_result_status(result)) in {"failed", "denied"}
+                for result in activity_tool_results
+            ):
+                latency_outcome = "partial"
             _log_timing_if_slow(
-                "completed",
+                latency_outcome,
                 conversation_id_value=conversation_id,
                 conversation_result_value=conversation_result,
                 tool_count=len(activity_tool_results),
                 artifact_count=current_artifact_count,
             )
             _finish_latency(
-                "completed",
+                latency_outcome,
                 tool_count=len(activity_tool_results),
                 artifact_count=current_artifact_count,
             )

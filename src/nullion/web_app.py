@@ -8191,7 +8191,7 @@ async function sendHttpMessage(text, turnId = null, attachments = []) {
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, attachments, conversation_id: conversationId, show_thinking: thinkingDisplayEnabled }),
+      body: JSON.stringify({ text, attachments, conversation_id: conversationId, turn_id: turnId, show_thinking: thinkingDisplayEnabled }),
     });
     const msg = await r.json();
     if (!r.ok || msg.type === 'error') {
@@ -8968,7 +8968,6 @@ function setApprovalStateEverywhere(approvalId, text, kind = '') {
   return views[0] || null;
 }
 
-let _approvalHistoryRefreshTimer = null;
 let _terminalReplyHistoryRefreshTimer = null;
 let _pendingTerminalReplyRecoveryKickTimer = null;
 function renderedConversationMessageCount() {
@@ -8977,28 +8976,11 @@ function renderedConversationMessageCount() {
     .length;
 }
 
-function historyHasNewBotReply(msgs, minCount) {
-  if (!Array.isArray(msgs) || msgs.length <= minCount) return false;
-  const tail = msgs.slice(minCount);
-  return tail.some(m => m && m.role === 'bot' && String(m.text || '').trim());
-}
-
-function refreshConversationAfterExternalApproval(attempt = 0, minCount = null) {
-  if (_approvalHistoryRefreshTimer) clearTimeout(_approvalHistoryRefreshTimer);
-  const baselineCount = minCount == null ? renderedConversationMessageCount() : minCount;
-  _approvalHistoryRefreshTimer = setTimeout(async () => {
-    _approvalHistoryRefreshTimer = null;
-    try {
-      const data = await fetch(`/api/chat/history/${encodeURIComponent(conversationId)}`).then(r => r.json());
-      const msgs = data.messages || [];
-      if (historyHasNewBotReply(msgs, baselineCount)) {
-        renderRestoredMessages(msgs);
-        _chatSaveEnabled = true;
-      } else if (attempt < 12) {
-        refreshConversationAfterExternalApproval(attempt + 1, baselineCount);
-      }
-    } catch (_) { /* best-effort */ }
-  }, attempt === 0 ? 900 : 700);
+function refreshConversationAfterExternalApproval(approvalId) {
+  const turnId = activityTurnForApproval(approvalId);
+  if (!turnId) return;
+  rememberPendingTerminalReply(turnId);
+  refreshConversationAfterMissingTerminalReply();
 }
 
 function refreshConversationAfterMissingTerminalReply(attempt = 0, minCount = null) {
@@ -9022,16 +9004,8 @@ function refreshConversationAfterMissingTerminalReply(attempt = 0, minCount = nu
         if (_pendingTerminalReplyRecoveries.size && attempt < 90) refreshConversationAfterMissingTerminalReply(attempt + 1, baselineCount);
         return;
       }
-      const data = await fetch(`/api/chat/history/${encodeURIComponent(conversationId)}?sync_runtime=1`).then(r => r.json());
-      const msgs = data.messages || [];
-      if (historyHasNewBotReply(msgs, baselineCount)) {
-        renderRestoredMessages(msgs);
-        _chatSaveEnabled = true;
-        clearPendingTerminalReply();
-        finishTurnUi();
-      } else if (attempt < 90) {
-        refreshConversationAfterMissingTerminalReply(attempt + 1, baselineCount);
-      }
+      // A larger history can contain older imported replies. Without a pending
+      // turn identity it cannot establish that this request has completed.
     } catch (_) { /* best-effort */ }
   }, attempt === 0 ? 750 : 1500);
 }
@@ -9112,7 +9086,7 @@ function reconcileApprovalBubbles(list) {
       updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'done', detail: 'Approved' });
       setApprovalStateEverywhere(approvalId, approval.reason || 'Approved.', 'ok');
       removeApprovalBubblesEverywhere(approvalId);
-      refreshConversationAfterExternalApproval();
+      refreshConversationAfterExternalApproval(approvalId);
     } else if (status === 'denied' || status === 'rejected') {
       updateApprovalRunActivity(approvalId, { id: 'approval', label: 'Waiting for approval', status: 'failed', detail: 'Denied' });
       setApprovalStateEverywhere(approvalId, approval.reason || 'Denied.', 'error');
@@ -9126,7 +9100,7 @@ function handleApprovalResume(data, approvalId = null) {
   const text = (resume && resume.text) || (data && data.resumed_text);
   const activity = (resume && Array.isArray(resume.activity)) ? resume.activity : [];
   const activityApprovalId = approvalId || (data && data.approval_id) || '';
-  const activityTurnId = activityTurnForApproval(activityApprovalId);
+  const activityTurnId = (resume && resume.turn_id) || activityTurnForApproval(activityApprovalId);
   if (resume && resume.type === 'approval_required') {
     updateApprovalRunActivity(activityApprovalId, { id: 'orchestrate', label: 'Running model and tools', status: 'done', detail: 'Continued after approval' });
     updateApprovalRunActivity(activityApprovalId, { id: 'approval', label: 'Waiting for approval', status: 'done', detail: 'Approved' });
@@ -24146,11 +24120,9 @@ def create_app(runtime, orchestrator, registry):
                             orchestrator=orchestrator,
                             bot_token=os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", ""),
                         )
-                    return _resume_web_turn_from_snapshot(
-                        runtime,
-                        approval_id=approval_id,
-                        orchestrator=orchestrator,
-                        registry=registry,
+                    return await asyncio.to_thread(
+                        _resume_web_turn_from_snapshot, runtime,
+                        approval_id=approval_id, orchestrator=orchestrator, registry=registry,
                     )
                 except Exception as exc:
                     logger.exception("Failed to resume approval %s", approval_id)
@@ -27129,7 +27101,7 @@ def create_app(runtime, orchestrator, registry):
                     return JSONResponse(_web_approval_required_payload(
                         {"approval_id": result.approval_id or "", "is_web_request": True},
                         default_tool_name="tool",
-                        runtime=runtime,
+                        runtime=runtime, turn_id=payload.get("turn_id"),
                     ))
                 return JSONResponse(_http_platform_chat_message_payload(result))
 
@@ -27143,7 +27115,7 @@ def create_app(runtime, orchestrator, registry):
                 return JSONResponse(_web_approval_required_payload(
                     {"approval_id": result.approval_id or "", "is_web_request": True},
                     default_tool_name="tool",
-                    runtime=runtime,
+                    runtime=runtime, turn_id=payload.get("turn_id"),
                 ))
             return JSONResponse(_http_platform_chat_message_payload(result))
         except Exception as exc:
@@ -27420,7 +27392,7 @@ def create_app(runtime, orchestrator, registry):
                 if result.get("suspended_for_approval"):
                     await send_thinking_event(result.get("thinking"))
                     await send_activity_event({"id": "approval", "label": "Waiting for approval", "status": "running"})
-                    await send_websocket_event(turn_payload(_web_approval_required_payload(result, runtime=runtime)))
+                    await send_websocket_event(turn_payload(_web_approval_required_payload(result, runtime=runtime, turn_id=turn_id)))
                 else:
                     reply = _web_http_visible_text(result)
                     task_group_id = str(result.get("task_group_id") or "")
@@ -27544,7 +27516,7 @@ def create_app(runtime, orchestrator, registry):
             if result.get("suspended_for_approval"):
                 await send_thinking_event(result.get("thinking"))
                 await send_activity_event({"id": "approval", "label": "Waiting for approval", "status": "running"})
-                await send_websocket_event(turn_payload(_web_approval_required_payload(result, runtime=runtime)))
+                await send_websocket_event(turn_payload(_web_approval_required_payload(result, runtime=runtime, turn_id=turn_id)))
             else:
                 reply = _web_http_visible_text(result)
                 task_group_id = str(result.get("task_group_id") or "")
@@ -27770,7 +27742,9 @@ def _web_approval_required_payload(
     *,
     default_tool_name: str = "perform an action",
     runtime: Any | None = None,
+    turn_id: str | None = None,
 ) -> dict[str, object]:
+    turn_id = turn_id if isinstance(turn_id, str) and 0 < len(turn_id) <= 256 else None
     approval_id = str(result.get("approval_id") or "")
     display_label = ""
     display_detail = ""
@@ -27783,6 +27757,15 @@ def _web_approval_required_payload(
         try:
             store = getattr(runtime, "store", None)
             approval = store.get_approval_request(approval_id) if store is not None else None
+            if store is not None and turn_id:
+                suspended = store.get_suspended_turn(approval_id)
+                if suspended is not None:
+                    token = dict(suspended.resume_token or {})
+                    token["conversation_turn_id"] = turn_id
+                    store.add_suspended_turn(replace(suspended, resume_token=token))
+                    checkpoint = getattr(runtime, "checkpoint", None)
+                    if callable(checkpoint):
+                        checkpoint()
         except Exception:
             approval = None
         if approval is not None:
@@ -27808,6 +27791,7 @@ def _web_approval_required_payload(
             visible_text = "Nullion paused before continuing. Review the approval card to continue or deny the action."
     return {
         "type": "approval_required",
+        **({"turn_id": turn_id} if turn_id else {}),
         "text": visible_text,
         "approval_id": approval_id,
         "tool_name": result.get("tool_name") or display_label or default_tool_name,
@@ -31015,6 +30999,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         "type": "message",
         "text": final_text,
         "artifacts": artifacts,
+        "turn_id": conversation_turn_id,
     }
     if getattr(result, "reached_iteration_limit", False):
         payload["reached_iteration_limit"] = True
