@@ -79,6 +79,7 @@ def register_browser_tools(
     registry: ToolRegistry,
     *,
     policy: BrowserPolicy | None = None,
+    model_client_getter=None,
 ) -> None:
     """Register all browser_* tools into the given ToolRegistry.
 
@@ -101,6 +102,20 @@ def register_browser_tools(
     tools = BrowserTools(backend=backend, pool=pool, policy=effective_policy)
     registry.mark_plugin_installed("browser_plugin")
     registry.register_cleanup_hook(tools.close_tracked_sessions)
+    from nullion.plugins.browser_plugin.browser_use_adapter import browser_use_available, browser_task_handler
+    if model_client_getter is not None and browser_use_available():
+        registry.register(
+            _make_spec(
+                "browser_run_task",
+                "Use Browser Use visual navigation for a structured, multi-step read/compare task on a target URL. This tool itself captures and returns PNG screenshots together with grounded observations and unknown requirements; it fulfills screenshot capture without browser_screenshot. Its isolated browser session is not shared with low-level browser tools. Scope only this tool for a visual navigation task with screenshots; do not require a separate capture tool. Reuses the configured model. Prefer this for dynamic pages where low-level extraction is insufficient. Does not book or purchase. May take several minutes.",
+                risk=ToolRiskLevel.MEDIUM, side_effect=ToolSideEffectClass.WRITE, timeout=650,
+                input_schema={"type": "object", "properties": {
+                    "task": {"type": "string", "description": "Structured browser objective with constraints and expected observations"},
+                    "url": {"type": "string", "description": "HTTP/HTTPS target page"},
+                    "max_steps": {"type": "integer", "minimum": 1, "maximum": 30}},
+                    "required": ["task", "url"], "additionalProperties": False},
+            ), browser_task_handler(model_client_getter, effective_policy),
+        )
 
     registry.register(
         _make_spec(
@@ -121,6 +136,7 @@ def register_browser_tools(
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
             continuation_tools=(
+                "browser_run_task",
                 "browser_snapshot",
                 "browser_extract_text",
                 "browser_extract_items",
@@ -220,6 +236,7 @@ def register_browser_tools(
             continuation_tools=(
                 "browser_click_id",
                 "browser_type_id",
+                "browser_screenshot",
                 "browser_click_element",
                 "browser_type_field",
                 "browser_wait_for",

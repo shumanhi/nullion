@@ -18806,6 +18806,17 @@ def _append_chat_artifacts_to_reply(
         if browser_text_dump_reply:
             return browser_text_dump_reply
         return reply
+    if not reply_is_browser_text_dump and any(
+        normalize_tool_status(result.status) == "completed"
+        and isinstance(result.output, dict)
+        and result.output.get("result_kind") == "source_observations"
+        for result in tool_results or ()
+    ):
+        # Evidence attachments accompany a source-based answer. A generic file
+        # receipt must not erase the comparison or its unresolved requirements.
+        visible_reply = _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id)
+        media_lines = "\n".join(f"MEDIA:{descriptor.path}" for descriptor in descriptors)
+        return "\n\n".join([visible_reply.strip(), media_lines])
     if requested_extensions and reply_has_media_directives and reply_media_paths:
         required_suffixes = {
             extension if str(extension).startswith(".") else f".{extension}"
@@ -21652,6 +21663,10 @@ def _compact_tool_output_for_context(
                 if isinstance(entry, dict)
             ]
         return compact_archive
+    from nullion.source_observation_contract import compact_source_observations
+    source_output = compact_source_observations(redacted, max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
+    if source_output is not None:
+        return source_output
     try:
         encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
     except TypeError:
@@ -24900,7 +24915,13 @@ def _render_chat_turn(
                         return False
                     turn_result.artifacts = list(completed_paths)
                     completed_path_tuple = tuple(completed_paths)
-                    if (
+                    source_observations = any(
+                        normalize_tool_status(result.status) == "completed"
+                        and isinstance(result.output, dict)
+                        and result.output.get("result_kind") == "source_observations"
+                        for result in turn_result.tool_results or ()
+                    )
+                    if (source_observations and str(reply or "").strip()) or (
                         _reply_visible_text_references_all_artifact_paths(
                             reply,
                             completed_path_tuple,

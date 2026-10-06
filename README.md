@@ -14,6 +14,20 @@ separate, so powerful actions stay scoped and reviewable.
 
 Online docs: https://www.nullion.ai/docs/
 
+## Visual browser navigation
+
+Nullion 0.9 adds Browser Use for multi-step website navigation with the model you
+already configured. It can inspect rendered pages, compare displayed options,
+and attach screenshots alongside its findings. Useful partial results survive
+an interrupted run, with unavailable details clearly identified.
+
+Fresh installations prepare the isolated browser worker automatically. Existing
+installations can enable it with their app Python:
+`python -m nullion.plugins.browser_plugin.browser_use_setup --home ~/.nullion`.
+[Browser setup and configuration](src/nullion/plugins/browser_plugin/README.md).
+Some sites restrict automated access; navigation time depends on the website and
+model. The feature is intended for reading and comparison, not completing purchases.
+
 ## Install
 
 **Mac or Linux** — open Terminal and paste:

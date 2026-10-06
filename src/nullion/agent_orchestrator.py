@@ -2378,6 +2378,10 @@ def _distributed_text_excerpt(value: object, *, limit: int) -> str:
 
 def _compact_tool_output_for_model_context(tool_name: str, output: object) -> object:
     safe_output = _json_safe_tool_value(output)
+    from nullion.source_observation_contract import compact_source_observations
+    source_output = compact_source_observations(safe_output, max_chars=_model_tool_result_max_chars() - 2_000)
+    if source_output is not None:
+        return source_output
     if not isinstance(safe_output, dict):
         return _truncate_text(str(safe_output or ""), 12_000)
     if tool_name == "browser_extract_items" and isinstance(safe_output.get("items"), list):
@@ -4003,6 +4007,36 @@ def _sourced_artifact_requires_outcome_review(
         and normalize_tool_status(result.status) == "completed"
         for result in results
     )
+
+
+def _partial_source_report_delivery_ready(state, tool_results) -> bool:
+    """A typed partial report can be delivered without claiming full fulfillment."""
+    results = list(tool_results)
+    from nullion.source_observation_contract import partial_source_report_disclosures
+    if not partial_source_report_disclosures(results):
+        return False
+    if any(normalize_tool_status(result.status) != "completed" for result in results):
+        return False
+    scope = _completion_review_scope_contract(state.get("tool_registry"), results)
+    if scope["missing_callable_required_tool_names"] or scope["unavailable_required_tool_names"] or scope["connector_source_unavailable"]:
+        return False
+    if _scheduler_action_contract_missing(tool_registry=state.get("tool_registry"), tool_results=results):
+        return False
+    return not _turn_has_artifact_delivery_contract(state) or bool(
+        _completed_required_artifact_paths_for_turn(state, list(state.get("artifacts") or []))
+    )
+
+
+def _complete_partial_source_report(state, final_text=None):
+    from nullion.source_observation_contract import partial_source_report_reply
+    reply = partial_source_report_reply(state.get("tool_results") or [], draft=final_text)
+    reply = sanitize_user_visible_reply(user_message=state.get("user_message"), reply=reply,
+        tool_results=list(state.get("tool_results") or []), source="agent")
+    paths = [str(path) for path in state.get("artifacts") or [] if Path(path).is_file()]
+    if paths:
+        reply += "\n\n" + "\n".join("MEDIA:" + path for path in dict.fromkeys(paths))
+    return _complete_agent_turn(state, final_text=reply, response_fulfilled=False,
+                                completion_failure_reply=reply)
 
 
 def _completion_review_required(
@@ -8310,6 +8344,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     browser_page_state_continuation_nudged: bool
     browser_low_quality_items_continuation_nudged: bool
     browser_terminal_revalidation_attempt_keys: list[str]
+    source_report_delivery_ready: bool
     completion_review_count: int
     completion_review_unresolved_requirements: list[str]
     repeated_failure_limit: int
@@ -9024,6 +9059,15 @@ def _execute_agent_turn_tool_uses(
             logger.debug("Tool result callback failed", exc_info=True)
 
     def _completed_required_artifact_update() -> dict[str, Any] | None:
+        # Source observations may include evidence images. Delivering those
+        # bytes does not replace the requested answer/comparison.
+        if any(
+            normalize_tool_status(result.status) == "completed"
+            and isinstance(result.output, Mapping)
+            and result.output.get("result_kind") == "source_observations"
+            for result in tool_results
+        ):
+            return None
         decision = getattr(tool_registry, "turn_tool_scope_decision", None)
         if (
             getattr(decision, "valid", False)
@@ -10294,6 +10338,10 @@ def _agent_turn_model_node(state: _AgentTurnGraphState) -> dict[str, object]:
 def _agent_turn_tools_node(state: _AgentTurnGraphState) -> dict[str, object]:
     if _agent_turn_was_cancelled(state):
         return _cancelled_agent_turn_update(state)
+    if state.get("source_report_delivery_ready"):
+        # One summary attempt is enough; unshown fields do not justify an
+        # endless source retry or erase the already collected observations.
+        return _complete_partial_source_report(state)
     messages = list(state.get("messages") or [])
     content = list(state.get("content") or [])
     messages.append({"role": "assistant", "content": _conversation_visible_content(content)})
@@ -10301,6 +10349,14 @@ def _agent_turn_tools_node(state: _AgentTurnGraphState) -> dict[str, object]:
     updated_state["messages"] = messages
     update = _execute_agent_turn_tool_uses(updated_state, content)
     tool_results = list(update.get("tool_results") or state.get("tool_results") or [])
+    candidate_state = {**state, **update, "tool_results": tool_results}
+    if "result" not in update and _partial_source_report_delivery_ready(candidate_state, tool_results):
+        update["source_report_delivery_ready"] = True
+        update["messages"] = [*(update.get("messages") or candidate_state.get("messages") or []),
+            {"role": "user", "content": [{"type": "text", "text":
+                "The tool returned a deliverable partial source report. Summarize the recorded observations now; "
+                "describe unshown requirements as unresolved. Do not claim full fulfillment, recheck an explicitly "
+                "unshown field, or invoke more tools. Screenshots accompany the findings."}]}]
     if state.get("enable_doctor_notifications", False) and "result" not in update:
         doctor_threshold = int(state.get("doctor_threshold") or 1)
         next_notice = int(state.get("next_doctor_notice_at") or doctor_threshold)
@@ -10333,6 +10389,8 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         if isinstance(block, dict) and block.get("type") == "text"
     ]
     final_text = "".join(part for part in final_parts if isinstance(part, str)).strip() or None
+    if state.get("source_report_delivery_ready"):
+        return _complete_partial_source_report(state, final_text)
     if state.get("use_authoritative_completion_text", False):
         authoritative_text = _authoritative_tool_completion_text(tool_results)
         if authoritative_text is not None:

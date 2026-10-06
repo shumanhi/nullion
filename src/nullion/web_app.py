@@ -821,6 +821,7 @@ class CronBackgroundDeliveryTracker:
 
 
 _BROWSER_TOOL_NAMES = (
+    "browser_run_task",
     "browser_open",
     "browser_navigate",
     "browser_click",
@@ -19427,6 +19428,13 @@ def _web_artifact_delivery_notice(
             "I created an artifact file, but it looked empty or incomplete, so I did not offer it as a download. "
             "The source fetch likely failed; try the rendered browser capture path or retry the fetch."
         )
+    if artifact_payloads and any(
+        normalize_tool_status(result.status) == "completed"
+        and isinstance(result.output, dict)
+        and result.output.get("result_kind") == "source_observations"
+        for result in tool_results or ()
+    ):
+        return _strip_web_media_directive_lines(text)
     if artifact_payloads:
         if len(artifact_payloads) > 1:
             stripped_text = _strip_web_media_directive_lines(text)
@@ -21062,7 +21070,7 @@ def create_app(runtime, orchestrator, registry):
         os.environ["NULLION_BROWSER_BACKEND"] = browser_backend
         from nullion.plugins.browser_plugin import register_browser_tools
 
-        register_browser_tools(registry)
+        register_browser_tools(registry, model_client_getter=lambda: getattr(runtime, "model_client", None))
         logger.info("Browser plugin refreshed after live config update (backend=%s)", browser_backend)
 
     def _hot_reload_live_config(
@@ -21385,7 +21393,7 @@ def create_app(runtime, orchestrator, registry):
                 reply_text,
                 artifact_paths,
                 artifacts,
-                tool_results=None,
+                tool_results=list(getattr(result, "tool_results", ()) or ()),
             )
         return {
             "text": reply_text,
@@ -29421,6 +29429,10 @@ def _compact_web_tool_output_for_context(
                 "sample_files": sample_files[:50],
                 "sample_files_truncated": {"shown": 50, "total": len(sample_files)},
             }
+    from nullion.source_observation_contract import compact_source_observations
+    source_output = compact_source_observations(redacted, max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
+    if source_output is not None:
+        return source_output
     try:
         encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True, default=str)
     except TypeError:
@@ -31581,7 +31593,7 @@ def _build_runtime():
         try:
             os.environ["NULLION_BROWSER_BACKEND"] = _browser_backend
             from nullion.plugins.browser_plugin import register_browser_tools
-            register_browser_tools(registry)
+            register_browser_tools(registry, model_client_getter=lambda: getattr(runtime, "model_client", None))
             logger.info("Browser plugin registered (backend=%s)", _browser_backend)
         except Exception as _br_err:
             logger.warning("Could not register browser plugin: %s", _br_err)
