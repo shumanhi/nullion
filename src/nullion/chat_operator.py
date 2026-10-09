@@ -1217,8 +1217,6 @@ def _literal_requested_attachment_extensions(prompt: str) -> tuple[str, ...]:
 def _has_attachment_format_candidate(prompt: str) -> bool:
     if is_slash_prefixed_literal_message(prompt):
         return False
-    if re.search(r"\bscreenshots?\b", str(prompt or ""), re.IGNORECASE):
-        return True
     for raw_token in re.split(r"\s+", str(prompt or "")):
         token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
         if not token:
@@ -1265,8 +1263,6 @@ def _requested_attachment_extensions(
         return output_filename_extensions
     if extensions:
         return tuple(extensions)
-    if re.search(r"\bscreenshots?\b", text, re.IGNORECASE):
-        return (".png",)
     has_format_candidate = _has_attachment_format_candidate(prompt)
     has_planner = callable(getattr(model_client, "create", None))
     should_plan = has_planner and (has_format_candidate or allow_model_planning)
@@ -2438,10 +2434,15 @@ def execute_approved_tool_call_from_approval_context(
     approval_id: str,
     *,
     tool_registry: ToolRegistry | None = None,
+    resume_claim_owned: bool = False,
 ) -> ToolResult | None:
     invocation = _approved_tool_invocation_from_approval_context(runtime, approval_id)
     if invocation is None:
         return None
+    if not resume_claim_owned:
+        from nullion.approval_resume import claim_approval_resume
+        if not claim_approval_resume(runtime, approval_id):
+            return None
     try:
         from nullion.runtime import invoke_tool_with_boundary_policy
 
@@ -2557,17 +2558,9 @@ def _resume_turn_from_snapshot(
     snapshot = suspended_turn.messages_snapshot
     if not snapshot:
         return None
-    # The snapshot ends with: [..., user_msg, assistant_tool_use]
-    # Extract the original user text from the snapshot
-    user_msg_content = None
-    for msg in reversed(snapshot):
-        if msg.get("role") == "user":
-            for block in (msg.get("content") or []):
-                if isinstance(block, dict) and block.get("type") == "text":
-                    user_msg_content = block.get("text")
-                    break
-        if user_msg_content:
-            break
+    # The last user-role message may be a runtime recovery nudge, not the
+    # original request. Never let that nudge become the resumed mission.
+    user_msg_content = str(suspended_turn.message or "").removeprefix("/chat ").strip()
     if not user_msg_content:
         return None
     screenshot_reply = _telegram_screenshot_reply_if_requested(
@@ -2646,7 +2639,7 @@ def _resume_turn_from_snapshot(
                 "role": "system",
                 "content": [{"type": "text", "text": _profile_text}],
             })
-        _user_context_text = _user_context_prompt_for_chat(chat_id, settings)
+        _user_context_text = _user_context_prompt_for_chat(suspended_turn.chat_id, settings)
         if _user_context_text:
             resume_system_history.append({
                 "role": "system",
@@ -2779,6 +2772,10 @@ def resume_approved_telegram_request(
     if approval is None or approval.status.value != "approved":
         return None
     if approval.action not in {"use_tool", "allow_boundary", AGENT_TURN_LIMIT_EXTENSION_ACTION}:
+        return None
+    from nullion.approval_resume import claim_approval_resume
+
+    if not claim_approval_resume(runtime, approval_id):
         return None
     suspended_turn = runtime.store.get_suspended_turn(approval_id)
     if suspended_turn is not None:
@@ -8864,7 +8861,8 @@ def _run_browser_screenshot_tool_directly(
         return None
     decision = getattr(registry, "turn_tool_scope_decision", None)
     tool_results: list[ToolResult] = []
-    flow_context = {"browser_session_scope": str(turn_id or uuid4().hex)}
+    flow_context = {"browser_session_scope": str(turn_id or uuid4().hex),
+        "artifact_extensions": list(getattr(decision, "requested_artifact_extensions", ()) or ())}
     target = extract_url_target(user_message)
     prior_navigation = None
     if target is None:
@@ -9553,6 +9551,10 @@ def _turn_scoped_attachment_extensions_for_registry(
     )
     decision = getattr(registry, "turn_tool_scope_decision", None)
     typed_extensions = _requested_artifact_extensions_from_registry(registry)
+    source_extensions = getattr(registry, "source_artifact_extensions", ())
+    if source_extensions and decision is not None:
+        raw_extensions = tuple(extension for extension in raw_extensions
+            if extension not in source_extensions or extension in typed_extensions)
     excluded_extensions = {
         str(extension or "").strip().lower()
         for extension in tuple(getattr(decision, "excluded_artifact_extensions", ()) or ())
@@ -10638,32 +10640,6 @@ def _connector_scope_builder_fallback(
             proposal=proposal,
         )
     return None
-
-
-def _active_connector_mention_builder_fallback(
-    user_message: object,
-    *,
-    tool_registry: object | None = None,
-    runtime: PersistentRuntime | None = None,
-) -> str | None:
-    if tool_registry is not None and not _registry_has_request_tool_scope(tool_registry):
-        return None
-    app_ids = mentioned_connector_app_ids(user_message, _active_connector_app_id_providers_for_message())
-    if not app_ids:
-        return None
-    app_id = app_ids[0]
-    app_label = _connector_app_label(app_id)
-    if _runtime_has_connector_skill_for_app(runtime, app_id):
-        return _connector_saved_skill_unavailable_text(app_label)
-    proposal = _store_connector_builder_proposal(
-        runtime,
-        app_id=app_id,
-        app_label=app_label,
-    )
-    return _connector_builder_fallback_text(
-        app_label,
-        proposal=proposal,
-    )
 
 
 def _compact_unstructured_clarification_fallback(
@@ -12064,6 +12040,8 @@ def _run_chat_turn_common_retries(
             retried_local_system_fallback=False,
         )
 
+    if (getattr(result, "response_presentation", None) or {}).get("source_report_status") in {"partial", "completed"}:
+        return _current_retry_result()
     if bool(getattr(result, "reached_iteration_limit", False)):
         return _current_retry_result()
     if had_account_source_selection and not numbered_option_selected:
@@ -12493,6 +12471,8 @@ def _run_chat_turn_saved_history_retry(
     mark_retry: Callable[[], None] | None = None,
     allow_history_search_retry: bool = True,
 ) -> tuple[object, object, bool]:
+    if (getattr(initial_result, "response_presentation", None) or {}).get("source_report_status") in {"partial", "completed"}:
+        return initial_result, active_tool_registry, False
     if not _turn_result_should_retry_with_saved_history(initial_result):
         return initial_result, active_tool_registry, False
     used_history_search = _turn_result_used_history_search(initial_result)
@@ -16123,7 +16103,7 @@ def _terminal_exec_outcome_reply(
         prefix += f" and it exited with code {exit_code}"
     prefix += "."
     terminal_output_path = str(output.get("terminal_output_path") or "").strip()
-    if terminal_output_path:
+    if terminal_output_path and terminal_output_path in artifact_paths_from_output_descriptors(output):
         return (
             f"{prefix} The output was too long for chat, so I saved the full output as a text file."
             f"\n\nMEDIA:{terminal_output_path}"
@@ -21270,6 +21250,16 @@ def _sanitize_chat_reply(
         tool_results=tool_results,
         source=source,
     ) or reply
+    # A persisted diagnostic capture is source evidence. Preserve the model's
+    # answer rather than replacing it with thousands of raw output characters.
+    if any(
+        _tool_result_name(result) == "terminal_exec"
+        and (output := _tool_result_output(result)).get("terminal_output_path")
+        and output_has_artifact_descriptors(output)
+        and not artifact_paths_from_output_descriptors(output)
+        for result in tool_results or ()
+    ):
+        return sanitized
     terminal_outcome_reply = _terminal_exec_outcome_reply(tool_results)
     discovery_paths = _local_discovery_paths_from_tool_results(tool_results)
     requested_file_search_delivery_identities = {
@@ -23161,7 +23151,6 @@ def _render_chat_turn(
     allow_attachment_model_planning = (
         planner_requested
         or attachment_context_present
-        or extract_url_target(effective_prompt) is not None
         or prompt_attachment_format_candidate
     )
     requested_attachment_extensions = _requested_attachment_extensions(
@@ -23525,6 +23514,7 @@ def _render_chat_turn(
     )
     turn_tool_flow_context = dict(turn_tool_flow_context or {})
     turn_tool_flow_context.update(
+        user_request=prompt,
         browser_session_scope=conversation_result.turn.turn_id,
         browser_session_owner=f"conversation:{conversation_id}",
     )
@@ -25027,24 +25017,8 @@ def _render_chat_turn(
                         )
                         else None
                     )
-                    connector_no_tool_fallback = (
-                        _active_connector_mention_builder_fallback(
-                            tool_scope_user_message,
-                            tool_registry=active_turn_tool_registry,
-                            runtime=runtime,
-                        )
-                        if (
-                            account_source_selection_reply is None
-                            and not suppress_foreground_reply
-                            and not numbered_option_context
-                            and not list(turn_result.tool_results or ())
-                        )
-                        else None
-                    )
                     if connector_scope_only_fallback:
                         reply = connector_scope_only_fallback
-                    elif connector_no_tool_fallback:
-                        reply = connector_no_tool_fallback
                     elif account_source_selection_reply is None and compact_followup_clarification and (
                         not _turn_result_has_substantive_tools(turn_result)
                         or _turn_result_used_only_scope_or_history_search(turn_result)

@@ -296,6 +296,28 @@ def output_has_artifact_descriptors(output: object) -> bool:
     return isinstance(output, dict) and isinstance(output.get("artifact_descriptors"), (list, tuple))
 
 
+
+def filter_source_artifact_paths(paths: Iterable[str], tool_results: Iterable[object]) -> list[str]:
+    """Explicit source/intermediate roles survive prose and raw path forwarding."""
+    blocked: set[str] = set()
+    deliverable: set[str] = set()
+    def identity(path: str) -> str:
+        return str(Path(path).expanduser().resolve())
+    for result in tool_results or ():
+        output = result.get("output") if isinstance(result, dict) else getattr(result, "output", None)
+        if not output_has_artifact_descriptors(output):
+            continue
+        for descriptor in output["artifact_descriptors"]:
+            if not isinstance(descriptor, dict) or not isinstance(descriptor.get("path"), str):
+                continue
+            role = descriptor.get("role")
+            if role in ARTIFACT_DELIVERY_ROLES:
+                deliverable.add(identity(descriptor["path"]))
+            elif role in {ARTIFACT_ROLE_SOURCE, ARTIFACT_ROLE_INTERMEDIATE}:
+                blocked.add(identity(descriptor["path"]))
+    blocked.difference_update(deliverable)
+    return [path for path in paths if identity(path) not in blocked]
+
 def promote_supporting_asset_artifact_paths(
     artifact_paths: list[str] | tuple[str, ...] | None,
     *,

@@ -22,6 +22,7 @@ from nullion.approval_markers import (
 from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
 from nullion import messaging_adapters as adapters
 from nullion.response_fulfillment_contract import strip_unselected_artifact_references
+from nullion.artifacts import filter_source_artifact_paths
 
 
 logger = logging.getLogger(__name__)
@@ -697,6 +698,7 @@ def _filter_last_mile_helper_artifact_paths(
 ) -> list[str]:
     if not artifact_paths or not tool_results:
         return artifact_paths
+    artifact_paths = filter_source_artifact_paths(artifact_paths, tool_results)
     helper_identities: set[str] = set()
     helper_suffixes: set[str] = set()
     normal_suffixes: set[str] = set()

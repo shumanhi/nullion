@@ -199,6 +199,7 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                 "spreadsheet, PDF, HTML, or deck files unless the user specifically requires visual/media bytes "
                 "inside that final file. "
                 "When the required attachment is a browser/page screenshot image, use extension .png. "
+                "URLs and their path/query suffixes identify source resources, not requested output formats. "
                 "Use null when no attachment file format is specified."
             ),
         }
@@ -293,7 +294,6 @@ def _extension_candidate_priority(token: str) -> int:
 
 
 _STRUCTURED_ATTACHMENT_DESCRIPTOR_KEYS = frozenset({"artifact", "artifacts", "file", "filename", "output", "path"})
-_SCREENSHOT_ATTACHMENT_RE = re.compile(r"\bscreenshots?\b", re.IGNORECASE)
 
 
 def _is_structured_attachment_descriptor(token: str) -> bool:
@@ -334,6 +334,9 @@ def _extension_from_match(token: str, raw_extension: str, *, allow_filename_toke
     mapped = ATTACHMENT_TOKEN_EXTENSIONS.get(normalized)
     parsed = urlparse(token.split("=", 1)[-1] if "://" in token else token)
     if parsed.scheme and parsed.netloc:
+        # A source URL suffix identifies the input resource, not an output file.
+        if not _is_structured_attachment_descriptor(token):
+            return None
         if _is_hidden_path_component_extension(parsed.path, raw_extension):
             return None
         path_suffix = ""
@@ -410,14 +413,6 @@ def _extension_token_node(state: AttachmentFormatState) -> dict[str, object]:
     return {}
 
 
-def _artifact_kind_node(state: AttachmentFormatState) -> dict[str, object]:
-    if state.get("plan") is not None:
-        return {}
-    if _SCREENSHOT_ATTACHMENT_RE.search(state.get("text") or ""):
-        return {"plan": AttachmentFormatPlan(extension=".png", evidence="artifact_kind")}
-    return {}
-
-
 def _default_node(state: AttachmentFormatState) -> dict[str, object]:
     if state.get("plan") is not None:
         return {}
@@ -429,12 +424,10 @@ def _compiled_attachment_format_graph():
     graph = StateGraph(AttachmentFormatState)
     graph.add_node("normalize", _normalize_node)
     graph.add_node("extension_token", _extension_token_node)
-    graph.add_node("artifact_kind", _artifact_kind_node)
     graph.add_node("default", _default_node)
     graph.add_edge(START, "normalize")
     graph.add_edge("normalize", "extension_token")
-    graph.add_edge("extension_token", "artifact_kind")
-    graph.add_edge("artifact_kind", "default")
+    graph.add_edge("extension_token", "default")
     graph.add_edge("default", END)
     return graph.compile()
 

@@ -33,6 +33,8 @@ def _make_spec(
     timeout: int = 30,
     input_schema: dict[str, object] | None = None,
     continuation_tools: tuple[str, ...] = (),
+    source_artifact_extensions: tuple[str, ...] = (),
+    source_artifact_only: bool = False,
 ) -> ToolSpec:
     return ToolSpec(
         name=name,
@@ -43,6 +45,8 @@ def _make_spec(
         timeout_seconds=timeout,
         input_schema=input_schema,
         continuation_tools=continuation_tools,
+        source_artifact_extensions=source_artifact_extensions,
+        source_artifact_only=source_artifact_only,
     )
 
 
@@ -107,8 +111,9 @@ def register_browser_tools(
         registry.register(
             _make_spec(
                 "browser_run_task",
-                "Use Browser Use visual navigation for a structured, multi-step read/compare task on a target URL. This tool itself captures and returns PNG screenshots together with grounded observations and unknown requirements; it fulfills screenshot capture without browser_screenshot. Its isolated browser session is not shared with low-level browser tools. Scope only this tool for a visual navigation task with screenshots; do not require a separate capture tool. Reuses the configured model. Prefer this for dynamic pages where low-level extraction is insufficient. Does not book or purchase. May take several minutes.",
+                "Use Browser Use visual navigation for a structured, multi-step read/compare task on a target URL. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. Its isolated browser session is not shared with low-level browser tools. Scope only this tool for a visual navigation task with screenshots; do not require a separate capture tool. Reuses the configured model. Prefer this for dynamic pages where low-level extraction is insufficient. Does not book or purchase. May take several minutes.",
                 risk=ToolRiskLevel.MEDIUM, side_effect=ToolSideEffectClass.WRITE, timeout=650,
+                source_artifact_extensions=(".png",),
                 input_schema={"type": "object", "properties": {
                     "task": {"type": "string", "description": "Structured browser objective with constraints and expected observations"},
                     "url": {"type": "string", "description": "HTTP/HTTPS target page"},
@@ -420,6 +425,8 @@ def register_browser_tools(
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=10,
+            source_artifact_extensions=(".png",),
+            source_artifact_only=True,
             input_schema=_object_schema(
                 {
                     "mode": {

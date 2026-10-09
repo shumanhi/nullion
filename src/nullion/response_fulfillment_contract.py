@@ -611,10 +611,12 @@ def _completed_structural_artifact_extensions_in_order(results: Iterable[object]
             continue
         tool_name = _result_like_tool_name(result)
         output = dict(_result_like_output(result))
-        paths = [
-            *artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES),
-            *_result_like_paths(result),
-        ]
+        if output_has_artifact_descriptors(output):
+            paths = artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES)
+            if not paths:
+                continue
+        else:
+            paths = list(_result_like_paths(result))
         if tool_name in _MEDIA_ARTIFACT_TOOL_EXTENSIONS:
             expected_extension = _MEDIA_ARTIFACT_TOOL_EXTENSIONS[tool_name]
             if not paths:

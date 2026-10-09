@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -265,6 +266,41 @@ def _telegram_reply_context(message) -> dict[str, object] | None:
         if isinstance(username, str) and username.strip():
             context["reply_to_username"] = username.strip()
     return {key: value for key, value in context.items() if value is not None}
+
+
+def _approval_callback_for_numeric_reply(message, *, bot_id: object) -> str | None:
+    """Resolve a number only from this bot's structured approval buttons."""
+    text = str(_message_text_or_caption(message) or "").strip()
+    if not text.isdecimal() or len(text) > 8:
+        return None
+    replied = getattr(message, "reply_to_message", None)
+    author = getattr(replied, "from_user", None)
+    if bot_id is None or not getattr(author, "is_bot", False) or getattr(author, "id", None) != bot_id:
+        return None
+    markup = getattr(replied, "reply_markup", None)
+    buttons = [button for row in (getattr(markup, "inline_keyboard", ()) or ()) for button in row]
+    callbacks = [getattr(button, "callback_data", None) for button in buttons]
+    parsed = [_parse_callback_data(data) for data in callbacks]
+    if not parsed or any(item is None or item[0] != "approval" for item in parsed):
+        return None
+    if len({item[2] for item in parsed}) != 1:
+        return None
+    index = int(text) - 1
+    return callbacks[index] if 0 <= index < len(callbacks) else None
+
+
+@dataclass(slots=True)
+class _ApprovalReplyCallback:
+    data: str
+    message: object
+    from_user: object
+    reply_message: object
+
+    async def answer(self, text: str, **kwargs) -> None:
+        # The card edit provides the normal acknowledgement. Stale choices
+        # need a visible answer because a text reply has no callback toast.
+        if kwargs.get("show_alert"):
+            await self.reply_message.reply_text(text, do_quote=False)
 
 
 def _telegram_active_turn_accepts_unstructured_followup(runtime: object, conversation_id: str | None) -> bool:
@@ -1452,6 +1488,8 @@ def _approval_card_text(approval) -> str:
         )
     else:
         lines.extend(["", format_approval_detail_markdown(detail)])
+    lines.extend(["", "Reply to this message with a number:"])
+    lines.extend(f"{index}. {label}" for index, (label, _action) in enumerate(_approval_card_actions(approval), 1))
     context = getattr(approval, "context", None)
     html_preview_path = ""
     if isinstance(context, dict):
@@ -2253,7 +2291,7 @@ async def _deliver_telegram_planner_summary_card(
     reply: str,
     status_messages: dict[tuple[str, str], int] | None = None,
     status_texts: dict[tuple[str, str], str] | None = None,
-    status_locks: dict[tuple[str, str], asyncio.Lock] | None = None,
+    status_locks: dict[tuple[str, str], threading.Lock] | None = None,
     typing_tasks: dict[tuple[str, str], asyncio.Task[None]] | None = None,
     task_card_store: PlatformTaskCardStore | None = None,
     force: bool = False,
@@ -2325,17 +2363,18 @@ async def _send_or_edit_telegram_status_message(
     group_id: str,
     text: str,
     status_texts: dict[tuple[str, str], str] | None = None,
-    status_locks: dict[tuple[str, str], asyncio.Lock] | None = None,
+    status_locks: dict[tuple[str, str], threading.Lock] | None = None,
 ) -> None:
     if bot is None or not chat_id or not group_id or not text:
         return
     key = (chat_id, group_id)
     if status_locks is not None:
-        lock = status_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            status_locks[key] = lock
-        async with lock:
+        # Background deliveries run on separate event loops. Serialize the
+        # message-id check and Telegram send/edit across those threads too.
+        lock = status_locks.setdefault(key, threading.Lock())
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        try:
             await _send_or_edit_telegram_status_message(
                 bot,
                 status_messages,
@@ -2344,6 +2383,8 @@ async def _send_or_edit_telegram_status_message(
                 text=text,
                 status_texts=status_texts,
             )
+        finally:
+            lock.release()
         return
     if status_texts is not None and status_texts.get(key) == text:
         return
@@ -2409,7 +2450,7 @@ async def _send_or_edit_telegram_task_status_message(
     runtime: PersistentRuntime,
     bot_token: str,
     status_texts: dict[tuple[str, str], str] | None = None,
-    status_locks: dict[tuple[str, str], asyncio.Lock] | None = None,
+    status_locks: dict[tuple[str, str], threading.Lock] | None = None,
     typing_tasks: dict[tuple[str, str], asyncio.Task[None]] | None = None,
 ) -> bool:
     key = (chat_id, group_id)
@@ -3750,6 +3791,10 @@ def _execute_decision_action(
                 "Approval expired",
                 "⏳ That approval is no longer active. Please rerun the request if you still want Nullion to continue.",
             )
+        from nullion.approval_resume import approval_resume_claimed
+
+        if approval.status is ApprovalStatus.APPROVED and approval_resume_claimed(service.runtime, record_id):
+            return ("Already handled", "This approval is already being handled or has finished. I won’t run the action again.")
         if getattr(approval, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
             multiplier = multiplier_for_limit_extension_action(action)
             if multiplier is None:
@@ -4062,7 +4107,7 @@ class ChatOperatorService:
     _live_config_signature_cache: tuple[object, ...] | None = None
     _status_messages: dict[tuple[str, str], int] = field(default_factory=dict)
     _status_texts: dict[tuple[str, str], str] = field(default_factory=dict)
-    _status_locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict)
+    _status_locks: dict[tuple[str, str], threading.Lock] = field(default_factory=dict)
     _status_typing_tasks: dict[tuple[str, str], asyncio.Task[None]] = field(default_factory=dict)
     _media_group_messages: dict[tuple[str, str], list[object]] = field(default_factory=dict)
     _media_group_claimed: set[tuple[str, str]] = field(default_factory=set)
@@ -4730,6 +4775,17 @@ class ChatOperatorService:
                 )
             turn_outcome = "unauthorized_ingress"
             _log_turn_timing(turn_outcome)
+            return
+        bot = getattr(context, "bot", None)
+        numeric_callback = _approval_callback_for_numeric_reply(message, bot_id=getattr(bot, "id", None))
+        if numeric_callback is not None and not _telegram_message_has_attachment_candidate(message):
+            callback = _ApprovalReplyCallback(
+                data=numeric_callback,
+                message=message.reply_to_message,
+                from_user=getattr(message, "from_user", None),
+                reply_message=message,
+            )
+            await self.on_callback_query(SimpleNamespace(callback_query=callback), context)
             return
         command_head = ""
         if isinstance(text_for_ack, str):
@@ -5669,12 +5725,12 @@ class ChatOperatorService:
                 raise
             # Stale proposal taps are common on mobile; keep the original card intact
             # and surface the status as a callback alert instead of replacing chat text.
-            skip_message_edit = kind == "proposal" and acknowledgement in {
+            skip_message_edit = (kind == "approval" and acknowledgement == "Already handled") or (kind == "proposal" and acknowledgement in {
                 "Expired",
                 "Already dismissed",
                 "Already archived",
                 "Already handled",
-            }
+            })
             callback_notice = reply if skip_message_edit else acknowledgement
             await _answer_callback_query_safely(
                 callback_query,
@@ -5684,7 +5740,7 @@ class ChatOperatorService:
             if message is None or skip_message_edit:
                 return
             await _deliver_callback_action_result(message, acknowledgement, reply)
-            should_resume_approval = kind == "approval" and action in {
+            should_resume_approval = acknowledgement != "Already handled" and kind == "approval" and action in {
                 "approve",
                 "allow_session",
                 "allow_once",
@@ -5905,7 +5961,7 @@ class ChatOperatorService:
                             runtime=_service_ref.runtime,
                             bot_token=bot_token,
                             status_texts=_status_texts,
-                            status_locks=_status_locks if use_loop_bound_state else None,
+                            status_locks=_status_locks,
                             typing_tasks=_status_typing_tasks if use_loop_bound_state else None,
                         )
 
