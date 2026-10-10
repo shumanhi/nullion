@@ -159,6 +159,7 @@ class RuntimeStore:
     scheduled_tasks: dict[str, ScheduledTask] = field(default_factory=dict)
     reminders: dict[str, ReminderRecord] = field(default_factory=dict)
     suspended_turns: dict[str, SuspendedTurn] = field(default_factory=dict)
+    approval_resume_claims: set[str] = field(default_factory=set, repr=False)
     doctor_signals: list[SignalRoute] = field(default_factory=list)
     sentinel_signals: list[SignalRoute] = field(default_factory=list)
     sentinel_escalations: list[SentinelEscalationArtifact] = field(default_factory=list)

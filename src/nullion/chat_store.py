@@ -193,6 +193,7 @@ def _collapse_adjacent_duplicate_bot_messages(messages: list[dict]) -> list[dict
 
 
 def _artifact_metadata_from_runtime_turn(turn: dict) -> dict[str, Any] | None:
+    from nullion.artifacts import ARTIFACT_DELIVERY_ROLES, artifact_paths_from_output_descriptors, output_has_artifact_descriptors, filter_source_artifact_paths
     paths: list[str] = []
 
     def add_path(value: object) -> None:
@@ -212,6 +213,10 @@ def _artifact_metadata_from_runtime_turn(turn: dict) -> dict[str, Any] | None:
         output = result.get("output")
         if not isinstance(output, dict):
             continue
+        if output_has_artifact_descriptors(output):
+            for path in artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES):
+                add_path(path)
+            continue
         for key in ("path", "artifact_path", "output_path"):
             add_path(output.get(key))
         for key in ("artifact_paths", "created_paths", "files"):
@@ -222,7 +227,7 @@ def _artifact_metadata_from_runtime_turn(turn: dict) -> dict[str, Any] | None:
                         add_path(value.get("path"))
                     else:
                         add_path(value)
-    deduped = list(dict.fromkeys(paths))
+    deduped = filter_source_artifact_paths(list(dict.fromkeys(paths)), turn.get("tool_results") or ())
     if not deduped:
         return None
     return {"artifacts": [{"path": path} for path in deduped]}

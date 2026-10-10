@@ -797,7 +797,7 @@ def _build_runtime_service_from_settings(
                         runtime=runtime,
                         bot_token=bot_token,
                         status_texts=getattr(service, "_status_texts", None),
-                        status_locks=None,
+                        status_locks=getattr(service, "_status_locks", None),
                         typing_tasks=None,
                     ))
                     return delivered

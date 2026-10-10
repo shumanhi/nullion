@@ -32,6 +32,7 @@ from nullion.artifacts import (
     artifact_output_descriptor,
     artifact_paths_from_output_descriptors,
     output_has_artifact_descriptors,
+    normalize_artifact_extensions,
 )
 from nullion.missions import MissionContinuationPolicy, MissionRecord, MissionStep
 from nullion.model_clients import is_model_timeout_error
@@ -1650,9 +1651,8 @@ def _artifact_paths_from_tool_result(
     if result.status != "completed":
         return []
     output = result.output if isinstance(result.output, dict) else {}
-    descriptor_paths = artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES)
-    if descriptor_paths:
-        return descriptor_paths
+    if output_has_artifact_descriptors(output):
+        return artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES)
     forwarded_paths: list[str] = []
     for key in ("artifact_path", "artifact_paths", "artifacts"):
         value = output.get(key)
@@ -1762,7 +1762,29 @@ def _required_attachment_extensions_from_turn_state(state: Mapping[str, Any]) ->
                     extension = f".{extension}"
                 if extension not in extensions:
                     extensions.append(extension)
+    registry = state.get("tool_registry")
+    source_extensions = getattr(registry, "source_artifact_extensions", ())
+    decision = getattr(registry, "turn_tool_scope_decision", None)
+    if source_extensions and decision is not None:
+        allowed = set(getattr(decision, "requested_artifact_extensions", ()))
+        extensions = [extension for extension in extensions if extension not in source_extensions or extension in allowed]
     return tuple(extensions)
+
+
+def _refresh_scoped_delivery_context(state: dict[str, Any], registry: object) -> None:
+    source_extensions = set(getattr(registry, "source_artifact_extensions", ()))
+    if not source_extensions:
+        return
+    context = dict(state.get("tool_flow_context") or {})
+    prior_extensions = {extension for key in ("artifact_extensions", "required_artifact_extensions", "requested_artifact_extensions")
+        for extension in normalize_artifact_extensions(context.get(key) or ())}
+    extensions = _required_attachment_extensions_from_turn_state(state)
+    for key in ("artifact_extensions", "required_artifact_extensions", "requested_artifact_extensions"):
+        if key in context:
+            context[key] = extensions
+    if prior_extensions.intersection(source_extensions) and not extensions:
+        context["requires_artifact_delivery"] = False
+    state["tool_flow_context"] = context
 
 
 def _turn_still_needs_scoped_email_send(state: Mapping[str, Any]) -> bool:
@@ -2764,7 +2786,7 @@ def _compact_tool_output_for_model_context(tool_name: str, output: object) -> ob
     if tool_name == "terminal_exec":
         compact = {
             key: safe_output.get(key)
-            for key in ("exit_code", "shell", "timeout_seconds", "network_mode", "artifact_paths")
+            for key in ("exit_code", "shell", "timeout_seconds", "network_mode", "artifact_paths", "artifact_descriptors")
             if safe_output.get(key) is not None
         }
         for key in ("stdout", "stderr"):
@@ -4012,8 +4034,10 @@ def _sourced_artifact_requires_outcome_review(
 def _partial_source_report_delivery_ready(state, tool_results) -> bool:
     """A typed partial report can be delivered without claiming full fulfillment."""
     results = list(tool_results)
-    from nullion.source_observation_contract import partial_source_report_disclosures
-    if not partial_source_report_disclosures(results):
+    from nullion.source_observation_contract import source_report_status, pending_source_continuation
+    if pending_source_continuation(results):
+        return False
+    if not source_report_status(results):
         return False
     if any(normalize_tool_status(result.status) != "completed" for result in results):
         return False
@@ -4028,14 +4052,17 @@ def _partial_source_report_delivery_ready(state, tool_results) -> bool:
 
 
 def _complete_partial_source_report(state, final_text=None):
-    from nullion.source_observation_contract import partial_source_report_reply
+    from nullion.source_observation_contract import partial_source_report_reply, source_report_status
+    report_status = source_report_status(state.get("tool_results") or [])
     reply = partial_source_report_reply(state.get("tool_results") or [], draft=final_text)
     reply = sanitize_user_visible_reply(user_message=state.get("user_message"), reply=reply,
         tool_results=list(state.get("tool_results") or []), source="agent")
     paths = [str(path) for path in state.get("artifacts") or [] if Path(path).is_file()]
     if paths:
         reply += "\n\n" + "\n".join("MEDIA:" + path for path in dict.fromkeys(paths))
-    return _complete_agent_turn(state, final_text=reply, response_fulfilled=False,
+    state = {**state, "response_presentation": {**dict(state.get("response_presentation") or {}),
+             "source_report_status": report_status}}
+    return _complete_agent_turn(state, final_text=reply, response_fulfilled=report_status == "completed",
                                 completion_failure_reply=reply)
 
 
@@ -5660,7 +5687,8 @@ def _missing_required_tool_nudge(missing_requirements: tuple[str, ...]) -> str:
     return (
         "The active task is not complete yet. The next assistant step must invoke the registered tool needed for "
         f"{missing}. Do not give a final reply before that tool runs. If that tool requires approval, invoke it so "
-        "the approval prompt is created."
+        "the approval prompt is created. Preserve the original request and its breadth when producing the final answer. "
+        "Combine the new evidence with the existing results; do not replace a collection overview with only the last detail record."
     )
 
 
@@ -8345,6 +8373,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     browser_low_quality_items_continuation_nudged: bool
     browser_terminal_revalidation_attempt_keys: list[str]
     source_report_delivery_ready: bool
+    source_continuation_nudges: int
     completion_review_count: int
     completion_review_unresolved_requirements: list[str]
     repeated_failure_limit: int
@@ -9181,6 +9210,13 @@ def _execute_agent_turn_tool_uses(
             user_message=state.get("user_message") or user_message,
         )
         invocation_context = dict(state.get("tool_flow_context") or {})
+        # Tool adapters receive the current typed delivery contract, including
+        # scope updates made earlier in this turn. No prompt parsing is needed.
+        requested_extensions = _required_attachment_extensions_from_turn_state(state)
+        invocation_context["requested_artifact_extensions"] = requested_extensions
+        for contract_key in ("artifact_extensions", "required_artifact_extensions"):
+            if contract_key in invocation_context:
+                invocation_context[contract_key] = requested_extensions
         prior_navigation = None
         if tool_name in {"browser_open", "browser_screenshot"} and not any(
             result.tool_name.startswith("browser_") for result in tool_results
@@ -9216,6 +9252,7 @@ def _execute_agent_turn_tool_uses(
                 tool_duration_ms = (time.perf_counter() - tool_started_at) * 1000
                 tool_registry = widened_registry
                 state["tool_registry"] = widened_registry
+                _refresh_scoped_delivery_context(state, widened_registry)
                 tool_results.append(result)
                 _emit_tool_activity(result)
                 if runtime_store is not None:
@@ -9240,6 +9277,7 @@ def _execute_agent_turn_tool_uses(
                     recovery_duration_ms = (time.perf_counter() - recovery_started_at) * 1000
                     tool_registry = widened_registry
                     state["tool_registry"] = widened_registry
+                    _refresh_scoped_delivery_context(state, widened_registry)
                     tool_results.append(scope_result)
                     tool_recovery_scopes_attempted.append(recovery_scope)
                     _emit_tool_activity(scope_result)
@@ -10354,9 +10392,9 @@ def _agent_turn_tools_node(state: _AgentTurnGraphState) -> dict[str, object]:
         update["source_report_delivery_ready"] = True
         update["messages"] = [*(update.get("messages") or candidate_state.get("messages") or []),
             {"role": "user", "content": [{"type": "text", "text":
-                "The tool returned a deliverable partial source report. Summarize the recorded observations now; "
+                "The tool returned a usable source report. Summarize the recorded observations now; "
                 "describe unshown requirements as unresolved. Do not claim full fulfillment, recheck an explicitly "
-                "unshown field, or invoke more tools. Screenshots accompany the findings."}]}]
+                "unshown field, or invoke more tools. Only deliver attachments selected by the typed artifact descriptors."}]}]
     if state.get("enable_doctor_notifications", False) and "result" not in update:
         doctor_threshold = int(state.get("doctor_threshold") or 1)
         next_notice = int(state.get("next_doctor_notice_at") or doctor_threshold)
@@ -10389,6 +10427,17 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         if isinstance(block, dict) and block.get("type") == "text"
     ]
     final_text = "".join(part for part in final_parts if isinstance(part, str)).strip() or None
+    from nullion.source_observation_contract import pending_source_continuation
+    continuation = pending_source_continuation(tool_results)
+    if continuation and int(state.get("source_continuation_nudges") or 0) < 2:
+        available = {spec.name for spec in state["tool_registry"].list_specs()}
+        if available.intersection(continuation.get("tool_names") or ()):
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": [{"type": "text", "text":
+                "The source tool returned an unresolved alternative_source continuation: "
+                + json.dumps(continuation, ensure_ascii=False)
+                + ". Continue the same request using a different safe source or entry point. Do not retry the same blocked URL or present its link as a completed lookup. Keep useful findings; do not submit or book without authorization."}]})
+            return {"messages": messages, "source_continuation_nudges": int(state.get("source_continuation_nudges") or 0) + 1}
     if state.get("source_report_delivery_ready"):
         return _complete_partial_source_report(state, final_text)
     if state.get("use_authoritative_completion_text", False):

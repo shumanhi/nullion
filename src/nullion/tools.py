@@ -1495,6 +1495,8 @@ class ToolSpec:
     input_schema: dict[str, object] | None = None
     capability_tags: tuple[str, ...] = ()
     continuation_tools: tuple[str, ...] = ()
+    source_artifact_extensions: tuple[str, ...] = ()
+    source_artifact_only: bool = False
 
 
 @dataclass(slots=True)
@@ -3339,7 +3341,7 @@ def _materialize_terminal_output_attachment(
         return None
     try:
         root.mkdir(parents=True, exist_ok=True)
-        path = root / f"terminal-output-{invocation.invocation_id[:12]}.txt"
+        path = root / f"terminal-output-{uuid4().hex}.txt"
         path.write_text(text + "\n", encoding="utf-8")
         return str(path.resolve())
     except OSError:
@@ -11747,7 +11749,12 @@ def _build_terminal_exec_handler(
                 error=str(mutation_denial.get("message") or "Filesystem mutation approval required"),
             )
 
-        egress_attempts = _egress_attempts_for_invocation(invocation)
+        # Filesystem and account facts have their own boundary checks. They
+        # must not be treated as network targets by the terminal network policy.
+        egress_attempts = [
+            attempt for attempt in _egress_attempts_for_invocation(invocation)
+            if attempt.get("kind") == BoundaryKind.OUTBOUND_NETWORK.value
+        ]
         raw_network_mode = invocation.arguments.get("network_mode")
         network_mode = _normalize_network_mode(raw_network_mode)
         if raw_network_mode is not None and network_mode not in _VALID_NETWORK_MODES:
@@ -11929,7 +11936,11 @@ def _build_terminal_exec_handler(
             descriptors.append(
                 artifact_output_descriptor(
                     terminal_output_path,
-                    role=ARTIFACT_ROLE_DELIVERABLE,
+                    role=(
+                        ARTIFACT_ROLE_DELIVERABLE
+                        if ".txt" in (invocation.flow_context or {}).get("requested_artifact_extensions", ())
+                        else ARTIFACT_ROLE_SOURCE
+                    ),
                     kind="terminal_output",
                     label="Terminal output",
                 )

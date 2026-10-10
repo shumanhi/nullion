@@ -288,51 +288,21 @@ def format_active_connector_provider_context_for_prompt(
 
 
 def mentioned_connector_app_ids(text: object, providers: Iterable[Mapping[str, object]]) -> tuple[str, ...]:
-    raw_text = str(text or "").lower()
-    text_tokens = re.findall(r"[a-z0-9]+", raw_text)
-    if not text_tokens:
-        return ()
-    text_token_set = set(text_tokens)
-    compact_text = "".join(text_tokens)
-    generic_app_id_tokens = {
-        "app",
-        "api",
-        "cloud",
-        "co",
-        "com",
-        "connector",
-        "dev",
-        "io",
-        "net",
-        "org",
-        "service",
-        "services",
-    }
+    """Recognize complete registered identifiers, never natural-language fragments.
+
+    Aliases and intent belong to a structured scope decision. Splitting an app
+    identifier turns ordinary words such as a follow-up's subject into a false
+    connector request and can add inventory/classifier work to plain turns.
+    """
+    raw_text = str(text or "").casefold()
     mentioned: list[str] = []
     for provider in providers:
         raw_app_ids = provider.get("active_app_ids") if isinstance(provider, Mapping) else None
         for raw_app_id in raw_app_ids if isinstance(raw_app_ids, (list, tuple)) else ():
-            app_id = str(raw_app_id or "").strip().lower()
+            app_id = str(raw_app_id or "").strip().casefold()
             if not app_id or app_id in mentioned:
                 continue
-            app_tokens = re.findall(r"[a-z0-9]+", app_id)
-            if not app_tokens:
-                continue
-            if len(app_tokens) == 1:
-                if app_tokens[0] in text_token_set:
-                    mentioned.append(app_id)
-                continue
-            if "".join(app_tokens) in compact_text:
-                mentioned.append(app_id)
-                continue
-            # App ids often include a provider prefix plus a user-visible source
-            # token, for example "vendor-calendar". Treat those app-id-derived
-            # source tokens as structured metadata, not product routing prose.
-            if any(
-                token in text_token_set
-                for token in app_tokens[1:]
-                if len(token) >= 3 and token not in generic_app_id_tokens
-            ):
+            if re.search(r"(?<![\w.-])" + re.escape(app_id) + r"(?![\w.-])", raw_text):
                 mentioned.append(app_id)
     return tuple(mentioned)
 

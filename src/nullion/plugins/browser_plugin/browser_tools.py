@@ -5277,12 +5277,19 @@ class BrowserTools:
             )
             artifact_path.write_bytes(png_bytes)
             path = str(artifact_path)
+            from nullion.artifacts import artifact_output_descriptor, normalize_artifact_extensions
+            context = invocation.flow_context or {}
+            requested_extensions = set()
+            for key in ("artifact_extensions", "required_artifact_extensions", "requested_artifact_extensions"):
+                values = context.get(key) or ()
+                requested_extensions.update(normalize_artifact_extensions((values,) if isinstance(values, str) else values))
             return _ok(
                 invocation,
                 {
                     "path": path,
                     "artifact_path": path,
                     "artifact_paths": [path],
+                    "artifact_descriptors": [artifact_output_descriptor(path, role="deliverable" if ".png" in requested_extensions else "source", kind="screenshot")],
                     "format": "png",
                     "size_bytes": len(png_bytes),
                     "session_id": session_id,

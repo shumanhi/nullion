@@ -80,6 +80,7 @@ from nullion.artifacts import (
     artifact_root_for_runtime,
     ensure_artifact_root,
     is_unrequested_internal_sidecar_artifact,
+    filter_source_artifact_paths,
     media_candidate_paths_from_text,
     normalize_artifact_extensions,
     output_has_artifact_descriptors,
@@ -9702,6 +9703,25 @@ function renderMessageText(text) {
     stash(`<pre><code>${code.replace(/^\n|\n$/g, '')}</code></pre>`)
   );
   html = html.replace(/`([^`\n]+)`/g, (_, code) => stash(`<code>${code}</code>`));
+  const link = (label, escapedTarget) => {
+    const decoder = document.createElement('textarea');
+    decoder.innerHTML = escapedTarget;
+    const target = decoder.value;
+    try {
+      const parsed = new URL(target);
+      if (!/^https?:\/\//i.test(target) || !['http:', 'https:'].includes(parsed.protocol)) return null;
+    } catch (_) { return null; }
+    return stash(`<a href="${escAttr(target)}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+  };
+  html = html.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/gi,
+    (original, label, target) => link(label, target) || original);
+  html = html.replace(/https?:\/\/[^\s<>\u0000]+/gi, (original) => {
+    let target = original.replace(/[.,;!]+$/, '');
+    while (target.endsWith(')') && (target.match(/\)/g) || []).length > (target.match(/\(/g) || []).length) {
+      target = target.slice(0, -1);
+    }
+    return (link(target, target) || target) + original.slice(target.length);
+  });
   html = html.replace(/\*\*([^*\n][\s\S]*?[^*\n]?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/(^|[^\w*])\*([^*\s\n][^*\n]*?[^*\s\n]?)\*(?!\*)/g, '$1<em>$2</em>');
   html = renderMessageBlocks(html);
@@ -17620,12 +17640,14 @@ _WEB_PRIMARY_PACKAGE_EXTENSIONS = frozenset({".csv", ".docx", ".html", ".pdf", "
 
 
 def _web_prompt_requested_attachment_extensions(prompt: str | None) -> tuple[str, ...]:
+    # A source URL's path/query suffix is not a requested attachment format.
+    text = " ".join(token for token in str(prompt or "").split() if "://" not in token)
     extensions: list[str] = []
-    for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", str(prompt or "")):
+    for match in re.finditer(r"\.([A-Za-z0-9]{1,12})(?![\w/-])", text):
         extension = f".{match.group(1).lower()}"
         if extension in VALID_ATTACHMENT_EXTENSIONS:
             extensions.append(extension)
-    for token in re.findall(r"[A-Za-z0-9_+-]+", str(prompt or "")):
+    for token in re.findall(r"[A-Za-z0-9_+-]+", text):
         extension = ATTACHMENT_TOKEN_EXTENSIONS.get(token.lower())
         if extension in VALID_ATTACHMENT_EXTENSIONS:
             extensions.append(extension)
@@ -18288,7 +18310,8 @@ def _web_delivery_artifact_paths(
         for path in candidates
         if _web_normalized_path_identity(path) not in unverified_browser_screenshot_paths
     ]
-    candidates = list(dict.fromkeys(str(path) for path in candidates if str(path or "").strip()))
+    candidates = filter_source_artifact_paths(
+        list(dict.fromkeys(str(path) for path in candidates if str(path or "").strip())), tool_results)
     if email_attachment_paths:
         # An email send's attachment list is the typed delivery contract. Earlier
         # helper artifacts may include source media or drafts that should not be
@@ -22382,7 +22405,8 @@ def create_app(runtime, orchestrator, registry):
                     from nullion.chat_store import _artifact_metadata_from_runtime_turn
                     metadata = _artifact_metadata_from_runtime_turn(event) or {}
                     if event.get("artifacts"):
-                        metadata["artifacts"] = event["artifacts"]
+                        metadata["artifacts"] = [{"path": path} for path in filter_source_artifact_paths(
+                            _web_result_artifact_paths(event["artifacts"]), event.get("tool_results") or ())]
                     hydrated = _hydrate_chat_history_media(runtime, [{
                         "role": "bot", "text": event["assistant_reply"], "metadata": metadata,
                     }], principal_id=conv_id)
@@ -24114,6 +24138,10 @@ def create_app(runtime, orchestrator, registry):
             from nullion.approval_decisions import approve_request_with_mode, normalize_approval_mode
 
             store = runtime.store
+            from nullion.approval_resume import approval_resume_claimed
+            if approval_resume_claimed(runtime, approval_id):
+                return JSONResponse({"ok": True, "approval_id": approval_id,
+                    "already_handled": True, "resume": None, "resumed_text": None})
             suspended_turn = store.get_suspended_turn(approval_id)
 
             async def resume_existing_suspended_turn() -> dict[str, Any] | None:
@@ -24144,6 +24172,8 @@ def create_app(runtime, orchestrator, registry):
                     }
 
             def resume_approved_tool_from_context() -> dict[str, Any] | None:
+                if suspended_turn is not None:
+                    return None
                 current_req = store.get_approval_request(approval_id)
                 if current_req is None:
                     return None
@@ -30723,6 +30753,10 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     if suspended_turn is None:
         return None
 
+    from nullion.approval_resume import claim_approval_resume
+    if not claim_approval_resume(runtime, approval_id):
+        return None
+
     if suspended_turn.task_id:
         if orchestrator is None:
             return None
@@ -30819,6 +30853,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
                 runtime,
                 approval_id,
                 tool_registry=registry,
+                resume_claim_owned=True,
             )
         except Exception:
             logger.exception("Failed to execute approved tool context for approval %s", approval_id)
