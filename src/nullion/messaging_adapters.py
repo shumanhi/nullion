@@ -862,10 +862,14 @@ def _resolve_output_attachment_filename(name: str, *, principal_id: str | None) 
 def sanitize_external_inline_markup(text: str) -> str:
     """Strip lightweight HTML emphasis tags commonly copied from RSS/search results."""
     text = normalize_platform_code_fences(text)
-    unescaped = html.unescape(text)
-    if not _EXTERNAL_INLINE_TAG_PATTERN.search(unescaped):
-        return text
-    return _EXTERNAL_INLINE_TAG_PATTERN.sub("", unescaped)
+    # Code is literal content. Strip copied presentation tags only outside
+    # fenced blocks and inline code, including on the shared preparation path.
+    parts = re.split(r"(```[\s\S]*?```|`[^`\n]+`)", text)
+    for index in range(0, len(parts), 2):
+        unescaped = html.unescape(parts[index])
+        if _EXTERNAL_INLINE_TAG_PATTERN.search(unescaped):
+            parts[index] = _EXTERNAL_INLINE_TAG_PATTERN.sub("", unescaped)
+    return "".join(parts)
 
 
 _QUOTE_CODE_FENCE_LINE_RE = re.compile(
@@ -882,7 +886,15 @@ def normalize_platform_code_fences(text: str | None) -> str:
     lines = value.splitlines()
     normalized: list[str] = []
     active_quote_fence: str | None = None
+    in_backtick_fence = False
     for line in lines:
+        if active_quote_fence is None and line.lstrip().startswith("```"):
+            in_backtick_fence = not in_backtick_fence
+            normalized.append(line)
+            continue
+        if in_backtick_fence:
+            normalized.append(line)
+            continue
         match = _QUOTE_CODE_FENCE_LINE_RE.match(line)
         if match is None:
             normalized.append(line)
@@ -2327,15 +2339,21 @@ async def retry_messaging_delivery_operation(
 
 
 def split_reply_for_platform(reply: str | None, *, limit: int) -> list[str]:
+    if limit < 1:
+        raise ValueError("Message chunk limit must be positive")
     if reply is None:
         return []
     text = str(reply).strip()
     if not text:
         return []
+    if "```" in text and len(text) > limit and limit >= 80:
+        return _split_fenced_reply_for_platform(text, limit=limit)
     chunks: list[str] = []
     remaining = text
     while len(remaining) > limit:
-        split_at = remaining.rfind("\n", 0, limit)
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = remaining.rfind("\n", 0, limit)
         if split_at < limit // 2:
             split_at = remaining.rfind(" ", 0, limit)
         if split_at < limit // 2:
@@ -2344,6 +2362,37 @@ def split_reply_for_platform(reply: str | None, *, limit: int) -> list[str]:
         remaining = remaining[split_at:].strip()
     if remaining:
         chunks.append(remaining)
+    return chunks
+
+
+def _split_fenced_reply_for_platform(text: str, *, limit: int) -> list[str]:
+    """Reopen literal code blocks when they cross a message boundary."""
+    chunks = []
+    remaining = text
+    fence = None
+    while remaining:
+        prefix = fence + "\n" if fence else ""
+        # Reserve a closing fence, including when this chunk opens a block.
+        budget = limit - len(prefix) - 4
+        if len(remaining) <= budget:
+            split_at = len(remaining)
+        else:
+            split_at = remaining.rfind("\n\n", 0, budget)
+            if split_at < budget // 2:
+                split_at = remaining.rfind("\n", 0, budget)
+            if split_at < budget // 2:
+                split_at = budget
+        raw = remaining[:split_at]
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if fence is None and re.fullmatch(r"```[A-Za-z0-9_+.-]{0,32}", stripped):
+                fence = stripped
+            elif stripped == "```":
+                fence = None
+        chunks.append(prefix + raw + ("\n```" if fence else ""))
+        remaining = remaining[split_at:]
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
     return chunks
 
 

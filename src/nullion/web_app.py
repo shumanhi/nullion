@@ -2865,6 +2865,11 @@ _HTML = r"""<!DOCTYPE html>
   }
   .bubble strong { color: var(--text); font-weight: 800; }
   .bubble em { color: var(--text); font-style: italic; }
+  .bubble a:not(.artifact-link), .ahm-text a {
+    color: #93c5fd; text-decoration: underline; text-underline-offset: 2px;
+    overflow-wrap: anywhere;
+  }
+  .bubble a:not(.artifact-link):visited, .ahm-text a:visited { color: #c4b5fd; }
   .msg.bot .bubble { white-space: normal; }
   .bubble ul {
     margin: 6px 0 10px 18px; padding: 0;
@@ -6929,7 +6934,7 @@ function renderTaskStatusText(text) {
     if (taskMatch) {
       const visual = taskStatusVisual(taskMatch[1]);
       rowStates.push(visual.cls);
-      rows.push(`<div class="task-status-row ${visual.cls}"><span class="task-status-icon" aria-hidden="true">${escHtml(visual.symbol)}</span><span class="task-status-label">${escHtml(taskMatch[2])}</span></div>`);
+      rows.push(`<div class="task-status-row ${visual.cls}"><span class="task-status-icon" aria-hidden="true">${escHtml(visual.symbol)}</span><span class="task-status-label">${renderMessageText(taskMatch[2], {inline: true})}</span></div>`);
       return;
     }
     titles.push(line.replace(/^→\s*/, '').replace(/:$/, '').trim());
@@ -6946,7 +6951,7 @@ function renderTaskStatusText(text) {
   const cardState = allTerminal ? 'complete' : 'active';
   const titleIcon = allTerminal ? '✓' : '◐';
   const titleHtml = titles.length
-    ? `<div class="task-status-title"><span class="task-status-title-icon" aria-hidden="true">${titleIcon}</span><span>${escHtml(title)}</span></div>`
+    ? `<div class="task-status-title"><span class="task-status-title-icon" aria-hidden="true">${titleIcon}</span><span>${renderMessageText(title, {inline: true})}</span></div>`
     : '';
   return `<div class="task-status-card ${cardState}">${plannerHtml}${subjectHtml}${titleHtml}<div class="task-status-list">${rows.join('')}</div></div>`;
 }
@@ -9690,7 +9695,7 @@ function renderBuilderNotice(skills) {
   return `<div class="builder-notice"><div class="builder-notice-head"><span class="builder-notice-icon">${NI.wrench()}</span><span>Builder</span></div><div class="builder-notice-list">${items}</div></div>`;
 }
 
-function renderMessageText(text) {
+function renderMessageText(text, options = {}) {
   const builder = splitBuilderNoticeText(text);
   const placeholders = [];
   const stash = (html) => {
@@ -9699,6 +9704,11 @@ function renderMessageText(text) {
     return key;
   };
   let html = escHtml(builder.body || '');
+  html = html.replace(/```(?:([a-z0-9_+.-]{1,32})[ \t]*)?\n([\s\S]*?)```/gi, (_, language, code) =>
+    stash(`<pre><code${language ? ` class="language-${language.toLowerCase()}"` : ''}>${code.replace(/\n$/, '')}</code></pre>`)
+  );
+  // Retain legacy compact fences; standard fences above keep language metadata
+  // out of the literal code and preserve its indentation.
   html = html.replace(/```([\s\S]*?)```/g, (_, code) =>
     stash(`<pre><code>${code.replace(/^\n|\n$/g, '')}</code></pre>`)
   );
@@ -9724,7 +9734,7 @@ function renderMessageText(text) {
   });
   html = html.replace(/\*\*([^*\n][\s\S]*?[^*\n]?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/(^|[^\w*])\*([^*\s\n][^*\n]*?[^*\s\n]?)\*(?!\*)/g, '$1<em>$2</em>');
-  html = renderMessageBlocks(html);
+  if (!options.inline) html = renderMessageBlocks(html);
   placeholders.forEach((value, index) => {
     html = html.replaceAll(`\u0000${index}\u0000`, value);
   });
@@ -9760,8 +9770,10 @@ function renderMessageBlocks(html) {
   };
   const isSeparator = (cells) => cells && cells.some(cell => cell.includes('-')) && cells.every(cell => cell.replace(/[:-]/g, '').trim() === '');
   const renderTable = (header, rows) => {
-    const head = header.map(cell => `<th>${cell}</th>`).join('');
-    const body = rows.map(row => '<tr>' + header.map((_, idx) => `<td>${row[idx] || ''}</td>`).join('') + '</tr>').join('');
+    const width = Math.max(header.length, ...rows.map(row => row.length));
+    const columns = Array.from({length: width}, (_, idx) => idx);
+    const head = columns.map(idx => `<th>${header[idx] || ''}</th>`).join('');
+    const body = rows.map(row => '<tr>' + columns.map(idx => `<td>${row[idx] || ''}</td>`).join('') + '</tr>').join('');
     return `<div class="message-table-wrap"><table class="message-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
   };
   for (let i = 0; i < lines.length; i++) {
@@ -21984,7 +21996,8 @@ def create_app(runtime, orchestrator, registry):
                 metadata={"artifacts": artifact_payloads} if artifact_payloads else None,
             )
         except Exception:
-            logger.debug("Could not persist web cron fallback delivery", exc_info=True)
+            logger.warning("Could not persist web cron fallback delivery", exc_info=True)
+            return False
         loop = _WEB_DELIVERY_LOOP
         if loop is not None and not loop.is_closed():
             try:

@@ -10,6 +10,21 @@ from __future__ import annotations
 import re
 
 
+def transform_markdown_prose(text: str, transform) -> str:
+    """Apply presentation cleanup without changing literal Markdown code."""
+    parts = re.split(r"(```[\s\S]*?```|`[^`\n]+`)", text)
+    if len(parts) == 1:
+        return transform(text)
+    for index in range(0, len(parts), 2):
+        part = parts[index]
+        if not part.strip():
+            continue
+        leading = part[:len(part) - len(part.lstrip())]
+        trailing = part[len(part.rstrip()):]
+        parts[index] = leading + transform(part).strip() + trailing
+    return "".join(parts)
+
+
 def _is_generic_column_label(label: str) -> bool:
     normalized = " ".join(str(label or "").strip().lower().split())
     if not normalized:
@@ -29,7 +44,7 @@ def _split_table_row(line: str) -> list[str] | None:
     stripped = line.strip()
     if not (stripped.startswith("|") and stripped.endswith("|")):
         return None
-    cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+    cells = [cell.strip() for cell in stripped[1:-1].split("|")]
     if len(cells) < 2:
         return None
     return cells
@@ -45,7 +60,15 @@ def _is_separator_row(cells: list[str]) -> bool:
 
 def _expand_compacted_table_lines(text: str) -> str:
     lines: list[str] = []
+    in_fence = False
     for line in str(text).splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            lines.append(line)
+            continue
+        if in_fence:
+            lines.append(line)
+            continue
         if "|" not in line or "---" not in line:
             lines.append(line)
             continue
@@ -58,12 +81,13 @@ def _render_table_as_list(header: list[str], rows: list[list[str]]) -> list[str]
     rendered: list[str] = []
     multiple_rows = len(rows) > 1
     for row_index, row in enumerate(rows, start=1):
-        cells = [_clean_cell(row[index] if index < len(row) else "") for index in range(len(header))]
-        if len(header) == 2 and cells[0] and cells[1]:
+        cells = [_clean_cell(cell) for cell in row]
+        if len(header) == 2 and len(cells) == 2 and cells[0] and cells[1]:
             rendered.append(f"- {cells[0]}: {cells[1]}")
             continue
         parts: list[tuple[str, str]] = []
-        for cell_index, heading in enumerate(header):
+        for cell_index in range(max(len(header), len(cells))):
+            heading = header[cell_index] if cell_index < len(header) else f"Column {cell_index + 1}"
             value = cells[cell_index] if cell_index < len(cells) else ""
             if not value:
                 continue

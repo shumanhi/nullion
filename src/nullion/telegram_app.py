@@ -536,6 +536,9 @@ def _attachments_include_video(attachments: list[dict[str, str]] | None) -> bool
 
 
 def _split_telegram_message_chunks(text: str, *, limit: int = _TELEGRAM_MESSAGE_CHUNK_SIZE) -> list[str]:
+    if "```" in text:
+        from nullion.messaging_adapters import split_reply_for_platform
+        return split_reply_for_platform(text, limit=limit)
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -804,7 +807,7 @@ async def _deliver_callback_action_result(message, acknowledgement: str, reply: 
     )
 
 
-async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool, **kwargs) -> bool:
+async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool, **kwargs):
     reply_text = getattr(message, "reply_text", None)
     if reply_text is None:
         return False
@@ -818,10 +821,10 @@ async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool
     edit_text = getattr(sent, "edit_text", None)
     if edit_text is None:
         for chunk in chunks[1:]:
-            await retry_messaging_delivery_operation(
+            sent = await retry_messaging_delivery_operation(
                 lambda chunk=chunk: reply_text(chunk, do_quote=False, **safe_kwargs)
             )
-        return True
+        return sent
     rendered = chunks[0]
     for chunk in chunks[1:]:
         rendered += chunk
@@ -829,7 +832,7 @@ async def _reply_text_with_streaming_edits(message, text: str, *, do_quote: bool
             lambda rendered=rendered: edit_text(rendered, **safe_kwargs)
         )
         await asyncio.sleep(0.02)
-    return True
+    return sent
 
 
 class _TelegramTextDeltaStreamer:
@@ -1978,11 +1981,16 @@ async def _deliver_reply(
         ):
             try:
                 _mark_timing("streaming_text_retry")
-                if await _reply_text_with_streaming_edits(
+                sent_message = await _reply_text_with_streaming_edits(
                     message,
                     formatted_reply,
                     do_quote=do_quote,
-                ):
+                )
+                if sent_message:
+                    _record_telegram_delivery_receipt(
+                        message, delivery, transport_ok=True, request_id=request_id,
+                        delivered_message=sent_message,
+                    )
                     _mark_timing("delivery_complete")
                     total_ms = (time.perf_counter() - started_at) * 1000
                     _log_slow_delivery(total_ms)

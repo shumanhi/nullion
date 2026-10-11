@@ -2265,11 +2265,11 @@ def _chat_prompt_for_message(message: str) -> str | None:
     if planner_command.requested:
         return planner_command.prompt or None
     if stripped.startswith("/") and is_operator_command_text(stripped):
-        parts = stripped.split()
+        parts = stripped.split(maxsplit=1)
         head = _normalize_command_head(parts[0])
         if head != "/chat":
             return None
-        prompt = " ".join(parts[1:]) if head == "/chat" else stripped.removeprefix("/chat").strip()
+        prompt = parts[1] if len(parts) > 1 else ""
         return prompt or None
     return stripped
 

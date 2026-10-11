@@ -413,6 +413,13 @@ def _restore_account_tool_prefix(text: str, *, original: str, account_tool_famil
 
 def _strip_emoji_characters(text: str) -> str:
     value = str(text or "")
+    if "`" in value:
+        from nullion.chat_text import transform_markdown_prose
+        return transform_markdown_prose(value, _strip_emoji_prose)
+    return _strip_emoji_prose(value)
+
+
+def _strip_emoji_prose(value: str) -> str:
     chars: list[str] = []
     line_start = True
     preserve_line_heading_emoji = False
@@ -471,16 +478,25 @@ def _strip_invisible_tracking_text(text: str) -> str:
             continue
         chars.append(char)
     cleaned = "".join(chars)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r"(?m)[ \t]+$", "", cleaned)
-    cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
-    return cleaned.strip()
+    from nullion.chat_text import transform_markdown_prose
+    def normalize_spacing(value):
+        value = re.sub(r"[ \t]{2,}", " ", value)
+        value = re.sub(r"(?m)[ \t]+$", "", value)
+        return re.sub(r"\n{4,}", "\n\n\n", value).strip()
+    return transform_markdown_prose(cleaned, normalize_spacing).strip()
 
 
 def _repair_collapsed_numbered_list_reply(text: str) -> str:
     """Make model-collapsed numbered lists readable without changing content."""
 
     value = str(text or "")
+    if "`" in value:
+        from nullion.chat_text import transform_markdown_prose
+        return transform_markdown_prose(value, _repair_collapsed_numbered_list_prose)
+    return _repair_collapsed_numbered_list_prose(value)
+
+
+def _repair_collapsed_numbered_list_prose(value: str) -> str:
     if "\n" in value and not _has_inline_numbered_markers(value):
         return value
     paragraphs = re.split(r"(\n{2,})", value)
@@ -531,6 +547,13 @@ def _renumber_visible_numbered_list_reply(text: str) -> str:
     """Keep visible ordered lists from starting at an impossible number."""
 
     value = str(text or "")
+    if "`" in value:
+        from nullion.chat_text import transform_markdown_prose
+        return transform_markdown_prose(value, _renumber_visible_numbered_list_prose)
+    return _renumber_visible_numbered_list_prose(value)
+
+
+def _renumber_visible_numbered_list_prose(value: str) -> str:
     matches = list(
         re.finditer(
             r"(?m)^(?P<indent>\s*)(?P<marker>(?P<paren>\((?P<pnum>\d{1,2})\))|(?P<dnum>\d{1,2})\.)(?P<space>\s+)",

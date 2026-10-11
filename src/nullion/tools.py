@@ -852,12 +852,20 @@ def _generated_output_path_should_use_workspace_artifacts(path: Path) -> bool:
     return _path_within_any_root(path, (data_home,))
 
 
+def _is_workspace_scratch_path(path: Path, principal_id: str | None) -> bool:
+    from nullion.workspace_storage import workspace_storage_roots_for_principal
+    scratch = workspace_storage_roots_for_principal(principal_id, create=False).scratch.resolve()
+    return path.resolve().is_relative_to(scratch)
+
+
 def _file_write_artifact_path_should_use_workspace_artifacts(
     path: Path,
     *,
     principal_id: str | None,
     effective_roots: tuple[Path, ...],
 ) -> bool:
+    if _is_workspace_scratch_path(path, principal_id):
+        return False
     if path.suffix.lower() not in VALID_ATTACHMENT_EXTENSIONS:
         return False
     artifact_root = _workspace_artifact_root_for_principal(principal_id)
@@ -7041,6 +7049,10 @@ def _build_file_write_handler(
         if path.suffix.lower() in VALID_ATTACHMENT_EXTENSIONS:
             output["artifact_path"] = str(path)
             output["artifact_paths"] = [str(path)]
+            if _is_workspace_scratch_path(path, invocation.principal_id):
+                from nullion.artifacts import artifact_output_descriptor
+                output["artifact_descriptors"] = [artifact_output_descriptor(path, role="source", kind="workspace_support")]
+
         if binary_image_decoded:
             output["binary_image_decoded"] = True
         if embedded_html_images:

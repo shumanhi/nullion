@@ -4033,6 +4033,10 @@ def _sourced_artifact_requires_outcome_review(
 
 def _partial_source_report_delivery_ready(state, tool_results) -> bool:
     """A typed partial report can be delivered without claiming full fulfillment."""
+    if _state_is_scheduled_task_run(state):
+        # A completed source read does not finish the saved task's remaining
+        # checks or actions. Continue the scheduled agent before presentation.
+        return False
     results = list(tool_results)
     from nullion.source_observation_contract import source_report_status, pending_source_continuation
     if pending_source_continuation(results):
@@ -7159,6 +7163,10 @@ def _browser_extract_evidence_completion_text(
     tool_results: list[ToolResult],
     artifacts: list[str],
 ) -> str | None:
+    # A scheduled run must finish its saved task, not terminate after the first
+    # fallback page read. Let its agent continue source checks and synthesis.
+    if _state_is_scheduled_task_run(state):
+        return None
     if artifacts:
         return None
     # Raw page text after a failed live-search path is discovery evidence, not

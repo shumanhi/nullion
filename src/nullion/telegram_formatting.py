@@ -158,12 +158,13 @@ def _normalize_markdown_bullets(text: str) -> str:
 
 def format_telegram_text(text: str) -> tuple[str, dict[str, str]]:
     text = sanitize_external_inline_markup(text)
-    text = make_markdown_tables_chat_readable(text)
-    text = _normalize_markdown_bullets(text)
     text_with_placeholders, formatted_blocks = _replace_fenced_code_blocks(text)
+    text_with_placeholders = make_markdown_tables_chat_readable(text_with_placeholders)
+    text_with_placeholders = _normalize_markdown_bullets(text_with_placeholders)
     text_with_placeholders, formatted_codes = _replace_inline_code_spans(text_with_placeholders)
     text_with_placeholders, formatted_links = _replace_links(text_with_placeholders)
     text_with_placeholders, formatted_quotes = _replace_blockquotes(text_with_placeholders)
+    text_with_placeholders = re.sub(r"(?m)^#{1,6} +(.+)$", r"**\1**", text_with_placeholders)
     escaped = html.escape(text_with_placeholders)
     formatted = _BOLD_PATTERN.sub(lambda match: f"<b>{match.group(1)}</b>", escaped)
     formatted = _ITALIC_PATTERN.sub(lambda match: f"<i>{match.group(1)}</i>", formatted)
@@ -181,7 +182,7 @@ def format_telegram_text(text: str) -> tuple[str, dict[str, str]]:
         formatted = formatted.replace(placeholder, quote)
     if formatted != escaped:
         return formatted, {"parse_mode": "HTML"}
-    return text, {}
+    return text_with_placeholders, {}
 
 
 __all__ = ["format_telegram_text"]

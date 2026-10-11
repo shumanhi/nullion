@@ -56,8 +56,10 @@ class CronExecutionToolRegistry:
         allowed_structured_tool_names: Iterable[str] | None = None,
         allow_connector_tools: bool = False,
         connector_provider_ids: Iterable[str] | None = None,
+        checkpoint_journal=None,
     ) -> None:
         self._delegate = delegate
+        self._checkpoint_journal = checkpoint_journal
         self._allowed_tool_names = (
             frozenset(str(name).strip() for name in allowed_tool_names if str(name).strip())
             if allowed_tool_names is not None
@@ -274,7 +276,12 @@ class CronExecutionToolRegistry:
                     },
                     error=f"Connector provider not granted for this scheduled task run: {provider_id}",
                 )
-        return self._delegate.invoke(invocation)
+        path = self._checkpoint_journal.before(invocation) if self._checkpoint_journal else None
+        try:
+            return self._delegate.invoke(invocation)
+        finally:
+            if self._checkpoint_journal:
+                self._checkpoint_journal.after(path, None)
 
     def register_cleanup_hook(self, hook) -> None:
         self._delegate.register_cleanup_hook(hook)

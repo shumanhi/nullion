@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Mapping
 
 
@@ -102,20 +103,37 @@ def partial_source_report_disclosures(tool_results) -> list[str]:
     return unknowns
 
 
+def _readable_source_line(text: str) -> str:
+    """Remove inaccessible font glyphs and empty separators from captured UI."""
+    clean = ''.join(char for char in text if unicodedata.category(char) != 'Co')
+    return ' · '.join(part.strip() for part in clean.split('·') if part.strip()).strip()
+
+
 def partial_source_report_reply(tool_results, *, draft=None) -> str:
     """Deliver captured source quotes and typed unknowns without inventing facts."""
     results = list(tool_results)
+    from nullion.tools import normalize_tool_status
     unknowns = partial_source_report_disclosures(results)
     # The source report already validates each quote against captured page text.
     # A later free-form draft must not replace those facts with an unsupported
     # failure claim or a guessed alternative link.
     quotes = []
     source_urls = []
+    producer_omitted = 0
     for result in results:
+        if normalize_tool_status(getattr(result, 'status', None)) != 'completed':
+            continue
         output = getattr(result, 'output', None)
         if not isinstance(output, Mapping) or output.get('result_kind') != 'source_observations' or output.get('report_status') not in {'completed', 'partial'}:
             continue
+        count = output.get('omitted_observation_count')
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            producer_omitted += count
         for row in output.get('observations') or []:
+            if not isinstance(row, Mapping) or not isinstance(row.get('value'), str) or not isinstance(row.get('quote'), str):
+                continue
+            if not row['value'].strip() or ' '.join(row['value'].split()) not in ' '.join(row['quote'].split()):
+                continue
             source_index = row.get('source_index') if isinstance(row, Mapping) else None
             sources = output.get('sources') or []
             source = sources[source_index] if isinstance(source_index, int) and 0 <= source_index < len(sources) else row
@@ -124,13 +142,38 @@ def partial_source_report_reply(tool_results, *, draft=None) -> str:
                 source_urls.append(url)
             value = str(row.get('value') or '').strip() if isinstance(row, Mapping) else ''
             label = str(row.get('label') or '').strip() if isinstance(row, Mapping) else ''
-            fact = f'{label}: {value}' if label else str(row.get('quote') or value).strip()
-            if value and fact not in quotes:
-                quotes.append(fact[:2000])
-    findings = '\n'.join('- ' + fact for fact in quotes[:20])
+            if not value:
+                continue
+            # Multiline excerpts already carry their own title. Producer labels
+            # are evidence metadata, not a second title to prepend to a listing.
+            lines = [_readable_source_line(line) for line in value.splitlines()]
+            lines = [line for line in lines if line]
+            fact = '\n'.join(lines) if len(lines) > 1 else (f'{label}: {lines[0]}' if label and lines else _readable_source_line(str(row.get('quote') or value).strip()))
+            if not fact:
+                continue
+            # Keep the richest captured excerpt when one is wholly contained
+            # in another. This is evidence equality, independent of language.
+            normalized = ' '.join(fact.split())
+            for index, existing in enumerate(quotes):
+                previous = ' '.join(existing.split())
+                if normalized == previous or (len(lines) > 1 and normalized in previous):
+                    break
+                if len(lines) > 1 and previous in normalized:
+                    quotes[index] = fact
+                    break
+            else:
+                quotes.append(fact)
+    blocks = []
+    for index, fact in enumerate(quotes[:20], 1):
+        title, _, details = fact.partition('\n')
+        blocks.append(f'{index}. **{title}**' + ('\n' + details if details else ''))
+    findings = '\n\n'.join(blocks)
     references = '\n\n' + ' · '.join(f'[Source {index + 1}]({url})' for index, url in enumerate(source_urls[:10])) if source_urls else ''
     unresolved = '\n\nUnshown or unresolved:\n' + '\n'.join('- ' + value for value in unknowns) if unknowns else ''
-    return 'Here are the available findings:\n\n' + findings + references + unresolved
+    omitted = producer_omitted + max(0, len(quotes) - 20)
+    if omitted:
+        findings += f'\n\n{omitted} additional findings are not shown.'
+    return findings + references + unresolved
 
 
 def pending_source_continuation(tool_results):
