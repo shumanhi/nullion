@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import lru_cache
 import re
+import sqlite3
+import unicodedata
 from typing import Any, TypedDict
 from uuid import uuid4
 
@@ -57,13 +59,6 @@ class _MemoryCaptureState(TypedDict, total=False):
     candidate: MemoryCandidate
 
 
-_EXPLICIT_REMEMBER_RE = re.compile(
-    r"^\s*(?:please\s+)?remember(?:\s+(?:this|that))?\s*(?:[:,\-]\s*|\s+)(?P<fact>.+?)\s*$",
-    re.I,
-)
-_DIRECT_MEMORY_FIELD_RE = re.compile(
-    r"^\s*(?P<key>[A-Za-z][A-Za-z0-9 _.\-/]{0,60})\s*(?:=|:)\s*(?P<value>.+?)\s*$"
-)
 _SECRET_OR_TOKEN_RE = re.compile(
     r"\b(?:api[_ -]?key|bearer|password|secret|token|sk-[A-Za-z0-9_-]{12,})\b",
     re.I,
@@ -71,7 +66,7 @@ _SECRET_OR_TOKEN_RE = re.compile(
 
 
 def _slug_key(value: str, *, default: str = "memory") -> str:
-    key = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    key = re.sub(r"[^\w]+", "_", unicodedata.normalize("NFKC", value).casefold()).strip("_")
     return key[:60] or default
 
 
@@ -148,29 +143,13 @@ def _memory_normalize_node(state: _MemoryCaptureState) -> dict[str, object]:
 
 
 def _memory_detect_candidates_node(state: _MemoryCaptureState) -> dict[str, object]:
-    stripped = state.get("stripped") or ""
-    if not stripped:
+    candidate = state.get("candidate")
+    if not isinstance(candidate, MemoryCandidate) or not candidate.is_remember_request:
         return {"candidate": MemoryCandidate()}
-    # This parser is intentionally scoped to the explicit-memory capture path.
-    # It does not route product behavior or split tasks; it only extracts the
-    # payload from a direct memory request that has already reached this graph.
-    match = _EXPLICIT_REMEMBER_RE.match(stripped)
-    if not match:
-        return {"candidate": MemoryCandidate()}
-    fact = match.group("fact").strip().strip("\"'")
-    if not fact or _SECRET_OR_TOKEN_RE.search(fact):
+    payload = " ".join(str(value or "") for value in (candidate.remember_fact, candidate.field_key, candidate.field_value))
+    if _SECRET_OR_TOKEN_RE.search(payload):
         return {"candidate": MemoryCandidate(is_remember_request=True)}
-    field_match = _DIRECT_MEMORY_FIELD_RE.match(fact)
-    if field_match:
-        return {
-            "candidate": MemoryCandidate(
-                remember_fact=fact,
-                field_key=field_match.group("key").strip(),
-                field_value=field_match.group("value").strip().strip("\"'"),
-                is_remember_request=True,
-            )
-        }
-    return {"candidate": MemoryCandidate(remember_fact=fact, is_remember_request=True)}
+    return {"candidate": candidate}
 
 
 def _memory_zip_node(state: _MemoryCaptureState) -> dict[str, object]:
@@ -265,8 +244,10 @@ def _compiled_memory_capture_graph():
     return graph.compile()
 
 
-def capture_explicit_user_memory(store, *, owner: str, text: str, source: str) -> list[UserMemoryEntry]:
+def capture_explicit_user_memory(store, *, owner: str, text: str, source: str, candidate: MemoryCandidate | None = None) -> list[UserMemoryEntry]:
     """Compatibility wrapper; Builder owns structured workspace memory writes."""
+    if candidate is None:
+        return []
     final_state = _compiled_memory_capture_graph().invoke(
         {
             "store": store,
@@ -274,14 +255,41 @@ def capture_explicit_user_memory(store, *, owner: str, text: str, source: str) -
             "text": text,
             "source": source,
             "written": [],
+            "candidate": candidate,
         },
         config={"configurable": {"thread_id": f"memory-capture:{owner or 'unknown'}"}},
     )
     return list(final_state.get("written") or [])
 
 
-def memory_entries_for_owner(store, owner: str) -> list[UserMemoryEntry]:
-    return [entry for entry in store.list_user_memory_entries() if entry.owner == owner]
+def memory_entries_for_owner(store, owner: str, *, checkpoint_path=None) -> list[UserMemoryEntry]:
+    checkpoint_path = checkpoint_path or getattr(store, "_memory_checkpoint_path", None)
+    entries = {entry.entry_id: entry for entry in store.list_user_memory_entries() if entry.owner == owner}
+    if checkpoint_path is not None:
+        from nullion.runtime_persistence import read_persisted_memory_entries
+        try:
+            snapshot = read_persisted_memory_entries(checkpoint_path)
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", None) not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise
+            # A concurrent checkpoint must not abort a chat. Keep the last
+            # verified in-process snapshot and retry on the next read.
+            snapshot = None
+        if snapshot is not None:
+            committed = {entry.entry_id: entry for entry in snapshot if entry.owner == owner}
+            for identity in getattr(store, "_dirty_memory_entry_ids", ()):
+                current = store.get_user_memory_entry(identity)
+                if identity in getattr(store, "_memory_reinforcement_only_ids", ()):
+                    continue
+                if current is not None and current.owner == owner:
+                    committed[identity] = current
+                elif current is None:
+                    committed.pop(identity, None)
+            entries = committed
+            refresh = getattr(store, "refresh_committed_user_memory", None)
+            if callable(refresh):
+                refresh(owner, list(entries.values()))
+    return list(entries.values())
 
 
 def format_memory_context(entries: list[UserMemoryEntry]) -> str | None:

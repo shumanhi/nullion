@@ -467,11 +467,12 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_wait_for",
-            "Wait for any page condition: a CSS selector, URL glob, or visible page text. Use multiple conditions when a site may update in place instead of navigating.",
+            "Wait for any page condition. Provide at least one non-empty selector, url_pattern, or text. Use multiple conditions when a site may update in place instead of navigating. If the wait fails, inspect the page with browser_snapshot or browser_extract_text before choosing a new condition; do not repeat the same wait blindly.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
-            input_schema=_object_schema(
+            continuation_tools=("browser_snapshot", "browser_extract_text"),
+            input_schema={**_object_schema(
                 {
                     "selector": {"type": "string", "description": "CSS selector to wait for."},
                     "url_pattern": {
@@ -488,7 +489,10 @@ def register_browser_tools(
                         "description": "Timeout in seconds. Defaults to 10.",
                     },
                 }
-            ),
+            ), "anyOf": [
+                {"required": [key], "properties": {key: {"type": "string", "minLength": 1}}}
+                for key in ("selector", "url_pattern", "text")
+            ]},
         ),
         tools.browser_wait_for,
     )

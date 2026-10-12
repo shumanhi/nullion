@@ -1660,8 +1660,13 @@ _CRON_TOOL_PROPERTIES: dict[str, dict[str, object]] = {
     },
     "artifact_delivery_options": {
         "type": "object",
-        "description": "Persist the scheduled deliverable contract. Supply required_artifact_extensions and requires_attachment_delivery when a file is requested; text must not replace a required file.",
+        "description": "Persist the scheduled delivery contract. Always set alert_delivery_mode from the user's notification requirements: verified_matches_only for conditional alerts that must stay silent without a verified match; report_each_run for routine reports. Supply required_artifact_extensions and requires_attachment_delivery when a file is requested; text must not replace a required file.",
         "properties": {
+            "alert_delivery_mode": {
+                "type": "string",
+                "enum": ["verified_matches_only", "report_each_run"],
+                "description": "Notification policy selected from the user request. Preserve it on updates unless the user changes the notification requirements.",
+            },
             "requires_attachment_delivery": {"type": "boolean"},
             "required_artifact_extensions": {"type": "array", "items": {"type": "string"}},
             "required_artifact_content_tokens": {"type": "array", "items": {"type": "string"}},
@@ -6497,6 +6502,8 @@ def _has_path_suffix(path: Path, suffix: tuple[str, ...]) -> bool:
 def _should_prune_filesystem_walk_dir(path: Path) -> bool:
     name = path.name.lower()
     if name in _FILE_WALK_PRUNED_DIR_NAMES:
+        return True
+    if (path / "pyvenv.cfg").is_file():
         return True
     return any(_has_path_suffix(path, suffix) for suffix in _MACOS_PROTECTED_APP_DATA_SUFFIXES)
 
@@ -13955,6 +13962,7 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
                     "summaries, start from these previews and read only the few selected messages whose full "
                     "body is needed. Call email_read with a returned id before summarizing full body content "
                     "or claiming a specific message body was read."
+                    + _EMAIL_STATUS_EVIDENCE_CONTRACT
                 ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
@@ -13979,6 +13987,7 @@ def register_connector_plugin(registry: ToolRegistry) -> None:
                     "the user asks to read, summarize, inspect, or act on message body content. HTML links are "
                     "returned as structured message.links entries when present, including hidden href targets. "
                     "Attachments are returned as structured message.attachments entries with attachmentId values."
+                    + _EMAIL_STATUS_EVIDENCE_CONTRACT
                 ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
@@ -15129,6 +15138,16 @@ def _build_connector_request_handler() -> ToolHandler:
     return handler
 
 
+def _email_body_continuation_metadata(records: object) -> dict[str, str]:
+    """A body-read continuation requires a concrete message returned by the search."""
+    if isinstance(records, (list, tuple)) and any(
+        isinstance(record, Mapping) and isinstance(record.get("id"), str) and record["id"].strip()
+        for record in records
+    ):
+        return {"next_tool_for_body": "email_read", "body_requires_tool": "email_read"}
+    return {}
+
+
 def _build_connector_email_search_handler() -> ToolHandler:
     def handler(invocation: ToolInvocation) -> ToolResult:
         raw_query = invocation.arguments.get("query")
@@ -15198,8 +15217,7 @@ def _build_connector_email_search_handler() -> ToolHandler:
                     "resultSizeEstimate": listing.get("resultSizeEstimate"),
                     "results": results,
                     "body_included": False,
-                    "next_tool_for_body": "email_read",
-                    "body_requires_tool": "email_read",
+                    **_email_body_continuation_metadata(results),
                 },
                 error=None,
             )
@@ -15403,6 +15421,42 @@ def _build_connector_email_attachment_read_handler() -> ToolHandler:
     return handler
 
 
+_EMAIL_STATUS_EVIDENCE_CONTRACT = (
+    " Answer account-status questions directly. Select a search time window that matches the requested "
+    "status and runtime date; broad historical matches are context, not current-state proof. For a status "
+    "question with no explicit historical time range, check a recent window first. If only past evidence "
+    "exists, lead with whether current/upcoming status was verified; do not lead with an unqualified yes "
+    "based on that historical record. Respect explicit historical date ranges. Read relevant "
+    "bodies and compare event dates, not just subject/snippet or message date. Distinguish earlier "
+    "confirmations from currently scheduled/pending items, and check later cancellation, completion or "
+    "superseding messages when relevant. State the checked window and what remains unverified. "
+    "An email establishes what it said at that time; absence of matching emails does not prove absence "
+    "of an account action. Never substitute a message preview for the requested conclusion."
+)
+
+
+def _email_message_evidence_scope(message: object) -> dict[str, object]:
+    """Expose record time separately from retrieval time, without interpreting its body."""
+    from email.utils import parsedate_to_datetime
+
+    sent_at = None
+    if isinstance(message, Mapping):
+        raw = message.get("date")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                sent_at = parsedate_to_datetime(raw)
+            except (ValueError, TypeError, OverflowError):
+                try:
+                    sent_at = datetime.fromisoformat(raw)
+                except ValueError:
+                    pass
+    if sent_at is not None and sent_at.tzinfo is not None:
+        sent_at = sent_at.astimezone(UTC)
+    return {"kind": "email_message", "retrieved_at": datetime.now(UTC).isoformat(),
+            "message_sent_at": sent_at.isoformat() if sent_at is not None else None,
+            "current_account_state_verified": False}
+
+
 def _build_connector_email_read_handler() -> ToolHandler:
     def handler(invocation: ToolInvocation) -> ToolResult:
         raw_id = invocation.arguments.get("id")
@@ -15422,6 +15476,7 @@ def _build_connector_email_read_handler() -> ToolHandler:
                 url=f"{endpoint}/{quote(raw_id.strip(), safe='')}",
                 params={"format": "full"},
             )
+            compact_message = _compact_gmail_message(message, include_body=True)
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
@@ -15429,7 +15484,8 @@ def _build_connector_email_read_handler() -> ToolHandler:
                 output={
                     "id": raw_id.strip(),
                     "provider_id": provider_id,
-                    "message": _compact_gmail_message(message, include_body=True),
+                    "message": compact_message,
+                    "evidence_scope": _email_message_evidence_scope(compact_message),
                 },
                 error=None,
             )
@@ -16371,6 +16427,7 @@ def register_email_plugin(
                     "Search email messages via the configured provider. Search results are metadata-only; "
                     "use their headers/snippets for broad inbox triage, then call email_read with a returned "
                     "id only when a specific message's full body is needed."
+                    + _EMAIL_STATUS_EVIDENCE_CONTRACT
                 ),
             risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.READ,
@@ -16390,6 +16447,7 @@ def register_email_plugin(
                 description=(
                     "Read a single email message via the configured provider. The id must be exactly one "
                     "email_search.results[].id value; do not infer ids or pass placeholders."
+                    + _EMAIL_STATUS_EVIDENCE_CONTRACT
                 ),
                 risk_level=ToolRiskLevel.LOW,
                 side_effect_class=ToolSideEffectClass.READ,
@@ -16497,8 +16555,7 @@ def _build_email_search_handler(
                 "query": raw_query,
                 "results": results,
                 "body_included": False,
-                "next_tool_for_body": "email_read",
-                "body_requires_tool": "email_read",
+                **_email_body_continuation_metadata(results),
             },
             error=None,
         )
@@ -16524,7 +16581,7 @@ def _build_email_read_handler(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
             status="completed",
-            output={"id": raw_id, "message": message},
+            output={"id": raw_id, "message": message, "evidence_scope": _email_message_evidence_scope(message)},
             error=None,
         )
 
@@ -17735,7 +17792,7 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
                 "html_image_delivery_mode": html_image_delivery_mode,
             }
             if artifact_options is not None:
-                updates["artifact_delivery_options"] = dict(artifact_options)
+                updates["artifact_delivery_options"] = {**dict(existing.artifact_delivery_options or {}), **artifact_options}
             try:
                 job = update_cron(existing.id, **updates)
             except Exception as exc:
@@ -18143,6 +18200,8 @@ def _build_update_cron_handler():
             if field == "artifact_delivery_options" and not isinstance(value, dict):
                 return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {},
                                   "artifact_delivery_options must be an object")
+            if field == "artifact_delivery_options" and existing is not None:
+                value = {**dict(existing.artifact_delivery_options or {}), **value}
             updates[field] = value
         if not updates:
             return ToolResult(
@@ -19138,6 +19197,7 @@ def register_cron_tools(
                 "Nullion will execute when the cron fires). "
                 "Optional: enabled (bool, default true), workspace_id, delivery_channel, delivery_target, "
                 "html_image_delivery_mode (linked|auto|self_contained). "
+                "Set artifact_delivery_options.alert_delivery_mode explicitly from the user's notification requirements. "
                 "If workspace and delivery are omitted, Nullion uses the current workspace and chat adapter defaults."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
@@ -19186,7 +19246,8 @@ def register_cron_tools(
             description=(
                 "Update a scheduled cron job by id. Required args: id. "
                 "Optional mutable fields: name, schedule, task, enabled, workspace_id, delivery_channel, "
-                "delivery_target, html_image_delivery_mode."
+                "delivery_target, html_image_delivery_mode, artifact_delivery_options. "
+                "When changing notification requirements, also set artifact_delivery_options.alert_delivery_mode."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
             side_effect_class=ToolSideEffectClass.WRITE,

@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from nullion.approvals import ApprovalRequest, BoundaryPermit, PermissionGrant
@@ -177,6 +178,9 @@ class RuntimeStore:
     user_facts: dict[str, UserMemoryEntry] = field(default_factory=dict)
     preferences: dict[str, UserMemoryEntry] = field(default_factory=dict)
     environment_facts: dict[str, UserMemoryEntry] = field(default_factory=dict)
+    _dirty_memory_entry_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _memory_reinforcement_only_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _memory_checkpoint_path: Path | None = field(default=None, init=False, repr=False)
     skill_execution_plans: dict[str, SkillExecutionPlan] = field(default_factory=dict)
     cancelled_mission_ids: set[str] = field(default_factory=set)
     task_frames: dict[str, TaskFrame] = field(default_factory=dict)
@@ -391,14 +395,30 @@ class RuntimeStore:
         if existing is None:
             return False
         self._drop_user_memory_entry(entry_id)
+        self._dirty_memory_entry_ids.add(entry_id)
+        self._memory_reinforcement_only_ids.discard(entry_id)
         return True
 
     def add_user_memory_entry(self, entry: UserMemoryEntry) -> None:
         self._drop_user_memory_entry(entry.entry_id)
         self._user_memory_collection_for_kind(entry.kind)[entry.entry_id] = entry
+        self._dirty_memory_entry_ids.add(entry.entry_id)
+        self._memory_reinforcement_only_ids.discard(entry.entry_id)
 
     def update_user_memory_entry(self, entry: UserMemoryEntry) -> None:
         self.add_user_memory_entry(entry)
+
+    def refresh_committed_user_memory(self, owner: str, entries: list[UserMemoryEntry]) -> None:
+        """Refresh shared committed state without creating local write intents."""
+        pending = self._dirty_memory_entry_ids - self._memory_reinforcement_only_ids
+        latest = {entry.entry_id: entry for entry in entries if entry.owner == owner}
+        for existing in self.list_user_memory_entries():
+            if existing.owner == owner and existing.entry_id not in latest and existing.entry_id not in pending:
+                self._drop_user_memory_entry(existing.entry_id)
+        for entry in latest.values():
+            if entry.entry_id not in pending:
+                self._drop_user_memory_entry(entry.entry_id)
+                self._user_memory_collection_for_kind(entry.kind)[entry.entry_id] = entry
 
     def get_user_memory_entry(self, entry_id: str) -> UserMemoryEntry | None:
         entry = self.user_facts.get(entry_id)

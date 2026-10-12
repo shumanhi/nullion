@@ -2112,8 +2112,17 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
                 request.text,
                 reply=delivery_text,
                 artifact_paths=stored_artifact_paths,
-                requires_attachment_delivery=bool(stored_artifact_paths or required_attachment_extensions),
-                required_attachment_extensions=required_attachment_extensions,
+                # A verified run_cron receipt acknowledges the dispatch. Its
+                # background delivery owns the file contract; applying that
+                # future contract here turns a correct started receipt into a
+                # false attachment failure on Web and messaging surfaces.
+                requires_attachment_delivery=bool(
+                    not completed_run_cron_reply
+                    and (stored_artifact_paths or required_attachment_extensions)
+                ),
+                required_attachment_extensions=(
+                    () if completed_run_cron_reply else required_attachment_extensions
+                ),
             ),
         )
     response_text = delivery.text

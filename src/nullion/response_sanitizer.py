@@ -3997,6 +3997,8 @@ def _structured_tool_evidence_reply_over_ignored_results(
     *,
     user_message: str | None,
 ) -> str | None:
+    if any(isinstance(result.output, dict) and result.output.get("lookup_selection_unresolved") is True for result in results):
+        return None
     if _reply_contains_completed_scheduler_action_message(text, results):
         return None
     if _has_completed_deliverable_artifact_result(results):
@@ -4006,6 +4008,14 @@ def _structured_tool_evidence_reply_over_ignored_results(
     if _parse_bare_structured_payload(text) is not None:
         return None
     if _browser_tools_attempted(results) and str(text or "").strip():
+        return None
+    from nullion.artifacts import history_artifact_reference_paths, text_references_file_path
+    if any(text_references_file_path(text, path) for path in history_artifact_reference_paths(results)):
+        return None
+    if any(text_references_file_path(text, path)
+           for result in results if result.tool_name == "file_search" and result.status == "completed"
+           for path in _file_search_match_paths_from_output(result.output if isinstance(result.output, dict) else {})):
+        # Search candidates are not a requirement to mention every discovered file.
         return None
     sections = _structured_tool_evidence_sections(
         results,
@@ -4056,16 +4066,8 @@ def _reply_contains_completed_scheduler_action_message(text: str, results: list[
     return False
 
 
-_ACCOUNT_STRUCTURED_REPAIR_PHRASE_RE = re.compile(
-    r"\b(?:message\s+id|if\s+you\s+want|can\s+check|do\s+not\s+(?:currently\s+)?have|don't\s+(?:currently\s+)?have|not\s+available|cannot\s+send|can't\s+send)\b",
-    flags=re.IGNORECASE,
-)
-
-
 def _account_structured_evidence_repair_needed(text: str, results: list[ToolResult]) -> bool:
     if not _normalized_reply_text(text):
-        return True
-    if _ACCOUNT_STRUCTURED_REPAIR_PHRASE_RE.search(str(text or "")):
         return True
     for result in results:
         if result.status != "completed" or not isinstance(result.output, dict):
@@ -4085,6 +4087,10 @@ def _structured_tool_evidence_sections(
     prefer_browser_source_heading: bool = False,
 ) -> list[tuple[str, list[str], list[Mapping[str, Any]]]]:
     sections: list[tuple[str, list[str], list[Mapping[str, Any]]]] = []
+    file_search_results = [result for result in results if result.tool_name == "file_search" and result.status == "completed"]
+    focused_file_search = next((result for result in reversed(file_search_results)
+                               if _file_search_match_paths_from_output(result.output if isinstance(result.output, dict) else {})),
+                              file_search_results[-1] if file_search_results else None)
     verified_browser_bindings = _browser_detail_record_bindings_for_verified_sessions(
         results,
         user_message=user_message,
@@ -4198,6 +4204,8 @@ def _structured_tool_evidence_sections(
                 sections.append(("Relevant calendar results", lines, items or [result.output]))
             continue
         if result.tool_name == "file_search":
+            if result is not focused_file_search:
+                continue
             summary = _file_search_payload_summary([result])
             items = _structured_evidence_items_from_mapping(result.output)
             lines = _summary_to_bullet_lines(summary)
@@ -8136,24 +8144,7 @@ def _account_tool_reply_over_ungrounded_result(
         return summary
     if _has_uncompleted_required_account_tool(results, primary_family):
         return summary
-    if _primary_account_tool_family_has_empty_result(results, primary_family):
-        return summary
     return text
-
-
-def _primary_account_tool_family_has_empty_result(results: list[ToolResult], family: str) -> bool:
-    for result in results:
-        if result.status != "completed" or not isinstance(result.output, dict):
-            continue
-        if _account_tool_family(result.tool_name) != family:
-            continue
-        output = result.output
-        if result.tool_name in {"email_search", "calendar_list"}:
-            records = output.get("results")
-            count = output.get("count", output.get("result_count", output.get("resultSizeEstimate")))
-            if records == [] or count == 0:
-                return True
-    return False
 
 
 def _sanitize_account_tool_body_leak(text: str, results: list[ToolResult]) -> str:

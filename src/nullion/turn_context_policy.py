@@ -155,6 +155,7 @@ _SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES = frozenset(
         "file_patch",
         "file_write",
         "image_generate",
+        "memory_save",
         "pdf_create",
         "personal_task_save",
         "pdf_edit",
@@ -236,7 +237,7 @@ _SCHEDULER_TOOLS = frozenset(_SCHEDULER_READ_TOOLS | _SCHEDULER_RUN_TOOLS | _SCH
 _DEFAULT_REMINDER_SCOPE_TOOLS = frozenset({"set_reminder", "list_reminders", "delete_reminder", "update_reminder"})
 _SKILL_PACK_TOOLS = frozenset({"skill_pack_read"})
 _SKILL_PACK_CAPABILITY_TAGS = frozenset({"skill_pack"})
-_CONVERSATION_HISTORY_TOOLS = frozenset({"chat_history_search"})
+_CONVERSATION_HISTORY_TOOLS = frozenset({"chat_history_search", "memory_search", "memory_save"})
 _CONVERSATION_HISTORY_CAPABILITY_TAGS = frozenset({"conversation_history"})
 _LOCAL_FILE_READ_TOOLS = frozenset({"file_read", "file_search", "workspace_summary"})
 _LOCAL_FILE_TOOLS = frozenset({"archive_create", "archive_extract", "file_read", "file_search", "file_write", "file_patch", "workspace_summary"})
@@ -268,8 +269,10 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "agent should choose exactly one eligible task from structured list_crons output. "
         "Use personal_tasks for the persistent personal task list. Include personal_task_save explicitly only "
         "for a user-authorized addition, edit, completion, archival, or restoration. "
-        "Use conversation_history for saved turns in the current chat that are older "
-        "than the visible prompt context. Use web for public websites, live public lookups, and public source data "
+        "Use conversation_history for earlier workspace turns, document references, or durable memory. "
+        "Use memory_search for saved preferences/facts and request memory_save explicitly for an authorized durable memory write. "
+        "A memory_save persisted receipt is required before saying it is saved. "
+        "Use web for public websites, live public lookups, and public source data "
         "that will be written into a local artifact such as CSV, HTML, PDF, DOCX, or XLSX. Use skill_pack only "
         "when detailed installed-pack reference docs are needed. Capabilities: web, "
         "scheduler_read, scheduler_run, scheduler_mutate, connector, skill_pack, conversation_history, personal_tasks, weather, "
@@ -279,6 +282,10 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "set scheduler_selection_policy to delegate_one. "
         "When the turn needs a downloadable or attached file in a specific format, include artifact_extensions with the required "
         "final suffix so the runtime can expose the matching structured artifact tool. "
+        "For an existing report or document lookup, use chat_history_search with artifact_extensions matching the desired file type. "
+        "If the user asks for that existing file, including asking whether the earlier file is available, set source_artifact_delivery_requested "
+        "and quote the current request as source_artifact_request_evidence. This is a read-only retrieval of unchanged files. For requested creation or editing, use a production plan with source_artifact_delivery_requested=false. Preserve its artifact_extensions; do not create a replacement. "
+        "A directory read is an inventory, not completion of a particular document lookup. "
         "Internal evidence captures are not user deliverables. To deliver them, set source_artifact_delivery_requested "
         "and supply source_artifact_request_evidence quoting the user's actual request to receive those files. "
         "When that final artifact must contain images, screenshots, generated visuals, or other media inside "
@@ -369,6 +376,8 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "calendar_respond",
                         "calendar_delete",
                         "chat_history_search",
+                        "memory_search",
+                        "memory_save",
                         "list_crons",
                         "list_reminders",
                         "run_cron",
@@ -802,6 +811,7 @@ class TurnToolScopeDecision:
     connector_source_evidence: str = ""
     source_artifact_delivery_requested: bool = False
     source_artifact_request_evidence: str = ""
+    source_artifact_retrieval_only: bool = False
     requested_tool_names: tuple[str, ...] = ()
     required_tool_names: tuple[str, ...] = ()
     requested_artifact_extensions: tuple[str, ...] = ()
@@ -1155,6 +1165,16 @@ class ScopedTurnToolRegistry:
             return False
         scheduler_action = str(self.turn_tool_scope_decision.scheduler_action or "").strip().lower()
         requested_tool_names = set(self.turn_tool_scope_decision.requested_tool_names)
+        if (self.turn_tool_scope_decision.source_artifact_retrieval_only
+                and tool_name in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS | _LOCAL_SHELL_TOOLS)):
+            return False
+        if (tool_name in _LOCAL_FILE_READ_TOOLS and tool_name in requested_tool_names
+                and self.turn_tool_scope_decision.source_artifact_delivery_requested):
+            return True
+        if (self.turn_tool_scope_decision.source_artifact_delivery_requested
+                and tool_name in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS)
+                and tool_name not in requested_tool_names):
+            return False
         if tool_name in {"delete_cron", "delete_reminder"} and tool_name not in requested_tool_names:
             return False
         is_scheduler_tool = self._is_scheduler_tool_name(tool_name)
@@ -1253,8 +1273,14 @@ class ScopedTurnToolRegistry:
                 )
             )
         if tool_name in _CONVERSATION_HISTORY_TOOLS:
+            if tool_name == "memory_save":
+                return tool_name in requested_tool_names
             return (
                 tool_name in requested_tool_names
+                or (
+                    self._evidence.saved_history_available
+                    and bool(requested_tool_names.intersection({"file_search", "file_read"}))
+                )
                 or (
                     self._evidence.context_linked
                     and (
@@ -1452,6 +1478,12 @@ class ScopedTurnToolRegistry:
         )
         if not artifact_scope_allowed:
             requested_artifact_extensions = ()
+        source_quote = " ".join(str(arguments.get("source_artifact_request_evidence") or "").split())
+        source_delivery_requested = (
+            arguments.get("source_artifact_delivery_requested") is True
+            and bool(source_quote)
+            and source_quote in " ".join(self._evidence.current_user_message.split())
+        )
         if (
             "local_files" in capabilities
             and set(exact_tool_names).intersection(_LOCAL_FILE_LISTING_TOOLS)
@@ -1459,6 +1491,7 @@ class ScopedTurnToolRegistry:
             and not self._evidence.has_attachments
             and not self._evidence.has_url_target
             and not embedded_media_extensions
+            and not source_delivery_requested
         ):
             requested_artifact_extensions = ()
         local_file_write_tools_requested = bool(
@@ -1472,9 +1505,11 @@ class ScopedTurnToolRegistry:
             and not requested_artifact_extensions
             and not embedded_media_extensions
             and not local_file_write_tools_requested
+            and not source_delivery_requested
         )
         requested: list[str] = []
         available = self._delegate_tool_names()
+        requested.extend(name for name in exact_tool_names if name in _CONVERSATION_HISTORY_TOOLS and name in available)
         raw_connector_app_ids = arguments.get("connector_app_ids")
         requested_connector_app_ids = _unique_connector_app_ids(
             raw_connector_app_ids if isinstance(raw_connector_app_ids, list) else ()
@@ -1603,7 +1638,7 @@ class ScopedTurnToolRegistry:
             elif capability == "skill_pack":
                 requested.extend(sorted(_SKILL_PACK_TOOLS))
             elif capability == "conversation_history":
-                requested.extend(sorted(_CONVERSATION_HISTORY_TOOLS))
+                requested.extend(sorted(_CONVERSATION_HISTORY_TOOLS - {"memory_save"}))
             elif capability == "personal_tasks":
                 requested.append("personal_tasks_list")
             elif capability == "weather":
@@ -1673,6 +1708,14 @@ class ScopedTurnToolRegistry:
             and not embedded_media_extensions
         ):
             requested.append("terminal_exec")
+        if set(requested).intersection({"file_search", "file_read"}):
+            requested.extend(sorted((_CONVERSATION_HISTORY_TOOLS - {"memory_save"}).intersection(available)))
+        if source_delivery_requested and set(capabilities).issubset({"conversation_history", "local_files"}):
+            # A typed retrieval plan needs reads, not automatically enabled
+            # artifact producers merely because it names a desired extension.
+            requested = [name for name in requested
+                         if name not in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS)]
+            requested.extend(sorted(_LOCAL_FILE_READ_TOOLS | (_CONVERSATION_HISTORY_TOOLS - {"memory_save"})))
         return _with_local_artifact_companion_tools(requested, available_tools=available)
 
     def _required_tool_names_for_scope_request(
@@ -2022,6 +2065,7 @@ class ScopedTurnToolRegistry:
             and not self._evidence.has_attachments
             and not self._evidence.has_url_target
             and not embedded_media_extensions
+            and not source_delivery_requested
         ):
             artifact_extensions = ()
             tool_names = tuple(tool_name for tool_name in tool_names if tool_name not in _STRUCTURED_ARTIFACT_TOOLS)
@@ -2148,6 +2192,7 @@ class ScopedTurnToolRegistry:
             and bool(available_sources)
             and not bool(set(tool_names).intersection(_CONNECTOR_TYPED_TOOLS))
             and not connector_source_user_requested
+            and not tool_names
         )
         connector_source_evidence_required = bool(
             "connector" in capabilities
@@ -2238,6 +2283,8 @@ class ScopedTurnToolRegistry:
                 ),
                 source_artifact_delivery_requested=source_delivery_requested,
                 source_artifact_request_evidence=request_quote if source_delivery_requested else "",
+                source_artifact_retrieval_only=bool(source_delivery_requested
+                    and capabilities.issubset({"conversation_history", "local_files"})),
                 requested_tool_names=merged_requested_tool_names,
                 required_tool_names=merged_required_tool_names,
                 requested_artifact_extensions=tuple(
@@ -2254,8 +2301,16 @@ class ScopedTurnToolRegistry:
             ),
         )
         callable_tool_names = tuple(tool_name for tool_name in tool_names if widened.can_invoke_tool(tool_name))
+        read_only_source_delivery = bool(source_delivery_requested
+            and capabilities.issubset({"conversation_history", "local_files"})
+            and set(callable_tool_names).intersection(_LOCAL_FILE_READ_TOOLS | _CONVERSATION_HISTORY_TOOLS)
+            and not set(callable_tool_names).intersection(_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS))
+        if read_only_source_delivery:
+            merged_required_tool_names = tuple(name for name in merged_required_tool_names
+                                               if name not in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS))
+            widened.turn_tool_scope_decision = replace(widened.turn_tool_scope_decision, required_tool_names=merged_required_tool_names)
         callable_required_tool_names = tuple(
-            tool_name for tool_name in merged_required_tool_names if widened.can_invoke_tool(tool_name)
+            tool_name for tool_name in merged_required_tool_names if tool_name in callable_tool_names
         )
         unavailable_required_tool_names = tuple(
             tool_name
@@ -2300,6 +2355,9 @@ class ScopedTurnToolRegistry:
                     "source_selection_required": source_selection_required,
                     "connector_source_evidence_required": connector_source_evidence_required,
                     "source_evidence_verified": source_evidence_verified,
+                    "source_artifact_delivery_requested": source_delivery_requested,
+                    "read_only_source_delivery": read_only_source_delivery,
+                    "source_artifact_request_evidence": request_quote if source_delivery_requested else "",
                     "active_connector_providers": list(active_connector_providers),
                     "missing_connector_app_scope": missing_connector_app_scope,
                     "message": (
@@ -2351,7 +2409,21 @@ class ScopedTurnToolRegistry:
                     error=f"Connector app is not in this turn scope: {app_id}",
                 )
         if self.can_invoke_tool(invocation.tool_name):
-            return self._delegate.invoke(invocation)
+            result = self._delegate.invoke(invocation)
+            if invocation.tool_name == "chat_history_search" and result.status == "completed" and isinstance(result.output, dict):
+                verified_extensions = {
+                    str(ref.get("extension") or "").lower()
+                    for match in result.output.get("matches", []) if isinstance(match, dict)
+                    for ref in match.get("artifact_refs", []) if isinstance(ref, dict)
+                    if ref.get("availability") == "available"
+                    and ref.get("extension") in VALID_ATTACHMENT_EXTENSIONS
+                }
+                if verified_extensions:
+                    # Existing document evidence permits its read/discovery tools;
+                    # a historical reference is never a new-artifact receipt.
+                    self._evidence = replace(self._evidence, existing_named_artifact_extensions=tuple(sorted(
+                        set(self._evidence.existing_named_artifact_extensions) | verified_extensions)))
+            return result
         return ToolResult(
             invocation_id=invocation.invocation_id,
             tool_name=invocation.tool_name,
@@ -4009,7 +4081,9 @@ def build_turn_tool_scope_decision(
         "If the current user turn requires a final scheduler state change and the draft only listed scheduler objects or asked for setup details, choose scheduler_action=mutate "
         "and include the registered scheduler mutation tool that can perform the requested state change; do not leave the action as inspect. "
         "Do not choose scheduler just because a saved task could answer the domain. "
-        "Use requested_tool_names=[\"chat_history_search\"] when the answer may be in saved current-conversation turns that are not visible in the prompt context. "
+        "Use requested_tool_names=[\"chat_history_search\"] when the answer may be in saved workspace conversations or earlier document references that are not visible in the prompt context. "
+        "Use memory_search for durable facts and preferences. For an explicit request to remember a durable preference or fact, "
+        "request memory_save and require its persisted receipt before claiming it was saved. "
         "Use connector only when the user explicitly asks this turn to use a connected external API/account/source, "
         "or this turn is linked to prior connector source selection. Set connector_source_user_requested=true only in those cases. "
         "For a new source request, copy the shortest exact substring from user_turn that names or selects the connected source into "

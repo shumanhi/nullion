@@ -394,6 +394,15 @@ class ModelClientTimeoutError(ModelClientConfigurationError):
     """Raised when a provider call exceeds the caller's explicit time budget."""
 
 
+class ModelClientResponseError(ModelClientConfigurationError):
+    """A provider explicitly failed instead of producing an assistant answer."""
+
+    def __init__(self, code: str, *, retryable: bool = False):
+        self.code = code
+        self.retryable = retryable
+        super().__init__(f"The model response failed ({code}).")
+
+
 def is_model_timeout_error(exc: BaseException) -> bool:
     if isinstance(exc, (TimeoutError, ModelClientTimeoutError)):
         return True
@@ -1193,6 +1202,11 @@ class CodexResponsesModelClient:
         metadata: dict[str, Any] = {}
         if status in {"completed", "incomplete", "failed", "cancelled"}:
             metadata["status"] = status
+        error = data.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and code.isascii() and len(code) <= 100 and code.replace("_", "").isalnum():
+            # Record the protocol code, never a provider payload or request text.
+            metadata["error_code"] = code
         if isinstance(details, dict) and details.get("reason") in {"max_output_tokens", "content_filter"}:
             metadata["reason"] = details["reason"]
         if isinstance(usage, dict):
@@ -1273,6 +1287,7 @@ class CodexResponsesModelClient:
                 thinking_parts: list[str] = []
                 tool_blocks: list[dict[str, Any]] = []
                 completion: dict[str, Any] = {}
+                terminal_content: list[dict[str, Any]] | None = None
                 # track in-progress function call by item index
                 fn_calls: dict[int, dict[str, Any]] = {}
                 with _httpx.Client(timeout=remaining_budget()) as client:
@@ -1296,9 +1311,9 @@ class CodexResponsesModelClient:
                         resp.raise_for_status()
                         for raw_line in _deadline_response_lines(resp, request_deadline):
                             line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
-                            if not line.startswith("data: "):
+                            if not line.startswith("data:"):
                                 continue
-                            data_str = line[6:]
+                            data_str = line[5:].lstrip()
                             if data_str == "[DONE]":
                                 break
                             try:
@@ -1307,11 +1322,16 @@ class CodexResponsesModelClient:
                                 continue
 
                             etype = ev.get("type", "")
-                            if etype in {"response.completed", "response.incomplete", "response.failed"}:
+                            if etype == "error":
+                                completion = self._completion_metadata({"status": "failed", "error": ev})
+                                break
+                            if etype in {"response.completed", "response.incomplete", "response.failed", "response.cancelled"}:
                                 terminal = ev.get("response")
                                 terminal = dict(terminal) if isinstance(terminal, dict) else {}
                                 terminal.setdefault("status", etype.split(".", 1)[1])
                                 completion = self._completion_metadata(terminal)
+                                if isinstance(terminal.get("output"), list) and terminal["output"]:
+                                    terminal_content = self._parse(terminal)["content"]
                                 break
 
                             if etype == "response.output_text.delta":
@@ -1359,6 +1379,23 @@ class CodexResponsesModelClient:
                                         "name": item.get("name", ""),
                                         "input": parsed_input,
                                     })
+                if completion.get("status") in {"failed", "cancelled"}:
+                    code = str(completion.get("error_code") or completion["status"])
+                    retryable = code in {"failed", "server_error", "temporarily_unavailable", "overloaded_error"}
+                    if retryable and attempt == 0 and not text_parts and not tool_blocks and not fn_calls:
+                        logger.warning("Model stream failed before output; retrying once (code=%s)", code)
+                        continue
+                    raise ModelClientResponseError(code, retryable=retryable)
+                meaningful_content = terminal_content if terminal_content is not None else (
+                    [{"type": "text"}] if any(text_parts) else tool_blocks
+                )
+                if completion.get("status") == "completed" and not any(
+                    block.get("type") in {"text", "tool_use"} for block in meaningful_content
+                ) and not fn_calls:
+                    if attempt == 0:
+                        logger.warning("Model completed without an answer; retrying once")
+                        continue
+                    raise ModelClientResponseError("empty_response")
                 break
 
             # Also flush any fn_calls that didn't get an output_item.done
@@ -1382,6 +1419,12 @@ class CodexResponsesModelClient:
             if full_text:
                 content_blocks.append({"type": "text", "text": full_text})
             content_blocks.extend(tool_blocks)
+
+            if terminal_content is not None:
+                # The terminal snapshot is authoritative. Some streams include
+                # completed items without deltas; do not lose or duplicate them.
+                content_blocks = terminal_content
+                tool_blocks = [block for block in content_blocks if block.get("type") == "tool_use"]
 
             stop_reason = "tool_use" if tool_blocks else "end_turn"
             return {"stop_reason": stop_reason, "content": content_blocks, "completion": completion}

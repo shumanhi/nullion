@@ -1855,6 +1855,9 @@ def _reply_is_failed_artifact_producer_setup_reply(
 
 def operation_failure_reply(tool_results: Iterable[ToolResult]) -> str:
     """Explain typed failures without leaking provider payloads or promising a retry."""
+    from nullion.browser_capture_contract import repaired_browser_results
+
+    tool_results = repaired_browser_results(tool_results)
     failures = [result for result in tool_results if normalize_tool_status(result.status) in {"failed", "denied"}]
     browser_failures = [result for result in failures if result.tool_name.startswith("browser_")]
     if browser_failures:

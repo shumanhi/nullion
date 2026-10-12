@@ -13,8 +13,9 @@ import hashlib
 from time import perf_counter
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 from nullion.approvals import ApprovalRequest, ApprovalStatus, BoundaryPermit, PermissionGrant
 from nullion.audit import AuditRecord
@@ -249,6 +250,30 @@ def _builder_proposal_merge_value(
 
 
 def _merge_previous_checkpoint_records(store: RuntimeStore, previous: RuntimeStore) -> None:
+    # Memory is shared by running chat surfaces. Preserve committed updates and
+    # deletions while overlaying only this process's actual pending mutations.
+    pending_memory = {identity: store.get_user_memory_entry(identity)
+                      for identity in store._dirty_memory_entry_ids}
+    committed_ids = {entry.entry_id for entry in previous.list_user_memory_entries()}
+    for identity in store._memory_reinforcement_only_ids - committed_ids:
+        pending_memory.pop(identity, None)
+        store._dirty_memory_entry_ids.discard(identity)
+    store.user_facts.clear()
+    store.preferences.clear()
+    store.environment_facts.clear()
+    for entry in previous.list_user_memory_entries():
+        pending = pending_memory.get(entry.entry_id)
+        # A stale recall reinforcement must not overwrite a newer semantic edit.
+        def version(value):
+            stamp = value.updated_at or value.created_at
+            return (stamp.replace(tzinfo=UTC) if stamp.tzinfo is None else stamp.astimezone(UTC)) if stamp else datetime.min.replace(tzinfo=UTC)
+        if pending is not None and version(entry) > version(pending):
+            pending_memory[entry.entry_id] = entry
+        if entry.entry_id not in pending_memory:
+            store._user_memory_collection_for_kind(entry.kind)[entry.entry_id] = entry
+    for entry in pending_memory.values():
+        if entry is not None:
+            store._user_memory_collection_for_kind(entry.kind)[entry.entry_id] = entry
     dict_attrs = (
         "suspended_turns",
         "approval_requests",
@@ -1341,6 +1366,90 @@ def _deserialize_user_memory_entry(payload: dict[str, object]) -> UserMemoryEntr
     )
 
 
+_MEMORY_READ_CACHE: dict[str, tuple[tuple, tuple[UserMemoryEntry, ...]]] = {}
+_MEMORY_READ_CACHE_LOCK = threading.RLock()
+
+
+def read_persisted_memory_entries(path: str | Path) -> list[UserMemoryEntry] | None:
+    """Read only encrypted memory rows, with cheap snapshot invalidation.
+
+    Chat must never reload the full runtime/history database to refresh memory.
+    None means this is not a persisted SQLite memory store.
+    """
+    from dataclasses import replace
+
+    target = Path(path).expanduser().resolve()
+    if not target.is_file() or not _is_sqlite_runtime_path(target):
+        return None
+    collections = tuple(sorted(_ENCRYPTED_SQLITE_COLLECTIONS))
+    with sqlite3.connect(target.as_uri() + "?mode=ro", uri=True, timeout=0.2) as conn:
+        conn.execute("BEGIN")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('memory','runtime_meta')")}
+        if "memory" not in tables:
+            # Chat/history auxiliary tables can predate the first full checkpoint.
+            return []
+        fingerprint = tuple(conn.execute(
+            "SELECT collection, count(*), max(updated_at) FROM memory GROUP BY collection"
+        ).fetchall())
+        revision = conn.execute("SELECT value FROM runtime_meta WHERE key='memory_revision'").fetchone() if "runtime_meta" in tables else None
+        fingerprint = (target.stat().st_ino, revision, fingerprint)
+        with _MEMORY_READ_CACHE_LOCK:
+            cached = _MEMORY_READ_CACHE.get(str(target))
+            if cached is not None and cached[0] == fingerprint:
+                return [replace(entry) for entry in cached[1]]
+        entries = []
+        for collection, payload in conn.execute("SELECT collection, payload FROM memory"):
+            if collection not in collections:
+                continue
+            try:
+                entries.append(_deserialize_user_memory_entry(_decode_sqlite_runtime_payload(collection, target, payload)))
+            except (ValueError, KeyError, TypeError, InvalidToken) as exc:
+                raise ValueError("Persisted memory could not be verified") from exc
+        with _MEMORY_READ_CACHE_LOCK:
+            if len(_MEMORY_READ_CACHE) >= 16:
+                _MEMORY_READ_CACHE.pop(next(iter(_MEMORY_READ_CACHE)))
+            _MEMORY_READ_CACHE[str(target)] = (fingerprint, tuple(entries))
+        return [replace(entry) for entry in entries]
+
+
+def _mark_memory_snapshot_persisted(store: RuntimeStore, payload: dict[str, object]) -> None:
+    written = {str(entry["entry_id"]): entry for collection in _ENCRYPTED_SQLITE_COLLECTIONS
+               for entry in payload.get(collection, []) if isinstance(entry, dict)}
+    for identity in tuple(store._dirty_memory_entry_ids):
+        current = store.get_user_memory_entry(identity)
+        if (None if current is None else _serialize_user_memory_entry(current)) == written.get(identity):
+            store._dirty_memory_entry_ids.discard(identity)
+            store._memory_reinforcement_only_ids.discard(identity)
+
+
+def save_user_memory_entry(entry: UserMemoryEntry, path: str | Path) -> Path:
+    """Commit one encrypted memory entry without rewriting runtime/history data."""
+    target = Path(path).expanduser().resolve()
+    if not _is_sqlite_runtime_path(target):
+        raise ValueError("Scoped memory writes require a SQLite runtime store")
+    collection = {UserMemoryKind.FACT: 'user_facts', UserMemoryKind.PREFERENCE: 'preferences',
+                  UserMemoryKind.ENVIRONMENT_FACT: 'environment_facts'}[entry.kind]
+    with _runtime_store_file_lock(target), sqlite3.connect(str(target), timeout=2) as conn:
+        conn.executescript(_sqlite_runtime_ddl())
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('INSERT OR IGNORE INTO runtime_meta (key,value) VALUES (?,?)',
+                     ('format_version', str(RUNTIME_STORE_FORMAT_VERSION)))
+        matching_rows = []
+        for old_collection, item_key, raw in conn.execute('SELECT collection,item_key,payload FROM memory'):
+            decoded = _decode_sqlite_runtime_payload(old_collection, target, raw)
+            if decoded.get('entry_id') == entry.entry_id:
+                if decoded.get('owner') != entry.owner:
+                    raise ValueError('Memory identity belongs to another owner')
+                matching_rows.append((old_collection, item_key))
+        for old_collection, item_key in matching_rows:
+            conn.execute('DELETE FROM memory WHERE collection=? AND item_key=?', (old_collection, item_key))
+        encoded = _encode_sqlite_runtime_payload(collection, target, _serialize_user_memory_entry(entry))
+        conn.execute('INSERT INTO memory (collection,item_key,payload,updated_at) VALUES (?,?,?,?)',
+                     (collection, 'encrypted:' + uuid4().hex, encoded, datetime.now(UTC).isoformat()))
+        conn.execute('INSERT OR REPLACE INTO runtime_meta (key,value) VALUES (?,?)', ('memory_revision', uuid4().hex))
+    return target
+
+
 
 
 def _serialize_skill_execution_plan(capsule_id: str, plan: SkillExecutionPlan) -> dict[str, object]:
@@ -1982,6 +2091,8 @@ def _save_runtime_store_sqlite(
     merged_previous = False
     if merge_existing and target.exists():
         merge_started_at = perf_counter()
+        # Unreadable encrypted memory must never be replaced by a stale/empty snapshot.
+        verified_memory = read_persisted_memory_entries(target)
         try:
             previous_store = _load_runtime_store_sqlite_collections(
                 target,
@@ -1998,8 +2109,17 @@ def _save_runtime_store_sqlite(
                     "builder_proposals",
                     "builder_route_observations",
                     "skills",
+                    "user_facts",
+                    "preferences",
+                    "environment_facts",
                 ),
             )
+            if verified_memory is not None:
+                previous_store.user_facts.clear()
+                previous_store.preferences.clear()
+                previous_store.environment_facts.clear()
+                for entry in verified_memory:
+                    previous_store._user_memory_collection_for_kind(entry.kind)[entry.entry_id] = entry
             _merge_previous_checkpoint_records(store, previous_store)
             merged_previous = True
         except Exception:
@@ -2027,6 +2147,7 @@ def _save_runtime_store_sqlite(
             "INSERT OR REPLACE INTO runtime_meta (key, value) VALUES (?, ?)",
             ("format_version", str(RUNTIME_STORE_FORMAT_VERSION)),
         )
+        conn.execute('INSERT OR REPLACE INTO runtime_meta (key,value) VALUES (?,?)', ('memory_revision', uuid4().hex))
         for table_name, collections in _SQLITE_RUNTIME_COLLECTIONS_BY_TABLE.items():
             for collection in collections:
                 rows = payload.get(collection, [])
@@ -2074,6 +2195,8 @@ def _save_runtime_store_sqlite(
         for rows in payload.values()
     )
     _log_runtime_sqlite_timing("save", started_at, target, records=record_count)
+    _mark_memory_snapshot_persisted(store, payload)
+    store._memory_checkpoint_path = target
     total_ms = (perf_counter() - started_at) * 1000
     if total_ms >= RUNTIME_CHECKPOINT_SLOW_MS:
         logger.warning(
@@ -2212,6 +2335,7 @@ def _load_runtime_store_sqlite(path: str | Path) -> RuntimeStore:
         timing_operation="load",
     )
     store = _runtime_store_from_payload(payload)
+    store._memory_checkpoint_path = Path(path)
     return store
 
 
@@ -2363,6 +2487,8 @@ def save_runtime_store(
             if temp_target.exists():
                 temp_target.unlink()
             raise
+    _mark_memory_snapshot_persisted(store, json.loads(payload_json))
+    store._memory_checkpoint_path = target
     return target
 
 
@@ -2454,6 +2580,7 @@ def _runtime_store_from_payload(payload: dict[str, object]) -> RuntimeStore:
             store.add_conversation_ingress_id(conversation_id, ingress_id)
     for conversation_event in payload.get("conversation_events", []):
         store.add_conversation_event(dict(conversation_event))
+    _mark_memory_snapshot_persisted(store, payload)
     return store
 
 

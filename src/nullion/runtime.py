@@ -4574,6 +4574,7 @@ def bootstrap_persistent_runtime(path: str | Path) -> PersistentRuntime:
     except Exception:
         logger.debug("Startup maintenance skipped for runtime checkpoint %s", checkpoint_path, exc_info=True)
     store = bootstrap_runtime_store(checkpoint_path)
+    store._memory_checkpoint_path = checkpoint_path
     fingerprint = render_runtime_store_payload_json(store) if checkpoint_path.exists() else None
     return PersistentRuntime(
         store=store,

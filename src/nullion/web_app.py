@@ -144,7 +144,6 @@ from nullion.doctor_playbooks import execute_doctor_playbook_command
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.fetch_artifact_workflow import run_fetch_artifact_workflow
 from nullion.memory import (
-    capture_explicit_user_memory,
     format_memory_context,
     memory_entries_for_owner,
     memory_owner_for_web_admin,
@@ -22423,7 +22422,8 @@ def create_app(runtime, orchestrator, registry):
                     hydrated = _hydrate_chat_history_media(runtime, [{
                         "role": "bot", "text": event["assistant_reply"], "metadata": metadata,
                     }], principal_id=conv_id)
-                    replies.append({"turn_id": event["turn_id"], "text": redact_text(event["assistant_reply"]),
+                    visible_text = hydrated[0].get("text", event["assistant_reply"]) if hydrated else event["assistant_reply"]
+                    replies.append({"turn_id": event["turn_id"], "text": redact_text(visible_text),
                                     "artifacts": hydrated[0].get("artifacts", []) if hydrated else []})
                 return JSONResponse({"ok": True, "terminal_replies": replies})
             store = _get_chat_store()
@@ -23430,7 +23430,7 @@ def create_app(runtime, orchestrator, registry):
             is_durable_memory_entry = lambda entry: True  # noqa: E731
         for entry in sorted(
             memory_entries_for_owner(store, dashboard_memory_owner),
-            key=lambda item: (item.updated_at or item.created_at or datetime.min.replace(tzinfo=UTC), item.entry_id),
+            key=lambda item: (_coerce_utc_datetime(item.updated_at or item.created_at) or datetime.min.replace(tzinfo=UTC), item.entry_id),
             reverse=True,
         ):
             if len(memory) >= memory_limit:
@@ -23714,7 +23714,8 @@ def create_app(runtime, orchestrator, registry):
     @app.delete("/api/memory/{entry_id}")
     async def delete_user_memory_entry(entry_id: str):
         owner = memory_owner_for_web_admin()
-        entry = runtime.store.get_user_memory_entry(entry_id)
+        entry = next((entry for entry in memory_entries_for_owner(runtime.store, owner)
+                      if entry.entry_id == entry_id), None)
         if entry is None or entry.owner != owner:
             return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
         runtime.store.remove_user_memory_entry(entry_id)
@@ -23725,7 +23726,7 @@ def create_app(runtime, orchestrator, registry):
     @app.delete("/api/memory")
     async def delete_all_memory():
         owner = memory_owner_for_web_admin()
-        entries = [entry for entry in runtime.store.list_user_memory_entries() if entry.owner == owner]
+        entries = memory_entries_for_owner(runtime.store, owner)
         for entry in entries:
             runtime.store.remove_user_memory_entry(entry.entry_id)
         runtime.checkpoint()
@@ -29425,6 +29426,9 @@ def _compact_web_tool_output_for_context(
     user_message: str | None = None,
 ) -> object:
     redacted = redact_value(output)
+    if tool_name == "chat_history_search" and isinstance(redacted, dict):
+        from nullion.conversation_history_tools import compact_history_search_output
+        return compact_history_search_output(redacted, max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
     if tool_name == "list_crons" and isinstance(redacted, dict):
         return compact_list_crons_output_for_context(redacted, user_message=user_message, message_limit=600)
     if tool_name == "connector_request" and isinstance(redacted, dict):
@@ -29663,18 +29667,22 @@ def _web_builder_route_hints_prompt(runtime, tool_registry: ToolRegistry | None)
         return None
 
 
-def _web_memory_context(runtime, *, owner: str | None = None, reinforce: bool = True) -> str | None:
+def _web_memory_context(runtime, *, owner: str | None = None, reinforce: bool = True, query: str | None = None) -> str | None:
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return None
     store = getattr(runtime, "store", None)
     if store is None:
         return None
     memory_owner = owner or memory_owner_for_web_admin()
-    entries = memory_entries_for_owner(store, memory_owner)
+    try:
+        entries = memory_entries_for_owner(store, memory_owner, checkpoint_path=getattr(runtime, "checkpoint_path", None))
+    except Exception:
+        logger.warning("Saved web memory context could not be verified", exc_info=True)
+        return None
     try:
         from nullion.builder_memory import reinforce_memory_entries, select_memory_entries_for_prompt
 
-        entries = select_memory_entries_for_prompt(entries)
+        entries = select_memory_entries_for_prompt(entries, **({"query": query} if query else {}))
         if reinforce and reinforce_memory_entries(store, entries):
             _schedule_web_checkpoint(runtime, force=True)
     except Exception:
@@ -29764,35 +29772,8 @@ def _remember_web_chat_turn(
 
 
 def _remember_web_explicit_memory(runtime, *, user_message: str, owner: str | None = None) -> None:
-    if not _feature_enabled("NULLION_MEMORY_ENABLED"):
-        return
-    if _is_internal_scheduled_task_context(user_message):
-        return
-    store = getattr(runtime, "store", None)
-    if store is None:
-        return
-    memory_owner = owner or memory_owner_for_web_admin()
-
-    def _worker() -> None:
-        try:
-            written = capture_explicit_user_memory(
-                store,
-                owner=memory_owner,
-                text=user_message,
-                source="web_chat",
-            )
-            if written:
-                _schedule_web_checkpoint(runtime, force=True)
-        except Exception:
-            logger.debug("Unable to capture explicit web memory", exc_info=True)
-
-    if _feature_enabled("NULLION_WEB_EXPLICIT_MEMORY_SYNC_CAPTURE", default=False):
-        _worker()
-        return
-    timer = threading.Timer(_web_background_memory_start_delay_seconds(), _worker)
-    timer.name = "nullion-web-explicit-memory"
-    timer.daemon = True
-    timer.start()
+    """Explicit writes use the shared scoped memory tool and its durable receipt."""
+    return None
 
 
 class _WebConfigIntentState(TypedDict, total=False):

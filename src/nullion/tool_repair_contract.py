@@ -15,6 +15,10 @@ def tool_repair_kind(result: object) -> str | None:
     if recovery.get("retry_tool_name") != getattr(result, "tool_name", None):
         return None
     kind = recovery.get("kind")
+    if kind == "inspect_page" and output.get("reason") == "browser_condition_unmet":
+        tools = recovery.get("required_tool_names")
+        if isinstance(tools, list) and tools and all(isinstance(name, str) and name.strip() for name in tools):
+            return kind
     if kind == "repair_precondition" and output.get("reason") == "tool_precondition_unmet":
         tools = recovery.get("required_tool_names")
         if isinstance(tools, list) and tools and all(isinstance(name, str) and name.strip() for name in tools):

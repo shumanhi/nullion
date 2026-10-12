@@ -5339,7 +5339,13 @@ class BrowserTools:
                 _run(wait_for(session_id, selector, url_pattern, text, timeout))
             return _ok(invocation, {"waited_for": selector or url_pattern or text, "session_id": session_id})
         except Exception as e:
-            return _fail(invocation, f"Wait failed: {e}")
+            return _fail(invocation, f"Wait failed: {e}", {
+                "reason": "browser_condition_unmet", "session_id": session_id,
+                "page_state_preserved": True,
+                "conditions": {"selector": selector, "url_pattern": url_pattern, "text": text},
+                "recovery": {"kind": "inspect_page", "retry_tool_name": invocation.tool_name,
+                             "required_tool_names": ["browser_snapshot", "browser_extract_text"]},
+            })
 
     @_serialized_browser_operation
     def browser_assert_page_state(self, invocation: ToolInvocation) -> ToolResult:

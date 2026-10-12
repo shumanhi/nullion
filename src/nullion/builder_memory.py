@@ -521,6 +521,10 @@ def _memory_write_node(state: _BuilderMemoryState) -> dict[str, object]:
         _replacement_memory_entry(owner=owner, item=item, existing=existing, now=now)
         for item in parsed_entries[:policy.total_limit]
     ]
+    protected = {entry.entry_id: entry for entry in _entries_for_owner(store, owner)
+                 if entry.source == "explicit_memory_tool" and entry.kind is UserMemoryKind.PREFERENCE}
+    replacement_entries = [entry for entry in replacement_entries if entry.entry_id not in protected]
+    replacement_entries.extend(protected.values())
     removed = _replace_owner_memory(store, owner, replacement_entries)
     for entry in replacement_entries:
         store.add_user_memory_entry(entry)
@@ -571,6 +575,7 @@ def _compact_memory_inner(runtime, model_client) -> int:
 
     written = 0
     for owner, owner_entries in entries_by_owner.items():
+        owner_entries = _entries_for_owner(store, owner)
         if len(owner_entries) < COMPACTION_THRESHOLD:
             logger.debug(
                 "builder_memory: skipping compaction for %s — %d entries < threshold %d",
@@ -588,7 +593,8 @@ def _compact_memory_entries(store, owner: str, all_entries: list[UserMemoryEntry
     # Protect repeatedly recalled memories first, then fall back to recency.
     sorted_entries = sorted(all_entries, key=_memory_survival_sort_key, reverse=True)
     recent_entries = sorted_entries[:RECENT_WINDOW_ENTRIES]
-    candidate_entries = sorted_entries[RECENT_WINDOW_ENTRIES:]
+    candidate_entries = [entry for entry in sorted_entries[RECENT_WINDOW_ENTRIES:]
+                         if not (entry.source == "explicit_memory_tool" and entry.kind is UserMemoryKind.PREFERENCE)]
 
     if not candidate_entries:
         return 0
@@ -657,9 +663,7 @@ def _compact_memory_entries(store, owner: str, all_entries: list[UserMemoryEntry
     # Only remove originals after all compacted replacements are safely written.
     for entry in candidate_entries:
         try:
-            store.user_facts.pop(entry.entry_id, None)
-            store.preferences.pop(entry.entry_id, None)
-            store.environment_facts.pop(entry.entry_id, None)
+            _remove_memory_entry(store, entry.entry_id)
         except Exception as exc:
             logger.warning("builder_memory: failed to remove old entry %s: %s", entry.entry_id, exc)
 
@@ -719,8 +723,9 @@ def _parse_compacted_entries(raw: str) -> list[dict]:
 
 
 def _entries_for_owner(store, owner: str) -> list[UserMemoryEntry]:
+    from nullion.memory import memory_entries_for_owner
     entries = [
-        entry for entry in store.list_user_memory_entries()
+        entry for entry in memory_entries_for_owner(store, owner)
         if getattr(entry, "owner", None) == owner
     ]
     return sorted(entries, key=lambda entry: (entry.kind.value, entry.key, entry.entry_id))
@@ -791,6 +796,8 @@ def smart_cleanup_owner_memory(
             entry.entry_id
             for entry in sorted(candidates, key=_memory_survival_sort_key, reverse=True)[:target]
         }
+        keep_ids.update(entry.entry_id for entry in candidates
+                        if entry.source == "explicit_memory_tool" and entry.kind is UserMemoryKind.PREFERENCE)
         for entry in candidates:
             if entry.entry_id in keep_ids:
                 continue
@@ -881,8 +888,10 @@ def select_memory_entries_for_prompt(
     *,
     policy: MemoryPolicy | None = None,
     limit_multiplier: int = 1,
+    query: str | None = None,
 ) -> list[UserMemoryEntry]:
     policy = policy or memory_policy_from_env()
+    relevance = _memory_query_scores(entries, query)
     selected: list[UserMemoryEntry] = []
     for kind in (UserMemoryKind.PREFERENCE, UserMemoryKind.ENVIRONMENT_FACT, UserMemoryKind.FACT):
         limit = max(0, policy.limit_for_kind(kind) * max(1, limit_multiplier))
@@ -893,11 +902,33 @@ def select_memory_entries_for_prompt(
             for entry in entries
             if _memory_kind_value(entry.kind) == kind.value and is_durable_memory_entry(entry)
         ]
-        selected.extend(sorted(candidates, key=_memory_survival_sort_key, reverse=True)[:limit])
+        selected.extend(sorted(candidates, key=lambda entry: (relevance.get(entry.entry_id, 0.0), _memory_survival_sort_key(entry)), reverse=True)[:limit])
+    if query:
+        # Query matches must reach the prompt before its bounded context is trimmed.
+        selected.sort(key=lambda entry: relevance.get(entry.entry_id, 0.0), reverse=True)
     return selected
 
 
+def _memory_query_scores(entries: list[UserMemoryEntry], query: str | None) -> dict[str, float]:
+    """Rank stored data using corpus overlap, without classifying user intent."""
+    import math
+    import unicodedata
+
+    def tokens(text: str) -> set[str]:
+        return set(re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", text).casefold()))
+
+    query_tokens = tokens(str(query or ""))
+    if not query_tokens:
+        return {}
+    documents = {entry.entry_id: tokens(f"{entry.key} {entry.value}") for entry in entries}
+    counts = {token: sum(token in document for document in documents.values()) for token in query_tokens}
+    return {identity: sum(math.log1p(len(documents) / (1 + counts[token])) for token in query_tokens & document)
+            for identity, document in documents.items()}
+
+
 def is_durable_memory_entry(entry: UserMemoryEntry) -> bool:
+    if entry.source == "explicit_memory_tool" and entry.kind is UserMemoryKind.PREFERENCE:
+        return True
     return _is_structurally_durable_memory(
         str(getattr(entry, "key", "") or ""),
         str(getattr(entry, "value", "") or ""),
@@ -963,7 +994,11 @@ def reinforce_memory_entries(store, entries: list[UserMemoryEntry]) -> int:
             last_used_at=now,
         )
         try:
+            usage_ids = getattr(store, "_memory_reinforcement_only_ids", None)
+            usage_only = entry.entry_id not in getattr(store, "_dirty_memory_entry_ids", ()) or entry.entry_id in (usage_ids or ())
             store.add_user_memory_entry(reinforced)
+            if usage_only and usage_ids is not None:
+                usage_ids.add(entry.entry_id)
             written += 1
         except Exception:
             logger.debug("builder_memory: failed to reinforce memory %s", entry.entry_id, exc_info=True)
@@ -972,8 +1007,12 @@ def reinforce_memory_entries(store, entries: list[UserMemoryEntry]) -> int:
 
 def _memory_survival_sort_key(entry: UserMemoryEntry) -> tuple[float, datetime, datetime, str]:
     score = float(getattr(entry, "use_score", 0.0) or 0.0)
-    last_used = getattr(entry, "last_used_at", None) or datetime.min.replace(tzinfo=UTC)
-    updated = entry.updated_at or entry.created_at or datetime.min.replace(tzinfo=UTC)
+    def utc(value):
+        if not isinstance(value, datetime):
+            return datetime.min.replace(tzinfo=UTC)
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    last_used = utc(getattr(entry, "last_used_at", None))
+    updated = utc(entry.updated_at or entry.created_at)
     return (score, last_used, updated, entry.entry_id)
 
 
@@ -1137,10 +1176,9 @@ def _parse_json_object(raw: str) -> dict[str, object]:
 
 
 def _normalize_memory_key(value: str) -> str:
-    key = "".join(ch if ch.isalnum() else "_" for ch in value.lower()).strip("_")
-    while "__" in key:
-        key = key.replace("__", "_")
-    return (key or "memory")[:60]
+    from nullion.memory import _slug_key
+
+    return _slug_key(value)
 
 
 def _dt_for_payload(value: datetime | None) -> str:
@@ -1177,6 +1215,8 @@ def _replacement_memory_entry(
 ) -> UserMemoryEntry:
     key = _normalize_memory_key(str(item["key"]))
     previous = _entry_for_key(existing, key)
+    if previous and previous.source == "explicit_memory_tool" and previous.kind is UserMemoryKind.PREFERENCE:
+        return previous
     return UserMemoryEntry(
         entry_id=f"{owner}:{key}",
         owner=owner,

@@ -1192,6 +1192,8 @@ def _instruction_aware_cron_html(
         trace["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
         completion = response.get("completion", {}) if isinstance(response, dict) else {}
         trace["completion_status"] = completion.get("status") if isinstance(completion, dict) else None
+        if isinstance(completion, dict) and completion.get("error_code"):
+            trace["error_code"] = completion["error_code"]
         usage = completion.get("usage") if isinstance(completion, dict) else None
         if isinstance(usage, dict):
             trace["usage"] = {key: value for key, value in usage.items()
@@ -1199,6 +1201,14 @@ def _instruction_aware_cron_html(
         if isinstance(completion, dict) and completion.get("status") in {"incomplete", "failed", "cancelled"}:
             trace["status"] = "incomplete"
             trace["reason"] = completion.get("incomplete_reason") or completion.get("reason")
+            if completion.get("status") == "failed" and not timeout_retry_attempted:
+                # A failed model request is not a rejected report. Reuse the
+                # document and evidence for one bounded review attempt.
+                return _instruction_aware_cron_html(
+                    job, result, model_client=model_client, existing_html=existing_html,
+                    existing_documents=existing_documents, repair_attempts=repair_attempts,
+                    timeout_retry_attempted=True,
+                )
             if existing_html is None and completion.get("status") == "incomplete":
                 return recover_prefix(_cron_model_response_text(response, strip=False))
             if existing_html is not None and completion.get("status") == "incomplete":
@@ -1284,7 +1294,10 @@ def _instruction_aware_cron_html(
                 existing_documents=existing_documents, repair_attempts=repair_attempts,
                 timeout_retry_attempted=True, review_restart_attempted=True,
             )
-        from nullion.model_clients import is_model_timeout_error
+        from nullion.model_clients import is_model_timeout_error, ModelClientResponseError
+        if isinstance(exc, ModelClientResponseError):
+            trace["error_code"] = exc.code
+            trace["completion_status"] = "failed"
         if existing_html is not None and streamed_parts and is_model_timeout_error(exc):
             candidate = review_prefix + "".join(streamed_parts)
             if candidate.lstrip().startswith("{"):
@@ -1382,7 +1395,11 @@ def _recover_typed_html_artifact_after_terminal_limit(
             valid_existing_paths.append(candidate)
     if valid_existing_paths and len(valid_existing_paths) == len(candidates):
         artifact_path = Path(valid_existing_paths[-1])
-        if terminal_limit or not result.get("artifact_delivery_satisfied"):
+        # Verified unchanged bytes fulfill the same contract as repaired bytes.
+        # Clear stale producer failure flags even when the file already existed;
+        # an unsuccessful discovery call must not erase an accepted report.
+        if (terminal_limit or not result.get("artifact_delivery_satisfied")
+                or result.get("response_fulfilled") is False or result.get("cron_report_failed")):
             _complete_typed_html_artifact_recovery(
                 result,
                 artifact_path=artifact_path,
@@ -1882,6 +1899,14 @@ def run_single_agent_cron_turn(
                     "cron_id": str(getattr(job, "id", "") or ""),
                     "cron_name": str(getattr(job, "name", "") or ""),
                     "requires_artifact_delivery": requires_artifact_delivery,
+                    # HTML delivery verifies the saved request, source evidence
+                    # and actual document bytes after the producer returns.
+                    # Do not run a second generic review of its runtime prompt
+                    # or require a delivery receipt before that delivery phase.
+                    "completion_review_owner": (
+                        "cron_delivery" if requires_artifact_delivery
+                        and required_artifact_extensions == (".html",) else None
+                    ),
                     # Successful source rows do not prove that every saved
                     # report requirement has been researched. Keep read tools
                     # available so the agent can follow source links before
@@ -1986,14 +2011,22 @@ def run_single_agent_cron_turn(
             result_payload["cron_failure_notice"] = True
             result_payload["response_fulfilled"] = False
             result_payload["artifacts"] = []
+            required_artifact_missing = (
+                result_payload.get("artifact_delivery_required")
+                and not result_payload.get("artifact_delivery_satisfied")
+            )
             result_payload["reason"] = (
                 "cron_report_partial" if result_payload.get("cron_report_partial") else
-                "cron_required_artifact_missing" if result_payload.get("artifact_delivery_required")
+                "cron_required_artifact_missing" if required_artifact_missing
                 else "cron_report_incomplete"
             )
             if not result_payload.get("cron_report_partial"):
                 result_payload["text"] = (
+                    "The report was created, but its final review failed. I could not verify it for delivery."
+                    if result_payload.get("cron_artifact_review_unavailable") else
                     "This scheduled task could not create the required report file. It will retry at its next scheduled run."
+                    if required_artifact_missing else
+                    "The report file was created, but some required work could not be verified."
                     if result_payload.get("artifact_delivery_required") else
                     _cron_report_failure_notice(result_payload)
                 )
@@ -2017,7 +2050,9 @@ def run_single_agent_cron_turn(
 def _cron_report_failure_notice(result: dict[str, object]) -> str:
     """Present a safe cause from execution state, never provider payload prose."""
     from nullion.response_fulfillment_contract import operation_failure_reply
+    from nullion.browser_capture_contract import repaired_browser_results
 
+    unresolved_results = repaired_browser_results(result.get("tool_results") or ())
     if result.get("cron_agent_final_repair_failure") == "model_call_failed":
         detail = "The model request failed while preparing the report."
     elif result.get("cron_agent_final_repair_failure"):
@@ -2026,9 +2061,11 @@ def _cron_report_failure_notice(result: dict[str, object]) -> str:
                   "The source checks did not produce a complete report for this run.")
     elif result.get("model_timed_out"):
         detail = "The model request timed out before the report was finished."
+    elif result.get("reached_iteration_limit"):
+        detail = "The check reached its execution limit before the requested result could be verified."
     elif any(_normalized_tool_result_status(item) in {"failed", "denied"}
-             for item in result.get("tool_results") or ()):
-        detail = operation_failure_reply(result.get("tool_results") or ())
+             for item in unresolved_results):
+        detail = operation_failure_reply(unresolved_results)
     else:
         detail = "The source checks did not produce a complete report for this run."
     return f"{detail} It will retry at its next scheduled run."
@@ -2342,6 +2379,7 @@ def _repair_cron_agent_final_text_if_needed(
             validation_result = dict(result)
             validation_result["raw_tool_payload_blocked"] = False
             validation_result["model_timed_out"] = False
+            validation_result["reached_iteration_limit"] = False
             validation_result["response_fulfilled"] = True
             validation_result["response_presentation"] = {}
             repaired_text_reason = None if silent else _cron_final_text_repair_reason(
@@ -2391,6 +2429,7 @@ def _repair_cron_agent_final_text_if_needed(
     result["response_presentation"] = {"kind": "scheduled_report", "fulfillment_satisfied": True}
     result["response_fulfilled"] = True
     result["model_timed_out"] = False
+    result["reached_iteration_limit"] = False
     if result.get("raw_tool_payload_blocked"):
         result["cron_raw_tool_payload_repaired"] = True
         result["raw_tool_payload_blocked"] = False
@@ -2424,6 +2463,13 @@ def _cron_final_text_repair_reason(
         )
     ):
         return "model_timeout_with_completed_evidence"
+    # A runtime failure sentence is not a completed report. Salvage usable
+    # current-run evidence even when the producer returned non-empty text.
+    if _cron_result_has_completed_tool_evidence(result):
+        if result.get("reached_iteration_limit"):
+            return "iteration_limit_with_completed_evidence"
+        if result.get("response_fulfilled") is False:
+            return "unfulfilled_with_completed_evidence"
     try:
         from nullion.response_sanitizer import is_structured_tool_evidence_replacement_reply
 
@@ -2489,6 +2535,8 @@ def _cron_final_repair_system_prompt() -> str:
         'Choose delivery_decision=silent with delivery_reason=no_verified_match and an empty report '
         'only when the saved instructions require silence for no new matching items and completed '
         'source evidence establishes that condition, including any saved deduplication state. '
+        'A completed navigation, form edit, generic page excerpt, failed search, or missing results '
+        'does not establish that the saved search constraints were applied or that no matches exist. '
         'Existing unrelated or already reported records mean source_state=available, not empty. '
         'Failed or insufficient evidence must never be suppressed as silent. Otherwise choose send. '
         "In report, produce only the user-facing scheduled-task report that should be delivered. Do not mention repair, guards, raw payloads, "

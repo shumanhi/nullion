@@ -40,7 +40,9 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
     description=(
         "Search or inspect the current workspace's saved chat history, including turns "
         "older than the visible prompt context. Use this before telling the user that recent "
-        "chat details are unavailable when the answer may be in this workspace."
+        "chat details are unavailable when the answer may be in this workspace. For a prior "
+        "document or project, recover its saved request and artifact references before broad "
+        "filesystem discovery. References report current availability, not proof of delivery."
     ),
     risk_level=ToolRiskLevel.LOW,
     side_effect_class=ToolSideEffectClass.READ,
@@ -64,6 +66,10 @@ CHAT_HISTORY_SEARCH_TOOL_SPEC = ToolSpec(
                 "enum": ["workspace", "recent_conversation"],
                 "description": "Search workspace history, or only the recent current conversation for lightweight turn context.",
             },
+            "artifact_extensions": {
+                "type": "array", "items": {"type": "string", "pattern": "^\\.[A-Za-z0-9]+$"},
+                "description": "For a prior document/file request, specify its desired file extensions, such as .pdf. This filters artifact references, including named files in earlier replies. It never requests generation of a new file.",
+            },
         },
         "additionalProperties": False,
     },
@@ -81,12 +87,13 @@ def _coerce_limit(value: object, *, default: int = 20) -> int:
 
 def _parse_created_at(value: object) -> datetime:
     if isinstance(value, datetime):
-        return value
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
     text = str(value or "").strip()
     if not text:
         return datetime.min.replace(tzinfo=UTC)
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
     except ValueError:
         return datetime.min.replace(tzinfo=UTC)
 
@@ -220,15 +227,78 @@ def _tokenize(value: object) -> tuple[str, ...]:
     return tuple(dict.fromkeys(tokens))
 
 
+def _event_discovery_only(event: dict[str, object]) -> bool:
+    results = event.get("tool_results")
+    if not isinstance(results, list) or _event_artifact_candidate_paths(event):
+        return False
+    names = {str(result.get("tool_name") or "") for result in results
+             if isinstance(result, dict) and result.get("status") == "completed"}
+    names.discard("request_tool_scope")
+    return bool(names) and names.issubset({"file_search", "workspace_summary"})
+
+
 def _event_text(event: dict[str, object]) -> str:
     return "\n".join(
         part
         for part in (
             str(event.get("user_message") or ""),
-            str(event.get("assistant_reply") or ""),
+            "" if _event_discovery_only(event) else str(event.get("assistant_reply") or ""),
+            " ".join(path.name for path in _event_artifact_candidate_paths(event)),
         )
         if part.strip()
     )
+
+
+def _event_artifact_candidate_paths(event: dict[str, object]) -> list[Path]:
+    from nullion.artifacts import artifact_paths_from_output_descriptors, media_candidate_paths_from_text
+
+    paths = media_candidate_paths_from_text(str(event.get("assistant_reply") or ""))
+    for key in ("artifact_paths", "delivered_artifact_paths"):
+        values = event.get(key)
+        if isinstance(values, (list, tuple)):
+            paths.extend(Path(value) for value in values if isinstance(value, str) and value)
+    results = event.get("tool_results")
+    for result in results if isinstance(results, list) else ():
+        if not isinstance(result, dict) or result.get("status") != "completed":
+            continue
+        output = result.get("output")
+        if isinstance(output, dict):
+            paths.extend(Path(value) for value in artifact_paths_from_output_descriptors(output))
+    return list(dict.fromkeys(paths))
+
+
+def _event_artifact_refs(event: dict[str, object]) -> list[dict[str, object]]:
+    from nullion.artifacts import artifact_descriptor_for_path
+    from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
+    from nullion.workspace_storage import workspace_storage_roots_for_workspace
+
+    roots = workspace_storage_roots_for_workspace(_event_workspace_id(event), create=False)
+    if not getattr(roots, "artifacts", None):
+        return []
+    refs = []
+    paths = _event_artifact_candidate_paths(event)
+    # A literal filename is attachment identity metadata even when an older
+    # adapter stored the final caption without its MEDIA directive.
+    suffixes = "|".join(re.escape(value.lstrip(".")) for value in sorted(VALID_ATTACHMENT_EXTENSIONS))
+    filename_pattern = r"(?<![\w./\\-])([^\s/\\<>\"'`*]+\.(?:" + suffixes + r"))(?![\w/\\-]|\.[\w])"
+    for name in re.findall(filename_pattern, str(event.get("assistant_reply") or ""), re.IGNORECASE):
+        candidate = roots.artifacts / name
+        if candidate.is_file():
+            paths.append(candidate)
+    for candidate in dict.fromkeys(paths):
+        try:
+            path = candidate.expanduser().resolve()
+            if not path.is_relative_to(roots.artifacts.resolve()) or path.suffix.lower() not in VALID_ATTACHMENT_EXTENSIONS:
+                continue
+            descriptor = artifact_descriptor_for_path(path, artifact_root=roots.artifacts)
+            availability = "available" if descriptor else "unverified" if path.exists() else "missing"
+            refs.append({"type": "artifact", "name": path.name, "path": str(path),
+                         "extension": path.suffix.lower(), "availability": availability})
+        except (OSError, RuntimeError, ValueError):
+            continue
+    # Document references must survive a long run's internal image captures.
+    refs.sort(key=lambda ref: ref["extension"] in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"})
+    return refs[:_MAX_STRUCTURED_REFERENCES]
 
 
 def _event_has_history_search_tool_result(event: dict[str, object]) -> bool:
@@ -282,7 +352,7 @@ def _tool_evidence_from_event(event: dict[str, object]) -> list[dict[str, object
     if not isinstance(tool_results, list):
         return []
     evidence: list[dict[str, object]] = []
-    for result in tool_results:
+    for result in reversed(tool_results):
         if not isinstance(result, dict):
             continue
         name = str(result.get("tool_name") or "").strip()
@@ -301,7 +371,7 @@ def _tool_evidence_from_event(event: dict[str, object]) -> list[dict[str, object
         evidence.append(item)
         if len(evidence) >= _MAX_TOOL_EVIDENCE_ITEMS:
             break
-    return evidence
+    return list(reversed(evidence))
 
 
 def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
@@ -313,6 +383,9 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
         "user_message": _snippet(event.get("user_message")),
         "assistant_reply": _snippet(event.get("assistant_reply")),
     }
+    if _event_discovery_only(event):
+        record["evidence_kind"] = "search_candidates_only"
+        record["assistant_reply"] = "Search candidates were returned; no document delivery was verified."
     workspace_id = str(event.get("workspace_id") or "").strip()
     if workspace_id:
         record["workspace_id"] = workspace_id
@@ -323,6 +396,10 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
     if isinstance(context, str) and context.strip():
         record["context"] = context.strip()
     structured_refs = _structured_references_from_event(event)
+    artifact_refs = _event_artifact_refs(event)
+    if artifact_refs:
+        record["artifact_refs"] = artifact_refs
+        structured_refs.extend(artifact_refs)
     if structured_refs:
         record["structured_refs"] = structured_refs
     context_text = str(record.get("context") or "")
@@ -337,6 +414,69 @@ def _event_record(event: dict[str, object], *, index: int) -> dict[str, object]:
         if tool_evidence:
             record["tool_evidence"] = tool_evidence
     return record
+
+
+def compact_history_search_output(output: dict[str, object], *, max_chars: int = 10_000) -> dict[str, object]:
+    """Keep ranked history and artifact references typed under a context budget."""
+    compact = {key: output[key] for key in ("conversation_id", "workspace_id", "query", "requested_artifact_extensions", "match_count", "searched_turn_count",
+               "searched_scope", "fallback_to_recent", "suppress_activity", "lookup_selection_unresolved", "artifact_descriptors", "message") if key in output}
+    if isinstance(compact.get("query"), str):
+        compact["query"] = _snippet(compact["query"], max_chars=500)
+    original_counts = {}
+    for key in ("matches", "structured_matches"):
+        records = output.get(key)
+        original_counts[key] = len(records) if isinstance(records, list) else 0
+        compact[key] = []
+        for record in records if isinstance(records, list) else ():
+            if not isinstance(record, dict):
+                continue
+            value = dict(record)
+            if isinstance(value.get("tool_names"), list):
+                value["tool_names"] = value["tool_names"][-12:]
+            # Tool payloads and artifact references already have authoritative
+            # owners. Do not repeat nested inventories in historical snippets.
+            value["tool_evidence"] = [{name: item[name] for name in ("tool_name", "status", "error") if name in item}
+                                      for item in record.get("tool_evidence", []) if isinstance(item, dict)]
+            for evidence, item in zip(value["tool_evidence"], [item for item in record.get("tool_evidence", []) if isinstance(item, dict)]):
+                preview = item.get("output_preview")
+                if isinstance(preview, str) and len(preview) <= 500:
+                    evidence["output_preview"] = preview
+            if not value["tool_evidence"]:
+                value.pop("tool_evidence")
+            if value.get("artifact_refs"):
+                value["structured_refs"] = [ref for ref in record.get("structured_refs", [])
+                                            if isinstance(ref, dict) and ref.get("type") != "artifact"]
+                if not value["structured_refs"]:
+                    value.pop("structured_refs")
+            compact[key].append(value)
+    def size():
+        return len(json.dumps(compact, ensure_ascii=False, sort_keys=True, default=str))
+    while size() > max_chars - 300:
+        removable = [key for key in original_counts if len(compact[key]) > 1]
+        if not removable:
+            break
+        # Trim lower ranked records, never generic string representations of
+        # the best document references.
+        longest = max(removable, key=lambda key: len(json.dumps(compact[key], ensure_ascii=False)))
+        compact[longest].pop()
+    for key in original_counts:
+        for record in compact[key]:
+            for refs in ("artifact_refs", "structured_refs"):
+                while size() > max_chars - 300 and len(record.get(refs, [])) > 1:
+                    record[refs].pop()
+    if size() > max_chars - 300:
+        for key in original_counts:
+            for record in compact[key]:
+                for field in ("user_message", "assistant_reply"):
+                    if field in record:
+                        record[field] = _snippet(record[field], max_chars=200)
+    if size() > max_chars - 300 and compact["matches"]:
+        compact["structured_matches"] = []
+    compact["context_window"] = {key: {"shown": len(compact[key]), "total": count}
+                                  for key, count in original_counts.items() if len(compact[key]) != count}
+    if not compact["context_window"]:
+        compact.pop("context_window")
+    return compact
 
 
 def _workspace_id_for_conversation(conversation_id: str | None) -> str:
@@ -698,12 +838,13 @@ def _ranked_history_events(
         if not haystack:
             continue
         user_tokens = set(_tokenize(str(event.get("user_message") or "").lower()))
-        assistant_tokens = set(_tokenize(str(event.get("assistant_reply") or "").lower()))
+        assistant_tokens = set() if _event_discovery_only(event) else set(_tokenize(str(event.get("assistant_reply") or "").lower()))
+        assistant_tokens.update(_tokenize(" ".join(path.name for path in _event_artifact_candidate_paths(event))))
         haystack_tokens = user_tokens.union(assistant_tokens)
         matched_tokens = query_tokens.intersection(haystack_tokens)
         score = sum(_token_weight(token) for token in matched_tokens)
         score += sum(
-            max(1, _token_weight(token) * 2)
+            _token_weight(token) * 2
             for token in matched_tokens
             if token in user_tokens and token in assistant_tokens
         )
@@ -847,6 +988,11 @@ def _chat_history_search_result(
     query = str(arguments.get("query") or "").strip()
     limit = _coerce_limit(arguments.get("limit"))
     recent_conversation_only = arguments.get("search_scope") == "recent_conversation"
+    from nullion.attachment_format_graph import VALID_ATTACHMENT_EXTENSIONS
+    extensions = arguments.get("artifact_extensions") or []
+    if not isinstance(extensions, list) or any(not isinstance(value, str) or value.lower() not in VALID_ATTACHMENT_EXTENSIONS for value in extensions):
+        return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason": "invalid_artifact_extensions"}, error="Unsupported history artifact filter")
+    extensions = {value.lower() for value in extensions}
     full_history = bool(query) and not recent_conversation_only
     workspace_id = str(workspace_id or _workspace_id_for_conversation(conversation_id)).strip()
     if recent_conversation_only:
@@ -859,6 +1005,8 @@ def _chat_history_search_result(
             runtime, store, conversation_id,
             full_history=full_history, workspace_id=workspace_id,
         )
+    if extensions:
+        events = [event for event in events if any(ref["extension"] in extensions for ref in _event_artifact_refs(event))]
     selected, fallback_to_recent = _ranked_history_events(
         events,
         query=query,
@@ -870,6 +1018,10 @@ def _chat_history_search_result(
         query=query,
         limit=min(_MAX_HISTORY_RETURN_LIMIT, max(limit, 12)),
     )
+    if extensions:
+        selected.sort(key=lambda event: any(ref["extension"] in extensions and ref["availability"] == "available"
+                                           for ref in _event_artifact_refs(event)), reverse=True)
+        structured_selected = []
     # Structured references are supplemental evidence. Keep plain direct
     # matches too; only drop unrelated surrounding context when a structured
     # candidate is present, so its tool payload cannot contaminate the answer.
@@ -890,10 +1042,12 @@ def _chat_history_search_result(
             "conversation_id": conversation_id,
             "workspace_id": workspace_id,
             "query": query,
+            "requested_artifact_extensions": sorted(extensions),
             "match_count": len(records),
             "searched_turn_count": len(events),
             "searched_scope": "recent_conversation_after_reset" if recent_conversation_only else "full_workspace_after_reset" if full_history else "recent_workspace_after_reset",
             "fallback_to_recent": fallback_to_recent,
+            "suppress_activity": True,
             "matches": records,
             "structured_matches": structured_records,
             "message": (
@@ -915,13 +1069,18 @@ class ConversationHistoryToolRegistry:
         runtime: object,
         conversation_id: str,
         workspace_id: str | None = None,
+        user_message: str | None = None,
     ) -> None:
         from nullion.personal_tasks import PersonalTaskToolRegistry
+        from nullion.memory_tools import MemoryToolRegistry
 
         self._runtime = runtime
         self._conversation_id = conversation_id
         self._workspace_id = str(workspace_id or _workspace_id_for_conversation(conversation_id)).strip()
-        self._delegate = PersonalTaskToolRegistry(delegate, runtime=runtime, workspace_id=self._workspace_id)
+        self._delegate = PersonalTaskToolRegistry(
+            MemoryToolRegistry(delegate, runtime=runtime, workspace_id=self._workspace_id,
+                               conversation_id=conversation_id, user_message=user_message),
+            runtime=runtime, workspace_id=self._workspace_id)
 
     def get_spec(self, name: str):
         if name == CHAT_HISTORY_SEARCH_TOOL_NAME:
@@ -980,6 +1139,7 @@ def with_conversation_history_tool(
     runtime: object,
     conversation_id: str | None,
     workspace_id: str | None = None,
+    user_message: str | None = None,
 ) -> object:
     normalized_conversation_id = str(conversation_id or "").strip()
     if registry is None or not normalized_conversation_id or getattr(runtime, "store", None) is None:
@@ -991,6 +1151,7 @@ def with_conversation_history_tool(
         runtime=runtime,
         conversation_id=normalized_conversation_id,
         workspace_id=workspace_id,
+        user_message=user_message,
     )
 
 

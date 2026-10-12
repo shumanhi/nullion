@@ -124,7 +124,6 @@ from nullion.messaging_delivery_contract import foreground_reply_should_be_suppr
 from nullion.mini_agent_runs import MiniAgentRunStatus
 from nullion import runtime_cache
 from nullion.memory import (
-    capture_explicit_user_memory,
     format_memory_context,
     memory_entries_for_owner,
     memory_owner_for_messaging,
@@ -3626,11 +3625,16 @@ def _memory_context_for_chat(
     chat_id: str | None,
     settings: NullionSettings | None = None,
     reinforce: bool = True,
+    query: str | None = None,
 ) -> str | None:
     if not _feature_enabled("NULLION_MEMORY_ENABLED"):
         return None
     owner = _memory_owner_for_chat(chat_id, settings)
-    entries = memory_entries_for_owner(runtime.store, owner)
+    try:
+        entries = memory_entries_for_owner(runtime.store, owner, checkpoint_path=getattr(runtime, "checkpoint_path", None))
+    except Exception:
+        logger.warning("Saved memory context could not be verified", exc_info=True)
+        return None
 
     # Backward compatibility for pre-workspace memory entries that were owned
     # by Telegram chat ID. They are read but future writes use workspace:<id>.
@@ -3638,13 +3642,13 @@ def _memory_context_for_chat(
     if legacy_owner != owner:
         entries.extend(
             entry
-            for entry in memory_entries_for_owner(runtime.store, legacy_owner)
+            for entry in memory_entries_for_owner(runtime.store, legacy_owner, checkpoint_path=getattr(runtime, "checkpoint_path", None))
             if entry.key not in {existing.key for existing in entries}
         )
     try:
         from nullion.builder_memory import reinforce_memory_entries, select_memory_entries_for_prompt
 
-        entries = select_memory_entries_for_prompt(entries)
+        entries = select_memory_entries_for_prompt(entries, **({"query": query} if query else {}))
         if reinforce and reinforce_memory_entries(runtime.store, entries):
             runtime.checkpoint()
     except Exception:
@@ -3660,36 +3664,12 @@ def _remember_explicit_memory(
     settings: NullionSettings | None,
     prompt: str,
 ) -> None:
-    if not _feature_enabled("NULLION_MEMORY_ENABLED"):
-        return
-    if _is_internal_scheduled_task_context(prompt):
-        return
-    owner = _memory_owner_for_chat(chat_id, settings)
+    """Compatibility hook; explicit writes require a structured memory tool receipt.
 
-    def _worker() -> None:
-        try:
-            written = capture_explicit_user_memory(
-                runtime.store,
-                owner=owner,
-                text=prompt,
-                source="telegram_chat",
-            )
-            if written:
-                runtime.checkpoint()
-        except Exception:
-            logger.debug("Unable to capture explicit chat memory", exc_info=True)
-
-    try:
-        sync_capture = _feature_enabled("NULLION_CHAT_EXPLICIT_MEMORY_SYNC_CAPTURE", default=False)
-    except TypeError:
-        sync_capture = _feature_enabled("NULLION_CHAT_EXPLICIT_MEMORY_SYNC_CAPTURE")
-    if sync_capture:
-        _worker()
-        return
-    timer = threading.Timer(_chat_background_memory_start_delay_seconds(), _worker)
-    timer.name = "nullion-chat-explicit-memory"
-    timer.daemon = True
-    timer.start()
+    Ordinary durable facts still use the existing off-path Builder extraction.
+    No phrase-based capture or extra classifier runs on plain chat here.
+    """
+    return None
 
 
 def _chat_background_memory_start_delay_seconds() -> float:
@@ -11960,6 +11940,24 @@ def _scheduler_common_retries_may_bypass_before_mutation_recovery(
     )
 
 
+def _register_selected_existing_source_artifacts(runtime, result, *, prompt: str, principal_id: str | None, source_scope_decision=None) -> None:
+    from nullion.artifacts import history_artifact_reference_paths
+    if (getattr(result, "suspended_for_approval", False) or getattr(result, "reached_iteration_limit", False)
+            or getattr(result, "model_timed_out", False) or getattr(result, "response_fulfilled", None) is False):
+        return
+    if not getattr(source_scope_decision, "source_artifact_delivery_requested", False) and not history_artifact_reference_paths(getattr(result, "tool_results", None)) and not any(_tool_result_name(item) == "request_tool_scope"
+               and _tool_result_output(item).get("source_artifact_delivery_requested") is True
+               for item in getattr(result, "tool_results", None) or []):
+        return
+    from nullion.artifacts import register_selected_existing_source_artifacts
+    paths = register_selected_existing_source_artifacts(
+        reply=str(getattr(result, "final_text", "") or ""), user_message=prompt,
+        tool_results=getattr(result, "tool_results", None) or [], artifact_roots=_artifact_roots_for_delivery(runtime, principal_id),
+        source_scope_decision=source_scope_decision)
+    if paths:
+        result.artifacts = list(dict.fromkeys([*(getattr(result, "artifacts", None) or []), *paths]))
+
+
 def _run_chat_turn_common_retries(
     *,
     initial_result: object,
@@ -11981,6 +11979,9 @@ def _run_chat_turn_common_retries(
 ) -> ChatTurnCommonRetryResult:
     result = initial_result
     tool_registry = active_tool_registry
+    if runtime is not None:
+        _register_selected_existing_source_artifacts(runtime, result, prompt=user_message, principal_id=principal_id,
+            source_scope_decision=getattr(tool_registry, "turn_tool_scope_decision", None))
     had_account_source_selection = bool(
         _account_source_selection_reply_from_scope_results(getattr(result, "tool_results", None))
     )
@@ -14924,7 +14925,10 @@ def _chat_delivery_contract_prompt(
         "Use personal_tasks_list to read the durable list. When it is empty but prior items were discussed, search saved history "
         "before claiming there are no items; report any recovered item with its source turn and restore only user-authorized items. "
         "A preference to maintain a list is not the list itself. Do not invent example items as saved tasks.\n"
-        "- When the needed detail may be in earlier turns of this same conversation but is not visible in the prompt context, request conversation_history scope and use chat_history_search before asking the user to resend it.\n"
+        "- Use memory_search for durable workspace facts and preferences. For an explicit request to remember one, "
+        "request memory_save, quote the current human request as source_quote, and claim it was saved only after "
+        "a persisted=true receipt. Stored memory supplies context, not proof of current file availability or tool completion.\n"
+        "- When a request refers to a prior project, document, or decision, use workspace chat_history_search to recover its request and artifact references before broad file search or asking the user to resend it. For a document lookup, include artifact_extensions with the desired file type. References can be missing; verify current availability before claiming a file exists. Use a focused topic query and interpret abbreviations semantically; never substitute all files of a format or a directory inventory for the requested document. Finish with the selected file/attachment or a specific evidence-backed absence; a statement that you are checking is not a final result.\n"
         "- For browser shopping or cart work, treat prior screenshot, attachment, or conversation-derived merchant and item names as target evidence. Reuse the active browser session when available, search or open pages using those exact known names, and continue through reasonable page-discovery attempts before asking the user for a direct link. Adding requested items to a cart is allowed; do not submit checkout, payment, purchase, booking, or order placement without explicit approval.\n"
         "- Do not say the chat platform cannot attach files. Nullion will attach completed artifact files after your turn.\n"
         "- Use scheduler tools for scheduled-task listing, updates, and manual runs. Do not inspect or mutate the cron database with terminal_exec to perform scheduler operations.\n"
@@ -16841,10 +16845,21 @@ def _filter_local_discovery_candidate_paths(
 
 
 def _local_discovery_results_reply(reply: str, paths: tuple[str, ...]) -> str:
-    del reply
+    selected = _referenced_local_discovery_paths(reply, paths)
+    paths = selected or paths
     count = len(paths)
     heading = f"I found {count} file{'s' if count != 1 else ''}:"
-    return "\n".join([heading, *(f"- {Path(path).name or path}" for path in paths)]).strip()
+    lines = [heading, *(f"- {Path(path).name or path}" for path in paths[:8])]
+    if count > 8:
+        lines.append(f"{count - 8} additional candidates omitted; the matching document is not yet confirmed.")
+    return "\n".join(lines).strip()
+
+
+def _referenced_local_discovery_paths(reply: str, paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Select opaque file references, never infer an action from reply wording."""
+    from nullion.artifacts import text_references_file_path
+
+    return tuple(path for path in paths if text_references_file_path(reply, path))
 
 
 def _completed_email_attachment_paths(
@@ -18240,11 +18255,7 @@ def _append_chat_artifacts_to_reply(
         discovery_paths
         and not explicit_artifact_paths
         and not reply_has_media_directives
-        and not _reply_visible_text_references_all_artifact_paths(
-            reply,
-            discovery_paths,
-            artifact_roots=artifact_roots,
-        )
+        and not _referenced_local_discovery_paths(reply, discovery_paths)
         and local_discovery_only
     ):
         if terminal_outcome_reply:
@@ -19875,16 +19886,49 @@ def _missing_required_attachment_extensions_for_repair(
     return tuple(missing)
 
 
+def _existing_source_retrieval_scope(tool_results) -> dict[str, object] | None:
+    producers = {name for names in _REPAIR_EXTENSION_TOOL_NAMES.values() for name in names} | {"file_patch", "archive_create"}
+    reads = {"chat_history_search", "memory_search", "file_read", "file_search", "workspace_summary"}
+    for result in tool_results or ():
+        if _tool_result_name(result) != "request_tool_scope" or normalize_tool_status(_tool_result_status(result)) != "completed":
+            continue
+        output = _tool_result_output(result)
+        capabilities = set(output.get("capabilities") or ())
+        explicit = set(output.get("explicit_tool_names") or ()) | set(output.get("requested_required_tool_names") or ())
+        writer_required = bool(explicit.intersection(producers))
+        if output.get("read_only_source_delivery") is True:
+            writer_required = False
+        if (output.get("source_artifact_delivery_requested") is True and output.get("source_artifact_request_evidence")
+                and not writer_required
+                and (capabilities.intersection({"conversation_history", "local_files"}) or explicit.intersection(reads))
+                and capabilities.issubset({"conversation_history", "local_files"})):
+            return output
+    return None
+
+
 def _repair_tool_registry_for_missing_attachment_extensions(
     *,
     base_registry: object,
     active_registry: object,
     missing_extensions: tuple[str, ...],
     existing_registry_decision: TurnToolScopeDecision | None = None,
+    source_tool_results=(),
+    user_message: str | None = None,
 ) -> object:
     if not missing_extensions:
         return active_registry
     available = _registry_tool_names(base_registry)
+    retrieval_scope = _existing_source_retrieval_scope(source_tool_results)
+    if retrieval_scope is not None:
+        quote = str(retrieval_scope["source_artifact_request_evidence"])
+        read_tools = tuple(name for name in ("chat_history_search", "memory_search", "file_read", "file_search", "workspace_summary") if name in available)
+        existing = existing_registry_decision or getattr(active_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
+        repair_registry = ScopedTurnToolRegistry(base_registry,
+            evidence=build_turn_tool_evidence(user_message=user_message or quote, conversation_result=None, requested_extensions=missing_extensions),
+            tool_scope_decision=replace(existing, requested_tool_names=read_tools, required_tool_names=(),
+                requested_artifact_extensions=missing_extensions, source_artifact_delivery_requested=True,
+                source_artifact_request_evidence=quote, source_artifact_retrieval_only=True, confidence=1.0, valid=True))
+        return _ToolRegistryWithoutRequestScope(repair_registry)
     requested_tools = tuple(
         dict.fromkeys(
             tool_name
@@ -19932,6 +19976,10 @@ def _required_attachment_repair_prompt(
     source_tool_results: list[ToolResult] | tuple[ToolResult, ...] = (),
 ) -> str:
     required = ", ".join(required_attachment_extensions) or "the requested attachment"
+    if _existing_source_retrieval_scope(source_tool_results) is not None:
+        return (f"The previous response did not deliver the requested existing {required} file. Continue the same lookup: "
+                "recover its saved reference, verify the matching existing file and attach it using its MEDIA path. "
+                "Do not create, edit, overwrite or regenerate the document. If the existing file cannot be verified, report the missing result clearly.")
     media_paths = tuple(path for path in collected_media_paths if str(path or "").strip())
     media_instruction = (
         " Reuse these current-turn local raster paths for any missing embedded-media artifact: "
@@ -21226,6 +21274,11 @@ def _sanitize_chat_reply(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     source: str = "agent",
 ) -> str:
+    from nullion.artifacts import history_artifact_reference_paths, text_references_file_path
+    if any(_tool_result_output(item).get("lookup_selection_unresolved") is True for item in tool_results or ()):
+        return sanitize_user_visible_reply(user_message=prompt, reply=reply, tool_results=tool_results, source=source) or reply
+    if any(text_references_file_path(reply, path) for path in history_artifact_reference_paths(tool_results)):
+        return sanitize_user_visible_reply(user_message=prompt, reply=reply, tool_results=tool_results, source=source) or reply
     direct_existing_artifact_delivery = _tool_results_include_direct_existing_artifact_delivery(tool_results)
     if _reply_media_candidate_paths(reply):
         discovery_paths = _local_discovery_paths_from_tool_results(tool_results)
@@ -21292,7 +21345,14 @@ def _sanitize_chat_reply(
         and not _merge_required_attachment_extensions((), tool_results)
         and _completed_tools_are_only_local_discovery(tool_results)
     ):
-        return _local_discovery_results_reply(sanitized, discovery_paths)
+        if _referenced_local_discovery_paths(sanitized, discovery_paths):
+            return sanitized
+        # An earlier broad query is evidence for the agent, not a final inventory.
+        focused = next((paths for result in reversed(tool_results or ())
+                        if _tool_result_name(result) == "file_search"
+                        and normalize_tool_status(_tool_result_status(result)) == "completed"
+                        and (paths := _file_search_match_paths_from_output(_tool_result_output(result)))), discovery_paths)
+        return _local_discovery_results_reply(sanitized, focused)
     return sanitized
 
 
@@ -21529,6 +21589,9 @@ def _compact_tool_output_for_context(
     user_message: str | None = None,
 ) -> object:
     redacted = redact_value(output)
+    if tool_name == "chat_history_search" and isinstance(redacted, dict):
+        from nullion.conversation_history_tools import compact_history_search_output
+        return compact_history_search_output(redacted, max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
     if tool_name == "list_crons" and isinstance(redacted, dict):
         return compact_list_crons_output_for_context(redacted, user_message=user_message, message_limit=600)
     if tool_name == "connector_request" and isinstance(redacted, dict):
@@ -23121,6 +23184,7 @@ def _render_chat_turn(
         chat_id=chat_id,
         settings=settings,
         reinforce=False,
+        query=prompt,
     )
     _mark_timing("memory_context")
     prior_user_message = _previous_user_message(thread)
@@ -23334,6 +23398,7 @@ def _render_chat_turn(
         runtime.active_tool_registry or ToolRegistry(),
         runtime=runtime,
         conversation_id=conversation_id,
+        user_message=prompt,
     )
     waiting_delegated_turn = _latest_waiting_delegated_suspended_turn(
         runtime,
@@ -25261,21 +25326,23 @@ def _render_chat_turn(
                             base_registry=base_tool_registry,
                             active_registry=active_turn_tool_registry,
                             missing_extensions=missing_repair_extensions,
+                            source_tool_results=turn_result.tool_results,
+                            user_message=effective_prompt,
                         )
                         repair_history = [
                             *orchestrator_conversation_history,
                             {"role": "user", "content": user_content_blocks or [{"type": "text", "text": effective_prompt}]},
                             {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+                            {"role": "user", "content": [{"type": "text", "text": "[Runtime recovery instructions]\n" + _required_attachment_repair_prompt(
+                                missing_repair_extensions or requested_attachment_extensions,
+                                collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
+                                source_tool_results=turn_result.tool_results)}]},
                         ]
                         try:
                             repair_result = agent_orchestrator.run_turn(
                                 conversation_id=conversation_id,
                                 principal_id=principal_id,
-                                user_message=_required_attachment_repair_prompt(
-                                    missing_repair_extensions or requested_attachment_extensions,
-                                    collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
-                                    source_tool_results=turn_result.tool_results,
-                                ),
+                                user_message=effective_prompt,
                                 conversation_history=repair_history,
                                 tool_registry=repair_tool_registry,
                                 policy_store=runtime.store,
@@ -25396,20 +25463,22 @@ def _render_chat_turn(
                                     base_registry=base_tool_registry,
                                     active_registry=repair_tool_registry,
                                     missing_extensions=second_missing_repair_extensions,
+                                    source_tool_results=turn_result.tool_results,
+                                    user_message=effective_prompt,
                                 )
                                 second_repair_history = [
                                     *repair_history,
                                     {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+                                    {"role": "user", "content": [{"type": "text", "text": "[Runtime recovery instructions]\n" + _required_attachment_repair_prompt(
+                                        second_missing_repair_extensions or turn_requested_attachment_extensions,
+                                        collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
+                                        source_tool_results=turn_result.tool_results)}]},
                                 ]
                                 try:
                                     second_repair_result = agent_orchestrator.run_turn(
                                         conversation_id=conversation_id,
                                         principal_id=principal_id,
-                                        user_message=_required_attachment_repair_prompt(
-                                            second_missing_repair_extensions or turn_requested_attachment_extensions,
-                                            collected_media_paths=_current_turn_collected_media_paths(turn_result.tool_results),
-                                            source_tool_results=turn_result.tool_results,
-                                        ),
+                                        user_message=effective_prompt,
                                         conversation_history=second_repair_history,
                                         tool_registry=second_repair_tool_registry,
                                         policy_store=runtime.store,

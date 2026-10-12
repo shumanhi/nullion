@@ -14,6 +14,119 @@ from urllib.parse import quote
 from uuid import uuid4
 
 _MIN_HTML_ARTIFACT_BYTES = 64
+
+
+def history_artifact_reference_paths(tool_results) -> list[str]:
+    """Return available artifact identities from this turn's typed history evidence."""
+    paths = []
+    for result in tool_results or ():
+        field = result.get if isinstance(result, dict) else lambda key, default=None: getattr(result, key, default)
+        if field("tool_name") != "chat_history_search" or field("status") != "completed":
+            continue
+        output = field("output")
+        if not isinstance(output, dict):
+            continue
+        for key in ("matches", "structured_matches"):
+            for record in output.get(key, []) if isinstance(output.get(key), list) else ():
+                if not isinstance(record, dict):
+                    continue
+                for ref in record.get("artifact_refs", []):
+                    if isinstance(ref, dict) and ref.get("availability") == "available" and isinstance(ref.get("path"), str):
+                        paths.append(ref["path"])
+    return list(dict.fromkeys(paths))
+
+
+def register_selected_existing_source_artifacts(*, reply: str, user_message: str, tool_results, artifact_roots, source_scope_decision=None) -> list[str]:
+    """Verify and expose inspected workspace files selected by a source-delivery plan."""
+    from nullion.tools import normalize_tool_status
+    def field(result, name, default=None):
+        return result.get(name, default) if isinstance(result, dict) else getattr(result, name, default)
+    def output(result):
+        value = field(result, "output")
+        return value if isinstance(value, dict) else {}
+    results = list(tool_results or ())
+    scopes = [output(item) for item in results if field(item, "tool_name") == "request_tool_scope"
+              and normalize_tool_status(field(item, "status")) == "completed"]
+    if source_scope_decision is not None:
+        scopes.append({"source_artifact_delivery_requested": getattr(source_scope_decision, "source_artifact_delivery_requested", False),
+                       "source_artifact_request_evidence": getattr(source_scope_decision, "source_artifact_request_evidence", ""),
+                       "required_tool_names": getattr(source_scope_decision, "required_tool_names", ())})
+    user_text = " ".join(str(user_message or "").split())
+    declared_delivery = any(scope.get("source_artifact_delivery_requested") is True
+               and (quote := " ".join(str(scope.get("source_artifact_request_evidence") or "").split()))
+               and quote in user_text for scope in scopes)
+    history_paths = history_artifact_reference_paths(results)
+    if not declared_delivery and not history_paths:
+        return []
+    producers = {"file_write", "file_patch", "pdf_create", "pdf_edit", "document_create", "presentation_create",
+                 "spreadsheet_create", "archive_create", "image_generate", "terminal_exec"}
+    if any(producers.intersection(scope.get("required_tool_names", scope.get("requested_required_tool_names", ())) or ()) for scope in scopes):
+        return []
+    selected = tuple(dict.fromkeys(media_candidate_paths_from_text(reply)))
+    reads = [item for item in results if field(item, "tool_name") == "file_read"
+             and normalize_tool_status(field(item, "status")) == "completed"]
+    histories = [item for item in results if field(item, "tool_name") == "chat_history_search"
+                 and normalize_tool_status(field(item, "status")) == "completed"]
+    if not selected or not (reads or histories):
+        return []
+    roots = tuple(artifact_roots)
+    verified = []
+    for path in selected:
+        try:
+            resolved = path.expanduser().resolve()
+            matching = next((item for item in reads if declared_delivery and output(item).get("path")
+                             and Path(str(output(item)["path"])).expanduser().resolve() == resolved), None)
+            if matching is None:
+                matching = next((item for item in histories if any(
+                    Path(value).expanduser().resolve() == resolved for value in history_artifact_reference_paths([item]))), None)
+            descriptor = next((value for root in roots if (value := artifact_descriptor_for_path(resolved, artifact_root=root)) is not None), None)
+        except (OSError, RuntimeError, ValueError):
+            return []
+        if matching is None or descriptor is None:
+            return []
+        verified.append((matching, descriptor))
+    for item, descriptor in verified:
+        payload = {**descriptor.to_dict(), "role": "deliverable", "origin": "existing_workspace_artifact"}
+        # Reading an existing file may also emit a source descriptor. Its old
+        # role must not suppress the same explicitly selected, verified file.
+        for result in results:
+            data = output(result)
+            descriptors = data.get("artifact_descriptors")
+            if not isinstance(descriptors, list):
+                continue
+            reconciled = []
+            for value in descriptors:
+                try:
+                    same_path = isinstance(value, dict) and value.get("path") and Path(str(value["path"])).expanduser().resolve() == Path(descriptor.path)
+                except (OSError, RuntimeError, ValueError):
+                    same_path = False
+                reconciled.append(payload if same_path else value)
+            if reconciled != descriptors:
+                if isinstance(result, dict):
+                    result["output"] = {**data, "artifact_descriptors": reconciled}
+                else:
+                    result.output = {**data, "artifact_descriptors": reconciled}
+        data = output(item)
+        descriptors = list(data.get("artifact_descriptors") or [])
+        if not any(isinstance(value, dict) and value.get("path") == descriptor.path and value.get("role") == "deliverable" for value in descriptors):
+            descriptors.append(payload)
+        enriched = {**data, "artifact_descriptors": descriptors}
+        if isinstance(item, dict):
+            item["output"] = enriched
+        else:
+            item.output = enriched
+    return [descriptor.path for _, descriptor in verified]
+
+
+def text_references_file_path(text: str, path: str | Path) -> bool:
+    """Match a concrete file identity without accepting filename prefixes."""
+    text = re.sub(r"(?ms)^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?^[ \t]*\1[ \t]*$", "", text)
+    candidate = Path(path)
+    return any(
+        re.search(r"(?<![\w./\\-])" + re.escape(value) + r"(?![\w/\\-]|\.[\w])", text, re.IGNORECASE)
+        for value in (str(candidate), candidate.name) if value
+    )
+
 _MAX_SUPPORTING_ASSET_HTML_CANDIDATES = 20
 _MAX_SUPPORTING_ASSET_HTML_BYTES = 1_500_000
 _HTML_ARTIFACT_SUFFIXES = frozenset({".html", ".htm"})
