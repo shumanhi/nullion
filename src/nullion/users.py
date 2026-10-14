@@ -267,6 +267,8 @@ def is_authorized_messaging_identity(
         return False
     if channel_name == "slack" and _normalize_chat_id(settings.slack.operator_user_id) == identity_text:
         return True
+    if channel_name == "discord" and _normalize_chat_id(getattr(getattr(settings, "discord", None), "operator_user_id", None)) == identity_text:
+        return True
 
     registry = load_user_registry(settings=settings)
     if not registry.multi_user_enabled:
@@ -305,6 +307,10 @@ def resolve_messaging_user(
         and settings is not None
         and _normalize_chat_id(settings.slack.operator_user_id) == identity_text
     ):
+        return _admin_user(settings)
+    if (channel_name == "discord" and settings is not None
+            and identity_text is not None
+            and _normalize_chat_id(getattr(getattr(settings, "discord", None), "operator_user_id", None)) == identity_text):
         return _admin_user(settings)
 
     registry = load_user_registry(settings=settings)

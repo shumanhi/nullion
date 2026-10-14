@@ -109,11 +109,56 @@ def _command_tokens(command: str) -> list[str]:
         return command.split()
 
 
+def _shell_statement_separators(command: str) -> str:
+    # Keep quoted newlines as filename bytes and escaped newlines as shell
+    # continuations. Only unquoted statement endings become separators.
+    result: list[str] = []
+    quote = None
+    escaped = False
+    comment = False
+    boundary = True
+    for char in command:
+        if comment:
+            if char == "\n":
+                result.append(";")
+                comment = False
+                boundary = True
+            continue
+        if escaped:
+            if char == "\n":
+                result.pop()  # the preceding continuation backslash
+            else:
+                result.append(char)
+            escaped = False
+            continue
+        if quote is not None:
+            result.append(char)
+            if char == quote:
+                quote = None
+            elif char == "\\" and quote == '"':
+                escaped = True
+            continue
+        if char == "#" and boundary:
+            comment = True
+        elif char == "\n":
+            result.append(";")
+            boundary = True
+        else:
+            result.append(char)
+            if char in {"'", '"'}:
+                quote = char
+            elif char == "\\":
+                escaped = True
+            boundary = char.isspace() or char in ";|&()<>"
+    return "".join(result)
+
+
 def _shell_syntax_tokens(command: str) -> list[str]:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer = shlex.shlex(_shell_statement_separators(command), posix=True, punctuation_chars=True)
+        lexer.commenters = ""
         lexer.whitespace_split = True
-        return list(lexer)
+        return [";" if token and set(token) == {";"} else token for token in lexer]
     except Exception:
         return _command_tokens(command)
 

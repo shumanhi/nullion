@@ -1287,6 +1287,7 @@ SLACK_SIGNING_SECRET=""
 SLACK_OPERATOR_USER_ID=""
 DISCORD_ENABLED=false
 DISCORD_BOT_TOKEN=""
+DISCORD_OPERATOR_USER_ID=""
 SKIP_MESSAGING_SETUP=false
 
 EXISTING_TELEGRAM_TOKEN="$(env_value NULLION_TELEGRAM_BOT_TOKEN)"
@@ -1299,6 +1300,7 @@ EXISTING_SLACK_SIGNING_SECRET="$(env_value NULLION_SLACK_SIGNING_SECRET)"
 EXISTING_SLACK_OPERATOR_USER_ID="$(env_value NULLION_SLACK_OPERATOR_USER_ID)"
 EXISTING_DISCORD_ENABLED="$(env_value NULLION_DISCORD_ENABLED)"
 EXISTING_DISCORD_BOT_TOKEN="$(env_value NULLION_DISCORD_BOT_TOKEN)"
+EXISTING_DISCORD_OPERATOR_USER_ID="$(env_value NULLION_DISCORD_OPERATOR_USER_ID)"
 EXISTING_MESSAGING_DONE="$(env_value NULLION_SETUP_MESSAGING_DONE)"
 
 if [[ "$EXISTING_MESSAGING_DONE" == "true" || -n "$EXISTING_TELEGRAM_TOKEN$EXISTING_SLACK_BOT_TOKEN$EXISTING_DISCORD_BOT_TOKEN" ]]; then
@@ -1321,6 +1323,7 @@ if [[ "$EXISTING_MESSAGING_DONE" == "true" || -n "$EXISTING_TELEGRAM_TOKEN$EXIST
         if [[ "$EXISTING_DISCORD_ENABLED" == "true" || -n "$EXISTING_DISCORD_BOT_TOKEN" ]]; then
             DISCORD_ENABLED=true
             DISCORD_BOT_TOKEN="$EXISTING_DISCORD_BOT_TOKEN"
+            DISCORD_OPERATOR_USER_ID="$EXISTING_DISCORD_OPERATOR_USER_ID"
         fi
         print_ok "Using existing messaging setup."
     fi
@@ -1464,7 +1467,20 @@ if [[ "$MESSAGING_CHOICES" == *"3"* || "$MESSAGING_CHOICES" == *"discord"* ]]; t
         fi
         print_err "Discord needs a bot token."
     done
-    print_ok "Discord messaging configured."
+    echo "  Invite the bot to your server with View Channel, Send Messages and Attach Files permissions."
+    echo "  Enable Developer Mode in Discord, then right-click your profile and choose Copy User ID."
+    while true; do
+        prompt_read -rp "  Your Discord user ID (leave blank for registered multi-user access): " DISCORD_OPERATOR_USER_ID
+        if [[ -z "$DISCORD_OPERATOR_USER_ID" || "$DISCORD_OPERATOR_USER_ID" =~ ^[1-9][0-9]{0,19}$ ]]; then
+            break
+        fi
+        print_err "Use the numeric user ID copied from your Discord profile, not a username or channel ID."
+    done
+    if [[ -n "$DISCORD_OPERATOR_USER_ID" ]]; then
+        print_ok "Discord messaging configured."
+    else
+        print_info "Before starting Discord, add an authorized Discord user in Settings > Users and enable multi-user mode."
+    fi
 fi
 
 if [[ "$TELEGRAM_ENABLED" == "true" || "$SLACK_ENABLED" == "true" || "$DISCORD_ENABLED" == "true" || "$SKIP_MESSAGING_SETUP" == "true" ]]; then
@@ -1485,6 +1501,7 @@ if [[ "$TELEGRAM_ENABLED" == "true" || "$SLACK_ENABLED" == "true" || "$DISCORD_E
     checkpoint_env_raw "NULLION_DISCORD_ENABLED" "$DISCORD_ENABLED"
     if [[ "$DISCORD_ENABLED" == "true" ]]; then
         checkpoint_env_value "NULLION_DISCORD_BOT_TOKEN" "$DISCORD_BOT_TOKEN"
+        checkpoint_env_value "NULLION_DISCORD_OPERATOR_USER_ID" "$DISCORD_OPERATOR_USER_ID"
     fi
     print_ok "Messaging setup checkpoint saved to $NULLION_ENV_FILE"
 fi
@@ -2664,6 +2681,7 @@ if [[ "$SLACK_ENABLED" != "true" && "$(env_value NULLION_SLACK_ENABLED)" != "fal
     SLACK_ENABLED=true
 fi
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-$(env_value NULLION_DISCORD_BOT_TOKEN)}"
+DISCORD_OPERATOR_USER_ID="${DISCORD_OPERATOR_USER_ID:-$(env_value NULLION_DISCORD_OPERATOR_USER_ID)}"
 if [[ "$DISCORD_ENABLED" != "true" && "$(env_value NULLION_DISCORD_ENABLED)" != "false" && -n "$DISCORD_BOT_TOKEN" ]]; then
     DISCORD_ENABLED=true
 fi
@@ -2720,6 +2738,7 @@ fi
     if [[ "$DISCORD_ENABLED" == "true" ]]; then
         echo "NULLION_DISCORD_ENABLED=true"
         echo "NULLION_DISCORD_BOT_TOKEN=\"$DISCORD_BOT_TOKEN\""
+        echo "NULLION_DISCORD_OPERATOR_USER_ID=\"$DISCORD_OPERATOR_USER_ID\""
     else
         echo "NULLION_DISCORD_ENABLED=false"
     fi

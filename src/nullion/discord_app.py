@@ -9,6 +9,7 @@ import inspect
 import logging
 import os
 from pathlib import Path
+import sys
 import time
 
 from nullion.chat_attachments import is_supported_chat_file
@@ -17,6 +18,7 @@ from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_fa
 from nullion.events import make_event
 from nullion.latency_phases import record_surface_latency_timing
 from nullion.messaging_adapters import (
+    DeliveryContract,
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
     MessagingIngress,
@@ -42,7 +44,7 @@ from nullion.run_activity import activity_trace_enabled
 from nullion.session_stop import stop_session_async, stop_session_reply
 from nullion.turn_dispatch_graph import GLOBAL_TURN_DISPATCH_TRACKER
 from nullion.turn_relationship_evidence import has_structured_turn_relationship_evidence
-from nullion.users import resolve_messaging_user
+from nullion.users import load_user_registry, resolve_messaging_user
 
 
 logger = logging.getLogger(__name__)
@@ -103,7 +105,33 @@ def _require_discord_settings(settings: NullionSettings) -> str:
         raise MessagingAdapterConfigurationError("Set NULLION_DISCORD_ENABLED=true to run the Discord adapter.")
     if not settings.discord.bot_token:
         raise MessagingAdapterConfigurationError("NULLION_DISCORD_BOT_TOKEN is required.")
+    if settings.discord.operator_user_id:
+        identity = settings.discord.operator_user_id
+        if not discord_user_id_valid(identity):
+            raise MessagingAdapterConfigurationError("Discord operator user ID must be the numeric user ID copied from Discord, not a username or channel ID.")
+    if not discord_authorized_user_configured(settings):
+        raise MessagingAdapterConfigurationError(
+            "Discord has no authorized user. Set your Discord user ID in Settings > Messaging "
+            "(NULLION_DISCORD_OPERATOR_USER_ID), or enable multi-user mode and register a Discord member."
+        )
     return settings.discord.bot_token
+
+
+def discord_user_id_valid(identity: str) -> bool:
+    return (isinstance(identity, str) and 1 <= len(identity) <= 20
+            and identity.isascii() and identity.isdecimal()
+            and not identity.startswith("0") and int(identity) < 2**64)
+
+
+def discord_authorized_user_configured(settings: NullionSettings) -> bool:
+    if settings.discord.operator_user_id:
+        identity = settings.discord.operator_user_id
+        return discord_user_id_valid(identity)
+    registry = load_user_registry(settings=settings)
+    return registry.multi_user_enabled and any(
+        user.active and user.role == "member" and user.messaging_channel == "discord" and user.messaging_user_id
+        for user in registry.users
+    )
 
 
 @asynccontextmanager
@@ -307,6 +335,7 @@ async def send_discord_platform_delivery(
     channel_id: str,
     text: str,
     principal_id: str | None = None,
+    message_only: bool = False,
 ) -> bool:
     """Send a platform delivery to Discord over REST, uploading MEDIA artifacts."""
     if not bot_token or not channel_id:
@@ -361,6 +390,7 @@ async def send_discord_platform_delivery(
                 channel="discord",
                 target_id=channel_id,
                 principal_id=principal_id,
+                delivery_contract=DeliveryContract.message_only() if message_only else None,
                 send_text=_send_text,
                 send_attachments=_send_attachments,
             )
@@ -488,6 +518,12 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         turn_outcome = "ignored"
         _log_turn_timing(turn_outcome)
         return
+    # Authorize before retrieving or saving external attachments.
+    if not require_authorized_ingress(MessagingIngress(channel="discord", user_id=user_id, text=text), settings):
+        await message.channel.send("This Discord user is not authorized. Ask the Nullion operator to add your Discord user ID in Settings > Users.")
+        turn_outcome = "unauthorized"
+        _log_turn_timing(turn_outcome)
+        return
     try:
         attachments = await _download_discord_attachments(message, settings=settings)
     except TypeError:
@@ -507,12 +543,6 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
         message_id=_optional_message_text(getattr(message, "id", None)),
         delivery_target_id=_optional_message_text(getattr(getattr(message, "channel", None), "id", None)),
     )
-    if not require_authorized_ingress(ingress, settings):
-        await message.channel.send("Unauthorized messaging identity.")
-        turn_outcome = "unauthorized"
-        _log_turn_timing(turn_outcome)
-        return
-
     if is_stop_command_text(ingress.text):
         stop_result = await stop_session_async(
             conversation_id=ingress.operator_chat_id,
@@ -707,7 +737,24 @@ async def run_discord_app(
         service.agent_orchestrator.set_deliver_fn(_discord_deliver_fn)
 
     logger.info("Starting Nullion Discord adapter")
-    await client.start(bot_token)
+    try:
+        async with client:
+            await client.start(bot_token)
+    except discord.LoginFailure as exc:
+        raise MessagingAdapterConfigurationError(
+            "Discord rejected the bot token. Copy the bot token from the Discord Developer Portal > Bot; "
+            "an application ID, public key, or client secret cannot be used as a bot token."
+        ) from exc
+    except discord.PrivilegedIntentsRequired as exc:
+        raise MessagingAdapterConfigurationError(
+            "Discord rejected the Message Content intent. Enable Message Content Intent in "
+            "Discord Developer Portal > your application > Bot > Privileged Gateway Intents, then restart Discord."
+        ) from exc
+    finally:
+        reminder_task = getattr(client, "_nullion_reminder_task", None)
+        if reminder_task is not None:
+            reminder_task.cancel()
+            await asyncio.gather(reminder_task, return_exceptions=True)
 
 
 def main(
@@ -731,7 +778,11 @@ def cli() -> None:
             description="nullion-discord",
         )
 
-    return run_user_facing_entrypoint(_run)
+    try:
+        return run_user_facing_entrypoint(_run)
+    except MessagingAdapterConfigurationError as exc:
+        print(f"Discord setup: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

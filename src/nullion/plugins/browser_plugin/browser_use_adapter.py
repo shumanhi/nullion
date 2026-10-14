@@ -12,10 +12,11 @@ import hashlib
 import json
 import os
 import sys
+import shutil
 import tempfile
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from nullion.artifacts import artifact_path_for_generated_workspace_file, artifact_output_descriptor, normalize_artifact_extensions
 from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy, BrowserPolicyViolation
-from nullion.tools import ToolInvocation, ToolResult, tool_execution_remaining_seconds
+from nullion.tools import ToolInvocation, ToolResult, filesystem_error_metadata, tool_execution_remaining_seconds
 
 
 class BrowserObservation(BaseModel):
@@ -153,6 +154,8 @@ class PageEvidence:
         self.blocker: str | None = None
         self.next_action = "report"
         self.goal_status = "blocked"
+        self._resources = ExitStack()
+        self._capture_root = None
 
     async def capture(self, state, output=None, step=None):
         if not self.policy.is_allowed(state.url):
@@ -177,10 +180,18 @@ class PageEvidence:
         if existing:
             path = existing["path"]
         elif png.startswith(b"\x89PNG\r\n\x1a\n"):
-            artifact = artifact_path_for_generated_workspace_file(principal_id=self.principal_id, suffix=".png", stem="browser-evidence")
+            if self._capture_root is None:
+                from nullion.workspace_storage import workspace_storage_roots_for_principal
+                from nullion.plugins.browser_plugin.browser_resources import browser_resource_directory
+                root = workspace_storage_roots_for_principal(self.principal_id).scratch / "browser-source-evidence"
+                self._capture_root = self._resources.enter_context(browser_resource_directory(root, retain=True))
+            artifact = self._capture_root / f"{digest}.png"
             artifact.write_bytes(png)
             path = str(artifact)
         self.pages.append({"url": state.url, "title": state.title, "text": dom, "visible_text": visible_text, "controls": controls, "frames": frames, "path": path, "step": step, "captured_at": time.time(), "digest": digest})
+
+    def close(self):
+        self._resources.close()
 
     def page_state(self) -> dict[str, object]:
         if not self.pages:
@@ -242,6 +253,7 @@ class PageEvidence:
         status: Literal["completed", "partial", "blocked"] = "blocked"
         if self.observations and self.goal_status != "blocked":
             status = "completed" if done and self.goal_status == "answered" and not error and not self.unknowns and not self.blocker and not self.last_rejections else "partial"
+        self.close()
         return {"backend": "browser-use", "result_kind": "source_observations", "goal_status": self.goal_status, "next_action": self.next_action, "continuation": {"kind": "alternative_source", "tool_names": ["browser_run_task"], "source_url": last_capture["url"] if last_capture else None} if self.next_action == "alternative_source" or status == "blocked" else None, "report_status": status, "observations": self.observations, "unknowns": self.unknowns, "blocker": error or self.blocker or ("No source-backed observations were captured" if not self.observations else None), "rejected_observations": self.rejected, "rejection_counts": self.rejection_counts, "artifact_paths": paths, "artifact_descriptors": [artifact_output_descriptor(path, role="source", kind="screenshot") for path in paths], "format": "png", "elapsed_seconds": round(elapsed, 3), "steps": steps, "page_url": last_capture["url"] if last_capture else None}
 
 
@@ -267,6 +279,7 @@ async def run_browser_task(task: BrowserTask, *, client: object, principal_id: s
     evidence = PageEvidence(principal_id, policy)
     started = time.monotonic()
     error = None
+    resource_failure = None
     done = False
     steps = 0
     # Allow only navigation actions. No arbitrary JS, host-file access, uploads,
@@ -336,7 +349,9 @@ async def run_browser_task(task: BrowserTask, *, client: object, principal_id: s
     # Read-only navigation may follow alternative sources. The browser policy
     # still blocks private addresses and prohibited domains across redirects.
     cdp_url = os.environ.get("NULLION_BROWSER_USE_CDP_URL") or None
-    with cdp_resource_lease(cdp_url), tempfile.TemporaryDirectory(prefix="nullion-browser-use-") as scratch:
+    from nullion.plugins.browser_plugin.browser_resources import browser_resource_directory
+    from nullion.plugins.browser_plugin.browser_config import nullion_runtime_home
+    with cdp_resource_lease(cdp_url), browser_resource_directory(nullion_runtime_home() / "browser-task-scratch") as scratch:
         async with async_playwright() as playwright:
             executable = os.environ.get("NULLION_BROWSER_USE_EXECUTABLE_PATH") or playwright.chromium.executable_path
         browser = Browser(cdp_url=cdp_url, headless=os.environ.get("NULLION_BROWSER_HEADLESS", "true" if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") else "false").lower() == "true", executable_path=executable if not cdp_url else None, chromium_sandbox=os.environ.get("NULLION_BROWSER_USE_SANDBOX", "true").lower() != "false", user_data_dir=str(Path(scratch) / "profile") if not cdp_url else None, downloads_path=str(Path(scratch) / "downloads"), allowed_domains=list(policy.allowed_domains) or None, prohibited_domains=list(policy.blocked_domains), enable_default_extensions=False, accept_downloads=False, auto_download_pdfs=False, viewport={"width": 1440, "height": 1000}, keep_alive=bool(cdp_url))
@@ -387,20 +402,31 @@ async def run_browser_task(task: BrowserTask, *, client: object, principal_id: s
             if final:
                 evidence.retain(BrowserReport.model_validate_json(final))
         except Exception as exc:
+            if filesystem_error_metadata(exc, reason="browser_task_unavailable")["reason"] == "storage_exhausted":
+                resource_failure = exc
             error = f"{type(exc).__name__}: {str(exc)[:300]}" if not isinstance(exc, TimeoutError) else "Browser task reached its time limit"
         finally:
             # Capture post-action state, including the blocker when possible.
             try:
                 state = await asyncio.wait_for(browser.get_browser_state_summary(), timeout=10)
                 await evidence.capture(state, step="final")
-            except Exception:
-                pass
+            except Exception as exc:
+                if filesystem_error_metadata(exc, reason="browser_task_unavailable")["reason"] == "storage_exhausted":
+                    resource_failure = exc
             # Stop detaches an explicitly supplied CDP browser. Kill only a
             # browser this tool created; never terminate a user's browser.
             try:
                 await asyncio.wait_for(browser.stop() if cdp_url else browser.kill(), timeout=10)
             except Exception:
                 pass
+            evidence.close()
+            # The SDK's in-process fallback creates its own screenshot folder.
+            # Remove only this exact agent's directory, never a temp-folder glob.
+            agent_dir = Path(agent.agent_directory)
+            if agent_dir.parent == Path(tempfile.gettempdir()) and agent_dir.name.startswith(f"browser_use_agent_{agent.id}_"):
+                shutil.rmtree(agent_dir, ignore_errors=True)
+    if resource_failure is not None:
+        raise resource_failure
     return evidence.result(error=error, elapsed=time.monotonic() - started, steps=steps, done=done)
 
 
@@ -428,6 +454,16 @@ def browser_task_handler(client_getter: Callable[[], object], policy: BrowserPol
             for key in ("artifact_extensions", "required_artifact_extensions", "requested_artifact_extensions"):
                 values = context.get(key) or ()
                 requested.update(normalize_artifact_extensions((values,) if isinstance(values, str) else values))
+            if ".png" in requested:
+                promoted = {}
+                for path in output.get("artifact_paths", ()):
+                    target = artifact_path_for_generated_workspace_file(principal_id=invocation.principal_id, suffix=".png", stem="browser-evidence")
+                    shutil.copyfile(path, target)
+                    promoted[path] = str(target)
+                output["artifact_paths"] = list(promoted.values())
+                for observation in output.get("observations", ()):
+                    if observation.get("evidence_path") in promoted:
+                        observation["evidence_path"] = promoted[observation["evidence_path"]]
             # Screenshots support navigation internally. Only an explicit typed
             # PNG delivery requirement promotes them to user attachments.
             output["artifact_descriptors"] = [
@@ -436,5 +472,5 @@ def browser_task_handler(client_getter: Callable[[], object], policy: BrowserPol
             ]
             return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", output)
         except Exception as exc:
-            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"backend": "browser-use", "report_status": "blocked", "reason": "browser_task_unavailable"}, str(exc)[:400])
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"backend": "browser-use", "report_status": "blocked", **filesystem_error_metadata(exc, reason="browser_task_unavailable")}, str(exc)[:400])
     return handle

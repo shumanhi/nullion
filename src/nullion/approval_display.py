@@ -363,20 +363,35 @@ def _terminal_destructive_review_detail(context: dict[str, object]) -> str:
     if total <= 0:
         total = len(target_lines)
 
+    scopes = [target for target in targets if isinstance(target, dict) and (
+        target.get("target_kind") == "search_scope"
+        or (not target.get("target_kind") and target.get("command_family") == "find")
+    )] if isinstance(targets, (list, tuple)) else []
+    exact_lines = [_destructive_target_path(target) for target in targets if target not in scopes] if isinstance(targets, (list, tuple)) else []
+    exact_lines = [line for line in exact_lines if line]
     lines = ["Destructive terminal action:"]
     if command:
         safe_command = command.replace("`", "'")
         lines.extend(["", "Command:", f"`{safe_command}`"])
-    if total:
-        lines.extend(["", f"About to delete {total} path{'s' if total != 1 else ''}:"])
-    elif target_lines:
-        lines.extend(["", "About to delete:"])
-    preview_limit = 40
-    for path in target_lines[:preview_limit]:
-        lines.append(f"- {path}")
-    remaining = total - min(total, len(target_lines[:preview_limit]))
-    if remaining > 0:
-        lines.append(f"- ...and {remaining} more.")
+    if scopes:
+        if exact_lines:
+            lines.extend(["", f"Files to delete ({len(exact_lines)}):"])
+            lines.extend(f"- {path}" for path in exact_lines[:40])
+        lines.extend(["", "Delete matching entries within:"])
+        for scope in scopes[:40]:
+            lines.append(f"- {_destructive_target_path(scope)}")
+            if selection := _string(scope.get("selection")):
+                lines.append(f"  Selection: {selection}")
+        lines.append("The exact matches have not been enumerated. A search scope is not an exact deletion target.")
+    else:
+        if total:
+            lines.extend(["", f"About to delete {total} path{'s' if total != 1 else ''}:"])
+        elif target_lines:
+            lines.extend(["", "About to delete:"])
+        lines.extend(f"- {path}" for path in target_lines[:40])
+        remaining = total - min(total, len(target_lines[:40]))
+        if remaining > 0:
+            lines.append(f"- ...and {remaining} more.")
     if len(lines) == 1:
         return "Destructive terminal action:\nReview the terminal command before deleting anything."
     return "\n".join(lines)

@@ -1481,7 +1481,7 @@ def _approval_card_text(approval) -> str:
         display.copy or _approval_copy_for(tool_name, detail),
     ]
     target_url = _approval_target_url(detail)
-    if _approval_is_web_request(tool_name, detail) and target_url:
+    if display.is_web_request and target_url:
         lines.extend(
             [
                 "",

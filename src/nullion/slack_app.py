@@ -17,6 +17,7 @@ from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_fa
 from nullion.events import make_event
 from nullion.latency_phases import record_surface_latency_timing
 from nullion.messaging_adapters import (
+    DeliveryContract,
     MessagingAdapterConfigurationError,
     MessagingAdapterDependencyError,
     MessagingIngress,
@@ -357,6 +358,7 @@ async def send_slack_platform_delivery(
     channel: str,
     text: str,
     principal_id: str | None = None,
+    message_only: bool = False,
 ) -> bool:
     """Send a platform delivery to Slack, uploading any MEDIA artifacts."""
     if not bot_token or not channel:
@@ -380,6 +382,7 @@ async def send_slack_platform_delivery(
             channel="slack",
             target_id=channel,
             principal_id=principal_id,
+            delivery_contract=DeliveryContract.message_only() if message_only else None,
             send_text=_send_text,
             send_attachments=lambda initial_comment, paths: _upload_slack_reply_files(
                 client,

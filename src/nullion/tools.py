@@ -2873,6 +2873,14 @@ def _build_market_quote_handler(
     return _handler
 
 
+def filesystem_error_metadata(exc: BaseException, *, reason: str) -> dict[str, object]:
+    import errno
+    if isinstance(exc, OSError) and exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+        return {"reason": "storage_exhausted", "resource": "disk", "retryable": False,
+                "requires_operator_action": True}
+    return {"reason": reason}
+
+
 @dataclass(frozen=True, slots=True)
 class TerminalExecutionPolicy:
     network_mode: str | None
@@ -3123,15 +3131,8 @@ def _terminal_resolved_target_text(raw_target: object, *, execution_cwd: Path | 
 
 
 def _terminal_shell_tokens(command: str) -> list[str]:
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        return list(lexer)
-    except Exception:
-        try:
-            return shlex.split(command, posix=True)
-        except Exception:
-            return str(command or "").split()
+    from nullion.tool_boundaries import _shell_syntax_tokens
+    return _shell_syntax_tokens(command)
 
 
 def _terminal_find_delete_targets(command: str, *, execution_cwd: Path | None) -> tuple[dict[str, object], ...]:
@@ -3165,6 +3166,8 @@ def _terminal_find_delete_targets(command: str, *, execution_cwd: Path | None) -
                 "target": _terminal_resolved_target_text(raw_root, execution_cwd=execution_cwd),
                 "operation": "delete",
                 "command_family": "find",
+                "target_kind": "search_scope",
+                "selection": " ".join(segment[len(raw_roots):]),
             })
     return tuple(targets)
 
@@ -6362,7 +6365,7 @@ class ToolExecutor:
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
-                output={"reason": "handler_exception"},
+                output=filesystem_error_metadata(exc, reason="handler_exception"),
                 error=str(exc),
             )
         duration_ms = (perf_counter() - started_at) * 1000
@@ -12915,8 +12918,8 @@ def _build_file_download_handler(
             return _file_download_error_result(
                 invocation,
                 error=f"Could not download file: {exc}",
-                reason="download_failed",
-                output={"url": url},
+                reason=filesystem_error_metadata(exc, reason="download_failed")["reason"],
+                output={"url": url, **filesystem_error_metadata(exc, reason="download_failed")},
             )
         integrity_error = _download_archive_integrity_error(
             output_path,
@@ -17959,6 +17962,8 @@ def _build_list_crons_handler():
     def handle(invocation: ToolInvocation) -> ToolResult:
         from nullion.connections import workspace_id_for_principal
         from nullion.crons import cron_display_fields, cron_display_timezone, list_crons
+        from nullion.crons import _runtime_db_path
+        from nullion.tracker_status import tracker_statuses
 
         args = invocation.arguments or {}
         include_all = bool(args.get("include_all_workspaces", False))
@@ -17975,6 +17980,7 @@ def _build_list_crons_handler():
         lines = []
         crons = []
         cron_tz = cron_display_timezone()
+        health = tracker_statuses(_runtime_db_path(), jobs)
         for index, j in enumerate(jobs, start=1):
             display = cron_display_fields(j, tz=cron_tz)
             lines.append(_cron_display_line(index, j, display))
@@ -17993,6 +17999,7 @@ def _build_list_crons_handler():
                     "schedule_description": display["schedule_description"],
                     "next_run_description": display["next_run_description"],
                     "last_run": j.last_run,
+                    "tracker_status": health[j.id],
                     "run_by_name": run_by_name,
                     "presentation_hint": (
                         "Show schedule_description and next_run_description for timing. "
@@ -19198,6 +19205,8 @@ def register_cron_tools(
                 "Optional: enabled (bool, default true), workspace_id, delivery_channel, delivery_target, "
                 "html_image_delivery_mode (linked|auto|self_contained). "
                 "Set artifact_delivery_options.alert_delivery_mode explicitly from the user's notification requirements. "
+                "Conditional trackers include a daily summary and health notices by default; "
+                "set artifact_delivery_options.tracker_status_notifications=false to turn those off without disabling match alerts. "
                 "If workspace and delivery are omitted, Nullion uses the current workspace and chat adapter defaults."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
@@ -19216,7 +19225,8 @@ def register_cron_tools(
             name="list_crons",
             description=(
                 "List scheduled cron jobs for the current workspace with their id, workspace, schedule, "
-                "enabled state, next run time, and stored task instructions in structured output. "
+                "enabled state, next run time, last attempt, last successful check, verified check counts, "
+                "tracker health, and stored task instructions in structured output. "
                 "Optional args: workspace_id, include_all_workspaces."
             ),
             risk_level=ToolRiskLevel.LOW,
@@ -19247,7 +19257,9 @@ def register_cron_tools(
                 "Update a scheduled cron job by id. Required args: id. "
                 "Optional mutable fields: name, schedule, task, enabled, workspace_id, delivery_channel, "
                 "delivery_target, html_image_delivery_mode, artifact_delivery_options. "
-                "When changing notification requirements, also set artifact_delivery_options.alert_delivery_mode."
+                "When changing notification requirements, also set artifact_delivery_options.alert_delivery_mode. "
+                "Use artifact_delivery_options.tracker_status_notifications (bool) for daily summaries and health notices; "
+                "preserve existing delivery options when updating it."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
             side_effect_class=ToolSideEffectClass.WRITE,

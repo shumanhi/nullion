@@ -3102,7 +3102,7 @@ _HTML = r"""<!DOCTYPE html>
   .approval-detail {
     padding: 10px 12px; border-radius: 7px; background: rgba(11,11,13,0.55);
     border: 1px solid var(--border); color: var(--text); font-size: 12px;
-    line-height: 1.45; word-break: break-word;
+    line-height: 1.45; word-break: break-word; white-space: pre-wrap;
     box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
   }
   .approval-detail.email-review {
@@ -3116,7 +3116,7 @@ _HTML = r"""<!DOCTYPE html>
   .approval-trigger strong { color: var(--text); font-weight: 700; overflow-wrap: anywhere; }
   .approval-trigger .ni { width: 13px; height: 13px; color: var(--accent2); flex: 0 0 auto; }
   .approval-url-card {
-    display: grid; gap: 7px;
+    display: grid; gap: 7px; white-space: normal;
   }
   .approval-url-meta {
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -4838,7 +4838,7 @@ _HTML = r"""<!DOCTYPE html>
       <button class="snav-btn" onclick="showTab('execution',this)">Execution</button>
       <button class="snav-btn" onclick="showTab('doctor',this)">Doctor</button>
       <button class="snav-btn" onclick="showTab('security',this)">Security</button>
-      <button class="snav-btn" onclick="showTab('users',this);loadUsersTab()">Users</button>
+      <button class="snav-btn" onclick="showTab('users',this)">Users</button>
       <button class="snav-btn" onclick="showTab('crons',this);loadCronsTab()">Crons</button>
       <button class="snav-btn" onclick="showTab('logs',this)">Logs</button>
     </nav>
@@ -5046,7 +5046,12 @@ _HTML = r"""<!DOCTYPE html>
           <div class="form-group" style="margin-bottom:0">
             <label>Bot Token</label>
             <input type="password" id="cfg-discord-bot-token" placeholder="Discord bot token" autocomplete="off">
-            <div class="form-hint">Enable Message Content intent, then start it with <code>nullion-discord</code>.</div>
+            <div class="form-hint">Enable Message Content Intent in the Discord Developer Portal and invite the bot to your server with View Channel, Send Messages and Attach Files permissions.</div>
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label for="cfg-discord-operator-user-id">Your Discord User ID</label>
+            <input type="text" id="cfg-discord-operator-user-id" placeholder="Numeric user ID, not a username or channel ID" inputmode="numeric">
+            <div class="form-hint">Enable Developer Mode in Discord, then right-click your profile and choose Copy User ID. This authorizes your account to use Nullion. For member-only access, enable multi-user mode and register Discord users in Users. Save, then restart the Discord service.</div>
           </div>
         </div>
 
@@ -5705,7 +5710,7 @@ _HTML = r"""<!DOCTYPE html>
                 <div class="pref-row-title">Enable other users</div>
                 <div class="pref-row-desc">Allow active member identities below. The configured operator remains the only admin.</div>
               </div>
-              <label class="toggle-switch"><input type="checkbox" id="users-enabled"><span class="toggle-slider"></span></label>
+              <label class="toggle-switch"><input type="checkbox" id="users-enabled" disabled><span class="toggle-slider"></span></label>
             </div>
             <div id="users-list" style="margin-top:12px"><div class="empty">Loading users…</div></div>
           </div>
@@ -5759,7 +5764,7 @@ _HTML = r"""<!DOCTYPE html>
               <label>Notes</label>
               <textarea id="new-user-notes" rows="2" placeholder="Context for the agent: who this person is, their preferred name, role, and anything it should remember."></textarea>
             </div>
-            <button class="btn-sm" onclick="addUserMember()">Add member</button>
+            <button class="btn-sm" id="new-user-add-btn" onclick="addUserMember()" disabled>Add member</button>
           </aside>
         </div>
         <div class="pref-card" id="connections-section" style="margin-top:18px;display:none">
@@ -8837,8 +8842,8 @@ function approvalTriggerHtml(label) {
   return `<div class="approval-trigger">${NI.task()}<span>Triggered by <strong>${escHtml(value)}</strong></span></div>`;
 }
 
-function approvalDetailHtml(toolName, detail, forceWeb = false) {
-  const isWeb = forceWeb || approvalIsWebRequest(toolName, detail);
+function approvalDetailHtml(toolName, detail, forceWeb = false, requestKind = '') {
+  const isWeb = requestKind !== 'terminal_destructive_action' && (forceWeb || approvalIsWebRequest(toolName, detail));
   const url = approvalTargetUrl(detail);
   if (isWeb && url) {
     const host = approvalTargetHost(url);
@@ -8909,7 +8914,7 @@ function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel =
             <div class="approval-copy">${escHtml(approvalCopyFor(toolName, detail, isWeb, requestKind))}</div>
           </div>
         </div>
-        ${approvalDetailHtml(toolName, detail, isWeb)}
+        ${approvalDetailHtml(toolName, detail, isWeb, requestKind)}
         ${approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel, isWeb, requestKind)}
         <div class="approval-state" aria-live="polite"></div>
       </div>
@@ -9906,7 +9911,7 @@ function approvalCardHtml(a) {
             <div class="approval-copy">${escHtml(copy)}</div>
           </div>
         </div>
-        ${approvalDetailHtml(toolName, detail, isWeb)}
+        ${approvalDetailHtml(toolName, detail, isWeb, requestKind)}
         ${approvalActionsHtml(a.approval_id, toolName, detail, 'for all workspaces', isWeb, requestKind)}
         <div class="approval-state" aria-live="polite"></div>
       </div>
@@ -12151,6 +12156,7 @@ let settingsSaveInProgress = false;
 let preferencesLoaded = false;
 let profileSettingsLoaded = false;
 let usersTabLoaded = false;
+let usersTabLoadPromise = null;
 let connectionsTabLoaded = false;
 let builderDoctorSummaryLoaded = false;
 let domainPolicyPreviewLoaded = false;
@@ -13216,11 +13222,14 @@ async function loadConfig(options = {}) {
       slackStatus.textContent = 'Disabled'; slackStatus.className = 'connector-status missing';
     }
     document.getElementById('cfg-discord-enabled').checked = cfg.discord_enabled === true;
+    document.getElementById('cfg-discord-operator-user-id').value = cfg.discord_operator_user_id || '';
     document.getElementById('cfg-discord-bot-token').value = cfg.discord_bot_token_set ? '••••••••' : '';
     document.getElementById('cfg-discord-bot-token').placeholder = cfg.discord_bot_token_set ? '(already set — paste to replace)' : 'Discord bot token';
     const discordStatus = document.getElementById('discord-status');
-    if (cfg.discord_enabled && cfg.discord_bot_token_set) {
+    if (cfg.discord_enabled && cfg.discord_bot_token_set && cfg.discord_authorized_user_configured) {
       discordStatus.textContent = 'Configured'; discordStatus.className = 'connector-status ok';
+    } else if (cfg.discord_enabled && cfg.discord_bot_token_set) {
+      discordStatus.textContent = 'Needs authorized user'; discordStatus.className = 'connector-status missing';
     } else if (cfg.discord_enabled) {
       discordStatus.textContent = 'Needs token'; discordStatus.className = 'connector-status missing';
     } else {
@@ -14089,9 +14098,12 @@ function normalizeWorkspaceId(value, fallbackName) {
 }
 
 function renderUsersTab() {
+  const addButton = document.getElementById('new-user-add-btn');
+  if (addButton) addButton.disabled = !usersTabLoaded;
   const enabled = document.getElementById('users-enabled');
   const list = document.getElementById('users-list');
   if (!enabled || !list) return;
+  enabled.disabled = !usersTabLoaded;
   enabled.checked = !!usersRegistry.multi_user_enabled;
   const users = usersRegistry.users || [];
   if (!users.length) {
@@ -14595,19 +14607,27 @@ function updateNewUserChannelFields() {
 
 async function loadUsersTab() {
   if (usersTabLoaded) return;
+  if (usersTabLoadPromise) return usersTabLoadPromise;
+  usersTabLoadPromise = (async () => {
+    try {
+      const data = await API('/api/users');
+      usersTabLoaded = true;
+      usersRegistry = {
+        multi_user_enabled: !!data.multi_user_enabled,
+        users: Array.isArray(data.users) ? data.users : [],
+      };
+      updateNewUserChannelFields();
+      renderUsersTab();
+      markSettingsCleanAfterLazyLoad();
+    } catch (e) {
+      const list = document.getElementById('users-list');
+      if (list) list.innerHTML = `<div class="empty"><strong>Could not load users</strong>${escHtml(e.message || e)}</div>`;
+    }
+  })();
   try {
-    const data = await API('/api/users');
-    usersTabLoaded = true;
-    usersRegistry = {
-      multi_user_enabled: !!data.multi_user_enabled,
-      users: Array.isArray(data.users) ? data.users : [],
-    };
-    updateNewUserChannelFields();
-    renderUsersTab();
-    markSettingsCleanAfterLazyLoad();
-  } catch (e) {
-    const list = document.getElementById('users-list');
-    if (list) list.innerHTML = `<div class="empty"><strong>Could not load users</strong>${escHtml(e.message || e)}</div>`;
+    await usersTabLoadPromise;
+  } finally {
+    usersTabLoadPromise = null;
   }
 }
 
@@ -14734,6 +14754,7 @@ async function removeUserMember(index) {
 }
 
 function addUserMember() {
+  if (!usersTabLoaded) return;
   const nameEl = document.getElementById('new-user-name');
   const channelEl = document.getElementById('new-user-channel');
   const notesEl = document.getElementById('new-user-notes');
@@ -15350,6 +15371,7 @@ async function saveConfig() {
     tg_streaming_enabled: document.getElementById('cfg-tg-streaming-enabled').checked,
     slack_enabled:   document.getElementById('cfg-slack-enabled').checked,
     discord_enabled: document.getElementById('cfg-discord-enabled').checked,
+    discord_operator_user_id: document.getElementById('cfg-discord-operator-user-id').value.trim(),
     model_provider:         _currentProvider,
     model_provider_enabled: document.getElementById('cfg-model-provider-enabled')?.checked === true,
     model_name:             _currentModel,
@@ -16699,6 +16721,43 @@ function cronNextRunLabel(job) {
   return _fmtNextRun(job && job.next_run);
 }
 
+function cronHealthLabel(status) {
+  return ({paused:'Paused', running:'Checking now', no_match:'Checked — no match',
+    match:'Match found', succeeded:'Completed', incomplete:'Check incomplete', delivery_failed:'Result delivery failed',
+    needs_attention:'Needs attention', waiting_for_approval:'Waiting for approval',
+    cancelled:'Stopped', not_checked:'Not checked yet'})[status?.state] || 'Not checked yet';
+}
+
+function cronCheckTime(value) {
+  if (!value) return 'Not yet';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'Not yet' : date.toLocaleString();
+}
+
+function cronHealthDetails(job) {
+  const status = job.tracker_status;
+  if (!status) return '';
+  return `<div class="cron-meta cron-health" role="status">${escHtml(cronHealthLabel(status))}</div>
+    <div class="cron-meta">Last attempt: ${escHtml(cronCheckTime(status.last_attempt_at))}<br>
+    Last successful check: ${escHtml(cronCheckTime(status.last_success_at))}</div>
+    ${status.is_tracker ? `<div class="cron-meta">Past 24 hours: ${Number(status.successful_checks_24h) || 0} successful · ${Number(status.incomplete_checks_24h) || 0} incomplete</div>
+    <label class="cron-meta"><input type="checkbox" ${status.notifications_enabled ? 'checked' : ''}
+      onchange="toggleTrackerUpdates('${escHtml(job.id)}', this.checked)"> Daily summary and health notices</label>` : ''}`;
+}
+
+async function toggleTrackerUpdates(id, enabled) {
+  const job = _cronsCache.find(j => j.id === id);
+  if (!job) return;
+  try {
+    const r = await fetch('/api/crons/' + encodeURIComponent(id), {method:'PATCH',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({artifact_delivery_options:{
+        ...(job.artifact_delivery_options || {}), tracker_status_notifications:enabled}})});
+    const result = await r.json();
+    if (!result.ok) alert('Could not update tracker notifications.');
+  } catch(e) { alert('Could not update tracker notifications.'); }
+  await loadCronsTab();
+}
+
 async function loadCronsTab() {
   try {
     const jobs = await fetch('/api/crons').then(r => r.json());
@@ -16756,8 +16815,9 @@ function renderCronsTab(jobs) {
           &nbsp;·&nbsp; ${escHtml(j.workspace_id || 'workspace_admin')}
           &nbsp;·&nbsp; ${j.enabled ? 'next ' + escHtml(cronNextRunLabel(j)) : 'disabled'}
           ${j.last_run ? '&nbsp;·&nbsp; last ' + new Date(j.last_run).toLocaleString() : ''}
-          ${j.last_result && j.last_result !== 'ok' ? `${NI.warn()} ${escHtml(j.last_result)}` : ''}
+          ${!j.tracker_status && j.last_result && j.last_result !== 'ok' ? `${NI.warn()} ${escHtml(j.last_result)}` : ''}
         </div>
+        ${cronHealthDetails(j)}
         <div class="cron-meta">Delivery: ${escHtml(cronDeliveryLabel(j))}</div>
         <div class="cron-meta cron-task">${escHtml(j.task.slice(0, 120))}${j.task.length > 120 ? '…' : ''}</div>
       </div>
@@ -16791,7 +16851,7 @@ function renderCronsDash(jobs) {
     <div class="cron-dash-row">
       <div class="cron-dash-dot ${j.enabled ? 'on' : ''}"></div>
       <div class="cron-dash-name">${escHtml(j.name)}</div>
-      <div class="cron-dash-next">${escHtml(j.workspace_id || 'workspace_admin')} · ${j.enabled ? escHtml(cronNextRunLabel(j)) : 'off'}</div>
+      <div class="cron-dash-next">${j.tracker_status ? escHtml(cronHealthLabel(j.tracker_status)) + ' · ' : ''}${escHtml(j.workspace_id || 'workspace_admin')} · ${j.enabled ? escHtml(cronNextRunLabel(j)) : 'off'}</div>
     </div>
   `, { key: 'scheduled', title: `Scheduled tasks · ${jobs.length}`, className: 'control-list' });
 }
@@ -20709,6 +20769,14 @@ def _chat_service_enabled_from_env(name: str) -> bool:
     return False
 
 
+def _discord_access_configured_from_env() -> bool:
+    from nullion.config import DiscordSettings, NullionSettings
+    from nullion.discord_app import discord_authorized_user_configured
+    settings = NullionSettings(discord=DiscordSettings(
+        operator_user_id=os.environ.get("NULLION_DISCORD_OPERATOR_USER_ID", "").strip() or None))
+    return discord_authorized_user_configured(settings)
+
+
 def _chat_service_configured_from_env(name: str) -> tuple[bool, str]:
     if name == "telegram":
         if os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", "").strip() and os.environ.get("NULLION_TELEGRAM_OPERATOR_CHAT_ID", "").strip():
@@ -20724,6 +20792,8 @@ def _chat_service_configured_from_env(name: str) -> tuple[bool, str]:
         enabled = os.environ.get("NULLION_DISCORD_ENABLED", "false").strip().lower() not in {"0", "false", "no", "off"}
         has_token = bool(os.environ.get("NULLION_DISCORD_BOT_TOKEN", "").strip())
         if enabled and has_token:
+            if not _discord_access_configured_from_env():
+                return False, "Needs authorized user"
             return True, "Configured"
         return False, "Needs token" if enabled else "Disabled"
     return False, "Disabled"
@@ -21495,6 +21565,13 @@ def create_app(runtime, orchestrator, registry):
             logger.debug("Could not read dashboard checkpoint signature", exc_info=True)
             return None
 
+    # Capture the baseline alongside the Web runtime's initial snapshot, before
+    # another process can add approvals. A first request must not establish its
+    # baseline from an already-changed database or discard local pending state.
+    initial_checkpoint_path = getattr(runtime, "checkpoint_path", None)
+    if initial_checkpoint_path is not None:
+        status_checkpoint_dashboard_signature = _checkpoint_dashboard_signature(Path(initial_checkpoint_path))
+
     def _load_dashboard_runtime_store(path: Path):
         if path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
             from nullion.runtime_persistence import load_runtime_store
@@ -21568,15 +21645,13 @@ def create_app(runtime, orchestrator, registry):
             return False
         dashboard_signature = _checkpoint_dashboard_signature(path)
         with runtime_store_sync_lock:
-            if status_checkpoint_dashboard_signature is None:
-                status_checkpoint_dashboard_signature = dashboard_signature
             if active_runtime_turns > 0:
                 return False
             if _orchestrator_has_active_background_tasks():
                 return False
             if checkpoint_signature == status_checkpoint_file_signature:
                 return False
-            if dashboard_signature is not None and dashboard_signature == status_checkpoint_dashboard_signature:
+            if dashboard_signature is not None and status_checkpoint_dashboard_signature is not None and dashboard_signature == status_checkpoint_dashboard_signature:
                 status_checkpoint_file_signature = checkpoint_signature
                 return False
         try:
@@ -21779,7 +21854,7 @@ def create_app(runtime, orchestrator, registry):
             return False
 
     # ── Cron scheduler ────────────────────────────────────────────────────────
-    from nullion.crons import CronScheduler
+    from nullion.crons import CronScheduler, load_crons
 
     def _cron_delivery_target(job, channel: str) -> str:
         try:
@@ -21810,6 +21885,8 @@ def create_app(runtime, orchestrator, registry):
             settings = None
         return effective_cron_delivery_channel(job, settings=settings)
 
+    from nullion.tracker_status import health_store_path
+    tracker_health_path = health_store_path(runtime)
     cron_background_deliveries = CronBackgroundDeliveryTracker()
     def _record_cron_delivery_event(event_type: str, job, channel: str, target: str, conv_id: str, **extra: Any) -> None:
         try:
@@ -21858,6 +21935,7 @@ def create_app(runtime, orchestrator, registry):
         *,
         target: str = "",
         run_label: str = "Scheduled task",
+        message_only: bool = False,
     ) -> bool:
         target = str(target or "").strip() or _cron_delivery_target(job, "telegram")
         if not target:
@@ -21878,6 +21956,7 @@ def create_app(runtime, orchestrator, registry):
                     message,
                     principal_id=f"telegram:{target}",
                     suppress_link_preview=True,
+                    **({"message_only": True} if message_only else {}),
                 )
             )
         except Exception:
@@ -21913,9 +21992,10 @@ def create_app(runtime, orchestrator, registry):
         text: str,
         *,
         run_label: str = "Scheduled task",
+        message_only: bool = False,
     ) -> bool:
         if channel == "telegram":
-            sent = _send_cron_telegram_delivery(job, text, target=target, run_label=run_label)
+            sent = _send_cron_telegram_delivery(job, text, target=target, run_label=run_label, message_only=message_only)
             return sent
         target = str(target or "").strip() or _cron_delivery_target(job, channel)
         if not target:
@@ -21936,6 +22016,7 @@ def create_app(runtime, orchestrator, registry):
                     channel=target,
                     text=message,
                     principal_id=f"slack:{target}",
+                    **({"message_only": True} if message_only else {}),
                 ))
             if channel == "discord":
                 from nullion.discord_app import send_discord_platform_delivery
@@ -21948,6 +22029,7 @@ def create_app(runtime, orchestrator, registry):
                     channel_id=target,
                     text=message,
                     principal_id=f"discord:{target}",
+                    **({"message_only": True} if message_only else {}),
                 ))
         except Exception:
             logger.warning("Cron %s delivery failed [%s]", channel, getattr(job, "id", ""), exc_info=True)
@@ -21961,6 +22043,7 @@ def create_app(runtime, orchestrator, registry):
         result: dict[str, object],
         *,
         run_label: str = "Scheduled task",
+        message_only: bool = False,
     ) -> bool:
         delivery_body = cron_delivery_text(text, artifacts)
         fallback = scheduled_task_delivery_text(job, delivery_body, run_label=run_label)
@@ -21970,13 +22053,14 @@ def create_app(runtime, orchestrator, registry):
             platform_delivery = prepare_reply_for_platform_delivery(
                 fallback,
                 principal_id=conv_id,
+                allow_attachments=False if message_only else None,
             )
             if platform_delivery.text:
                 visible_text = platform_delivery.text
             elif platform_delivery.attachments:
                 visible_text = "Attached the requested file."
             artifact_paths = [str(path) for path in platform_delivery.attachments]
-            if not artifact_paths:
+            if not artifact_paths and not message_only:
                 artifact_paths = list(cron_delivery_artifact_paths_from_result(result, delivery_body))
             artifact_payloads = _web_artifact_descriptors(
                 runtime,
@@ -21992,7 +22076,8 @@ def create_app(runtime, orchestrator, registry):
                 "bot",
                 visible_text,
                 is_error=False,
-                metadata={"artifacts": artifact_payloads} if artifact_payloads else None,
+                metadata=({"source": "tracker_status", "notification_kind": result.get("tracker_notice_kind")}
+                          if message_only else {"artifacts": artifact_payloads} if artifact_payloads else None),
             )
         except Exception:
             logger.warning("Could not persist web cron fallback delivery", exc_info=True)
@@ -22107,6 +22192,7 @@ def create_app(runtime, orchestrator, registry):
                 silent_delivery_text=manual_cron_silent_delivery_text if manual_delivery_channel is not None else None,
                 notify_approval_required=_notify_cron_approval_required,
                 record_chat_turn=_record_cron_delivery_chat_turn,
+                health_store_path=tracker_health_path,
             ),
         )
 
@@ -22119,8 +22205,44 @@ def create_app(runtime, orchestrator, registry):
             logger.warning("Cron fire error [%s]: %s", job.id, exc)
             raise
 
-    _cron_scheduler = CronScheduler(fire_fn=_cron_fire)
+    def _tracker_status_tick(jobs, now):
+        from nullion.tracker_status import dispatch_tracker_updates
+
+        def route(job):
+            channel = _effective_cron_delivery_channel(job)
+            return channel, _cron_delivery_target(job, channel)
+
+        def send(job, channel, target, text, kind):
+            from nullion.cron_delivery import cron_conversation_id
+            from nullion.tracker_status import _label
+            conv_id = cron_conversation_id(job, channel, target)
+            display_job = replace(job, name="Your trackers" if kind == "daily" else _label(job.name))
+            if channel == "web":
+                delivered = _save_cron_web_delivery(display_job, conv_id, text, [], {"tracker_notice_kind": kind}, run_label="Tracker update", message_only=True)
+            else:
+                delivered = _send_cron_platform_delivery(display_job, channel, target, text, run_label="Tracker update", message_only=True)
+            if delivered:
+                if channel != "web":
+                    try:
+                        from nullion.chat_store import get_chat_store
+                        get_chat_store().save_message(conv_id, "bot", scheduled_task_delivery_text(display_job, text, run_label="Tracker update"),
+                                                      metadata={"source": "tracker_status", "notification_kind": kind})
+                    except Exception:
+                        logger.warning("Could not save tracker notification history", exc_info=True)
+                _record_cron_delivery_event("cron.tracker_status.sent", job, channel, target, conv_id, notification_kind=kind)
+                try:
+                    runtime.checkpoint(force=True)
+                except Exception:
+                    logger.warning("Could not checkpoint tracker notification receipt", exc_info=True)
+            return delivered
+
+        return dispatch_tracker_updates(tracker_health_path, jobs, resolve_route=route, send=send, now=now,
+                                        current_jobs=lambda: load_crons(refresh_next_runs=False))
+
+    app.state.tracker_status_tick = _tracker_status_tick
+    _cron_scheduler = CronScheduler(fire_fn=_cron_fire, status_fn=_tracker_status_tick)
     _cron_scheduler.start()
+    app.router.on_shutdown.append(_cron_scheduler.stop)
 
     try:
         from nullion.platform_activity import PlatformTaskCardStore, platform_activity_capabilities
@@ -22272,6 +22394,7 @@ def create_app(runtime, orchestrator, registry):
                         silent_delivery_text=manual_cron_silent_delivery_text,
                         notify_approval_required=_notify_cron_approval_required,
                         record_chat_turn=_record_cron_delivery_chat_turn,
+                        health_store_path=tracker_health_path,
                     ),
                     origin_conversation_id=(
                         principal_id
@@ -22315,12 +22438,17 @@ def create_app(runtime, orchestrator, registry):
     @app.get("/api/crons")
     async def list_crons_endpoint():
         from nullion.crons import cron_display_fields, cron_display_timezone, load_crons
+        from nullion.tracker_status import tracker_statuses
 
         rows = []
         cron_tz = cron_display_timezone()
-        for job in load_crons():
+        jobs = load_crons()
+        health = tracker_statuses(tracker_health_path, jobs)
+        for job in jobs:
             item = job.to_dict()
             item.update(cron_display_fields(job, tz=cron_tz))
+            if job.id in health:
+                item["tracker_status"] = health[job.id]
             rows.append(item)
         return JSONResponse(rows)
 
@@ -22341,6 +22469,8 @@ def create_app(runtime, orchestrator, registry):
             artifact_delivery_options = body.get("artifact_delivery_options")
             if artifact_delivery_options is not None and not isinstance(artifact_delivery_options, dict):
                 return JSONResponse({"ok": False, "error": "artifact_delivery_options must be an object"}, status_code=400)
+            if isinstance(artifact_delivery_options, dict) and "tracker_status_notifications" in artifact_delivery_options and type(artifact_delivery_options["tracker_status_notifications"]) is not bool:
+                return JSONResponse({"ok": False, "error": "tracker_status_notifications must be a boolean"}, status_code=400)
             if delivery_channel == "web" and not delivery_target:
                 delivery_target = "web:operator"
             if not name or not schedule or not task:
@@ -22367,6 +22497,9 @@ def create_app(runtime, orchestrator, registry):
             body = await request.json()
             if "artifact_delivery_options" in body and not isinstance(body.get("artifact_delivery_options"), dict):
                 return JSONResponse({"ok": False, "error": "artifact_delivery_options must be an object"}, status_code=400)
+            options = body.get("artifact_delivery_options")
+            if isinstance(options, dict) and "tracker_status_notifications" in options and type(options["tracker_status_notifications"]) is not bool:
+                return JSONResponse({"ok": False, "error": "tracker_status_notifications must be a boolean"}, status_code=400)
             if set(body.keys()) <= {"enabled"} and "enabled" in body:
                 from nullion.crons import toggle_cron
                 job = toggle_cron(cron_id, bool(body.get("enabled")))
@@ -24830,6 +24963,8 @@ def create_app(runtime, orchestrator, registry):
             "slack_app_token_set": bool(slack_app_token),
             "discord_enabled": discord_enabled,
             "discord_bot_token_set": bool(discord_bot_token),
+            "discord_operator_user_id": os.environ.get("NULLION_DISCORD_OPERATOR_USER_ID", ""),
+            "discord_authorized_user_configured": _discord_access_configured_from_env(),
             "chat_services": _chat_services_status_payload(),
             "model_provider":         provider,
             "model_provider_enabled": (
@@ -25383,6 +25518,12 @@ def create_app(runtime, orchestrator, registry):
         except Exception as exc:
             return JSONResponse({"ok": False, "error": f"Invalid JSON: {exc}"}, status_code=400)
 
+        if isinstance(body, dict) and "discord_operator_user_id" in body:
+            raw_identity = body.get("discord_operator_user_id")
+            identity = "" if raw_identity is None else str(raw_identity).strip()
+            from nullion.discord_app import discord_user_id_valid
+            if identity and not discord_user_id_valid(identity):
+                return JSONResponse({"ok": False, "error": "Discord user ID must be a numeric user ID copied from Discord."}, status_code=400)
         try:
             return await _do_post_config(body)
         except Exception as exc:
@@ -25955,6 +26096,7 @@ def create_app(runtime, orchestrator, registry):
             "slack_bot_token": "NULLION_SLACK_BOT_TOKEN",
             "slack_app_token": "NULLION_SLACK_APP_TOKEN",
             "discord_bot_token": "NULLION_DISCORD_BOT_TOKEN",
+            "discord_operator_user_id": "NULLION_DISCORD_OPERATOR_USER_ID",
             "model_provider": "NULLION_MODEL_PROVIDER",
             "api_key":        None,   # handled below: routes to ANTHROPIC_ or OPENAI_
             "model_name":     "NULLION_MODEL",

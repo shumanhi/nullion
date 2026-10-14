@@ -2948,6 +2948,8 @@ def _malformed_tool_call_result(*, principal_id: str, reason: str, block: object
 def _terminal_tool_failure_text(result: ToolResult) -> str | None:
     output = result.output if isinstance(result.output, dict) else {}
     reason = output.get("reason")
+    if result.status == "failed" and reason == "storage_exhausted":
+        return "I couldn’t finish because local storage is full. Free some disk space, then retry. I stopped this run instead of attempting file cleanup."
     if result.tool_name == "market_quote" and result.status == "failed":
         detail = str(result.error or output.get("error") or "").strip()
         if len(detail) > 180:
@@ -4101,6 +4103,15 @@ def _complete_partial_source_report(state, final_text=None):
                                 completion_failure_reply=reply)
 
 
+def _scheduled_alert_requires_outcome_review(state: Mapping[str, Any], results: Iterable[ToolResult]) -> bool:
+    context = state.get("tool_flow_context") or {}
+    return (isinstance(context, Mapping) and context.get("scheduled_task_run") is True
+            and context.get("scheduled_alert_delivery_mode") == "verified_matches_only"
+            and not context.get("requires_artifact_delivery")
+            and any(result.tool_name in _WEB_SOURCE_TOOLS | {"web_search"}
+                    and normalize_tool_status(result.status) == "completed" for result in results))
+
+
 def _completion_review_required(
     state: "_AgentTurnGraphState",
     *,
@@ -4116,6 +4127,8 @@ def _completion_review_required(
         completed_capture_paths(getattr(state.get("tool_registry"), "turn_tool_scope_decision", None), results)
     ):
         return False
+    if _scheduled_alert_requires_outcome_review(state, results):
+        return True
     if _sourced_artifact_requires_outcome_review(state, results):
         return True
     has_failed_or_unverified_result = False
@@ -4344,12 +4357,12 @@ def _completion_review_timeout_seconds() -> float:
 
 
 def _completion_requirement_timeout_seconds() -> float:
-    raw_value = os.environ.get("NULLION_COMPLETION_REQUIREMENT_TIMEOUT_SECONDS", "8").strip()
+    raw_value = os.environ.get("NULLION_COMPLETION_REQUIREMENT_TIMEOUT_SECONDS", "20").strip()
     try:
         timeout = float(raw_value)
     except ValueError:
-        return 8.0
-    return min(20.0, max(2.0, timeout))
+        return 20.0
+    return min(60.0, max(2.0, timeout))
 
 
 def _parse_completion_review_decision(
@@ -4464,6 +4477,7 @@ def _parse_completion_requirement_contract(
     response: object,
     *,
     registered_tool_names: set[str] | None = None,
+    scheduler_owns_delivery: bool = False,
 ) -> tuple[_CompletionRequirementContractRow, ...]:
     text = _model_response_text(response)
     start = text.find("{")
@@ -4485,10 +4499,17 @@ def _parse_completion_requirement_contract(
     for index, raw_requirement in enumerate(raw_requirements, start=1):
         if not isinstance(raw_requirement, Mapping):
             return ()
-        requirement = _truncate_text(
-            str(raw_requirement.get("requirement") or "").strip(),
-            300,
-        )
+        owner = raw_requirement.get("completion_owner", "producer")
+        if owner == "cron_delivery":
+            if (not scheduler_owns_delivery or raw_requirement.get("requirement_kind") not in {"action", "deliverable"}
+                    or raw_requirement.get("eligible_evidence_tool_names") != []):
+                return ()
+            # The scheduler verifies transport after producer verification.
+            # It cannot provide its own future receipt to this source phase.
+            continue
+        if owner != "producer":
+            return ()
+        requirement = str(raw_requirement.get("requirement") or "").strip()
         requirement_kind = str(
             raw_requirement.get("requirement_kind") or ""
         ).strip().lower()
@@ -4510,6 +4531,7 @@ def _parse_completion_requirement_contract(
         )
         if (
             not requirement
+            or len(requirement) > 2000
             or not evidence_subject_id
             or len(evidence_subject_id) > 120
             or evidence_subject_id in seen_subject_ids
@@ -4593,6 +4615,15 @@ def _completion_requirement_tool_catalog(
     return catalog
 
 
+def _completion_review_original_request(state: Mapping[str, Any]) -> str:
+    context = state.get("tool_flow_context") or {}
+    if isinstance(context, Mapping) and context.get("scheduled_task_run") is True:
+        request = context.get("scheduled_task_request")
+        if isinstance(request, str) and request.strip():
+            return request
+    return str(state.get("user_message") or "")
+
+
 def _extract_completion_requirement_contract(
     state: "_AgentTurnGraphState",
     *,
@@ -4603,9 +4634,10 @@ def _extract_completion_requirement_contract(
     model_client = getattr(state.get("orchestrator"), "model_client", None)
     if model_client is None:
         return ()
+    materialized_results = list(state.get("tool_results") or () if tool_results is None else tool_results)
     tool_catalog = _completion_requirement_tool_catalog(
         state.get("tool_registry"),
-        state.get("tool_results") or () if tool_results is None else tool_results,
+        materialized_results,
     )
     registered_tool_names = {
         str(record.get("name") or "").strip()
@@ -4613,15 +4645,26 @@ def _extract_completion_requirement_contract(
         if str(record.get("name") or "").strip()
     }
     payload = {
-        "original_request": str(state.get("user_message") or ""),
+        "original_request": _completion_review_original_request(state),
         "completed_current_turn_tools": tool_catalog,
     }
+    scheduler_owns_delivery = _scheduled_alert_requires_outcome_review(
+        state, materialized_results,
+    )
+    if scheduler_owns_delivery:
+        payload["execution_phase"] = "verify_monitored_condition"
+        payload["conditional_alert_delivery_owner"] = "cron_delivery"
+    cache_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    cached = state.get("completion_requirement_contract_cache") or {}
+    if cached.get("key") == cache_key and cached.get("rows"):
+        return cached["rows"]
     system = (
         "You are a material-requirements planner for a general-purpose personal assistant. "
         "Treat the user message as one request; do not create separate tasks from conjunction wording. "
         "Return only JSON matching: "
         '{"all_material_requirements_enumerated":true|false,'
         '"material_requirements":[{"requirement":"one independently verifiable outcome",'
+        '"completion_owner":"producer|cron_delivery",'
         '"requirement_kind":"fact|constraint|comparison_side|action|deliverable|user_input|other",'
         '"evidence_subject_id":"stable opaque id for the entity or deliverable proved by one evidence record",'
         '"eligible_evidence_tool_names":["exact-completed-tool-name"]}]}. '
@@ -4635,8 +4678,17 @@ def _extract_completion_requirement_contract(
         "underlying entity, account state, action, or deliverable one unique evidence_subject_id. Distinct named "
         "entities, comparison sides, actions, and deliverables require distinct subject ids. Subject ids are opaque "
         "structural labels, not evidence claims. Set "
-        "all_material_requirements_enumerated true only after checking the full request."
+        "all_material_requirements_enumerated true only after checking the full request. "
+        "For a scheduled conditional monitor, enumerate verification of the monitored condition, "
+        "not a future scheduler delivery receipt. A verified negative check can finish the monitor; "
+        "conditional follow-on actions apply only if its condition is verified as met."
+        " Use completion_owner=producer for source scope, records, constraints, booking verification and other "
+        "requested execution. Only when conditional_alert_delivery_owner is cron_delivery, use "
+        "completion_owner=cron_delivery for sending that conditional alert, with requirement_kind=action "
+        "and eligible_evidence_tool_names=[]; the scheduler owns that later transport step. "
+        "Never assign factual verification or other requested actions to cron_delivery."
     )
+    started_at = time.perf_counter()
     try:
         response = model_client.create(
             messages=[
@@ -4646,17 +4698,27 @@ def _extract_completion_requirement_contract(
                 }
             ],
             tools=[],
-            max_tokens=800,
+            max_tokens=2000,
             system=system,
             timeout=_completion_requirement_timeout_seconds(),
         )
-    except Exception:
-        logger.debug("Material completion requirement planning failed", exc_info=True)
+    except Exception as exc:
+        logger.info("completion requirement planning conversation_id=%s duration_ms=%.1f input_chars=%s tools=%s error=%s",
+                    state.get("conversation_id"), (time.perf_counter() - started_at) * 1000,
+                    len(json.dumps(payload, ensure_ascii=False)), len(tool_catalog), type(exc).__name__)
         return ()
-    return _parse_completion_requirement_contract(
+    contract = _parse_completion_requirement_contract(
         response,
         registered_tool_names=registered_tool_names,
+        scheduler_owns_delivery=scheduler_owns_delivery,
     )
+    logger.info("completion requirement planning conversation_id=%s duration_ms=%.1f input_chars=%s tools=%s rows=%s completion_status=%s",
+                state.get("conversation_id"), (time.perf_counter() - started_at) * 1000,
+                len(json.dumps(payload, ensure_ascii=False)), len(tool_catalog), len(contract),
+                (response.get("completion") or {}).get("status") if isinstance(response, dict) else None)
+    if contract:
+        state["completion_requirement_contract_cache"] = {"key": cache_key, "rows": contract}
+    return contract
 
 
 _COMPLETION_EVIDENCE_RUNTIME_ENVELOPE_KEYS = frozenset(
@@ -5512,7 +5574,7 @@ def _review_risky_agent_completion(
         required_tool_names=scope_contract["requested_required_tool_names"],
     )
     payload = {
-        "original_request": str(state.get("user_message") or ""),
+        "original_request": _completion_review_original_request(state),
         "draft_final_response": str(final_text or ""),
         "tool_evidence": json.loads(_compact_tool_evidence_for_repair(review_tool_results, limit=10_000)),
         "artifact_evidence": _completion_review_artifact_evidence(state, combined_artifacts),
@@ -5544,6 +5606,8 @@ def _review_risky_agent_completion(
         '"satisfied":true|false,"draft_covered":true|false,'
         '"evidence_invocation_ids":["exact-current-turn-invocation-id"]}]}. '
         "Judge the original request against verified runtime evidence, not against the draft's confidence. "
+        "A scheduled conditional monitor can complete with a verified negative within the full requested scope; "
+        "follow-on actions and delivery apply only if the monitored condition is verified as met. "
         "Use exactly one material_requirements row for each evidence subject in material_requirement_contract, with all "
         "facts and constraints that its one record must jointly prove kept in that row. Set "
         "all_material_requirements_enumerated true only after checking the entire "
@@ -8418,6 +8482,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     missing_required_tool_nudge_count: int
     artifact_tool_delivery_nudged: bool
     raw_tool_payload_nudge_count: int
+    email_answer_recovery_count: int
     search_evidence_continuation_nudged: bool
     browser_form_action_continuation_nudged: bool
     browser_page_state_continuation_nudged: bool
@@ -8429,6 +8494,7 @@ class _AgentTurnGraphState(TypedDict, total=False):
     source_continuation_nudges: int
     history_artifact_lookup_nudges: int
     completion_review_count: int
+    completion_requirement_contract_cache: dict[str, object]
     completion_review_unresolved_requirements: list[str]
     repeated_failure_limit: int
     failure_fingerprints: dict[str, int]
@@ -9015,6 +9081,24 @@ def _complete_agent_turn(
     model_timed_out: bool = False,
     completion_failure_reply: str | None = None,
 ) -> dict[str, object]:
+    # Direct terminal shortcuts must not promote an email preview to proof.
+    # Normal finalization recovers this presentation through the model first.
+    if not suspended_for_approval and any(
+        r.tool_name == "email_read" and r.status == "completed"
+        for r in state.get("tool_results") or ()
+    ):
+        presentation = dict(state.get("response_presentation") or {})
+        if "response_presentation" not in state:
+            sanitize_user_visible_reply(user_message=state.get("user_message"), reply=final_text,
+                tool_results=state.get("tool_results"), presentation_metadata=presentation)
+        if presentation.get("kind") in {"source_preview", "source_summary"} and presentation.get("fulfillment_satisfied") is False:
+            final_text = completion_failure_reply = (
+                "I read the email, but couldn't verify the answer to your question. "
+                "The email describes what was confirmed for its stated date; "
+                "it does not establish current account status."
+            )
+            response_fulfilled = False
+            state = {**state, "response_presentation": {"kind": "unverified_email_answer", "fulfillment_satisfied": False}}
     if response_fulfilled is not True and _completion_review_required(
         state,
         tool_results=list(state.get("tool_results") or []),
@@ -9086,7 +9170,10 @@ def _complete_agent_turn(
             artifact_delivery_required=artifact_delivery_required,
             artifact_delivery_satisfied=artifact_delivery_satisfied,
             required_artifact_extensions=required_artifact_extensions,
-            response_presentation=dict(state.get("response_presentation") or {}),
+            response_presentation={**dict(state.get("response_presentation") or {}),
+                **({"scheduled_source_verification_required": True,
+                    "scheduled_source_verification_satisfied": response_fulfilled is True}
+                   if _scheduled_alert_requires_outcome_review(state, state.get("tool_results") or ()) else {})},
             messages_snapshot=list(state.get("messages") or []) if reached_iteration_limit else [],
         ),
     }
@@ -9600,6 +9687,14 @@ def _execute_agent_turn_tool_uses(
         if prior_navigation is not None and result.status == "completed" and isinstance(result.output, dict):
             result.output["navigation_receipt"] = dict(prior_navigation.output)
         tool_results.append(result)
+        # Resource exhaustion is terminal for this run. Do not ask the model
+        # to invent filesystem cleanup or widen tool scope to repair the host.
+        if result.status == "failed" and isinstance(result.output, dict) and result.output.get("reason") == "storage_exhausted":
+            _emit_tool_activity(result)
+            updated_state = dict(state)
+            updated_state.update({"tool_results": tool_results, "artifacts": artifacts})
+            return {"tool_results": tool_results, "artifacts": artifacts,
+                    **_complete_agent_turn(updated_state, final_text=_terminal_tool_failure_text(result))}
         email_attachment_guard_result = _email_attachment_artifact_guard_result(
             state,
             invocation=invocation,
@@ -10874,6 +10969,7 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
                         state.get("browser_terminal_revalidation_attempt_keys") or []
                     ),
                     "completion_review_count": review_count + 1,
+                    "completion_requirement_contract_cache": state.get("completion_requirement_contract_cache") or {},
                     "completion_review_unresolved_requirements": list(completion_review.unresolved_requirements),
                     "tool_registry": (
                         state.get("tool_registry")
@@ -10910,6 +11006,29 @@ def _agent_turn_finalize_node(state: _AgentTurnGraphState) -> dict[str, object]:
         presentation_metadata=response_presentation,
     )
     state["response_presentation"] = response_presentation
+    if (response_presentation.get("kind") in {"source_preview", "source_summary"}
+            and response_presentation.get("fulfillment_satisfied") is False
+            and any(r.tool_name == "email_read" and r.status == "completed" for r in tool_results)
+            and int(state.get("email_answer_recovery_count") or 0) < 1):
+        # Reuse this turn's tool evidence and selected scope. This is a bounded
+        # recovery of a known formatter fallback, not another intent classifier.
+        messages.extend([
+            {"role": "assistant", "content": [{"type": "text", "text": final_text or ""}]},
+            {"role": "user", "content": [{"type": "text", "text":
+                "The delivered draft is an email preview, not an answer to the original request. "
+                "Use the full email evidence already read to answer that request directly. "
+                "Runtime UTC date: " + datetime.now(UTC).date().isoformat() + ". "
+                "Compare the event or processing dates in the body with the requested period. "
+                "A recently retrieved old confirmation is historical evidence, not current proof. "
+                "Check later completion, cancellation or superseding evidence when needed; "
+                "email absence does not prove no action occurred. State what was verified and what remains uncertain. "
+                "Do not return sender/date/preview fields as the conclusion. "
+                "Do not repeat completed reads unless new evidence is needed."}]},
+        ])
+        return {"messages": messages, "email_answer_recovery_count": 1,
+                "response_presentation": {},
+                "max_iterations": max(int(state.get("max_iterations") or _default_agent_turn_max_iterations()),
+                                      int(state.get("iterations") or 0) + 2)}
     try:
         from nullion.artifacts import materialize_inline_html_reply_artifact
 

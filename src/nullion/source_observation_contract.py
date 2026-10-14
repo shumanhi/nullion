@@ -235,7 +235,8 @@ def render_source_answer(tool_results, presentation: object) -> str:
         citation = ' ' + ' · '.join(f'[Source {index + 1}]({url})' for index, url in enumerate(urls[:2])) if urls else ''
         blocks.append(f'- **{title}**' + (f' — {body}' if body else '') + citation)
     notes = list(dict.fromkeys(unknowns[i] for i in limitations))
-    return (intro.strip() + '\n\n' if intro.strip() else '') + '\n\n'.join(blocks) + ('\n\n' + ' '.join(notes) if notes else '')
+    limitation_text = '\n\n**Not verified from this check:** ' + '; '.join(notes) if notes else ''
+    return (intro.strip() + '\n\n' if intro.strip() else '') + '\n\n'.join(blocks) + limitation_text
 
 
 def partial_source_report_reply(tool_results, *, draft=None) -> str:

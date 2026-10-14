@@ -2744,6 +2744,7 @@ def _browser_select_combobox_script(
     return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
   }};
   const disabled = (el) => Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
+  const exactText = (value) => textOf(value).normalize('NFKC').toLocaleLowerCase();
   const labelFor = (el) => {{
     const pieces = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name')];
     if (el.labels) for (const candidate of el.labels) pieces.push(textOf(candidate.innerText || candidate.textContent));
@@ -2752,17 +2753,22 @@ def _browser_select_combobox_script(
       const label = document.querySelector(`label[for="${{CSS.escape(id)}}"]`);
       if (label) pieces.push(textOf(label.innerText || label.textContent));
     }}
-    return normalize(pieces.filter(Boolean).join(' '));
+    return exactText(pieces.filter(Boolean).join(' '));
   }};
-  const desiredLabel = normalize([args.label, args.placeholder, args.name].filter(Boolean).join(' '));
-  const candidates = Array.from(document.querySelectorAll('input, textarea, [role="combobox"], [contenteditable="true"]'))
+  const desiredLabel = exactText([args.label, args.placeholder, args.name].filter(Boolean).join(' '));
+  const candidates = Array.from(document.querySelectorAll('select, input, textarea, [role="combobox"], [contenteditable="true"]'))
     .filter((el) => visible(el) && !disabled(el));
   let el = args.elementId ? document.querySelector(`[data-nullion-eid="${{CSS.escape(args.elementId)}}"]`) : null;
   if (el && (!visible(el) || disabled(el))) el = null;
   if (!el && desiredLabel) {{
-    el = candidates.find((candidate) => labelFor(candidate).includes(desiredLabel) || desiredLabel.includes(labelFor(candidate)));
+    const matches = candidates.filter((candidate) => {{
+      const candidateLabel = labelFor(candidate);
+      return candidateLabel && (candidateLabel.includes(desiredLabel) || desiredLabel.includes(candidateLabel));
+    }});
+    if (matches.length > 1) return {{ok: false, reason: 'ambiguous_combobox'}};
+    el = matches[0] || null;
   }}
-  if (!el) el = candidates[0] || null;
+  if (!el && !args.elementId && !desiredLabel) el = candidates[0] || null;
   if (!el) return {{ok: false, reason: 'combobox_not_found'}};
   if (!el.dataset.nullionEid) {{
     window.__nullionBrowserElementSeq = window.__nullionBrowserElementSeq || 0;
@@ -2770,6 +2776,33 @@ def _browser_select_combobox_script(
   }}
   const before = 'value' in el ? String(el.value || '') : textOf(el.textContent);
   el.scrollIntoView({{block: 'center', inline: 'center'}});
+  if (el.tagName.toLowerCase() === 'select') {{
+    const expected = exactText(args.expectedText || args.query);
+    const options = Array.from(el.options);
+    const matches = options.filter((option) => exactText(option.value) === expected || exactText(option.textContent) === expected);
+    if (matches.length !== 1) return {{
+      ok: false, reason: matches.length ? 'ambiguous_option' : 'no_compatible_option',
+      element_id: el.dataset.nullionEid, before_value: before,
+      options: options.map((option) => textOf(option.textContent)).slice(0, 12)
+    }};
+    const selected = matches[0];
+    if (disabled(selected) || (selected.parentElement?.tagName.toLowerCase() === 'optgroup' && disabled(selected.parentElement))) {{
+      return {{ok: false, reason: 'option_disabled', element_id: el.dataset.nullionEid, before_value: before}};
+    }}
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+    if (setter) setter.call(el, selected.value);
+    else el.value = selected.value;
+    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+    await sleep(100);
+    const verified = el.isConnected && selected.selected && el.value === selected.value;
+    return {{
+      ok: verified, reason: verified ? undefined : 'selection_not_committed',
+      element_id: el.dataset.nullionEid, before_value: before, after_value: el.value,
+      selected_text: textOf(selected.textContent), verified,
+      options: options.map((option) => textOf(option.textContent)).slice(0, 12)
+    }};
+  }}
   const populate = (value) => {{
     if (typeof el.focus === 'function') el.focus({{preventScroll: true}});
     if ('value' in el) {{

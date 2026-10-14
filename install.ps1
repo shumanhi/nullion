@@ -715,6 +715,7 @@ function Save-MessagingCheckpoint {
     Set-EnvValue "NULLION_DISCORD_ENABLED" (Format-BoolText $DISCORD_ENABLED) -Raw
     if ($DISCORD_ENABLED) {
         Set-EnvValue "NULLION_DISCORD_BOT_TOKEN" $DISCORD_BOT_TOKEN
+        Set-EnvValue "NULLION_DISCORD_OPERATOR_USER_ID" $DISCORD_OPERATOR_USER_ID
     }
     Write-Ok "Messaging setup checkpoint saved to $NULLION_ENV_FILE"
 }
@@ -1784,6 +1785,7 @@ $SLACK_SIGNING_SECRET = ""
 $SLACK_OPERATOR_USER_ID = ""
 $DISCORD_ENABLED = $false
 $DISCORD_BOT_TOKEN = ""
+$DISCORD_OPERATOR_USER_ID = ""
 $SKIP_MESSAGING_SETUP = $false
 
 $ExistingTelegramToken = Get-EnvValue "NULLION_TELEGRAM_BOT_TOKEN"
@@ -1796,6 +1798,7 @@ $ExistingSlackSigningSecret = Get-EnvValue "NULLION_SLACK_SIGNING_SECRET"
 $ExistingSlackOperatorUserId = Get-EnvValue "NULLION_SLACK_OPERATOR_USER_ID"
 $ExistingDiscordEnabled = Get-EnvValue "NULLION_DISCORD_ENABLED"
 $ExistingDiscordBotToken = Get-EnvValue "NULLION_DISCORD_BOT_TOKEN"
+$ExistingDiscordOperatorUserId = Get-EnvValue "NULLION_DISCORD_OPERATOR_USER_ID"
 
 if ("$ExistingTelegramToken$ExistingSlackBotToken$ExistingDiscordBotToken") {
     $ExistingMessagingSummary = Get-ExistingMessagingSummary
@@ -1818,6 +1821,7 @@ if ("$ExistingTelegramToken$ExistingSlackBotToken$ExistingDiscordBotToken") {
         if (($ExistingDiscordEnabled -eq "true") -or $ExistingDiscordBotToken) {
             $DISCORD_ENABLED = $true
             $DISCORD_BOT_TOKEN = $ExistingDiscordBotToken
+            $DISCORD_OPERATOR_USER_ID = $ExistingDiscordOperatorUserId
         }
         Write-Ok "Using existing messaging setup."
     }
@@ -1947,7 +1951,18 @@ if (($MESSAGING_CHOICES -match '3') -or ($MESSAGING_CHOICES -match 'discord')) {
         if ($DISCORD_BOT_TOKEN) { break }
         Write-Err "Discord needs a bot token."
     }
-    Write-Ok "Discord messaging configured."
+    Write-Host "  Invite the bot with View Channel, Send Messages and Attach Files permissions."
+    Write-Host "  Enable Developer Mode in Discord, then right-click your profile and choose Copy User ID."
+    while ($true) {
+        $DISCORD_OPERATOR_USER_ID = (Read-Host "  Your Discord user ID (leave blank for registered multi-user access)").Trim()
+        if (-not $DISCORD_OPERATOR_USER_ID -or ($DISCORD_OPERATOR_USER_ID -match '^[1-9][0-9]{0,19}$')) { break }
+        Write-Err "Use the numeric user ID copied from your Discord profile, not a username or channel ID."
+    }
+    if ($DISCORD_OPERATOR_USER_ID) {
+        Write-Ok "Discord messaging configured."
+    } else {
+        Write-Info "Before starting Discord, add an authorized Discord user in Settings > Users and enable multi-user mode."
+    }
 }
 }
 
@@ -2836,6 +2851,7 @@ if ($SLACK_ENABLED) {
 if ($DISCORD_ENABLED) {
     $envLines += "NULLION_DISCORD_ENABLED=true"
     $envLines += "NULLION_DISCORD_BOT_TOKEN=`"$DISCORD_BOT_TOKEN`""
+    $envLines += "NULLION_DISCORD_OPERATOR_USER_ID=`"$DISCORD_OPERATOR_USER_ID`""
 } else {
     $envLines += "NULLION_DISCORD_ENABLED=false"
 }

@@ -33,6 +33,7 @@ class SlackSettings:
 class DiscordSettings:
     enabled: bool = False
     bot_token: str | None = field(default=None, repr=False)
+    operator_user_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -338,6 +339,7 @@ def load_settings(
     settings.discord = DiscordSettings(
         enabled=_env_flag(_first_nonempty_env_value(merged_env, "NULLION_DISCORD_ENABLED")),
         bot_token=_first_nonempty_env_value(merged_env, "NULLION_DISCORD_BOT_TOKEN"),
+        operator_user_id=_first_nonempty_env_value(merged_env, "NULLION_DISCORD_OPERATOR_USER_ID"),
     )
 
     terminal_backend_mode = (

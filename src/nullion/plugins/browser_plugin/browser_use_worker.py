@@ -15,7 +15,6 @@ import site
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,36 +68,51 @@ def run_isolated_browser_task(task, *, client, principal_id, policy, timeout, py
     bridge.daemon_threads = True
     thread = threading.Thread(target=bridge.serve_forever, daemon=True)
     thread.start()
+    from nullion.plugins.browser_plugin.browser_resources import browser_resource_directory, browser_temporary_root
+    from nullion.plugins.browser_plugin.browser_config import nullion_runtime_home
     process = None
     try:
-        with tempfile.TemporaryDirectory(prefix='nullion-browser-worker-') as scratch:
+        with browser_resource_directory(nullion_runtime_home() / "browser-task-scratch") as scratch, browser_resource_directory(browser_temporary_root()) as sdk_temp:
             job = Path(scratch) / 'job.json'
             result_file = Path(scratch) / 'result.json'
             job.write_text(json.dumps({'task': task.model_dump(), 'principal_id': principal_id, 'timeout': timeout,
                 'fallback_site_packages': site.getsitepackages(), 'model': str(getattr(client, 'model', 'configured-model')), 'bridge_url': f'http://127.0.0.1:{bridge.server_port}/model', 'token': token,
+                'resource_lease': str(Path(scratch) / '.lease'),
                 'policy': {'allowed_domains': list(policy.allowed_domains), 'blocked_domains': list(policy.blocked_domains), 'block_private': policy.block_private}}, ensure_ascii=False))
             job.chmod(0o600)
             env = {key: value for key, value in os.environ.items() if key in {'PATH', 'HOME', 'TMPDIR', 'DISPLAY', 'XAUTHORITY', 'PLAYWRIGHT_BROWSERS_PATH', 'NULLION_HOME', 'NULLION_DATA_DIR', 'NULLION_CHECKPOINT_PATH'} or key.startswith(('NULLION_BROWSER_', 'NULLION_WORKSPACE_'))}
-            env.update(PYTHONPATH=str(Path(__file__).resolve().parents[3]), ANONYMIZED_TELEMETRY='false', PYTHONUNBUFFERED='1')
+            env.update(TMPDIR=str(sdk_temp), TEMP=str(sdk_temp), TMP=str(sdk_temp), PYTHONPATH=str(Path(__file__).resolve().parents[3]), ANONYMIZED_TELEMETRY='false', PYTHONUNBUFFERED='1')
             env.pop('NULLION_BROWSER_USE_PYTHON', None)
-            with (Path(scratch) / 'worker.log').open('wb') as log:
-                process = subprocess.Popen([python or os.environ['NULLION_BROWSER_USE_PYTHON'], str(Path(__file__).resolve()), str(job), str(result_file)], env=env, stdout=log, stderr=log, start_new_session=True)
-                process.wait(timeout=timeout + 25)
-            if process.returncode != 0 or not result_file.is_file():
-                raise RuntimeError('Isolated browser worker failed before producing a report')
-            result = json.loads(result_file.read_text())
-            if 'worker_error' in result:
-                raise RuntimeError('Isolated browser worker: ' + result['worker_error']['type'] + ': ' + result['worker_error']['message'])
-            logger.info('Browser Use worker report status=%s observations=%s rejected=%s elapsed_seconds=%s', result.get('report_status'), len(result.get('observations', [])), result.get('rejected_observations'), result.get('elapsed_seconds'))
-            return result
-    finally:
-        if process is not None and process.poll() is None:
-            _signal_worker(process)
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _signal_worker(process, force=True)
-                process.wait(timeout=5)
+                with (Path(scratch) / 'worker.log').open('wb') as log:
+                    process = subprocess.Popen([python or os.environ['NULLION_BROWSER_USE_PYTHON'], str(Path(__file__).resolve()), str(job), str(result_file)], env=env, stdout=log, stderr=log, start_new_session=True)
+                    process.wait(timeout=timeout + 25)
+                if process.returncode != 0 or not result_file.is_file():
+                    raise RuntimeError('Isolated browser worker failed before producing a report')
+                result = json.loads(result_file.read_text())
+                if 'worker_error' in result:
+                    if result['worker_error'].get('reason') == 'storage_exhausted':
+                        import errno
+                        raise OSError(errno.ENOSPC, 'Browser storage is full')
+                    raise RuntimeError('Isolated browser worker: ' + result['worker_error']['type'] + ': ' + result['worker_error']['message'])
+                logger.info('Browser Use worker report status=%s observations=%s rejected=%s elapsed_seconds=%s', result.get('report_status'), len(result.get('observations', [])), result.get('rejected_observations'), result.get('elapsed_seconds'))
+                return result
+            finally:
+                if process is not None:
+                    try:
+                        # An exited Windows PID can be reused; taskkill cannot
+                        # identify its old descendants after the parent exits.
+                        if process.poll() is None or platform.system() != "Windows":
+                            _signal_worker(process, force=process.poll() is not None)
+                    except ProcessLookupError:
+                        pass
+                    if process.poll() is None:
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            _signal_worker(process, force=True)
+                            process.wait(timeout=5)
+    finally:
         bridge.shutdown()
         bridge.server_close()
         thread.join(timeout=2)
@@ -132,7 +146,10 @@ if __name__ == '__main__':
     # from the parent environment only when they are absent here.
     sys.path.extend(path for path in job['fallback_site_packages'] if path not in sys.path)
     try:
-        result = asyncio.run(_worker(job))
+        from portalocker import Lock, LOCK_SH
+        with Lock(job["resource_lease"], mode="r+", flags=LOCK_SH, timeout=0):
+            result = asyncio.run(_worker(job))
     except Exception as exc:
-        result = {'worker_error': {'type': type(exc).__name__, 'message': str(exc)[:300]}}
+        from nullion.tools import filesystem_error_metadata
+        result = {'worker_error': {'type': type(exc).__name__, 'message': str(exc)[:300], **filesystem_error_metadata(exc, reason='browser_task_unavailable')}}
     Path(sys.argv[2]).write_text(json.dumps(result, ensure_ascii=False))

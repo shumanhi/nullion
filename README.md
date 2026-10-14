@@ -474,12 +474,15 @@ Authorize Slack users in the Users settings or `~/.nullion/users.json` with `mes
 ### Discord adapter
 
 ```bash
-NULLION_DISCORD_ENABLED=true
-NULLION_DISCORD_BOT_TOKEN=<bot-token>
+export NULLION_DISCORD_ENABLED=true
+export NULLION_DISCORD_BOT_TOKEN="<bot-token>"
+export NULLION_DISCORD_OPERATOR_USER_ID="<your-numeric-user-id>"
 nullion-discord
 ```
 
-Authorize Discord users in the Users settings or `~/.nullion/users.json` with `messaging_channel=discord` and their Discord user ID. The Discord bot needs the Message Content intent enabled.
+For single-user access, set your Discord user ID in Settings -> Messaging or `NULLION_DISCORD_OPERATOR_USER_ID`. Enable Developer Mode in Discord, then choose Copy User ID from your profile. For member-only access, enable multi-user mode and authorize active members in Settings -> Users with `messaging_channel=discord` and their Discord user IDs.
+
+Enable Message Content Intent under Bot -> Privileged Gateway Intents in the Discord Developer Portal. Invite the bot to your server with View Channel, Send Messages, and Attach Files permissions. Save settings, then restart the Discord adapter. An invalid token or disallowed intent now produces a setup error explaining what to change.
 
 ### Multi-user connections
 

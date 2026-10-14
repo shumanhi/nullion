@@ -21,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from nullion.approvals import (
     ApprovalRequest,
     ApprovalStatus,
+    TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND,
     BoundaryPermit,
     PermissionGrant,
     approve,
@@ -2138,6 +2139,16 @@ def _pending_approval_already_covered(
     now: datetime,
 ) -> bool:
     if _approval_status_value(getattr(approval, "status", None)) != ApprovalStatus.PENDING.value:
+        return False
+    # Reviewed, invocation-specific actions require an explicit decision.
+    # A broad tool grant cannot substitute for the separate deletion review.
+    if approval.request_kind == TERMINAL_DESTRUCTIVE_ACTION_REQUEST_KIND:
+        return False
+    context = approval.context if isinstance(approval.context, dict) else {}
+    adapter_context = context.get("adapter_approval_context")
+    if context.get("tool_permission_scope") == "exact_invocation" or (
+        isinstance(adapter_context, dict) and adapter_context.get("tool_permission_scope") == "exact_invocation"
+    ):
         return False
     permissions = set(_approval_permission_candidates(approval))
     if permissions:

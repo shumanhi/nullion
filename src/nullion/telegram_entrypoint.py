@@ -840,6 +840,7 @@ def _build_runtime_service_from_settings(
         return _operator_chat_id or ""
 
     def _cron_tool_runner(job, invocation=None):
+        from nullion.tracker_status import health_store_path
         from nullion.cron_delivery import (
             CronRunDeliveryCallbacks,
             cron_delivery_block_reason,
@@ -938,6 +939,7 @@ def _build_runtime_service_from_settings(
                 silent_delivery_text=manual_cron_silent_delivery_text,
                 notify_approval_required=_notify_cron_approval_required,
                 record_chat_turn=_record_cron_delivery_chat_turn,
+                health_store_path=health_store_path(runtime),
             ),
             origin_conversation_id=origin_conversation_id,
             thread_name_prefix="nullion-telegram-manual-cron",
@@ -1037,6 +1039,7 @@ async def _send_operator_telegram_delivery(
     suppress_link_preview: bool = False,
     parse_mode: str | None = None,
     request_id: str | None = None,
+    message_only: bool = False,
 ) -> bool:
     """Send a Telegram delivery, uploading any MEDIA artifact directives."""
     delivery = None
@@ -1056,6 +1059,7 @@ async def _send_operator_telegram_delivery(
             text,
             principal_id=principal_id,
             max_attachment_bytes=telegram_attachment_upload_limit_bytes(),
+            allow_attachments=False if message_only else None,
         )
         async with build_telegram_bot(Bot, bot_token) as bot:
             if delivery.attachments:

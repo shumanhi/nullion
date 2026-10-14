@@ -727,6 +727,7 @@ def add_cron(
     from nullion.cron_delivery import normalize_cron_delivery_channel, normalize_html_image_delivery_mode
 
     _validate_cron_fields(name, schedule, task)
+    _validate_tracker_options(artifact_delivery_options)
     jobs = load_crons()
     job = CronJob(
         id=str(uuid.uuid4())[:8],
@@ -778,6 +779,8 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
     """Update mutable fields (name, schedule, task, enabled). Recomputes next_run."""
     from nullion.cron_delivery import normalize_cron_delivery_channel, normalize_html_image_delivery_mode
 
+    _validate_tracker_options(kwargs.get("artifact_delivery_options"))
+
     jobs = load_crons()
     for job in jobs:
         if job.id == cron_id:
@@ -812,6 +815,12 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
     return None
 
 
+def _validate_tracker_options(options: object) -> None:
+    if isinstance(options, dict) and "tracker_status_notifications" in options:
+        if type(options["tracker_status_notifications"]) is not bool:
+            raise ValueError("tracker_status_notifications must be a boolean")
+
+
 def get_cron(cron_id: str) -> CronJob | None:
     for job in load_crons():
         if job.id == cron_id:
@@ -839,10 +848,13 @@ class CronScheduler:
         self,
         fire_fn: Callable[[CronJob], object],
         tick_interval: float = 30.0,
+        status_fn: Callable[[list[CronJob], datetime], object] | None = None,
     ) -> None:
         self._fire = fire_fn
         self._tick_interval = tick_interval
         self._stop = threading.Event()
+        self._status_fn = status_fn
+        self._status_thread = threading.Thread(target=self._status_loop, daemon=True, name="nullion-tracker-status")
         self._thread = threading.Thread(
             target=self._loop,
             daemon=True,
@@ -851,10 +863,20 @@ class CronScheduler:
 
     def start(self) -> None:
         self._thread.start()
+        if self._status_fn is not None:
+            self._status_thread.start()
         log.info("CronScheduler started (tick every %ss)", self._tick_interval)
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _status_loop(self) -> None:
+        # Remain observable even while a source check is slow or stalled.
+        while not self._stop.wait(timeout=self._tick_interval):
+            try:
+                self._status_fn(load_crons(refresh_next_runs=False), datetime.now(timezone.utc))
+            except Exception:
+                log.warning("Tracker status tick failed", exc_info=True)
 
     def _loop(self) -> None:
         while not self._stop.wait(timeout=self._tick_interval):
