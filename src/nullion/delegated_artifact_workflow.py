@@ -18,12 +18,34 @@ from nullion.artifacts import (
     artifact_root_for_principal,
 )
 from nullion.attachment_format_graph import plan_attachment_format
-from nullion.task_queue import TaskGroup
+from nullion.task_queue import TaskGroup, TaskStatus
 
 
 logger = logging.getLogger(__name__)
 
 _TEXT_ARTIFACT_EXTENSIONS = frozenset({".txt", ".md", ".csv", ".json", ".yaml", ".yml"})
+_LOCAL_ARTIFACT_PRODUCER_TOOLS = frozenset({
+    "file_write", "document_create", "pdf_create", "pdf_edit", "spreadsheet_create", "presentation_create",
+})
+
+
+def _recoverable_artifact_task(task: object) -> bool:
+    tools = set(getattr(task, "allowed_tools", ()) or ())
+    return bool(tools) and tools.issubset(_LOCAL_ARTIFACT_PRODUCER_TOOLS)
+
+
+def _artifact_receipt_task(task: object) -> bool:
+    metadata = getattr(task, "metadata", {}) or {}
+    return metadata.get("artifact_role") == "deliver_receipt" and not getattr(task, "allowed_tools", ())
+
+
+def unresolved_group_tasks(group: TaskGroup, recovered_artifacts=(), verified_artifacts=()) -> list:
+    """A local artifact receipt cannot replace failed source/account work."""
+    recovered_ids = set((getattr(group, "planner_metadata", {}) or {}).get("recovered_artifact_task_ids", ()))
+    return [task for task in group.tasks if task.status != TaskStatus.COMPLETE and not (
+        task.status == TaskStatus.FAILED and (
+            recovered_artifacts and task.task_id in recovered_ids and _recoverable_artifact_task(task)
+            or verified_artifacts and _artifact_receipt_task(task)))]
 
 
 class DelegatedArtifactState(TypedDict, total=False):
@@ -114,8 +136,10 @@ def _collect_candidate_content(state: DelegatedArtifactState) -> dict[str, objec
     if not state.get("should_materialize") or state.get("existing_artifacts"):
         return {}
     group = state["group"]
+    if any(task.status != TaskStatus.COMPLETE and not (
+        task.status == TaskStatus.FAILED and (_recoverable_artifact_task(task) or _artifact_receipt_task(task))) for task in group.tasks):
+        return {"error": "Required source or action work is unfinished."}
     success_sections: list[str] = []
-    fallback_sections: list[str] = []
     for task in group.tasks:
         result = task.result
         if result is None:
@@ -127,9 +151,7 @@ def _collect_candidate_content(state: DelegatedArtifactState) -> dict[str, objec
         section = f"{title}\n{'=' * min(len(title), 72)}\n{content}"
         if result.status == "success":
             success_sections.append(section)
-        else:
-            fallback_sections.append(section)
-    sections = success_sections or fallback_sections
+    sections = success_sections
     if not sections:
         return {}
     header = f"Original request: {group.original_message.strip()}"
@@ -220,6 +242,8 @@ def _record_created_artifacts(group: TaskGroup, paths: list[str]) -> None:
             return
         existing = [path for path in metadata.get("created_artifacts", []) if isinstance(path, str)]
         metadata["created_artifacts"] = list(dict.fromkeys([*existing, *paths]))
+        metadata["recovered_artifact_task_ids"] = [task.task_id for task in group.tasks
+            if task.status == TaskStatus.FAILED and _recoverable_artifact_task(task)]
     except Exception:
         logger.debug("Could not record delegated artifact metadata", exc_info=True)
 
@@ -227,4 +251,5 @@ def _record_created_artifacts(group: TaskGroup, paths: list[str]) -> None:
 __all__ = [
     "DelegatedArtifactState",
     "finalize_delegated_artifacts",
+    "unresolved_group_tasks",
 ]

@@ -290,12 +290,13 @@ def _sanitize_user_visible_reply(
         return _sanitize_local_paths(artifact_completion_reply)
     if empty_reminder_cancel_reply := _empty_reminder_cancel_reply(results):
         return empty_reminder_cancel_reply
-    if scheduler_read_reply := _scheduler_read_reply_over_model_reformat(raw, results):
-        return _sanitize_local_paths(scheduler_read_reply)
+    # A model answer may discuss one relevant scheduled task. A completed read
+    # does not authorize replacing that answer with the whole inventory.
     if numbered_reply := _structured_numbered_choice_reply(results):
         return numbered_reply
-    if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
-        return cron_list_reply
+    if not user_message:
+        if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
+            return cron_list_reply
     if _looks_like_raw_function_markup(raw):
         return safe_raw_tool_payload_replacement(tool_results=results, source=source)
     parsed = _parse_bare_structured_payload(raw)

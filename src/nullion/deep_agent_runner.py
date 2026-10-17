@@ -496,24 +496,6 @@ class DeepAgentMiniAgentRunner:
                 completion_decision.get("answer")
                 or "The scheduled task could not verify enough evidence to complete this step."
             ).strip()
-            if _should_emit_best_effort_scheduled_result(config, tool_results):
-                # Product invariant: scheduled runs should deliver best-effort
-                # output whenever verified tool work exists.
-                try:
-                    best_effort_answer = await _fallback_answer_from_tool_evidence(
-                        config,
-                        tool_results=tool_results,
-                        model_client=anthropic_client,
-                    )
-                except DeepAgentEvidenceFallbackUnavailable:
-                    best_effort_answer = reason
-                best_effort_answer = str(best_effort_answer or reason).strip() or reason
-                return TaskResult(
-                    task_id=task.task_id,
-                    status="success",
-                    output=best_effort_answer,
-                    context_out=best_effort_answer,
-                )
             return TaskResult(
                 task_id=task.task_id,
                 status="failure",
@@ -566,18 +548,6 @@ def _completed_tool_results(tool_results: list[Any]) -> list[Any]:
         for result in (tool_results or [])
         if str(getattr(result, "status", "") or "").lower() in {"completed", "success", "succeeded"}
     ]
-
-
-def _should_emit_best_effort_scheduled_result(config: Any, tool_results: list[Any]) -> bool:
-    if not _is_scheduled_background_config(config):
-        return False
-    task = getattr(config, "task", None)
-    if getattr(task, "context_key_out", None):
-        # Context-producing steps are dependency contracts. If validation says
-        # evidence is insufficient, do not publish best-effort text as verified
-        # context for downstream report/artifact steps.
-        return False
-    return bool(_completed_tool_results(tool_results))
 
 
 async def _persist_context_handoff_from_tool_evidence(
@@ -3371,7 +3341,7 @@ async def _scheduled_task_completion_decision(
         return None
     create = getattr(model_client, "create", None)
     if create is None or not _model_client_can_make_evidence_fallback_decision(model_client):
-        return None
+        return {"status": "failure", "answer": "The required completion could not be verified because the model is unavailable."}
     task = getattr(config, "task", None)
     evidence = _tool_evidence_payload(tool_results)
     system_prompt = (
@@ -3380,9 +3350,9 @@ async def _scheduled_task_completion_decision(
         "Output only JSON with this schema: "
         '{"status":"success"|"failure","answer":"string"}. '
         "Set status=failure when required evidence, data, side effects, or verification are insufficient. "
-        "For a reasoning/synthesis-only step with no side-effect tool to perform, do not set failure solely "
-        "because some candidate items are unverified; return success when the answer can report verified "
-        "partial findings with clear caveats and avoid unsafe downstream claims. "
+        "Reasoning and synthesis steps must also satisfy every assigned requirement. Unavailable optional "
+        "fields may be disclosed, but unfinished required work cannot become success by summarizing a subset "
+        "of findings or adding caveats. Keep insufficient findings internal and set status=failure. "
         "External platform delivery is performed by Nullion after this step; do not require proof that a "
         "message, report, or artifact was already sent unless the assigned task had an available side-effect "
         "tool and the final answer claims that tool-side effect already happened. "
@@ -3414,14 +3384,15 @@ async def _scheduled_task_completion_decision(
         )
     except Exception:
         logger.warning(
-            "DeepAgent scheduled completion validation failed; preserving original result "
+            "DeepAgent scheduled completion validation failed; withholding unverified result "
             "agent_id=%s task_id=%s",
             getattr(config, "agent_id", ""),
             str(getattr(task, "task_id", "") or ""),
             exc_info=True,
         )
-        return None
-    return _parse_evidence_fallback_decision(_extract_response_text(response))
+        return {"status": "failure", "answer": "The model could not verify that all required work finished."}
+    return _parse_evidence_fallback_decision(_extract_response_text(response)) or {
+        "status": "failure", "answer": "The required completion could not be verified."}
 
 
 async def _fallback_answer_from_tool_evidence(

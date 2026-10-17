@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, TypedDict
@@ -48,6 +49,7 @@ from nullion.task_queue import (
 
 logger = logging.getLogger(__name__)
 _DEFAULT_DECOMPOSER_MAX_TOKENS = 512
+_DEFAULT_DECOMPOSER_TIMEOUT_SECONDS = 30.0
 _DECOMPOSER_MAX_TOOLS_ENV = "NULLION_TASK_DECOMPOSER_MAX_TOOLS"
 _DEFAULT_DECOMPOSER_MAX_TOOLS = 48
 
@@ -198,7 +200,9 @@ class TaskDecomposer:
         scheduled_preview_mode: bool = False,
     ) -> None:
         self._model_client = model_client
-        self._model_timeout_seconds = model_timeout_seconds
+        self._model_timeout_seconds = (
+            _DEFAULT_DECOMPOSER_TIMEOUT_SECONDS if model_timeout_seconds is None else model_timeout_seconds
+        )
         self._scheduled_preview_mode = scheduled_preview_mode
 
     def decompose(
@@ -407,11 +411,16 @@ def _call_decomposer_model_text(
             {"role": "system", "content": system_prompt},
             *messages,
         ]
+    started = time.perf_counter()
+    logger.info("TaskDecomposer: model call started prompt_chars=%s tool_count=%s timeout_seconds=%s",
+                len(prompt) + len(system_prompt), len(tools_for_prompt), create_kwargs.get("timeout"))
     try:
         response = model_client.create(**create_kwargs)
     except Exception as exc:
-        logger.warning("TaskDecomposer: model call failed: %s", exc)
+        logger.warning("TaskDecomposer: model call failed elapsed_ms=%.1f error=%s",
+                       (time.perf_counter() - started) * 1000, type(exc).__name__)
         return None
+    logger.info("TaskDecomposer: model call completed elapsed_ms=%.1f", (time.perf_counter() - started) * 1000)
     return _response_text(response)
 
 

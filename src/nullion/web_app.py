@@ -6256,6 +6256,15 @@ _HTML = r"""<!DOCTYPE html>
             </div>
           </div>
 
+          <div class="pref-row" style="margin-bottom:16px">
+            <div><label for="cron-parallel-limit">Maximum parallel scheduled jobs</label>
+              <div class="form-hint">Independent jobs can run together. Each scheduled task runs only once at a time.</div>
+              <span id="cron-capacity-state" role="status"></span></div>
+            <div><input id="cron-parallel-limit" type="number" min="1" max="32" disabled style="width:75px">
+              <button class="btn-sm" onclick="saveCronParallelLimit()">Save parallel limit</button>
+              <span id="cron-parallel-message" role="status"></span></div>
+          </div>
+
           <!-- Inline create form -->
           <div id="cron-form" class="cron-form-panel">
             <div class="form-group" style="margin-bottom:12px">
@@ -16724,7 +16733,7 @@ function cronNextRunLabel(job) {
 function cronHealthLabel(status) {
   return ({paused:'Paused', running:'Checking now', no_match:'Checked — no match',
     match:'Match found', succeeded:'Completed', incomplete:'Check incomplete', delivery_failed:'Result delivery failed',
-    needs_attention:'Needs attention', waiting_for_approval:'Waiting for approval',
+    needs_attention:'Needs attention', delayed:'Check delayed', waiting_for_approval:'Waiting for approval',
     cancelled:'Stopped', not_checked:'Not checked yet'})[status?.state] || 'Not checked yet';
 }
 
@@ -16735,32 +16744,65 @@ function cronCheckTime(value) {
 }
 
 function cronHealthDetails(job) {
-  const status = job.tracker_status;
-  if (!status) return '';
+  const status = job.tracker_status || {};
+  const options = job.artifact_delivery_options || {};
+  const monitoring = options.doctor_monitoring_enabled ?? options.tracker_status_notifications ?? true;
+  const limit = options.doctor_streak_limit ?? 12;
   return `<div class="cron-meta cron-health" role="status">${escHtml(cronHealthLabel(status))}</div>
     <div class="cron-meta">Last attempt: ${escHtml(cronCheckTime(status.last_attempt_at))}<br>
     Last successful check: ${escHtml(cronCheckTime(status.last_success_at))}</div>
-    ${status.is_tracker ? `<div class="cron-meta">Past 24 hours: ${Number(status.successful_checks_24h) || 0} successful · ${Number(status.incomplete_checks_24h) || 0} incomplete</div>
-    <label class="cron-meta"><input type="checkbox" ${status.notifications_enabled ? 'checked' : ''}
-      onchange="toggleTrackerUpdates('${escHtml(job.id)}', this.checked)"> Daily summary and health notices</label>` : ''}`;
+    <div class="cron-meta">Past 24 hours: ${Number(status.successful_checks_24h) || 0} successful · ${Number(status.incomplete_checks_24h) || 0} incomplete</div>
+    <details class="cron-meta cron-doctor-settings"><summary>Doctor monitoring</summary>
+      <label for="cron-doctor-${job.id}"><input id="cron-doctor-${job.id}" type="checkbox" ${monitoring ? 'checked' : ''}> Monitor this scheduled task</label><br>
+      <label for="cron-limit-${job.id}">Notify after consecutive checks:</label>
+      <input id="cron-limit-${job.id}" type="number" min="1" max="1000" value="${Number(limit)}" style="width:75px">
+      <p>One notice for repeated failed checks${status.is_tracker ? ' or successful checks with no match' : ''}. Verified matches are still delivered immediately.</p>
+      <button class="btn-sm" onclick="saveCronDoctorSettings('${job.id}')">Save monitoring</button>
+      <span id="cron-doctor-message-${job.id}" role="status"></span>
+    </details>`;
 }
 
-async function toggleTrackerUpdates(id, enabled) {
+async function saveCronDoctorSettings(id) {
   const job = _cronsCache.find(j => j.id === id);
   if (!job) return;
+  const message = document.getElementById('cron-doctor-message-' + id);
+  const limitInput = document.getElementById('cron-limit-' + id);
+  if (!limitInput.reportValidity()) return;
+  const options = {...(job.artifact_delivery_options || {}),
+    doctor_monitoring_enabled:document.getElementById('cron-doctor-' + id).checked,
+    doctor_streak_limit:Number(limitInput.value)};
   try {
-    const r = await fetch('/api/crons/' + encodeURIComponent(id), {method:'PATCH',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({artifact_delivery_options:{
-        ...(job.artifact_delivery_options || {}), tracker_status_notifications:enabled}})});
-    const result = await r.json();
-    if (!result.ok) alert('Could not update tracker notifications.');
-  } catch(e) { alert('Could not update tracker notifications.'); }
-  await loadCronsTab();
+    const response = await fetch('/api/crons/' + encodeURIComponent(id), {method:'PATCH',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({artifact_delivery_options:options})});
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || 'Could not save monitoring.');
+    await loadCronsTab();
+    const updated = document.getElementById('cron-doctor-message-' + id);
+    if (updated) { updated.closest('details').open = true; updated.textContent = 'Saved'; }
+  } catch(error) { message.textContent = error.message || 'Could not save monitoring.'; }
+}
+
+async function saveCronParallelLimit() {
+  const input = document.getElementById('cron-parallel-limit');
+  const message = document.getElementById('cron-parallel-message');
+  if (!input.reportValidity()) return;
+  try {
+    const response = await fetch('/api/cron-scheduler',{method:'PUT',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({max_parallel_jobs:Number(input.value)})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not save parallel limit.');
+    await loadCronsTab(); message.textContent = 'Saved';
+  } catch(error) { message.textContent = error.message || 'Could not save parallel limit.'; }
 }
 
 async function loadCronsTab() {
   try {
-    const jobs = await fetch('/api/crons').then(r => r.json());
+    const [jobs,capacity] = await Promise.all([
+      fetch('/api/crons').then(r => r.json()),fetch('/api/cron-scheduler').then(r => r.json())]);
+    const limit = document.getElementById('cron-parallel-limit');
+    if (limit) { limit.value = capacity.max_parallel_jobs; limit.disabled = false; }
+    const capacityState = document.getElementById('cron-capacity-state');
+    if (capacityState) capacityState.textContent = `${capacity.running_jobs} running · limit ${capacity.max_parallel_jobs}`;
     _cronsCache = jobs;
     populateCronWorkspaceFilter(jobs);
     renderCronsTab(jobs);
@@ -16817,6 +16859,7 @@ function renderCronsTab(jobs) {
           ${j.last_run ? '&nbsp;·&nbsp; last ' + new Date(j.last_run).toLocaleString() : ''}
           ${!j.tracker_status && j.last_result && j.last_result !== 'ok' ? `${NI.warn()} ${escHtml(j.last_result)}` : ''}
         </div>
+        ${j.scheduler_status === 'waiting_for_capacity' ? '<div class="cron-meta">Waiting for a worker</div>' : j.scheduler_status === 'running' ? '<div class="cron-meta">Running now</div>' : ''}
         ${cronHealthDetails(j)}
         <div class="cron-meta">Delivery: ${escHtml(cronDeliveryLabel(j))}</div>
         <div class="cron-meta cron-task">${escHtml(j.task.slice(0, 120))}${j.task.length > 120 ? '…' : ''}</div>
@@ -22216,17 +22259,17 @@ def create_app(runtime, orchestrator, registry):
             from nullion.cron_delivery import cron_conversation_id
             from nullion.tracker_status import _label
             conv_id = cron_conversation_id(job, channel, target)
-            display_job = replace(job, name="Your trackers" if kind == "daily" else _label(job.name))
+            display_job = replace(job, name=_label(job.name))
             if channel == "web":
-                delivered = _save_cron_web_delivery(display_job, conv_id, text, [], {"tracker_notice_kind": kind}, run_label="Tracker update", message_only=True)
+                delivered = _save_cron_web_delivery(display_job, conv_id, text, [], {"tracker_notice_kind": kind}, run_label="Doctor", message_only=True)
             else:
-                delivered = _send_cron_platform_delivery(display_job, channel, target, text, run_label="Tracker update", message_only=True)
+                delivered = _send_cron_platform_delivery(display_job, channel, target, text, run_label="Doctor", message_only=True)
             if delivered:
                 if channel != "web":
                     try:
                         from nullion.chat_store import get_chat_store
-                        get_chat_store().save_message(conv_id, "bot", scheduled_task_delivery_text(display_job, text, run_label="Tracker update"),
-                                                      metadata={"source": "tracker_status", "notification_kind": kind})
+                        get_chat_store().save_message(conv_id, "bot", scheduled_task_delivery_text(display_job, text, run_label="Doctor"),
+                                                      metadata={"source": "doctor_cron_monitor", "notification_kind": kind})
                     except Exception:
                         logger.warning("Could not save tracker notification history", exc_info=True)
                 _record_cron_delivery_event("cron.tracker_status.sent", job, channel, target, conv_id, notification_kind=kind)
@@ -22236,11 +22279,13 @@ def create_app(runtime, orchestrator, registry):
                     logger.warning("Could not checkpoint tracker notification receipt", exc_info=True)
             return delivered
 
+        from nullion.doctor_crons import sync_cron_doctor_action
         return dispatch_tracker_updates(tracker_health_path, jobs, resolve_route=route, send=send, now=now,
-                                        current_jobs=lambda: load_crons(refresh_next_runs=False))
+            current_jobs=lambda: load_crons(refresh_next_runs=False),
+            observe=lambda job,facts,notice,scope: sync_cron_doctor_action(runtime,job,facts,notice,scope=scope))
 
     app.state.tracker_status_tick = _tracker_status_tick
-    _cron_scheduler = CronScheduler(fire_fn=_cron_fire, status_fn=_tracker_status_tick)
+    _cron_scheduler = CronScheduler(fire_fn=_cron_fire, status_fn=_tracker_status_tick,store_path=tracker_health_path)
     _cron_scheduler.start()
     app.router.on_shutdown.append(_cron_scheduler.stop)
 
@@ -22435,6 +22480,23 @@ def create_app(runtime, orchestrator, registry):
 
     # ── Cron REST endpoints ────────────────────────────────────────────────────
 
+    app.state.cron_scheduler = _cron_scheduler
+
+    @app.get("/api/cron-scheduler")
+    async def cron_scheduler_settings():
+        return JSONResponse(_cron_scheduler.snapshot())
+
+    @app.put("/api/cron-scheduler")
+    async def update_cron_scheduler_settings(request: Request):
+        try:
+            body = await request.json()
+            if set(body) != {"max_parallel_jobs"}:
+                raise ValueError("Provide max_parallel_jobs only")
+            _cron_scheduler.set_max_parallel_jobs(body["max_parallel_jobs"])
+            return JSONResponse(_cron_scheduler.snapshot())
+        except (ValueError,TypeError) as exc:
+            return JSONResponse({"ok":False,"error":str(exc)},status_code=400)
+
     @app.get("/api/crons")
     async def list_crons_endpoint():
         from nullion.crons import cron_display_fields, cron_display_timezone, load_crons
@@ -22444,8 +22506,10 @@ def create_app(runtime, orchestrator, registry):
         cron_tz = cron_display_timezone()
         jobs = load_crons()
         health = tracker_statuses(tracker_health_path, jobs)
+        scheduling = _cron_scheduler.snapshot(jobs)
         for job in jobs:
             item = job.to_dict()
+            item["scheduler_status"] = scheduling["jobs"].get(job.id,"scheduled")
             item.update(cron_display_fields(job, tz=cron_tz))
             if job.id in health:
                 item["tracker_status"] = health[job.id]
@@ -22488,6 +22552,8 @@ def create_app(runtime, orchestrator, registry):
                 artifact_delivery_options=artifact_delivery_options,
             )
             return JSONResponse({"ok": True, "job": job.to_dict()})
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -22512,6 +22578,8 @@ def create_app(runtime, orchestrator, registry):
             if job is None:
                 return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
             return JSONResponse({"ok": True, "job": job.to_dict()})
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
