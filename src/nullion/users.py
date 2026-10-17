@@ -380,33 +380,6 @@ def registered_workspace_ids(*, settings: NullionSettings | None = None) -> tupl
     return tuple(dict.fromkeys(workspace_id for workspace_id in ids if workspace_id))
 
 
-def format_workspace_registry_for_prompt(*, settings: NullionSettings | None = None) -> str | None:
-    """Return structured workspace records for chat/tool planning.
-
-    This is intentionally a registry dump, not prompt parsing. Agents may use
-    these concrete IDs and display names as runtime evidence, but should not
-    create new workspace identities from free-form user text.
-    """
-
-    registry = load_user_registry(settings=settings)
-    records: list[str] = []
-    for user in registry.users:
-        if not user.active and user.role != "admin":
-            continue
-        workspace_id = workspace_id_for_user(user)
-        records.append(
-            f"- workspace_id={workspace_id}; display_name={user.display_name}; "
-            f"user_id={user.user_id}; role={user.role}"
-        )
-    if not records:
-        return None
-    return (
-        "Known workspace registry:\n"
-        + "\n".join(records)
-        + "\nUse only these workspace_id values for cross-workspace actions. "
-        "If a requested person or workspace is not listed, ask for clarification "
-        "instead of creating a new workspace, user, folder, or workspace_id from chat text."
-    )
 
 
 def messaging_delivery_targets_for_workspace(

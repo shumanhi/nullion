@@ -414,10 +414,15 @@ def filter_source_artifact_paths(paths: Iterable[str], tool_results: Iterable[ob
     """Explicit source/intermediate roles survive prose and raw path forwarding."""
     blocked: set[str] = set()
     deliverable: set[str] = set()
+    excluded_extensions: set[str] = set()
     def identity(path: str) -> str:
         return str(Path(path).expanduser().resolve())
     for result in tool_results or ():
         output = result.get("output") if isinstance(result, dict) else getattr(result, "output", None)
+        name = result.get("tool_name") if isinstance(result, dict) else getattr(result, "tool_name", None)
+        status = result.get("status") if isinstance(result, dict) else getattr(result, "status", None)
+        if name == "request_tool_scope" and status == "completed" and isinstance(output, dict):
+            excluded_extensions.update(normalize_artifact_extensions(output.get("excluded_artifact_extensions") or ()))
         if not output_has_artifact_descriptors(output):
             continue
         for descriptor in output["artifact_descriptors"]:
@@ -429,7 +434,8 @@ def filter_source_artifact_paths(paths: Iterable[str], tool_results: Iterable[ob
             elif role in {ARTIFACT_ROLE_SOURCE, ARTIFACT_ROLE_INTERMEDIATE}:
                 blocked.add(identity(descriptor["path"]))
     blocked.difference_update(deliverable)
-    return [path for path in paths if identity(path) not in blocked]
+    return [path for path in paths if identity(path) not in blocked
+            and (".html" if Path(path).suffix.lower() == ".htm" else Path(path).suffix.lower()) not in excluded_extensions]
 
 def promote_supporting_asset_artifact_paths(
     artifact_paths: list[str] | tuple[str, ...] | None,

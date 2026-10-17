@@ -38,8 +38,8 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
         index = item.get('source_index')
         source = dict(sources[index]) if isinstance(index, int) and 0 <= index < len(sources) and isinstance(sources[index], Mapping) else {}
         source.update({key: item[key] for key in ('source_url', 'evidence_path', 'captured_at') if key in item})
-        if source.get('source_url') == compact.get('page_url'):
-            source.pop('source_url')
+        if source.get('source_url') and source.get('source_url') == compact.get('page_url'):
+            source.pop('source_url', None)
             source['page_url_ref'] = True
         identity = json.dumps(source, ensure_ascii=False, sort_keys=True, default=str)
         source_index = identities.get(identity, len(compact['sources']))
@@ -173,7 +173,8 @@ def source_answer_tool_definition(context: dict) -> dict:
         'detail_ids must belong to that item, never a different product or entity. Explain useful distinctions with '
         'short supporting excerpts selected by their detail_ids; never rewrite the excerpt text or invent claims, rankings, or applicability. '
         'The intro is a short transition, not an uncited factual claim. Select only limitations that '
-        'materially affect the answer; do not append every unavailable field. No further tool work is needed.',
+        'materially affect the answer; do not append every unavailable field. This composes a draft; '
+        'it does not certify that required source checks or requested actions completed.',
         'input_schema': {'type': 'object', 'additionalProperties': False,
             'properties': {'intro': {'type': 'string', 'maxLength': 350},
                 'points': {'type': 'array', 'minItems': 1, 'maxItems': 20, 'items': {

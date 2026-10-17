@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -627,12 +627,46 @@ def install_skill_pack(
 ) -> InstalledSkillPack:
     normalized_id = normalize_pack_id(pack_id) if pack_id else derive_pack_id_from_source(source)
     destination = skill_pack_path(normalized_id, root=root)
-    if destination.exists() and not force:
-        raise FileExistsError(f"skill pack already installed: {normalized_id}")
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    from nullion.entrypoint_guard import SingleInstanceLock
 
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    lock = SingleInstanceLock("skill-pack-" + sha256(str(destination.resolve()).encode()).hexdigest(),
+                              lock_dir=(root or default_skill_pack_root()) / ".locks")
+    if not lock.acquire():
+        raise RuntimeError("This skill pack is already being installed.")
+    previous = destination.with_name("." + destination.name + ".previous")
+    try:
+        # A process interrupted between renames leaves a recoverable old pack.
+        if previous.exists() and not destination.exists():
+            previous.replace(destination)
+        if destination.exists() and not force:
+            raise FileExistsError(f"skill pack already installed: {normalized_id}")
+        with tempfile.TemporaryDirectory(prefix=".install-", dir=destination.parent) as staging:
+            candidate = Path(staging) / "pack"
+            pack = _install_skill_pack_candidate(source, normalized_id, candidate)
+            if previous.exists():
+                shutil.rmtree(previous)
+            if destination.exists():
+                destination.replace(previous)
+            try:
+                candidate.replace(destination)
+            except BaseException:
+                if previous.exists() and not destination.exists():
+                    previous.replace(destination)
+                raise
+            if previous.exists():
+                shutil.rmtree(previous, ignore_errors=True)
+        try:
+            from nullion import runtime_cache
+            runtime_cache.invalidate_prefix("stable_context")
+        except Exception:
+            logger.debug("Could not invalidate stable context cache after skill pack install", exc_info=True)
+        return replace(pack, path=str(destination))
+    finally:
+        lock.release()
+
+
+def _install_skill_pack_candidate(source: str, normalized_id: str, destination: Path) -> InstalledSkillPack:
     raw_source = source.strip()
     github_source = _parse_github_source_url(raw_source)
     if github_source is not None:
@@ -661,12 +695,6 @@ def install_skill_pack(
         "warnings": warnings,
     }
     (destination / "nullion-skill-pack.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    try:
-        from nullion import runtime_cache
-
-        runtime_cache.invalidate_prefix("stable_context")
-    except Exception:
-        logger.debug("Could not invalidate stable context cache after skill pack install", exc_info=True)
     return InstalledSkillPack(
         pack_id=normalized_id,
         source=raw_source,

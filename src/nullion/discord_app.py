@@ -653,6 +653,9 @@ async def run_discord_app(
     class NullionDiscordClient(discord.Client):
         async def on_ready(self) -> None:
             logger.info("Nullion Discord adapter connected as %s", self.user)
+            if not hasattr(self, "_nullion_delivery_recovery_task") and hasattr(service.agent_orchestrator, "run_delivery_recovery"):
+                self._nullion_delivery_recovery_task = asyncio.create_task(
+                    service.agent_orchestrator.run_delivery_recovery(service.runtime, surface="discord"))
             if not hasattr(self, "_nullion_reminder_task"):
                 from nullion.reminder_delivery import run_reminder_delivery_loop
 
@@ -728,7 +731,7 @@ async def run_discord_app(
             if path.exists() and path.is_file():
                 await _send_discord_reply_file(channel, path=path, content="Attached the requested file.")
             else:
-                await _send_discord_chunks_with_plain_fallback(channel, text, limit=1900)
+                return False
         else:
             await _send_discord_chunks_with_plain_fallback(channel, text, limit=1900)
         return True
@@ -751,6 +754,10 @@ async def run_discord_app(
             "Discord Developer Portal > your application > Bot > Privileged Gateway Intents, then restart Discord."
         ) from exc
     finally:
+        recovery = getattr(client, "_nullion_delivery_recovery_task", None)
+        if recovery is not None:
+            recovery.cancel()
+            await asyncio.gather(recovery, return_exceptions=True)
         reminder_task = getattr(client, "_nullion_reminder_task", None)
         if reminder_task is not None:
             reminder_task.cancel()

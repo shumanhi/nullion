@@ -772,10 +772,15 @@ async def run_slack_app(
     reminder_task = asyncio.create_task(
         run_reminder_delivery_loop(service.runtime, send=_send_slack_reminder, settings=settings)
     )
+    recovery_task = (asyncio.create_task(service.agent_orchestrator.run_delivery_recovery(service.runtime, surface="slack"))
+                     if hasattr(service.agent_orchestrator, "run_delivery_recovery") else None)
     try:
         await AsyncSocketModeHandler(app, app_token).start_async()
     finally:
         reminder_task.cancel()
+        if recovery_task is not None:
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
 
 
 def main(

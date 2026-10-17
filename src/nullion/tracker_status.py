@@ -43,7 +43,20 @@ def is_tracker(job: object) -> bool:
 
 def notifications_enabled(job: object) -> bool:
     options = getattr(job, "artifact_delivery_options", {})
-    return is_tracker(job) and options.get("tracker_status_notifications", True) is not False
+    return isinstance(options, dict) and options.get("doctor_monitoring_enabled", options.get("tracker_status_notifications", True)) is not False
+
+
+def health_notifications_enabled(job: object) -> bool:
+    return notifications_enabled(job)
+
+
+def _streak_limit(job: object) -> int:
+    value = (getattr(job, "artifact_delivery_options", {}) or {}).get("doctor_streak_limit", 12)
+    return value if type(value) is int and 1 <= value <= 1000 else 12
+
+
+def _route_scope(route: tuple[str, str, str]) -> str:
+    return "recipient:" + hashlib.sha256(json.dumps(route).encode()).hexdigest()
 
 
 def _scope(job: object) -> str:
@@ -52,7 +65,7 @@ def _scope(job: object) -> str:
                   ("id", "workspace_id", "task", "delivery_channel", "delivery_target")}
     descriptor["tracker"] = is_tracker(job)
     descriptor["requirements"] = {k: v for k, v in (getattr(job, "artifact_delivery_options", {}) or {}).items()
-                                  if k != "tracker_status_notifications"}
+                                  if k not in {"tracker_status_notifications", "tracker_health_notifications", "doctor_monitoring_enabled", "doctor_streak_limit"}}
     return hashlib.sha256(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()
 
 
@@ -66,6 +79,7 @@ def _db(path: Path, *, write: bool = True):
         conn.execute("CREATE INDEX IF NOT EXISTS cron_tracker_runs_scope_time ON cron_tracker_runs(scope, started_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS cron_tracker_runs_scope_finished ON cron_tracker_runs(scope, finished_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS cron_tracker_runs_started ON cron_tracker_runs(started_at)")
+        conn.execute("CREATE TABLE IF NOT EXISTS cron_tracker_owners (run_id TEXT PRIMARY KEY, cron_id TEXT NOT NULL, lease_token TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS cron_tracker_state (scope TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS cron_tracker_notices (notice_key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         conn.commit()
@@ -100,6 +114,10 @@ def start_check(path: Path, job: object, run_id: str, *, now: datetime | None = 
     now = _utc(now)
     with _db(path) as conn:
         conn.execute("INSERT OR IGNORE INTO cron_tracker_runs VALUES (?,?,?,NULL,'running')", (run_id, _scope(job), now.isoformat()))
+        from nullion.cron_scheduler_state import current_execution_token
+        token = current_execution_token()
+        if token:
+            conn.execute("INSERT OR IGNORE INTO cron_tracker_owners VALUES (?,?,?)", (run_id, str(job.id), token))
 
 
 def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: datetime | None = None) -> None:
@@ -133,6 +151,14 @@ def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: dat
         # Concurrent manual/automatic checks must not overwrite a newer attempt.
         if row["started_at"] >= str(state.get("last_attempt_at") or ""):
             state.update(last_attempt_at=row["started_at"], last_finished_at=now.isoformat(), outcome=status)
+            if status == "no_match":
+                state["consecutive_no_matches"] = int(state.get("consecutive_no_matches", 0)) + 1
+                state["no_match_since"] = state.get("no_match_since") or row["started_at"]
+            else:
+                state.update(consecutive_no_matches=0, no_match_since=None)
+            state["last_issue"] = ("model_timeout" if result.get("reason") == "cron_run_model_timeout" else
+                "source_unverified" if result.get("cron_source_verification_required") is True and result.get("cron_source_verification_satisfied") is not True else
+                "delivery_failed" if status == "delivery_failed" else "incomplete" if status == "incomplete" else None)
             if status in SUCCESS:
                 state.update(last_success_at=now.isoformat(), consecutive_failures=0, failure_since=None)
             elif status in {"incomplete", "delivery_failed"}:
@@ -143,8 +169,55 @@ def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: dat
             else:
                 state.update(consecutive_failures=0, failure_since=None)
             _save(conn, scope, state)
-        # Keep bounded run history; the compact last-success state survives.
-        conn.execute("DELETE FROM cron_tracker_runs WHERE started_at<?", ((now - timedelta(days=30)).isoformat(),))
+        # Count completed runs in start order, including late completions. Keep
+        # the latest 1000 per scope so sparse schedules aren't cut off at 30 days.
+        history = conn.execute("SELECT status,started_at FROM cron_tracker_runs WHERE scope=? AND finished_at IS NOT NULL ORDER BY started_at DESC,run_id DESC LIMIT 1000", (scope,)).fetchall()
+        for field, anchor, outcomes in (("consecutive_no_matches", "no_match_since", {"no_match"}),
+                                        ("consecutive_failures", "failure_since", {"incomplete", "delivery_failed", "interrupted"})):
+            count = 0
+            since = None
+            for item in history:
+                if item["status"] not in outcomes:
+                    break
+                count += 1
+                since = item["started_at"]
+            previous_count = int(state.get(field, 0))
+            if count and previous_count and count >= previous_count and state.get(anchor):
+                since = state[anchor]
+            state[field] = count
+            state[anchor] = since
+        _save(conn,scope,state)
+        conn.execute("DELETE FROM cron_tracker_runs WHERE scope=? AND finished_at IS NOT NULL AND run_id NOT IN (SELECT run_id FROM cron_tracker_runs WHERE scope=? ORDER BY started_at DESC,run_id DESC LIMIT 1000)", (scope,scope))
+
+
+def _reconcile_interrupted_checks(conn: sqlite3.Connection, job: object, now: datetime) -> None:
+    scope = _scope(job)
+    rows = conn.execute("""SELECT r.run_id,r.started_at,o.cron_id,o.lease_token FROM cron_tracker_runs r
+        LEFT JOIN cron_tracker_owners o ON r.run_id=o.run_id
+        WHERE r.scope=? AND r.finished_at IS NULL ORDER BY r.started_at""", (scope,)).fetchall()
+    leases_exist = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_execution_leases'").fetchone()
+    state = _state(conn, scope)
+    changed = False
+    for row in rows:
+        if row["lease_token"]:
+            active = leases_exist and conn.execute(
+                "SELECT 1 FROM cron_execution_leases WHERE cron_id=? AND token=? AND expires_at>?",
+                (row["cron_id"], row["lease_token"], now.isoformat())).fetchone()
+            if active:
+                continue
+        elif now - _date(row["started_at"]) < MISSED_CHECK_GRACE:
+            # Legacy/manual fixtures without ownership get a bounded startup grace.
+            continue
+        conn.execute("UPDATE cron_tracker_runs SET status='interrupted',finished_at=? WHERE run_id=? AND finished_at IS NULL",
+                     (now.isoformat(), row["run_id"]))
+        changed = True
+        if row["started_at"] >= str(state.get("last_attempt_at") or ""):
+            state.update(last_attempt_at=row["started_at"], last_finished_at=now.isoformat(), outcome="interrupted",
+                         last_issue="interrupted", consecutive_no_matches=0, no_match_since=None,
+                         consecutive_failures=int(state.get("consecutive_failures", 0)) + 1,
+                         failure_since=state.get("failure_since") or row["started_at"])
+    if changed:
+        _save(conn, scope, state)
 
 
 def _status(conn: sqlite3.Connection, job: object, now: datetime) -> dict:
@@ -164,20 +237,30 @@ def _status(conn: sqlite3.Connection, job: object, now: datetime) -> dict:
         health = "paused"
     elif state.get("outcome") == "waiting_for_approval" and not running:
         health = "waiting_for_approval"
-    elif overdue or int(state.get("consecutive_failures", 0)) >= 3:
-        health = "needs_attention"
     elif running:
+        # Elapsed time is not evidence that an active source check failed.
         health = "running"
+    elif int(state.get("consecutive_failures", 0)) >= _streak_limit(job):
+        health = "needs_attention"
+    elif overdue:
+        # A due occurrence can be waiting behind another scheduled job.
+        # Keep the delay observable without turning it into a failure episode.
+        health = "delayed"
     else:
         health = str(state.get("outcome") or "not_checked")
     return {"is_tracker": is_tracker(job), "notifications_enabled": notifications_enabled(job),
+            "health_notifications_enabled": health_notifications_enabled(job),
+            "doctor_streak_limit": _streak_limit(job),
             "state": health, "last_attempt_at": last_attempt,
             "last_success_at": state.get("last_success_at"),
             "next_check_at": getattr(job, "next_run", None) if getattr(job, "enabled", False) else None,
             "successful_checks_24h": sum(counts.get(s, 0) for s in SUCCESS),
             "no_match_checks_24h": counts.get("no_match", 0), "matches_24h": counts.get("match", 0),
-            "incomplete_checks_24h": counts.get("incomplete", 0) + counts.get("delivery_failed", 0),
+            "incomplete_checks_24h": sum(counts.get(status, 0) for status in ("incomplete", "delivery_failed", "interrupted")),
             "consecutive_failures": int(state.get("consecutive_failures", 0)),
+            "consecutive_no_matches": int(state.get("consecutive_no_matches", 0)),
+            "no_match_since": state.get("no_match_since"), "failure_since": state.get("failure_since"),
+            "last_issue": state.get("last_issue"),
             "overdue": bool(overdue), "last_outcome": state.get("outcome")}
 
 
@@ -186,7 +269,9 @@ def tracker_statuses(path: Path | None, jobs: Iterable[object], *, now: datetime
     jobs = tuple(jobs)
     if not jobs or path is None:
         return {}
-    with _db(path, write=False) as conn:
+    with _db(path) as conn:
+        for job in jobs:
+            _reconcile_interrupted_checks(conn, job, _utc(now))
         return {str(job.id): _status(conn, job, _utc(now)) for job in jobs}
 
 
@@ -213,34 +298,7 @@ def _time(value: object, job: object) -> str:
 
 def _details(job: object, status: dict) -> str:
     return (f"Last successful check: {_time(status['last_success_at'], job)}\n"
-            f"Next check: {_time(status['next_check_at'], job)}")
-
-
-def _summary_line(job: object, status: dict) -> str:
-    state = status["state"]
-    if state == "needs_attention":
-        explanation = "Needs attention — checks are overdue." if status["overdue"] else "Needs attention — repeated checks could not verify the result."
-    elif state == "running":
-        explanation = "Checking now."
-    elif state == "delivery_failed":
-        explanation = "Latest result could not be delivered."
-    elif state == "incomplete":
-        explanation = "Latest check could not verify the result."
-    elif state == "waiting_for_approval":
-        explanation = "Waiting for your approval."
-    elif state == "cancelled":
-        explanation = "Latest check was stopped."
-    elif state == "not_checked":
-        explanation = "Waiting for the first recorded check."
-    elif status["matches_24h"]:
-        explanation = f"Active — {status['matches_24h']} verified matching check(s) in the past 24 hours."
-    elif status["no_match_checks_24h"]:
-        explanation = "Active — no verified matches in the successful checks."
-    else:
-        explanation = "Active — no new successful checks in the past 24 hours."
-    return (f"Tracker: {_label(job.name)}\n{explanation}\n"
-            f"Past 24 hours: {status['successful_checks_24h']} successful, {status['incomplete_checks_24h']} incomplete.\n"
-            + _details(job, status))
+            f"{'Scheduled check' if status['overdue'] else 'Next check'}: {_time(status['next_check_at'], job)}")
 
 
 def _claim(conn: sqlite3.Connection, key: str, now: datetime) -> bool:
@@ -257,16 +315,25 @@ def dispatch_tracker_updates(path: Path | None, jobs: Iterable[object], *,
                              resolve_route: Callable[[object], tuple[str, str]],
                              send: Callable[[object, str, str, str, str], bool],
                              current_jobs: Callable[[], Iterable[object]] | None = None,
-                             now: datetime | None = None) -> int:
-    """Claim and deliver one daily digest per workspace/recipient plus transitions.
+                             now: datetime | None = None,
+                             observe: Callable | None = None) -> int:
+    """Deliver one Doctor notice per completed 12-run streak; never daily digests.
 
     Failed deliveries retry after five minutes. Claims prevent concurrent sends;
     an interrupted remote send can be retried because platforms offer no shared
-    exactly-once receipt. A delivered warning is the prerequisite for recovery.
+    exactly-once receipt. Recovery resets the incident without sending a notice.
     """
     now = _utc(now)
-    jobs = tuple(j for j in jobs if getattr(j, "enabled", False) and notifications_enabled(j))
-    if not jobs or path is None:
+    all_jobs = tuple(jobs)
+    if path is None:
+        return 0
+    inactive = tuple(j for j in all_jobs if not getattr(j,"enabled",False) or not notifications_enabled(j))
+    if observe is not None and inactive:
+        facts = tracker_statuses(path,inactive,now=now)
+        for job in inactive:
+            observe(job,facts[job.id],None,_scope(job))
+    jobs = tuple(j for j in all_jobs if getattr(j,"enabled",False) and notifications_enabled(j))
+    if not jobs:
         return 0
     groups = defaultdict(list)
     for job in jobs:
@@ -274,62 +341,44 @@ def dispatch_tracker_updates(path: Path | None, jobs: Iterable[object], *,
         if channel and target:
             groups[(str(job.workspace_id), channel, target)].append(job)
     pending = []
+    observations = []
     with _db(path) as conn:
         for route, group in groups.items():
+            for job in group:
+                _reconcile_interrupted_checks(conn, job, now)
             statuses = {j.id: _status(conn, j, now) for j in group}
             for job in group:
+                from nullion.doctor_crons import cron_notice
+                from nullion.crons import cron_display_fields
                 status = statuses[job.id]
                 scope = _scope(job)
-                state = _state(conn, scope)
-                notification_scope = scope + ":route:" + hashlib.sha256(json.dumps(route).encode()).hexdigest()
-                notification_state = _state(conn, notification_scope)
-                kind = None
-                if status["state"] == "needs_attention" and not notification_state.get("warning_sent_at"):
-                    kind = "warning"
-                    anchor = state.get("failure_since") or status["last_attempt_at"] or job.next_run
-                    text = f"Tracker needs attention: {_label(job.name)}\n\n"
-                    text += ("A scheduled check is overdue. The monitored condition is not confirmed." if status["overdue"] else
-                             "The latest result could not be delivered." if status["last_outcome"] == "delivery_failed" else
-                             f"The last {status['consecutive_failures']} checks could not verify the result.")
-                elif notification_state.get("warning_sent_at") and status["state"] in SUCCESS:
-                    kind = "recovery"
-                    anchor = notification_state["warning_sent_at"]
-                    text = f"Tracker recovered: {_label(job.name)}\n\nThe latest check completed successfully."
-                    text += " No verified match was found." if status["state"] == "no_match" else ""
-                if kind:
-                    key = f"{notification_scope}:{kind}:{anchor}"
-                    if _claim(conn, key, now):
-                        pending.append((key, notification_scope, kind, job, route, text + "\n\n" + _details(job, status)))
-            group_key = "daily:" + hashlib.sha256(json.dumps(route).encode()).hexdigest()
-            state = _state(conn, group_key)
-            if not state.get("daily_since"):
-                state["daily_since"] = now.isoformat()
-                _save(conn, group_key, state)
-            elif now - _date(state["daily_since"]) >= DAY:
-                key = group_key + ":" + state["daily_since"]
-                if _claim(conn, key, now):
-                    text = "Daily tracker summary\n\n" + "\n\n".join(_summary_line(j, statuses[j.id]) for j in group)
-                    pending.append((key, group_key, "daily", group[0], route, text))
+                notice = cron_notice(job, status, label=_label(job.name),
+                    schedule=cron_display_fields(job)["schedule_description"],
+                    last_success=_time(status["last_success_at"],job), next_check=_time(status["next_check_at"],job))
+                observations.append((job,status,notice,scope))
+                if notice and health_notifications_enabled(job):
+                    key = f"{scope}:{_route_scope(route)}:doctor:{notice.kind}:{notice.episode}"
+                    if _claim(conn,key,now):
+                        pending.append((key,scope,notice.kind,job,route,notice.message))
+    if observe is not None:
+        for observation in observations:
+            observe(*observation)
     sent = 0
     for key, scope, kind, job, route, text in pending:
         if current_jobs is not None:
             current = tuple(j for j in current_jobs() if getattr(j, "enabled", False) and notifications_enabled(j)
                             and (str(j.workspace_id), *resolve_route(j)) == route)
-            if kind == "daily":
-                if not current:
-                    continue
-                job = current[0]
-                with _db(path, write=False) as conn:
-                    text = "Daily tracker summary\n\n" + "\n\n".join(_summary_line(j, _status(conn, j, now)) for j in current)
-            elif not any(_scope(j) == _scope(job) for j in current):
+            latest_job = next((j for j in current if _scope(j) == _scope(job)), None)
+            if latest_job is None:
                 continue
-        if kind != "daily":
-            with _db(path, write=False) as conn:
-                latest = _status(conn, job, now)
-            if kind == "warning" and latest["state"] != "needs_attention":
-                continue
-            if kind == "recovery" and latest["state"] not in SUCCESS:
-                continue
+            job = latest_job
+        if not health_notifications_enabled(job):
+            continue
+        with _db(path,write=False) as conn:
+            latest = _status(conn,job,now)
+        limit = _streak_limit(job)
+        if latest["state"] == "running" or (kind == "failure" and latest["consecutive_failures"] < limit) or (kind == "no_match" and latest["consecutive_no_matches"] < limit):
+            continue
         try:
             delivered = send(job, route[1], route[2], text, kind) is True
         except Exception:
@@ -338,11 +387,5 @@ def dispatch_tracker_updates(path: Path | None, jobs: Iterable[object], *,
         if delivered:
             with _db(path) as conn:
                 conn.execute("UPDATE cron_tracker_notices SET payload=? WHERE notice_key=?", (json.dumps({"sent_at": now.isoformat()}), key))
-                state = _state(conn, scope)
-                if kind == "daily":
-                    state["daily_since"] = now.isoformat()
-                else:
-                    state["warning_sent_at"] = now.isoformat() if kind == "warning" else None
-                _save(conn, scope, state)
             sent += 1
     return sent

@@ -14,6 +14,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -34,7 +35,7 @@ from nullion.artifacts import (
     media_candidate_paths_from_text,
 )
 from nullion.attachment_format_graph import is_domain_suffix_extension, plan_attachment_format
-from nullion.delegated_artifact_workflow import finalize_delegated_artifacts
+from nullion.delegated_artifact_workflow import finalize_delegated_artifacts, unresolved_group_tasks
 from nullion.mini_agent_runner import ProgressUpdate
 from nullion.task_queue import TaskGroup, TaskRecord, TaskRegistry, TaskStatus
 from nullion.task_status_format import format_task_status_line, format_task_status_summary
@@ -115,6 +116,7 @@ class ResultAggregator:
         task_registry: TaskRegistry,
         model_client: Any | None = None,
         min_progress_interval_s: float = MIN_PROGRESS_INTERVAL_S,
+        outbox_path: Path | None = None,
     ) -> None:
         self._deliver_fn = deliver_fn
         self._registry = task_registry
@@ -122,13 +124,21 @@ class ResultAggregator:
         self._min_interval = min_progress_interval_s
         self._group_state: dict[str, GroupState] = {}
         self._completed_groups: set[str] = set()
+        from nullion.delivery_outbox import DeliveryOutbox
+        self._outbox = DeliveryOutbox(outbox_path)
+        self._delivery_locks: dict[str, asyncio.Lock] = {}
+        self._completion_locks: dict[str, asyncio.Lock] = {}
 
     async def run(self, progress_queue: asyncio.Queue) -> None:
         """Drain the queue forever. Call as a background asyncio task."""
         while True:
             try:
-                update: ProgressUpdate = await progress_queue.get()
-                await self._handle(update)
+                try:
+                    update: ProgressUpdate = await asyncio.wait_for(progress_queue.get(), timeout=5)
+                except asyncio.TimeoutError:
+                    await self.retry_pending_deliveries()
+                else:
+                    await self._handle(update)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -226,17 +236,33 @@ class ResultAggregator:
             gs.task_summary_visible = True
 
     async def _on_group_complete(self, gs: GroupState, group: TaskGroup) -> None:
-        """All tasks terminal — generate and deliver the final summary."""
+        lock = self._completion_locks.setdefault(group.group_id, asyncio.Lock())
+        async with lock:
+            await self._prepare_completed_group_delivery(gs, group)
+
+    async def _prepare_completed_group_delivery(self, gs: GroupState, group: TaskGroup) -> None:
+        """All tasks terminal — plan delivery once, then retry receipts only."""
         if group.group_id in self._completed_groups:
             return
-        self._completed_groups.add(group.group_id)
-        await self._deliver_status(gs, group, terminal=True)
+        if self._outbox.get(group.group_id) is not None:
+            await self._deliver_outbox(group.group_id, group=group)
+            return
         recovered_artifacts = finalize_delegated_artifacts(group)
-        preverified_artifacts = _artifact_paths_for_group_delivery(
-            group,
-            recovered_artifacts,
-            summary=None,
-        )
+        preverified_artifacts = _artifact_paths_for_group_delivery(group, recovered_artifacts, summary=None)
+        from nullion.artifact_validation import validate_artifact_paths
+        receipt_artifacts = preverified_artifacts if preverified_artifacts and validate_artifact_paths(preverified_artifacts).ok else []
+        unresolved = unresolved_group_tasks(group, recovered_artifacts, receipt_artifacts)
+        await self._deliver_status(gs, group, terminal=True,
+            status_line_overrides={task.task_id: format_task_status_line(task) for task in unresolved} or None)
+        if unresolved:
+            summary = self._fallback_summary(group, include_findings=False)
+            requested_extension = _requested_attachment_extension_for_group(group, model_client=self._model_client)
+            if requested_extension:
+                summary = _merge_missing_requested_artifact_summary(group, summary,
+                    requested_extension=requested_extension)
+            self._queue_delivery(group, summary + " No report was published.", [], work_complete=False)
+            await self._deliver_outbox(group.group_id, group=group)
+            return
         summary = (
             _artifact_recovery_summary(group, recovered_artifacts)
             if recovered_artifacts
@@ -260,28 +286,62 @@ class ResultAggregator:
         summary = _strip_attached_artifact_references(summary, deliverable_artifacts)
         if not deliverable_artifacts:
             summary = _strip_unverified_attachment_claims(summary)
-        await self._deliver(
-            gs.conversation_id,
-            _summary_with_original_request_context(group, summary),
-            group_id=gs.group_id,
-        )
+        self._queue_delivery(group, summary, deliverable_artifacts,
+                             work_complete=not (requested_extension and not deliverable_artifacts))
+        await self._deliver_outbox(group.group_id, group=group)
 
-        # Deliver any artifacts.
-        delivered_artifacts: list[str] = []
-        for artifact in deliverable_artifacts:
-            delivered = await self._deliver(gs.conversation_id, artifact, is_artifact=True, group_id=gs.group_id)
-            if delivered:
-                delivered_artifacts.append(artifact)
-        if delivered_artifacts:
-            await self._deliver_status(
-                gs,
-                group,
-                status_line_overrides=_status_lines_for_delivered_artifacts(group, delivered_artifacts),
-                terminal=True,
-            )
+    def _queue_delivery(self, group: TaskGroup, summary: str, artifacts: list[str], *, work_complete: bool) -> None:
+        self._outbox.enqueue(group.group_id, {"conversation_id": group.conversation_id,
+            "summary": _summary_with_original_request_context(group, summary),
+            "artifacts": artifacts, "delivered_artifacts": [], "text_delivered": False,
+            "work_complete": work_complete, "status": "pending", "attempts": 0, "retry_at": 0})
 
-        # Clean up group state.
-        self._group_state.pop(gs.group_id, None)
+    async def retry_pending_deliveries(self) -> None:
+        due = await asyncio.to_thread(self._outbox.due, surfaces=getattr(self, "_recovery_surfaces", None))
+        for group_id in due:
+            await self._deliver_outbox(group_id, group=self._registry.get_group(group_id))
+
+    async def _deliver_outbox(self, group_id: str, *, group: TaskGroup | None = None) -> None:
+        lock = self._delivery_locks.setdefault(group_id, asyncio.Lock())
+        async with lock:
+            with self._outbox.claim(group_id) as acquired:
+                if not acquired:
+                    return
+                record = await asyncio.to_thread(self._outbox.get, group_id)
+                if record is None:
+                    return
+                if record["status"] == "delivered":
+                    self._completed_groups.add(group_id)
+                    return
+                record["attempts"] += 1
+                record["status"] = "delivering"
+                await asyncio.to_thread(self._outbox.put, group_id, record)
+                for artifact in record["artifacts"]:
+                    if artifact in record["delivered_artifacts"]:
+                        continue
+                    if await self._deliver(record["conversation_id"], artifact, is_artifact=True, group_id=group_id):
+                        record["delivered_artifacts"].append(artifact)
+                        await asyncio.to_thread(self._outbox.put, group_id, record)
+                files_complete = len(record["delivered_artifacts"]) == len(record["artifacts"])
+                if files_complete and not record["text_delivered"]:
+                    record["text_delivered"] = await self._deliver(record["conversation_id"], record["summary"], group_id=group_id)
+                record["status"] = "delivered" if files_complete and record["text_delivered"] else "failed"
+                record["retry_at"] = time.time() + 5 * record["attempts"]
+                await asyncio.to_thread(self._outbox.put, group_id, record)
+                if group is not None:
+                    group.planner_metadata["delivery_status"] = "completed" if record["status"] == "delivered" and record["work_complete"] else "failed"
+                    group.planner_metadata["undelivered_artifacts"] = [path for path in record["artifacts"] if path not in record["delivered_artifacts"]]
+                if record["status"] == "delivered":
+                    self._completed_groups.add(group_id)
+                    self._group_state.pop(group_id, None)
+                    if group is not None and record["delivered_artifacts"]:
+                        state = GroupState(group_id, record["conversation_id"], group.original_message)
+                        await self._deliver_status(state, group,
+                            status_line_overrides=_status_lines_for_delivered_artifacts(group, record["delivered_artifacts"]), terminal=True)
+                elif not record.get("failure_notice_delivered"):
+                    record["failure_notice_delivered"] = await self._deliver(record["conversation_id"],
+                        "I couldn't deliver the complete result. Delivery will retry without repeating the completed work.", group_id=group_id)
+                    await asyncio.to_thread(self._outbox.put, group_id, record)
 
     async def _generate_summary(self, group: TaskGroup, *, deliverable_artifacts: list[str] | None = None) -> str:
         """One-shot LLM call to synthesize a coherent final reply."""
@@ -339,7 +399,7 @@ class ResultAggregator:
             logger.debug("ResultAggregator: summary LLM call failed: %s", exc)
             return self._fallback_summary(group)
 
-    def _fallback_summary(self, group: TaskGroup) -> str:
+    def _fallback_summary(self, group: TaskGroup, *, include_findings: bool = True) -> str:
         """Plain-text summary when LLM call fails or is unavailable."""
         done = sum(1 for t in group.tasks if t.status == TaskStatus.COMPLETE)
         failed = sum(1 for t in group.tasks if t.status == TaskStatus.FAILED)
@@ -357,7 +417,7 @@ class ResultAggregator:
                 if task.result and task.result.output
                 else ""
             )
-            if preview:
+            if preview and include_findings:
                 parts.append(f"• {task.title}: {preview}")
             if task.status == TaskStatus.FAILED and task.result and task.result.error:
                 failure = _safe_result_text_preview(task.result.error, max_chars=180)
@@ -384,8 +444,13 @@ class ResultAggregator:
 
     async def _deliver(self, conversation_id: str, text: str, **kwargs) -> bool:
         try:
-            result = self._deliver_fn(conversation_id, text, **kwargs)
-            if asyncio.iscoroutine(result):
+            if kwargs.get("is_status") or inspect.iscoroutinefunction(self._deliver_fn):
+                result = self._deliver_fn(conversation_id, text, **kwargs)
+            else:
+                # Synchronous platform adapters may wait on network I/O. Startup
+                # recovery must not block the chat/polling event loop.
+                result = await asyncio.to_thread(self._deliver_fn, conversation_id, text, **kwargs)
+            if inspect.isawaitable(result):
                 result = await result
             delivered = result is not False
             if not delivered:

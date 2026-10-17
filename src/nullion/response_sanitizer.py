@@ -243,11 +243,9 @@ def _sanitize_user_visible_reply(
             _sanitize_local_paths(account_detour_reply),
             account_tool_family=_primary_account_tool_family(results),
         )
-    if account_browser_detour_reply := _account_read_reply_over_browser_detour(raw, results):
-        return _sanitize_reply_style(
-            _sanitize_local_paths(account_browser_detour_reply),
-            account_tool_family=_primary_account_tool_family(results),
-        )
+    # Email and browser reads are evidence for the same request. A later
+    # browser operation does not authorize replacing the answer with an email
+    # preview, even when the browser could not verify the current state.
     raw = _account_tool_reply_over_ungrounded_result(raw, results, user_message=user_message)
     raw = _calendar_relevance_reply_over_raw_listing(user_message, raw, results)
     if image_generation_unavailable_reply := _image_generation_scope_unavailable_reply(results):
@@ -290,12 +288,13 @@ def _sanitize_user_visible_reply(
         return _sanitize_local_paths(artifact_completion_reply)
     if empty_reminder_cancel_reply := _empty_reminder_cancel_reply(results):
         return empty_reminder_cancel_reply
-    if scheduler_read_reply := _scheduler_read_reply_over_model_reformat(raw, results):
-        return _sanitize_local_paths(scheduler_read_reply)
+    # A model answer may discuss one relevant scheduled task. A completed read
+    # does not authorize replacing that answer with the whole inventory.
     if numbered_reply := _structured_numbered_choice_reply(results):
         return numbered_reply
-    if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
-        return cron_list_reply
+    if not user_message:
+        if cron_list_reply := _cron_list_reply_over_empty_reminder_drift(raw, results):
+            return cron_list_reply
     if _looks_like_raw_function_markup(raw):
         return safe_raw_tool_payload_replacement(tool_results=results, source=source)
     parsed = _parse_bare_structured_payload(raw)
@@ -8200,42 +8199,6 @@ def _account_read_reply_over_invalid_attachment_detour(text: str, results: list[
             return _email_read_summary(completed_email_read.output)
     return None
 
-
-def _account_read_reply_over_browser_detour(text: str, results: list[ToolResult]) -> str | None:
-    """Prefer completed email body evidence over a later browser page detour."""
-
-    completed_email_read: ToolResult | None = None
-    completed_email_read_index = -1
-    for index, result in enumerate(results):
-        if result.status == "completed" and result.tool_name == "email_read" and isinstance(result.output, dict):
-            completed_email_read = result
-            completed_email_read_index = index
-    if completed_email_read is None:
-        return None
-    browser_detour = False
-    for result in results[completed_email_read_index + 1 :]:
-        if result.status != "completed" or not result.tool_name.startswith("browser_"):
-            continue
-        if result.tool_name != "browser_extract_text" or not isinstance(result.output, dict):
-            browser_detour = True
-            continue
-        extracted_text = result.output.get("text") or result.output.get("content") or ""
-        if _reply_mentions_browser_extract_evidence(text, extracted_text):
-            browser_detour = True
-            break
-    if not browser_detour:
-        return None
-    message = completed_email_read.output.get("message")
-    if not isinstance(message, Mapping):
-        return None
-    normalized = str(text or "").casefold()
-    subject = str(message.get("subject") or "").strip()
-    sender = str(message.get("from") or "").strip()
-    if subject and subject.casefold() in normalized:
-        return None
-    if sender and sender.casefold() in normalized:
-        return None
-    return _email_read_summary(completed_email_read.output)
 
 
 def _compact_account_text(value: object) -> str:

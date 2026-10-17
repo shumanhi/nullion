@@ -475,7 +475,7 @@ def _parse_store_timestamp(value: object) -> datetime | None:
         return None
 
 
-def _cron_delivery_started_since(cron_id: str, scheduled_for: datetime, *, now: datetime) -> str | None:
+def _cron_delivery_started_since(cron_id: str, scheduled_for: datetime, *, now: datetime, db_path: Path | None = None) -> str | None:
     """Return the first recorded delivery start for this scheduled occurrence."""
     cron_id = str(cron_id or "").strip()
     if not cron_id:
@@ -487,7 +487,7 @@ def _cron_delivery_started_since(cron_id: str, scheduled_for: datetime, *, now: 
     scheduled_iso = scheduled_for.astimezone(timezone.utc).isoformat()
     now_iso = now.astimezone(timezone.utc).isoformat()
     try:
-        with sqlite3.connect(str(_runtime_db_path()), timeout=10) as conn:
+        with sqlite3.connect(str(db_path or _runtime_db_path()), timeout=10) as conn:
             row = conn.execute(
                 """
                 SELECT json_extract(payload, '$.created_at')
@@ -653,17 +653,17 @@ def _save_crons_db(
                         (_CRON_COLLECTION, job.id),
                     ).fetchone()
                     if existing is not None and _payload_is_deleted(existing[0]):
-                        log.warning("Skipping stale save for deleted cron %s.", job.id)
-                        continue
+                        raise RuntimeError(f"Scheduled task {job.id} was deleted during this update; reload before trying again.")
                     expected_updated_at = str(getattr(job, "_persisted_updated_at", "") or "")
                     existing_updated_at = str(existing[1] or "") if existing is not None else ""
                     if expected_updated_at and existing_updated_at and existing_updated_at != expected_updated_at:
-                        log.warning("Skipping stale save for concurrently updated cron %s.", job.id)
-                        continue
+                        raise RuntimeError(f"Scheduled task {job.id} changed during this update; reload before trying again.")
                     conn.execute(
-                        f"""INSERT OR REPLACE INTO {_CRON_TABLE}
+                        f"""INSERT INTO {_CRON_TABLE}
                             (collection, item_key, payload, updated_at)
-                            VALUES (?, ?, ?, ?)""",
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT(collection, item_key) DO UPDATE SET
+                                payload=excluded.payload, updated_at=excluded.updated_at""",
                         (_CRON_COLLECTION, job.id, json.dumps(job.to_dict(), sort_keys=True), now),
                     )
                     job._persisted_updated_at = now
@@ -683,8 +683,9 @@ def save_crons(jobs: list[CronJob], *, allow_empty: bool = False) -> None:
         log.error("Refusing to overwrite existing cron store with an implicit empty cron list.")
         raise RuntimeError("Refusing to overwrite existing cron store with an implicit empty cron list.")
     saved_to_db = _save_crons_db(jobs, replace_missing=allow_empty)
-    if saved_to_db:
-        log.debug("Saved %d cron(s) to runtime DB.", len(jobs))
+    if not saved_to_db:
+        raise RuntimeError("The scheduled-task change could not be saved. No successful change was confirmed.")
+    log.debug("Saved %d cron(s) to runtime DB.", len(jobs))
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -744,8 +745,7 @@ def add_cron(
         created_at=_now_iso(),
         next_run=_compute_next_run(schedule) if enabled else None,
     )
-    jobs.append(job)
-    save_crons(jobs)
+    save_crons([job])
     log.info("Cron created: %r (%s) schedule=%r", job.name, job.id, job.schedule)
     return job
 
@@ -770,7 +770,7 @@ def toggle_cron(cron_id: str, enabled: bool) -> CronJob | None:
         if job.id == cron_id:
             job.enabled = enabled
             job.next_run = _compute_job_next_run(job) if enabled else None
-            save_crons(jobs)
+            save_crons([job])
             return job
     return None
 
@@ -809,16 +809,21 @@ def update_cron(cron_id: str, **kwargs) -> CronJob | None:
             job.workspace_id = str(job.workspace_id or _DEFAULT_WORKSPACE_ID).strip() or _DEFAULT_WORKSPACE_ID
             # Validate after applying changes so we check the final state.
             _validate_cron_fields(job.name, job.schedule, job.task)
-            job.next_run = _compute_job_next_run(job) if job.enabled else None
-            save_crons(jobs)
+            if "schedule" in kwargs or "enabled" in kwargs:
+                job.next_run = _compute_job_next_run(job) if job.enabled else None
+            save_crons([job])
             return job
     return None
 
 
 def _validate_tracker_options(options: object) -> None:
-    if isinstance(options, dict) and "tracker_status_notifications" in options:
-        if type(options["tracker_status_notifications"]) is not bool:
-            raise ValueError("tracker_status_notifications must be a boolean")
+    if isinstance(options, dict):
+        for key in ("tracker_status_notifications", "tracker_health_notifications", "doctor_monitoring_enabled"):
+            if key in options and type(options[key]) is not bool:
+                raise ValueError(f"{key} must be a boolean")
+        limit = options.get("doctor_streak_limit",12)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("doctor_streak_limit must be an integer from 1 to 1000")
 
 
 def get_cron(cron_id: str) -> CronJob | None:
@@ -831,125 +836,115 @@ def get_cron(cron_id: str) -> CronJob | None:
 # ── Scheduler ──────────────────────────────────────────────────────────────────
 
 class CronScheduler:
-    """Background thread that fires due cron jobs every ~30 seconds.
+    """Bounded scheduled workers; due jobs remain visible until capacity is free."""
 
-    Parameters
-    ----------
-    fire_fn:
-        Called with a CronJob when it is due.  Should be non-blocking or
-        hand off to a thread executor — the scheduler waits for it to return
-        before continuing, so long-running tasks should be dispatched async.
-    tick_interval:
-        How often (seconds) the scheduler wakes to check for due jobs.
-        Default 30 s gives at most 30 s of latency for minute-granularity crons.
-    """
+    def __init__(self,fire_fn: Callable[[CronJob],object],tick_interval: float=30.0,
+                 status_fn=None,max_parallel_jobs: int | None=None,store_path: Path | None=None):
+        from nullion.cron_scheduler_state import read_limit,validate_limit
+        self._store_path=Path(store_path) if store_path is not None else _runtime_db_path()
+        self._fire=fire_fn;self._tick_interval=tick_interval;self._status_fn=status_fn
+        self._default_limit=validate_limit(max_parallel_jobs) if max_parallel_jobs is not None else None
+        self.max_parallel_jobs=read_limit(self._store_path,self._default_limit)
+        self._stop=threading.Event();self._wake=threading.Event();self._lock=threading.RLock()
+        self._running={}
+        self._thread=threading.Thread(target=self._loop,daemon=True,name='nullion-cron-scheduler')
+        self._status_thread=threading.Thread(target=self._status_loop,daemon=True,name='nullion-tracker-status')
 
-    def __init__(
-        self,
-        fire_fn: Callable[[CronJob], object],
-        tick_interval: float = 30.0,
-        status_fn: Callable[[list[CronJob], datetime], object] | None = None,
-    ) -> None:
-        self._fire = fire_fn
-        self._tick_interval = tick_interval
-        self._stop = threading.Event()
-        self._status_fn = status_fn
-        self._status_thread = threading.Thread(target=self._status_loop, daemon=True, name="nullion-tracker-status")
-        self._thread = threading.Thread(
-            target=self._loop,
-            daemon=True,
-            name="nullion-cron-scheduler",
-        )
-
-    def start(self) -> None:
+    def start(self):
         self._thread.start()
-        if self._status_fn is not None:
-            self._status_thread.start()
-        log.info("CronScheduler started (tick every %ss)", self._tick_interval)
+        if self._status_fn is not None:self._status_thread.start()
 
-    def stop(self) -> None:
-        self._stop.set()
+    def stop(self):
+        self._stop.set();self._wake.set()
 
-    def _status_loop(self) -> None:
-        # Remain observable even while a source check is slow or stalled.
-        while not self._stop.wait(timeout=self._tick_interval):
+    def set_max_parallel_jobs(self,value):
+        from nullion.cron_scheduler_state import write_limit
+        self.max_parallel_jobs=write_limit(self._store_path,value);self._wake.set()
+        return self.max_parallel_jobs
+
+    def snapshot(self,jobs=None):
+        from nullion.cron_scheduler_state import leases,read_limit
+        active=leases(self._store_path)
+        limit=read_limit(self._store_path,self._default_limit)
+        count=sum(token.startswith('scheduler:') for token in active.values())
+        states={}
+        for job in jobs or []:
+            due=job.next_run_dt()
+            states[job.id]=('paused' if not job.enabled else 'running' if job.id in active else
+                           'waiting_for_capacity' if due and due<=datetime.now(timezone.utc) and count>=limit else
+                           'due' if due and due<=datetime.now(timezone.utc) else 'scheduled')
+        return {'max_parallel_jobs':limit,'running_jobs':count,'jobs':states}
+
+    def _status_loop(self):
+        while not self._stop.wait(self._tick_interval):
             try:
-                self._status_fn(load_crons(refresh_next_runs=False), datetime.now(timezone.utc))
-            except Exception:
-                log.warning("Tracker status tick failed", exc_info=True)
+                from nullion.cron_scheduler_state import load_jobs
+                self._status_fn(load_jobs(self._store_path),datetime.now(timezone.utc))
+            except Exception:log.warning('Tracker status tick failed',exc_info=True)
 
-    def _loop(self) -> None:
-        while not self._stop.wait(timeout=self._tick_interval):
+    def _loop(self):
+        while not self._stop.is_set():
+            self._wake.wait(self._tick_interval);self._wake.clear()
+            if self._stop.is_set():break
+            try:self._tick()
+            except Exception:log.exception('CronScheduler tick failed')
+
+    def _tick(self):
+        from nullion.cron_scheduler_state import claim_scheduled,read_limit,renew,load_jobs,update_schedule_fields
+        if self._stop.is_set():return
+        with self._lock:
+            self.max_parallel_jobs=read_limit(self._store_path,self._default_limit)
+            for job_id,(_thread,token) in tuple(self._running.items()):
+                renew(self._store_path,job_id,token)
+            jobs=load_jobs(self._store_path)
+            # Oldest due first; no unbounded executor queue or pre-claimed backlog.
+            jobs.sort(key=lambda j:j.next_run_dt() or datetime.min.replace(tzinfo=timezone.utc))
+            for job in jobs:
+                if self._stop.is_set() or len(self._running)>=self.max_parallel_jobs:break
+                if not job.enabled or job.id in self._running:continue
+                if not job.next_run_dt():
+                    update_schedule_fields(self._store_path,job,next_run=_compute_job_next_run(job));continue
+                if job.next_run_dt()>datetime.now(timezone.utc):continue
+                existing=_cron_delivery_started_since(job.id,job.next_run_dt(),now=datetime.now(timezone.utc),db_path=self._store_path)
+                if existing:
+                    update_schedule_fields(self._store_path,job,last_run=existing,next_run=_compute_job_next_run(job));continue
+                claim=claim_scheduled(self._store_path,job,self.max_parallel_jobs)
+                if claim is None:continue
+                claimed,token=claim
+                thread=threading.Thread(target=self._run_job,args=(claimed,token),daemon=True,name='nullion-cron-'+job.id)
+                self._running[job.id]=(thread,token)
+                try:thread.start()
+                except Exception:
+                    from nullion.cron_scheduler_state import release
+                    from nullion.cron_scheduler_state import update_schedule_fields
+                    self._running.pop(job.id,None)
+                    update_schedule_fields(self._store_path,claimed,next_run=job.next_run,last_run=job.last_run)
+                    release(self._store_path,job.id,token)
+                    raise
+
+    def _run_job(self,job,token):
+        from nullion.cron_scheduler_state import release,save_result,scheduled_token,load_jobs
+        try:
+            current=next((j for j in load_jobs(self._store_path) if j.id==job.id),None)
+            if current is None or not current.enabled or any(getattr(current,k)!=getattr(job,k) for k in ('task','workspace_id','delivery_channel','delivery_target')):return
+            with scheduled_token(token):
+                result=self._fire(job)
+            if isinstance(result,dict) and result.get('cron_run_skipped'):return
+            if not isinstance(result,dict):outcome='ok'
+            elif result.get('suspended_for_approval'):outcome='waiting_for_approval'
+            elif result.get('cron_run_cancelled'):outcome='cancelled'
+            elif (any(result.get(k) for k in ('cron_run_failed','cron_report_failed','cron_delivery_failed'))
+                  or (isinstance(result.get('execution_outcome'),dict) and result['execution_outcome'].get('execution_succeeded') is False)):
+                outcome='error: '+str(result.get('reason') or 'scheduled task incomplete')
+            elif result.get('cron_delivery_partial_success'):outcome='partial_success'
+            else:outcome='ok'
+            save_result(self._store_path,job,outcome)
+        except Exception as exc:
+            log.warning('Cron %s failed: %s',job.id,exc)
+            save_result(self._store_path,job,'error: '+str(exc))
+        finally:
             try:
-                self._tick()
-            except Exception as exc:
-                log.error("CronScheduler tick error: %s (%s)", exc, type(exc).__name__, exc_info=True)
-
-    def _tick(self) -> None:
-        now = datetime.now(timezone.utc)
-        jobs = load_crons()
-        changed = False
-
-        for job in jobs:
-            if not job.enabled:
-                continue
-
-            # Ensure next_run is populated
-            if not job.next_run:
-                job.next_run = _compute_job_next_run(job, after=now)
-                changed = True
-                continue
-
-            next_dt = job.next_run_dt()
-            if next_dt is None:
-                # Corrupt next_run — recompute
-                job.next_run = _compute_job_next_run(job, after=now)
-                changed = True
-                continue
-
-            if now >= next_dt:
-                existing_started_at = _cron_delivery_started_since(job.id, next_dt, now=now)
-                if existing_started_at:
-                    log.warning(
-                        "Skipping duplicate cron delivery for %r [%s]; occurrence %s already started at %s",
-                        job.name,
-                        job.id,
-                        next_dt.isoformat(),
-                        existing_started_at,
-                    )
-                    job.last_run = existing_started_at
-                    job.next_run = _compute_job_next_run(job, after=now)
-                    changed = True
-                    continue
-
-                log.info("Firing cron %r [%s]: %s", job.name, job.id, job.task[:80])
-                # Advance next_run and persist BEFORE firing so a crash mid-fire
-                # doesn't cause a double-fire on the next scheduler tick.
-                job.last_run = _now_iso()
-                job.next_run = _compute_job_next_run(job, after=now)
-                save_crons(jobs)
-                changed = False  # already saved
-                try:
-                    result = self._fire(job)
-                    if isinstance(result, dict):
-                        outcome = result.get("execution_outcome") or {}
-                        if result.get("suspended_for_approval"):
-                            job.last_result = "waiting_for_approval"
-                        elif result.get("cron_run_cancelled"):
-                            job.last_result = "cancelled"
-                        elif (result.get("cron_run_failed") or result.get("cron_report_failed") or result.get("cron_delivery_failed")
-                              or (isinstance(outcome, dict) and outcome.get("execution_succeeded") is False)):
-                            job.last_result = f"error: {result.get('reason') or 'scheduled task incomplete'}"
-                        elif result.get("cron_delivery_partial_success"):
-                            job.last_result = "partial_success"
-                        else:
-                            job.last_result = "ok"
-                    else:
-                        job.last_result = "ok"
-                except Exception as exc:
-                    log.warning("Cron %r [%s] fire error: %s", job.name, job.id, exc)
-                    job.last_result = f"error: {exc}"
-                changed = True  # persist last_result update
-
-        if changed:
-            save_crons(jobs)
+                release(self._store_path,job.id,token)
+            finally:
+                with self._lock:self._running.pop(job.id,None)
+                self._wake.set()

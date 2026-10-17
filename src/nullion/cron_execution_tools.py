@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 import time
@@ -57,9 +57,11 @@ class CronExecutionToolRegistry:
         allow_connector_tools: bool = False,
         connector_provider_ids: Iterable[str] | None = None,
         checkpoint_journal=None,
+        browser_session_id: str | None = None,
     ) -> None:
         self._delegate = delegate
         self._checkpoint_journal = checkpoint_journal
+        self._browser_session_id = browser_session_id
         self._allowed_tool_names = (
             frozenset(str(name).strip() for name in allowed_tool_names if str(name).strip())
             if allowed_tool_names is not None
@@ -198,6 +200,9 @@ class CronExecutionToolRegistry:
         return self._delegate.is_plugin_installed(plugin_name)
 
     def invoke(self, invocation: ToolInvocation) -> ToolResult:
+        if self._browser_session_id:
+            invocation = replace(invocation,flow_context={**(invocation.flow_context or {}),
+                "browser_session_id":self._browser_session_id,"browser_session_scope":self._browser_session_id})
         try:
             spec = self._delegate.get_spec(invocation.tool_name)
         except KeyError:

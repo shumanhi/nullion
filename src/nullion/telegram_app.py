@@ -2491,38 +2491,8 @@ async def _send_or_edit_telegram_task_status_message(
     return delivered_status
 
 
-async def _stop_telegram_status_typing_for_group(
-    typing_tasks: dict[tuple[str, str], asyncio.Task[None]],
-    *,
-    chat_id: str,
-    group_id: str,
-) -> None:
-    await _stop_typing_keepalive(typing_tasks.pop((chat_id, group_id), None))
 
 
-def _cancel_telegram_status_typing_for_group(
-    typing_tasks: dict[tuple[str, str], asyncio.Task[None]],
-    *,
-    chat_id: str,
-    group_id: str,
-) -> None:
-    task = typing_tasks.pop((chat_id, group_id), None)
-    if task is None:
-        return
-    try:
-        loop = task.get_loop()
-    except Exception:
-        loop = None
-    if loop is not None and loop.is_running():
-        try:
-            loop.call_soon_threadsafe(task.cancel)
-            return
-        except Exception:
-            logger.debug("Failed to stop Telegram status typing keepalive via loop", exc_info=True)
-    try:
-        task.cancel()
-    except Exception:
-        logger.debug("Failed to cancel Telegram status typing keepalive task", exc_info=True)
 
 
 async def _stop_telegram_status_typing_for_group(
@@ -2631,8 +2601,7 @@ def _run_confirmed_telegram_delivery(delivery_factory, *, timeout_seconds: float
         asyncio.get_running_loop()
     except RuntimeError:
         try:
-            asyncio.run(delivery_factory())
-            return True
+            return asyncio.run(delivery_factory()) is not False
         except Exception:
             logger.debug("Telegram delivery failed outside polling loop", exc_info=True)
             return False
@@ -2643,8 +2612,7 @@ def _run_confirmed_telegram_delivery(delivery_factory, *, timeout_seconds: float
     def _run_delivery() -> None:
         nonlocal delivered, delivery_error
         try:
-            asyncio.run(delivery_factory())
-            delivered = True
+            delivered = asyncio.run(delivery_factory()) is not False
         except BaseException as exc:
             delivery_error = exc
 
@@ -6016,6 +5984,9 @@ class ChatOperatorService:
         monitor = self._build_health_monitor(app)
 
         async def _post_init(app) -> None:
+            if hasattr(self.agent_orchestrator, "run_delivery_recovery"):
+                app._nullion_delivery_recovery_task = asyncio.create_task(
+                    self.agent_orchestrator.run_delivery_recovery(self.runtime, surface="telegram"))
             # Register command hints so / shows the menu in the Telegram input bar
             try:
                 registered = await register_telegram_bot_commands(app.bot)
@@ -6070,6 +6041,10 @@ class ChatOperatorService:
             )
 
         async def _post_shutdown(app) -> None:
+            recovery = getattr(app, "_nullion_delivery_recovery_task", None)
+            if recovery is not None:
+                recovery.cancel()
+                await asyncio.gather(recovery, return_exceptions=True)
             config_task = getattr(app, "_nullion_live_config_task", None)
             if config_task is not None:
                 config_task.cancel()

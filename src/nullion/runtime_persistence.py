@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 import logging
 import os
@@ -2078,6 +2078,25 @@ def _validate_sqlite_runtime_row(collection: str, decoded: dict[str, object]) ->
     _runtime_store_from_payload(payload)
 
 
+def _snapshot_runtime_sqlite(target: Path) -> None:
+    """Publish a committed SQLite snapshot even when auxiliary stores write."""
+    temporary = target.with_name(f".{target.name}.backup-{uuid4().hex}.tmp")
+    deadline = perf_counter() + 15
+
+    def progress(_status, _remaining, _total):
+        if perf_counter() > deadline:
+            raise TimeoutError("Runtime database backup could not obtain a consistent snapshot in time.")
+
+    try:
+        with closing(sqlite3.connect(target.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)) as source:
+            with closing(sqlite3.connect(str(temporary))) as destination:
+                source.backup(destination, pages=256, progress=progress, sleep=0.05)
+        _rotate_runtime_store_backups(target)
+        temporary.replace(_backup_path_for(target, 0))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _save_runtime_store_sqlite(
     store: RuntimeStore,
     path: str | Path,
@@ -2132,8 +2151,7 @@ def _save_runtime_store_sqlite(
     backup_ms = 0.0
     if target.exists():
         backup_started_at = perf_counter()
-        _rotate_runtime_store_backups(target)
-        shutil.copy2(target, _backup_path_for(target, 0))
+        _snapshot_runtime_sqlite(target)
         backup_ms = (perf_counter() - backup_started_at) * 1000
 
     now = datetime.now(UTC).isoformat()

@@ -776,23 +776,6 @@ def _browser_image_collection_paths(result: ToolResult) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def _path_identity_variants(path: object) -> tuple[str, ...]:
-    text = str(path or "").strip()
-    if not text:
-        return ()
-    expanded = Path(text).expanduser()
-    variants = [text, str(expanded)]
-    for marker in ("workspaces", "artifacts"):
-        if marker not in expanded.parts:
-            continue
-        marker_index = expanded.parts.index(marker)
-        if marker_index < len(expanded.parts) - 1:
-            variants.append(str(Path(*expanded.parts[marker_index:])))
-    try:
-        variants.append(str(expanded.resolve()))
-    except (OSError, RuntimeError, ValueError):
-        pass
-    return tuple(dict.fromkeys(variants))
 
 
 def _path_identity_set(paths: Iterable[object]) -> set[str]:

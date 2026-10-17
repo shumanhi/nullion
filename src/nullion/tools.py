@@ -56,6 +56,7 @@ from nullion.artifacts import (
     ARTIFACT_ROLE_INTERMEDIATE,
     ARTIFACT_ROLE_SOURCE,
     artifact_output_descriptor,
+    normalize_artifact_extensions,
     promote_supporting_asset_artifact_paths,
 )
 from nullion.approval_context import FLOW_TRIGGER_CONTEXT_KEY, build_trigger_flow_context
@@ -556,21 +557,50 @@ class _SafeWebFetchRedirectHandler(urllib.request.HTTPRedirectHandler):
     max_redirections = _WEB_FETCH_MAX_REDIRECTS
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urlparse(req.full_url)
         parsed = urlparse(newurl)
-        if parsed.scheme not in {"http", "https"}:
-            # Refuse non-HTTP redirect targets (data:, file:, ftp:, etc.)
+        if parsed.scheme not in {"http", "https"} or (old.scheme == "https" and parsed.scheme != "https"):
             return None
-        # Refuse redirects to private/loopback hosts
-        host = parsed.hostname or ""
-        try:
-            from ipaddress import ip_address as _ip
-            addr = _ip(host)
-            if not addr.is_global:
-                return None
-        except ValueError:
-            # Hostname — allow it; DNS resolution happens later
-            pass
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        bases = getattr(req, "_nullion_allowed_base_urls", ())
+        if bases and not any(_url_is_under_base(newurl, base) for base in bases):
+            return None
+        if not bases and _resolve_web_fetch_resolution(newurl) is None and not _is_global_literal_ip(parsed.hostname or ""):
+            return None
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        redirected._nullion_allowed_base_urls = bases
+        origin = lambda value: (value.scheme, value.hostname, value.port or (443 if value.scheme == "https" else 80))
+        if origin(old) != origin(parsed):
+            for name in tuple(redirected.headers):
+                if name.lower() in {"authorization", "proxy-authorization", "cookie"}:
+                    redirected.remove_header(name)
+        return redirected
+
+
+@contextmanager
+def _checked_web_fetch_connection(request):
+    """Validate and pin each connection, including every redirected hostname."""
+    bases = getattr(request, "_nullion_allowed_base_urls", ())
+    if bases and not any(_url_is_under_base(request.full_url, base) for base in bases):
+        raise urllib.error.URLError("Redirect is outside the configured connector endpoint.")
+    resolution = _resolve_web_fetch_resolution(request.full_url)
+    if resolution is None and not _is_global_literal_ip(urlparse(request.full_url).hostname or "") and not bases:
+        raise urllib.error.URLError("URL resolves to an unavailable or private network address.")
+    with _pinned_web_fetch_resolution(resolution):
+        yield
+
+
+class _PinnedWebFetchHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        with _checked_web_fetch_connection(request):
+            return super().http_open(request)
+
+
+class _PinnedWebFetchHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        with _checked_web_fetch_connection(request):
+            return super().https_open(request)
 
 
 _WEB_FETCH_RESOLUTION_LOCK = threading.RLock()
@@ -937,10 +967,11 @@ def _resolve_local_workspace_file_input(
 
 
 def _build_web_fetch_opener() -> urllib.request.OpenerDirector:
-    https_handler = urllib.request.HTTPSHandler(context=_web_fetch_tls_context())
+    https_handler = _PinnedWebFetchHTTPSHandler(context=_web_fetch_tls_context())
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         https_handler,
+        _PinnedWebFetchHTTPHandler,
         _SafeWebFetchRedirectHandler,
     )
 
@@ -1695,6 +1726,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         "list_crons": {
             "type": "object",
             "properties": {
+                "query": {"type": "string", "description": "Optional case-insensitive substring to find in stored cron names or task instructions. Use a distinctive term from the requested task; omit for all jobs."},
                 "workspace_id": {"type": "string", "description": "Workspace id to list. Defaults to the current workspace."},
                 "include_all_workspaces": {"type": "boolean", "description": "Whether to include crons from every workspace."},
             },
@@ -5991,6 +6023,57 @@ class ToolExecutor:
                 continue
         return False
 
+    def _temporary_helper_scratch_recovery(self, invocation: ToolInvocation, fact) -> ToolResult | None:
+        # A typed artifact task may need a helper script. A model-chosen system
+        # temp path should recover into this workspace's scratch directory,
+        # rather than ask the user to authorize an internal implementation file.
+        flow = invocation.flow_context or {}
+        if invocation.tool_name not in {"terminal_exec", "file_write", "file_patch"} or not any(flow.get(key) is True for key in ("requires_new_artifact_content", "requires_artifact_delivery")):
+            return None
+        if fact.kind is not BoundaryKind.FILESYSTEM_ACCESS or fact.operation != "write":
+            return None
+        if not _scheduled_task_helper_script_path(fact.target):
+            return None
+        requested = {extension for key in ("artifact_extensions", "requested_artifact_extensions", "required_artifact_extensions")
+                     for extension in normalize_artifact_extensions(flow.get(key))}
+        if not requested or Path(fact.target).suffix.lower() in requested:
+            return None
+        try:
+            target = Path(fact.target).expanduser().resolve()
+            temporary_roots = [Path(tempfile.gettempdir()).resolve()]
+            if os.name == "posix":
+                temporary_roots.extend(Path(root).resolve() for root in ("/tmp", "/var/tmp"))
+            if not any(target.is_relative_to(root) for root in temporary_roots):
+                return None
+            if _is_approved_filesystem_path(target, invocation.trusted_filesystem_selectors):
+                return None
+        except OSError:
+            return None
+        scratch = _workspace_scratch_root_for_principal(invocation.principal_id)
+        if scratch is None:
+            return None
+        return self._deny_invocation(invocation, reason="workspace_scratch_path_required",
+            error="Helper scripts must use workspace scratch storage", output={
+                "reason": "workspace_scratch_path_required", "requires_approval": False, "retryable": True,
+                "target": fact.target, "operation": fact.operation, "boundary_kind": fact.kind.value,
+                "suggested_scratch_root": str(scratch), "suggested_path": str(scratch / target.name),
+                "recovery": {"kind": "retry_in_workspace_scratch", "tool_name": invocation.tool_name},
+                "message": "Retry this internal helper script under suggested_scratch_root and update its references in the command. Keep the final deliverable in the workspace artifact directory.",
+            })
+
+    def _temporary_helper_scratch_preapproval_result(self, invocation: ToolInvocation) -> ToolResult | None:
+        if (invocation.tool_name not in {"terminal_exec", "file_write", "file_patch"}
+                or not any((invocation.flow_context or {}).get(key) is True
+                           for key in ("requires_new_artifact_content", "requires_artifact_delivery"))):
+            return None
+        for fact in extract_boundary_facts(invocation):
+            if self._filesystem_boundary_allowed(fact.target, principal_id=invocation.principal_id):
+                continue
+            result = self._temporary_helper_scratch_recovery(invocation, fact)
+            if result is not None:
+                return result
+        return None
+
     def _scheduled_task_terminal_filesystem_boundary_denial(self, invocation: ToolInvocation, fact) -> ToolResult | None:
         if invocation.tool_name != "terminal_exec":
             return None
@@ -6137,6 +6220,9 @@ class ToolExecutor:
                     return helper_artifact_denial
                 if self._filesystem_boundary_allowed(fact.target, principal_id=invocation.principal_id):
                     continue
+                scratch_recovery = self._temporary_helper_scratch_recovery(invocation, fact)
+                if scratch_recovery is not None:
+                    return scratch_recovery
                 scheduled_terminal_denial = self._scheduled_task_terminal_filesystem_boundary_denial(invocation, fact)
                 if scheduled_terminal_denial is not None:
                     return scheduled_terminal_denial
@@ -6309,6 +6395,10 @@ class ToolExecutor:
         scheduled_terminal_denial = self._scheduled_task_terminal_filesystem_preapproval_result(invocation)
         if scheduled_terminal_denial is not None:
             return scheduled_terminal_denial
+
+        scratch_recovery = self._temporary_helper_scratch_preapproval_result(invocation)
+        if scratch_recovery is not None:
+            return scratch_recovery
 
         destructive_terminal_approval = self._terminal_destructive_preapproval_result(invocation)
         if destructive_terminal_approval is not None:
@@ -14769,6 +14859,7 @@ def _connector_json_request(
         headers["Content-Type"] = "application/json"
         data = json.dumps(json_payload).encode("utf-8")
     request = urllib.request.Request(request_url, data=data, headers=headers, method=normalized_method)
+    request._nullion_allowed_base_urls = _connector_allowed_base_urls(connection, provider_id)
     opener = _build_web_fetch_opener()
     try:
         with _pinned_web_fetch_resolution(resolution):
@@ -14990,6 +15081,9 @@ def _connector_skill_pack_base_urls(provider_id: str) -> tuple[str, ...]:
 
 
 def _url_is_under_base(url: str, base_url: str) -> bool:
+    import posixpath
+    from urllib.parse import unquote
+
     parsed = urlparse(url)
     base = urlparse(base_url)
     if parsed.scheme != base.scheme or parsed.hostname != base.hostname:
@@ -14998,8 +15092,10 @@ def _url_is_under_base(url: str, base_url: str) -> bool:
     base_port = base.port or (443 if base.scheme == "https" else 80)
     if parsed_port != base_port:
         return False
-    base_path = (base.path or "/").rstrip("/") + "/"
-    path = (parsed.path or "/").rstrip("/") + "/"
+    # Endpoint permission applies to the path after ordinary server decoding
+    # and dot-segment normalization, not an unchecked textual prefix.
+    base_path = posixpath.normpath(unquote(base.path or "/").replace("\\", "/")).rstrip("/") + "/"
+    path = posixpath.normpath(unquote(parsed.path or "/").replace("\\", "/")).rstrip("/") + "/"
     return path.startswith(base_path)
 
 
@@ -15091,6 +15187,7 @@ def _build_connector_request_handler() -> ToolHandler:
                 headers=headers,
                 method=method,
             )
+            request._nullion_allowed_base_urls = _connector_allowed_base_urls(connection, provider_id)
             opener = _build_web_fetch_opener()
             with _pinned_web_fetch_resolution(resolution):
                 with opener.open(request, timeout=20) as response:
@@ -17737,6 +17834,9 @@ def _build_create_cron_handler(*, default_delivery_channel: str = "", default_de
             return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {},
                               "artifact_delivery_options must be an object")
         workspace_id = _workspace_id_from_invocation(invocation, args)
+        denial = _cron_workspace_access_denial(invocation, workspace_id)
+        if denial is not None:
+            return denial
         context_channel, context_target = _current_delivery_context_defaults()
         if not context_channel or not context_target:
             context_channel, context_target = _invocation_delivery_context_defaults(invocation)
@@ -17968,13 +18068,25 @@ def _build_list_crons_handler():
         args = invocation.arguments or {}
         include_all = bool(args.get("include_all_workspaces", False))
         workspace_id = str(args.get("workspace_id") or "").strip() or workspace_id_for_principal(invocation.principal_id)
+        denial = _cron_workspace_access_denial(invocation, None if include_all else workspace_id)
+        if denial is not None:
+            return denial
         jobs = list_crons(workspace_id=None if include_all else workspace_id)
+        total_count = len(jobs)
+        query = str(args.get("query") or "").strip().casefold()
+        if query:
+            # This is retrieval over a model-supplied tool argument, never
+            # classification or decomposition of the user's message.
+            jobs = [job for job in jobs if query in str(job.name).casefold()
+                    or query in str(job.task).casefold()]
         if not jobs:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="completed",
-                output={"crons": [], "count": 0, "message": "No crons scheduled."},
+                output={"crons": [], "count": 0,
+                        **({"query": query, "total_count": total_count} if query else {}),
+                        "message": "No scheduled tasks match this search." if query else "No crons scheduled."},
                 error=None,
             )
         lines = []
@@ -18019,6 +18131,7 @@ def _build_list_crons_handler():
             output={
                 "crons": crons,
                 "count": len(crons),
+                **({"query": query, "total_count": total_count} if query else {}),
                 "message": f"{header}\n\n" + "\n\n".join(lines),
             },
             error=None,
@@ -18028,6 +18141,22 @@ def _build_list_crons_handler():
 
 def _cron_admin_workspace_allowed(workspace_id: str) -> bool:
     return str(workspace_id or "").strip() == "workspace_admin"
+
+
+def _cron_workspace_access_denial(invocation: ToolInvocation, workspace_id: str | None) -> ToolResult | None:
+    """A selected workspace is an object reference, never an access grant."""
+    from nullion.connections import principal_has_admin_access, workspace_id_for_principal
+
+    principal = str(invocation.principal_id or "")
+    valid_member = True
+    if principal.startswith("user:"):
+        from nullion.users import load_user_registry
+        valid_member = any(user.active and user.user_id == principal.removeprefix("user:")
+                           for user in load_user_registry().users)
+    if valid_member and (workspace_id == workspace_id_for_principal(principal) or principal_has_admin_access(principal)):
+        return None
+    return ToolResult(invocation.invocation_id, invocation.tool_name, "denied",
+                      {"reason": "workspace_access_denied"}, "This scheduled-task workspace is not available to this user.")
 
 
 def _cron_workspace_denial(
@@ -18210,6 +18339,10 @@ def _build_update_cron_handler():
             if field == "artifact_delivery_options" and existing is not None:
                 value = {**dict(existing.artifact_delivery_options or {}), **value}
             updates[field] = value
+        if "workspace_id" in updates:
+            denial = _cron_workspace_access_denial(invocation, str(updates["workspace_id"]))
+            if denial is not None:
+                return denial
         if not updates:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -19205,8 +19338,8 @@ def register_cron_tools(
                 "Optional: enabled (bool, default true), workspace_id, delivery_channel, delivery_target, "
                 "html_image_delivery_mode (linked|auto|self_contained). "
                 "Set artifact_delivery_options.alert_delivery_mode explicitly from the user's notification requirements. "
-                "Conditional trackers include a daily summary and health notices by default; "
-                "set artifact_delivery_options.tracker_status_notifications=false to turn those off without disabling match alerts. "
+                "Doctor monitors completed runs and sends one notice after 12 consecutive failures or verified no-match checks. No daily summaries or recovery alerts. "
+                "Set artifact_delivery_options.doctor_monitoring_enabled=false to disable Doctor notices without disabling match alerts. "
                 "If workspace and delivery are omitted, Nullion uses the current workspace and chat adapter defaults."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
@@ -19227,7 +19360,8 @@ def register_cron_tools(
                 "List scheduled cron jobs for the current workspace with their id, workspace, schedule, "
                 "enabled state, next run time, last attempt, last successful check, verified check counts, "
                 "tracker health, and stored task instructions in structured output. "
-                "Optional args: workspace_id, include_all_workspaces."
+                "Use query to search stored names and instructions for a specific tracker instead of listing unrelated jobs. "
+                "Optional args: query, workspace_id, include_all_workspaces."
             ),
             risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.READ,
@@ -19258,7 +19392,7 @@ def register_cron_tools(
                 "Optional mutable fields: name, schedule, task, enabled, workspace_id, delivery_channel, "
                 "delivery_target, html_image_delivery_mode, artifact_delivery_options. "
                 "When changing notification requirements, also set artifact_delivery_options.alert_delivery_mode. "
-                "Use artifact_delivery_options.tracker_status_notifications (bool) for daily summaries and health notices; "
+                "Use artifact_delivery_options.doctor_monitoring_enabled (bool) and doctor_streak_limit (integer 1–1000, default 12) for Doctor monitoring; "
                 "preserve existing delivery options when updating it."
             ),
             risk_level=ToolRiskLevel.MEDIUM,

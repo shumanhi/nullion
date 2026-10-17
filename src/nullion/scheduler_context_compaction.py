@@ -17,6 +17,8 @@ _CRON_CONTEXT_KEYS = (
     "run_by_name",
     "has_task",
     "has_last_result",
+    "last_run",
+    "tracker_status",
 )
 
 
@@ -90,6 +92,10 @@ def compact_list_crons_output_for_context(
         "cron_count": len(crons),
         "crons": visible_rows,
     }
+    if isinstance(output.get("query"), str):
+        compact["query"] = output["query"]
+    if isinstance(output.get("total_count"), int):
+        compact["total_cron_count"] = output["total_count"]
     omitted_count = max(0, len(prioritized_rows) - len(visible_rows))
     if omitted_count:
         compact["omitted_cron_count"] = omitted_count

@@ -431,6 +431,10 @@ def principal_has_admin_access(principal_id: str | None) -> bool:
     text = str(principal_id or "").strip()
     if text in {"operator", "telegram_chat", "web:operator", "web:admin"}:
         return True
+    # The Web server is the loopback-only operator surface; conversation IDs
+    # identify its chats rather than separate member identities.
+    if text.startswith("web:"):
+        return True
     if text.startswith("workspace:"):
         return (text.removeprefix("workspace:") or _ADMIN_WORKSPACE_ID) == _ADMIN_WORKSPACE_ID
     registry = load_user_registry()

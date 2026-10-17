@@ -2595,7 +2595,7 @@ _HTML = r"""<!DOCTYPE html>
   #update-btn {
     background: var(--accent); border: none; color: #fff;
     border-radius: 8px; padding: 0 12px; height: 30px; cursor: pointer;
-    font-size: 12px; font-weight: 600; display: none; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 5px;
     transition: opacity 0.15s;
   }
   #update-btn:hover { opacity: 0.85; }
@@ -5897,23 +5897,23 @@ _HTML = r"""<!DOCTYPE html>
           <div class="form-hint" style="margin-bottom:12px">This information is stored locally and shared with the AI so it can personalise responses.</div>
           <div class="form-group">
             <label>Full name</label>
-            <input type="text" id="cfg-profile-name" placeholder="Your name">
+            <input type="text" id="cfg-profile-name" disabled placeholder="Your name">
           </div>
           <div class="form-group">
             <label>Email</label>
-            <input type="email" id="cfg-profile-email" placeholder="Optional">
+            <input type="email" id="cfg-profile-email" disabled placeholder="Optional">
           </div>
           <div class="form-group">
             <label>Phone</label>
-            <input type="tel" id="cfg-profile-phone" placeholder="Optional">
+            <input type="tel" id="cfg-profile-phone" disabled placeholder="Optional">
           </div>
           <div class="form-group">
             <label>Address</label>
-            <textarea id="cfg-profile-address" rows="2" placeholder="Optional"></textarea>
+            <textarea id="cfg-profile-address" disabled rows="2" placeholder="Optional"></textarea>
           </div>
           <div class="form-group" style="margin-bottom:0">
             <label>Notes</label>
-            <textarea id="cfg-profile-notes" rows="3" placeholder="Anything else the AI should remember about you…"></textarea>
+            <textarea id="cfg-profile-notes" disabled rows="3" placeholder="Anything else the AI should remember about you…"></textarea>
           </div>
         </div>
       </div>
@@ -6254,6 +6254,15 @@ _HTML = r"""<!DOCTYPE html>
               </label>
               <button class="btn-sm" onclick="showCronForm()" id="cron-add-btn">＋ New cron</button>
             </div>
+          </div>
+
+          <div class="pref-row" style="margin-bottom:16px">
+            <div><label for="cron-parallel-limit">Maximum parallel scheduled jobs</label>
+              <div class="form-hint">Independent jobs can run together. Each scheduled task runs only once at a time.</div>
+              <span id="cron-capacity-state" role="status"></span></div>
+            <div><input id="cron-parallel-limit" type="number" min="1" max="32" disabled style="width:75px">
+              <button class="btn-sm" onclick="saveCronParallelLimit()">Save parallel limit</button>
+              <span id="cron-parallel-message" role="status"></span></div>
           </div>
 
           <!-- Inline create form -->
@@ -8558,6 +8567,7 @@ function addArtifactLinks(bubble, artifacts) {
     wrap.appendChild(downloadLink);
   });
   if (wrap.children.length) {
+    bubble.querySelectorAll('.artifact-list').forEach(existing => existing.remove());
     bubble.appendChild(wrap);
     ensureBubbleTimestamp(bubble);
   }
@@ -11965,7 +11975,8 @@ function setUpdateResult(kind, title, message, opts = {}) {
     toPill.textContent = '';
   }
 }
-function startUpdate() {
+async function startUpdate() {
+  if (updateRunning) return;
   updateRunning = true;
   document.getElementById('update-idle').style.display = 'none';
   document.getElementById('update-running').style.display = 'block';
@@ -11973,7 +11984,21 @@ function startUpdate() {
   document.getElementById('update-restart-btn').style.display = 'none';
 
   const log = document.getElementById('update-log');
-  const es  = new EventSource('/api/update');
+  let started;
+  try {
+    const response = await fetch('/api/update', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({request_key:crypto.randomUUID()})});
+    started = await response.json();
+    if (!response.ok) throw new Error(started.error || 'Could not start the update.');
+  } catch(error) {
+    updateRunning = false;
+    document.getElementById('update-close-btn').disabled = false;
+    document.getElementById('update-running').style.display = 'none';
+    document.getElementById('update-done').style.display = 'block';
+    setUpdateResult('error', 'Update could not start', error.message);
+    return;
+  }
+  const es = new EventSource(started.stream_url);
 
   es.onmessage = (e) => {
     const d = JSON.parse(e.data);
@@ -12024,12 +12049,11 @@ function startUpdate() {
   };
 
   es.onerror = () => {
-    es.close();
-    updateRunning = false;
-    document.getElementById('update-close-btn').disabled = false;
-    document.getElementById('update-running').style.display = 'none';
-    document.getElementById('update-done').style.display = 'block';
-    setUpdateResult('error', 'Connection lost', 'The update stream disconnected. Check the logs before retrying.');
+    if (es.readyState === EventSource.CLOSED && updateRunning) {
+      updateRunning = false;
+      document.getElementById('update-close-btn').disabled = false;
+      setUpdateResult('error', 'Connection lost', 'Reconnect to the existing update before starting another.');
+    }
   };
 }
 
@@ -12228,9 +12252,18 @@ function openSettings() {
   overlay.style.display = 'flex';
   settingsSnapshotReady = false;
   settingsDirtyExplicit = false;
+  // Lazy forms belong to this opening of Settings. Discarded values from a
+  // previous opening must not be displayed or saved with another tab's edits.
+  preferencesLoaded = false;
+  profileSettingsLoaded = false;
+  window.__nullionProfileLoaded = false;
+  usersTabLoaded = false;
+  connectionsTabLoaded = false;
   renderSkillPackOptions(DEFAULT_SKILL_PACK_CATALOG, '');
   renderCapabilityDependencies([]);
   refreshSettingsBaseline();
+  const activeTab = overlay.querySelector('.settings-tab.active');
+  if (activeTab) showTab(activeTab.id.slice(4), overlay.querySelector('.snav-btn.active'));
 }
 
 async function closeSettings() {
@@ -13419,6 +13452,10 @@ async function loadConfig(options = {}) {
 async function loadProfileSettings(options = {}) {
   if (profileSettingsLoaded) return;
   if (options.skipSettingsApplyIfDirty && settingsDirtyExplicit) return;
+  // Prevent hydration from racing an operator editing a still-loading field.
+  profileSettingsLoaded = true;
+  const fields = Array.from(document.querySelectorAll('#tab-profile input, #tab-profile textarea'));
+  fields.forEach(field => { field.disabled = true; });
   try {
     const p = await API('/api/profile');
     if (settingsDirtyExplicit) {
@@ -13434,7 +13471,8 @@ async function loadProfileSettings(options = {}) {
     window.__nullionProfileLoaded = true;
     profileSettingsLoaded = true;
     markSettingsCleanAfterLazyLoad();
-  } catch(e) { /* silent */ }
+  } catch(e) { profileSettingsLoaded = false; }
+  finally { fields.forEach(field => { field.disabled = false; }); }
 }
 
 async function loadHeaderConfig(options = {}) {
@@ -15451,7 +15489,7 @@ async function saveConfig() {
     notes:   document.getElementById('cfg-profile-notes').value.trim(),
     _allow_clear: window.__nullionProfileLoaded === true,
   };
-  const profileSave = fetch('/api/profile', {
+  const profileSave = profileSettingsLoaded && window.__nullionProfileLoaded === true ? fetch('/api/profile', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify(profilePayload),
@@ -15461,7 +15499,7 @@ async function saveConfig() {
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) throw new Error(data.error || 'Profile save failed');
     return data;
-  });
+  }) : Promise.resolve();
 
   try {
     const [res] = await Promise.all([
@@ -16054,7 +16092,12 @@ addMessage = function(role, text, isError = false, metadata = null) {
 // Patch finalizeBotMsg to save the complete bot reply once streaming finishes
 const _origFinalizeBotMsg = finalizeBotMsg;
 finalizeBotMsg = function(fallback = null, isError = false, turnId = null) {
-  const bubble = _origFinalizeBotMsg(fallback, isError, turnId);
+  const pendingMetadata = _messageMetadataByTurn.get(turnId || '__current__');
+  const hasAttachments = pendingMetadata && Array.isArray(pendingMetadata.artifacts) && pendingMetadata.artifacts.length > 0;
+  // A verified attachment is a terminal result even when its MEDIA directive
+  // was stripped from the visible text by the server.
+  const visibleFallback = !String(fallback || '').trim() && hasAttachments ? 'File attached.' : fallback;
+  const bubble = _origFinalizeBotMsg(visibleFallback, isError, turnId);
   if (bubble) {
     const text = bubble.dataset.rawText || '';
     const cleanText = String(text || '').trim();
@@ -16724,8 +16767,8 @@ function cronNextRunLabel(job) {
 function cronHealthLabel(status) {
   return ({paused:'Paused', running:'Checking now', no_match:'Checked — no match',
     match:'Match found', succeeded:'Completed', incomplete:'Check incomplete', delivery_failed:'Result delivery failed',
-    needs_attention:'Needs attention', waiting_for_approval:'Waiting for approval',
-    cancelled:'Stopped', not_checked:'Not checked yet'})[status?.state] || 'Not checked yet';
+    needs_attention:'Needs attention', delayed:'Check delayed', waiting_for_approval:'Waiting for approval',
+    cancelled:'Stopped', interrupted:'Check interrupted', not_checked:'Not checked yet'})[status?.state] || 'Not checked yet';
 }
 
 function cronCheckTime(value) {
@@ -16735,32 +16778,65 @@ function cronCheckTime(value) {
 }
 
 function cronHealthDetails(job) {
-  const status = job.tracker_status;
-  if (!status) return '';
+  const status = job.tracker_status || {};
+  const options = job.artifact_delivery_options || {};
+  const monitoring = options.doctor_monitoring_enabled ?? options.tracker_status_notifications ?? true;
+  const limit = options.doctor_streak_limit ?? 12;
   return `<div class="cron-meta cron-health" role="status">${escHtml(cronHealthLabel(status))}</div>
     <div class="cron-meta">Last attempt: ${escHtml(cronCheckTime(status.last_attempt_at))}<br>
     Last successful check: ${escHtml(cronCheckTime(status.last_success_at))}</div>
-    ${status.is_tracker ? `<div class="cron-meta">Past 24 hours: ${Number(status.successful_checks_24h) || 0} successful · ${Number(status.incomplete_checks_24h) || 0} incomplete</div>
-    <label class="cron-meta"><input type="checkbox" ${status.notifications_enabled ? 'checked' : ''}
-      onchange="toggleTrackerUpdates('${escHtml(job.id)}', this.checked)"> Daily summary and health notices</label>` : ''}`;
+    <div class="cron-meta">Past 24 hours: ${Number(status.successful_checks_24h) || 0} successful · ${Number(status.incomplete_checks_24h) || 0} incomplete</div>
+    <details class="cron-meta cron-doctor-settings"><summary>Doctor monitoring</summary>
+      <label for="cron-doctor-${job.id}"><input id="cron-doctor-${job.id}" type="checkbox" ${monitoring ? 'checked' : ''}> Monitor this scheduled task</label><br>
+      <label for="cron-limit-${job.id}">Notify after consecutive checks:</label>
+      <input id="cron-limit-${job.id}" type="number" min="1" max="1000" value="${Number(limit)}" style="width:75px">
+      <p>One notice for repeated failed checks${status.is_tracker ? ' or successful checks with no match' : ''}. Verified matches are still delivered immediately.</p>
+      <button class="btn-sm" onclick="saveCronDoctorSettings('${job.id}')">Save monitoring</button>
+      <span id="cron-doctor-message-${job.id}" role="status"></span>
+    </details>`;
 }
 
-async function toggleTrackerUpdates(id, enabled) {
+async function saveCronDoctorSettings(id) {
   const job = _cronsCache.find(j => j.id === id);
   if (!job) return;
+  const message = document.getElementById('cron-doctor-message-' + id);
+  const limitInput = document.getElementById('cron-limit-' + id);
+  if (!limitInput.reportValidity()) return;
+  const options = {...(job.artifact_delivery_options || {}),
+    doctor_monitoring_enabled:document.getElementById('cron-doctor-' + id).checked,
+    doctor_streak_limit:Number(limitInput.value)};
   try {
-    const r = await fetch('/api/crons/' + encodeURIComponent(id), {method:'PATCH',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({artifact_delivery_options:{
-        ...(job.artifact_delivery_options || {}), tracker_status_notifications:enabled}})});
-    const result = await r.json();
-    if (!result.ok) alert('Could not update tracker notifications.');
-  } catch(e) { alert('Could not update tracker notifications.'); }
-  await loadCronsTab();
+    const response = await fetch('/api/crons/' + encodeURIComponent(id), {method:'PATCH',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({artifact_delivery_options:options})});
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || 'Could not save monitoring.');
+    await loadCronsTab();
+    const updated = document.getElementById('cron-doctor-message-' + id);
+    if (updated) { updated.closest('details').open = true; updated.textContent = 'Saved'; }
+  } catch(error) { message.textContent = error.message || 'Could not save monitoring.'; }
+}
+
+async function saveCronParallelLimit() {
+  const input = document.getElementById('cron-parallel-limit');
+  const message = document.getElementById('cron-parallel-message');
+  if (!input.reportValidity()) return;
+  try {
+    const response = await fetch('/api/cron-scheduler',{method:'PUT',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({max_parallel_jobs:Number(input.value)})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not save parallel limit.');
+    await loadCronsTab(); message.textContent = 'Saved';
+  } catch(error) { message.textContent = error.message || 'Could not save parallel limit.'; }
 }
 
 async function loadCronsTab() {
   try {
-    const jobs = await fetch('/api/crons').then(r => r.json());
+    const [jobs,capacity] = await Promise.all([
+      fetch('/api/crons').then(r => r.json()),fetch('/api/cron-scheduler').then(r => r.json())]);
+    const limit = document.getElementById('cron-parallel-limit');
+    if (limit) { limit.value = capacity.max_parallel_jobs; limit.disabled = false; }
+    const capacityState = document.getElementById('cron-capacity-state');
+    if (capacityState) capacityState.textContent = `${capacity.running_jobs} running · limit ${capacity.max_parallel_jobs}`;
     _cronsCache = jobs;
     populateCronWorkspaceFilter(jobs);
     renderCronsTab(jobs);
@@ -16817,6 +16893,7 @@ function renderCronsTab(jobs) {
           ${j.last_run ? '&nbsp;·&nbsp; last ' + new Date(j.last_run).toLocaleString() : ''}
           ${!j.tracker_status && j.last_result && j.last_result !== 'ok' ? `${NI.warn()} ${escHtml(j.last_result)}` : ''}
         </div>
+        ${j.scheduler_status === 'waiting_for_capacity' ? '<div class="cron-meta">Waiting for a worker</div>' : j.scheduler_status === 'running' ? '<div class="cron-meta">Running now</div>' : ''}
         ${cronHealthDetails(j)}
         <div class="cron-meta">Delivery: ${escHtml(cronDeliveryLabel(j))}</div>
         <div class="cron-meta cron-task">${escHtml(j.task.slice(0, 120))}${j.task.length > 120 ? '…' : ''}</div>
@@ -18383,6 +18460,10 @@ def _web_delivery_artifact_paths(
     ]
     candidates = filter_source_artifact_paths(
         list(dict.fromkeys(str(path) for path in candidates if str(path or "").strip())), tool_results)
+    from nullion.chat_operator import _excluded_attachment_extensions_from_tool_scope
+    excluded_extensions = _excluded_attachment_extensions_from_tool_scope(tool_results)
+    normalized_required_extensions = tuple(extension for extension in normalized_required_extensions
+                                          if extension not in excluded_extensions)
     if email_attachment_paths:
         # An email send's attachment list is the typed delivery contract. Earlier
         # helper artifacts may include source media or drafts that should not be
@@ -20652,7 +20733,7 @@ def _unique_download_path(name: str, *, downloads_dir: Path | None = None) -> Pa
 
 
 def _known_log_files() -> list[Path]:
-    logs_dir = Path.home() / ".nullion" / "logs"
+    logs_dir = _web_nullion_home_path() / "logs"
     names = ("nullion.log", "nullion-error.log", "telegram.log", "telegram.error.log")
     return [logs_dir / name for name in names if (logs_dir / name).exists()]
 
@@ -22216,17 +22297,17 @@ def create_app(runtime, orchestrator, registry):
             from nullion.cron_delivery import cron_conversation_id
             from nullion.tracker_status import _label
             conv_id = cron_conversation_id(job, channel, target)
-            display_job = replace(job, name="Your trackers" if kind == "daily" else _label(job.name))
+            display_job = replace(job, name=_label(job.name))
             if channel == "web":
-                delivered = _save_cron_web_delivery(display_job, conv_id, text, [], {"tracker_notice_kind": kind}, run_label="Tracker update", message_only=True)
+                delivered = _save_cron_web_delivery(display_job, conv_id, text, [], {"tracker_notice_kind": kind}, run_label="Doctor", message_only=True)
             else:
-                delivered = _send_cron_platform_delivery(display_job, channel, target, text, run_label="Tracker update", message_only=True)
+                delivered = _send_cron_platform_delivery(display_job, channel, target, text, run_label="Doctor", message_only=True)
             if delivered:
                 if channel != "web":
                     try:
                         from nullion.chat_store import get_chat_store
-                        get_chat_store().save_message(conv_id, "bot", scheduled_task_delivery_text(display_job, text, run_label="Tracker update"),
-                                                      metadata={"source": "tracker_status", "notification_kind": kind})
+                        get_chat_store().save_message(conv_id, "bot", scheduled_task_delivery_text(display_job, text, run_label="Doctor"),
+                                                      metadata={"source": "doctor_cron_monitor", "notification_kind": kind})
                     except Exception:
                         logger.warning("Could not save tracker notification history", exc_info=True)
                 _record_cron_delivery_event("cron.tracker_status.sent", job, channel, target, conv_id, notification_kind=kind)
@@ -22236,11 +22317,13 @@ def create_app(runtime, orchestrator, registry):
                     logger.warning("Could not checkpoint tracker notification receipt", exc_info=True)
             return delivered
 
+        from nullion.doctor_crons import sync_cron_doctor_action
         return dispatch_tracker_updates(tracker_health_path, jobs, resolve_route=route, send=send, now=now,
-                                        current_jobs=lambda: load_crons(refresh_next_runs=False))
+            current_jobs=lambda: load_crons(refresh_next_runs=False),
+            observe=lambda job,facts,notice,scope: sync_cron_doctor_action(runtime,job,facts,notice,scope=scope))
 
     app.state.tracker_status_tick = _tracker_status_tick
-    _cron_scheduler = CronScheduler(fire_fn=_cron_fire, status_fn=_tracker_status_tick)
+    _cron_scheduler = CronScheduler(fire_fn=_cron_fire, status_fn=_tracker_status_tick,store_path=tracker_health_path)
     _cron_scheduler.start()
     app.router.on_shutdown.append(_cron_scheduler.stop)
 
@@ -22435,6 +22518,23 @@ def create_app(runtime, orchestrator, registry):
 
     # ── Cron REST endpoints ────────────────────────────────────────────────────
 
+    app.state.cron_scheduler = _cron_scheduler
+
+    @app.get("/api/cron-scheduler")
+    async def cron_scheduler_settings():
+        return JSONResponse(_cron_scheduler.snapshot())
+
+    @app.put("/api/cron-scheduler")
+    async def update_cron_scheduler_settings(request: Request):
+        try:
+            body = await request.json()
+            if set(body) != {"max_parallel_jobs"}:
+                raise ValueError("Provide max_parallel_jobs only")
+            _cron_scheduler.set_max_parallel_jobs(body["max_parallel_jobs"])
+            return JSONResponse(_cron_scheduler.snapshot())
+        except (ValueError,TypeError) as exc:
+            return JSONResponse({"ok":False,"error":str(exc)},status_code=400)
+
     @app.get("/api/crons")
     async def list_crons_endpoint():
         from nullion.crons import cron_display_fields, cron_display_timezone, load_crons
@@ -22444,8 +22544,10 @@ def create_app(runtime, orchestrator, registry):
         cron_tz = cron_display_timezone()
         jobs = load_crons()
         health = tracker_statuses(tracker_health_path, jobs)
+        scheduling = _cron_scheduler.snapshot(jobs)
         for job in jobs:
             item = job.to_dict()
+            item["scheduler_status"] = scheduling["jobs"].get(job.id,"scheduled")
             item.update(cron_display_fields(job, tz=cron_tz))
             if job.id in health:
                 item["tracker_status"] = health[job.id]
@@ -22488,6 +22590,8 @@ def create_app(runtime, orchestrator, registry):
                 artifact_delivery_options=artifact_delivery_options,
             )
             return JSONResponse({"ok": True, "job": job.to_dict()})
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -22512,6 +22616,8 @@ def create_app(runtime, orchestrator, registry):
             if job is None:
                 return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
             return JSONResponse({"ok": True, "job": job.to_dict()})
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -26426,57 +26532,79 @@ def create_app(runtime, orchestrator, registry):
 
         return JSONResponse({"ok": True, "updated": list(updates.keys()), **live_reload_errors})
 
-    @app.get("/api/update")
-    async def update_stream(request: Request):
-        """Server-Sent Events stream for the update flow."""
-        from fastapi.responses import StreamingResponse
-        from nullion.updater import run_update, UpdateProgress
-        import asyncio
+    from nullion.update_operations import UpdateOperations
+    update_operations = UpdateOperations(Path(getattr(runtime, "checkpoint_path", None) or _web_nullion_home_path() / "runtime.db"))
+    update_tasks: set[asyncio.Task] = set()
 
-        queue: asyncio.Queue[UpdateProgress | None] = asyncio.Queue()
+    async def _wait_for_updates() -> None:
+        if update_tasks:
+            await asyncio.gather(*tuple(update_tasks), return_exceptions=True)
 
-        def emit(p: UpdateProgress) -> None:
-            queue.put_nowait(p)
+    app.router.on_shutdown.append(_wait_for_updates)
 
-        async def _sse():
-            web_port = request.url.port or 8742
-            task = asyncio.create_task(run_update(emit=emit, web_port=web_port))
-            while True:
+    @app.post("/api/update")
+    async def start_update(request: Request):
+        # CLI callers can obtain this token from /api/session as well. A plain
+        # GET or a cross-site request cannot start an installer mutation.
+        if not secrets.compare_digest(request.headers.get("x-nullion-csrf", ""), csrf_token):
+            return _csrf_response()
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("request_key"), str) or not 1 <= len(body["request_key"]) <= 128:
+            return JSONResponse({"error": "Provide a request_key of 1 to 128 characters."}, status_code=400)
+        operation_id, created = await asyncio.to_thread(update_operations.start, body["request_key"])
+        if created:
+            async def execute_update():
+                from nullion.updater import run_update
+                def emit(progress):
+                    update_operations.append(operation_id, {"step": progress.step, "message": progress.message, "ok": progress.ok})
                 try:
-                    p = await asyncio.wait_for(queue.get(), timeout=1.0)
-                    if p is None:
-                        break
-                    data = json.dumps({"step": p.step, "message": p.message, "ok": p.ok})
-                    yield f"data: {data}\n\n"
-                except asyncio.TimeoutError:
-                    if task.done():
-                        result = task.result()
-                        final = json.dumps({
-                            "step": "complete",
-                            "success": result.success,
-                            "rolled_back": result.rolled_back,
-                            "from_version": result.from_version,
-                            "to_version": result.to_version,
-                            "error": result.error,
-                        })
-                        yield f"data: {final}\n\n"
-                        break
-                    yield ": ping\n\n"
+                    result = await run_update(emit=emit, web_port=request.url.port or 8742,
+                                              env_path=os.environ.get("NULLION_ENV_FILE"), checkpoint_path=getattr(runtime, "checkpoint_path", None))
+                    event = {"step": "complete", "success": result.success, "rolled_back": result.rolled_back,
+                             "from_version": result.from_version, "to_version": result.to_version, "error": result.error}
+                except asyncio.CancelledError:
+                    # run_update waits for its shielded installer graph before
+                    # propagating cancellation, so observation can now terminate.
+                    update_operations.append(operation_id, {"step": "complete", "success": False,
+                        "rolled_back": False, "error": "The update observer stopped. Check the installed version before retrying."}, complete=True)
+                    raise
+                except Exception as exc:
+                    logger.exception("Update operation failed")
+                    event = {"step": "complete", "success": False, "rolled_back": False, "error": str(exc)}
+                update_operations.append(operation_id, event, complete=True)
+            task = asyncio.create_task(execute_update())
+            update_tasks.add(task)
+            task.add_done_callback(update_tasks.discard)
+        return JSONResponse({"operation_id": operation_id, "stream_url": "/api/update/" + operation_id}, status_code=202)
 
-            # drain any remaining items
-            while not queue.empty():
-                p = queue.get_nowait()
-                if p:
-                    data = json.dumps({"step": p.step, "message": p.message, "ok": p.ok})
-                    yield f"data: {data}\n\n"
+    @app.get("/api/update")
+    async def update_observation_only():
+        return JSONResponse({"error": "Start an update with POST; observe its returned stream URL."}, status_code=405)
 
-        return StreamingResponse(
-            _sse(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+    @app.get("/api/update/{operation_id}")
+    async def update_stream(request: Request, operation_id: str):
+        from fastapi.responses import StreamingResponse
+        if await asyncio.to_thread(update_operations.read, operation_id) is None:
+            return JSONResponse({"error": "Update operation not found."}, status_code=404)
+        try:
+            cursor = max(0, int(request.headers.get("last-event-id", "0")))
+        except ValueError:
+            return JSONResponse({"error": "Invalid event cursor."}, status_code=400)
+        async def events():
+            nonlocal cursor
+            while not await request.is_disconnected():
+                record = await asyncio.to_thread(update_operations.read, operation_id)
+                for event in record["events"][cursor:]:
+                    cursor += 1
+                    yield f"id: {cursor}\ndata: {json.dumps(event)}\n\n"
+                if record["status"] != "running":
+                    return
+                yield ": ping\n\n"
+                await asyncio.sleep(0.25)
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    _PROFILE_PATH = Path.home() / ".nullion" / "profile.json"
+    _PROFILE_PATH = _web_nullion_home_path() / "profile.json"
 
     @app.get("/api/profile")
     async def get_profile():
@@ -26925,6 +27053,10 @@ def create_app(runtime, orchestrator, registry):
             logger.debug("Could not schedule web chat startup warmup", exc_info=True)
 
     async def _stop_reminder_delivery_loop() -> None:
+        recovery = getattr(app.state, "nullion_delivery_recovery_task", None)
+        if recovery is not None:
+            recovery.cancel()
+            await asyncio.gather(recovery, return_exceptions=True)
         task = getattr(app.state, "nullion_reminder_task", None)
         if task is None:
             return
@@ -26935,6 +27067,13 @@ def create_app(runtime, orchestrator, registry):
             pass
 
     add_event_handler = getattr(app, "add_event_handler", None)
+    async def _start_delivery_recovery() -> None:
+        if hasattr(orchestrator, "run_delivery_recovery"):
+            _wire_web_mini_agent_delivery()
+            app.state.nullion_delivery_recovery_task = asyncio.create_task(
+                orchestrator.run_delivery_recovery(runtime, surface="web"))
+
+    app.router.on_startup.append(_start_delivery_recovery)
     if add_event_handler is not None:
         add_event_handler("startup", _start_chat_startup_warmup)
         add_event_handler("startup", _start_reminder_delivery_loop)
@@ -26948,7 +27087,7 @@ def create_app(runtime, orchestrator, registry):
         if not hasattr(orchestrator, "set_deliver_fn"):
             return
 
-        def _web_deliver_fn(conversation_id: str, text: str, **kwargs) -> None:
+        def _web_deliver_fn(conversation_id: str, text: str, **kwargs) -> bool:
             normalized_conversation_id = str(conversation_id or "")
             if not normalized_conversation_id.startswith("web:"):
                 delivery_group_id = str(kwargs.get("group_id") or "")
@@ -26963,12 +27102,12 @@ def create_app(runtime, orchestrator, registry):
                 )
                 channel, _sep, target = normalized_conversation_id.partition(":")
                 if cron_job is None or channel not in {"telegram", "slack", "discord"}:
-                    return
+                    return False
                 text = str(text or "").strip()
                 if not text:
-                    return
+                    return False
                 if kwargs.get("is_status"):
-                    return
+                    return True
                 if (
                     _should_suppress_active_cron_no_output_delivery(
                         text,
@@ -26976,7 +27115,7 @@ def create_app(runtime, orchestrator, registry):
                         runtime.store,
                     )
                 ):
-                    return
+                    return True
                 delivery_text = f"MEDIA:{text}" if kwargs.get("is_artifact") else text
                 sent = _send_cron_platform_delivery(cron_job, channel, target, delivery_text)
                 if sent and kwargs.get("is_final") and (
@@ -26986,10 +27125,10 @@ def create_app(runtime, orchestrator, registry):
                         normalized_conversation_id,
                         group_id=delivery_group_id,
                     )
-                return
+                return bool(sent)
             text = str(text or "").strip()
             if not text:
-                return
+                return False
             delivery_group_id = str(kwargs.get("group_id") or "")
             if kwargs.get("is_artifact"):
                 artifacts = _web_artifact_descriptors(runtime, [text], principal_id=conversation_id)
@@ -27013,6 +27152,7 @@ def create_app(runtime, orchestrator, registry):
                         )
                     except Exception:
                         logger.debug("Could not persist web mini-agent artifact delivery", exc_info=True)
+                        return False
                     loop = _WEB_DELIVERY_LOOP
                     if loop is not None and not loop.is_closed():
                         try:
@@ -27027,7 +27167,7 @@ def create_app(runtime, orchestrator, registry):
                             )
                         except Exception:
                             logger.debug("Could not broadcast web mini-agent artifact delivery", exc_info=True)
-                    return
+                    return True
                 filename = Path(text).name or "the generated file"
                 artifact_text = (
                     f"I couldn't attach `{filename}` because it was saved outside the downloadable workspace. "
@@ -27056,11 +27196,11 @@ def create_app(runtime, orchestrator, registry):
                         )
                     except Exception:
                         logger.debug("Could not broadcast web mini-agent artifact delivery failure", exc_info=True)
-                return
+                return False
             if kwargs.get("is_status"):
                 status_kind = str(kwargs.get("status_kind") or "")
                 if status_kind != "task_summary" and not activity_trace_enabled():
-                    return
+                    return True
                 status_text = text
                 if status_kind == "tool_activity":
                     status_text = compact_tool_activity_text(
@@ -27068,7 +27208,7 @@ def create_app(runtime, orchestrator, registry):
                         label=str(kwargs.get("activity_label") or ""),
                     )
                     if not status_text:
-                        return
+                        return True
                 loop = _WEB_DELIVERY_LOOP
                 if loop is not None and not loop.is_closed():
                     try:
@@ -27088,15 +27228,16 @@ def create_app(runtime, orchestrator, registry):
                         )
                     except Exception:
                         logger.debug("Could not broadcast web mini-agent status", exc_info=True)
-                return
+                return True
             try:
                 from nullion.chat_store import get_chat_store
                 get_chat_store().save_message(conversation_id, "bot", text, is_error=False)
             except Exception:
                 logger.debug("Could not persist web mini-agent delivery", exc_info=True)
+                return False
             loop = _WEB_DELIVERY_LOOP
             if loop is None or loop.is_closed():
-                return
+                return True
             try:
                 asyncio.run_coroutine_threadsafe(
                     _broadcast_web_background_message(conversation_id, text, group_id=delivery_group_id),
@@ -27104,6 +27245,7 @@ def create_app(runtime, orchestrator, registry):
                 )
             except Exception:
                 logger.debug("Could not broadcast web mini-agent delivery", exc_info=True)
+            return True
 
         orchestrator.set_deliver_fn(_web_deliver_fn)
         if hasattr(orchestrator, "set_checkpoint_fn"):

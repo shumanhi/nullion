@@ -181,17 +181,6 @@ def format_tool_inventory_activity_detail(
     return format_activity_sublist_line(f"Tools: {', '.join(visible)}{suffix}")
 
 
-def format_tool_results_activity_detail(tool_results: Iterable[Any]) -> str:
-    lines: list[str] = []
-    for result in tool_results or ():
-        status = str(_tool_field(result, "status", "unknown") or "unknown")
-        tool_name = str(_tool_field(result, "tool_name", "tool") or "tool")
-        detail = _short_tool_detail(result)
-        suffix = f" — {detail}" if detail else ""
-        normalized = status.lower()
-        status_suffix = "" if normalized in {"completed", "approved", "ok", "success"} else f" — {status}"
-        lines.append(f"{_tool_status_icon(status)} {tool_name}{suffix or status_suffix}")
-    return format_activity_detail_lines(lines)
 
 
 def _short_tool_detail(tool_result: Any) -> str:

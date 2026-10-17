@@ -110,7 +110,6 @@ _PDF_EXTENSIONS = frozenset({".pdf"})
 _PRESENTATION_EXTENSIONS = frozenset({".ppt", ".pptx"})
 _SPREADSHEET_EXTENSIONS = frozenset({".xls", ".xlsx"})
 _DOCUMENT_EXTENSIONS = frozenset({".doc", ".docx"})
-_PLANNER_FALLBACK_ARTIFACT_EXTENSIONS = (".csv", ".docx", ".html", ".pdf", ".pptx", ".xlsx")
 _TEXT_WRITE_EXTENSIONS = frozenset({"", ".csv", ".htm", ".html", ".json", ".md", ".svg", ".tsv", ".txt", ".yaml", ".yml"})
 _STRUCTURED_ARTIFACT_TOOLS = frozenset(
     {
@@ -1124,6 +1123,10 @@ class ScopedTurnToolRegistry:
         )
 
     def _is_allowed_tool_name(self, tool_name: str) -> bool:
+        # Core execution remains discoverable across capability scopes. The
+        # delegate still enforces availability, approval and execution policy.
+        if tool_name in _LOCAL_SHELL_TOOLS:
+            return True
         requested_extensions = set(self._evidence.requested_extensions).union(
             set(self.turn_tool_scope_decision.requested_artifact_extensions)
         ).union(
@@ -4254,18 +4257,18 @@ def _planner_materialized_registry(
     decision: TurnToolScopeDecision | None,
 ) -> ScopedTurnToolRegistry:
     existing = decision or TurnToolScopeDecision()
+    excluded_extensions = set(getattr(existing, "excluded_artifact_extensions", ()) or ())
     requested_extensions = tuple(
         dict.fromkeys(
-            [
+            extension for extension in [
                 *tuple(getattr(evidence, "requested_extensions", ()) or ()),
                 *tuple(getattr(existing, "requested_artifact_extensions", ()) or ()),
-                *_PLANNER_FALLBACK_ARTIFACT_EXTENSIONS,
-            ]
+            ] if extension not in excluded_extensions
         )
     )
     planner_evidence = TurnToolEvidence(
-        has_url_target=True,
-        has_attachments=True,
+        has_url_target=evidence.has_url_target,
+        has_attachments=evidence.has_attachments,
         has_email_address_target=evidence.has_email_address_target,
         requested_extensions=requested_extensions,
         context_linked=evidence.context_linked,
@@ -4278,11 +4281,7 @@ def _planner_materialized_registry(
         base_registry,
         evidence=planner_evidence,
         tool_scope_decision=TurnToolScopeDecision(
-            web_action=(
-                existing.web_action
-                if str(existing.web_action or "").strip().lower() not in {"", "none"}
-                else "browser_interaction"
-            ),
+            web_action=existing.web_action,
             scheduler_action=existing.scheduler_action,
             scheduler_toggle_enabled=existing.scheduler_toggle_enabled,
             scheduler_selection_policy=existing.scheduler_selection_policy,
@@ -4301,6 +4300,9 @@ def _planner_materialized_registry(
             ),
             required_tool_names=tuple(getattr(existing, "required_tool_names", ()) or ()),
             requested_artifact_extensions=requested_extensions,
+            excluded_artifact_extensions=tuple(getattr(existing, "excluded_artifact_extensions", ()) or ()),
+            source_artifact_delivery_requested=existing.source_artifact_delivery_requested,
+            source_artifact_request_evidence=existing.source_artifact_request_evidence,
             required_embedded_media_extensions=tuple(
                 getattr(existing, "required_embedded_media_extensions", ()) or ()
             ),
@@ -4494,6 +4496,8 @@ def turn_tool_registry_for_evidence(
             if any("personal_tasks" in getattr(spec, "capability_tags", ()) for spec in registry.list_specs()):
                 # Built-in persistent tasks must be discoverable on a first turn.
                 # Expose only the scope request; do not classify or read task data.
+                return ScopedTurnToolRegistry(registry, evidence=evidence)
+            if any(spec.name in _LOCAL_SHELL_TOOLS for spec in registry.list_specs()):
                 return ScopedTurnToolRegistry(registry, evidence=evidence)
             return PlainNoToolFastPathRegistry(registry)
         if _registry_has_scoped_special_tools(registry):

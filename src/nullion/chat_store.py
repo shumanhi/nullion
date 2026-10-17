@@ -207,6 +207,14 @@ def _artifact_metadata_from_runtime_turn(turn: dict) -> dict[str, Any] | None:
             return
         paths.append(str(candidate))
 
+    # A completed turn already selected its delivery package. Reconstructing it
+    # from every tool path also publishes file_read inputs and intermediate files.
+    if isinstance(turn.get("artifact_paths"), (list, tuple)):
+        for path in turn["artifact_paths"]:
+            add_path(path)
+        selected = filter_source_artifact_paths(list(dict.fromkeys(paths)), turn.get("tool_results") or ())
+        return {"artifacts": [{"path": path} for path in selected]} if selected else None
+
     for result in turn.get("tool_results") or ():
         if not isinstance(result, dict):
             continue

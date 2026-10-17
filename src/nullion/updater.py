@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 def _install_dir() -> Path:
-    return Path(os.environ.get("NULLION_INSTALL_DIR", Path.home() / ".nullion"))
+    return Path(os.environ.get("NULLION_INSTALL_DIR") or os.environ.get("NULLION_HOME") or Path.home() / ".nullion")
 
 def _pip_command() -> list[str]:
     """Run pip through Python so Windows does not lock pip.exe during updates."""
@@ -1332,6 +1332,30 @@ async def run_update(
     update_channel: str = "release",
 ) -> UpdateResult:
     """Full update flow. Calls emit() for each step so callers can stream progress."""
+    from nullion.entrypoint_guard import SingleInstanceLock
+    import hashlib
+
+    source = _src_dir().resolve()
+    lock = SingleInstanceLock("update-" + hashlib.sha256(str(source).encode()).hexdigest()[:24],
+                              lock_dir=source.parent / "locks")
+    if not await asyncio.to_thread(lock.acquire):
+        return UpdateResult(success=False, error="An update is already running for this installation.")
+    try:
+        task = asyncio.create_task(_run_update_locked(emit=emit, web_port=web_port,
+            ignore_check_failures=ignore_check_failures, env_path=env_path,
+            checkpoint_path=checkpoint_path, update_channel=update_channel))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Git/pip operations already running in a worker must reach a safe
+            # terminal state before another process can acquire this lock.
+            await task
+            raise
+    finally:
+        lock.release()
+
+
+async def _run_update_locked(*, emit, web_port, ignore_check_failures, env_path, checkpoint_path, update_channel):
     final_state = await _compiled_update_workflow_graph().ainvoke(
         {
             "emit": emit,
