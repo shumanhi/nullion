@@ -34,7 +34,7 @@ from nullion.artifacts import (
     media_candidate_paths_from_text,
 )
 from nullion.attachment_format_graph import is_domain_suffix_extension, plan_attachment_format
-from nullion.delegated_artifact_workflow import finalize_delegated_artifacts
+from nullion.delegated_artifact_workflow import finalize_delegated_artifacts, unresolved_group_tasks
 from nullion.mini_agent_runner import ProgressUpdate
 from nullion.task_queue import TaskGroup, TaskRecord, TaskRegistry, TaskStatus
 from nullion.task_status_format import format_task_status_line, format_task_status_summary
@@ -230,13 +230,23 @@ class ResultAggregator:
         if group.group_id in self._completed_groups:
             return
         self._completed_groups.add(group.group_id)
-        await self._deliver_status(gs, group, terminal=True)
         recovered_artifacts = finalize_delegated_artifacts(group)
-        preverified_artifacts = _artifact_paths_for_group_delivery(
-            group,
-            recovered_artifacts,
-            summary=None,
-        )
+        preverified_artifacts = _artifact_paths_for_group_delivery(group, recovered_artifacts, summary=None)
+        from nullion.artifact_validation import validate_artifact_paths
+        receipt_artifacts = preverified_artifacts if preverified_artifacts and validate_artifact_paths(preverified_artifacts).ok else []
+        unresolved = unresolved_group_tasks(group, recovered_artifacts, receipt_artifacts)
+        await self._deliver_status(gs, group, terminal=True,
+            status_line_overrides={task.task_id: format_task_status_line(task) for task in unresolved} or None)
+        if unresolved:
+            summary = self._fallback_summary(group, include_findings=False)
+            requested_extension = _requested_attachment_extension_for_group(group, model_client=self._model_client)
+            if requested_extension:
+                summary = _merge_missing_requested_artifact_summary(group, summary,
+                    requested_extension=requested_extension)
+            await self._deliver(gs.conversation_id,
+                _summary_with_original_request_context(group, summary + " No report was published."), group_id=gs.group_id)
+            self._group_state.pop(gs.group_id, None)
+            return
         summary = (
             _artifact_recovery_summary(group, recovered_artifacts)
             if recovered_artifacts
@@ -260,19 +270,21 @@ class ResultAggregator:
         summary = _strip_attached_artifact_references(summary, deliverable_artifacts)
         if not deliverable_artifacts:
             summary = _strip_unverified_attachment_claims(summary)
-        await self._deliver(
-            gs.conversation_id,
-            _summary_with_original_request_context(group, summary),
-            group_id=gs.group_id,
-        )
-
-        # Deliver any artifacts.
+        # Only announce the completed report after every required upload has
+        # a receipt. File existence alone does not prove delivery.
         delivered_artifacts: list[str] = []
         for artifact in deliverable_artifacts:
             delivered = await self._deliver(gs.conversation_id, artifact, is_artifact=True, group_id=gs.group_id)
             if delivered:
                 delivered_artifacts.append(artifact)
-        if delivered_artifacts:
+        if len(delivered_artifacts) != len(deliverable_artifacts):
+            group.planner_metadata["delivery_status"] = "failed"
+            group.planner_metadata["undelivered_artifacts"] = [p for p in deliverable_artifacts if p not in delivered_artifacts]
+            summary = "I couldn't deliver all required report files. The request is not complete; please retry delivery."
+        else:
+            group.planner_metadata["delivery_status"] = "failed" if requested_extension and not deliverable_artifacts else "completed"
+        await self._deliver(gs.conversation_id, _summary_with_original_request_context(group, summary), group_id=gs.group_id)
+        if delivered_artifacts and len(delivered_artifacts) == len(deliverable_artifacts):
             await self._deliver_status(
                 gs,
                 group,
@@ -339,7 +351,7 @@ class ResultAggregator:
             logger.debug("ResultAggregator: summary LLM call failed: %s", exc)
             return self._fallback_summary(group)
 
-    def _fallback_summary(self, group: TaskGroup) -> str:
+    def _fallback_summary(self, group: TaskGroup, *, include_findings: bool = True) -> str:
         """Plain-text summary when LLM call fails or is unavailable."""
         done = sum(1 for t in group.tasks if t.status == TaskStatus.COMPLETE)
         failed = sum(1 for t in group.tasks if t.status == TaskStatus.FAILED)
@@ -357,7 +369,7 @@ class ResultAggregator:
                 if task.result and task.result.output
                 else ""
             )
-            if preview:
+            if preview and include_findings:
                 parts.append(f"• {task.title}: {preview}")
             if task.status == TaskStatus.FAILED and task.result and task.result.error:
                 failure = _safe_result_text_preview(task.result.error, max_chars=180)

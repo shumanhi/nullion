@@ -1695,6 +1695,7 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         "list_crons": {
             "type": "object",
             "properties": {
+                "query": {"type": "string", "description": "Optional case-insensitive substring to find in stored cron names or task instructions. Use a distinctive term from the requested task; omit for all jobs."},
                 "workspace_id": {"type": "string", "description": "Workspace id to list. Defaults to the current workspace."},
                 "include_all_workspaces": {"type": "boolean", "description": "Whether to include crons from every workspace."},
             },
@@ -17969,12 +17970,21 @@ def _build_list_crons_handler():
         include_all = bool(args.get("include_all_workspaces", False))
         workspace_id = str(args.get("workspace_id") or "").strip() or workspace_id_for_principal(invocation.principal_id)
         jobs = list_crons(workspace_id=None if include_all else workspace_id)
+        total_count = len(jobs)
+        query = str(args.get("query") or "").strip().casefold()
+        if query:
+            # This is retrieval over a model-supplied tool argument, never
+            # classification or decomposition of the user's message.
+            jobs = [job for job in jobs if query in str(job.name).casefold()
+                    or query in str(job.task).casefold()]
         if not jobs:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="completed",
-                output={"crons": [], "count": 0, "message": "No crons scheduled."},
+                output={"crons": [], "count": 0,
+                        **({"query": query, "total_count": total_count} if query else {}),
+                        "message": "No scheduled tasks match this search." if query else "No crons scheduled."},
                 error=None,
             )
         lines = []
@@ -18019,6 +18029,7 @@ def _build_list_crons_handler():
             output={
                 "crons": crons,
                 "count": len(crons),
+                **({"query": query, "total_count": total_count} if query else {}),
                 "message": f"{header}\n\n" + "\n\n".join(lines),
             },
             error=None,
@@ -19205,8 +19216,8 @@ def register_cron_tools(
                 "Optional: enabled (bool, default true), workspace_id, delivery_channel, delivery_target, "
                 "html_image_delivery_mode (linked|auto|self_contained). "
                 "Set artifact_delivery_options.alert_delivery_mode explicitly from the user's notification requirements. "
-                "Conditional trackers include a daily summary and health notices by default; "
-                "set artifact_delivery_options.tracker_status_notifications=false to turn those off without disabling match alerts. "
+                "Doctor monitors completed runs and sends one notice after 12 consecutive failures or verified no-match checks. No daily summaries or recovery alerts. "
+                "Set artifact_delivery_options.doctor_monitoring_enabled=false to disable Doctor notices without disabling match alerts. "
                 "If workspace and delivery are omitted, Nullion uses the current workspace and chat adapter defaults."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
@@ -19227,7 +19238,8 @@ def register_cron_tools(
                 "List scheduled cron jobs for the current workspace with their id, workspace, schedule, "
                 "enabled state, next run time, last attempt, last successful check, verified check counts, "
                 "tracker health, and stored task instructions in structured output. "
-                "Optional args: workspace_id, include_all_workspaces."
+                "Use query to search stored names and instructions for a specific tracker instead of listing unrelated jobs. "
+                "Optional args: query, workspace_id, include_all_workspaces."
             ),
             risk_level=ToolRiskLevel.LOW,
             side_effect_class=ToolSideEffectClass.READ,
@@ -19258,7 +19270,7 @@ def register_cron_tools(
                 "Optional mutable fields: name, schedule, task, enabled, workspace_id, delivery_channel, "
                 "delivery_target, html_image_delivery_mode, artifact_delivery_options. "
                 "When changing notification requirements, also set artifact_delivery_options.alert_delivery_mode. "
-                "Use artifact_delivery_options.tracker_status_notifications (bool) for daily summaries and health notices; "
+                "Use artifact_delivery_options.doctor_monitoring_enabled (bool) and doctor_streak_limit (integer 1–1000, default 12) for Doctor monitoring; "
                 "preserve existing delivery options when updating it."
             ),
             risk_level=ToolRiskLevel.MEDIUM,
