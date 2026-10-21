@@ -245,13 +245,14 @@ class _SlackTextDeltaStreamer:
         now = time.monotonic()
         if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
             return
-        self._last_text = text
         self._last_update_at = now
         try:
-            asyncio.run_coroutine_threadsafe(
+            delivered = asyncio.run_coroutine_threadsafe(
                 _update_slack_message(self._client, channel=self._channel, ts=self._ts, text=_format_slack_reply(text)),
                 self._loop,
             ).result(timeout=2)
+            if delivered:
+                self._last_text = text
         except Exception:
             logger.debug("Slack text streaming update failed", exc_info=True)
 
@@ -639,6 +640,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
             message_id=ingress.message_id,
             reply_already_sent=reply_already_sent,
             send_text=_send_text,
+            finalize_stream=text_streamer.finish,
             send_attachments=lambda initial_comment, paths: _upload_slack_reply_files(
                 client,
                 channel=working_channel,
@@ -646,9 +648,7 @@ async def handle_slack_message(service, settings: NullionSettings, *, event: dic
                 initial_comment=_format_slack_reply(initial_comment or "") or None,
             ),
         )
-        if reply_already_sent and not result.delivery.attachments:
-            await text_streamer.finish(turn_result.reply)
-        elif result.attachments_sent:
+        if result.attachments_sent:
             if working_ts:
                 await _update_slack_message(
                     client,

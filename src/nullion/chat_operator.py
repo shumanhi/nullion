@@ -26447,19 +26447,16 @@ def handle_chat_operator_message(
     conversation_ingress_id: str | None = None,
     reply_context: dict[str, object] | None = None,
 ) -> str | None:
+    from nullion.messaging_adapters import messaging_chat_enabled
+
     message = text.strip()
     if not message:
         logger.info("Ignored blank Telegram text (chat_id=%s)", chat_id)
         return None
     planner_command = parse_planner_command(message)
 
-    configured_chat_id = None
-    chat_enabled = False
-    if settings is not None:
-        configured_chat_id = settings.telegram.operator_chat_id
-        chat_enabled = settings.telegram.chat_enabled
-
     channel_name, identity = _messaging_channel_and_identity_for_chat(chat_id)
+    chat_enabled = messaging_chat_enabled(channel_name, settings)
     if channel_name == "web":
         chat_enabled = True
     elif channel_name == "telegram" and not is_authorized_telegram_chat(chat_id, settings):
@@ -26508,7 +26505,7 @@ def handle_chat_operator_message(
                 )
                 return reply
         if not chat_enabled:
-            logger.info("Ignored non-command Telegram text (chat_id=%s, text=%s)", chat_id, message)
+            logger.info("Ignored non-command %s text (chat_id=%s)", channel_name, chat_id)
             return None
         reply = _render_chat_turn(
             runtime,
@@ -26574,7 +26571,7 @@ def handle_chat_operator_message(
         reply = _render_telegram_health(runtime)
     elif planner_command.requested:
         if not chat_enabled:
-            reply = "Telegram chat is disabled."
+            reply = f"{channel_name.title()} chat is disabled."
         elif not planner_command.prompt:
             reply = "Usage: /planner <message>"
         else:
@@ -26600,7 +26597,7 @@ def handle_chat_operator_message(
             )
     elif _normalize_command_head(message) == "/chat":
         if not chat_enabled:
-            reply = "Telegram chat is disabled."
+            reply = f"{channel_name.title()} chat is disabled."
         else:
             reply = _render_chat_turn(
                 runtime,

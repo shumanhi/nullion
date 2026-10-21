@@ -2191,6 +2191,7 @@ async def execute_platform_reply_delivery(
     reply_already_sent: bool = False,
     send_text: PlatformTextSender,
     send_attachments: PlatformAttachmentSender | None = None,
+    finalize_stream: PlatformTextSender | None = None,
 ) -> PlatformDeliveryResult:
     """Run the common final-delivery boundary for chat platforms.
 
@@ -2206,6 +2207,15 @@ async def execute_platform_reply_delivery(
         artifact_paths=artifact_paths,
     )
     target = None if target_id is None else str(target_id)
+    if delivery.text and not delivery.attachments and finalize_stream is not None:
+        try:
+            # The adapter owns the transport acknowledgement. Reuse its existing
+            # streamed message only after the final text is confirmed delivered.
+            stream_delivered = bool(await finalize_stream(delivery.text))
+        except Exception:
+            logger.debug("Stream finalization failed; falling back to final delivery", exc_info=True)
+            stream_delivered = False
+        reply_already_sent = reply_already_sent or stream_delivered
     if reply_already_sent and not delivery.attachments:
         receipt = build_platform_delivery_receipt(
             channel=channel,

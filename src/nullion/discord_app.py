@@ -220,8 +220,12 @@ class _DiscordTextDeltaStreamer:
             if send is None:
                 return False
             self._message = await send(rendered)
+            self._last_text = text
             return True
-        return await _edit_discord_message(self._message, rendered)
+        delivered = await _edit_discord_message(self._message, rendered)
+        if delivered:
+            self._last_text = text
+        return delivered
 
     def emit(self, delta: str) -> None:
         if not delta or self._channel is None:
@@ -231,7 +235,6 @@ class _DiscordTextDeltaStreamer:
         now = time.monotonic()
         if self._last_text and now - self._last_update_at < 0.35 and len(text) - len(self._last_text) < 48:
             return
-        self._last_text = text
         self._last_update_at = now
         try:
             asyncio.run_coroutine_threadsafe(self._send_or_edit(text), self._loop).result(timeout=2)
@@ -596,7 +599,7 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
             await _send_discord_chunks_with_plain_fallback(message.channel, reply_text, limit=1900)
             return True
 
-        result = await execute_platform_reply_delivery(
+        await execute_platform_reply_delivery(
             reply,
             channel="discord",
             target_id=_optional_message_text(getattr(message.channel, "id", None)),
@@ -606,14 +609,13 @@ async def handle_discord_message(service, settings: NullionSettings, message) ->
             message_id=ingress.message_id,
             reply_already_sent=reply_already_sent,
             send_text=_send_text,
+            finalize_stream=text_streamer.finish,
             send_attachments=lambda initial_text, paths: _send_discord_reply_files(
                 message.channel,
                 text=initial_text,
                 paths=paths,
             ),
         )
-        if reply_already_sent and not result.delivery.attachments:
-            await text_streamer.finish(reply)
         _mark_timing("delivery_complete")
         _log_turn_timing(turn_outcome)
     finally:

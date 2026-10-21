@@ -49,6 +49,7 @@ from nullion.messaging_adapters import (
     build_platform_delivery_receipt,
     delivery_contract_for_turn,
     is_retryable_messaging_delivery_error,
+    messaging_chat_enabled,
     platform_delivery_failure_reply,
     principal_id_for_messaging_identity,
     prepare_reply_for_platform_delivery,
@@ -4074,6 +4075,7 @@ class ChatOperatorService:
     settings: NullionSettings
     model_client: object | None = None
     agent_orchestrator: object | None = None
+    chat_channels: tuple[str, ...] = field(default=("telegram",), kw_only=True)
     _inflight_chat_by_id: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     _turn_dispatch_tracker: AsyncTurnDispatchTracker = field(default_factory=AsyncTurnDispatchTracker)
     _activity_streams: _TelegramActivityRegistry = field(default_factory=_TelegramActivityRegistry)
@@ -4225,8 +4227,10 @@ class ChatOperatorService:
         next_settings = load_settings(env_path=env_path)
         self._apply_live_settings(next_settings)
 
-        if self.settings.telegram.chat_enabled:
-            next_client = _build_chat_model_client_with_fallback(self.settings, surface="Telegram")
+        chat_enabled = any(messaging_chat_enabled(channel, self.settings) for channel in self.chat_channels)
+        surface = "/".join(self.chat_channels)
+        if chat_enabled:
+            next_client = _build_chat_model_client_with_fallback(self.settings, surface=surface)
         else:
             next_client = None
 
@@ -4242,8 +4246,9 @@ class ChatOperatorService:
             pass
         self._live_config_signature_cache = self._live_config_signature()
         logger.info(
-            "Telegram live configuration refreshed (chat_enabled=%s provider=%s model=%s operator_chat_id=%s)",
-            self.settings.telegram.chat_enabled,
+            "%s live configuration refreshed (chat_enabled=%s provider=%s model=%s operator_chat_id=%s)",
+            surface,
+            chat_enabled,
             getattr(getattr(self.settings, "model", None), "provider", "?"),
             getattr(getattr(self.settings, "model", None), "openai_model", "?"),
             self.operator_chat_id or "",
@@ -6157,8 +6162,9 @@ def build_messaging_operator_service(
     settings: NullionSettings,
 ) -> ChatOperatorService:
     """Build the shared operator service for non-Telegram messaging adapters."""
+    chat_channels = ("slack", "discord")
     model_client = None
-    if settings.telegram.chat_enabled:
+    if any(messaging_chat_enabled(channel, settings) for channel in chat_channels):
         model_client = _build_chat_model_client_with_fallback(settings, surface="messaging")
 
     agent_orchestrator = None
@@ -6172,6 +6178,7 @@ def build_messaging_operator_service(
         settings=settings,
         model_client=model_client,
         agent_orchestrator=agent_orchestrator,
+        chat_channels=chat_channels,
     )
 
 
