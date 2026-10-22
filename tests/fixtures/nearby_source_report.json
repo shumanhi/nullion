@@ -1,0 +1,100 @@
+{
+  "result_kind": "source_observations",
+  "report_status": "partial",
+  "observations": [
+    {
+      "label": "Riverfront Park nearby listing",
+      "quote": "Riverfront Park\n4.7(802)\nTourist attraction ·  · Hudson Ave\nOpen · Closes 8:30 PM",
+      "source_index": 0,
+      "value": "Riverfront Park\n4.7(802)\nTourist attraction ·  · Hudson Ave\nOpen · Closes 8:30 PM"
+    },
+    {
+      "label": "The Peekskill Museum nearby listing",
+      "quote": "The Peekskill Museum\n4.5(24)\nTourist attraction · 124 Union Ave\nOpen · Closes 4 PM · (914) 736-0473",
+      "source_index": 0,
+      "value": "The Peekskill Museum\n4.5(24)\nTourist attraction · 124 Union Ave\nOpen · Closes 4 PM · (914) 736-0473"
+    },
+    {
+      "label": "Paramount Hudson Valley Theater nearby listing",
+      "quote": "Paramount Hudson Valley Theater\n4.7(960)\nLive music venue ·  · 1008 Brown St\nHistoric venue for the performing arts\n(914) 739-0039 ext. 2",
+      "source_index": 0,
+      "value": "Paramount Hudson Valley Theater\n4.7(960)\nLive music venue ·  · 1008 Brown St\nHistoric venue for the performing arts"
+    },
+    {
+      "label": "Trailside Museums & Zoo nearby listing",
+      "quote": "Trailside Museums & Zoo\n4.5(677)\nTourist attraction · \nNatural history museum & animal habitat\nOpen · Closes 4:30 PM · (845) 429-2960",
+      "source_index": 0,
+      "value": "Trailside Museums & Zoo\n4.5(677)\nTourist attraction · \nNatural history museum & animal habitat\nOpen · Closes 4:30 PM"
+    },
+    {
+      "label": "The Peekskill Coffee House nearby listing",
+      "quote": "The Peekskill Coffee House\n4.7(1,508)\nCoffee shop ·  · 101 S Division St\nFunky cafe for espresso drinks & panini\nOpen · Closes 6 PM · (914) 739-1287",
+      "source_index": 0,
+      "value": "The Peekskill Coffee House\n4.7(1,508)\nCoffee shop ·  · 101 S Division St\nFunky cafe for espresso drinks & panini\nOpen · Closes 6 PM"
+    },
+    {
+      "label": "Bean Runner Cafe nearby listing",
+      "quote": "Bean Runner Cafe\n4.6(319)\nCafe ·  · 201 S Division St\nEclectic bites in a lively hangout\nOpen · Closes 8:30 PM · (914) 737-1701",
+      "source_index": 0,
+      "value": "Bean Runner Cafe\n4.6(319)\nCafe ·  · 201 S Division St\nEclectic bites in a lively hangout\nOpen · Closes 8:30 PM"
+    },
+    {
+      "label": "Activity 1 — Riverfront Park",
+      "quote": "Riverfront Park\n4.7(802)\nTourist attraction ·  · Hudson Ave\nOpen · Closes 8:30 PM",
+      "source_index": 1,
+      "value": "Riverfront Park\n4.7(802)\nTourist attraction ·  · Hudson Ave\nOpen · Closes 8:30 PM"
+    },
+    {
+      "label": "Activity 2 — The Peekskill Museum",
+      "quote": "The Peekskill Museum\n4.5(24)\nTourist attraction · 124 Union Ave\nOpen · Closes 4 PM · (914) 736-0473",
+      "source_index": 1,
+      "value": "The Peekskill Museum\n4.5(24)\nTourist attraction · 124 Union Ave\nOpen · Closes 4 PM · (914) 736-0473"
+    },
+    {
+      "label": "Activity 3 — Paramount Hudson Valley Theater",
+      "quote": "Paramount Hudson Valley Theater\n4.7(960)\nLive music venue ·  · 1008 Brown St\nHistoric venue for the performing arts\n(914) 739-0039 ext. 2",
+      "source_index": 1,
+      "value": "Paramount Hudson Valley Theater\n4.7(960)\nLive music venue ·  · 1008 Brown St\nHistoric venue for the performing arts\n(914) 739-0039 ext. 2"
+    },
+    {
+      "label": "Activity 4 — Trailside Museums & Zoo",
+      "quote": "Trailside Museums & Zoo\n4.5(677)\nTourist attraction · \nNatural history museum & animal habitat\nOpen · Closes 4:30 PM · (845) 429-2960",
+      "source_index": 1,
+      "value": "Trailside Museums & Zoo\n4.5(677)\nTourist attraction · \nNatural history museum & animal habitat\nOpen · Closes 4:30 PM · (845) 429-2960"
+    },
+    {
+      "label": "Cool coffee shop — The Peekskill Coffee House",
+      "quote": "The Peekskill Coffee House\n4.7(1,508)\nCoffee shop ·  · 101 S Division St\nFunky cafe for espresso drinks & panini\nOpen · Closes 6 PM · (914) 739-1287",
+      "source_index": 1,
+      "value": "The Peekskill Coffee House\n4.7(1,508)\nCoffee shop ·  · 101 S Division St\nFunky cafe for espresso drinks & panini\nOpen · Closes 6 PM · (914) 739-1287"
+    },
+    {
+      "label": "Cool coffee shop — Bean Runner Cafe",
+      "quote": "Bean Runner Cafe\n4.6(319)\nCafe ·  · 201 S Division St\nEclectic bites in a lively hangout\nOpen · Closes 8:30 PM · (914) 737-1701",
+      "source_index": 1,
+      "value": "Bean Runner Cafe\n4.6(319)\nCafe ·  · 201 S Division St\nEclectic bites in a lively hangout\nOpen · Closes 8:30 PM · (914) 737-1701"
+    },
+    {
+      "label": "Not suitable this afternoon — Depew Park",
+      "quote": "Depew Park\n4.5(496)\nTourist attraction ·  · 1 Robin Dr\nClosed · Opens 9 AM Mon · (914) 734-7275",
+      "source_index": 1,
+      "value": "Depew Park\n4.5(496)\nTourist attraction ·  · 1 Robin Dr\nClosed · Opens 9 AM Mon · (914) 734-7275"
+    }
+  ],
+  "unknowns": [
+    "A fifth attraction verified as suitable for this Saturday afternoon was not established.",
+    "Exact or approximate distance and travel time from Taco District, 20 N Division St, was not established for the listed places.",
+    "Direct Google Maps listing URLs were not captured.",
+    "No open status or hours were visible for Paramount Hudson Valley Theater; an afternoon event was not verified.",
+    "The Peekskill Museum closes at 4 PM and Trailside Museums & Zoo closes at 4:30 PM, but admission or last-entry availability was not verified."
+  ],
+  "page_url": "https://example.com/places",
+  "sources": [
+    {
+      "page_url_ref": true
+    },
+    {
+      "page_url_ref": true
+    }
+  ]
+}

@@ -2156,6 +2156,16 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
             if len(delivery.attachments) != 1
             else "Attached the requested file."
         )
+    from nullion.artifact_lifecycle import filter_delivery_paths
+    attachment_paths = filter_delivery_paths(attachment_paths, stored_tool_results)
+    from nullion.artifact_lifecycle import artifact_review_unavailable_reply
+    review_notice = artifact_review_unavailable_reply(stored_tool_results)
+    if attachment_paths and review_notice:
+        response_text = review_notice
+    from nullion.artifact_lifecycle import artifact_terminal_failure_reply
+    failure_notice = artifact_terminal_failure_reply(stored_tool_results)
+    if not attachment_paths and failure_notice:
+        response_text = failure_notice
     return PlatformChatResponse(
         text=response_text,
         artifact_paths=attachment_paths,

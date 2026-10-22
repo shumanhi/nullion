@@ -44,6 +44,7 @@ def reset_conversation_session(
     *,
     chat_id: str | None = None,
     checkpoint: bool = True,
+    history_retained: bool = False,
 ) -> bool:
     conversation_key = str(conversation_id or "").strip()
     store = getattr(runtime, "store", None)
@@ -54,6 +55,7 @@ def reset_conversation_session(
         "event_type": "conversation.session_reset",
         "created_at": datetime.now(UTC).isoformat(),
     }
+    event["history_retained"] = bool(history_retained)
     if chat_id is not None:
         event["chat_id"] = chat_id
     try:
@@ -66,6 +68,36 @@ def reset_conversation_session(
     except Exception:
         logger.debug("Unable to reset conversation session", exc_info=True)
         return False
+
+
+def history_reset_retains_history(event: dict[str, Any]) -> bool:
+    # Older messaging /new receipts carried chat_id; Web destructive clears
+    # did not. New receipts state the retention decision explicitly.
+    return event.get("history_retained") is True or (
+        "history_retained" not in event and event.get("chat_id") is not None
+    )
+
+
+def retained_history_turns(events: Any) -> list[dict[str, Any]]:
+    """Apply typed reset boundaries while retaining explicitly archived history."""
+    def timestamp(event):
+        value = event.get("created_at")
+        try:
+            parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        except (TypeError, ValueError):
+            return datetime.min.replace(tzinfo=UTC)
+
+    selected: dict[str, list[dict[str, Any]]] = {}
+    for event in sorted((item for item in events if isinstance(item, dict)), key=timestamp):
+        identity = str(event.get("conversation_id") or "")
+        if event.get("event_type") == "conversation.session_reset":
+            if not history_reset_retains_history(event):
+                selected[identity] = []
+        elif event.get("event_type") == "conversation.chat_turn":
+            selected.setdefault(identity, []).append(event)
+    return sorted((event for group in selected.values() for event in group),
+                  key=timestamp)
 
 
 def cancel_active_task_frame(runtime: object, conversation_id: str | None) -> bool:

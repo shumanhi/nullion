@@ -1544,6 +1544,9 @@ def _action_receipt_reply_over_drift(text: str, results: list[ToolResult]) -> st
 
 
 def _artifact_completion_reply_over_drift(text: str, results: list[ToolResult]) -> str | None:
+    from nullion.artifact_lifecycle import artifact_review_unavailable_reply, artifact_terminal_failure_reply
+    if notice := artifact_terminal_failure_reply(results) or artifact_review_unavailable_reply(results):
+        return notice
     requested_extensions = _requested_artifact_extensions_from_results(results)
     if not requested_extensions:
         return None
@@ -8020,7 +8023,8 @@ def _completed_artifact_paths_for_extensions(results: list[ToolResult], extensio
             path = str(value or "").strip()
             if path and Path(path).suffix.lower() in extensions and path not in paths:
                 paths.append(path)
-    return paths
+    from nullion.artifact_lifecycle import filter_delivery_paths
+    return filter_delivery_paths(paths, results)
 
 
 _EMAIL_TRANSPORT_PAREN_RE = re.compile(

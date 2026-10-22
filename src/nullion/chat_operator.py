@@ -24,6 +24,8 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
+from nullion.source_selection import pending_source_selection
+
 from nullion.agent_turn_limits import (
     AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
     AGENT_TURN_LIMIT_EXTENSION_ACTION,
@@ -1137,79 +1139,14 @@ def _token_has_url_boundary(token: str) -> bool:
 def _literal_requested_attachment_extensions(prompt: str) -> tuple[str, ...]:
     if is_slash_prefixed_literal_message(prompt):
         return ()
+    # Only explicit dotted extensions are structural format signals. A bare
+    # format name (even uppercase) may describe a schema, code or source data;
+    # let the existing structured model plan decide its output role.
     extensions: list[str] = []
-    bare_extensions: list[str] = []
-    emphasized_bare_extensions: list[str] = []
-    raw_tokens = tuple(re.split(r"\s+", str(prompt or "")))
-    mapped_token_counts: dict[str, int] = {}
-    for raw_token in raw_tokens:
-        token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
-        if not token:
-            continue
-        mapped = ATTACHMENT_TOKEN_EXTENSIONS.get(token.lower())
-        if mapped in VALID_ATTACHMENT_EXTENSIONS:
-            mapped_token_counts[mapped] = mapped_token_counts.get(mapped, 0) + 1
-    filename_reference_extensions: set[str] = set()
-    ambiguous_filename_reference_extensions: set[str] = set()
-    for raw_token in raw_tokens:
-        token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
-        if not token:
-            continue
-        extension = Path(token).suffix.lower().strip()
-        has_path_boundary = (
-            "/" in token
-            or "\\" in token
-            or token.startswith("~")
-            or _token_has_url_boundary(token)
-        )
-        if extension in VALID_ATTACHMENT_EXTENSIONS and not has_path_boundary:
-            filename_reference_extensions.add(extension)
-            if not has_unambiguous_attachment_extension_context(prompt, token):
-                ambiguous_filename_reference_extensions.add(extension)
-    for raw_token in raw_tokens:
-        token = raw_token.strip().strip("`'\"<>()[]{}.,;:")
-        if not token:
-            continue
-        dotted_token = token.lower()
-        if dotted_token in VALID_ATTACHMENT_EXTENSIONS and dotted_token not in extensions:
-            extensions.append(dotted_token)
-            continue
-        mapped = ATTACHMENT_TOKEN_EXTENSIONS.get(token.lower())
-        if (
-            mapped in VALID_ATTACHMENT_EXTENSIONS
-        ):
-            if ambiguous_filename_reference_extensions:
-                if (
-                    mapped in ambiguous_filename_reference_extensions
-                    and mapped_token_counts.get(mapped, 0) >= 2
-                    and mapped not in extensions
-                ):
-                    extensions.append(mapped)
-                continue
-            if token != token.lower() and mapped not in emphasized_bare_extensions:
-                emphasized_bare_extensions.append(mapped)
-            if mapped not in filename_reference_extensions:
-                bare_extensions.append(mapped)
-        extension = Path(token).suffix.lower().strip()
-        has_path_boundary = (
-            "/" in token
-            or "\\" in token
-            or token.startswith("~")
-            or _token_has_url_boundary(token)
-        )
-        if extension in VALID_ATTACHMENT_EXTENSIONS and not _token_has_url_boundary(token):
-            continue
-    # A filename inside a user message is structured evidence that a file is in
-    # scope, but not by itself proof that the file should be delivered back as a
-    # new attachment. Output contracts must come from dotted/bare format tokens,
-    # structured task state, artifact descriptors, or the model format planner.
-    if len(bare_extensions) > 1:
-        for extension in bare_extensions:
-            extensions.append(extension)
-    elif emphasized_bare_extensions:
-        for extension in emphasized_bare_extensions:
-            if extension not in extensions:
-                extensions.append(extension)
+    for raw_token in re.split(r"\s+", str(prompt or "")):
+        dotted = raw_token.strip().strip("`'\"<>()[]{};:,").rstrip(".").lower()
+        if dotted in VALID_ATTACHMENT_EXTENSIONS:
+            extensions.append(dotted)
     return tuple(extensions)
 
 
@@ -1255,10 +1192,6 @@ def _requested_attachment_extensions(
         return tuple(structured_descriptor_extensions)
     output_filename_extensions = _requested_output_filename_extensions(prompt)
     if output_filename_extensions and re.search(r"(?i)(?:^|\s)(?:artifact|output)=", text):
-        return output_filename_extensions
-    if output_filename_extensions and len(_requested_output_filenames(text)) >= 3:
-        return output_filename_extensions
-    if output_filename_extensions and allow_model_planning:
         return output_filename_extensions
     if extensions:
         return tuple(extensions)
@@ -2312,6 +2245,10 @@ def _approved_pending_tool_invocation_from_suspended_turn(
     if not resource:
         return None
     approval_context = getattr(approval, "context", None)
+    if isinstance(approval_context, Mapping) and approval_context.get("delegated_resume"):
+        # Resume the wrapper's snapshot so validation and final synthesis still
+        # run; executing only the nested command would skip that contract.
+        return None
     approval_arguments = approval_context.get("tool_arguments") if isinstance(approval_context, Mapping) else None
     if not isinstance(approval_arguments, Mapping):
         return None
@@ -2402,6 +2339,8 @@ def _approved_tool_invocation_from_approval_context(
         return None
     approval_context = getattr(approval, "context", None)
     if not isinstance(approval_context, Mapping):
+        return None
+    if approval_context.get("delegated_resume"):
         return None
     tool_name = str(approval_context.get("tool_name") or getattr(approval, "resource", "") or "").strip()
     if not tool_name:
@@ -4789,6 +4728,8 @@ def _saved_history_structured_target_fallback_reply(history_context: str | None)
 
 
 def _apply_saved_history_structured_target_fallback(result: object, history_context: str | None) -> bool:
+    if pending_source_selection(getattr(result, "tool_results", None)) is not None:
+        return False
     if not _assistant_reply_has_numbered_choice_prompt(getattr(result, "final_text", None)):
         return False
     fallback_reply = _saved_history_structured_target_fallback_reply(history_context)
@@ -6584,19 +6525,32 @@ def _turn_scope_decision_from_completed_scope_results(
             for item in (output.get("capabilities") if isinstance(output.get("capabilities"), (list, tuple)) else ())
             if str(item or "").strip()
         }
+        # Core exec is always available as a permission-governed fallback.
+        # Its presence in discovery is not a request to run a command.
+        explicit = set(output.get("explicit_tool_names") or ())
+        if "local_shell" not in capabilities and "terminal_exec" not in explicit.union(required_tool_names):
+            requested_tool_names = tuple(name for name in requested_tool_names if name != "terminal_exec")
         connector_requested = bool(
             connector_app_ids
             or "connector" in capabilities
             or set(requested_tool_names).intersection(_READ_ONLY_ACCOUNT_TOOL_NAMES)
         )
         return TurnToolScopeDecision(
+            requested_outcome=str(output.get("requested_outcome") or "unspecified"),
             scheduler_action=scheduler_action,
+            scheduler_effect_actions=tuple(action for action in output.get("scheduler_effect_actions", ())
+                if action in {"inspect", "run", "mutate"}),
             scheduler_toggle_enabled=scheduler_toggle_enabled if scheduler_action == "mutate" else None,
             scheduler_selection_policy=scheduler_selection_policy if scheduler_action == "run" else "none",
             scheduler_target_scope=scheduler_target_scope if scheduler_action == "mutate" else "none",
             skill_pack_action="connector" if connector_requested else "none",
             connector_app_ids=connector_app_ids if connector_requested else (),
-            connector_source_user_requested=connector_requested,
+            connector_source_user_requested=output.get("connector_source_user_requested") is True,
+            connector_source_evidence=str(output.get("connector_source_evidence") or ""),
+            source_artifact_delivery_requested=output.get("source_artifact_delivery_requested") is True,
+            source_artifact_request_evidence=str(output.get("source_artifact_request_evidence") or ""),
+            source_artifact_retrieval_only=output.get("read_only_source_delivery") is True,
+            excluded_artifact_extensions=tuple(normalize_artifact_extensions(output.get("excluded_artifact_extensions"))),
             requested_tool_names=requested_tool_names,
             required_tool_names=required_tool_names,
             requested_artifact_extensions=tuple(
@@ -7237,119 +7191,27 @@ def _run_chat_turn_scheduler_run_scope_retry(
     mark_retry: Callable[[], None] | None = None,
     principal_id: str | None = None,
 ) -> tuple[object, object, bool]:
+    if not _scheduler_recovery_allows_action(initial_result, active_tool_registry, base_tool_registry, "run"):
+        return initial_result, active_tool_registry, False
     registry_for_lookup = _scheduler_retry_registry_with_tools(
         base_tool_registry or active_tool_registry,
         required_tool_names=("run_cron",),
     )
-    retry_decision_override: TurnToolScopeDecision | None = None
-    retry_target_summary = ""
-    structured_run_target = _structured_scheduler_run_target_from_list_crons(
-        initial_result,
-        user_message=user_message,
+    scope_decision = _turn_scope_decision_from_completed_scope_results(
+        getattr(initial_result, "tool_results", None), available_tool_names=_retry_available_tool_names(registry_for_lookup),
     )
-    if not _turn_result_should_retry_scheduler_run_scope(initial_result, active_tool_registry):
-        existing_scheduler_action = str(
-            getattr(
-                getattr(active_tool_registry, "turn_tool_scope_decision", None),
-                "scheduler_action",
-                "",
-            )
-            or ""
-        ).strip().lower()
-        has_structured_run_target = (
-            existing_scheduler_action == "inspect"
-            and structured_run_target is not None
-            and _turn_result_used_tool(initial_result, "list_crons")
-            and not _turn_result_used_tool(initial_result, "run_cron")
-            and "run_cron" in _registry_tool_names(registry_for_lookup)
-        )
-        if (
-            (
-                existing_scheduler_action == "inspect"
-                and not (
-                    _turn_result_used_tool(initial_result, "list_crons")
-                    and not _turn_result_used_tool(initial_result, "run_cron")
-                    and "run_cron" in _registry_tool_names(registry_for_lookup)
-                )
-            )
-            or model_client is None
-            or not _turn_result_used_tool(initial_result, "list_crons")
-            or _turn_result_used_tool(initial_result, "run_cron")
-            or getattr(initial_result, "artifacts", None)
-            or getattr(initial_result, "suspended_for_approval", False)
-            or "run_cron" not in _registry_tool_names(registry_for_lookup)
-        ):
-            return initial_result, active_tool_registry, False
-        assistant_no_tool_draft = getattr(initial_result, "final_text", None)
-        if existing_scheduler_action == "inspect" and structured_run_target is not None:
-            retry_target_summary = ", ".join(f"{key}={value!r}" for key, value in structured_run_target.items())
-            assistant_no_tool_draft = (
-                "The previous scheduler attempt completed only list/read tools. A single eligible cron target "
-                f"was resolved from structured list_crons output ({retry_target_summary}). Decide from the "
-                "current user request whether the remaining action is scheduler_run. Keep scheduler_action=inspect "
-                "when the user only asked to inspect the cron without running it."
-            )
-        try:
-            candidate_decision = build_turn_tool_scope_decision(
-                model_client=model_client,
-                user_message=user_message,
-                evidence=evidence,
-                registry=registry_for_lookup,
-                force_model_decision=True,
-                assistant_no_tool_draft=assistant_no_tool_draft,
-            )
-        except ChatBackendUnavailableError as exc:
-            _preserve_initial_result_after_retry_backend_failure(
-                retry_name="scheduler_run_scope_retry",
-                exc=exc,
-            )
-            return initial_result, active_tool_registry, False
-        candidate_requested = set(getattr(candidate_decision, "requested_tool_names", ()) or ())
-        candidate_required = set(getattr(candidate_decision, "required_tool_names", ()) or ())
-        candidate_scheduler_action = str(getattr(candidate_decision, "scheduler_action", "") or "").strip().lower()
-        if candidate_scheduler_action != "run" and "run_cron" not in candidate_requested | candidate_required:
-            if existing_scheduler_action == "inspect" and mark_retry is not None:
-                mark_retry()
-                return initial_result, active_tool_registry, True
-            return initial_result, active_tool_registry, False
-        scheduler_selection_policy = str(
-            getattr(candidate_decision, "scheduler_selection_policy", "") or ""
-        ).strip().lower()
-        if (
-            existing_scheduler_action == "inspect"
-            and structured_run_target is None
-            and scheduler_selection_policy not in {"delegate_one"}
-        ):
-            if mark_retry is not None:
-                mark_retry()
-                return initial_result, active_tool_registry, True
-            return initial_result, active_tool_registry, False
-        if scheduler_selection_policy not in {"user_selected", "delegate_one"}:
-            scheduler_selection_policy = "user_selected"
-        retry_decision_override = replace(
-            candidate_decision,
-            scheduler_action="run",
-            scheduler_selection_policy=scheduler_selection_policy,
-            requested_tool_names=tuple(
-                dict.fromkeys([
-                    *tuple(getattr(candidate_decision, "requested_tool_names", ()) or ()),
-                    "list_crons",
-                    "run_cron",
-                ])
-            ),
-            required_tool_names=tuple(
-                dict.fromkeys([
-                    *tuple(getattr(candidate_decision, "required_tool_names", ()) or ()),
-                    "run_cron",
-                ])
-            ),
-            valid=True,
-        )
-        if not has_structured_run_target:
-            retry_target_summary = ""
-    if retry_decision_override is None and not _turn_result_should_retry_scheduler_run_scope(initial_result, active_tool_registry):
+    candidates = (scope_decision, getattr(active_tool_registry, "turn_tool_scope_decision", None),
+                  getattr(base_tool_registry, "turn_tool_scope_decision", None))
+    existing_decision = next((decision for decision in candidates
+        if decision is not None and decision.valid and decision.scheduler_action == "run"), None)
+    if existing_decision is None:
         return initial_result, active_tool_registry, False
-    existing_decision = retry_decision_override or getattr(active_tool_registry, "turn_tool_scope_decision", None)
+    if (_turn_result_used_tool(initial_result, "run_cron")
+            or getattr(initial_result, "artifacts", None)
+            or getattr(initial_result, "suspended_for_approval", False)):
+        return initial_result, active_tool_registry, False
+    retry_target_summary = ""
+    structured_run_target = _structured_scheduler_run_target_from_list_crons(initial_result, user_message=user_message)
     retry_decision = TurnToolScopeDecision(
         scheduler_action="run",
         scheduler_selection_policy=str(
@@ -7611,8 +7473,6 @@ def _turn_result_completed_scheduler_inspect_scope(
         return False
     if getattr(result, "suspended_for_approval", False):
         return False
-    if _turn_result_reports_unfulfilled_capability(result):
-        return False
     if not _turn_result_has_completed_scheduler_read_only_tools(result):
         return False
     decision = _turn_scope_decision_from_completed_scope_results(
@@ -7620,11 +7480,28 @@ def _turn_result_completed_scheduler_inspect_scope(
         available_tool_names=_retry_available_tool_names(registry),
     )
     if decision is None:
+        decision = getattr(registry, "turn_tool_scope_decision", None)
+    if decision is None or not decision.valid:
         return False
     scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
     if scheduler_action != "inspect":
         return False
-    return True
+    return "mutate" not in decision.allowed_scheduler_actions and "run" not in decision.allowed_scheduler_actions
+
+
+def _scheduler_recovery_allows_action(result, registry, base_registry, action: str) -> bool:
+    """A retry may continue current-turn effects, never derive them from an object or draft."""
+    decision = _turn_scope_decision_from_completed_scope_results(
+        getattr(result, "tool_results", None),
+        available_tool_names=_retry_available_tool_names(base_registry or registry),
+    )
+    if decision is not None and decision.allowed_scheduler_actions:
+        return action in decision.allowed_scheduler_actions
+    for candidate in (registry, base_registry):
+        decision = getattr(candidate, "turn_tool_scope_decision", None)
+        if decision is not None and decision.valid and decision.allowed_scheduler_actions:
+            return action in decision.allowed_scheduler_actions
+    return False
 
 
 def _scheduler_registry_decision_requests_action(registry: object | None) -> bool:
@@ -7645,95 +7522,6 @@ def _scheduler_registry_decision_requests_action(registry: object | None) -> boo
     return bool(
         requested_or_required.intersection(_SCHEDULER_CRON_ACTION_TOOLS | _SCHEDULER_REMINDER_ACTION_TOOLS)
     )
-
-
-def _scheduler_list_crons_result_has_toggleable_rows(result: object) -> bool:
-    for tool_result in list(getattr(result, "tool_results", None) or []):
-        if _tool_result_name(tool_result) != "list_crons":
-            continue
-        output = _tool_result_output(tool_result)
-        rows = output.get("crons")
-        if not isinstance(rows, list):
-            continue
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            if not isinstance(row.get("enabled"), bool):
-                continue
-            if str(row.get("id") or row.get("name") or "").strip():
-                return True
-    return False
-
-
-def _scheduler_read_only_recovery_user_message(
-    user_message: str,
-    result: object,
-    *,
-    available_mutation_tool_names: Iterable[str] = (),
-) -> str:
-    cron_count = 0
-    enabled_count = 0
-    disabled_count = 0
-    reminder_count = 0
-    for tool_result in list(getattr(result, "tool_results", None) or []):
-        name = _tool_result_name(tool_result)
-        output = _tool_result_output(tool_result)
-        if name == "list_crons":
-            rows = output.get("crons")
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                if not isinstance(row, Mapping):
-                    continue
-                cron_count += 1
-                if row.get("enabled") is True:
-                    enabled_count += 1
-                elif row.get("enabled") is False:
-                    disabled_count += 1
-        elif name == "list_reminders":
-            rows = output.get("reminders")
-            if isinstance(rows, list):
-                reminder_count += len(rows)
-    facts = (
-        f"Read-only scheduler result: crons={cron_count}, enabled_crons={enabled_count}, "
-        f"disabled_crons={disabled_count}, reminders={reminder_count}."
-    )
-    mutation_tools = tuple(
-        dict.fromkeys(
-            str(name or "").strip()
-            for name in available_mutation_tool_names
-            if str(name or "").strip()
-        )
-    )
-    mutation_facts = (
-        f"Registered scheduler mutation tools: {', '.join(mutation_tools)}."
-        if mutation_tools
-        else "Registered scheduler mutation tools: none."
-    )
-    return (
-        "Scheduler mutation recovery classifier.\n"
-        "The previous attempt completed only scheduler read/list tools and did not mutate any scheduler object.\n"
-        f"{facts}\n"
-        f"{mutation_facts}\n"
-        "Return a structured scheduler mutation decision only if the current user turn requires existing scheduler "
-        "objects to end in a different enabled/disabled/active/inactive state. Otherwise return inspect or none.\n\n"
-        "Current user turn:\n"
-        f"{str(user_message or '').strip()}"
-    )
-
-
-def _schema_scheduler_mutation_retry_tool_names(
-    result: object,
-    *,
-    available_tool_names: Iterable[str],
-) -> tuple[str, ...]:
-    available = {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
-    tool_names: list[str] = []
-    if "list_crons" in available and _turn_result_used_tool(result, "list_crons"):
-        tool_names.append("list_crons")
-    if "toggle_cron" in available and _scheduler_list_crons_result_has_toggleable_rows(result):
-        tool_names.append("toggle_cron")
-    return tuple(dict.fromkeys(tool_names))
 
 
 def _scheduler_retry_existing_decision(
@@ -7840,6 +7628,8 @@ def _run_chat_turn_scheduler_run_fallback_retry(
     mark_retry: Callable[[], None] | None = None,
     principal_id: str | None = None,
 ) -> tuple[object, object, bool]:
+    if not _scheduler_recovery_allows_action(initial_result, active_tool_registry, base_tool_registry, "run"):
+        return initial_result, active_tool_registry, False
     registry_for_lookup = _scheduler_retry_registry_with_tools(
         base_tool_registry or active_tool_registry,
         required_tool_names=tuple(
@@ -7874,49 +7664,17 @@ def _run_chat_turn_scheduler_run_fallback_retry(
         existing_decision is not None
         and _turn_result_used_only_scheduler_read_tools(initial_result)
     )
-    scheduler_read_only_scope_candidate = (
-        existing_decision is None
-        and _turn_result_used_only_scheduler_read_tools(initial_result)
-    )
-    scheduler_read_only_unfulfilled_attempt = (
-        scheduler_read_only_scope_candidate
-        and _turn_result_reports_unfulfilled_capability(initial_result)
-    )
-    if not (
-        context_only_attempt
-        or scheduler_read_only_attempt
-        or scheduler_read_only_scope_candidate
-        or scheduler_read_only_unfulfilled_attempt
-        or (existing_decision is not None and _turn_result_has_no_tool_progress(initial_result))
-    ):
+    if not (context_only_attempt or scheduler_read_only_attempt
+            or (existing_decision is not None and _turn_result_has_no_tool_progress(initial_result))):
         return initial_result, active_tool_registry, False
 
-    if existing_decision is not None:
-        decision = existing_decision
-    else:
-        assistant_no_tool_draft = getattr(initial_result, "final_text", None)
-        if scheduler_read_only_scope_candidate or scheduler_read_only_unfulfilled_attempt:
-            assistant_no_tool_draft = (
-                "Previous scheduler attempt completed only read/list tools and did not perform a scheduler mutation. "
-                "If the current user request requires an existing scheduler object to end in a different state, "
-                "return scheduler_action=mutate with the registered mutation tool instead of inspect.\n\n"
-                + str(assistant_no_tool_draft or "")
-            )
-        try:
-            decision = build_turn_tool_scope_decision(
-                model_client=model_client,
-                user_message=_scope_retry_user_message_with_visible_context(user_message, base_history),
-                evidence=evidence,
-                registry=registry_for_lookup,
-                force_model_decision=True,
-                assistant_no_tool_draft=assistant_no_tool_draft,
-            )
-        except ChatBackendUnavailableError as exc:
-            _preserve_initial_result_after_retry_backend_failure(
-                retry_name="scheduler_run_fallback_retry",
-                exc=exc,
-            )
-            return initial_result, active_tool_registry, False
+    if existing_decision is None:
+        existing_decision = _turn_scope_decision_from_completed_scope_results(
+            getattr(initial_result, "tool_results", None), available_tool_names=available_tool_names,
+        )
+    if existing_decision is None or existing_decision.scheduler_action != "run":
+        return initial_result, active_tool_registry, False
+    decision = existing_decision
 
     requested_or_required = tuple(
         dict.fromkeys([
@@ -8008,6 +7766,8 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
     mark_retry: Callable[[], None] | None = None,
     principal_id: str | None = None,
 ) -> tuple[object, object, bool]:
+    if not _scheduler_recovery_allows_action(initial_result, active_tool_registry, base_tool_registry, "mutate"):
+        return initial_result, active_tool_registry, False
     registry_for_lookup = _scheduler_retry_registry_with_tools(
         base_tool_registry or active_tool_registry,
         required_tool_names=tuple(
@@ -8028,51 +7788,30 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
         return initial_result, active_tool_registry, False
     if getattr(initial_result, "suspended_for_approval", False):
         return initial_result, active_tool_registry, False
-    context_only_attempt = _turn_result_used_only_scheduler_fallback_context_tools(initial_result)
+    # Recovery continues a declared action; it cannot invent one from a list
+    # result, an assistant draft, prior history, or another classifier pass.
+    scope_decision = _turn_scope_decision_from_completed_scope_results(
+        getattr(initial_result, "tool_results", None), available_tool_names=available_tool_names,
+    )
+    if scope_decision is not None and "mutate" not in scope_decision.allowed_scheduler_actions:
+        return initial_result, active_tool_registry, False
+    active_decision = getattr(active_tool_registry, "turn_tool_scope_decision", None)
+    if active_decision is not None and active_decision.allowed_scheduler_actions and "mutate" not in active_decision.allowed_scheduler_actions:
+        return initial_result, active_tool_registry, False
     existing_decision = _scheduler_retry_existing_decision(
-        active_tool_registry,
-        action="mutate",
-        available_tool_names=available_tool_names,
+        active_tool_registry, action="mutate", available_tool_names=available_tool_names,
     ) or _scheduler_retry_existing_decision(
-        registry_for_lookup,
-        action="mutate",
-        available_tool_names=available_tool_names,
+        registry_for_lookup, action="mutate", available_tool_names=available_tool_names,
     )
-    if existing_decision is None and not _turn_result_used_only_scheduler_read_tools(initial_result):
+    if existing_decision is None and scope_decision is not None and scope_decision.scheduler_action == "mutate":
+        existing_decision = scope_decision
+    if existing_decision is None:
         return initial_result, active_tool_registry, False
-    scheduler_read_only_scope_candidate = (
-        existing_decision is None
-        and _turn_result_used_only_scheduler_read_tools(initial_result)
-    )
-    scheduler_read_only_unfulfilled_attempt = (
-        scheduler_read_only_scope_candidate
-        and _turn_result_reports_unfulfilled_capability(initial_result)
-    )
-    if not (
-        _turn_result_used_only_scheduler_read_tools(initial_result)
-        or (existing_decision is not None and (context_only_attempt or _turn_result_has_no_tool_progress(initial_result)))
-    ):
+    if not (_turn_result_used_only_scheduler_read_tools(initial_result)
+            or _turn_result_used_only_scheduler_fallback_context_tools(initial_result)
+            or _turn_result_has_no_tool_progress(initial_result)):
         return initial_result, active_tool_registry, False
-
-    assistant_no_tool_draft = getattr(initial_result, "final_text", None)
-    if existing_decision is not None:
-        decision = existing_decision
-    else:
-        try:
-            decision = build_turn_tool_scope_decision(
-                model_client=model_client,
-                user_message=_scope_retry_user_message_with_visible_context(user_message, base_history),
-                evidence=evidence,
-                registry=registry_for_lookup,
-                force_model_decision=True,
-                assistant_no_tool_draft=assistant_no_tool_draft,
-            )
-        except ChatBackendUnavailableError as exc:
-            _preserve_initial_result_after_retry_backend_failure(
-                retry_name="scheduler_mutation_fallback_retry",
-                exc=exc,
-            )
-            return initial_result, active_tool_registry, False
+    decision = existing_decision
 
     requested_or_required = tuple(
         dict.fromkeys([
@@ -8086,75 +7825,12 @@ def _run_chat_turn_scheduler_mutation_fallback_retry(
         if name in _SCHEDULER_MUTATION_RETRY_TOOLS and name in available_tool_names and name != "list_crons"
     ]
     scheduler_action = str(getattr(decision, "scheduler_action", "") or "").strip().lower()
-    if (
-        scheduler_action != "mutate"
-        and not requested_mutation_tool_names
-        and scheduler_read_only_scope_candidate
-    ):
-        recovery_user_message = _scheduler_read_only_recovery_user_message(
-            _scope_retry_user_message_with_visible_context(user_message, base_history),
-            initial_result,
-            available_mutation_tool_names=available_mutation_tool_names,
-        )
-        try:
-            recovery_decision = build_turn_tool_scope_decision(
-                model_client=model_client,
-                user_message=recovery_user_message,
-                evidence=evidence,
-                registry=registry_for_lookup,
-                force_model_decision=True,
-                assistant_no_tool_draft=assistant_no_tool_draft,
-            )
-        except ChatBackendUnavailableError as exc:
-            _preserve_initial_result_after_retry_backend_failure(
-                retry_name="scheduler_mutation_recovery_decision",
-                exc=exc,
-            )
-            recovery_decision = None
-        if recovery_decision is not None:
-            recovery_requested_or_required = tuple(
-                dict.fromkeys([
-                    *tuple(getattr(recovery_decision, "requested_tool_names", ()) or ()),
-                    *tuple(getattr(recovery_decision, "required_tool_names", ()) or ()),
-                ])
-            )
-            recovery_scheduler_action = str(
-                getattr(recovery_decision, "scheduler_action", "") or ""
-            ).strip().lower()
-            recovery_mutation_tool_names = [
-                name
-                for name in recovery_requested_or_required
-                if name in _SCHEDULER_MUTATION_RETRY_TOOLS
-                and name in available_tool_names
-                and name != "list_crons"
-            ]
-            if recovery_scheduler_action == "mutate" and recovery_mutation_tool_names:
-                decision = recovery_decision
-                requested_or_required = recovery_requested_or_required
-                requested_mutation_tool_names = recovery_mutation_tool_names
-                scheduler_action = recovery_scheduler_action
-    schema_retry_tool_names = (
-        _schema_scheduler_mutation_retry_tool_names(
-            initial_result,
-            available_tool_names=available_tool_names,
-        )
-        if scheduler_read_only_unfulfilled_attempt
-        else ()
-    )
-    schema_mutation_tool_names = [
-        name
-        for name in schema_retry_tool_names
-        if name in _SCHEDULER_MUTATION_RETRY_TOOLS and name in available_tool_names and name != "list_crons"
-    ]
-    if not requested_mutation_tool_names and schema_mutation_tool_names:
-        requested_mutation_tool_names = schema_mutation_tool_names
-        scheduler_action = "mutate"
     if scheduler_action != "mutate" and not requested_mutation_tool_names:
         return initial_result, active_tool_registry, False
     if not requested_mutation_tool_names:
         return initial_result, active_tool_registry, False
 
-    requested_tool_names = list(schema_retry_tool_names if schema_mutation_tool_names else requested_mutation_tool_names)
+    requested_tool_names = list(requested_mutation_tool_names)
     if "list_crons" in available_tool_names and "list_crons" not in requested_tool_names:
         requested_tool_names.insert(0, "list_crons")
     if "list_reminders" in available_tool_names and any(
@@ -9873,6 +9549,25 @@ def _completed_requested_artifact_paths_for_turn_result(
     scoped_extensions = _required_attachment_extensions_from_tool_scope(tool_results)
     if scoped_extensions and required_attachment_extensions:
         requested_extensions = scoped_extensions
+    from nullion.artifact_lifecycle import delivery_manifest, filter_delivery_paths
+    final_manifest = delivery_manifest(tool_results)
+    if final_manifest is not None:
+        # Final runtime selection assigns output roles. Names mentioned in the
+        # request can also be sources or drafts, so they cannot override it.
+        selected = filter_delivery_paths(final_manifest, tool_results)
+        required_formats = set(_normalized_requested_extensions(scoped_extensions or required_attachment_extensions or ()))
+        selected_formats = {Path(path).suffix.lower() for path in selected}
+        if not required_formats.issubset(selected_formats):
+            return ()
+        for path in selected:
+            candidate = Path(path).expanduser()
+            if not candidate.is_file() or candidate.stat().st_size <= 0:
+                return ()
+            if candidate.suffix.lower() in media_required_suffixes and _office_artifact_embedded_media_count(candidate) <= 0:
+                from nullion.response_fulfillment_contract import artifact_file_embedded_media_count
+                if artifact_file_embedded_media_count(candidate) <= 0:
+                    return ()
+        return tuple(selected)
     requested_extensions = (*requested_extensions, *media_required_suffixes)
     requested_extensions = _refine_required_attachment_extensions_for_structured_outputs(
         prompt=prompt,
@@ -10697,43 +10392,8 @@ def _account_source_option_labels(tool_names: Iterable[str]) -> list[str]:
 
 
 def _account_source_selection_reply_from_scope_results(tool_results: Iterable[object] | None) -> str | None:
-    selection_required = False
-    options: list[str] = []
-    for tool_result in tool_results or ():
-        if _tool_result_name(tool_result) != "request_tool_scope":
-            continue
-        if normalize_tool_status(_tool_result_status(tool_result)) != "completed":
-            continue
-        output = _tool_result_output(tool_result)
-        if output.get("source_selection_required") is not True:
-            if selection_required:
-                available_tools = output.get("available_tools")
-                if isinstance(available_tools, list) and set(
-                    str(tool or "").strip() for tool in available_tools
-                ).intersection(_READ_ONLY_ACCOUNT_TOOL_NAMES):
-                    selection_required = False
-                    options = []
-            continue
-        selection_required = True
-        sources = output.get("available_sources")
-        if not isinstance(sources, list):
-            continue
-        for source in sources:
-            if not isinstance(source, Mapping):
-                continue
-            read_tools = source.get("read_tools")
-            labels = _account_source_option_labels(read_tools if isinstance(read_tools, list) else ())
-            display_name = str(source.get("display_name") or "").strip()
-            for label in labels:
-                if display_name and label != "Another connected account/source, if available":
-                    options.append(f"{display_name}: {label}")
-                else:
-                    options.append(label)
-    options = list(dict.fromkeys(options))
-    if not selection_required or len(options) < 2:
-        return None
-    numbered = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
-    return f"I can check, but please choose which authorized source you want me to read first.\n\n{numbered}"
+    selection = pending_source_selection(tool_results)
+    return selection.reply if selection is not None else None
 
 
 def _account_source_selection_scope_retry_context(tool_results: Iterable[object] | None) -> str | None:
@@ -10965,6 +10625,9 @@ def _run_chat_turn_schema_followup_tool_retry(
     user_message: str | None = None,
 ) -> tuple[object, object, bool]:
     registry_for_lookup = base_tool_registry or active_tool_registry
+    if ((getattr(initial_result, "response_presentation", None) or {}).get("artifact_terminal") is True
+            or (getattr(initial_result, "response_presentation", None) or {}).get("source_report_status") in {"partial", "completed"}):
+        return initial_result, active_tool_registry, False
     if _turn_result_has_completed_requested_artifact(initial_result, active_tool_registry):
         return initial_result, active_tool_registry, False
     browser_reads = _BROWSER_READ_EVIDENCE_TOOLS | {"browser_navigate", "browser_open", "browser_find", "web_search"}
@@ -12023,6 +11686,7 @@ def _run_chat_turn_common_retries(
 ) -> ChatTurnCommonRetryResult:
     result = initial_result
     tool_registry = active_tool_registry
+    recovery_contract = None
     if runtime is not None:
         _register_selected_existing_source_artifacts(runtime, result, prompt=user_message, principal_id=principal_id,
             source_scope_decision=getattr(tool_registry, "turn_tool_scope_decision", None))
@@ -12069,10 +11733,15 @@ def _run_chat_turn_common_retries(
             if registry is not None
         )
 
+    def _request_result_registry():
+        if recovery_contract is not None and tool_registry is not active_tool_registry:
+            return recovery_contract.bind(tool_registry)
+        return tool_registry
+
     def _current_retry_result() -> ChatTurnCommonRetryResult:
         return ChatTurnCommonRetryResult(
             result=result,
-            tool_registry=tool_registry,
+            tool_registry=_request_result_registry(),
             retried_model_tool_request=retried_model_tool_request,
             retried_no_tool_scope_decision=retried_no_tool_scope_decision,
             retried_missing_tool_scope=retried_missing_tool_scope,
@@ -12085,7 +11754,8 @@ def _run_chat_turn_common_retries(
             retried_local_system_fallback=False,
         )
 
-    if (getattr(result, "response_presentation", None) or {}).get("source_report_status") in {"partial", "completed"}:
+    if ((getattr(result, "response_presentation", None) or {}).get("artifact_terminal") is True
+            or (getattr(result, "response_presentation", None) or {}).get("source_report_status") in {"partial", "completed"}):
         return _current_retry_result()
     if bool(getattr(result, "reached_iteration_limit", False)):
         return _current_retry_result()
@@ -12095,6 +11765,24 @@ def _run_chat_turn_common_retries(
         return _current_retry_result()
     if _plain_no_tool_common_retries_may_bypass(result, tool_registry):
         return _current_retry_result()
+    # A successful inspection can report an unhealthy source or an unknown
+    # observation. Neither fact makes a scheduler write an unfinished task.
+    if _turn_result_completed_scheduler_inspect_scope(result, tool_registry, base_registry=base_tool_registry):
+        return _current_retry_result()
+    # Recovery may discover reads and alternative implementations, but its
+    # new registries must retain the original request's action authority.
+    from nullion.recovery_contract import RequestRecoveryContract
+    contract_registry = _scoped_registry_from_completed_scope_results(
+        tool_registry, evidence=evidence, tool_results=getattr(result, "tool_results", None),
+    ) or tool_registry
+    recovery_contract = RequestRecoveryContract.from_registry(contract_registry)
+    if recovery_contract is not None:
+        base_tool_registry = recovery_contract.bind(base_tool_registry or tool_registry)
+        original_run_turn = run_turn
+
+        def run_turn(history, registry):
+            return original_run_turn(history, recovery_contract.bind(registry))
+
     scheduler_read_only_result = _turn_result_used_only_scheduler_read_tools(result)
     if not scheduler_read_only_result and _scheduler_common_retries_may_bypass_before_mutation_recovery(
         result,
@@ -12460,7 +12148,7 @@ def _run_chat_turn_common_retries(
     if _account_source_selection_reply_from_scope_results(getattr(result, "tool_results", None)):
         return ChatTurnCommonRetryResult(
             result=result,
-            tool_registry=tool_registry,
+            tool_registry=_request_result_registry(),
             retried_model_tool_request=retried_model_tool_request,
             retried_no_tool_scope_decision=retried_no_tool_scope_decision,
             retried_missing_tool_scope=retried_missing_tool_scope,
@@ -12488,7 +12176,7 @@ def _run_chat_turn_common_retries(
 
     return ChatTurnCommonRetryResult(
         result=result,
-        tool_registry=tool_registry,
+        tool_registry=_request_result_registry(),
         retried_model_tool_request=retried_model_tool_request,
         retried_no_tool_scope_decision=retried_no_tool_scope_decision,
         retried_missing_tool_scope=retried_missing_tool_scope,
@@ -12516,7 +12204,8 @@ def _run_chat_turn_saved_history_retry(
     mark_retry: Callable[[], None] | None = None,
     allow_history_search_retry: bool = True,
 ) -> tuple[object, object, bool]:
-    if (getattr(initial_result, "response_presentation", None) or {}).get("source_report_status") in {"partial", "completed"}:
+    if ((getattr(initial_result, "response_presentation", None) or {}).get("artifact_terminal") is True
+            or (getattr(initial_result, "response_presentation", None) or {}).get("source_report_status") in {"partial", "completed"}):
         return initial_result, active_tool_registry, False
     if not _turn_result_should_retry_with_saved_history(initial_result):
         return initial_result, active_tool_registry, False
@@ -13050,6 +12739,12 @@ def _augment_tool_registry_from_structured_tool_context(
     if not requested_tool_names:
         return active_registry
     existing = getattr(active_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
+    current_actions = set(existing.requested_tool_names) | set(existing.required_tool_names)
+    requested_tool_names = tuple(name for name in requested_tool_names
+        if name in current_actions or base_registry.get_spec(name).side_effect_class == ToolSideEffectClass.READ)
+    if not requested_tool_names:
+        return active_registry
+
     scheduler_action = _scheduler_action_for_context_tool_names(
         (name for name in requested_tool_names if name in _SCHEDULER_TOOL_NAMES),
         str(getattr(existing, "scheduler_action", "none") or "none"),
@@ -13059,7 +12754,7 @@ def _augment_tool_registry_from_structured_tool_context(
     # the first turn does not crowd out the tool that can complete the follow-up.
     combined_requested = requested_tool_names
     connector_followup_requested = any(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in combined_requested)
-    decision = TurnToolScopeDecision(
+    decision = replace(existing,
         web_action=str(getattr(existing, "web_action", "none") or "none"),
         scheduler_action=scheduler_action,
         scheduler_toggle_enabled=getattr(existing, "scheduler_toggle_enabled", None),
@@ -13082,11 +12777,9 @@ def _augment_tool_registry_from_structured_tool_context(
             getattr(existing, "required_embedded_media_extensions", ()) or ()
         ),
         confidence=max(float(getattr(existing, "confidence", 0.0) or 0.0), 1.0),
-        valid=True,
+        valid=existing.valid,
     )
-    return _ToolRegistryWithoutRequestScope(
-        ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
-    )
+    return ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
 
 
 def _structured_tool_context_scope_prompt(
@@ -13223,6 +12916,12 @@ def _augment_tool_registry_from_saved_history_context(
     if not requested_tool_names:
         return active_registry
     existing = getattr(active_registry, "turn_tool_scope_decision", None) or TurnToolScopeDecision()
+    current_actions = set(existing.requested_tool_names) | set(existing.required_tool_names)
+    requested_tool_names = tuple(name for name in requested_tool_names
+        if name in current_actions or base_registry.get_spec(name).side_effect_class == ToolSideEffectClass.READ)
+    if not requested_tool_names:
+        return active_registry
+
     existing_requested = tuple(getattr(existing, "requested_tool_names", ()) or ())
     combined_requested = tuple(dict.fromkeys([*existing_requested, *requested_tool_names]))
     connector_followup_requested = any(name in _READ_ONLY_ACCOUNT_TOOL_NAMES for name in combined_requested)
@@ -13233,7 +12932,7 @@ def _augment_tool_registry_from_saved_history_context(
     web_action = str(getattr(existing, "web_action", "none") or "none")
     if web_action == "none" and web_tool_requested:
         web_action = "browser_interaction"
-    decision = TurnToolScopeDecision(
+    decision = replace(existing,
         web_action=web_action,
         scheduler_action=str(getattr(existing, "scheduler_action", "none") or "none"),
         scheduler_toggle_enabled=getattr(existing, "scheduler_toggle_enabled", None),
@@ -13256,11 +12955,9 @@ def _augment_tool_registry_from_saved_history_context(
             getattr(existing, "required_embedded_media_extensions", ()) or ()
         ),
         confidence=max(float(getattr(existing, "confidence", 0.0) or 0.0), 1.0),
-        valid=True,
+        valid=existing.valid,
     )
-    return _ToolRegistryWithoutRequestScope(
-        ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
-    )
+    return ScopedTurnToolRegistry(base_registry, evidence=evidence, tool_scope_decision=decision)
 
 
 def _saved_history_tool_scope_prompt(history_context: str | None) -> str | None:
@@ -14471,10 +14168,8 @@ def _maybe_materialize_requested_fetch_attachment(
     if _reply_has_deliverable_media(runtime, reply, principal_id=principal_id):
         return reply
     has_media_marker = bool(_reply_media_candidate_paths(reply))
-    extension = plan_attachment_format(
-        prompt,
-        allow_filename_tokens=True,
-    ).extension
+    declared_extensions = _required_attachment_extensions_from_tool_scope(tool_results)
+    extension = (declared_extensions[0] if declared_extensions else plan_attachment_format(prompt).extension)
     if extension is None:
         return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
     if runtime.active_tool_registry is None:
@@ -14488,6 +14183,7 @@ def _maybe_materialize_requested_fetch_attachment(
         tool_results=tool_results,
         registry=runtime.active_tool_registry,
         principal_id=principal_id,
+        requested_extension=extension,
     )
     if not result.completed:
         return _clean_undeliverable_media_reply(runtime, reply, principal_id=principal_id) if has_media_marker else reply
@@ -14908,6 +14604,8 @@ def _chat_delivery_contract_prompt(
         "Chat delivery contract:\n"
         f"- When the user asks you to send, attach, upload, or deliver a file, write it with file_write under this workspace artifact directory only: {artifact_root}\n"
         f"- Legacy artifact directory still supported for older turns: {legacy_artifact_root}\n"
+        "- For an exact PDF page-count request, set expected_page_count on pdf_create/pdf_edit. A layout overflow requires repairing the layout, not dropping requested content.\n"
+        "- Treat artifact creation, inspection, and delivery as separate steps. Reuse successful producer inspection receipts; do not download local files to inspect them. Finish with MEDIA:<exact path> for each final requested file only. Drafts and superseded versions must not be attached.\n"
         "- Use pdf_create only when the requested final/output artifact is a PDF, or use pdf_edit when changing an existing PDF. Do not use PDF tools just because PDFs are the source files, search target, or subject of the request.\n"
         "- When deriving artifact rows from web/browser pages, prefer browser_extract_items over browser_snapshot/page dumps. Collect compact per-item row objects from the rendered page, including the row title/text, direct row URL, numeric/text value fields, and image URL when needed. Do not substitute aggregate search, category, navigation, or repeated result-page URLs for row-specific links; continue collecting row data or report the limitation.\n"
         "- When a typed artifact must embed remote image URLs or page image assets, use browser_image_collect when visible to save local image artifact files first, then pass those local paths to the artifact tool. Its default quality_profile=content is for report/document media and rejects tiny icons, placeholders, low-detail assets, and extreme banners; use quality_profile=any only when the structured artifact requirement is intentionally a small logo/icon/low-detail asset. If direct page collection cannot see rendered image assets, use browser_extract_items first, or browser_run_js on the open browser page to extract compact per-item image URLs, then pass those URLs to browser_image_collect. Do not use terminal_exec for normal web-image materialization.\n"
@@ -15202,8 +14900,11 @@ def _chat_capability_inventory_prompt(
         "the matching final suffix; artifact_extensions alone only means that file type is required. Answer the user's actual question first; do not substitute "
         "a list of matching messages, events, files, search results, or connector rows for the answer. Browser tools may be used when "
         "the user can log in or the target is public; "
-        "if the needed answer may already be in this same conversation but is outside the visible history, "
-        "request conversation_history and use chat_history_search before asking the user to repeat details; "
+        "When a request refers to previously discussed work or facts, use available memory_search or "
+        "chat_history_search to recover relevant identifiers, references and prior decisions before asking "
+        "the user to repeat them or choosing a connected-account source. Search only when prior context "
+        "is needed. Recalled facts describe earlier observations; verify current external state with a live "
+        "tool, and do not treat history as fresh consent to read a connected account. "
         "for live website or browser-app tasks, attempt the browser/web tool path before substituting a "
         "rough estimate or saying live checking is unavailable. "
         "terminal tools may be used for local command-line paths when registered and approved. If every "
@@ -15351,7 +15052,8 @@ def _artifact_paths_from_tool_results(
                 requested_extensions=sidecar_requested_extensions,
             )
         ]
-    return list(dict.fromkeys(paths))
+    from nullion.artifact_lifecycle import filter_delivery_paths
+    return filter_delivery_paths(paths, tool_results)
 
 
 def _iter_nested_string_values(value: object, *, limit: int = 200) -> tuple[str, ...]:
@@ -16319,6 +16021,10 @@ def _filter_artifact_descriptors_for_required_extension_counts(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None = None,
     protected_identities: set[str] | frozenset[str] | None = None,
 ) -> list[object]:
+    from nullion.artifact_lifecycle import delivery_manifest, filter_delivery_paths
+    if delivery_manifest(tool_results) is not None:
+        allowed = set(filter_delivery_paths([str(_artifact_descriptor_path(d)) for d in descriptors], tool_results))
+        return [d for d in descriptors if str(_artifact_descriptor_path(d)) in allowed]
     requested_counts = _extension_count_map(requested_extensions)
     protected_identities = set(protected_identities or ())
     superseded_identities = {
@@ -16639,7 +16345,9 @@ def _should_checkpoint_conversation_events_after_chat_turn(
     artifact_count: int,
     suspended_for_approval: bool,
 ) -> bool:
-    return _should_force_checkpoint_after_chat_turn(
+    # Completed tool work must be recallable after a process restart. Keep
+    # plain no-tool chat on its existing deferred checkpoint path.
+    return bool(tool_results) or _should_force_checkpoint_after_chat_turn(
         tool_results=tool_results,
         artifact_count=artifact_count,
         suspended_for_approval=suspended_for_approval,
@@ -18791,6 +18499,9 @@ def _append_chat_artifacts_to_reply(
             if descriptor_path.suffix.lower() in requested_suffixes
             or descriptor_path.name.lower() in requested_output_filenames
         ]
+    from nullion.artifact_lifecycle import filter_delivery_paths
+    selected_delivery_paths = set(filter_delivery_paths([str(d.path) for d in descriptors], tool_results))
+    descriptors = [d for d in descriptors if str(d.path) in selected_delivery_paths]
     descriptors = _filter_visual_helper_html_artifact_descriptors(
         descriptors,
         requested_extensions=requested_extensions,
@@ -19205,6 +18916,9 @@ def _enforce_chat_response_fulfillment(
     required_tool_names: tuple[str, ...] | list[str] | None = None,
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> str:
+    selection = pending_source_selection(tool_results)
+    if selection is not None:
+        return selection.reply
     if (
         not tool_results
         and not artifact_paths
@@ -19380,6 +19094,8 @@ def _needs_required_attachment_repair(
     required_embedded_media_extensions: tuple[str, ...] | list[str] | None = None,
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> bool:
+    if pending_source_selection(tool_results) is not None:
+        return False
     if _completed_scheduler_mutation_tool_present(tool_results):
         return False
     if _turn_still_needs_scoped_required_tools(tool_results or ()):
@@ -19808,6 +19524,8 @@ def _missing_required_attachment_extensions_for_repair(
     artifact_paths: list[str] | tuple[str, ...] | None,
     source_attachment_paths: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> tuple[str, ...]:
+    if pending_source_selection(tool_results) is not None:
+        return ()
     media_required = set(normalize_artifact_media_required_extensions(required_embedded_media_extensions))
     prompt_requested_extensions = _requested_output_filename_extensions_counted(prompt)
     explicit_required_extensions: list[str] = []
@@ -20295,6 +20013,11 @@ def _refine_required_attachment_extensions_for_structured_outputs(
             extension = f".{extension}"
         if extension not in excluded:
             required.append(extension)
+    scoped_output_extensions = _required_attachment_extensions_from_tool_scope(tool_results)
+    if scoped_output_extensions:
+        # The structured output contract distinguishes outputs from source filenames.
+        # Filename metadata alone cannot add an incidental input format to that plan.
+        return tuple(extension for extension in required if extension in scoped_output_extensions)
     if (
         required
         and _has_local_discovery_tool_results(tool_results)
@@ -22100,6 +21823,7 @@ def _generate_backend_reply(
     attachments: list[dict[str, str]] | None = None,
     conversation_context: str | None,
     memory_context: str | None,
+    conversation_history: list[dict[str, object]] | None = None,
     live_tool_results: list[ToolResult] | None = None,
     live_information_resolutions: list[str] | None = None,
     model_client: object | None = None,
@@ -22118,6 +21842,8 @@ def _generate_backend_reply(
         reply_kwargs["conversation_context"] = conversation_context
     if "memory_context" in parameters:
         reply_kwargs["memory_context"] = memory_context
+    if "conversation_history" in parameters and conversation_history is not None:
+        reply_kwargs["conversation_history"] = conversation_history
     if "active_tool_registry" in parameters:
         reply_kwargs["active_tool_registry"] = live_registry
     elif "live_tool_registry" in parameters:
@@ -23864,6 +23590,7 @@ def _render_chat_turn(
     phase_tracker.done(PHASE_CHECK_TASK_STATE, "task_state")
     tool_activity_count = 0
     tool_activity_ids: dict[str, str] = {}
+    orchestrator_conversation_history: list[dict[str, object]] | None = None
 
     def _record_tool_activity(result: ToolResult) -> None:
         nonlocal tool_activity_count
@@ -25842,6 +25569,11 @@ def _render_chat_turn(
                     "status": "blocked" if _turn_is_suspended else "done",
                     "detail": result_detail,
                 })
+            from nullion.artifact_lifecycle import artifact_review_unavailable_reply, delivery_manifest
+            review_notice = artifact_review_unavailable_reply(activity_tool_results)
+            if review_notice:
+                reply = review_notice + "\n\n" + "\n".join(
+                    "MEDIA:" + path for path in delivery_manifest(activity_tool_results) or ())
             stale_artifact_failure_suppressed = (
                 turn_outcome is TurnOutcome.SUCCESS
                 and not deferred_scheduler_receipt_reply
@@ -26122,6 +25854,7 @@ def _render_chat_turn(
                     attachments=attachments,
                     conversation_context=conversation_context,
                     memory_context=memory_context,
+                    conversation_history=orchestrator_conversation_history,
                     live_tool_results=live_tool_results,
                     live_information_resolutions=live_information_resolutions,
                     model_client=model_client,
@@ -26230,7 +25963,11 @@ def _render_chat_turn(
                         activity_callback=activity_callback,
                     ),
                 )
-                _remember_chat_turn(runtime, chat_id=chat_id, user_message=prompt, assistant_reply=reply, conversation_turn_id=conversation_result.turn.turn_id)
+                _remember_chat_turn(
+                    runtime, chat_id=chat_id, user_message=prompt, assistant_reply=reply,
+                    conversation_turn_id=conversation_result.turn.turn_id,
+                    tool_results=live_tool_results,
+                )
                 _remember_explicit_memory(runtime, chat_id=chat_id, settings=settings, prompt=prompt)
                 _schedule_chat_turn_memory_capture(
                     runtime,
@@ -26559,6 +26296,7 @@ def handle_chat_operator_message(
             conversation_id,
             chat_id=chat_id,
             checkpoint=channel_name not in {"telegram", "slack", "discord"},
+            history_retained=True,
         )
         reply = "Starting fresh."
     elif _normalize_command_head(message) == "/verbose":

@@ -5624,7 +5624,8 @@ def cron_delivery_artifact_paths_from_result(
         principal_id=principal_id,
         collected_assets=_collected_report_assets(result),
     )
-    return deliverable_paths
+    from nullion.artifact_lifecycle import filter_delivery_paths
+    return tuple(filter_delivery_paths(deliverable_paths, result.get("tool_results", ())))
 
 
 def _has_remote_html_image_dependency(path_text: str) -> bool:

@@ -524,3 +524,16 @@ confirmation and records the connection as an admin-shared credential.
 - Unauthorized attempts return `Unauthorized operator chat.` and emit warning logs.
 - Every handled command is logged: `Handled Telegram operator command (chat_id=..., command=..., result=...)`.
 - INFO-level logging must be enabled to see startup, clean-stop, and handled-command logs. Unauthorized attempts and failures are logged at warning/error levels.
+
+## Development checks
+
+The app, unit tests, browser workflows, and installer checks share this checkout.
+Install local test dependencies with `python -m pip install -e '.[test]'`.
+Run `./scripts/test-docker.sh` for unit tests and coverage, and
+`./scripts/e2e-docker.sh` for the complete E2E suite.
+E2E tests refuse to run on the host; they use isolated Docker runtime data.
+See [Testing](docs/e2e-testing.md) for focused checks and installer commands.
+
+GUI, browser, install, and web tests stay inside the container for local checks.
+The macOS installer runs in an isolated CI job. Actual desktop tray visibility
+requires an interactive desktop session and is not proven by headless checks.

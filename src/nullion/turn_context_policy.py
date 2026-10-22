@@ -243,13 +243,17 @@ _LOCAL_FILE_TOOLS = frozenset({"archive_create", "archive_extract", "file_read",
 _LOCAL_FILE_MUTATION_TOOLS = _LOCAL_FILE_TOOLS - _LOCAL_FILE_READ_TOOLS
 _LOCAL_FILE_LISTING_TOOLS = frozenset({"file_read", "file_search", "workspace_summary"})
 _LOCAL_SHELL_TOOLS = frozenset({"terminal_exec"})
+_REUSABLE_LOCAL_TOOLS = frozenset({"local_tool_search", "local_tool_read", "local_tool_save", "local_tool_run"})
 _SCOPE_REQUEST_TOOL_NAME = "request_tool_scope"
-_PLAIN_DIRECT_SAFE_READ_TOOLS = frozenset({"market_quote", "weather_forecast"})
+_PLAIN_DIRECT_SAFE_READ_TOOLS = frozenset({"market_quote", "weather_forecast", "chat_history_search", "memory_search"})
 _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
     name=_SCOPE_REQUEST_TOOL_NAME,
     description=(
         "Request the exact tool family needed for this turn when visible tools are insufficient. "
         "Call this before saying a registered capability is unavailable. "
+        "Declare the complete current request's action plan at its first scope: include the exact authorized "
+        "write tools in tool_names and required_tool_names even when discovery or reading must happen first. "
+        "Recovery preserves that plan; discovering a modifiable object or a write continuation does not authorize a new action. "
         "Use connector for authenticated external account APIs such as mail, calendars, docs, "
         "and connected services. For account-evidence or source-discovery requests, request connector "
         "scope so the runtime can report active sources and expose safe structured read tools. "
@@ -263,7 +267,11 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "reminders. If the current turn asks to manually start, trigger, run now, rerun, or otherwise execute "
         "an existing scheduled task, request scheduler_run with scheduler_action=\"run\" and include run_cron "
         "when registered. If the current turn both locates/identifies an existing scheduled task and executes it, "
-        "request scheduler_run, not scheduler_read. Use scheduler_selection_policy=\"user_selected\" when the "
+        "request scheduler_run, not scheduler_read. Declare the scheduler action for the entire current request "
+        "before its first scheduler scope: inspection permits reads, run permits execution, mutate permits changes. "
+        "An inspection cannot gain run or mutation effects through discovery or recovery. An interrupted check, "
+        "an unavailable source, or a modifiable object is evidence to report, never authorization to change it. "
+        "Use scheduler_selection_policy=\"user_selected\" when the "
         "task id, number, name, or linked task state is already identified; use \"delegate_one\" only when the "
         "agent should choose exactly one eligible task from structured list_crons output. "
         "Use personal_tasks for the persistent personal task list. Include personal_task_save explicitly only "
@@ -271,12 +279,18 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "Use conversation_history for earlier workspace turns, document references, or durable memory. "
         "Use memory_search for saved preferences/facts and request memory_save explicitly for an authorized durable memory write. "
         "A memory_save persisted receipt is required before saying it is saved. "
+        "Use local_tools to search, inspect, write and run durable Python tools in this workspace. "
+        "Include local_tool_save explicitly in tool_names when creating or updating a helper is authorized; "
+        "library discovery alone does not select that write. "
+        "When custom code would help, search saved tools first; reuse a suitable revision instead of recreating it. "
+        "If none fits, save a tool with input/output schemas, run a representative example, then reuse that revision in future turns. "
+        "Saved tools use terminal_exec authorization; they do not grant extra permissions. "
         "Use web for public websites, live public lookups, and public source data "
         "that will be written into a local artifact such as CSV, HTML, PDF, DOCX, or XLSX. Use skill_pack only "
         "when detailed installed-pack reference docs are needed. Capabilities: web, "
         "scheduler_read, scheduler_run, scheduler_mutate, connector, skill_pack, conversation_history, personal_tasks, weather, "
         "market_data, "
-        "image_generation, local_files, local_shell. "
+        "image_generation, local_files, local_shell, local_tools. "
         "When scheduler_run should run exactly one eligible scheduled task chosen from structured list_crons output, "
         "set scheduler_selection_policy to delegate_one. "
         "When the turn needs a downloadable or attached file in a specific format, include artifact_extensions with the required "
@@ -311,6 +325,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "local_files exposes structured local file read/search tools by default and write/artifact "
                     "tools only when exact tool_names or artifact_extensions request them; local_shell exposes "
                     "local terminal execution when registered."
+                    " local_tools exposes the persistent workspace Python tool library for discovery, creation and reuse."
                 ),
                 "items": {
                     "type": "string",
@@ -329,6 +344,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "image_generation",
                         "local_files",
                         "local_shell",
+                        "local_tools",
                     ],
                 },
             },
@@ -449,7 +465,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "If the artifact itself must contain embedded media, repeat that suffix in "
                     "embedded_media_artifact_extensions instead of relying on artifact_extensions alone."
                 ),
-                "items": {"type": "string", "enum": sorted(VALID_ATTACHMENT_EXTENSIONS)},
+                "items": {"type": "string", "pattern": r"^\.[A-Za-z0-9]{1,16}$"},
             },
             "excluded_artifact_extensions": {
                 "type": "array",
@@ -580,7 +596,7 @@ def _validated_artifact_extensions(value: object) -> tuple[str, ...]:
             continue
         if not extension.startswith("."):
             extension = f".{extension}"
-        if extension not in VALID_ATTACHMENT_EXTENSIONS:
+        if extension not in VALID_ATTACHMENT_EXTENSIONS and re.fullmatch(r"\.[a-z0-9]{1,16}", extension) is None:
             continue
         extensions.append(extension)
     return tuple(extensions)
@@ -655,6 +671,8 @@ def _exact_scope_tools_for_capability(capability: str, tool_names: Iterable[str]
         capability_tools = _LOCAL_FILE_TOOLS | _ARCHIVE_TOOLS | _STRUCTURED_ARTIFACT_TOOLS
     elif capability == "local_shell":
         capability_tools = _LOCAL_SHELL_TOOLS
+    elif capability == "local_tools":
+        capability_tools = _REUSABLE_LOCAL_TOOLS | _LOCAL_SHELL_TOOLS
     else:
         return ()
     return tuple(dict.fromkeys(tool_name for tool_name in tool_names if tool_name in capability_tools))
@@ -804,6 +822,10 @@ class TurnToolScopeDecision:
     scheduler_toggle_enabled: bool | None = None
     scheduler_selection_policy: str = "none"
     scheduler_target_scope: str = "none"
+    # Runtime-owned contract, not a model-requestable scope argument. Narrowing
+    # discovery to reads does not discard a previously declared action, and
+    # discovering object metadata never adds a new action to this contract.
+    scheduler_effect_actions: tuple[str, ...] = ()
     skill_pack_action: str = "none"
     connector_app_ids: tuple[str, ...] = ()
     connector_source_user_requested: bool = False
@@ -828,12 +850,46 @@ class TurnToolScopeDecision:
         return self.scheduler_action in {"inspect", "run", "mutate"}
 
     @property
+    def allowed_scheduler_actions(self) -> tuple[str, ...]:
+        if self.scheduler_effect_actions:
+            return self.scheduler_effect_actions
+        if self.valid and self.scheduler_action in {"inspect", "run", "mutate"}:
+            return tuple(dict.fromkeys(("inspect", self.scheduler_action)))
+        return ()
+
+    @property
     def allow_connector_tools(self) -> bool:
         return self.skill_pack_action == "connector" and self.connector_source_user_requested
 
     @property
     def allow_skill_pack_tools(self) -> bool:
         return self.skill_pack_action in {"reference", "connector"}
+
+
+def _planned_output_extensions(registry, required_tool_names, declared_extensions=()):
+    """A required producer is an output plan; a reader's formats are capabilities."""
+    planned = set(required_tool_names or ())
+    writable = set()
+    for name in planned:
+        try:
+            spec = registry.get_spec(name)
+        except (AttributeError, KeyError):
+            continue
+        if (spec.side_effect_class in {ToolSideEffectClass.WRITE, ToolSideEffectClass.DANGEROUS_EXEC}
+                and not getattr(spec, "source_artifact_only", False)):
+            writable.add(spec.name)
+    extensions = {extension for extension, producers in _ARTIFACT_EXTENSION_TOOLS.items()
+                  if writable.intersection(producers)}
+    declared = set(_validated_artifact_extensions(list(declared_extensions)))
+    if writable.intersection(_LOCAL_SHELL_TOOLS):
+        extensions.update(declared)
+    if writable.intersection({"file_write", "file_patch"}):
+        extensions.update(declared.intersection(_TEXT_WRITE_EXTENSIONS))
+    if "archive_create" in writable:
+        extensions.update(declared.intersection({".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".tbz2", ".txz"}))
+    if "image_generate" in writable:
+        extensions.update(declared.intersection({".png", ".jpg", ".jpeg", ".webp", ".svg"}))
+    return extensions
 
 
 class ScopedTurnToolRegistry:
@@ -850,6 +906,9 @@ class ScopedTurnToolRegistry:
         self._evidence = evidence
         self.turn_tool_scope_decision = tool_scope_decision or TurnToolScopeDecision()
         decision = self.turn_tool_scope_decision
+        if decision.allowed_scheduler_actions and not decision.scheduler_effect_actions:
+            decision = replace(decision, scheduler_effect_actions=decision.allowed_scheduler_actions)
+            self.turn_tool_scope_decision = decision
         source_extensions = set()
         if decision.requested_tool_names:
             source_extensions = set()
@@ -862,6 +921,8 @@ class ScopedTurnToolRegistry:
                         capture_only_names.add(name)
                 except (AttributeError, KeyError):
                     continue
+            if not decision.source_artifact_retrieval_only:
+                source_extensions.difference_update(_planned_output_extensions(delegate, decision.required_tool_names, decision.requested_artifact_extensions))
             quote = " ".join(decision.source_artifact_request_evidence.split())
             current_text = " ".join(evidence.current_user_message.split())
             capture_requested = decision.source_artifact_delivery_requested and quote and quote in current_text
@@ -876,6 +937,13 @@ class ScopedTurnToolRegistry:
                     required_tool_names=tuple(name for name in decision.required_tool_names if name not in drop_capture_only))
         self.source_artifact_extensions = frozenset(source_extensions)
         self._active_connector_read_tools: frozenset[str] | None = None
+        # Retry helpers can rebuild a scoped view around a protected registry.
+        # Retain that request contract on the view returned to finalization too,
+        # not only on the registry used while invoking its tools.
+        from nullion.recovery_contract import RequestRecoveryContract
+        contract = getattr(delegate, "contract", None)
+        if isinstance(contract, RequestRecoveryContract):
+            self.turn_tool_scope_decision = contract.bind(self).turn_tool_scope_decision
 
     def _delegate_tool_names(self) -> set[str]:
         try:
@@ -918,7 +986,9 @@ class ScopedTurnToolRegistry:
             for continuation in getattr(spec, "continuation_tools", ()) or ():
                 continuation_name = str(continuation or "").strip()
                 if continuation_name and continuation_name in available:
-                    continuations.append(continuation_name)
+                    continuation_spec = self._delegate.get_spec(continuation_name)
+                    if continuation_spec.side_effect_class == ToolSideEffectClass.READ:
+                        continuations.append(continuation_name)
             if capability == "web" and tool_name == "web_search":
                 continuations.extend(name for name in ("web_fetch", *_BROWSER_INTERACTION_SCOPE_TOOLS) if name in available)
         return tuple(dict.fromkeys(continuations))
@@ -1127,6 +1197,12 @@ class ScopedTurnToolRegistry:
         # delegate still enforces availability, approval and execution policy.
         if tool_name in _LOCAL_SHELL_TOOLS:
             return True
+        if tool_name in {"chat_history_search", "memory_search"}:
+            try:
+                spec = self._delegate.get_spec(tool_name)
+            except KeyError:
+                return False
+            return spec.side_effect_class == ToolSideEffectClass.READ and not spec.requires_approval
         requested_extensions = set(self._evidence.requested_extensions).union(
             set(self.turn_tool_scope_decision.requested_artifact_extensions)
         ).union(
@@ -1136,6 +1212,8 @@ class ScopedTurnToolRegistry:
         if tool_name == _SCOPE_REQUEST_TOOL_NAME:
             return True
         if tool_name in {"personal_tasks_list", "personal_task_save"}:
+            return tool_name in self.turn_tool_scope_decision.requested_tool_names
+        if tool_name in _REUSABLE_LOCAL_TOOLS:
             return tool_name in self.turn_tool_scope_decision.requested_tool_names
         if self._artifact_scheduler_scope_is_ambiguous():
             return False
@@ -1205,6 +1283,8 @@ class ScopedTurnToolRegistry:
             if (
                 tool_name in requested_tool_names
                 and (
+                    tool_name in self.turn_tool_scope_decision.required_tool_names
+                    or
                     self._evidence.has_url_target
                     or self.turn_tool_scope_decision.allow_web_tools
                 )
@@ -1228,6 +1308,12 @@ class ScopedTurnToolRegistry:
             if not allowed_by_other_scope:
                 return False
         if is_scheduler_tool:
+            effects = self.turn_tool_scope_decision.allowed_scheduler_actions
+            if effects and (
+                (tool_name in _SCHEDULER_MUTATE_TOOLS and "mutate" not in effects)
+                or (tool_name in _SCHEDULER_RUN_TOOLS and "run" not in effects)
+            ):
+                return False
             allowed_scheduler_tools = _scheduler_tools_allowed_for_action(
                 scheduler_action
             )
@@ -1364,6 +1450,14 @@ class ScopedTurnToolRegistry:
             return False
         if self._is_plain_independent_turn():
             return tool_name == _SCOPE_REQUEST_TOOL_NAME
+        # Registered tools may belong to a dynamically installed family. Their
+        # presence is discovery metadata, not a request to perform writes.
+        try:
+            spec = self._delegate.get_spec(tool_name)
+        except KeyError:
+            return False
+        if spec.side_effect_class != ToolSideEffectClass.READ:
+            return tool_name in requested_tool_names
         return True
 
     def get_spec(self, name: str):
@@ -1377,17 +1471,19 @@ class ScopedTurnToolRegistry:
         specs = [
             spec
             for spec in self._delegate.list_specs()
-            if self.can_invoke_tool(str(getattr(spec, "name", "") or ""))
+            if str(getattr(spec, "name", "")) != _SCOPE_REQUEST_TOOL_NAME
+            and self.can_invoke_tool(str(getattr(spec, "name", "") or ""))
         ]
         if self._is_allowed_tool_name(_SCOPE_REQUEST_TOOL_NAME):
             specs.insert(0, _SCOPE_REQUEST_TOOL_SPEC)
-        return specs
+        return list({spec.name: spec for spec in specs}.values())
 
     def list_tool_definitions(self, *args, **kwargs) -> list[dict[str, object]]:
         definitions = [
             definition
             for definition in self._delegate.list_tool_definitions(*args, **kwargs)
-            if self.can_invoke_tool(str(definition.get("name") or ""))
+            if definition.get("name") != _SCOPE_REQUEST_TOOL_NAME
+            and self.can_invoke_tool(str(definition.get("name") or ""))
         ]
         if self._is_allowed_tool_name(_SCOPE_REQUEST_TOOL_NAME):
             definitions.insert(
@@ -1402,6 +1498,7 @@ class ScopedTurnToolRegistry:
                     "requires_approval": False,
                 },
             )
+        definitions = list({definition['name']: definition for definition in definitions}.values())
         visible_tool_names = frozenset(str(definition.get("name") or "") for definition in definitions)
         return [
             self._definition_with_visible_continuations(definition, visible_tool_names)
@@ -1487,6 +1584,9 @@ class ScopedTurnToolRegistry:
             and bool(source_quote)
             and source_quote in " ".join(self._evidence.current_user_message.split())
         )
+        local_file_write_tools_requested = bool(
+            set(exact_tool_names).intersection({"archive_create", "file_patch", "file_write"})
+        )
         if (
             "local_files" in capabilities
             and set(exact_tool_names).intersection(_LOCAL_FILE_LISTING_TOOLS)
@@ -1495,11 +1595,9 @@ class ScopedTurnToolRegistry:
             and not self._evidence.has_url_target
             and not embedded_media_extensions
             and not source_delivery_requested
+            and not local_file_write_tools_requested
         ):
             requested_artifact_extensions = ()
-        local_file_write_tools_requested = bool(
-            set(exact_tool_names).intersection({"archive_create", "file_patch", "file_write"})
-        )
         local_file_listing_without_artifact_request = (
             "local_files" in capabilities
             and not self._evidence.artifact_requested
@@ -1562,7 +1660,7 @@ class ScopedTurnToolRegistry:
                     requested.extend(["file_read", "file_search", "workspace_summary"])
                 continue
             if capability == "local_files":
-                requested.extend(sorted(_LOCAL_FILE_TOOLS | _ARCHIVE_TOOLS))
+                requested.extend(sorted(_LOCAL_FILE_READ_TOOLS))
                 exact_local_tools = _exact_scope_tools_for_capability(capability, exact_tool_names)
                 if local_file_listing_without_artifact_request:
                     exact_local_tools = tuple(
@@ -1656,6 +1754,8 @@ class ScopedTurnToolRegistry:
                     requested.extend(_ARTIFACT_EXTENSION_TOOLS.get(extension, ()))
             elif capability == "local_shell":
                 requested.extend(sorted(_LOCAL_SHELL_TOOLS))
+            elif capability == "local_tools":
+                requested.extend(sorted((_REUSABLE_LOCAL_TOOLS - {"local_tool_save"}) | _LOCAL_SHELL_TOOLS))
         if not scheduler_mutation_scope:
             for extension in requested_artifact_extensions:
                 requested.extend(_ARTIFACT_EXTENSION_TOOLS.get(extension, ()))
@@ -1820,6 +1920,24 @@ class ScopedTurnToolRegistry:
 
     def apply_scope_request(self, invocation: ToolInvocation) -> tuple[ToolResult, "ScopedTurnToolRegistry"]:
         scope_arguments = dict(invocation.arguments)
+        allowed_actions = self.turn_tool_scope_decision.allowed_scheduler_actions
+        capabilities = set(scope_arguments.get("capabilities") or ())
+        names = set(scope_arguments.get("tool_names") or ()).union(scope_arguments.get("required_tool_names") or ())
+        requested_actions = set()
+        action = scope_arguments.get("scheduler_action")
+        if action in {"inspect", "run", "mutate"}:
+            requested_actions.add(action)
+        if "scheduler_mutate" in capabilities or names.intersection(_SCHEDULER_MUTATE_TOOLS):
+            requested_actions.add("mutate")
+        if "scheduler_run" in capabilities or "run_cron" in names:
+            requested_actions.add("run")
+        if allowed_actions and requested_actions.difference(allowed_actions):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "denied", {
+                "reason": "turn_effect_not_authorized",
+                "allowed_scheduler_actions": list(allowed_actions),
+                "requested_scheduler_actions": sorted(requested_actions),
+                "suppress_activity": True,
+            }, error="Tool discovery cannot expand this turn's declared scheduler actions."), self
         # A tool's incidental captures are not output requirements. Validate the
         # model's delivery decision against the current request, using tool
         # metadata rather than vendor names or language-specific intent rules.
@@ -1830,6 +1948,10 @@ class ScopedTurnToolRegistry:
             if spec.name in requested_names
             for extension in getattr(spec, "source_artifact_extensions", ())
         }
+        if not self.turn_tool_scope_decision.source_artifact_retrieval_only:
+            source_extensions.difference_update(_planned_output_extensions(
+                self._delegate, scope_arguments.get("required_tool_names") or (),
+                _validated_artifact_extensions(scope_arguments.get("artifact_extensions"))))
         source_delivery_flag = scope_arguments.get("source_artifact_delivery_requested", self.turn_tool_scope_decision.source_artifact_delivery_requested)
         request_quote = " ".join(str(scope_arguments.get("source_artifact_request_evidence") or self.turn_tool_scope_decision.source_artifact_request_evidence).split())
         request_text = " ".join(self._evidence.current_user_message.split())
@@ -2064,6 +2186,9 @@ class ScopedTurnToolRegistry:
         if (
             "local_files" in capabilities
             and explicitly_requested_tools.intersection(_LOCAL_FILE_LISTING_TOOLS)
+            and not explicitly_requested_tools.intersection({"archive_create", "file_patch", "file_write"})
+            and not _planned_output_extensions(self._delegate, scope_arguments.get("required_tool_names") or ())
+            and not set(scope_arguments.get("required_tool_names") or ()).intersection(_LOCAL_SHELL_TOOLS | {"image_generate"})
             and not self._evidence.artifact_requested
             and not self._evidence.has_attachments
             and not self._evidence.has_url_target
@@ -2245,8 +2370,23 @@ class ScopedTurnToolRegistry:
             tuple(dict.fromkeys([*existing.requested_tool_names, *tool_names])),
             scheduler_action,
         )
+        # A new safe execution path may replace an account read that was never
+        # authorized or callable. Keep real action obligations and selected
+        # account reads; do not carry an unselected source guess into that path.
+        superseded_unselected_required = tuple(
+            name for name in existing.required_tool_names
+            if capabilities.difference({"connector", "conversation_history"})
+            and "connector" not in capabilities
+            and not existing.connector_source_user_requested
+            and self._is_connector_tool_name(name)
+            and not self.can_invoke_tool(name)
+            and name not in required_tool_names
+        )
         merged_required_tool_names = _filter_scheduler_requested_tool_names_for_action(
-            tuple(dict.fromkeys([*existing.required_tool_names, *required_tool_names])),
+            tuple(dict.fromkeys([
+                *(name for name in existing.required_tool_names if name not in superseded_unselected_required),
+                *required_tool_names,
+            ])),
             scheduler_action,
         )
         web_action = (
@@ -2271,8 +2411,13 @@ class ScopedTurnToolRegistry:
             self._delegate,
             evidence=self._evidence,
             tool_scope_decision=TurnToolScopeDecision(
+                requested_outcome=existing.requested_outcome,
                 web_action=web_action,
                 scheduler_action=scheduler_action,
+                scheduler_effect_actions=existing.allowed_scheduler_actions or (
+                    tuple(dict.fromkeys(("inspect", scheduler_action)))
+                    if scheduler_action in {"inspect", "run", "mutate"} else ()
+                ),
                 scheduler_toggle_enabled=scheduler_toggle_enabled,
                 scheduler_selection_policy=scheduler_selection_policy,
                 scheduler_target_scope=scheduler_target_scope,
@@ -2309,8 +2454,15 @@ class ScopedTurnToolRegistry:
             and set(callable_tool_names).intersection(_LOCAL_FILE_READ_TOOLS | _CONVERSATION_HISTORY_TOOLS)
             and not set(callable_tool_names).intersection(_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS))
         if read_only_source_delivery:
+            selected_reads = set(invocation.arguments.get("tool_names") or ()).union(
+                invocation.arguments.get("required_tool_names") or ())
+            unselected_helpers = tuple(name for name in merged_required_tool_names
+                                      if name in _LOCAL_FILE_READ_TOOLS and name not in selected_reads)
+            superseded_unselected_required = tuple(dict.fromkeys([
+                *superseded_unselected_required, *unselected_helpers]))
             merged_required_tool_names = tuple(name for name in merged_required_tool_names
-                                               if name not in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS))
+                                               if name not in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS)
+                                               and name not in unselected_helpers)
             widened.turn_tool_scope_decision = replace(widened.turn_tool_scope_decision, required_tool_names=merged_required_tool_names)
         callable_required_tool_names = tuple(
             tool_name for tool_name in merged_required_tool_names if tool_name in callable_tool_names
@@ -2339,12 +2491,17 @@ class ScopedTurnToolRegistry:
                     "scope_requested": True,
                     "capabilities": sorted(capabilities),
                     "scheduler_action": scheduler_action,
+                    "scheduler_effect_actions": list(widened.turn_tool_scope_decision.allowed_scheduler_actions),
+                    "requested_outcome": widened.turn_tool_scope_decision.requested_outcome,
+                    "connector_source_user_requested": widened.turn_tool_scope_decision.connector_source_user_requested,
+                    "connector_source_evidence": widened.turn_tool_scope_decision.connector_source_evidence,
                     "scheduler_toggle_enabled": widened.turn_tool_scope_decision.scheduler_toggle_enabled,
                     "scheduler_selection_policy": widened.turn_tool_scope_decision.scheduler_selection_policy,
                     "scheduler_target_scope": widened.turn_tool_scope_decision.scheduler_target_scope,
                     "available_tools": list(callable_tool_names),
                     "required_tool_names": list(callable_required_tool_names),
                     "requested_required_tool_names": list(merged_required_tool_names),
+                    "superseded_unselected_required_tool_names": list(superseded_unselected_required),
                     "explicit_tool_names": sorted(set(existing.requested_tool_names) | explicitly_requested_tools),
                     "unavailable_required_tool_names": list(unavailable_required_tool_names),
                     "unavailable_tools": list(unavailable_tools),
@@ -3976,6 +4133,8 @@ def build_turn_tool_scope_decision(
         available_special_tool_scopes.append("local_files")
     if registered_special_tool_names.intersection(_LOCAL_SHELL_TOOLS):
         available_special_tool_scopes.append("local_shell")
+    if registered_special_tool_names.intersection(_REUSABLE_LOCAL_TOOLS):
+        available_special_tool_scopes.append("local_tools")
     unavailable_special_tool_scopes = [
         scope
         for scope in ("weather", "market_data", "image_generation")
@@ -4266,7 +4425,7 @@ def _planner_materialized_registry(
             ] if extension not in excluded_extensions
         )
     )
-    planner_evidence = TurnToolEvidence(
+    planner_evidence = replace(evidence,
         has_url_target=evidence.has_url_target,
         has_attachments=evidence.has_attachments,
         has_email_address_target=evidence.has_email_address_target,
@@ -4280,21 +4439,12 @@ def _planner_materialized_registry(
     return ScopedTurnToolRegistry(
         base_registry,
         evidence=planner_evidence,
-        tool_scope_decision=TurnToolScopeDecision(
-            web_action=existing.web_action,
-            scheduler_action=existing.scheduler_action,
-            scheduler_toggle_enabled=existing.scheduler_toggle_enabled,
-            scheduler_selection_policy=existing.scheduler_selection_policy,
-            scheduler_target_scope=existing.scheduler_target_scope,
-            skill_pack_action=existing.skill_pack_action,
-            connector_app_ids=existing.connector_app_ids,
-            connector_source_user_requested=existing.connector_source_user_requested,
-            connector_source_evidence=existing.connector_source_evidence,
+        tool_scope_decision=replace(existing,
             requested_tool_names=tuple(
                 dict.fromkeys(
                     [
                         *tuple(getattr(existing, "requested_tool_names", ()) or ()),
-                        *_PLANNER_ARTIFACT_SCOPE_TOOLS,
+                        *(_PLANNER_ARTIFACT_SCOPE_TOOLS if requested_extensions else ()),
                     ]
                 )
             ),
@@ -4323,7 +4473,8 @@ def materialize_mini_agent_tool_scope_registry(
     """Resolve fixed DeepAgent tool scope before mini-agent dispatch."""
 
     existing_decision = getattr(registry, "turn_tool_scope_decision", None)
-    base_registry = getattr(registry, "_delegate", registry)
+    from nullion.recovery_contract import RequestRecoveryRegistry
+    base_registry = registry if isinstance(registry, RequestRecoveryRegistry) else getattr(registry, "_delegate", registry)
     materialized_evidence = evidence
     if materialized_evidence is None:
         registry_evidence = getattr(registry, "_evidence", None)

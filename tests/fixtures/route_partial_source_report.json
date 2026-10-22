@@ -1,0 +1,29 @@
+{
+  "result_kind": "source_observations",
+  "report_status": "partial",
+  "next_action": "report",
+  "observations": [
+    {
+      "label": "Early route sightseeing — State Line Lookout",
+      "value": "State Line Lookout (Alpine, NJ)",
+      "quote": "State Line Lookout (Alpine, NJ)\nThe highest cliff point featuring amenities, a rest stop, and a hike to the Women’s Federation Monument.",
+      "source_url": "https://www.google.com/search?q=best+stops+Palisades+Interstate+Parkway+Bear+Mountain+official&sei=jK7WasnPBpSliLMPwoaB4AU"
+    },
+    {
+      "label": "Late-route food-shopping option — Saunderskill Farms, Accord",
+      "value": "Saunderskill Farms",
+      "quote": "Saunderskill Farms\n4.7(220) · Farmers' market\nAccord, NY · (845) 626-2676\nClosed · Opens 8 AM Tue\nPrepared foods·\nCredit cards",
+      "source_url": "https://www.google.com/search?q=best+food+farm+market+local+shopping+NY-17+US-209+Wurtsboro+Ellenville+Kerhonkson"
+    },
+    {
+      "label": "Kerhonkson sightseeing — Minnewaska State Park Preserve",
+      "value": "Minnewaska State Park Preserve",
+      "quote": "Minnewaska State Park Preserve (Kerhonkson/Minnewaska Region)\nThe crown jewel of regional sightseeing is the Minnewaska State Park Preserve. This massive 24,000-acre preserve rests atop the Shawangunk Ridge and features striking white quartzite cliffs, dense forests, and rare sky lakes.",
+      "source_url": "https://www.google.com/search?q=best+sightseeing+Kerhonkson+Samsonville+Phoenicia+Minnewaska+official"
+    }
+  ],
+  "unknowns": [
+    "Precise added driving times or mileage for each detour were not established; the recommendations are organized by their general position along or near the specified corridor.",
+    "Current opening hours, seasonal access, parking conditions, and reservation requirements should be checked directly before travel; displayed search-result hours may change."
+  ]
+}

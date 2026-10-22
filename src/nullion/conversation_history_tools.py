@@ -10,6 +10,8 @@ import re
 from typing import Iterable
 from urllib.parse import urlparse
 
+from nullion.recall_text import has_uncased_letters, normalize_search_text, search_tokens
+
 from nullion.tools import ToolInvocation, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
 
 
@@ -24,9 +26,6 @@ _MATCH_CONTEXT_PREVIOUS_TURNS = 4
 _MATCH_CONTEXT_FOLLOWING_TURNS = 1
 _MAX_STRUCTURED_REFERENCES = 8
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
-_GITHUB_PULL_PATH_RE = re.compile(r"^/([^/\s]+)/([^/\s]+)/pull/(\d+)(?:/|$)", re.IGNORECASE)
-_GITHUB_REPO_CODE_RE = re.compile(r"`([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)`")
-_PR_NUMBER_TEXT_RE = re.compile(r"\b(?:PR|Pull Request)\s*#?\s*(\d+)\b", re.IGNORECASE)
 _SCHEDULED_TASK_DELIVERY_CONTEXT_RE = re.compile(
     r"^\[Scheduled task delivery context\]\s*task=(?P<task>[^;\n]+)"
     r"(?:;\s*channel=(?P<channel>[^;\n]+))?"
@@ -140,22 +139,6 @@ def _structured_references_from_text(text: object) -> list[dict[str, object]]:
         domain = parsed.netloc.lower()
         if domain.startswith("www."):
             domain = domain[4:]
-        pull_match = _GITHUB_PULL_PATH_RE.match(parsed.path or "") if domain == "github.com" else None
-        if pull_match:
-            owner, repo, number = pull_match.groups()
-            ref = {
-                "type": "github_pr",
-                "owner": owner,
-                "repo": repo,
-                "number": number,
-                "url": url,
-            }
-            identity = tuple(sorted(ref.items()))
-            if identity not in seen:
-                refs.append(ref)
-                seen.add(identity)
-                if len(refs) >= _MAX_STRUCTURED_REFERENCES:
-                    break
         ref: dict[str, object] = {"type": "url", "domain": domain, "url": url}
         identity = tuple(sorted(ref.items()))
         if identity in seen:
@@ -164,21 +147,6 @@ def _structured_references_from_text(text: object) -> list[dict[str, object]]:
         seen.add(identity)
         if len(refs) >= _MAX_STRUCTURED_REFERENCES:
             break
-    if len(refs) < _MAX_STRUCTURED_REFERENCES:
-        pr_match = _PR_NUMBER_TEXT_RE.search(text_value)
-        repo_match = _GITHUB_REPO_CODE_RE.search(text_value)
-        if pr_match and repo_match:
-            owner, repo = repo_match.groups()
-            ref = {
-                "type": "github_pr",
-                "owner": owner,
-                "repo": repo,
-                "number": pr_match.group(1),
-                "url": f"https://github.com/{owner}/{repo}/pull/{pr_match.group(1)}",
-            }
-            identity = tuple(sorted(ref.items()))
-            if identity not in seen:
-                refs.append(ref)
     return refs
 
 
@@ -187,7 +155,10 @@ def _structured_references_from_event(event: dict[str, object]) -> list[dict[str
     seen: set[tuple[object, ...]] = set()
     sources = [event.get("user_message")]
     assistant_reply = str(event.get("assistant_reply") or "").strip()
-    if not assistant_reply.startswith("I found the saved chat target for this reference."):
+    tool_names = set(_tool_names_from_event(event))
+    recall_only = bool(tool_names.intersection({"chat_history_search", "memory_search"})) and tool_names.issubset(
+        {"chat_history_search", "memory_search", "request_tool_scope", "audio_transcribe"})
+    if not recall_only:
         sources.append(assistant_reply)
     for source in sources:
         for ref in _structured_references_from_text(source):
@@ -218,13 +189,8 @@ def _structured_reference_tokens(ref: dict[str, object]) -> set[str]:
 
 
 def _tokenize(value: object) -> tuple[str, ...]:
-    tokens: list[str] = []
-    for token in re.findall(r"\w+", str(value or "")):
-        normalized = token.lower()
-        if len(normalized) < _MIN_SEARCH_TOKEN_CHARS:
-            continue
-        tokens.append(normalized)
-    return tuple(dict.fromkeys(tokens))
+    return tuple(token for token in search_tokens(value)
+                 if len(token) >= _MIN_SEARCH_TOKEN_CHARS or has_uncased_letters(token))
 
 
 def _event_discovery_only(event: dict[str, object]) -> bool:
@@ -536,7 +502,10 @@ def _chat_store_history_turns(
             workspace_id=workspace_id,
         )
         messages_by_conversation: list[tuple[str, list[dict[str, object]]]] = []
+        archived_ids = set()
         for candidate_conversation_id in conversation_ids:
+            if (chat_store.get_conversation(candidate_conversation_id) or {}).get("status") == "archived":
+                archived_ids.add(candidate_conversation_id)
             message_limit = (
                 max(1, scan_limit * 2)
                 if scan_limit is not None
@@ -545,6 +514,7 @@ def _chat_store_history_turns(
             messages = chat_store.load_messages(
                 candidate_conversation_id,
                 limit=message_limit,
+                _include_runtime_identity=True,
             )
             if isinstance(messages, list):
                 messages_by_conversation.append((candidate_conversation_id, messages))
@@ -562,6 +532,7 @@ def _chat_store_history_turns(
                 continue
             created_at = str(message.get("created_at") or "").strip()
             message_id = str(message.get("id") or "").strip()
+            runtime_turn_id = str(message.get("runtime_turn_id") or "").strip()
             if role == "user":
                 if pending_user is not None:
                     turns.append(
@@ -569,14 +540,14 @@ def _chat_store_history_turns(
                             "conversation_id": candidate_conversation_id,
                             "event_type": "conversation.chat_turn",
                             "created_at": str(pending_user.get("created_at") or created_at),
-                            "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}",
+                            "turn_id": pending_user.get("runtime_turn_id") or f"chat-store:{pending_user.get('id') or len(turns)}",
                             "user_message": str(pending_user.get("text") or ""),
                             "assistant_reply": "",
                             "workspace_id": workspace_id,
                             "source": "chat_history",
                         }
                     )
-                pending_user = {"id": message_id, "text": text, "created_at": created_at}
+                pending_user = {"id": message_id, "text": text, "created_at": created_at, "runtime_turn_id": runtime_turn_id}
                 continue
             if role not in {"assistant", "bot"}:
                 continue
@@ -586,7 +557,7 @@ def _chat_store_history_turns(
                         "conversation_id": candidate_conversation_id,
                         "event_type": "conversation.chat_turn",
                         "created_at": created_at or str(pending_user.get("created_at") or ""),
-                        "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}:{message_id or len(turns)}",
+                        "turn_id": runtime_turn_id or pending_user.get("runtime_turn_id") or f"chat-store:{pending_user.get('id') or len(turns)}:{message_id or len(turns)}",
                         "user_message": str(pending_user.get("text") or ""),
                         "assistant_reply": text,
                         "workspace_id": workspace_id,
@@ -600,7 +571,7 @@ def _chat_store_history_turns(
                         "conversation_id": candidate_conversation_id,
                         "event_type": "conversation.chat_turn",
                         "created_at": created_at,
-                        "turn_id": f"chat-store:{message_id or len(turns)}",
+                        "turn_id": runtime_turn_id or f"chat-store:{message_id or len(turns)}",
                         "user_message": "",
                         "assistant_reply": text,
                         "workspace_id": workspace_id,
@@ -613,13 +584,16 @@ def _chat_store_history_turns(
                     "conversation_id": candidate_conversation_id,
                     "event_type": "conversation.chat_turn",
                     "created_at": str(pending_user.get("created_at") or ""),
-                    "turn_id": f"chat-store:{pending_user.get('id') or len(turns)}",
+                    "turn_id": pending_user.get("runtime_turn_id") or f"chat-store:{pending_user.get('id') or len(turns)}",
                     "user_message": str(pending_user.get("text") or ""),
                     "assistant_reply": "",
                     "workspace_id": workspace_id,
                     "source": "chat_history",
                 }
             )
+    for event in turns:
+        if event["conversation_id"] in archived_ids:
+            event["history_retained"] = True
     turns.sort(key=lambda event: _parse_created_at(event.get("created_at")))
     if scan_limit is not None:
         return turns[-scan_limit:]
@@ -664,28 +638,31 @@ def _dedupe_history_events(
     *,
     scan_limit: int | None,
 ) -> list[dict[str, object]]:
-    selected: list[dict[str, object]] = []
-    selected_indexes: dict[tuple[str, str], int] = {}
-    for event in sorted(
-        (dict(item) for item in events if isinstance(item, dict)),
-        key=lambda item: _parse_created_at(item.get("created_at")),
-    ):
-        identity = (
-            str(event.get("conversation_id") or ""),
-            " ".join(str(event.get("user_message") or "").split()),
-            " ".join(str(event.get("assistant_reply") or "").split()),
-        )
-        selected_index = selected_indexes.get(identity)
-        if selected_index is not None:
-            existing = selected[selected_index]
-            if not _event_has_richer_runtime_metadata(existing) and _event_has_richer_runtime_metadata(event):
-                selected[selected_index] = event
-            continue
-        selected_indexes[identity] = len(selected)
-        selected.append(event)
-    if scan_limit is not None:
-        return selected[-scan_limit:]
-    return selected
+    ordered = sorted((dict(item) for item in events if isinstance(item, dict)),
+                     key=lambda item: _parse_created_at(item.get("created_at")))
+    def content_key(event):
+        return (str(event.get("conversation_id") or ""),
+                " ".join(str(event.get("user_message") or "").split()),
+                " ".join(str(event.get("assistant_reply") or "").split()))
+    runtime_records = {(content_key(event), str(event.get("turn_id") or ""))
+                       for event in ordered if event.get("source") != "chat_history"}
+    runtime_timestamps = {(content_key(event), _parse_created_at(event.get("created_at")))
+                          for event in ordered if event.get("source") != "chat_history"}
+    selected = {}
+    for event in ordered:
+        content = content_key(event)
+        if event.get("source") == "chat_history" and (
+            (content, str(event.get("turn_id") or "")) in runtime_records
+            or (str(event.get("turn_id") or "").startswith("chat-store:")
+                and (content, _parse_created_at(event.get("created_at"))) in runtime_timestamps)
+        ):
+            continue  # Runtime records retain the authoritative turn and tool identities.
+        identity = (content[0], str(event.get("turn_id") or event.get("created_at") or ""), *content[1:])
+        existing = selected.get(identity)
+        if existing is None or _event_has_richer_runtime_metadata(event) or not _event_has_richer_runtime_metadata(existing):
+            selected[identity] = event
+    result = sorted(selected.values(), key=lambda item: _parse_created_at(item.get("created_at")))
+    return result[-scan_limit:] if scan_limit is not None else result
 
 
 def _conversation_events_after_reset(
@@ -699,6 +676,8 @@ def _conversation_events_after_reset(
     if not conversation_id:
         return []
     event_history: list[dict[str, object]] = []
+    reset_cutoffs: dict[str, datetime] = {}
+    from nullion.session_stop import history_reset_retains_history
     scan_limit = None if full_history else _MAX_HISTORY_SCAN_LIMIT
     if callable(getattr(store, "list_conversation_events", None)):
         list_events = getattr(store, "list_conversation_events")
@@ -709,6 +688,13 @@ def _conversation_events_after_reset(
                 events = list_events(conversation_id)
             except Exception:
                 events = []
+        for event in events if isinstance(events, list) else []:
+            if (isinstance(event, dict) and event.get("event_type") == "conversation.session_reset"
+                    and not history_reset_retains_history(event)
+                    and _event_matches_workspace(event, workspace_id=workspace_id)):
+                identity = str(event.get("conversation_id") or "")
+                reset_cutoffs[identity] = max(reset_cutoffs.get(identity, datetime.min.replace(tzinfo=UTC)),
+                                              _parse_created_at(event.get("created_at")))
         event_history = _workspace_chat_turns_after_resets(
             events if isinstance(events, list) else [],
             workspace_id=workspace_id,
@@ -731,7 +717,7 @@ def _conversation_events_after_reset(
                     ]
             except Exception:
                 pass
-        if not event_history and callable(getattr(store, "list_recent_conversation_events", None)):
+        if not callable(list_after_reset) and not event_history and callable(getattr(store, "list_recent_conversation_events", None)):
             list_recent = getattr(store, "list_recent_conversation_events")
             try:
                 events = list_recent(
@@ -750,12 +736,14 @@ def _conversation_events_after_reset(
     return _dedupe_history_events(
         [
             *event_history,
-            *_chat_store_history_turns(
+            *(event for event in _chat_store_history_turns(
                 runtime,
                 conversation_id,
                 scan_limit=scan_limit,
                 workspace_id=workspace_id,
-            ),
+            ) if event.get("history_retained") is True
+              or str(event.get("conversation_id") or "") not in reset_cutoffs
+              or _parse_created_at(event.get("created_at")) > reset_cutoffs[str(event.get("conversation_id") or "")]),
         ],
         scan_limit=scan_limit,
     )
@@ -767,32 +755,10 @@ def _workspace_chat_turns_after_resets(
     workspace_id: str,
     scan_limit: int | None,
 ) -> list[dict[str, object]]:
-    selected_by_conversation: dict[str, list[dict[str, object]]] = {}
-    for event in sorted(
-        (dict(item) for item in events if isinstance(item, dict)),
-        key=lambda item: _parse_created_at(item.get("created_at")),
-    ):
-        if not _event_matches_workspace(event, workspace_id=workspace_id):
-            continue
-        conversation_id = str(event.get("conversation_id") or "").strip()
-        if not conversation_id:
-            continue
-        event_type = str(event.get("event_type") or "")
-        if event_type == "conversation.session_reset":
-            selected_by_conversation[conversation_id] = []
-            continue
-        if event_type != "conversation.chat_turn":
-            continue
-        selected_by_conversation.setdefault(conversation_id, []).append(event)
-    selected = [
-        event
-        for conversation_events in selected_by_conversation.values()
-        for event in conversation_events
-    ]
-    selected.sort(key=lambda event: _parse_created_at(event.get("created_at")))
-    if scan_limit is not None:
-        return selected[-scan_limit:]
-    return selected
+    from nullion.session_stop import retained_history_turns
+    selected = retained_history_turns(event for event in events
+        if isinstance(event, dict) and _event_matches_workspace(event, workspace_id=workspace_id))
+    return selected[-scan_limit:] if scan_limit is not None else selected
 
 
 def _ranked_history_events(
@@ -809,7 +775,7 @@ def _ranked_history_events(
     if not query.strip():
         return ordered[-limit:], False
 
-    query_text = query.strip().lower()
+    query_text = normalize_search_text(query).strip()
     query_tokens = set(_tokenize(query_text))
     token_document_counts: dict[str, int] = {token: 0 for token in query_tokens}
     for event in ordered:
@@ -827,14 +793,14 @@ def _ranked_history_events(
         # For short follow-ups, common conversational tokens are actively harmful:
         # they make unrelated recent turns look relevant. Keep only distinctive
         # evidence-bearing tokens instead of maintaining a language-specific stop list.
-        if total_documents > 5 and (rarity < 1.0 or (len(token) <= 2 and rarity < 5.0)):
+        if total_documents > 5 and (rarity < 1.0 or (len(token) <= 2 and not has_uncased_letters(token) and rarity < 5.0)):
             return 0
         return max(1, min(16, int(round(rarity * 4))))
 
     scored: list[tuple[int, int, dict[str, object]]] = []
     direct_scores_by_index: dict[int, int] = {}
     for index, event in enumerate(ordered):
-        haystack = _event_text(event).lower()
+        haystack = normalize_search_text(_event_text(event))
         if not haystack:
             continue
         user_tokens = set(_tokenize(str(event.get("user_message") or "").lower()))
@@ -875,6 +841,14 @@ def _ranked_history_events(
         event["_history_context"] = context
         selected_by_index[index] = event
 
+    context_indices: dict[tuple[str, str], list[int]] = {}
+    positions: dict[int, int] = {}
+    for index, event in enumerate(ordered):
+        key = (str(event.get("conversation_id") or ""), str(event.get("branch_id") or ""))
+        group = context_indices.setdefault(key, [])
+        positions[index] = len(group)
+        group.append(index)
+
     # Direct matches have priority over nearby context. Previously one match's
     # neighbours filled the limit before older direct evidence was considered.
     for score, index, event in scored[:limit]:
@@ -882,22 +856,26 @@ def _ranked_history_events(
     for score, index, _event in scored[:limit]:
         if len(selected_by_index) >= limit:
             break
+        group = context_indices[(str(_event.get("conversation_id") or ""), str(_event.get("branch_id") or ""))]
+        position = positions[index]
         for offset in range(1, _MATCH_CONTEXT_PREVIOUS_TURNS + 1):
             if len(selected_by_index) >= limit:
                 break
             context = "previous_turn" if offset == 1 else f"previous_turn_{offset}"
-            _select_context_event(index - offset, score=score, context=context)
+            if position - offset >= 0:
+                _select_context_event(group[position - offset], score=score, context=context)
         for offset in range(1, _MATCH_CONTEXT_FOLLOWING_TURNS + 1):
             if len(selected_by_index) >= limit:
                 break
             context = "following_turn" if offset == 1 else f"following_turn_{offset}"
-            _select_context_event(index + offset, score=score, context=context)
+            if position + offset < len(group):
+                _select_context_event(group[position + offset], score=score, context=context)
     selected = list(selected_by_index.values())
     selected.sort(
         key=lambda event: (
-            -int(event.get("_history_match_score") or 0),
+            int(event.get("_history_match_score") or 0),
             _parse_created_at(event.get("created_at")),
-        )
+        ), reverse=True,
     )
     return selected[:limit], False
 
@@ -925,7 +903,7 @@ def _ranked_structured_reference_events(
         if document_count <= 0:
             return 0
         rarity = math.log2((total_documents + 1) / (document_count + 1))
-        if total_documents > 5 and (rarity < 1.0 or (len(token) <= 2 and rarity < 5.0)):
+        if total_documents > 5 and (rarity < 1.0 or (len(token) <= 2 and not has_uncased_letters(token) and rarity < 5.0)):
             return 0
         return max(1, min(16, int(round(rarity * 4))))
 

@@ -704,6 +704,7 @@ def generate_chat_reply(
     attachments: list[dict[str, str]] | None = None,
     conversation_context: str | None = None,
     memory_context: str | None = None,
+    conversation_history: list[dict[str, object]] | None = None,
     external_context_fetcher=fetch_external_context,
     live_tool_registry: ToolRegistry | None = None,
     active_tool_registry: ToolRegistry | None = None,
@@ -740,11 +741,17 @@ def generate_chat_reply(
     connector_context = format_active_connector_provider_context_for_prompt(
         _active_connector_context_for_chat_backend(tool_registry)
     )
-    conversation_history = _build_orchestrator_conversation_history(
-        conversation_context=conversation_context,
-        memory_context=memory_context,
-        connector_context=connector_context,
-    )
+    # The chat caller has already assembled authorized profile, preferences and
+    # linked history. Recovery must retain that context instead of rebuilding
+    # a smaller prompt that silently drops the user's defaults.
+    if conversation_history is None:
+        conversation_history = _build_orchestrator_conversation_history(
+            conversation_context=conversation_context,
+            memory_context=memory_context,
+            connector_context=connector_context,
+        )
+    else:
+        conversation_history = list(conversation_history)
     user_content_blocks = None
     if attachments:
         from nullion.chat_attachments import (
@@ -761,13 +768,19 @@ def generate_chat_reply(
         conversation_result=None,
         has_attachments=bool(user_content_blocks),
     )
-    turn_tool_registry = turn_tool_registry_for_evidence(
-        tool_registry or ToolRegistry(),
-        evidence=turn_tool_evidence,
-        model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
-        user_message=message,
-        skip_tool_scope_decision=False,
-    )
+    # An active turn registry already carries the scope and its authority.
+    # Wrapping it again hides the delegate's tools from request_tool_scope and
+    # leaves recovery unable to use even an explicitly selected capability.
+    if getattr(tool_registry, "turn_tool_scope_decision", None) is not None:
+        turn_tool_registry = tool_registry
+    else:
+        turn_tool_registry = turn_tool_registry_for_evidence(
+            tool_registry or ToolRegistry(),
+            evidence=turn_tool_evidence,
+            model_client=getattr(agent_orchestrator, "model_client", None) or model_client,
+            user_message=message,
+            skip_tool_scope_decision=False,
+        )
 
     run_turn = agent_orchestrator.run_turn
     turn_kwargs = {

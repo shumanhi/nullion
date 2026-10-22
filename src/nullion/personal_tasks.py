@@ -87,14 +87,21 @@ class PersonalTaskToolRegistry:
         if invocation.tool_name not in _NAMES:
             return self._delegate.invoke(invocation)
         path = Path(getattr(self._runtime, 'checkpoint_path', ''))
-        if not path.is_file() and invocation.tool_name == 'personal_task_save':
-            checkpoint = getattr(self._runtime, 'checkpoint', None)
-            if callable(checkpoint):
-                try:
-                    checkpoint(force=True)
-                except (ValueError, TypeError, sqlite3.Error, OSError) as exc:
-                    return self._failure(invocation, 'persistent_storage_unavailable', str(exc))
-        if not path.is_file() or path.suffix not in {'.db', '.sqlite', '.sqlite3'}:
+        if invocation.tool_name == 'personal_task_save':
+            try:
+                initialized = False
+                if path.is_file() and path.suffix in {'.db', '.sqlite', '.sqlite3'}:
+                    with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as connection:
+                        initialized = connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_events'"
+                        ).fetchone() is not None
+                if not initialized:
+                    checkpoint = getattr(self._runtime, 'checkpoint', None)
+                    if callable(checkpoint):
+                        checkpoint(force=True)
+            except (ValueError, TypeError, sqlite3.Error, OSError) as exc:
+                return self._failure(invocation, 'persistent_storage_unavailable', str(exc))
+        if path.suffix not in {'.db', '.sqlite', '.sqlite3'} or (not path.is_file() and invocation.tool_name != 'personal_tasks_list'):
             return self._failure(invocation, 'persistent_storage_unavailable', 'Persistent task storage is unavailable.')
         args = invocation.arguments or {}
         try:
@@ -102,8 +109,15 @@ class PersonalTaskToolRegistry:
                 status = args.get('status', 'pending')
                 if status not in {'pending', 'completed', 'archived', 'all'}:
                     raise ValueError('Unsupported task status.')
+                if not path.is_file():
+                    return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
+                        {'workspace_id': self._workspace_id, 'items': [], 'item_count': 0,
+                         'persisted': True, 'storage_initialized': False})
                 with sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5) as connection:
-                    records = _records(connection, self._conversation_id)
+                    initialized = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_events'"
+                    ).fetchone() is not None
+                    records = _records(connection, self._conversation_id) if initialized else {}
                 items = [record for record in records.values() if status == 'all' or record['status'] == status]
                 return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
                                   {'workspace_id': self._workspace_id, 'items': items, 'item_count': len(items), 'persisted': True})

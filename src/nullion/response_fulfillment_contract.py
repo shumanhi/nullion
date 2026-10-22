@@ -305,7 +305,12 @@ def _artifact_invocation_has_media_inputs(invocation: ToolInvocation) -> bool:
     media_keys = set(_SPREADSHEET_MEDIA_INPUT_KEYS)
     if invocation.tool_name == "pdf_edit":
         media_keys.update({"append_image_paths", "append_screenshot_paths"})
-    return _nested_media_inputs_present(arguments, keys=frozenset(media_keys))
+    if _nested_media_inputs_present(arguments, keys=frozenset(media_keys)):
+        return True
+    # HTML image elements are structured media inputs too. The PDF handler
+    # resolves/validates their sources and final fulfillment inspects the bytes.
+    return any(isinstance(page, str) and _HTML_IMAGE_SOURCE_RE.search(page)
+               for page in arguments.get("html_pages", ()) or ())
 
 
 def _browser_screenshot_path_identities(
@@ -616,7 +621,21 @@ def _completed_structural_artifact_extensions_in_order(results: Iterable[object]
             if not paths:
                 continue
         else:
-            paths = list(_result_like_paths(result))
+            # Source-file and changed-object identities are evidence, not
+            # deliverable declarations. Infer formats only from producers or
+            # explicit artifact fields, never an incidental read/edit path.
+            receipt = output.get("action_receipt")
+            ordinary_file_action = isinstance(receipt, dict) and receipt.get("object_type") == "file"
+            if tool_name in STRUCTURED_ARTIFACT_PRODUCER_TOOLS and not ordinary_file_action:
+                paths = list(_result_like_paths(result))
+            else:
+                paths = []
+                for key in ("artifact_path", "artifact_paths", "artifacts"):
+                    value = output.get(key)
+                    if isinstance(value, str):
+                        paths.append(value)
+                    elif isinstance(value, (list, tuple)):
+                        paths.extend(path for path in value if isinstance(path, str))
         if tool_name in _MEDIA_ARTIFACT_TOOL_EXTENSIONS:
             expected_extension = _MEDIA_ARTIFACT_TOOL_EXTENSIONS[tool_name]
             if not paths:
@@ -1081,6 +1100,11 @@ def artifact_media_plain_replacement_guard_result(
         return None
     if _artifact_invocation_has_media_inputs(invocation):
         return None
+    if invocation.tool_name == "pdf_edit":
+        # Edits inherit media from the input PDF. New image arguments or a
+        # preliminary read are unnecessary; the permission-checked handler
+        # inspects the saved PDF and final fulfillment checks its real media.
+        return None
     label = _artifact_media_label(extension)
     first_attempt_required = extension in set(normalize_artifact_media_required_extensions(required_embedded_media_extensions))
     reason = (
@@ -1235,7 +1259,17 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
         if has_deliverable_descriptors and tool_name == "file_write" and not scoped_required_extensions:
             continue
         if tool_name in {"file_patch", "file_write"}:
-            path = output.get("path")
+            receipt = output.get("action_receipt")
+            ordinary_file_action = bool(
+                isinstance(receipt, dict)
+                and receipt.get("type") == "action_receipt"
+                and receipt.get("object_type") == "file"
+                and not scoped_required_extensions
+            )
+            # A changed file's identity is an action receipt, not a request to
+            # attach it. Explicit artifact descriptors/paths and scoped output
+            # formats remain authoritative delivery evidence.
+            path = None if ordinary_file_action else output.get("path")
             if isinstance(path, str) and path.strip():
                 if tool_name == "file_write" and _path_matches_identity_set(path, consumed_file_write_paths):
                     continue
@@ -1285,7 +1319,8 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
                         and Path(value).suffix.lower() not in scoped_required_extensions
                     )
                 )
-    return list(dict.fromkeys(paths))
+    from nullion.artifact_lifecycle import filter_delivery_paths
+    return filter_delivery_paths(list(dict.fromkeys(paths)), tool_results)
 
 
 def _path_identity_variants(path: object) -> tuple[str, ...]:

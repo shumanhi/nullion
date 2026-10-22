@@ -178,6 +178,9 @@ def approve_request_with_mode(
         reason=approval_decision_reason(mode=normalized_mode, source=source),
     )
 
+    approved = replace(approved, context={**approval_context(approved), "decision_mode": normalized_mode})
+    store.add_approval_request(approved)
+
     if multiplier := multiplier_for_limit_extension_mode(normalized_mode):
         suspended = store.get_suspended_turn(approval_id)
         if suspended is not None:

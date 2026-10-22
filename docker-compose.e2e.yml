@@ -1,0 +1,31 @@
+services:
+  nullion-e2e:
+    image: ${NULLION_E2E_IMAGE:-nullion-e2e:local}
+    build:
+      context: .
+      dockerfile: docker/e2e.Dockerfile
+    working_dir: /tmp/nullion-src
+    environment:
+      HOME: /tmp/nullion-home
+      NULLION_HOME: /tmp/nullion-home/.nullion
+      XDG_CACHE_HOME: /tmp/nullion-cache
+      XDG_CONFIG_HOME: /tmp/nullion-config
+      XDG_DATA_HOME: /tmp/nullion-data
+      NULLION_ENV_FILE: /tmp/nullion-home/.nullion/.env
+      NULLION_RUN_E2E: ${NULLION_RUN_E2E:-1}
+      NULLION_E2E_CONTAINER: "1"
+      NULLION_TEST_COVERAGE: ${NULLION_TEST_COVERAGE:-0}
+      NULLION_E2E_COVERAGE_REPORT: /tmp/nullion-e2e-coverage.json
+      NULLION_E2E_PYTEST_ARGS: ${NULLION_E2E_PYTEST_ARGS:-tests/e2e}
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/inputs/suite:ro
+      - ./.e2e-artifacts:/outputs
+      - ${NULLION_APP_REPO_HOST:-.}:/inputs/app:ro
+    tmpfs:
+      - /tmp/nullion-home:exec
+      - /tmp/nullion-cache
+      - /tmp/nullion-config
+      - /tmp/nullion-data
+    command: ["bash", "/inputs/suite/scripts/run-container-tests.sh"]

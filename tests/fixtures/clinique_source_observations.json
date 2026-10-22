@@ -1,0 +1,189 @@
+{
+  "backend": "browser-use",
+  "blocker": null,
+  "continuation": null,
+  "elapsed_seconds": 253.098,
+  "format": "png",
+  "goal_status": "answered",
+  "next_action": "report",
+  "observations": [
+    {
+      "label": "Bestseller facial moisturizer",
+      "quote": "Bestseller\nDermatologist Recommended\nSize: 1.0 oz\n.5 oz\n1 oz\n1.7 fl oz\n2.5 oz\n4.2 oz\nMoisture Surge™ 100H Auto-Replenishing Hydrator\nRefreshing gel moisturizer. Instant absorption. Long lasting hydration. Oil free.",
+      "source_index": 0,
+      "value": "Moisture Surge™ 100H Auto-Replenishing Hydrator"
+    },
+    {
+      "label": "Bestseller barrier moisturizer",
+      "quote": "Bestseller\nDermatologist Recommended\nSize: 4.2 fl oz\n.5 fl oz\n1.7 fl oz\n4.2 fl oz\n6.7 fl oz\nDramatically Different™ Moisturizing Lotion+™\nClinique’s iconic silky lotion rapidly strengthens the skin barrier.",
+      "source_index": 0,
+      "value": "Dramatically Different™ Moisturizing Lotion+™"
+    },
+    {
+      "label": "Bestseller facial serum",
+      "quote": "Bestseller\nSize: 1.0 fl oz\n.34 fl oz\n1 fl oz\n1.7 fl oz\n3.4 fl oz\nClinique Smart Clinical Repair™ Wrinkle Correcting Serum\nMulti-benefit anti-aging serum helps visibly repair, resurface, and replump skin.",
+      "source_index": 0,
+      "value": "Clinique Smart Clinical Repair™ Wrinkle Correcting Serum"
+    },
+    {
+      "label": "Bestseller eye cream",
+      "quote": "Bestseller\nSize: 1.0 oz\n.5 oz\n1 oz\nAll About Eyes™ Eye Cream with Vitamin C\nRefreshing lightweight eye cream reduces the look of puffiness and undereye circles.",
+      "source_index": 0,
+      "value": "All About Eyes™ Eye Cream with Vitamin C"
+    },
+    {
+      "label": "Bestseller facial exfoliating lotion",
+      "quote": "Bestseller\nSize: 6.7 fl oz\n2 fl oz\n6.7 fl oz\n13.5 fl oz\n13.5 fl oz\n16.5 fl oz\nClarifying Lotion 2\nLiquid exfoliating lotion for dry-combination skin types instantly boosts radiance.",
+      "source_index": 0,
+      "value": "Clarifying Lotion 2"
+    },
+    {
+      "label": "Bestseller facial cleanser",
+      "quote": "Bestseller\nSize: 6.7 fl oz\n1 fl oz\n6.7 fl oz\n13.5 fl oz\n13.5 fl oz\nAll About Clean™ Liquid Facial Soap Mild for Dry Combination Skin Types\nGentle liquid face cleanser is quick-rinsing, non-drying. In 3 skin-typed formulas.",
+      "source_index": 0,
+      "value": "All About Clean™ Liquid Facial Soap Mild for Dry Combination Skin Types"
+    },
+    {
+      "label": "Dark-spot and uneven-tone serum",
+      "quote": "Even Better Clinical™ Dark Spot Clearing Serum\nBrightening serum visibly reduces dark spots + dullness for a more even-looking skin tone.",
+      "source_index": 0,
+      "value": "Even Better Clinical™ Dark Spot Clearing Serum"
+    },
+    {
+      "label": "Clinique hyperpigmentation category claim",
+      "quote": "Target hyperpigmentation, like sun spots, acne marks, and more.",
+      "source_index": 0,
+      "value": "Target hyperpigmentation, like sun spots, acne marks, and more."
+    },
+    {
+      "label": "Dark-spot serum key ingredients",
+      "quote": "Key Ingredients\nNiacinamide, Salicylic Acid, Vitamin C",
+      "source_index": 1,
+      "value": "Niacinamide, Salicylic Acid, Vitamin C"
+    },
+    {
+      "label": "Hyperpigmentation-focused Clinique serum",
+      "quote": "Even Better Clinical™ Dark Spot Clearing Serum\nRated 4.4 out of 5 stars based on 461 reviews\n4.4\n(461 Reviews)\nRead Reviews\nBrightening serum visibly reduces dark spots + dullness for a more even-looking skin tone.",
+      "source_index": 2,
+      "value": "Even Better Clinical™ Dark Spot Clearing Serum"
+    },
+    {
+      "label": "Official hyperpigmentation claim",
+      "quote": "Summary\nOur dermatologist-developed solution for hyperpigmentation powered by Clinique’s UP302. Targets tough dark spots.",
+      "source_index": 2,
+      "value": "Our dermatologist-developed solution for hyperpigmentation powered by Clinique’s UP302. Targets tough dark spots."
+    },
+    {
+      "label": "Related Clinique dark-spot moisturizer",
+      "quote": "Even Better Clinical™ Brightening Moisturizer\nLightweight, oil-free facial moisturizer helps improve the look of dark spots.",
+      "source_index": 2,
+      "value": "Even Better Clinical™ Brightening Moisturizer"
+    },
+    {
+      "label": "Clinique facial sunscreen in the brightening routine",
+      "quote": "Superdefense™ City Block Broad Spectrum SPF 50 Daily Energy + Face Protector\nEnergizing face sunscreen with SPF 50 for sheer, weightless defense.",
+      "source_index": 2,
+      "value": "Superdefense™ City Block Broad Spectrum SPF 50 Daily Energy + Face Protector"
+    },
+    {
+      "label": "Why Clinique includes SPF in the dark-spot routine",
+      "quote": "04. SPF\nIn the AM, apply to help protect against UV rays that can lead to future dark spots.",
+      "source_index": 2,
+      "value": "In the AM, apply to help protect against UV rays that can lead to future dark spots."
+    },
+    {
+      "label": "Named sunscreen ingredients",
+      "quote": "Sunscreen ingredients such as titanium dioxide, zinc oxide, and octinoxate help protect skin from harmful UV rays.",
+      "source_index": 3,
+      "value": "titanium dioxide, zinc oxide, and octinoxate"
+    },
+    {
+      "label": "Environmental and UV defense claim",
+      "quote": "Stop Signs™ Technology\nHelps prevent visible signs of aging by combating environmental aggressors, including UVA/UVB and other skin irritants.",
+      "source_index": 3,
+      "value": "Helps prevent visible signs of aging by combating environmental aggressors, including UVA/UVB and other skin irritants."
+    },
+    {
+      "label": "Clinique facial sunscreen",
+      "quote": "Superdefense™ City Block Broad Spectrum SPF 50 Daily Energy + Face Protector\nRated 3.3 out of 5 stars based on 185 reviews\n3.3\n(185 Reviews)\nRead Reviews\nEnergizing face sunscreen with SPF 50 for sheer, weightless defense.",
+      "source_index": 4,
+      "value": "Superdefense™ City Block Broad Spectrum SPF 50 Daily Energy + Face Protector"
+    },
+    {
+      "label": "Clinique facial-skincare bestseller",
+      "quote": "Bestseller\nDermatologist Recommended\nSize: 1.0 oz\n.5 oz\n1 oz\n1.7 fl oz\n2.5 oz\n4.2 oz\nMoisture Surge™ 100H Auto-Replenishing Hydrator\nRefreshing gel moisturizer. Instant absorption. Long lasting hydration. Oil free.\n(3081)\nRated 4.6 out of 5 stars based on 3081 reviews",
+      "source_index": 5,
+      "value": "Moisture Surge™ 100H Auto-Replenishing Hydrator"
+    },
+    {
+      "label": "Clinique facial-skincare bestseller",
+      "quote": "Bestseller\nDermatologist Recommended\nSize: 4.2 fl oz\n.5 fl oz\n1.7 fl oz\n4.2 fl oz\n6.7 fl oz\nDramatically Different™ Moisturizing Lotion+™\nClinique’s iconic silky lotion rapidly strengthens the skin barrier.\n(9871)\nRated 4.4 out of 5 stars based on 9871 reviews",
+      "source_index": 5,
+      "value": "Dramatically Different™ Moisturizing Lotion+™"
+    },
+    {
+      "label": "Clinique facial-serum bestseller",
+      "quote": "Bestseller\nSize: 1.0 fl oz\n.34 fl oz\n1 fl oz\n1.7 fl oz\n3.4 fl oz\nClinique Smart Clinical Repair™ Wrinkle Correcting Serum\nMulti-benefit anti-aging serum helps visibly repair, resurface, and replump skin.\n(1065)\nRated 4.4 out of 5 stars based on 1065 reviews",
+      "source_index": 5,
+      "value": "Clinique Smart Clinical Repair™ Wrinkle Correcting Serum"
+    },
+    {
+      "label": "Clinique eye-care bestseller",
+      "quote": "Bestseller\nSize: 1.0 oz\n.5 oz\n1 oz\nAll About Eyes™ Eye Cream with Vitamin C\nRefreshing lightweight eye cream reduces the look of puffiness and undereye circles.\n(2365)\nRated 4.6 out of 5 stars based on 2365 reviews",
+      "source_index": 5,
+      "value": "All About Eyes™ Eye Cream with Vitamin C"
+    },
+    {
+      "label": "Clinique exfoliating-lotion bestseller",
+      "quote": "Bestseller\nSize: 6.7 fl oz\n2 fl oz\n6.7 fl oz\n13.5 fl oz\n13.5 fl oz\n16.5 fl oz\nClarifying Lotion 2\nLiquid exfoliating lotion for dry-combination skin types instantly boosts radiance.\n(4429)\nRated 4.7 out of 5 stars based on 4429 reviews",
+      "source_index": 5,
+      "value": "Clarifying Lotion 2"
+    },
+    {
+      "label": "Clinique facial-cleanser bestseller",
+      "quote": "Bestseller\nSize: 6.7 fl oz\n1 fl oz\n6.7 fl oz\n13.5 fl oz\n13.5 fl oz\nAll About Clean™ Liquid Facial Soap Mild for Dry Combination Skin Types\nGentle liquid face cleanser is quick-rinsing, non-drying. In 3 skin-typed formulas.\n(8056)\nRated 4.7 out of 5 stars based on 8056 reviews",
+      "source_index": 5,
+      "value": "All About Clean™ Liquid Facial Soap Mild for Dry Combination Skin Types"
+    }
+  ],
+  "omitted_observation_count": 6,
+  "page_url": "https://www.clinique.com/products/superdefense-city-block-broad-spectrum-spf-50-daily-energy-face-protector",
+  "rejection_counts": {
+    "quote_not_captured": 4,
+    "value_not_in_quote": 1
+  },
+  "report_status": "partial",
+  "result_kind": "source_observations",
+  "sources": [
+    {
+      "captured_at": 1791767436.634166,
+      "source_url": "https://www.clinique.com/"
+    },
+    {
+      "captured_at": 1791767533.309808,
+      "source_url": "https://www.clinique.com/products/even-better-clinical-dark-spot-clearing-serum"
+    },
+    {
+      "captured_at": 1791767549.0899682,
+      "source_url": "https://www.clinique.com/products/even-better-clinical-dark-spot-clearing-serum"
+    },
+    {
+      "captured_at": 1791767601.865209,
+      "page_url_ref": true
+    },
+    {
+      "captured_at": 1791767620.5431209,
+      "page_url_ref": true
+    },
+    {
+      "captured_at": 1791767452.27777,
+      "source_url": "https://www.clinique.com/"
+    }
+  ],
+  "steps": 20,
+  "unknowns": [
+    "Clinique’s official pages reviewed did not state that these products were specifically developed, marketed, or clinically tested for South Asian skin.",
+    "The official pages did not provide audited sales totals or a numeric sales ranking; “top selling” here means products that Clinique currently labels “Bestseller.”",
+    "Percentages or concentrations of the dark-spot serum’s niacinamide, salicylic acid, vitamin C derivatives, and UP302 were not shown."
+  ]
+}

@@ -127,6 +127,7 @@ _CONVERSATION_MIGRATION_COLUMNS = [
 ]
 _MESSAGE_MIGRATION_COLUMNS = [
     ("metadata", "TEXT"),
+    ("runtime_turn_id", "TEXT"),
 ]
 
 
@@ -183,6 +184,8 @@ def _collapse_adjacent_duplicate_bot_messages(messages: list[dict]) -> list[dict
             and message.get("role") == "bot"
             and collapsed[-1].get("role") == "bot"
             and message.get("text") == collapsed[-1].get("text")
+            and (not message.get("runtime_turn_id") or not collapsed[-1].get("runtime_turn_id")
+                 or message["runtime_turn_id"] == collapsed[-1]["runtime_turn_id"])
             and bool(message.get("is_error")) == bool(collapsed[-1].get("is_error"))
         ):
             if _metadata_weight(message.get("metadata")) > _metadata_weight(collapsed[-1].get("metadata")):
@@ -206,6 +209,16 @@ def _artifact_metadata_from_runtime_turn(turn: dict) -> dict[str, Any] | None:
         except OSError:
             return
         paths.append(str(candidate))
+
+    from nullion.artifact_lifecycle import delivery_manifest, filter_delivery_paths
+    manifest = delivery_manifest(turn.get("tool_results") or ())
+    if manifest is not None:
+        for path in manifest:
+            add_path(path)
+        selected = filter_delivery_paths(paths, turn.get("tool_results") or ())
+        # An empty manifest is authoritative too. Absence of an optional
+        # artifact_paths field must never resurrect drafts during hydration.
+        return {"artifacts": [{"path": path} for path in selected]}
 
     # A completed turn already selected its delivery package. Reconstructing it
     # from every tool path also publishes file_read inputs and intermediate files.
@@ -692,7 +705,7 @@ class ChatStore:
             cur = conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
             return cur.rowcount > 0
 
-    def delete_conversations_for_channel_date(self, channel: str, date: str) -> int:
+    def delete_conversations_for_channel_date(self, channel: str, date: str, *, return_ids: bool = False) -> int | list[str]:
         """Hard-delete conversations on ``channel`` with messages on ``date``.
 
         Returns the number of conversation records removed.
@@ -724,7 +737,7 @@ class ChatStore:
             for conv_id in conv_ids:
                 conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
                 conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-            return len(conv_ids)
+            return conv_ids if return_ids else len(conv_ids)
 
     # ── Message management ────────────────────────────────────────────────────
 
@@ -840,7 +853,7 @@ class ChatStore:
         persisted directly to ``chat_history.db``.
         """
         imported = 0
-        existing_by_conversation: dict[str, dict[tuple[str, str], tuple[int, dict[str, Any] | None]]] = {}
+        existing_by_conversation: dict[str, dict[tuple[str, str], list[dict[str, Any]]]] = {}
         sorted_turns = sorted(
             (turn for turn in turns if isinstance(turn, dict)),
             key=lambda turn: str(turn.get("created_at") or ""),
@@ -860,20 +873,27 @@ class ChatStore:
                 if not user_message and not assistant_reply:
                     continue
 
+                runtime_identity = str(turn.get("turn_id") or turn.get("event_id") or "")
+                if not runtime_identity:
+                    import hashlib
+                    runtime_identity = hashlib.sha256(json.dumps(
+                        [conversation_id, created_at, user_message, assistant_reply], ensure_ascii=False,
+                    ).encode()).hexdigest()
                 if conversation_id not in existing_by_conversation:
                     rows = conn.execute(
-                        """SELECT id, role, text, metadata FROM messages
+                        """SELECT id, role, text, metadata, runtime_turn_id FROM messages
                            WHERE conversation_id = ?
                            ORDER BY id ASC""",
                         (conversation_id,),
                     ).fetchall()
-                    existing_by_conversation[conversation_id] = {
-                        (str(row["role"]), self._decrypt_text(row["text"]) or ""): (
-                            int(row["id"]),
-                            json.loads(raw_metadata) if (raw_metadata := (self._decrypt_text(row["metadata"]) if row["metadata"] else "")) else None,
-                        )
-                        for row in rows
-                    }
+                    existing_by_conversation[conversation_id] = {}
+                    for row in rows:
+                        metadata = self._decrypt_row(row)["metadata"]
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+                        key = (str(row["role"]), self._decrypt_text(row["text"]) or "")
+                        existing_by_conversation[conversation_id].setdefault(key, []).append(
+                            {"id": int(row["id"]), "metadata": metadata, "runtime_turn_id": row["runtime_turn_id"]})
 
                 channel = _channel_for_conversation(conversation_id)
                 channel_label = _channel_label_for_conversation(conversation_id)
@@ -889,24 +909,27 @@ class ChatStore:
                         continue
                     safe_text = redact_text(raw_text)
                     key = (role, safe_text)
-                    metadata = _artifact_metadata_from_runtime_turn(turn) if role == "bot" else None
-                    metadata_text = (
-                        json.dumps(metadata, separators=(",", ":"), sort_keys=True)
-                        if metadata
-                        else None
-                    )
-                    if key in existing_by_conversation[conversation_id]:
-                        existing_id, existing_metadata = existing_by_conversation[conversation_id][key]
-                        if _metadata_weight(metadata) > _metadata_weight(existing_metadata):
+                    metadata = dict((_artifact_metadata_from_runtime_turn(turn) if role == "bot" else None) or {})
+                    candidates = existing_by_conversation[conversation_id].get(key, [])
+                    existing = next((row for row in candidates if row["runtime_turn_id"] == runtime_identity), None)
+                    if existing is None:
+                        existing = next((row for row in candidates if not row["runtime_turn_id"]), None)
+                    if existing is not None:
+                        # Bind a legacy row to one runtime turn without exposing
+                        # internal identity through client artifact metadata.
+                        merged = ({**existing["metadata"], **metadata}
+                                  if _metadata_weight(metadata) >= _metadata_weight(existing["metadata"])
+                                  else {**metadata, **existing["metadata"]})
+                        if merged != existing["metadata"] or existing["runtime_turn_id"] != runtime_identity:
                             conn.execute(
-                                "UPDATE messages SET metadata = ? WHERE id = ?",
-                                (
-                                    self._encrypt_text(metadata_text) if metadata_text else None,
-                                    existing_id,
-                                ),
+                                "UPDATE messages SET metadata = ?, runtime_turn_id = ? WHERE id = ?",
+                                (self._encrypt_text(json.dumps(merged, separators=(",", ":"), sort_keys=True))
+                                 if merged else None, runtime_identity, existing["id"]),
                             )
-                            existing_by_conversation[conversation_id][key] = (existing_id, metadata)
+                            existing["metadata"] = merged
+                            existing["runtime_turn_id"] = runtime_identity
                         continue
+                    metadata_text = json.dumps(metadata, separators=(",", ":"), sort_keys=True) if metadata else None
                     if role == "user":
                         existing_title = conn.execute(
                             "SELECT title FROM conversations WHERE id = ?", (conversation_id,)
@@ -917,14 +940,15 @@ class ChatStore:
                                 (self._encrypt_text(_make_title(safe_text)), conversation_id),
                             )
                     conn.execute(
-                        "INSERT INTO messages (conversation_id, role, text, metadata, is_error, created_at) "
-                        "VALUES (?, ?, ?, ?, 0, ?)",
+                        "INSERT INTO messages (conversation_id, role, text, metadata, is_error, created_at, runtime_turn_id) "
+                        "VALUES (?, ?, ?, ?, 0, ?, ?)",
                         (
                             conversation_id,
                             role,
                             self._encrypt_text(safe_text),
                             self._encrypt_text(metadata_text) if metadata_text else None,
                             created_at,
+                            runtime_identity,
                         ),
                     )
                     conn.execute(
@@ -936,7 +960,8 @@ class ChatStore:
                            WHERE id = ?""",
                         (created_at, created_at, conversation_id),
                     )
-                    existing_by_conversation[conversation_id][key] = (int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]), metadata)
+                    existing_by_conversation[conversation_id].setdefault(key, []).append(
+                        {"id": int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]), "metadata": metadata, "runtime_turn_id": runtime_identity})
                     imported += 1
         return imported
 
@@ -946,6 +971,7 @@ class ChatStore:
         limit: int = 300,
         *,
         local_date: str | None = None,
+        _include_runtime_identity: bool = False,
     ) -> list[dict]:
         """Return the last ``limit`` messages in ascending chronological order.
 
@@ -961,7 +987,7 @@ class ChatStore:
                 expanded_start = (target_date - timedelta(days=1)).date().isoformat()
                 expanded_end = (target_date + timedelta(days=2)).date().isoformat()
                 rows = conn.execute(
-                    """SELECT id, role, text, metadata, is_error, created_at
+                    """SELECT id, role, text, metadata, is_error, created_at, runtime_turn_id
                        FROM messages
                        WHERE conversation_id = ?
                          AND created_at >= ? AND created_at < ?
@@ -971,7 +997,7 @@ class ChatStore:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT id, role, text, metadata, is_error, created_at
+                    """SELECT id, role, text, metadata, is_error, created_at, runtime_turn_id
                        FROM (
                            SELECT * FROM messages
                            WHERE conversation_id = ?
@@ -994,6 +1020,9 @@ class ChatStore:
                     if _local_date_for_timestamp(row.get("created_at"), tz) == local_date
                 ]
             results = _collapse_adjacent_duplicate_bot_messages(results)
+            if not _include_runtime_identity:
+                for row in results:
+                    row.pop("runtime_turn_id", None)
             _log_chat_sqlite_timing("load_messages", started_at, self._path, rows=len(results))
             return results
 

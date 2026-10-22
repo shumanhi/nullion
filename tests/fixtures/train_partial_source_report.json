@@ -1,0 +1,47 @@
+{
+  "result_kind": "source_observations",
+  "report_status": "partial",
+  "goal_status": "partial",
+  "next_action": "report",
+  "blocker": null,
+  "unknowns": [
+    "Live WAS to NYP Coach options for Sunday 2026-10-25 in the requested approximately 10:30 AM–2:00 PM departure window were not established.",
+    "Return train names and numbers are unknown.",
+    "Return departure and arrival times are unknown.",
+    "Return durations are unknown.",
+    "Return Coach fares are unknown.",
+    "An exact prefilled/search URL containing the requested search parameters was not exposed; the captured Amtrak results URL was only https://www.amtrak.com/tickets/departure.html."
+  ],
+  "observations": [
+    {
+      "label": "Outbound search context",
+      "quote": "1\nTraveler\n\nNYP\nNew York, NY\nMoynihan Train Hall at Penn Sta.\nWAS\nWashington, DC\nUnion Station\nThu, Oct 22",
+      "value": "1\nTraveler\n\nNYP\nNew York, NY\nMoynihan Train Hall at Penn Sta.\nWAS\nWashington, DC\nUnion Station\nThu, Oct 22",
+      "source_url": "https://www.amtrak.com/tickets/departure.html"
+    },
+    {
+      "label": "Outbound Northeast Regional 1147 Coach",
+      "quote": "1147\nNortheast Regional\nDEPARTS\n12:50\np\n3h 22m\nARRIVES\n4:12\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n155",
+      "value": "1147\nNortheast Regional\nDEPARTS\n12:50\np\n3h 22m\nARRIVES\n4:12\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n155",
+      "source_url": "https://www.amtrak.com/tickets/departure.html"
+    },
+    {
+      "label": "Outbound Northeast Regional 1099 Coach",
+      "quote": "1099\nNortheast Regional\nDEPARTS\n1:17\np\n3h 24m\nARRIVES\n4:41\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n197",
+      "value": "1099\nNortheast Regional\nDEPARTS\n1:17\np\n3h 24m\nARRIVES\n4:41\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n197",
+      "source_url": "https://www.amtrak.com/tickets/departure.html"
+    },
+    {
+      "label": "Outbound Northeast Regional 1161 Coach",
+      "quote": "1161\nNortheast Regional\nDEPARTS\n1:49\np\n3h 37m\nARRIVES\n5:26\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n197",
+      "value": "1161\nNortheast Regional\nDEPARTS\n1:49\np\n3h 37m\nARRIVES\n5:26\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n197",
+      "source_url": "https://www.amtrak.com/tickets/departure.html"
+    },
+    {
+      "label": "Outbound Crescent 1019 Coach",
+      "quote": "1019\nCrescent\nDEPARTS\n2:00\np\n3h 47m\nARRIVES\n5:47\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n197",
+      "value": "1019\nCrescent\nDEPARTS\n2:00\np\n3h 47m\nARRIVES\n5:47\np\nTrip Details\n\nCoach\n\nfrom\n\n$\n197",
+      "source_url": "https://www.amtrak.com/tickets/departure.html"
+    }
+  ]
+}

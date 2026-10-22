@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import json
 import logging
 import os
@@ -991,7 +992,10 @@ class PlaywrightBackend:
         if selector:
             conditions.append(page.wait_for_selector(selector, timeout=timeout_ms))
         if url_pattern:
-            conditions.append(page.wait_for_url(url_pattern, timeout=timeout_ms))
+            conditions.append(page.wait_for_url(
+                lambda url: fnmatch.fnmatchcase(str(url), url_pattern),
+                timeout=timeout_ms, wait_until="commit",
+            ))
         if text:
             conditions.append(
                 page.wait_for_function(

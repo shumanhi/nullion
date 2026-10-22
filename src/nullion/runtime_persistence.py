@@ -2242,9 +2242,8 @@ def checkpoint_runtime_conversation_events(
         return save_runtime_store(store, target, merge_existing=True)
     started_at = perf_counter()
     target.parent.mkdir(parents=True, exist_ok=True)
-    rows = store.list_conversation_events()
-    if limit > 0:
-        rows = rows[-limit:]
+    rows = (store.list_recent_conversation_events(limit=limit)
+            if limit > 0 else store.list_conversation_events())
     now = datetime.now(UTC).isoformat()
     encoded_rows = [
         (
@@ -2267,8 +2266,9 @@ def checkpoint_runtime_conversation_events(
             existing_rows = {
                 str(item_key): str(row_payload)
                 for item_key, row_payload in conn.execute(
-                    "SELECT item_key, payload FROM conversation_events WHERE collection = ?",
-                    ("conversation_events",),
+                    "SELECT item_key, payload FROM conversation_events WHERE collection = ? "
+                    "AND item_key IN (" + ",".join("?" for _ in encoded_rows) + ")",
+                    ("conversation_events", *(row[1] for row in encoded_rows)),
                 )
             }
             changed_rows = [
