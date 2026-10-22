@@ -894,6 +894,10 @@ def _file_write_artifact_path_should_use_workspace_artifacts(
     principal_id: str | None,
     effective_roots: tuple[Path, ...],
 ) -> bool:
+    # An existing target is a mutation of that exact file, never a generated
+    # artifact whose location may be chosen by the runtime.
+    if path.is_file():
+        return False
     if _is_workspace_scratch_path(path, principal_id):
         return False
     if path.suffix.lower() not in VALID_ATTACHMENT_EXTENSIONS:
@@ -1536,6 +1540,7 @@ class ToolSpec:
     continuation_tools: tuple[str, ...] = ()
     source_artifact_extensions: tuple[str, ...] = ()
     source_artifact_only: bool = False
+    delegated_tools: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -1592,6 +1597,7 @@ def _tool_handler_timeout_result(invocation: ToolInvocation, *, timeout_seconds:
 
 
 _TOOL_EXECUTION_DEADLINE: ContextVar[float | None] = ContextVar("tool_execution_deadline", default=None)
+_TOOL_EXECUTION_AUTHORITY: ContextVar[tuple[object, ToolInvocation] | None] = ContextVar("tool_execution_authority", default=None)
 
 
 def tool_execution_remaining_seconds() -> float | None:
@@ -2254,6 +2260,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         "pdf_create": {
             "type": "object",
             "properties": {
+                "expected_page_count": {
+                    "type": "integer", "minimum": 1, "maximum": 500,
+                    "description": "Set when the requested output has an exact page count. The actual PDF is checked; overflow is a repairable failure, never silently truncated.",
+                },
                 "output_path": {
                     "type": "string",
                     "description": "Destination .pdf path. If omitted, Nullion creates one in the artifact directory.",
@@ -2326,6 +2336,10 @@ def _default_input_schema_for_tool(tool_name: str) -> dict[str, object]:
         "pdf_edit": {
             "type": "object",
             "properties": {
+                "expected_page_count": {
+                    "type": "integer", "minimum": 1, "maximum": 500,
+                    "description": "Set when the requested output has an exact page count. The actual PDF is checked; overflow is a repairable failure, never silently truncated.",
+                },
                 "input_path": {"type": "string", "description": "Existing PDF path to edit."},
                 "output_path": {
                     "type": "string",
@@ -5611,10 +5625,13 @@ class ToolExecutor:
             error=error,
         )
 
-    def _has_active_grant(self, *, principal_id: str, permissions: Iterable[str]) -> bool:
+    def _has_active_grant(self, *, principal_id: str, permissions: Iterable[str], excluded_approval_ids: Iterable[str] = ()) -> bool:
         required = set(permissions)
+        excluded = set(excluded_approval_ids)
         principal_ids = _tool_grant_principal_candidates(principal_id)
         for grant in self._store.list_permission_grants():
+            if grant.approval_id in excluded:
+                continue
             if grant.principal_id not in principal_ids:
                 continue
             if grant.permission not in required:
@@ -5635,6 +5652,14 @@ class ToolExecutor:
             return True
         return self._has_active_grant(
             principal_id=invocation.principal_id,
+            # A reviewed saved-code execution is bound to its exact command,
+            # revision and inputs. It must not become a blanket shell grant.
+            excluded_approval_ids=(
+                approval.approval_id for approval in self._store.list_approval_requests()
+                if isinstance(approval.context, dict)
+                and isinstance(approval.context.get("tool_arguments"), dict)
+                and approval.context["tool_arguments"].get("saved_tool")
+            ) if invocation.tool_name == "terminal_exec" else (),
             permissions=(
                 f"tool:{invocation.tool_name}",
                 f"tool.{invocation.tool_name}",
@@ -5730,7 +5755,9 @@ class ToolExecutor:
                 logger.debug("Could not revoke consumed email_send approval grant", exc_info=True)
 
     def _find_pending_tool_approval(self, invocation: ToolInvocation):
-        current_arguments = redact_value(dict(invocation.arguments or {})) if invocation.tool_name == "email_send" else None
+        current_arguments = redact_value(dict(invocation.arguments or {})) if (
+            invocation.tool_name == "email_send" or invocation.arguments.get("saved_tool")
+        ) else None
         for approval in self._store.list_approval_requests():
             if approval.status.value != "pending":
                 continue
@@ -5739,6 +5766,9 @@ class ToolExecutor:
             if approval.action != "use_tool":
                 continue
             if approval.resource != invocation.tool_name:
+                continue
+            context = approval.context if isinstance(approval.context, dict) else {}
+            if current_arguments is None and isinstance(context.get("tool_arguments"), dict) and context["tool_arguments"].get("saved_tool"):
                 continue
             if current_arguments is not None:
                 context = approval.context if isinstance(approval.context, dict) else {}
@@ -6448,6 +6478,7 @@ class ToolExecutor:
         self._store.add_audit_record(make_audit_record("tool.invocation.started", invocation.principal_id, details))
 
         started_at = perf_counter()
+        authority_token = _TOOL_EXECUTION_AUTHORITY.set((self, invocation))
         try:
             result = self._registry.invoke(invocation)
         except Exception as exc:
@@ -6458,6 +6489,8 @@ class ToolExecutor:
                 output=filesystem_error_metadata(exc, reason="handler_exception"),
                 error=str(exc),
             )
+        finally:
+            _TOOL_EXECUTION_AUTHORITY.reset(authority_token)
         duration_ms = (perf_counter() - started_at) * 1000
         result = normalize_tool_result(result)
         result = _with_default_action_receipt(spec=spec, invocation=invocation, result=result)
@@ -6465,6 +6498,15 @@ class ToolExecutor:
             self._revoke_email_send_review_grants(invocation)
         if invocation.tool_name == "terminal_exec" and result.status != "denied":
             self._revoke_terminal_destructive_grants(invocation)
+            if invocation.arguments.get("saved_tool"):
+                for grant in self._matching_exact_tool_review_grants(invocation):
+                    approval = self._store.get_approval_request(grant.approval_id)
+                    if approval is not None and (approval.context or {}).get("decision_mode") == "always":
+                        continue
+                    self._store.add_permission_grant(revoke_permission_grant_record(
+                        grant, revoked_by="runtime", revoked_at=datetime.now(UTC),
+                        reason="Reviewed saved tool execution consumed.",
+                    ))
         self._record_egress_outcome(invocation, result, egress_attempts)
         result = self._rewrite_network_denied_result_as_boundary_approval_required(invocation, result)
         if invocation.tool_name != "terminal_exec" and result.status != "denied":
@@ -6732,6 +6774,38 @@ def _build_file_read_handler(
             )
 
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if path.suffix.lower() in {".docx", ".pptx"}:
+            kind = "document" if path.suffix.lower() == ".docx" else "presentation"
+            try:
+                if kind == "document":
+                    from docx import Document
+                    document = Document(path)
+                    blocks = [paragraph.text for paragraph in document.paragraphs]
+                    blocks.extend("\t".join(cell.text for cell in row.cells)
+                                  for table in document.tables for row in table.rows)
+                    details = {"paragraph_count": len(document.paragraphs), "table_count": len(document.tables)}
+                else:
+                    from pptx import Presentation
+                    presentation = Presentation(path)
+                    blocks = []
+                    for slide in list(presentation.slides)[:100]:
+                        for shape in slide.shapes:
+                            if shape.has_text_frame:
+                                blocks.append(shape.text)
+                            if shape.has_table:
+                                blocks.extend("\t".join(cell.text for cell in row.cells) for row in shape.table.rows)
+                    details = {"slide_count": len(presentation.slides)}
+                content = "\n".join(blocks)
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+                    "path": str(path), "type": kind, "media_type": media_type,
+                    "content": content[:24000], "content_available": bool(content.strip()),
+                    "truncated": len(content) > 24000 or details.get("slide_count", 0) > 100,
+                    "inspection_kind": "office_content", **details})
+            except Exception as exc:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                    {"path": str(path), "type": kind, "reason": "document_inspection_failed"},
+                    f"Could not inspect {kind}: {exc}")
+
         if path.suffix.lower() in {".xlsx", ".xlsm"}:
             try:
                 from openpyxl import load_workbook
@@ -6826,52 +6900,38 @@ def _build_file_read_handler(
             )
         if path.suffix.lower() == ".pdf" or media_type == "application/pdf":
             try:
-                data = path.read_bytes()
-                content, page_count, truncated = _extract_pdf_text(data)
+                content, page_count, truncated = _extract_pdf_text(path.read_bytes())
             except FileNotFoundError:
-                return ToolResult(
-                    invocation_id=invocation.invocation_id,
-                    tool_name=invocation.tool_name,
-                    status="failed",
-                    output={},
-                    error=f"File not found: {path}",
-                )
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, f"File not found: {path}")
             except Exception as exc:
-                return ToolResult(
-                    invocation_id=invocation.invocation_id,
-                    tool_name=invocation.tool_name,
-                    status="failed",
-                    output={"path": str(path), "type": "pdf", "media_type": media_type},
-                    error=f"Could not extract PDF text: {exc}",
-                )
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                    {"path": str(path), "type": "pdf", "media_type": media_type}, f"Could not extract PDF text: {exc}")
             if not content:
-                return ToolResult(
-                    invocation_id=invocation.invocation_id,
-                    tool_name=invocation.tool_name,
-                    status="failed",
-                    output={
-                        "path": str(path),
-                        "type": "pdf",
-                        "media_type": media_type,
-                        "page_count": page_count,
-                    },
-                    error=f"PDF contains no extractable text: {path}",
-                )
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                tool_name=invocation.tool_name,
-                status="completed",
-                output={
-                    "path": str(path),
-                    "type": "pdf",
-                    "media_type": media_type,
-                    "content": content,
-                    "page_count": page_count,
-                    "truncated": truncated,
-                    "extraction_method": "pypdf",
-                },
-                error=None,
-            )
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+                    "path": str(path), "type": "pdf", "media_type": media_type,
+                    "page_count": page_count, "content": "", "content_available": False,
+                    "inspection_kind": "pdf_metadata", "visual_content_verified": False,
+                    "message": "PDF is readable but contains no extractable text. Its visual content has not been inspected."})
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+                "path": str(path), "type": "pdf", "media_type": media_type, "content": content,
+                "page_count": page_count, "truncated": truncated, "extraction_method": "pypdf"})
+
+        if media_type.startswith("image/") and path.suffix.lower() != ".svg":
+            try:
+                from PIL import Image
+                with Image.open(path) as image:
+                    image.verify()
+                with Image.open(path) as image:
+                    metadata = {"width": image.width, "height": image.height, "format": image.format}
+            except Exception as exc:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                    {"path": str(path), "type": "image", "media_type": media_type, "reason": "invalid_image",
+                     "inspection_kind": "image_metadata", "visual_content_verified": False}, f"Could not inspect image: {exc}")
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+                "path": str(path), "type": "image", "media_type": media_type,
+                "inspection_kind": "image_metadata", "visual_content_verified": False,
+                "bytes": path.stat().st_size, **metadata,
+                "message": "Image file is readable. This is metadata inspection only; no visual content or text has been verified."})
 
         try:
             content = path.read_text(encoding="utf-8")
@@ -6952,6 +7012,7 @@ def _build_file_write_handler(
             )
 
         path = Path(raw_path).expanduser().resolve()
+        existing_file = path.is_file()
         if _file_write_artifact_path_should_use_workspace_artifacts(
             path,
             principal_id=invocation.principal_id,
@@ -7149,9 +7210,26 @@ def _build_file_write_handler(
         if path.suffix.lower() in VALID_ATTACHMENT_EXTENSIONS:
             output["artifact_path"] = str(path)
             output["artifact_paths"] = [str(path)]
-            if _is_workspace_scratch_path(path, invocation.principal_id):
-                from nullion.artifacts import artifact_output_descriptor
+            if (_is_workspace_scratch_path(path, invocation.principal_id)
+                    or (existing_file and not _flow_context_requires_artifact_delivery_for_extension(
+                        invocation.flow_context, path.suffix.lower()))):
                 output["artifact_descriptors"] = [artifact_output_descriptor(path, role="source", kind="workspace_support")]
+            elif existing_file:
+                artifact_root = _workspace_artifact_root_for_principal(invocation.principal_id)
+                if artifact_root is not None and not _path_within_any_root(path, (artifact_root,)):
+                    # Delivery may need a managed copy, but the authorized edit
+                    # must still affect the exact original target.
+                    from nullion.artifacts import artifact_path_for_generated_workspace_file
+                    delivered_path = artifact_path_for_generated_workspace_file(
+                        principal_id=invocation.principal_id, suffix=path.suffix.lower(), stem=path.stem)
+                    delivered_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, delivered_path)
+                    output["artifact_path"] = str(delivered_path)
+                    output["artifact_paths"] = [str(delivered_path)]
+                    output["artifact_descriptors"] = [
+                        artifact_output_descriptor(delivered_path, role="deliverable", kind="workspace_file_copy"),
+                        artifact_output_descriptor(path, role="source", kind="workspace_file_update"),
+                    ]
 
         if binary_image_decoded:
             output["binary_image_decoded"] = True
@@ -10884,6 +10962,50 @@ def _save_pdf_pages(path: Path, pages: list[object], *, title: str) -> None:
     )
 
 
+def _validated_pdf_output_handler(handler: ToolHandler) -> ToolHandler:
+    def validated(invocation: ToolInvocation) -> ToolResult:
+        expected = invocation.arguments.get("expected_page_count")
+        if expected is not None and (type(expected) is not int or not 1 <= expected <= 500):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                {"reason": "invalid_tool_arguments"}, "expected_page_count must be an integer from 1 to 500")
+        result = handler(invocation)
+        if normalize_tool_status(result.status) != "completed" or not isinstance(result.output, dict):
+            return result
+        output = result.output
+        path = Path(output["path"])
+        from pypdf import PdfReader
+        try:
+            reader = PdfReader(str(path))
+            count = len(reader.pages)
+            media_count = sum(len(page.images) for page in reader.pages)
+        except Exception as exc:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                {"reason": "artifact_validation_failed", "path": str(path)}, f"Could not verify generated PDF: {exc}")
+        output["page_count"] = count
+        output["inspection"] = {"kind": "pdf", "readable": True, "page_count": count, "embedded_image_count": media_count}
+        raster_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+        declared_images = [*output.get("source_image_paths", ()), *output.get("source_screenshot_paths", ())]
+        declared_images.extend(image.get("path") for image in output.get("embedded_html_images", ()) if isinstance(image, dict))
+        if media_count == 0 and any(isinstance(p, str) and Path(p).suffix.lower() in raster_suffixes for p in declared_images):
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                "reason": "artifact_validation_failed", "path": str(path), "inspection": output["inspection"],
+                "recovery": {"kind": "repair_existing_artifact", "path": str(path)}},
+                "The PDF was written, but its supplied images were not embedded. Repair the existing file.")
+        if invocation.tool_name == "pdf_edit":
+            output["input_path"] = invocation.arguments["input_path"]
+            output["supersedes_artifact_paths"] = [invocation.arguments["input_path"]]
+        if expected is not None and count != expected:
+            # Keep the failed candidate for repair, but never advertise it as a deliverable.
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                "reason": "artifact_page_count_mismatch", "path": str(path), "page_count": count,
+                "expected_page_count": expected, "inspection": output["inspection"],
+                "recovery": {"kind": "repair_existing_artifact", "tool_name": "pdf_create",
+                    "path": str(path), "expected_page_count": expected}},
+                f"PDF has {count} pages; the required count is {expected}. Repair the layout without dropping content.")
+        return result
+    return validated
+
+
 def _build_pdf_create_handler(
     workspace_root: str | Path | None = None,
     allowed_roots: list[Path] | tuple[Path, ...] | None = None,
@@ -11297,7 +11419,7 @@ def _build_pdf_create_handler(
             error=None,
         )
 
-    return handler
+    return _validated_pdf_output_handler(handler)
 
 
 def _build_pdf_edit_handler(
@@ -11511,7 +11633,7 @@ def _build_pdf_edit_handler(
             error=None,
         )
 
-    return handler
+    return _validated_pdf_output_handler(handler)
 
 
 
@@ -13815,6 +13937,8 @@ def _build_kernel_tool_registry(
             ),
             _build_skill_pack_read_handler(),
         )
+    from nullion.reusable_tools import register_reusable_tools
+    register_reusable_tools(registry)
     return registry
 
 

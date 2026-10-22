@@ -113,6 +113,7 @@ def register_browser_tools(
                 "browser_run_task",
                 "Use Browser Use visual navigation for a structured, multi-step read/compare task on a target URL. This tool captures PNG screenshots as internal evidence together with grounded observations and unknown requirements. Screenshots are delivered only when the typed task scope requests PNG attachments; otherwise return the findings as text. It fulfills requested screenshot capture without browser_screenshot. Its isolated browser session is not shared with low-level browser tools. Scope only this tool for a visual navigation task with screenshots; do not require a separate capture tool. Reuses the configured model. Prefer this for dynamic pages where low-level extraction is insufficient. Does not book or purchase. May take several minutes.",
                 risk=ToolRiskLevel.MEDIUM, side_effect=ToolSideEffectClass.WRITE, timeout=650,
+                continuation_tools=("browser_run_task",),
                 source_artifact_extensions=(".png",),
                 input_schema={"type": "object", "properties": {
                     "task": {"type": "string", "description": "Structured browser objective with constraints and expected observations"},
@@ -467,17 +468,17 @@ def register_browser_tools(
     registry.register(
         _make_spec(
             "browser_wait_for",
-            "Wait for any page condition. Provide at least one non-empty selector, url_pattern, or text. Use multiple conditions when a site may update in place instead of navigating. If the wait fails, inspect the page with browser_snapshot or browser_extract_text before choosing a new condition; do not repeat the same wait blindly.",
+            "Wait for any page condition. Provide at least one non-empty selector, url_pattern, or text. Use multiple conditions when a site may update in place instead of navigating. For selected form values, use browser_assert_page_state with each expected value separately; a text wait does not validate input values or a combined label that the page never displays. If the wait fails, inspect the page with browser_snapshot or browser_extract_text before choosing a new condition; do not repeat the same wait blindly.",
             risk=ToolRiskLevel.LOW,
             side_effect=ToolSideEffectClass.READ,
             timeout=30,
-            continuation_tools=("browser_snapshot", "browser_extract_text"),
+            continuation_tools=("browser_snapshot", "browser_extract_text", "browser_assert_page_state"),
             input_schema={**_object_schema(
                 {
                     "selector": {"type": "string", "description": "CSS selector to wait for."},
                     "url_pattern": {
                         "type": "string",
-                        "description": "Optional URL glob pattern to wait for.",
+                        "description": "Optional URL glob pattern. * matches any sequence, including path separators. This checks the current URL without waiting for unrelated page resources.",
                     },
                     "text": {
                         "type": "string",

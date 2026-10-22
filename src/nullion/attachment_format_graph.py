@@ -17,6 +17,14 @@ from langgraph.graph import END, START, StateGraph
 
 
 ATTACHMENT_TOKEN_EXTENSIONS: dict[str, str] = {
+    "zip": ".zip",
+    "tar": ".tar",
+    "tgz": ".tgz",
+    "gz": ".gz",
+    "bz2": ".bz2",
+    "xz": ".xz",
+    "tbz2": ".tbz2",
+    "txz": ".txz",
     "aac": ".aac",
     "avi": ".avi",
     "csv": ".csv",
@@ -172,6 +180,11 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                                     {"type": "null"},
                                 ]
                             },
+                            "output_kind": {
+                                "type": "string",
+                                "enum": ["attachment", "inline", "internal", "none"],
+                                "description": "Whether the user wants a delivered file, an inline answer, internal runtime/code storage, or no formatted output. Internal tool schemas and saved helper code are not attachments.",
+                            },
                             "confidence": {"type": "number"},
                             "embedded_media_extensions": {
                                 "type": "array",
@@ -183,7 +196,7 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
                                 "items": {"type": "string", "enum": list(EMBEDDED_MEDIA_ATTACHMENT_EXTENSIONS)},
                             },
                         },
-                        "required": ["extension", "embedded_media_extensions"],
+                        "required": ["extension", "embedded_media_extensions", "output_kind"],
                         "additionalProperties": False,
                     },
                 }
@@ -192,6 +205,11 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
             "system": (
                 "Identify whether this user request specifies a required attachment file format. "
                 "Call select_attachment_format with the result. "
+                "First classify output_kind by the requested user outcome. Choose attachment only when the user "
+                "wants a file delivered or downloaded. Inline structured answers, API input/output contracts, "
+                "schemas, examples, and code saved internally for tool reuse do not request an attachment. "
+                "For inline, internal, or none, return extension=null and no embedded media requirements, "
+                "even if the request discusses JSON, Python, another format, or explicitly declines attachments. "
                 "extension must be a literal file extension such as .pdf, .html, or .blend, or null. "
                 "embedded_media_extensions must include final artifact suffixes only when the requested output file "
                 "itself must contain images, screenshots, generated visuals, or other embedded media bytes. "
@@ -222,6 +240,12 @@ def _model_attachment_format_plan(text: str, model_client: object | None) -> Att
     payload = _structured_payload_from_model_response(response) or _parse_json_object(_text_from_model_response(response))
     if payload is None:
         return None
+    output_kind = payload.get("output_kind")
+    if output_kind is not None and (not isinstance(output_kind, str)
+            or output_kind not in {"attachment", "inline", "internal", "none"}):
+        return None
+    if output_kind in {"inline", "internal", "none"}:
+        return AttachmentFormatPlan(evidence="model_structured_output")
     embedded_media_extensions = _validated_embedded_media_extensions(
         payload.get("embedded_media_extensions")
     )
@@ -307,13 +331,12 @@ def has_unambiguous_attachment_extension_context(full_text: str, token: str) -> 
     token = str(token or "").strip("`'\"<>(),;:")
     if not token:
         return False
-    if token.startswith("."):
+    if _GENERIC_EXTENSION_RE.fullmatch(token):
         return True
-    if "/" in token or "\\" in token or _is_structured_attachment_descriptor(token):
-        return True
-    parts = tuple(part.lower() for part in re.split(r"[\\/]+", token) if part)
-    if "artifacts" in parts or "files" in parts:
-        return True
+    if _is_structured_attachment_descriptor(token):
+        return token.split("=", 1)[0].strip().lower() in {"artifact", "artifacts", "output"}
+    if "/" in token or "\\" in token:
+        return False
     return str(full_text or "").strip("`'\"<>(),;:") == token
 
 
@@ -380,6 +403,8 @@ def _explicit_extensions(text: str, *, allow_filename_tokens: bool = False) -> l
         if match.start() > 0 and value[match.start() - 1] == ".":
             continue
         token = _token_around(value, match.start(), match.end())
+        # Callers may enable filename parsing only inside an already-declared
+        # artifact workflow; ordinary request classification keeps it off.
         if not allow_filename_tokens and not has_unambiguous_attachment_extension_context(value, token):
             continue
         extension = _extension_from_match(

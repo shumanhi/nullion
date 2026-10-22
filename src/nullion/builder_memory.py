@@ -912,10 +912,10 @@ def select_memory_entries_for_prompt(
 def _memory_query_scores(entries: list[UserMemoryEntry], query: str | None) -> dict[str, float]:
     """Rank stored data using corpus overlap, without classifying user intent."""
     import math
-    import unicodedata
+    from nullion.recall_text import search_tokens
 
     def tokens(text: str) -> set[str]:
-        return set(re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", text).casefold()))
+        return set(search_tokens(text))
 
     query_tokens = tokens(str(query or ""))
     if not query_tokens:

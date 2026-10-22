@@ -13,6 +13,7 @@ dependencies = [
   "python-telegram-bot[webhooks]>=22.6,<23",
   "pyyaml>=6.0.3",
   "httpx>=0.27",
+  "jsonschema>=4.23,<5",
   "fastapi>=0.110",
   "uvicorn[standard]>=0.29",
   "websockets>=12.0",
@@ -55,6 +56,9 @@ nullion-tray     = "nullion.tray_app:cli"
 nullion-webview  = "nullion.webview_app:cli"
 nullion-recovery = "nullion.recovery:cli"
 
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "coverage>=7,<8"]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -69,6 +73,9 @@ tag_regex = "^v(?P<version>[0-9]+(?:\\.[0-9]+)*)$"
 fallback_version = "0.0.0"
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-ra"
 norecursedirs = [
   ".git",
   ".pytest_cache",

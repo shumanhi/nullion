@@ -43,6 +43,7 @@ class FetchArtifactState(TypedDict, total=False):
     registry: ToolRegistry | None
     principal_id: str | None
     extension: str | None
+    requested_extension: str | None
     content: str | None
     source_url: str | None
     artifact_paths: list[str]
@@ -59,6 +60,7 @@ def run_fetch_artifact_workflow(
     tool_results: list[ToolResult] | tuple[ToolResult, ...],
     registry: ToolRegistry | None = None,
     principal_id: str | None = None,
+    requested_extension: str | None = None,
 ) -> FetchArtifactWorkflowResult:
     """Create a requested artifact from completed fetch/tool output."""
 
@@ -70,6 +72,7 @@ def run_fetch_artifact_workflow(
             "tool_results": list(tool_results),
             "registry": registry,
             "principal_id": principal_id,
+            "requested_extension": requested_extension,
             "artifact_paths": [],
             "write_attempts": 0,
         },
@@ -102,7 +105,7 @@ def _compiled_fetch_artifact_workflow():
 
 
 def _plan_node(state: FetchArtifactState) -> dict[str, object]:
-    extension = plan_attachment_format(
+    extension = state.get("requested_extension") or plan_attachment_format(
         state.get("prompt") or "",
         allow_filename_tokens=True,
     ).extension
@@ -138,6 +141,13 @@ def _write_artifact_node(state: FetchArtifactState) -> dict[str, object]:
     content = state.get("content")
     if extension not in _SUPPORTED_FETCH_ARTIFACT_EXTENSIONS or not isinstance(content, str) or not content.strip():
         return {"write_attempts": attempts}
+    registry = state.get("registry")
+    if registry is not None and callable(getattr(registry, "get_spec", None)):
+        tool_name = "pdf_create" if extension == ".pdf" else "file_write"
+        try:
+            registry.get_spec(tool_name)
+        except KeyError:
+            return {"write_attempts": attempts, "error": f"Required artifact tool is unavailable: {tool_name}"}
     if extension == ".html":
         content = _viewable_static_html(content, source_url=state.get("source_url"))
     if extension == ".pdf":

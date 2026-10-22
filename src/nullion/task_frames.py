@@ -238,7 +238,7 @@ def extract_url_target(text: str) -> TaskFrameTarget | None:
 def _detect_output_override(text: str, current: TaskFrameOutputContract) -> TaskFrameOutputContract | None:
     # File extensions are structured output-format evidence for an active frame;
     # reuse the shared attachment graph before URL/domain target substitution.
-    requested_format = plan_attachment_format(text, allow_filename_tokens=True)
+    requested_format = plan_attachment_format(text)
     if requested_format.extension is not None:
         return TaskFrameOutputContract(
             artifact_kind=requested_format.extension.removeprefix("."),

@@ -1,41 +1,5 @@
 #!/bin/sh
 set -eu
-
-# Auto-clear stale git lock files before each commit.
-# These can accumulate when sandboxed tools cannot clean up tmp objects
-# on a macOS mount.
-git_dir="$(git rev-parse --git-dir)"
-git_local_env="$(git rev-parse --local-env-vars)"
-for lock in \
-    "$git_dir/HEAD.lock" \
-    "$git_dir/index.lock" \
-    "$git_dir/objects/maintenance.lock"; do
-    [ -f "$lock" ] && rm -f "$lock" 2>/dev/null || true
-done
-
-staged_test_files="$(git diff --cached --name-only --diff-filter=ACMR -- 'tests/**' || true)"
-if [ -n "$staged_test_files" ]; then
-    echo "Do not commit tests/ in this repo. Put tests in the private nullion-test repo instead:" >&2
-    echo "$staged_test_files" >&2
-    exit 1
-fi
-
-test_artifacts="$(
-    find . \
-        -path ./.git -prune -o \
-        -path ./.venv -prune -o \
-        -path ./.mypy_cache -prune -o \
-        -path ./.pytest_cache -prune -o \
-        -path ./__pycache__ -prune -o \
-        -path './src/*.egg-info' -prune -o \
-        -type d \( -name tests -o -name test \) -print -prune -o \
-        -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print
-)"
-if [ -n "$test_artifacts" ]; then
-    echo "Do not keep test files or test folders in this repo. Move them to ../nullion-test:" >&2
-    echo "$test_artifacts" >&2
-    exit 1
-fi
-
-echo "pre-commit: app repo hygiene checks passed."
-echo "pre-commit: private coverage/e2e checks run from .githooks/pre-push."
+# Tests and their fixtures belong beside the implementation.
+git diff --cached --check
+echo "pre-commit: staged whitespace checks passed."

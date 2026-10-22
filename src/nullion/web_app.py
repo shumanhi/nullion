@@ -1274,9 +1274,9 @@ def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
                     """SELECT payload
                        FROM conversation_events
                        WHERE collection = ?
-                         AND json_extract(payload, '$.event_type') = ?
+                         AND json_extract(payload, '$.event_type') IN (?, ?)
                        ORDER BY json_extract(payload, '$.created_at'), rowid""",
-                    ("conversation_events", "conversation.chat_turn"),
+                    ("conversation_events", "conversation.chat_turn", "conversation.session_reset"),
                 ).fetchall()
             events = []
             for (payload,) in rows:
@@ -1292,11 +1292,8 @@ def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
             if not isinstance(events, list):
                 _RUNTIME_HISTORY_SYNC_MTIMES[cache_key] = mtime
                 return
-        turns = [
-            event
-            for event in events
-            if isinstance(event, dict) and event.get("event_type") == "conversation.chat_turn"
-        ]
+        from nullion.session_stop import retained_history_turns
+        turns = retained_history_turns(events)
         importer = getattr(store, "import_runtime_chat_turns", None)
         if callable(importer):
             importer(turns)
@@ -18511,7 +18508,9 @@ def _web_delivery_artifact_paths(
         for path in email_attachment_paths
         if Path(path).suffix
     }
-    multi_required_extension_contract = len(set(normalized_required_extensions)) > 1
+    from nullion.artifact_lifecycle import delivery_manifest
+    terminal_manifest = delivery_manifest(tool_results)
+    multi_required_extension_contract = terminal_manifest is not None or len(set(normalized_required_extensions)) > 1
     if not (
         multi_required_extension_contract
         or (not requested_extension and explicit_result_artifact_paths and len(explicit_result_suffixes) > 1)
@@ -18582,12 +18581,13 @@ def _web_delivery_artifact_paths(
             if Path(path).suffix.lower() in normalized_required_extensions
             or _web_path_matches_identity_set(path, image_fallback_identities)
         ]
-        candidates = _web_prefer_complete_artifact_stem_package(
-            candidates,
-            normalized_required_extensions,
-            required_embedded_media_extensions=required_embedded_media_extensions,
-            tool_results=tool_results,
-        )
+        if terminal_manifest is None:
+            candidates = _web_prefer_complete_artifact_stem_package(
+                candidates,
+                normalized_required_extensions,
+                required_embedded_media_extensions=required_embedded_media_extensions,
+                tool_results=tool_results,
+            )
     if reply_artifact_paths and not email_attachment_paths and not multi_required_extension_contract:
         reply_artifact_identities = _web_path_identity_set(reply_artifact_paths)
         reply_selected_candidates = [
@@ -18602,7 +18602,8 @@ def _web_delivery_artifact_paths(
         for payload in _web_artifact_descriptors(runtime, candidates, principal_id=principal_id)
         if str(payload.get("path") or "")
     ]
-    return list(dict.fromkeys(descriptor_paths))
+    from nullion.artifact_lifecycle import filter_delivery_paths
+    return filter_delivery_paths(list(dict.fromkeys(descriptor_paths)), tool_results)
 
 
 def _web_filter_artifact_paths_to_reply_paths(
@@ -20581,6 +20582,7 @@ def _materialize_fetch_artifact_for_web(
     principal_id: str | None = None,
     registry: ToolRegistry | None = None,
     requested_extension: str | None = None,
+    existing_artifact_paths: list[str] | tuple[str, ...] = (),
 ) -> list[str]:
     if _web_tool_results_are_local_discovery_listing(
         tool_results
@@ -20593,9 +20595,14 @@ def _materialize_fetch_artifact_for_web(
     planned_extension = (
         requested_extension
         or source_attachment_extension
-        or plan_attachment_format(prompt or "", allow_filename_tokens=True).extension
+        or plan_attachment_format(prompt or "").extension
     )
     if planned_extension:
+        # A completed artifact is the result. Fetch materialization is only a
+        # fallback, and must not replace an already-created file's bytes.
+        existing = _web_artifact_descriptors(runtime, existing_artifact_paths, principal_id=principal_id) if existing_artifact_paths else []
+        if any(Path(str(item.get("path") or "")).suffix.lower() == planned_extension for item in existing):
+            return []
         existing_matching_artifacts = [
             path
             for path in artifact_paths_from_tool_results(tool_results)
@@ -20605,7 +20612,7 @@ def _materialize_fetch_artifact_for_web(
             return list(dict.fromkeys(existing_matching_artifacts))
     if planned_extension == ".pdf":
         pass
-    elif source_attachment_extension not in {".html", ".txt"}:
+    elif planned_extension not in {".html", ".txt"}:
         return []
     result = run_fetch_artifact_workflow(
         runtime,
@@ -20613,6 +20620,7 @@ def _materialize_fetch_artifact_for_web(
         tool_results=list(tool_results),
         registry=registry,
         principal_id=principal_id,
+        requested_extension=planned_extension,
     )
     return result.artifact_paths if result.completed else []
 
@@ -21429,6 +21437,7 @@ def create_app(runtime, orchestrator, registry):
             principal_id=conversation_id,
             registry=registry,
             requested_extension=requested_attachment_extension,
+            existing_artifact_paths=[*artifact_paths, *reply_artifact_paths],
         )
         if materialized_artifact_paths:
             artifact_paths = list(dict.fromkeys([*materialized_artifact_paths, *artifact_paths]))
@@ -22717,7 +22726,7 @@ def create_app(runtime, orchestrator, registry):
             store = _get_chat_store()
             store.ensure_conversation(conv_id)
             store.archive_conversation(conv_id)
-            _record_web_conversation_reset(runtime, conv_id)
+            _record_web_conversation_reset(runtime, conv_id, history_retained=True)
             return JSONResponse({"ok": True})
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -22743,6 +22752,7 @@ def create_app(runtime, orchestrator, registry):
         try:
             store = _get_chat_store()
             store.delete_conversation_permanently(conv_id)
+            _record_web_conversation_reset(runtime, conv_id)
             return JSONResponse({"ok": True})
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -22842,8 +22852,10 @@ def create_app(runtime, orchestrator, registry):
         try:
             store = _get_chat_store()
             _sync_runtime_chat_history_to_store(runtime, store)
-            deleted = store.delete_conversations_for_channel_date(channel, date)
-            return JSONResponse({"ok": True, "channel": channel, "date": date, "deleted": deleted})
+            deleted_ids = store.delete_conversations_for_channel_date(channel, date, return_ids=True)
+            for conversation_id in deleted_ids:
+                _record_web_conversation_reset(runtime, conversation_id)
+            return JSONResponse({"ok": True, "channel": channel, "date": date, "deleted": len(deleted_ids)})
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -28266,8 +28278,8 @@ def _is_new_command(text: str) -> bool:
     return is_new_command_text(text)
 
 
-def _record_web_conversation_reset(runtime, conversation_id: str) -> None:
-    reset_conversation_session(runtime, conversation_id)
+def _record_web_conversation_reset(runtime, conversation_id: str, *, history_retained: bool = False) -> None:
+    reset_conversation_session(runtime, conversation_id, history_retained=history_retained)
 
 
 def _parse_history_timestamp(value: object) -> datetime | None:
@@ -31230,6 +31242,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         principal_id=conversation_id,
         registry=registry,
         requested_extension=requested_attachment_extension,
+        existing_artifact_paths=_web_result_artifact_paths(getattr(result, "artifacts", []) or []),
     ) or []
     artifact_paths = list(dict.fromkeys([
         *materialized_artifact_paths,
