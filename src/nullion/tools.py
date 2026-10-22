@@ -16225,11 +16225,19 @@ def _build_skill_pack_read_handler() -> ToolHandler:
 
             text = read_skill_pack_reference(pack_id, path)
         except Exception as exc:
+            output: dict[str, object] = {"pack_id": pack_id, "path": path}
+            if isinstance(exc, FileNotFoundError):
+                from .skill_pack_installer import list_skill_pack_reference_paths
+                try:
+                    output["available_reference_paths"] = list(list_skill_pack_reference_paths(pack_id, max_paths=80))
+                except (OSError, ValueError):
+                    output["available_reference_paths"] = []
+                output["reason"] = "skill_reference_not_found"
             return ToolResult(
                 invocation_id=invocation.invocation_id,
                 tool_name=invocation.tool_name,
                 status="failed",
-                output={"pack_id": pack_id, "path": path},
+                output=output,
                 error=str(exc),
             )
         return ToolResult(

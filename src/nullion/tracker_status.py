@@ -135,7 +135,7 @@ def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: dat
         status = "cancelled"
     elif result.get("cron_delivery_failed"):
         status = "delivery_failed"
-    elif verified and is_tracker(job):
+    elif verified and (is_tracker(job) or result.get("cron_alert_delivery_mode") == "verified_matches_only"):
         reason = result.get("cron_alert_delivery_reason")
         decision = result.get("cron_alert_delivery_decision")
         status = ("match" if decision == "send" and reason == "verified_match" else
@@ -151,6 +151,12 @@ def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: dat
         # Concurrent manual/automatic checks must not overwrite a newer attempt.
         if row["started_at"] >= str(state.get("last_attempt_at") or ""):
             state.update(last_attempt_at=row["started_at"], last_finished_at=now.isoformat(), outcome=status)
+            # Legacy task policy can be resolved from a validated execution
+            # contract. Preserve that typed result for Doctor/UI without editing
+            # the saved job or changing the scope halfway through this run.
+            mode = result.get("cron_delivery_mode") or result.get("cron_alert_delivery_mode")
+            if mode in {"report_each_run", "verified_matches_only"}:
+                state["resolved_tracker"] = mode == "verified_matches_only"
             if status == "no_match":
                 state["consecutive_no_matches"] = int(state.get("consecutive_no_matches", 0)) + 1
                 state["no_match_since"] = state.get("no_match_since") or row["started_at"]
@@ -248,7 +254,7 @@ def _status(conn: sqlite3.Connection, job: object, now: datetime) -> dict:
         health = "delayed"
     else:
         health = str(state.get("outcome") or "not_checked")
-    return {"is_tracker": is_tracker(job), "notifications_enabled": notifications_enabled(job),
+    return {"is_tracker": is_tracker(job) or state.get("resolved_tracker") is True, "notifications_enabled": notifications_enabled(job),
             "health_notifications_enabled": health_notifications_enabled(job),
             "doctor_streak_limit": _streak_limit(job),
             "state": health, "last_attempt_at": last_attempt,

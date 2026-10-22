@@ -547,9 +547,9 @@ _CRON_FILE_INVENTORY_KEYS = frozenset(
 #   contain internal task text, paths, state files, artifacts, or connector
 #   payloads are not deliverables.
 # - Alert-only/no-change runs may be silent.
-# - Unspecified no-output runs should use DEFAULT_CRON_NO_OUTPUT_MESSAGE.
-# If you are asked to change this contract, confirm the intended behavior first
-# and update the cron delivery E2E matrix in nullion-test with the change.
+# - Resolve unspecified delivery policy from the saved task's typed execution
+#   contract; reports need source-backed outcomes, monitors need verified matches.
+# - Cover contract changes in the repository's cron delivery E2E matrix.
 
 
 def normalize_cron_delivery_channel(channel: object) -> str:
@@ -1649,7 +1649,14 @@ def cron_agent_prompt(job: object, *, label: str, run_context: dict[str, str] | 
         "readability, start it with a relevant emoji, wrap the heading text in **bold**, and leave an empty line "
         "after the heading. Use platform-friendly **bold** for important labels, statuses, names, and conclusions.\n"
         "- If the task says to alert only on new data or meaningful changes, return no output when nothing changed.\n"
-        f"- If no output behavior is specified and there is nothing specific to report, send: {DEFAULT_CRON_NO_OUTPUT_MESSAGE}"
+        "- For report-each-run tasks, summarize which sources were actually checked and their outcome. "
+        "Do not send generic runtime receipts or claim a successful empty check without source evidence. "
+        "For verified-matches-only tasks the scheduler decides delivery from current-run evidence.\n"
+        "- Use registered structured account tools for requested actions, including conditional actions. "
+        "Their normal permission/approval checks still apply. If an action tool is missing, request its scope; "
+        "do not replace it with guessed connector URLs or browser calls to private APIs. "
+        "Read only exact installed skill reference paths returned by the skill catalog or a prior tool result. "
+        "A missing reference is a documentation lookup failure, not proof that the account is unavailable."
     )
 
 
@@ -1848,8 +1855,19 @@ def run_single_agent_cron_turn(
         principal_id=conversation_id,
         registry=tool_registry,
         planned_tool_names=None,
+        resolve_execution_contract=True,
+        checkpoint_path=str(runtime.checkpoint_path) if getattr(runtime, "checkpoint_path", None) else None,
     )
-    structured_tool_names = structured_cron_passthrough_tool_names(tool_registry)
+    # A saved request may authorize conditional account actions. Expose exactly
+    # the validated structured capabilities; never bypass their normal approval.
+    structured_tool_names = tuple(dict.fromkeys((*structured_cron_passthrough_tool_names(tool_registry),
+                                                *getattr(connector_scope, "write_tool_names", ()))))
+    delivery_mode = getattr(connector_scope, "delivery_mode", "")
+    options = getattr(job, "artifact_delivery_options", None) or {}
+    if delivery_mode and not options.get("alert_delivery_mode"):
+        job = copy.copy(job)
+        job.artifact_delivery_options = {**options, "alert_delivery_mode": delivery_mode}
+        prompt = cron_agent_prompt(job, label=label, run_context=run_context)
     max_iterations = default_cron_agent_max_iterations()
     _record_preflight(
         "connector_scope",
@@ -1857,6 +1875,9 @@ def run_single_agent_cron_turn(
         connector_providers=len(connector_scope.provider_ids),
         structured_passthrough_tools=len(structured_tool_names),
         max_iterations=max_iterations,
+        scoped_tool_names=list(structured_tool_names),
+        selected_write_tools=list(getattr(connector_scope, "write_tool_names", ())),
+        alert_delivery_mode=_cron_alert_delivery_mode(job),
     )
     from nullion.cron_checkpoint_journal import CronCheckpointJournal
     checkpoint_journal = (CronCheckpointJournal(conversation_id)
@@ -1921,6 +1942,10 @@ def run_single_agent_cron_turn(
                 cancellation_checker=cancellation_checker,
                 tool_flow_context=flow_context,
             )
+            # A dashboard refresh may replace the in-memory store after this
+            # guard ends. Persist a suspension while it still owns that store.
+            if getattr(result, "suspended_for_approval", False) and callable(getattr(runtime, "checkpoint", None)):
+                runtime.checkpoint()
     except BaseException as exc:
         error_text = " ".join(str(exc).strip().split()) or exc.__class__.__name__
         if checkpoint_journal:
@@ -1959,6 +1984,7 @@ def run_single_agent_cron_turn(
             "cron_execution_mode": "single_agent",
             "cron_run_time_context": run_context,
             "cron_task": str(getattr(job, "task", "") or ""),
+            "cron_delivery_mode": (getattr(job, "artifact_delivery_options", None) or {}).get("alert_delivery_mode", ""),
         }
         presentation = result_payload["response_presentation"]
         if presentation.get("scheduled_source_verification_required") is True:
@@ -2085,6 +2111,8 @@ def run_single_agent_cron_turn(
                         tool_result_callback=tool_result_callback, tool_flow_context=flow_context,
                         cancellation_checker=cancellation_checker,
                     )
+                    if getattr(result, "suspended_for_approval", False) and callable(getattr(runtime, "checkpoint", None)):
+                        runtime.checkpoint()
             except Exception:
                 logger.warning("Scheduled completion continuation failed", exc_info=True)
                 result_payload["cron_completion_continuation_failed"] = True
@@ -2135,6 +2163,22 @@ def run_single_agent_cron_turn(
     return result_payload
 
 
+def _cron_safe_remaining_work(value: object) -> list[str]:
+    """Present bounded model-authored step descriptions, never drafts or source payloads."""
+    from nullion.redaction import redact_text
+    from nullion.response_sanitizer import _sanitize_local_paths
+    if not isinstance(value, list):
+        return []
+    steps = []
+    for item in value[:3]:
+        if not isinstance(item, str):
+            continue
+        item = _sanitize_local_paths(redact_text(" ".join(item.split())))[:180].rstrip(".; ")
+        if item and item not in steps:
+            steps.append(item)
+    return steps
+
+
 def _cron_report_failure_notice(result: dict[str, object]) -> str:
     """Present a safe cause from execution state, never provider payload prose."""
     from nullion.response_fulfillment_contract import operation_failure_reply
@@ -2144,7 +2188,12 @@ def _cron_report_failure_notice(result: dict[str, object]) -> str:
     if result.get("cron_completion_continuation_failed"):
         detail = "The attempt to finish the remaining required work failed. No report was published."
     elif result.get("cron_completion_required"):
-        detail = "Required checks or actions remain unfinished, so I could not publish a complete report."
+        detail = ("The check reached its execution limit before all required steps finished."
+                  if result.get("reached_iteration_limit") else
+                  "The check could not finish all required steps.")
+        remaining = _cron_safe_remaining_work(result.get("cron_remaining_work"))
+        if remaining:
+            detail += " Still needed: " + "; ".join(remaining) + "."
     elif result.get("cron_agent_final_repair_failure") == "model_call_failed":
         detail = "The model request failed while preparing the report."
     elif result.get("cron_agent_final_repair_failure"):
@@ -2647,6 +2696,9 @@ def _cron_final_repair_system_prompt() -> str:
         '"evidence_refs":["e0"],"delivery_decision":"send"|"silent",'
         '"delivery_reason":"report"|"no_verified_match","remaining_work":["specific unfinished requirement"],'
         '"report":"user-facing scheduled report"}. '
+        'Write remaining_work as concise user-facing descriptions of specific unfinished steps, without '
+        'local paths, credentials, internal prompts, or tool payloads. Keep already completed checks out of that list. '
+
         'Reference the supplied evidence_id values, not message IDs or item IDs. At least one '
         'reference must support a completed source check. A failed-source reference may support '
         'a disclosed gap, but never a claim that the source was checked successfully. source_state=empty is permitted '
@@ -6044,7 +6096,8 @@ def _cron_run_prepare_delivery_node(state: _CronRunDeliveryState) -> dict[str, o
         result.setdefault("reason", "cron_report_incomplete")
         if not safe_failure_notice:
             result["text"] = result["final_text"] = _cron_report_failure_notice(result)
-    if (_cron_alert_delivery_mode(state["job"]) == CRON_ALERT_DELIVERY_MODE_VERIFIED_MATCHES_ONLY
+    effective_alert_mode = _cron_alert_delivery_mode(state["job"]) or result.get("cron_alert_delivery_mode")
+    if (effective_alert_mode == CRON_ALERT_DELIVERY_MODE_VERIFIED_MATCHES_ONLY
             and (result.get("cron_report_failed") or result.get("cron_run_failed")
                  or result.get("cron_delivery_failed") or result.get("response_fulfilled") is False
                  or result.get("cron_alert_delivery_policy_failed")

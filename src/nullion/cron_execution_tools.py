@@ -41,6 +41,8 @@ class CronConnectorScopeDecision:
     provider_ids: tuple[str, ...] = ()
     confidence: float = 0.0
     valid: bool = False
+    write_tool_names: tuple[str, ...] = ()
+    delivery_mode: str = ""
 
 
 class CronExecutionToolRegistry:
@@ -512,7 +514,7 @@ def _parse_cron_connector_scope_decision(
         return CronConnectorScopeDecision()
     if not isinstance(payload, dict):
         return CronConnectorScopeDecision()
-    requires_connector = bool(payload.get("requires_account_connector"))
+    requires_connector = payload.get("requires_account_connector") is True
     try:
         confidence = float(payload.get("confidence") or 0.0)
     except (TypeError, ValueError):
@@ -547,6 +549,8 @@ def build_cron_connector_scope_decision(
     principal_id: str,
     registry,
     planned_tool_names: Iterable[str] | None = None,
+    resolve_execution_contract: bool = False,
+    checkpoint_path: str | None = None,
 ) -> CronConnectorScopeDecision:
     """Return connector scope from structured model output plus runtime connections."""
     if model_client is None or not _registry_has_connector_tools(registry):
@@ -564,7 +568,7 @@ def build_cron_connector_scope_decision(
     explicit_provider_ids = tuple(
         provider_id for provider_id in sorted(connected_provider_ids) if provider_id in structured_provider_ids
     )
-    if explicit_provider_ids:
+    if explicit_provider_ids and not resolve_execution_contract:
         logger.info(
             "cron connector scope allowed principal_id=%s providers=%d reason=stored_provider_id",
             principal_id,
@@ -587,7 +591,7 @@ def build_cron_connector_scope_decision(
             if app_id_text and app_id_text in structured_app_ids:
                 explicit_app_provider_ids.append(provider_id)
                 break
-    if explicit_app_provider_ids:
+    if explicit_app_provider_ids and not resolve_execution_contract:
         selected = tuple(dict.fromkeys(explicit_app_provider_ids))
         logger.info(
             "cron connector scope allowed principal_id=%s providers=%d reason=stored_active_app_id",
@@ -614,10 +618,41 @@ def build_cron_connector_scope_decision(
             principal_id,
             len(provider_summaries),
         )
+    classifier = CronExecutionToolRegistry(registry)
+    write_specs = [spec for spec in registry.list_specs()
+                   if classifier._is_structured_connector_write_spec(spec) and not classifier._is_blocked_spec(spec)]
+    write_catalog = [{"name": spec.name, "description": spec.description,
+                      "requires_approval": bool(spec.requires_approval)} for spec in write_specs]
+    cache_key = {"principal_id": principal_id, "task": user_message,
+                 "providers": provider_summaries, "writes": write_catalog,
+                 "planned_tools": planned_tool_names_tuple, "runtime_path": str(checkpoint_path or "")}
+    if resolve_execution_contract:
+        from nullion.runtime_cache import get_json, set_json
+        cached = get_json("cron.execution_contract", cache_key, version="v1",
+                          persistent=checkpoint_path is not None, db_path=checkpoint_path)
+        if cached.hit and isinstance(cached.value, dict):
+            value = cached.value
+            available_writes = {spec.name for spec in write_specs}
+            if (isinstance(value.get("allow_connector_tools"), bool)
+                    and isinstance(value.get("provider_ids"), list)
+                    and all(name in connected_provider_ids for name in value["provider_ids"])
+                    and isinstance(value.get("write_tool_names"), list)
+                    and all(name in available_writes for name in value["write_tool_names"])
+                    and isinstance(value.get("confidence"), (int, float))
+                    and (not value["allow_connector_tools"] or value["confidence"] >= 0.65)
+                    and (not value["write_tool_names"] or (value["allow_connector_tools"] and any(
+                        provider.get("provider_id") in value["provider_ids"] and provider.get("permission_mode") == "write"
+                        for provider in provider_summaries)))
+                    and value.get("delivery_mode") in {"report_each_run", "verified_matches_only"}):
+                return CronConnectorScopeDecision(
+                    allow_connector_tools=value["allow_connector_tools"],
+                    provider_ids=tuple(value["provider_ids"]), confidence=value["confidence"], valid=True,
+                    write_tool_names=tuple(value["write_tool_names"]), delivery_mode=value["delivery_mode"])
     prompt = {
         "surface": "scheduled_task_execution",
         "available_connector_providers": list(provider_summaries),
         "scheduled_task": user_message,
+        "available_structured_write_tools": write_catalog if resolve_execution_contract else [],
     }
     system = (
         "Return only a JSON object matching this schema: "
@@ -631,6 +666,17 @@ def build_cron_connector_scope_decision(
         "Choose false when the task does not clearly map to one of the available connector provider ids. "
         "When uncertain, choose false."
     )
+    if resolve_execution_contract:
+        system += (
+            ' Also include "write_tool_names":[], and "delivery_mode":"report_each_run"|"verified_matches_only". '
+            'Select only exact available structured write tool names needed to carry out actions explicitly '
+            'requested by the saved task, including conditional actions. This selects capabilities only; '
+            'normal permission and approval checks still apply. Do not select account writes merely to '
+            'send the scheduled report; the scheduler delivers it. Choose verified_matches_only for '
+            'conditional monitors/reminders that should notify only for new actionable matches; choose '
+            'report_each_run for reports requested on every run. Determine these from the full saved task '
+            'in any language, never from its title alone. Never invent tool names or provider ids.'
+        )
     try:
         response = model_client.create(
             messages=[
@@ -640,12 +686,15 @@ def build_cron_connector_scope_decision(
                 }
             ],
             tools=[],
-            max_tokens=180,
+            max_tokens=600 if resolve_execution_contract else 180,
             system=system,
             timeout=CRON_CONNECTOR_SCOPE_TIMEOUT_SECONDS,
         )
     except Exception:
         logger.debug("Cron connector-scope decision failed; hiding connector tools", exc_info=True)
+        return CronConnectorScopeDecision()
+    completion = response.get("completion", {}) if isinstance(response, dict) else {}
+    if isinstance(completion, dict) and completion.get("status") in {"incomplete", "failed", "cancelled"}:
         return CronConnectorScopeDecision()
     elapsed_ms = (time.perf_counter() - started) * 1000
     decision = _parse_cron_connector_scope_decision(
@@ -660,6 +709,30 @@ def build_cron_connector_scope_decision(
             len(provider_summaries),
         )
         return CronConnectorScopeDecision()
+    if resolve_execution_contract:
+        try:
+            payload = json.loads(_extract_response_text(response))
+            selected = payload.get("write_tool_names", [])
+            mode = payload.get("delivery_mode", "")
+            if (not isinstance(selected, list) or any(not isinstance(name, str) for name in selected)
+                    or mode not in {"", "report_each_run", "verified_matches_only"}):
+                return CronConnectorScopeDecision()
+            # The registry and connection permissions validate model scope. The
+            # normal delegate remains the only authority to execute an action.
+            writable = any(provider.get("provider_id") in decision.provider_ids and provider.get("permission_mode") == "write"
+                           for provider in provider_summaries)
+            available_writes = {spec.name for spec in write_specs}
+            writes = tuple(dict.fromkeys(name for name in selected if name in available_writes))
+            if selected and (not writable or not decision.allow_connector_tools
+                             or len(writes) != len(set(selected))):
+                return CronConnectorScopeDecision()
+            decision = replace(decision, write_tool_names=writes, delivery_mode=mode)
+            if mode:  # Do not cache incomplete legacy responses or transient failures.
+                from dataclasses import asdict
+                set_json("cron.execution_contract", cache_key, asdict(decision), version="v1",
+                         persistent=checkpoint_path is not None, db_path=checkpoint_path, max_entries=256)
+        except (TypeError, ValueError, KeyError):
+            return CronConnectorScopeDecision()
     logger.info(
         "cron connector scope decided principal_id=%s elapsed_ms=%.1f allow=%s providers=%d selected=%d confidence=%.2f",
         principal_id,

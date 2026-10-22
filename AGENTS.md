@@ -104,9 +104,9 @@
 
 - Before any code changes, check the local ops pinned branch file at `~/.nullion-ops/pinned-branches.json`.
 - If the `app` pin exists, all `nullion` app work must happen on that pinned branch/ref unless the user explicitly asks to use a different branch.
-- The app pin also selects the tests. Legacy test pins apply only to preserved external checkouts and do not select this repository’s suite.
+- The app pin selects code, tests, and developer tools together. There is no separate test repository or test branch pin.
 - If the current checkout is not on the pinned branch/ref, switch to the pinned branch or create/use a worktree for it before editing.
-- Do not create a new app or test branch while a pin exists unless the user asks to create or change the pin.
+- Do not create a new work branch while a pin exists unless the user asks to create or change the pin.
 - If no pin exists for a repo, follow the normal user-named branch and git workflow rules below.
 - The local ops dashboard at `scripts/local_ops_dashboard.py` is the source of truth for creating, changing, and clearing pinned branches.
 
