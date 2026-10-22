@@ -16,11 +16,13 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -33,6 +35,23 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 HOME = Path.home()
 UID = os.getuid()
+def checkout_workspace(checkout: Path) -> Path:
+    """Resolve sibling runtime folders consistently from normal or Git worktree checkouts."""
+    try:
+        result = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=4, check=True)
+        common = Path(result.stdout.strip())
+        if not common.is_absolute():
+            common = checkout / common
+        common = common.resolve()
+        if common.name == ".git":
+            return common.parent.parent
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return checkout.parent
+
+
+WORKSPACE = checkout_workspace(ROOT)
 DASHBOARD_PORT = 2020
 LOCAL_OPS_LAUNCHD_LABEL = "com.nullion.local-ops-dashboard"
 
@@ -106,7 +125,7 @@ STAGE = Instance(
     url="http://127.0.0.1:8753",
     port=8753,
     install_dir=HOME / ".nullion-stage",
-    expected_source=str(ROOT.parent / "nullion-stage-main"),
+    expected_source=str(WORKSPACE / "nullion-stage-main"),
     services=(
         Service("web", "com.nullion.stage.web", "nullion.log", "nullion-error.log"),
         Service("tray", "com.nullion.stage.tray", "tray.log", "tray-error.log"),
@@ -116,10 +135,9 @@ STAGE = Instance(
 
 INSTANCES = (PROD, STAGE, DEV)
 INSTANCE_BY_KEY = {instance.key: instance for instance in INSTANCES}
-TEST_LAUNCHER = Path(os.environ.get("NULLION_STAGE_LAUNCHER", str(ROOT / "scripts" / "stage-launcher")))
 APP_REPO = Path(os.environ.get("NULLION_APP_REPO", str(ROOT)))
-DEV_WORKTREE_DIR = Path(os.environ.get("NULLION_DEV_WORKTREE_DIR", str(ROOT.parent / "nullion-dev-worktrees")))
-STAGE_SOURCE_DIR = Path(os.environ.get("NULLION_STAGE_SOURCE_DIR", str(ROOT.parent / "nullion-stage-main")))
+DEV_WORKTREE_DIR = Path(os.environ.get("NULLION_DEV_WORKTREE_DIR", str(WORKSPACE / "nullion-dev-worktrees")))
+STAGE_SOURCE_DIR = Path(os.environ.get("NULLION_STAGE_SOURCE_DIR", str(WORKSPACE / "nullion-stage-main")))
 PINNED_BRANCH_FILE = Path(os.environ.get("NULLION_OPS_PINNED_BRANCH_FILE", str(HOME / ".nullion-ops" / "pinned-branches.json")))
 LAUNCH_AGENTS_DIR = HOME / "Library" / "LaunchAgents"
 JOBS: dict[str, dict[str, Any]] = {}
@@ -293,8 +311,6 @@ def _truthy(value: str | None) -> bool:
 def _repo_for_key(repo_key: str) -> Path:
     if repo_key == "app":
         return APP_REPO
-    if repo_key == "test":
-        return ROOT
     raise ValueError(f"unknown repo key: {repo_key}")
 
 
@@ -641,12 +657,13 @@ def _instance_source_git(instance: Instance, package: dict[str, Any]) -> dict[st
     return {}
 
 
-def _git_stdout(args: list[str], *, cwd: Path = APP_REPO, timeout: float = 8.0) -> str:
-    result = _run(["git", "-C", str(cwd), *args], timeout=timeout)
+def _git_stdout(args: list[str], *, cwd: Path | None = None, timeout: float = 8.0) -> str:
+    result = _run(["git", "-C", str(cwd or APP_REPO), *args], timeout=timeout)
     return result["stdout"] if result["ok"] else ""
 
 
-def _worktrees_by_branch(repo: Path = APP_REPO) -> dict[str, Path]:
+def _worktrees_by_branch(repo: Path | None = None) -> dict[str, Path]:
+    repo = repo or APP_REPO
     worktrees: dict[str, Path] = {}
     current_path: Path | None = None
     for line in _git_stdout(["worktree", "list", "--porcelain"], cwd=repo).splitlines():
@@ -664,7 +681,8 @@ def _git_dirty_count(path: Path) -> int:
     return len([line for line in status["stdout"].splitlines() if line.strip()]) if status["ok"] else 0
 
 
-def branch_rows(repo: Path = APP_REPO) -> list[dict[str, Any]]:
+def branch_rows(repo: Path | None = None) -> list[dict[str, Any]]:
+    repo = repo or APP_REPO
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     worktrees = _worktrees_by_branch(repo)
@@ -740,7 +758,8 @@ def _sorted_prod_source_rows(branches: list[dict[str, Any]], releases: list[dict
     return sorted([*branches, *releases], key=lambda row: row.get("updated_at", 0), reverse=True)
 
 
-def release_tag_rows(repo: Path = APP_REPO) -> list[dict[str, Any]]:
+def release_tag_rows(repo: Path | None = None) -> list[dict[str, Any]]:
+    repo = repo or APP_REPO
     if not (repo / ".git").exists():
         return []
     refs = _git_stdout(
@@ -774,7 +793,8 @@ def release_tag_rows(repo: Path = APP_REPO) -> list[dict[str, Any]]:
     return rows
 
 
-def _latest_release_tag(repo: Path = APP_REPO) -> str:
+def _latest_release_tag(repo: Path | None = None) -> str:
+    repo = repo or APP_REPO
     rows = release_tag_rows(repo)
     return str(rows[0]["branch"]) if rows else "v0.5.0"
 
@@ -885,9 +905,9 @@ def pin_branch(repo_key: str, selection: str) -> dict[str, Any]:
     value = _selection_value(str(resolved["source_scope"]), str(resolved["branch"]))
     state = _load_pin_state()
     state.pop("qa", None)
-    for key in ("app", "test"):
-        if isinstance(state.get(key), dict):
-            state[key].pop("bug_tracker", None)
+    state.pop("test", None)
+    if isinstance(state.get("app"), dict):
+        state["app"].pop("bug_tracker", None)
     state[repo_key] = {
         "selection": value,
         "branch": resolved["branch"],
@@ -904,6 +924,7 @@ def unpin_branch(repo_key: str) -> dict[str, Any]:
     _repo_for_key(repo_key)
     state = _load_pin_state()
     state.pop(repo_key, None)
+    state.pop("test", None)
     _write_pin_state(state)
     return {"ok": True, "repo": repo_key, "state_file": str(PINNED_BRANCH_FILE)}
 
@@ -911,7 +932,7 @@ def unpin_branch(repo_key: str) -> dict[str, Any]:
 def pinned_branch_status() -> dict[str, Any]:
     state = _load_pin_state()
     pins: dict[str, Any] = {"state_file": str(PINNED_BRANCH_FILE)}
-    for repo_key in ("app", "test"):
+    for repo_key in ("app",):
         item = state.get(repo_key)
         if not isinstance(item, dict) or not item.get("selection"):
             pins[repo_key] = {"pinned": False, "repo": str(_repo_for_key(repo_key))}
@@ -959,75 +980,16 @@ def create_and_pin_branch(repo_key: str, name: str, base_selection: str) -> dict
     return {"ok": pinned.get("ok"), "repo": repo_key, "branch": branch, "base": base, "pin": pinned}
 
 
-def _paired_branch_suffix(raw: str) -> str:
-    value = str(raw or "").strip()
-    if not value:
-        value = f"paired-{datetime.now().strftime('%Y-%m-%d')}"
-    for prefix in ("nullion/", "nullion-test/"):
-        if value.startswith(prefix):
-            return value[len(prefix) :]
-    return value
+def pin_work_branch(selection: str) -> dict[str, Any]:
+    return pin_branch("app", selection)
 
 
-def _paired_branch_create_suffix(raw: str) -> str:
-    base = _paired_branch_suffix(raw)
-    if _has_short_timestamp_suffix(base):
-        return base
-    return f"{base}{_short_timestamp_suffix()}"
+def unpin_work_branch() -> dict[str, Any]:
+    return unpin_branch("app")
 
 
-def _paired_selection(scope: str, branch: str) -> str:
-    return f"{scope}:{branch}" if scope in {"local", "local-ref", "origin"} else branch
-
-
-def pin_paired_work(selection: str) -> dict[str, Any]:
-    scope, branch = _split_ref_selection(selection, default="")
-    if not branch:
-        return {"ok": False, "error": "paired branch selection is required"}
-    source_scope = scope if scope in {"local", "local-ref", "origin"} else "local"
-    suffix = _paired_branch_suffix(branch)
-    app_selection = _paired_selection(source_scope, f"nullion/{suffix}")
-    test_selection = _paired_selection(source_scope, f"nullion-test/{suffix}")
-    app_resolved = _resolve_git_ref(APP_REPO, app_selection, default="")
-    test_resolved = _resolve_git_ref(ROOT, test_selection, default="")
-    if not app_resolved.get("ok"):
-        return {"ok": False, "error": app_resolved.get("error") or "app branch not found", "app_selection": app_selection}
-    if not test_resolved.get("ok"):
-        return {"ok": False, "error": test_resolved.get("error") or "test branch not found", "test_selection": test_selection}
-    app_pin = pin_branch("app", app_selection)
-    if not app_pin.get("ok"):
-        return {"ok": False, "error": app_pin.get("error") or "app pin failed", "app": app_pin}
-    test_pin = pin_branch("test", test_selection)
-    if not test_pin.get("ok"):
-        return {"ok": False, "error": test_pin.get("error") or "test pin failed", "app": app_pin, "test": test_pin}
-    return {"ok": True, "suffix": suffix, "app": app_pin, "test": test_pin}
-
-
-def unpin_paired_work() -> dict[str, Any]:
-    state = _load_pin_state()
-    state.pop("app", None)
-    state.pop("test", None)
-    state.pop("qa", None)
-    _write_pin_state(state)
-    return {"ok": True, "state_file": str(PINNED_BRANCH_FILE)}
-
-
-def create_and_pin_paired_branches(name: str, app_base_selection: str, test_base_selection: str) -> dict[str, Any]:
-    suffix = _paired_branch_create_suffix(name)
-    if not suffix:
-        return {"ok": False, "error": "branch name is required"}
-    app = create_and_pin_branch("app", f"nullion/{suffix}", app_base_selection or "origin:main")
-    if not app.get("ok"):
-        return {"ok": False, "error": app.get("error") or "app branch creation failed", "app": app, "suffix": suffix}
-    test = create_and_pin_branch("test", f"nullion-test/{suffix}", test_base_selection or "origin:main")
-    if not test.get("ok"):
-        return {"ok": False, "error": test.get("error") or "test branch creation failed", "app": app, "test": test, "suffix": suffix}
-    return {
-        "ok": True,
-        "suffix": suffix,
-        "app": app,
-        "test": test,
-    }
+def create_work_branch(name: str, base_selection: str) -> dict[str, Any]:
+    return create_and_pin_branch("app", name, base_selection)
 
 
 def _find_worktree_for_branch(branch: str) -> Path | None:
@@ -1144,14 +1106,13 @@ def dashboard_status() -> dict[str, Any]:
         "dashboard": {
             "repo": str(ROOT),
             "app_repo": str(APP_REPO),
-            "legacy_stage_launcher": str(TEST_LAUNCHER),
+            "test_suite": str(ROOT / "tests"),
             "dev_worktree_dir": str(DEV_WORKTREE_DIR),
             "stage_source_dir": str(STAGE_SOURCE_DIR),
             "pinned_branch_file": str(PINNED_BRANCH_FILE),
         },
         "pins": pinned_branch_status(),
         "branches": branches,
-        "test_branches": branch_rows(ROOT),
         "release_tags": release_tags,
         "prod_sources": _sorted_prod_source_rows(branches, release_tags),
         "jobs": jobs,
@@ -1161,7 +1122,7 @@ def dashboard_status() -> dict[str, Any]:
 
 def _dev_branch() -> str:
     branch = _run(["git", "-C", str(APP_REPO), "branch", "--show-current"], timeout=4)["stdout"]
-    return branch or "nullion/2026-05-05-cron-reminder-guard"
+    return branch or "main"
 
 
 def _default_app_selection() -> str:
@@ -1425,6 +1386,57 @@ def _port_listener_pids(instance: Instance) -> list[str]:
     return _run(["lsof", f"-tiTCP:{instance.port}", "-sTCP:LISTEN"], timeout=4)["stdout"].split()
 
 
+def _instance_service_pids(instance: Instance) -> list[str]:
+    result = _run(["ps", "-axo", "pid=,command="], timeout=6)
+    if not result.get("ok"):
+        return []
+    install_dir = str(instance.install_dir.resolve())
+    venv_dir = str((instance.install_dir / "venv").resolve())
+    runtime_db = str(instance.runtime_db.resolve())
+    env_file = str(instance.env_file.resolve())
+    matched: list[str] = []
+    for raw_line in str(result.get("stdout") or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        pid, command = parts
+        if pid == SELF_PID:
+            continue
+        if f"{venv_dir}/" not in command and f"{install_dir}/" not in command:
+            continue
+        is_web = "-m nullion.web_app" in command and f"--port {instance.port}" in command
+        is_tray = "nullion-tray" in command and f"--port {instance.port}" in command
+        is_webview = "-m nullion.webview_app" in command and f"--port {instance.port}" in command
+        is_telegram = "nullion-telegram" in command and (
+            f"--checkpoint {runtime_db}" in command
+            or f"--env-file {env_file}" in command
+            or f"{venv_dir}/bin/nullion-telegram" in command
+        )
+        if is_web or is_tray or is_webview or is_telegram:
+            matched.append(pid)
+    return matched
+
+def _kill_instance_service_processes(instance: Instance, *, signal: str = "TERM") -> dict[str, Any]:
+    pids = _instance_service_pids(instance)
+    results = []
+    for pid in pids:
+        results.append(_run(["kill", f"-{signal}", pid], timeout=4))
+    return {"ok": True, "pids": pids, "results": results}
+
+def _wait_for_instance_service_processes_free(instance: Instance, *, timeout: float = 10.0) -> dict[str, Any]:
+    started = time.time()
+    pids: list[str] = []
+    while time.time() - started < timeout:
+        pids = _instance_service_pids(instance)
+        if not pids:
+            return {"ok": True, "elapsed_ms": round((time.time() - started) * 1000), "pids": []}
+        time.sleep(0.2)
+    return {"ok": False, "elapsed_ms": round((time.time() - started) * 1000), "pids": pids}
+
+
 def _kill_instance_port(instance: Instance, *, signal: str = "TERM") -> dict[str, Any]:
     pids = _port_listener_pids(instance)
     results = []
@@ -1448,18 +1460,28 @@ def stop_instance(instance: Instance, *, job: dict[str, Any] | None = None) -> d
     results = [_bootout_service(service, job=job) for service in reversed(instance.services)]
     stopped = [_wait_for_service_stopped(service) for service in instance.services]
     stale = [_terminate_stale_service_processes(instance, service) for service in instance.services]
+    orphan_processes = _kill_instance_service_processes(instance, signal="TERM")
+    orphan_free = _wait_for_instance_service_processes_free(instance)
+    orphan_kill = None
+    if not orphan_free["ok"]:
+        orphan_kill = _kill_instance_service_processes(instance, signal="KILL")
+        orphan_free = _wait_for_instance_service_processes_free(instance, timeout=4)
+
     port = _kill_instance_port(instance, signal="TERM")
     port_free = _wait_for_port_free(instance)
     port_kill: dict[str, Any] | None = None
     if not port_free["ok"]:
         port_kill = _kill_instance_port(instance, signal="KILL")
         port_free = _wait_for_port_free(instance, timeout=4)
-    ok = all(item["ok"] for item in stopped) and all(item["ok"] for item in stale) and bool(port_free["ok"])
+    ok = all(item["ok"] for item in stopped) and all(item["ok"] for item in stale) and bool(orphan_free["ok"]) and bool(port_free["ok"])
     return {
         "ok": ok,
         "instance": instance.key,
         "results": results,
         "stopped": stopped,
+        "orphan_processes": orphan_processes,
+        "orphan_free": orphan_free,
+        "orphan_kill": orphan_kill,
         "stale": stale,
         "port": port,
         "port_kill": port_kill,
@@ -1846,9 +1868,18 @@ def copy_prod_db_to_stage() -> dict[str, Any]:
     }
 
 
+def _protected_work_branches() -> set[str]:
+    # The dashboard can run from a different worktree than APP_REPO.
+    # Keep its source and the selected work branch even after they are merged.
+    pin = _load_pin_state().get("app") or {}
+    return {"main", _git_stdout(["branch", "--show-current"]),
+            _git_stdout(["branch", "--show-current"], cwd=ROOT),
+            str(pin.get("branch") or "")}
+
+
 def cleanup_merged_branches() -> dict[str, Any]:
     _run(["git", "-C", str(APP_REPO), "fetch", "--prune", "origin"], timeout=30)
-    current = _git_stdout(["branch", "--show-current"])
+    protected = _protected_work_branches()
     removed: list[str] = []
     skipped: list[dict[str, str]] = []
     for row in branch_rows():
@@ -1856,8 +1887,8 @@ def cleanup_merged_branches() -> dict[str, Any]:
             skipped.append({"branch": row["display"], "reason": "remote ref"})
             continue
         branch = row["branch"]
-        if branch in {"main", current} or not row.get("merged_to_main"):
-            skipped.append({"branch": branch, "reason": "current/main/unmerged"})
+        if branch in protected or not row.get("merged_to_main"):
+            skipped.append({"branch": branch, "reason": "protected/unmerged"})
             continue
         worktree = _find_worktree_for_branch(branch)
         if worktree:
@@ -1880,9 +1911,8 @@ def cleanup_branch(branch: str) -> dict[str, Any]:
         return {"ok": False, "error": "cleanup only removes local branches"}
     if not branch:
         return {"ok": False, "error": "choose a branch first"}
-    current = _git_stdout(["branch", "--show-current"])
-    if branch in {"main", current}:
-        return {"ok": False, "error": "refusing to delete main or the current app branch"}
+    if branch in _protected_work_branches():
+        return {"ok": False, "error": "refusing to delete main, a current source branch, or the pinned work branch"}
     merged = _run(["git", "-C", str(APP_REPO), "merge-base", "--is-ancestor", branch, "main"], timeout=4)["ok"]
     if not merged:
         return {"ok": False, "error": f"{branch} is not merged to main"}
@@ -1944,10 +1974,14 @@ def start_e2e(branch: str, target: str) -> dict[str, Any]:
     source = _resolve_dev_source(branch or _default_app_selection())
     if not source["ok"]:
         return source
-    command = [str(ROOT / "scripts" / "e2e-docker.sh")]
+    checkout = Path(source["path"])
+    runner = checkout / "scripts" / "e2e-docker.sh"
+    if not runner.is_file() or not (checkout / "tests").is_dir():
+        return {"ok": False, "error": "Selected branch does not contain its own test suite and Docker runner."}
+    command = [str(runner)]
     if target.strip():
         command.append(target.strip())
-    return _start_background_job("e2e", command, cwd=ROOT, env={"NULLION_APP_REPO": str(source["path"])})
+    return _start_background_job("e2e", command, cwd=checkout, env={"NULLION_APP_REPO": str(checkout)})
 
 
 def open_webview(instance: Instance) -> dict[str, Any]:
@@ -2032,20 +2066,16 @@ def action_summary(name: str, result: dict[str, Any]) -> dict[str, Any]:
             "message": result.get("message") or result.get("error") or "",
             "details": {"label": LOCAL_OPS_LAUNCHD_LABEL},
         }
-    if name in {"pin_work_branch", "create_paired_branches"}:
-        app = result.get("app") or {}
-        test = result.get("test") or {}
+    if name in {"pin_work_branch", "create_work_branch"}:
+        pin = result.get("pin") or result
         return {
             "ok": result.get("ok"),
             "title": "Work branch pinned" if result.get("ok") else "Work branch setup failed",
-            "message": result.get("error") or str(result.get("suffix") or ""),
-            "details": {
-                "app_branch": app.get("branch") or app.get("pin", {}).get("branch"),
-                "test_branch": test.get("branch") or test.get("pin", {}).get("branch"),
-            },
+            "message": result.get("error") or str(result.get("branch") or ""),
+            "details": {"branch": result.get("branch") or pin.get("branch")},
         }
     if name == "unpin_work_branch":
-        return {"ok": result.get("ok"), "title": "Work branch pins cleared", "message": result.get("error") or "", "details": result}
+        return {"ok": result.get("ok"), "title": "Work branch pin cleared", "message": result.get("error") or "", "details": result}
     if name.startswith("pin_") or name.startswith("unpin_"):
         return {
             "ok": result.get("ok"),
@@ -2132,27 +2162,16 @@ def action(name: str, payload: dict[str, Any], *, job: dict[str, Any] | None = N
     elif name == "start_e2e":
         raw = start_e2e(str(payload.get("branch") or ""), str(payload.get("target") or ""))
     elif name == "pin_work_branch":
-        raw = pin_paired_work(str(payload.get("paired_branch") or payload.get("branch") or "").strip())
+        raw = pin_work_branch(str(payload.get("branch") or "").strip())
     elif name == "unpin_work_branch":
-        raw = unpin_paired_work()
+        raw = unpin_work_branch()
     elif name == "pin_app_branch":
         raw = pin_branch("app", str(payload.get("branch") or "").strip())
     elif name == "unpin_app_branch":
         raw = unpin_branch("app")
-    elif name == "pin_test_branch":
-        raw = pin_branch("test", str(payload.get("test_branch") or payload.get("branch") or "").strip())
-    elif name == "unpin_test_branch":
-        raw = unpin_branch("test")
-    elif name == "create_app_branch":
-        raw = create_and_pin_branch("app", str(payload.get("new_branch") or "").strip(), str(payload.get("branch") or "origin:main").strip())
-    elif name == "create_test_branch":
-        raw = create_and_pin_branch("test", str(payload.get("new_test_branch") or payload.get("new_branch") or "").strip(), str(payload.get("test_branch") or payload.get("branch") or "origin:main").strip())
-    elif name == "create_paired_branches":
-        raw = create_and_pin_paired_branches(
-            str(payload.get("new_paired_branch") or payload.get("new_branch") or "").strip(),
-            str(payload.get("base_branch") or "origin:main").strip(),
-            str(payload.get("test_base_branch") or "origin:main").strip(),
-        )
+    elif name in {"create_work_branch", "create_app_branch"}:
+        raw = create_work_branch(str(payload.get("new_branch") or "").strip(),
+                                 str(payload.get("base_branch") or "origin:main").strip())
     else:
         raw = {"ok": False, "error": f"unknown action: {name}"}
     return {"ok": raw.get("ok"), "summary": action_summary(name, raw), "raw": raw}
@@ -2331,18 +2350,18 @@ INDEX_HTML = r"""<!doctype html>
       <div class="body">
         <div class="branch-board">
           <div class="branch-row">
-            <div class="branch-title"><strong>Agent work branch</strong><span>Pairs app and nullion-test branches</span></div>
-            <select class="wide-input" id="workBranchSelect" aria-label="Agent paired work branch picker"></select>
+            <div class="branch-title"><strong>Agent work branch</strong><span>One branch for app, tests, and tools</span></div>
+            <select class="wide-input" id="workBranchSelect" aria-label="Agent work branch picker"></select>
             <div class="toolbar">
-              <button class="primary" onclick="runAction('pin_work_branch')">Pin all</button>
+              <button class="primary" onclick="runAction('pin_work_branch')">Pin</button>
               <button onclick="runAction('unpin_work_branch')">Clear</button>
             </div>
           </div>
           <details class="inline-create">
-            <summary>Create paired branches</summary>
+            <summary>Create work branch</summary>
             <div class="toolbar">
-              <input class="short-input" id="newPairedBranch" aria-label="New paired branch" placeholder="branch name">
-              <button onclick="runAction('create_paired_branches')">Create and pin all</button>
+              <input class="short-input" id="newWorkBranch" aria-label="New work branch" placeholder="branch name">
+              <button onclick="runAction('create_work_branch')">Create and pin</button>
             </div>
           </details>
           <div class="branch-row">
@@ -2420,7 +2439,7 @@ INDEX_HTML = r"""<!doctype html>
             <input class="wide-input" id="e2eTarget" placeholder="optional pytest target, e.g. tests/e2e/test_web_surface_contracts.py">
             <button class="primary" onclick="runAction('start_e2e')">Run E2E on selected branch</button>
           </div>
-          <div class="label" style="margin-top:10px">Runs Docker-isolated E2E with NULLION_APP_REPO pointed at the selected dev branch source.</div>
+          <div class="label" style="margin-top:10px">Runs the app and its test suite together from the selected dev branch in Docker.</div>
           <div id="jobs"></div>
         </div>
       </section>
@@ -2543,7 +2562,7 @@ function renderPinStatus(pins) {
     `;
   }
   const target = document.getElementById("pinStatus");
-  if (target) target.innerHTML = block("app", "Pinned app branch") + block("test", "Pinned nullion-test branch");
+  if (target) target.innerHTML = block("app", "Pinned work branch");
 }
 
 function renderJobs(jobs) {
@@ -2870,7 +2889,7 @@ async function runAction(action) {
   const prodReleaseEl = document.getElementById("prodReleaseSelect");
   const devBranchEl = document.getElementById("devBranchSelect");
   const stageBranchEl = document.getElementById("stageBranchSelect");
-  const newPairedBranchEl = document.getElementById("newPairedBranch");
+  const newWorkBranchEl = document.getElementById("newWorkBranch");
   const workBranch = workBranchEl ? workBranchEl.value.trim() : "";
   const prodRelease = prodReleaseEl ? prodReleaseEl.value.trim() : "";
   const devBranch = devBranchEl ? devBranchEl.value.trim() : "";
@@ -2879,7 +2898,7 @@ async function runAction(action) {
   let branch = devBranch;
   if (action.includes("prod")) branch = prodRelease;
   if (action === "reset_prod") branch = "latest release";
-  if (action === "pin_work_branch" || action === "create_paired_branches" || action === "cleanup_branch") branch = workBranch;
+  if (action === "pin_work_branch" || action === "create_work_branch" || action === "cleanup_branch") branch = workBranch;
   if (action.includes("stage")) branch = stageBranch || "origin:main";
   output.innerHTML = renderRunningAction(action, branch);
   const target = document.getElementById("e2eTarget") ? document.getElementById("e2eTarget").value.trim() : "";
@@ -2893,9 +2912,7 @@ async function runAction(action) {
       dev_branch: devBranch,
       stage_branch: stageBranch,
       allow_prod_local: allowLocalProd,
-      paired_branch: workBranch,
-      test_branch: workBranch,
-      new_paired_branch: newPairedBranchEl ? newPairedBranchEl.value.trim() : "",
+      new_branch: newWorkBranchEl ? newWorkBranchEl.value.trim() : "",
       target
     })
   });
@@ -2983,11 +3000,67 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+def dashboard_launchagent() -> dict[str, Any]:
+    script = ROOT / "scripts" / "local_ops_dashboard.py"
+    logs = HOME / ".nullion-ops" / "logs"
+    return {
+        "Label": LOCAL_OPS_LAUNCHD_LABEL,
+        "ProgramArguments": [sys.executable, str(script), "--host", "127.0.0.1", "--port", str(DASHBOARD_PORT)],
+        "WorkingDirectory": str(ROOT),
+        "EnvironmentVariables": {
+            "NULLION_APP_REPO": str(APP_REPO),
+            "NULLION_DEV_WORKTREE_DIR": str(DEV_WORKTREE_DIR),
+            "NULLION_STAGE_SOURCE_DIR": str(STAGE_SOURCE_DIR),
+            "NULLION_OPS_PINNED_BRANCH_FILE": str(PINNED_BRANCH_FILE),
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(logs / "local-ops-dashboard.log"),
+        "StandardErrorPath": str(logs / "local-ops-dashboard-error.log"),
+    }
+
+
+def install_dashboard_launchagent() -> dict[str, Any]:
+    """Move only the dashboard service to this checkout, preserving the old plist."""
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "LaunchAgent installation requires macOS."}
+    if not all((ROOT / item).exists() for item in ("pyproject.toml", "src/nullion", "tests", "scripts/e2e-docker.sh")):
+        return {"ok": False, "error": "Dashboard source must be a self-contained Nullion checkout."}
+    plist = LAUNCH_AGENTS_DIR / f"{LOCAL_OPS_LAUNCHD_LABEL}.plist"
+    before = plist.read_bytes() if plist.exists() else None
+    backup = None
+    if before is not None:
+        backup = HOME / ".nullion-ops" / "backups" / f"dashboard-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}.plist"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(before)
+    payload = dashboard_launchagent()
+    Path(payload["StandardOutPath"]).parent.mkdir(parents=True, exist_ok=True)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    domain = f"gui/{UID}"
+    _run(["launchctl", "bootout", f"{domain}/{LOCAL_OPS_LAUNCHD_LABEL}"], timeout=15)
+    plist.write_bytes(plistlib.dumps(payload))
+    loaded = _run(["launchctl", "bootstrap", domain, str(plist)], timeout=15)
+    if not loaded["ok"]:
+        if before is not None:
+            plist.write_bytes(before)
+            _run(["launchctl", "bootstrap", domain, str(plist)], timeout=15)
+        else:
+            plist.unlink(missing_ok=True)
+        return {"ok": False, "error": loaded.get("stderr") or loaded.get("stdout"), "backup": str(backup) if backup else None}
+    return {"ok": True, "plist": str(plist), "source": str(ROOT), "backup": str(backup) if backup else None}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve the local Nullion prod/stage/dev ops dashboard.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT, help=argparse.SUPPRESS)
+    parser.add_argument("--install-launchagent", action="store_true", help="Run the dashboard from this checkout at login (macOS).")
     args = parser.parse_args()
+    if args.install_launchagent:
+        result = install_dashboard_launchagent()
+        print(json.dumps(result, indent=2))
+        raise SystemExit(0 if result.get("ok") else 1)
     cleanup = _kill_stale_dashboard_processes(port=args.port)
     if not cleanup.get("ok"):
         print(f"Warning: failed to cleanup stale dashboard processes: {cleanup.get('errors')}")

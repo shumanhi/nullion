@@ -537,3 +537,7 @@ See [Testing](docs/e2e-testing.md) for focused checks and installer commands.
 GUI, browser, install, and web tests stay inside the container for local checks.
 The macOS installer runs in an isolated CI job. Actual desktop tray visibility
 requires an interactive desktop session and is not proven by headless checks.
+
+The [local operations dashboard](docs/e2e-testing.md#local-operations-dashboard)
+also lives here. Run `python3 scripts/local_ops_dashboard.py`; on macOS use
+`--install-launchagent` to run it at login from this checkout.

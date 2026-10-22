@@ -6643,6 +6643,21 @@ def _delegated_scheduler_run_arguments_from_list_result(
                     reference = value.strip()
                     break
         if not reference:
+            # The model's structured lookup query can identify a paused task too.
+            # Use the verified row id instead of passing the whole request as a name.
+            query = output.get("query")
+            if isinstance(query, str) and query.strip():
+                reference = query.strip().casefold()
+                matches = {str(row.get("id") or "").strip() for row in crons
+                           if isinstance(row, Mapping) and row.get("has_task") is not False
+                           and any(str(row.get(key) or "").strip().casefold() == reference
+                                   for key in ("id", "name", "display_name"))}
+                matches.discard("")
+                if len(matches) == 1:
+                    return {"id": matches.pop()}, selection_policy
+                # Ambiguous lookup metadata is not a selection. Let the model use
+                # the supplied rows or request clarification through the normal loop.
+                return None
             reference = str(state.get("user_message") or "").strip()
         if reference and len(reference) <= 512:
             return {"name": reference}, selection_policy

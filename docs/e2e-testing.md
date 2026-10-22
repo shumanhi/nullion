@@ -56,3 +56,22 @@ Do not run installer or managed-service operations against an existing personal
 installation. CI installer checks create disposable homes and work directories.
 Do not include private logs, runtime databases, credentials, or personal output
 in fixtures. Use fictional identities and example paths.
+
+## Local operations dashboard
+
+The dashboard, test runners, and app all come from this repository. A single
+work-branch pin selects code and tests together; there is no second repository,
+private access key, or paired test branch. E2E jobs execute the selected branch's
+own `scripts/e2e-docker.sh` and `tests/`, rather than mixing it with another checkout.
+
+Run `python3 scripts/local_ops_dashboard.py` to serve the dashboard on loopback
+port 2020. On macOS, `python3 scripts/local_ops_dashboard.py --install-launchagent`
+installs its login service from the current checkout, backs up the previous
+LaunchAgent, and restores it if loading fails. This changes only the dashboard
+service. Keep its source checkout available; branch cleanup protects it.
+
+Instance configuration, databases, and logs remain in their runtime homes;
+these are data directories, not separate Git repositories. Installing the
+dashboard does not install, restart, or change the app's prod/stage/dev services.
+The former standalone production-switching test launcher is retired; use the
+explicit lane controls in this dashboard for runtime operations.

@@ -149,49 +149,39 @@ def test_pin_branch_preserves_selection_and_existing_files(tmp_path, monkeypatch
 
 def test_create_and_pin_branch_uses_local_prefix(tmp_path, monkeypatch) -> None:
     dashboard = _load_dashboard()
-    repo = tmp_path / "nullion-test"
+    repo = tmp_path / "app"
     _init_repo(repo)
     state_file = tmp_path / "pins.json"
-    monkeypatch.setattr(dashboard, "ROOT", repo)
+    monkeypatch.setattr(dashboard, "APP_REPO", repo)
     monkeypatch.setattr(dashboard, "PINNED_BRANCH_FILE", state_file)
-    result = dashboard.create_and_pin_branch("test", "generated-pin", "local:main")
+    result = dashboard.create_work_branch("generated-pin", "local:main")
     assert result["ok"] is True, result
     assert result["branch"] == "nullion/generated-pin"
     assert _git(repo, "show-ref", "--verify", "--quiet", "refs/heads/nullion/generated-pin") == ""
-    saved = json.loads(state_file.read_text())["test"]
-    assert saved["selection"] == "local:nullion/generated-pin"
-    assert "commit" not in saved
-    assert "bug_tracker" not in result
-
-
-def test_create_and_repin_paired_branches_without_extra_files(tmp_path, monkeypatch) -> None:
-    dashboard = _load_dashboard()
-    app_repo = tmp_path / "app"
-    test_repo = tmp_path / "nullion-test"
-    _init_repo(app_repo)
-    _init_repo(test_repo)
-    state_file = tmp_path / "pins.json"
-    monkeypatch.setattr(dashboard, "APP_REPO", app_repo)
-    monkeypatch.setattr(dashboard, "ROOT", test_repo)
-    monkeypatch.setattr(dashboard, "PINNED_BRANCH_FILE", state_file)
-    result = dashboard.create_and_pin_paired_branches("paired-fix", "local:main", "local:main")
-    assert result["ok"] is True, result
-    assert re.fullmatch(r"paired-fix--\d{2}-\d{2}-(am|pm)", result["suffix"])
-    for key, prefix, repo in (("app", "nullion", app_repo), ("test", "nullion-test", test_repo)):
-        branch = f"{prefix}/{result['suffix']}"
-        assert result[key]["branch"] == branch
-        assert _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}") == ""
-    repinned = dashboard.pin_paired_work(f"local:nullion/{result['suffix']}")
-    assert repinned["ok"] is True
     saved = json.loads(state_file.read_text())
-    assert set(saved) == {"app", "test"}
-    assert set(dashboard.pinned_branch_status()) == {"app", "test", "state_file"}
-    assert "qa" not in result and "bug_tracker" not in result
-    assert "qa" not in repinned and "bug_tracker" not in repinned
-    assert not list(tmp_path.rglob("*.xlsx"))
-    assert not list(tmp_path.rglob("*.numbers"))
-    summary = dashboard.action_summary("create_paired_branches", result)
-    assert set(summary["details"]) == {"app_branch", "test_branch"}
+    assert set(saved) == {"app"}
+    assert saved["app"]["selection"] == "local:nullion/generated-pin"
+
+
+def test_create_and_repin_one_work_branch_removes_legacy_test_pin(tmp_path, monkeypatch) -> None:
+    dashboard = _load_dashboard()
+    repo = tmp_path / "app"
+    _init_repo(repo)
+    state_file = tmp_path / "pins.json"
+    state_file.write_text(json.dumps({"test": {"repo": str(tmp_path / "missing-old-repo"),
+                                            "selection": "local:retired"}}))
+    monkeypatch.setattr(dashboard, "APP_REPO", repo)
+    monkeypatch.setattr(dashboard, "PINNED_BRANCH_FILE", state_file)
+    result = dashboard.create_work_branch("unified-fix", "local:main")
+    assert result["ok"] is True, result
+    assert result["branch"] == "nullion/unified-fix"
+    repinned = dashboard.pin_work_branch("local:nullion/unified-fix")
+    assert repinned["ok"] is True
+    assert set(json.loads(state_file.read_text())) == {"app"}
+    assert set(dashboard.pinned_branch_status()) == {"app", "state_file"}
+    assert set(dashboard.action_summary("create_work_branch", result)["details"]) == {"branch"}
+    dashboard.unpin_work_branch()
+    assert json.loads(state_file.read_text()) == {}
 
 
 def test_start_prod_local_branch_requires_explicit_allowance(tmp_path, monkeypatch) -> None:

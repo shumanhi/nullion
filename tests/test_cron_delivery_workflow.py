@@ -252,7 +252,8 @@ def test_cron_agent_prompt_declares_file_text_silent_and_default_delivery_contra
     assert "Shape the visible reply to the amount and type of content" in prompt
     assert "Do not force every reply into bullets" in prompt
     assert "return no output when nothing changed" in prompt
-    assert DEFAULT_CRON_NO_OUTPUT_MESSAGE in prompt
+    assert DEFAULT_CRON_NO_OUTPUT_MESSAGE not in prompt
+    assert "without source evidence" in prompt
 
 
 def test_scheduled_task_delivery_text_uses_shared_visible_header() -> None:
