@@ -85,7 +85,7 @@ register_playbook(RemediationPlaybook(
     recommendation_code="model_api_unreachable",
     summary="The AI model API isn't responding",
     issue_type=HealthIssueType.TIMEOUT,
-    button_labels=["Retry now", "Switch to fallback model", "Pause chat"],
+    button_labels=["Retry on next request", "Switch to fallback model", "How to stop a request"],
     button_commands=["doctor:retry_model_api", "doctor:switch_fallback_model", "doctor:pause_chat"],
     auto_heal_fn=None,   # Can't auto-heal a down external API — surface the card
 ))

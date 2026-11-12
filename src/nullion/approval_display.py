@@ -288,7 +288,7 @@ def _email_send_review_detail(context: dict[str, object]) -> str | None:
     return "\n".join(lines)
 
 
-def _format_calendar_datetime(value: object) -> str:
+def _format_calendar_datetime(value: object, *, source_timezone: str = '') -> str:
     text = _string(value)
     if not text:
         return ""
@@ -300,8 +300,10 @@ def _format_calendar_datetime(value: object) -> str:
     has_explicit_time = "T" in text or " " in text
     if not has_explicit_time:
         return date_text
-    time_text = parsed.strftime("%I:%M %p").lstrip("0")
-    return f"{date_text}, {time_text}"
+    from nullion.preferences import format_user_datetime, resolve_timezone
+    if parsed.tzinfo is None and source_timezone:
+        parsed = parsed.replace(tzinfo=resolve_timezone(source_timezone))
+    return format_user_datetime(parsed, naive_is_local=True)
 
 
 def _calendar_event_review_detail(context: dict[str, object]) -> str | None:
@@ -310,9 +312,9 @@ def _calendar_event_review_detail(context: dict[str, object]) -> str | None:
         return None
 
     title = _string(arguments.get("summary") or arguments.get("title") or arguments.get("event_title"))
-    start = _format_calendar_datetime(arguments.get("start") or arguments.get("start_time"))
-    end = _format_calendar_datetime(arguments.get("end") or arguments.get("end_time"))
     time_zone = _string(arguments.get("time_zone") or arguments.get("timezone"))
+    start = _format_calendar_datetime(arguments.get("start") or arguments.get("start_time"), source_timezone=time_zone)
+    end = _format_calendar_datetime(arguments.get("end") or arguments.get("end_time"), source_timezone=time_zone)
     location = _string(arguments.get("location"))
     calendar_id = _string(arguments.get("calendar_id") or arguments.get("calendar"))
     description = _string(arguments.get("description"))
@@ -323,12 +325,12 @@ def _calendar_event_review_detail(context: dict[str, object]) -> str | None:
     if start and end:
         when = f"{start} to {end}"
         if time_zone:
-            when = f"{when} ({time_zone})"
+            when = f"{when} (event timezone: {time_zone})"
         lines.append(f"> When: {when}")
     elif start:
         when = start
         if time_zone:
-            when = f"{when} ({time_zone})"
+            when = f"{when} (event timezone: {time_zone})"
         lines.append(f"> When: {when}")
     if location:
         lines.append(f"> Where: {location}")
@@ -453,6 +455,18 @@ def approval_display_from_request(approval: Any) -> ApprovalDisplay:
     side_effect = _string(context.get("tool_side_effect_class"))
     tool_name = _tool_name_for(approval, context)
     if is_agent_turn_limit_extension_request(approval):
+        if context.get('execution_scope') == 'scheduled_run':
+            from nullion.chat_text import UserMessage, render_user_message
+            name = _string(context.get('scheduled_task_name')) or 'Scheduled task'
+            progress = _string(context.get('scheduled_progress_text'))
+            return ApprovalDisplay(label=AGENT_TURN_LIMIT_EXTENSION_TOOL_NAME,
+                title=f'Doctor: {name} needs more execution budget',
+                copy='The saved run reached its execution budget with work unfinished. '
+                    'Choose how much additional budget to allow. It will resume saved progress; '
+                    'this does not change the recurring schedule or grant action permissions.',
+                detail=render_user_message(UserMessage(paragraphs=(progress,) if progress else (),
+                    footer=f"Saved execution budget: {context.get('current_max_iterations')} model rounds.")),
+                is_web_request=_conversation_source_label(context.get('conversation_id')) == 'Source: Web')
         current_limit = _string(context.get("current_max_iterations"))
         approved_limit = _string(context.get("approved_max_iterations"))
         tool_count = _string(context.get("tool_result_count"))

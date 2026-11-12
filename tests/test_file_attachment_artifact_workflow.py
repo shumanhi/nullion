@@ -372,12 +372,13 @@ def test_platform_delivery_accepts_relative_workspace_artifact_media_directive(t
 
     assert delivery.attachments == (artifact,)
     assert delivery.text == (
-        "⏰ **SCHEDULED TASK: CNN latest news PDF every 5 minutes**\n\n"
+        "**SCHEDULED TASK: CNN latest news PDF every 5 minutes**\n\n"
         "CNN latest news PDF generated."
     )
     assert delivery.media_directive_count == 1
     assert "MEDIA" not in (delivery.text or "")
     assert "artifacts/cnn_latest_news_2026-05-04_0950.pdf" not in (delivery.text or "")
+
 
 
 def test_platform_delivery_removes_attached_plain_path_from_media_caption(tmp_path) -> None:
@@ -422,10 +423,11 @@ def test_platform_delivery_strips_internal_builder_marker_and_backticked_attachm
     delivery = prepare_reply_for_platform_delivery(reply, allow_attachments=True)
 
     assert delivery.attachments == (artifact,)
-    assert delivery.text == "⏰ **SCHEDULED TASK: Hourly CNN latest news PDF**\n\nCNN latest news PDF created:"
+    assert delivery.text == "**SCHEDULED TASK: Hourly CNN latest news PDF**\n\nCNN latest news PDF created:"
     assert str(artifact) not in (delivery.text or "")
     assert "::builder-skill::" not in (delivery.text or "")
     assert "``" not in (delivery.text or "")
+
 
 
 def test_platform_delivery_only_attaches_when_requested(tmp_path, monkeypatch) -> None:

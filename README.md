@@ -28,6 +28,25 @@ installations can enable it with their app Python:
 Some sites restrict automated access; navigation time depends on the website and
 model. The feature is intended for reading and comparison, not completing purchases.
 
+## Temporary live tracking
+
+Ask in chat to watch a condition for a limited time, for example:
+
+> Watch this train's platform assignment every 15 seconds for two hours. Alert
+> me once it is assigned, then stop.
+
+A live tracker prepares the source once and repeats only its read-only check;
+it does not restart a cron or full assistant task on each poll. Checks default
+to every 15 seconds and support intervals from 5 seconds to 6 hours. By default,
+they report new changes until the chosen finite duration or future end time;
+you can explicitly request a stop after the first match. If the condition, duration, or recurring-versus-temporary intent
+is unclear, Nullion asks numbered questions first. A readable source and its
+permissions are required.
+
+Manage trackers and their separate parallel-check limit under **Settings →
+Crons → Live trackers**. There is no `/track` slash command. See
+[Live tracking, reminders, and recurring jobs](docs/live-tracking.md).
+
 ## Install
 
 **Mac or Linux** — open Terminal and paste:
@@ -74,7 +93,7 @@ sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
 python3.12 --version
 ```
 
-The installer sets everything else up, walks you through connecting your API keys, and starts Nullion automatically. Takes about a minute.
+The installer sets everything else up, walks you through connecting your API keys, and starts Nullion automatically. Initial downloads, browser preparation, and optional local models can take several minutes.
 
 On macOS and Windows, Nullion also includes an optional tray/menu-bar companion:
 
@@ -83,6 +102,11 @@ nullion-tray
 ```
 
 It shows the Nullion logo in the menu bar or system tray and gives you quick access to the Web UI, approvals, logs, config, and restart actions. Clicking "Open Web UI" opens a native webview window; "Open in Browser" is still available from the menu.
+
+The tray reuses its local HTTP connection for status checks. Offline checks back
+off to at most once per minute; an explicit refresh checks immediately. See
+[connection troubleshooting](docs/support.md#local-tcp-connection-exhaustion)
+if several unrelated services report network address errors.
 
 To remove the local install later:
 
@@ -183,9 +207,9 @@ bash install.sh
   delivery targets, memory, and grants stay attached to the initiating
   workspace or operator instead of leaking across users.
 - **Visible planning and artifacts** — Planner cards show planned work by default
-  and stay separate from verbose mode. Verbose is only on/off for activity
-  details; when the planner feed is off, supported chat surfaces still show the
-  planner header/request/task rows without the activity section. Requested
+  and stay separate from verbose mode. The current runtime keeps task cards
+  enabled. Verbose is only on/off for activity details; when activity is off,
+  the card keeps its request summary and task rows. Requested
   artifacts are surfaced as the requested format, without dumping intermediate
   files used to build them.
 - **Faster normal chat** — independent turns can continue in parallel while
@@ -206,7 +230,7 @@ bash install.sh
 
 ## Product philosophy
 
-Nullion is shaped around four layers:
+Nullion is shaped around five layers:
 
 1. **Kernel** — tiny, generic, auditable primitives. Local-first by default. No provider-shaped promises.
 2. **Plugins** — optional installable tool groups (`search_plugin`, `email_plugin`, `calendar_plugin`, `browser_plugin`, …). Provider choice stays explicit and replaceable.
@@ -222,11 +246,11 @@ Nullion is shaped around four layers:
 - The runtime only claims support for what is actually installed and allowed
 - When a plugin is missing, Nullion composes generic primitives rather than pretending the plugin exists
 - Core tools remain a universal fallback path; plugins improve efficiency, not basic possibility
+- Shared request checks compare tool results and generated files with the full goal, catch conflicting assumptions before changes, and repair missing work while preserving completed actions.
 
-See also:
-- `docs/plugins.md`
-- `docs/skill-packs.md`
-- Online docs: https://www.nullion.ai/docs/
+See [Documentation](docs/README.md) for the complete guide, including
+[Commands](docs/commands.md), [Configuration](docs/configuration.md),
+[Live tracking](docs/live-tracking.md), and [Architecture](docs/architecture.md).
 
 ## Plugins
 
@@ -269,7 +293,8 @@ guidance, and plugin-author documentation.
 
 Public web research uses API-backed search only when the configured provider
 has credentials. Without a Brave, Google Custom Search, or Perplexity key,
-Nullion falls back to browser navigation, page extraction, and screenshots.
+Nullion falls back to browser navigation and page extraction; visual capture
+is used only when the task needs it.
 Set `NULLION_DIRECT_WEB_FETCH_ENABLED=true` only when you explicitly want the
 direct fetch path registered.
 
@@ -328,17 +353,10 @@ guidance for community skill packs.
 └─────────────────────────────────────────┘
 ```
 
-Each chat adapter is a thin platform-specific shim. The kernel and chat backend never touch platform APIs directly. Adding a new platform means implementing the `ChatAdapter` interface — nothing in the kernel changes.
-
-## Initial focus
-
-Build a minimal kernel with:
-- principals
-- tasks
-- events
-- audit logging
-- policy/capability checks
-- user-facing main assistant
+Chat adapters handle platform-specific transport and rendering. Shared routing,
+policy, persistence and presentation code keep the request contract consistent.
+A new adapter still needs its own reply, approval and attachment acceptance
+checks; passing on one surface does not prove the others.
 
 ## Chat adapters
 
@@ -480,7 +498,7 @@ export NULLION_DISCORD_OPERATOR_USER_ID="<your-numeric-user-id>"
 nullion-discord
 ```
 
-For single-user access, set your Discord user ID in Settings -> Messaging or `NULLION_DISCORD_OPERATOR_USER_ID`. Enable Developer Mode in Discord, then choose Copy User ID from your profile. For member-only access, enable multi-user mode and authorize active members in Settings -> Users with `messaging_channel=discord` and their Discord user IDs.
+For single-user access, set your Discord user ID in Settings -> Messaging or `NULLION_DISCORD_OPERATOR_USER_ID`. Enable Developer Mode in Discord, then choose Copy User ID from your profile. For member access, enable multi-user mode and authorize active members in Settings -> Users with `messaging_channel=discord` and their Discord user IDs.
 
 Enable Message Content Intent under Bot -> Privileged Gateway Intents in the Discord Developer Portal. Invite the bot to your server with View Channel, Send Messages, and Attach Files permissions. Save settings, then restart the Discord adapter. An invalid token or disallowed intent now produces a setup error explaining what to change.
 

@@ -129,17 +129,17 @@ def test_report_review_retries_failed_completion_using_same_document_and_sources
     ({'scheduled_task_run':True,'requires_artifact_delivery':False,'completion_review_owner':'cron_delivery','required_artifact_extensions':['.html']},False),
     ({'scheduled_task_run':True,'requires_artifact_delivery':True,'required_artifact_extensions':['.html']},False),
 ])
-def test_review_delegation_requires_typed_scheduled_html_contract(context,delegated):
+def test_legacy_owner_hint_cannot_skip_explicit_common_review(context,delegated):
     from nullion.agent_orchestrator import _review_risky_agent_completion
     from nullion.tools import ToolRegistry
     class Client:
         calls=0
         def create(self,**kwargs):
             self.calls+=1
-            raise AssertionError('Generic reviewer dependency must stay outside the scheduled HTML phase')
+            raise AssertionError('External planner unavailable')
     client=Client()
     result=_review_risky_agent_completion({'orchestrator':SimpleNamespace(model_client=client),
         'tool_registry':ToolRegistry(),'tool_flow_context':context,'user_message':'確認。'},
         final_text='確認。',tool_results=[],artifacts=[],force=True)
-    assert (result is None)==delegated
-    assert client.calls==(0 if delegated else 1)
+    assert result is not None
+    assert client.calls==1

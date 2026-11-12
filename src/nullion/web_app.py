@@ -12,6 +12,8 @@ The server hosts a single-page app with:
 """
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 import argparse
 import asyncio
 from contextlib import contextmanager
@@ -29,6 +31,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -140,7 +143,8 @@ from nullion.cron_planner_status import (
     build_cron_planner_status_fallback,
     build_cron_planner_status_preview,
 )
-from nullion.doctor_playbooks import execute_doctor_playbook_command
+from nullion.doctor_playbooks import DoctorPlaybookResult, execute_doctor_playbook_command
+from nullion.health_action_notices import health_action_notice
 from nullion.entrypoint_guard import run_single_instance_entrypoint, run_user_facing_entrypoint
 from nullion.fetch_artifact_workflow import run_fetch_artifact_workflow
 from nullion.memory import (
@@ -252,6 +256,8 @@ from nullion.turn_context_policy import (
     turn_is_context_linked,
 )
 
+from nullion.delivery_acknowledgement import UnconfirmedDelivery
+
 logger = logging.getLogger(__name__)
 
 _WEB_ARTIFACTS: dict[str, Path] = {}
@@ -267,8 +273,9 @@ _WEB_STABLE_CONTEXT_CACHE_MAX_ENTRIES = 32
 _WEB_STABLE_CONTEXT_CACHE: dict[tuple[object, ...], tuple[dict[str, object], ...]] = {}
 _WEB_STABLE_CONTEXT_CACHE_LOCK = threading.RLock()
 _WEB_CHECKPOINT_LOCK = threading.RLock()
-_WEB_CHECKPOINT_INFLIGHT: set[int] = set()
+_WEB_CHECKPOINT_INFLIGHT: dict[int, object] = {}
 _WEB_CHECKPOINT_DIRTY: set[int] = set()
+_WEB_CHECKPOINT_FORCE: set[int] = set()
 _WEB_TURN_SLOW_LOG_MS = 1200.0
 _WEB_AUTO_HISTORY_CONTEXT_LIMIT = 8
 _WEB_AUTO_HISTORY_CONTEXT_MIN_SCORE = 2
@@ -1267,9 +1274,8 @@ def _sync_runtime_chat_history_to_store(runtime: Any, store: Any) -> None:
             return
         _RUNTIME_HISTORY_SYNC_CHECKED_AT[cache_key] = now_monotonic
         if checkpoint_path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
-            import sqlite3
 
-            with sqlite3.connect(str(checkpoint_path), timeout=2) as conn:
+            with sqlite_connection(str(checkpoint_path), timeout=2) as conn:
                 rows = conn.execute(
                     """SELECT payload
                        FROM conversation_events
@@ -4506,6 +4512,7 @@ _HTML = r"""<!DOCTYPE html>
     #composer-mode { grid-column: 1 / 4; width: 100%; }
     #send-btn { grid-column: 4 / 5; grid-row: 2 / 3; height: 42px; align-self: end; }
   }
+  .bubble .message-heading { font-size: 1em; line-height: inherit; margin: 0.6em 0 0.3em; font-weight: 650; }
 </style>
 <script src="/assets/d3-force.bundle.min.js"></script>
 </head>
@@ -4661,10 +4668,17 @@ _HTML = r"""<!DOCTYPE html>
       <div id="memory-list"><div class="empty">No memory entries</div></div>
     </div>
 
+    <div class="dash-section">
+      <h3>Live trackers <span class="badge" id="live-tracker-count">0</span>
+        <button class="badge" onclick="openSettings();showTab('crons',document.querySelector('.snav-btn:last-child'))" style="cursor:pointer;margin-left:auto">Manage</button>
+      </h3>
+      <div id="live-trackers-dash"><div class="empty">No live trackers</div></div>
+    </div>
+
     <!-- Scheduled crons -->
     <div class="dash-section">
       <h3>Scheduled <span class="badge" id="cron-count">0</span>
-        <button class="badge" onclick="openSettings();showTab('crons',document.querySelector('.snav-btn:last-child'));loadCronsTab()" style="cursor:pointer;margin-left:auto;background:none;border:none;color:var(--muted);font-size:11px;padding:0">Manage</button>
+        <button class="badge" onclick="openSettings();showTab('crons',document.querySelector('.snav-btn:last-child'))" style="cursor:pointer;margin-left:auto;background:none;border:none;color:var(--muted);font-size:11px;padding:0">Manage</button>
       </h3>
       <div id="crons-dash-list"><div class="empty">No scheduled tasks</div></div>
     </div>
@@ -4836,7 +4850,7 @@ _HTML = r"""<!DOCTYPE html>
       <button class="snav-btn" onclick="showTab('doctor',this)">Doctor</button>
       <button class="snav-btn" onclick="showTab('security',this)">Security</button>
       <button class="snav-btn" onclick="showTab('users',this)">Users</button>
-      <button class="snav-btn" onclick="showTab('crons',this);loadCronsTab()">Crons</button>
+      <button class="snav-btn" onclick="showTab('crons',this)">Crons</button>
       <button class="snav-btn" onclick="showTab('logs',this)">Logs</button>
     </nav>
 
@@ -5187,8 +5201,8 @@ _HTML = r"""<!DOCTYPE html>
                 <div class="form-group" style="margin-bottom:0">
                   <label>Time</label>
                   <select id="pref-timeformat" style="width:100%">
-                    <option value="12h">12h</option>
-                    <option value="24h">24h</option>
+                    <option value="12h">12-hour (4:05 PM)</option>
+                    <option value="24h">24-hour (16:05)</option>
                   </select>
                 </div>
               </div>
@@ -6237,6 +6251,19 @@ _HTML = r"""<!DOCTYPE html>
       <!-- ── Crons tab ──────────────────────────────────────────────────────── -->
       <div id="tab-crons" class="settings-tab">
         <div class="settings-panel">
+          <div class="settings-panel-title">Live trackers</div>
+          <p class="cron-subcopy">Frequent checks for a limited time. Each tracker stops after a match or its deadline. Ask in chat to start one.</p>
+          <div class="form-group">
+            <label for="live-parallel-limit">How many live checks can run in parallel?</label>
+            <input id="live-parallel-limit" type="number" min="1" max="16" disabled style="width:80px">
+            <button class="btn-sm" onclick="saveLiveParallelLimit()">Save</button>
+            <span id="live-parallel-message" role="status"></span>
+            <div class="form-hint">Separate capacity from recurring jobs. A source can limit how frequently it can be checked.</div>
+          </div>
+          <div id="live-trackers-list"><div class="empty">No live trackers</div></div>
+        </div>
+
+        <div class="settings-panel">
           <div class="cron-toolbar">
             <div>
               <div class="settings-panel-title">Scheduled tasks</div>
@@ -6716,6 +6743,26 @@ function finishTurnUi(turnId = null) {
   setSendButtonDisabled(false);
 }
 
+function discardSupersededTurn(turnId) {
+  const obsolete = _botTurnBubbles.get(turnId) || findBotBubbleByTurnId(turnId);
+  if (obsolete) {
+    const row = obsolete.closest('.msg.bot');
+    if (row) row.remove();
+    else obsolete.remove();
+  }
+  if (obsolete === botMsgEl) { botMsgEl = null; botMsgRaw = ''; }
+  _botTurnBubbles.delete(turnId);
+  _messageMetadataByTurn.delete(turnId);
+  _activityEventsByTurn.delete(turnId);
+  _activityElByTurn.delete(turnId);
+  _activityItemsByTurn.delete(turnId);
+  _skipSaveByTurn.delete(turnId);
+  _finishedTurnIds.add(turnId);
+  if (_finishedTurnIds.size > 100) _finishedTurnIds = new Set(Array.from(_finishedTurnIds).slice(-50));
+  clearPendingTerminalReply(turnId);
+  finishTurnUi(turnId);
+}
+
 function correlatedTurnIdForBackgroundReply(data) {
   if (!data) return null;
   const explicitTurnId = String(data.turn_id || '').trim();
@@ -6748,6 +6795,31 @@ function existingServerDeliveredReply(text) {
     if (String(bubble.dataset.rawText || '').trim() === backgroundText) return bubble;
   }
   return null;
+}
+
+function renderLiveTrackerNotice(data) {
+  if (!data || typeof data.live_notice_id !== 'string' || !data.live_notice_id || !data.text) return null;
+  const existing = Array.from(document.querySelectorAll('.msg.bot .bubble'))
+    .find(bubble => bubble.dataset.liveNoticeId === data.live_notice_id);
+  if (existing) return existing;
+  const bubble = _origAddMessage('bot', data.text, false, { created_at: data.created_at || '' });
+  if (bubble) bubble.dataset.liveNoticeId = data.live_notice_id;
+  return bubble;
+}
+
+async function syncLiveTrackerNotices() {
+  const currentConversation = conversationId;
+  try {
+    const history = await _fetchConversationHistory(currentConversation);
+    if (conversationId !== currentConversation) return;
+    for (const message of history.messages || []) {
+      const metadata = message.metadata || {};
+      if (message.role === 'bot' && metadata.source === 'live_tracker') {
+        renderLiveTrackerNotice({ ...message, live_notice_id: metadata.live_notice_id });
+      }
+    }
+    refreshDashboard();
+  } catch (_) { /* The next connection attempt can recover durable notices. */ }
 }
 
 function typingIndicatorHtml(label = 'Thinking') {
@@ -7750,6 +7822,44 @@ function addAssistantNotice(title, body, turnId = null, options = {}) {
   return div;
 }
 
+// Shared saved policy for Web time labels; machine ISO values stay unchanged.
+function userTimePreferences() {
+  return window.__NULLION_TIME_PRESENTATION__ || { timezone: 'UTC', time_format: '12h' };
+}
+
+function setUserTimePreferences(policy) {
+  try { new Intl.DateTimeFormat('en-US', {timeZone: policy.timezone}); }
+  catch (_) { return; }
+  window.__NULLION_TIME_PRESENTATION__ = {
+    timezone: policy.timezone, time_format: policy.time_format === '24h' ? '24h' : '12h',
+    date_format: policy.date_format || 'YYYY-MM-DD',
+  };
+  document.querySelectorAll('.bubble[data-created-at]').forEach(bubble => ensureBubbleTimestamp(bubble));
+}
+
+function formatUserDateTime(value, options = {}) {
+  const dateOnly = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+  // Legacy stored timestamp strings without offsets are UTC, as on the server.
+  const raw = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(value)
+    ? value.replace(' ', 'T') + 'Z' : value;
+  const date = raw instanceof Date ? raw : new Date(raw);
+  if (Number.isNaN(date.getTime())) return '';
+  const policy = userTimePreferences();
+  const selected = Object.keys(options).length ? options : {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+  };
+  return new Intl.DateTimeFormat('en-US', { ...selected,
+    timeZone: dateOnly ? 'UTC' : policy.timezone, hourCycle: policy.time_format === '24h' ? 'h23' : 'h12' }).format(date);
+}
+
+function formatUserDate(value, options = {}) {
+  return formatUserDateTime(value, Object.keys(options).length ? options : { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function formatUserTime(value, options = {}) {
+  return formatUserDateTime(value, { hour: 'numeric', minute: '2-digit', ...options });
+}
+
 function messageTimestampIso(value = null) {
   const date = value ? new Date(value) : new Date();
   if (Number.isNaN(date.getTime())) return new Date().toISOString();
@@ -7759,7 +7869,7 @@ function messageTimestampIso(value = null) {
 function messageTimestampLabel(value = null) {
   const date = value ? new Date(value) : new Date();
   if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return formatUserTime(date);
 }
 
 function messageTimestampFromMetadata(metadata = null) {
@@ -7779,7 +7889,7 @@ function ensureBubbleTimestamp(bubble, value = null) {
   const label = messageTimestampLabel(iso);
   timeEl.textContent = label;
   timeEl.setAttribute('datetime', iso);
-  timeEl.title = new Date(iso).toLocaleString();
+  timeEl.title = formatUserDateTime(iso);
   bubble.appendChild(timeEl);
   return timeEl;
 }
@@ -7869,6 +7979,7 @@ async function connect() {
       setStatus(true, 'Connected');
       clearWebsocketReconnect();
       loadGatewayLifecycleEvents();
+      syncLiveTrackerNotices();
     };
     socket.onmessage = (event) => {
       if (ws !== socket) return;
@@ -7907,6 +8018,10 @@ async function connect() {
         if (!stoppedTurnIds.length) finishTurnUi();
         refreshDashboard();
       } else if (data.type === 'done') {
+        if (data.superseded === true) {
+          discardSupersededTurn(data.turn_id);
+          return;
+        }
         if (data.turn_id && _finishedTurnIds.has(data.turn_id) && isVisibleAnswerBubble(findBotBubbleByTurnId(data.turn_id))) return;
         const doneTurnId = data.turn_id || '__current__';
         _messageMetadataByTurn.set(doneTurnId, {
@@ -7937,7 +8052,7 @@ async function connect() {
         clearTurnWatchdog();
         rememberApprovalActivity(data.approval_id, data.turn_id || null);
         setBotStatus('Waiting for approval...', data.turn_id || null);
-        addApprovalBubble(data.approval_id, data.tool_name || 'perform an action', data.tool_detail || '', data.web_session_allow_label, data.trigger_flow_label || '', Boolean(data.is_web_request), data.request_kind || '');
+        addApprovalBubble(data.approval_id, data.tool_name || 'perform an action', data.tool_detail || '', data.web_session_allow_label, data.trigger_flow_label || '', Boolean(data.is_web_request), data.request_kind || '', data);
         finishTurnUi(data.turn_id || null);
         refreshDashboard();
       } else if (data.type === 'background_message') {
@@ -7955,7 +8070,7 @@ async function connect() {
             if (!wasRecentlyDisplayedBotReply(data.text || '', artifacts)) addMessage('bot', data.text || '', false, { artifacts });
             if (groupTurnId) finishTurnUi(groupTurnId);
           } else {
-            const bubble = renderServerDeliveredBackgroundReply(data) || existingServerDeliveredReply(data.text || '');
+            const bubble = renderLiveTrackerNotice(data) || renderServerDeliveredBackgroundReply(data) || existingServerDeliveredReply(data.text || '');
             if (!bubble) addMessage('bot', data.text || '', false, { artifacts });
           }
           refreshDashboard();
@@ -8217,13 +8332,15 @@ async function sendHttpMessage(text, turnId = null, attachments = []) {
         conversation_id: conversationId,
         error: msg.text || msg.error || 'Chat request failed.',
       });
+    } else if (msg.superseded === true) {
+      discardSupersededTurn(turnId);
     } else if (msg.type === 'conversation_reset') {
       finalizeBotMsg(null, false, turnId);
       resetWebConversation();
     } else if (msg.type === 'approval_required') {
       rememberApprovalActivity(msg.approval_id, turnId);
       setBotStatus('Waiting for approval...', turnId);
-      addApprovalBubble(msg.approval_id, msg.tool_name, msg.tool_detail || '', msg.web_session_allow_label, msg.trigger_flow_label || '', Boolean(msg.is_web_request), msg.request_kind || '');
+      addApprovalBubble(msg.approval_id, msg.tool_name, msg.tool_detail || '', msg.web_session_allow_label, msg.trigger_flow_label || '', Boolean(msg.is_web_request), msg.request_kind || '', msg);
       refreshDashboard();
     } else {
       _messageMetadataByTurn.set(turnId || '__current__', { artifacts: msg.artifacts || [] });
@@ -8232,7 +8349,7 @@ async function sendHttpMessage(text, turnId = null, attachments = []) {
       addArtifactLinks(bubble, msg.artifacts || []);
       refreshDashboard();
     }
-    finishTurnUi();
+    finishTurnUi(turnId);
   } catch (e) {
     finalizeBotMsg(`Error: ${e.message || e}`, true, turnId);
     reportClientIssue('error', 'HTTP chat request failed in the browser.', {
@@ -8758,7 +8875,7 @@ function permissionExpiryLabel(expiresAt) {
   const date = new Date(expiresAt);
   if (Number.isNaN(date.getTime())) return 'Expiry unknown';
   if (date.getTime() <= Date.now()) return 'Expired';
-  return `Expires ${date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+  return `Expires ${formatUserDateTime(date, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
 }
 
 function approvalTargetHost(detail) {
@@ -8904,11 +9021,11 @@ function approvalActionsHtml(approvalId, toolName, detail, sessionAllowLabel = '
   </div>`;
 }
 
-function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel = 'for all workspaces', triggerFlowLabel = '', forceWeb = false, requestKind = '') {
+function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel = 'for all workspaces', triggerFlowLabel = '', forceWeb = false, requestKind = '', display = {}) {
   const messages = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'msg bot';
-  const title = approvalTitle(toolName);
+  const title = display.display_title || approvalTitle(toolName);
   const detail = approvalDetail(toolName, toolDetail, approvalId);
   const isWeb = forceWeb || approvalIsWebRequest(toolName, detail);
   div.innerHTML = `<div class="avatar logo-avatar" aria-hidden="true"></div>
@@ -8918,7 +9035,7 @@ function addApprovalBubble(approvalId, toolName, toolDetail, sessionAllowLabel =
           <span class="approval-glyph" aria-hidden="true">${approvalToolIcon(toolName)}</span>
           <div>
             <div class="approval-title" data-approval-title-original="${escAttr(title)}">${escHtml(title)}</div>
-            <div class="approval-copy">${escHtml(approvalCopyFor(toolName, detail, isWeb, requestKind))}</div>
+            <div class="approval-copy">${escHtml(display.display_copy || approvalCopyFor(toolName, detail, isWeb, requestKind))}</div>
           </div>
         </div>
         ${approvalDetailHtml(toolName, detail, isWeb, requestKind)}
@@ -9126,7 +9243,7 @@ function handleApprovalResume(data, approvalId = null) {
       setBotStatus('Waiting for the next approval...');
     }
     rememberApprovalActivity(resume.approval_id, activityTurnId);
-    addApprovalBubble(resume.approval_id, resume.tool_name || 'perform an action', resume.tool_detail || '', resume.web_session_allow_label, resume.trigger_flow_label || '', Boolean(resume.is_web_request), resume.request_kind || '');
+    addApprovalBubble(resume.approval_id, resume.tool_name || 'perform an action', resume.tool_detail || '', resume.web_session_allow_label, resume.trigger_flow_label || '', Boolean(resume.is_web_request), resume.request_kind || '', resume);
     return;
   }
   if (text) {
@@ -9756,11 +9873,14 @@ function renderMessageBlocks(html) {
   const lines = String(html || '').split('\n');
   const out = [];
   let inList = false;
+  let listTag = null;
+  let listContinuationIndent = 2;
   let quoteLines = [];
   const closeList = () => {
     if (inList) {
-      out.push('</ul>');
+      out.push(`</${listTag}>`);
       inList = false;
+      listTag = null;
     }
   };
   const flushQuote = () => {
@@ -9813,14 +9933,43 @@ function renderMessageBlocks(html) {
         continue;
       }
     }
-    const match = line.match(/^(\s*)-\s+(.+)$/);
-    if (match) {
-      const depth = Math.min(3, Math.floor(match[1].replace(/\t/g, '  ').length / 2) + 1);
+    // Render Markdown syntax, never infer a workflow from its prose. Code
+    // remains stashed until after block rendering by formatMessage().
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      closeList();
+      const level = heading[1].length;
+      out.push(`<h${level} class="message-heading">${heading[2]}</h${level}>`);
+      continue;
+    }
+    const ordered = line.match(/^(\s*)(\d+)[.)]\s+(.+)$/);
+    const match = line.match(/^(\s*)[-*•]\s+(.+)$/);
+    if (match || ordered) {
+      const row = ordered || match;
+      const tag = ordered ? 'ol' : 'ul';
+      const indent = row[1].replace(/\t/g, '  ').length;
+      const depth = Math.min(3, Math.floor(indent / 2) + 1);
+      if (inList && listTag !== tag) closeList();
       if (!inList) {
-        out.push('<ul>');
+        out.push(`<${tag}>`);
         inList = true;
+        listTag = tag;
       }
-      out.push(`<li class="message-list-depth-${depth}">${match[2]}</li>`);
+      const ordinal = ordered ? ` value="${ordered[2]}"` : '';
+      out.push(`<li class="message-list-depth-${depth}"${ordinal}>${ordered ? ordered[3] : match[2]}</li>`);
+      listContinuationIndent = indent + (ordered ? ordered[2].length + 2 : 2);
+      continue;
+    }
+    const indentation = line.match(/^\s*/)[0].replace(/\t/g, '  ').length;
+    if (inList && line.trim() && indentation >= listContinuationIndent) {
+      out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, `<br>${line.trimStart()}</li>`);
+      continue;
+    }
+    const following = lines[i + 1] || '';
+    const followingIndent = following.match(/^\s*/)[0].replace(/\t/g, '  ').length;
+    if (inList && !line.trim() && following.trim() && followingIndent >= listContinuationIndent
+        && !following.trimStart().startsWith('- ')) {
+      out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, '<br></li>');
       continue;
     }
     closeList();
@@ -10008,7 +10157,7 @@ function dashboardTimeLabel(raw) {
   if (!raw) return '';
   const date = new Date(raw);
   if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return formatUserDateTime(date, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
 function decisionTime(a) {
@@ -10563,7 +10712,7 @@ function doctorSuggestionText(item) {
     return 'No action needed. Doctor cleared the stale task frame after confirming its approval was no longer pending.';
   }
   if (doctorCanTryFix(item)) {
-    return 'Safe fix available: restart the Telegram service and mark this item resolved if the restart succeeds.';
+    return 'Restart the Telegram service, then check its health before marking this alert resolved.';
   }
   if (code === 'investigate_timeout' || reason.includes('timeout')) {
     return 'Ask Doctor to inspect recent run activity and logs, then choose whether to retry the workflow, resume it, or retire it.';
@@ -10602,7 +10751,7 @@ function doctorTimestampText(item) {
     if (!raw) return '';
     const date = new Date(raw);
     if (Number.isNaN(date.getTime())) return '';
-    return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    return formatUserDateTime(date, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   };
   const created = format(createdRaw);
   const updated = format(updatedRaw);
@@ -10613,14 +10762,7 @@ function doctorTimestampText(item) {
 }
 
 function doctorCanTryFix(item) {
-  const text = [
-    item.recommendation_code,
-    item.summary,
-    item.reason,
-    item.source_reason,
-    item.error,
-  ].map(value => String(value || '').toLowerCase()).join(' ');
-  return text.includes('telegram') && (text.includes('typing_indicator') || text.includes('typing indicator') || text.includes('telegram_bot'));
+  return item.can_try_fix === true;
 }
 
 function doctorRemediationActions(item) {
@@ -10687,18 +10829,16 @@ async function updateDoctorItem(kind, id, action) {
   if (cardHasPendingAction(kind, id)) return;
   pendingCardActions.add(actionKey);
   try {
-    doctorActionFeedback.set(stateKey, action === 'repair' ? 'Applying safe fix...' : 'Updating...');
+    doctorActionFeedback.set(stateKey, action === 'repair' ? 'Requesting repair...' : 'Updating alert...');
     renderDoctor(_lastDashboardData || {});
     if (attentionModalIsOpen()) renderAttentionModal(_lastDashboardData || {});
     const r = await fetch(`/api/${kind}/${id}/${encodeURIComponent(action)}`, { method: 'POST' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) throw new Error(data.error || `${action} failed`);
-    const message = data.message || (action === 'repair'
-      ? 'Safe fix applied successfully.'
-      : `${action.replaceAll('_', ' ')} completed.`);
+    const message = data.message || 'Alert status updated. Repair status was not provided.';
     doctorActionFeedback.set(stateKey, message);
     if (kind === 'doctor') {
-      addAssistantNotice(action === 'repair' ? 'Safe fix applied' : 'Doctor action result', `${label}: ${message}`);
+      addAssistantNotice(data.notice_title || 'Doctor update', `${label}: ${message}`);
     }
     recordActivity('Doctor action updated', `${label}: ${message}`);
     await refreshDashboard();
@@ -10727,7 +10867,7 @@ function doctorItemHtml(item) {
   ).join('');
   const actions = isEscalation
     ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Mark reviewed', 'Mark this Sentinel item as reviewed.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Mark resolved', 'Close this Sentinel item after it has been handled.', 'mini-btn good')}`)
-    : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
+    : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Request restart', 'Request a service restart, then check whether the issue recovered.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
   return `<div class="control-card">
     <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
     <div class="doctor-body">
@@ -10770,7 +10910,7 @@ function renderDoctor(data) {
     ).join('');
     const actions = isEscalation
       ? (status === 'resolved' ? '' : `${status === 'escalated' ? doctorActionButtonHtml('sentinel', id, 'acknowledge', 'Mark reviewed', 'Mark this Sentinel item as reviewed.') : ''}${doctorActionButtonHtml('sentinel', id, 'resolve', 'Mark resolved', 'Close this Sentinel item after it has been handled.', 'mini-btn good')}`)
-      : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Apply safe fix', 'Ask Doctor to try the known safe repair for this issue.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
+      : (['completed','cancelled','failed'].includes(status) ? '' : `${remediationHtml}<button class="mini-btn good" title="Open a Diagnose chat with this Doctor item and suggested next steps." onclick="askDoctorAboutItem('${escHtml(id)}')">Ask Doctor</button>${!remediationHtml && doctorCanTryFix(item) ? doctorActionButtonHtml('doctor', id, 'repair', 'Request restart', 'Request a service restart, then check whether the issue recovered.', 'mini-btn good') : ''}${doctorActionButtonHtml('doctor', id, 'complete', 'Mark resolved', 'Close this Doctor item because the issue is no longer happening.')}${doctorActionButtonHtml('doctor', id, 'dismiss', 'Dismiss', 'Close this Doctor item without marking it resolved.')}`);
     return `<div class="control-card">
       <div class="control-top"><span class="control-icon">${NI.pulse()}</span><span class="control-title">${escHtml(doctorTitleText(item))}</span><span class="decision-status ${escHtml(status)}">${escHtml(statusText)}</span></div>
       <div class="doctor-body">
@@ -10872,6 +11012,7 @@ async function refreshDashboard() {
     _lastDashboardData = data;
     renderMission(data);
     renderApprovals(data.approvals || []);
+    renderLiveTrackers(data.live_trackers || []);
     reconcileApprovalBubbles(data.approvals || []);
     renderPermissions(data);
     renderDecisionHistory(data.approvals || []);
@@ -14054,6 +14195,7 @@ async function loadPreferences() {
       try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; }
       catch (_) { return ''; }
     })();
+    setUserTimePreferences(p);
     const persona = p.persona || '';
     document.getElementById('pref-persona').value = persona;
     document.getElementById('pref-persona-count').textContent = persona.length;
@@ -14108,6 +14250,7 @@ async function savePreferences() {
   }
   const d = await r.json().catch(() => ({}));
   if (!r.ok || !d.ok) throw new Error(d.error || `Preferences save failed (${r.status})`);
+  setUserTimePreferences(payload);
 }
 
 let usersRegistry = { multi_user_enabled: false, users: [] };
@@ -16104,7 +16247,7 @@ finalizeBotMsg = function(fallback = null, isError = false, turnId = null) {
     const artifacts = metadata && Array.isArray(metadata.artifacts) ? metadata.artifacts : [];
     if (cleanText && cleanText !== '(no reply)') rememberDisplayedBotReply(text, artifacts);
     if (cleanText && cleanText !== '(no reply)') clearPendingTerminalReply(turnId || null);
-    if (cleanText && cleanText !== '(no reply)' && !skipSave) _chatSaveMsg('bot', text, isError, metadata);
+    if (cleanText && cleanText !== '(no reply)' && !skipSave) _chatSaveMsg('bot', text, isError, { ...(metadata || {}), ...(turnId ? { runtime_turn_id: turnId } : {}) });
     _messageMetadataByTurn.delete(metadataKey);
     _activityEventsByTurn.delete(metadataKey);
   }
@@ -16139,6 +16282,7 @@ function cleanRestoredBotText(text) {
 function renderRestoredMessages(messages) {
   const container = document.getElementById('messages');
   container.innerHTML = '';
+  _botTurnBubbles = new Map();
   _chatSaveEnabled = false;
   for (const m of messages || []) {
     const role = m.role === 'user' ? 'user' : 'bot';
@@ -16148,9 +16292,19 @@ function renderRestoredMessages(messages) {
       : { artifacts: m.artifacts || [], activity: (m.metadata && Array.isArray(m.metadata.activity)) ? m.metadata.activity : [], created_at: m.created_at || '' };
     if (text) {
       const bubble = _origAddMessage(role, text, !!m.is_error, metadata);
+      const savedTurnId = m.metadata && m.metadata.runtime_turn_id;
+      if (role === 'bot' && typeof savedTurnId === 'string' && savedTurnId) {
+        bubble.dataset.turnId = savedTurnId;
+        _botTurnBubbles.set(savedTurnId, bubble);
+        _finishedTurnIds.add(savedTurnId);
+      }
+      if (role === 'bot' && m.metadata && typeof m.metadata.live_notice_id === 'string') {
+        bubble.dataset.liveNoticeId = m.metadata.live_notice_id;
+      }
       if (role === 'bot') restoreRunActivityEvents(bubble, metadata.activity);
     }
   }
+  if (_finishedTurnIds.size > 100) _finishedTurnIds = new Set(Array.from(_finishedTurnIds).slice(-50));
   container.scrollTop = container.scrollHeight;
 }
 
@@ -16298,7 +16452,7 @@ function renderHistoryModal(convs) {
     const title = c.title || '(untitled)';
     const msgCount = c.message_count ?? '?';
     const date = c.last_message_at || c.created_at || '';
-    const dateStr = date ? new Date(date).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : '';
+    const dateStr = date ? formatUserDate(date, { month: 'short', day: 'numeric', year: 'numeric' }) : '';
     return `<div class="hist-row">
       <div class="hist-info" style="flex:1;min-width:0;cursor:pointer" onclick="viewArchivedConv('${escAttr(c.id)}', '${escAttr(title)}')">
         <div class="hist-title">${escHtml(title)}</div>
@@ -16321,27 +16475,14 @@ async function viewArchivedConv(convId, title) {
     const msgs = data.messages || [];
     closeHistory();
 
-    _chatSaveEnabled = false;
-    document.getElementById('messages').innerHTML = '';
+    renderRestoredMessages(msgs);
     const container = document.getElementById('messages');
 
     // Header banner
     const banner = document.createElement('div');
     banner.className = 'history-restored-sep';
     banner.innerHTML = `${NI.folder()} Viewing archived: <strong>${escHtml(title)}</strong> — <a href="#" onclick="clearAndStartFresh();return false" style="color:var(--accent2)">back to current session</a>`;
-    container.appendChild(banner);
-
-    for (const m of msgs) {
-      const role = m.role === 'user' ? 'user' : 'bot';
-      const text = role === 'bot' ? cleanRestoredBotText(m.text) : String(m.text || '');
-      const metadata = role === 'user'
-        ? { attachments: m.attachments || [], created_at: m.created_at || '' }
-        : { artifacts: m.artifacts || [], activity: (m.metadata && Array.isArray(m.metadata.activity)) ? m.metadata.activity : [], created_at: m.created_at || '' };
-      if (text) {
-        const bubble = _origAddMessage(role, text, !!m.is_error, metadata);
-        if (role === 'bot') restoreRunActivityEvents(bubble, metadata.activity);
-      }
-    }
+    container.prepend(banner);
     container.scrollTop = container.scrollHeight;
     document.getElementById('send-btn').disabled = true;
   } catch (e) {
@@ -16496,14 +16637,18 @@ const _MONTH_NAMES = ['January','February','March','April','May','June',
 function _localDateKey(date) {
   const d = date instanceof Date ? date : new Date(date);
   if (Number.isNaN(d.getTime())) return '';
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const parts = new Intl.DateTimeFormat('en-US', {timeZone: userTimePreferences().timezone,
+    year: 'numeric', month: '2-digit', day: '2-digit'}).formatToParts(d);
+  const fields = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${fields.year}-${fields.month}-${fields.day}`;
 }
 
 function openAllHistory() {
   document.getElementById('allhist-overlay').style.display = 'flex';
   const now = new Date();
-  _ahCalYear  = now.getFullYear();
-  _ahCalMonth = now.getMonth();
+  const localDate = _localDateKey(now).split('-').map(Number);
+  _ahCalYear  = localDate[0];
+  _ahCalMonth = localDate[1] - 1;
   _loadAhChannels();
 }
 
@@ -16529,7 +16674,7 @@ async function _loadAhChannels() {
       el.dataset.channel = ch.channel;
       el.dataset.historyChannel = ch.channel;
       const lastDate = ch.last_message_at
-        ? new Date(ch.last_message_at).toLocaleDateString(undefined, {month:'short', day:'numeric'})
+        ? formatUserDate(ch.last_message_at, {month:'short', day:'numeric'})
         : '';
       const icon = ch.channel === 'web' ? '\uD83C\uDF10'
                  : ch.channel.startsWith('telegram:') ? '\u2708\uFE0F'
@@ -16645,7 +16790,7 @@ async function _selectAhDate(dateStr) {
       row.dataset.convId = c.id;
       row.dataset.historyConversationId = c.id;
       const time = c.last_message_at
-        ? new Date(c.last_message_at).toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'})
+        ? formatUserTime(c.last_message_at)
         : '';
       row.innerHTML =
         '<div class="ahconv-title">' + escHtml(c.title || '(untitled)') + '</div>' +
@@ -16771,7 +16916,7 @@ function cronHealthLabel(status) {
 function cronCheckTime(value) {
   if (!value) return 'Not yet';
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? 'Not yet' : date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? 'Not yet' : formatUserDateTime(date);
 }
 
 function cronHealthDetails(job) {
@@ -16815,6 +16960,8 @@ async function saveCronDoctorSettings(id) {
 
 async function saveCronParallelLimit() {
   const input = document.getElementById('cron-parallel-limit');
+  if (input.disabled) return;
+  ++_cronLoadGeneration;
   const message = document.getElementById('cron-parallel-message');
   if (!input.reportValidity()) return;
   try {
@@ -16826,12 +16973,81 @@ async function saveCronParallelLimit() {
   } catch(error) { message.textContent = error.message || 'Could not save parallel limit.'; }
 }
 
+function renderLiveTrackers(jobs) {
+  const count = document.getElementById('live-tracker-count');
+  if (count) count.textContent = jobs.filter(j => j.state === 'active' || j.state === 'blocked').length;
+  const stateLabels = {active:'Watching',blocked:'Paused — source needs attention',matched:'Match found',expired:'Finished — deadline reached',stopped:'Stopped'};
+  const rows = jobs.map(j => `<div class="cron-row" data-live-tracker-id="${escAttr(j.id)}">
+    <div class="cron-info"><div class="cron-name">${escHtml(j.name)}</div>
+    <div class="cron-meta">${escHtml(j.state === 'active' && j.last_problem ? 'Retrying — check needs attention' : stateLabels[j.state] || j.state)} · Every ${Number(j.interval_seconds)} seconds</div>
+    <div class="cron-meta">Ends ${escHtml(formatUserDateTime(j.expires_at))}</div>
+    <div class="cron-meta">${j.last_checked_at ? 'Last check '+escHtml(formatUserTime(j.last_checked_at)) : 'Waiting for first check'} · ${Number(j.checks)} checks</div>
+    ${j.last_outcome === 'no_match' && j.state === 'active' ? '<div class="cron-meta">No match yet</div>' : ''}
+    ${j.last_problem ? `<div class="cron-meta">${escHtml(j.last_problem.message)}</div>` : ''}
+    ${j.last_problem && j.state === 'blocked' ? `<div class="cron-meta">How to fix it: ${escHtml(j.last_problem.remedy)}</div>` : ''}
+    ${j.state === 'active' && j.last_problem ? `<div class="cron-meta">Next retry ${escHtml(formatUserDateTime(j.next_check_at))}</div>` : ''}
+    ${j.notification_status === 'retrying' ? '<div class="cron-meta">Alert delivery is retrying</div>' : ''}
+    ${j.notification_status === 'undelivered' ? '<div class="cron-meta">Alert could not be delivered before it became stale</div>' : ''}</div>
+    ${['blocked','stopped'].includes(j.state) && new Date(j.expires_at) > new Date() ? `<button class="btn-sm" onclick="liveTrackerAction('${escAttr(j.id)}','resume')">Resume</button>` : ''}
+    ${['active','blocked'].includes(j.state) ? `<button class="btn-sm btn-ghost" onclick="liveTrackerAction('${escAttr(j.id)}','stop')">Stop</button>` : ''}
+  </div>`).join('') || '<div class="empty">No live trackers</div>';
+  const panel = document.getElementById('live-trackers-list');
+  if (panel) panel.innerHTML = rows;
+  const dash = document.getElementById('live-trackers-dash');
+  if (dash) dash.innerHTML = rows;
+}
+
+async function liveTrackerAction(id, action) {
+  try {
+    const response = await fetch('/api/live-trackers/'+encodeURIComponent(id)+'/'+action, {method:'POST'});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not update live tracker');
+    await loadLiveTrackers();
+  } catch(error) { alert(error.message); }
+}
+
+let _liveTrackerLoadGeneration = 0;
+let _cronLoadGeneration = 0;
+
+async function loadLiveTrackers() {
+  const generation = ++_liveTrackerLoadGeneration;
+  const response = await fetch('/api/live-trackers');
+  if (!response.ok) return;
+  const result = await response.json();
+  if (generation !== _liveTrackerLoadGeneration) return;
+  renderLiveTrackers(result.trackers || []);
+  const maximum = document.getElementById('live-parallel-limit');
+  if (maximum) {
+    if (document.activeElement !== maximum) maximum.value = result.max_parallel_jobs;
+    maximum.disabled = false;
+  }
+}
+
+async function saveLiveParallelLimit() {
+  const field = document.getElementById('live-parallel-limit');
+  const message = document.getElementById('live-parallel-message');
+  if (field.disabled || !field.reportValidity()) return;
+  ++_liveTrackerLoadGeneration;
+  try {
+    const response = await fetch('/api/live-trackers/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_parallel_jobs:Number(field.value)})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not save live tracking limit');
+    message.textContent='Saved';
+  } catch(error) { message.textContent=error.message; }
+}
+
 async function loadCronsTab() {
+  const generation = ++_cronLoadGeneration;
+  loadLiveTrackers().catch(() => {});
   try {
     const [jobs,capacity] = await Promise.all([
       fetch('/api/crons').then(r => r.json()),fetch('/api/cron-scheduler').then(r => r.json())]);
+    if (generation !== _cronLoadGeneration) return;
     const limit = document.getElementById('cron-parallel-limit');
-    if (limit) { limit.value = capacity.max_parallel_jobs; limit.disabled = false; }
+    if (limit) {
+      if (document.activeElement !== limit) limit.value = capacity.max_parallel_jobs;
+      limit.disabled = false;
+    }
     const capacityState = document.getElementById('cron-capacity-state');
     if (capacityState) capacityState.textContent = `${capacity.running_jobs} running · limit ${capacity.max_parallel_jobs}`;
     _cronsCache = jobs;
@@ -16887,7 +17103,7 @@ function renderCronsTab(jobs) {
           ${escHtml(cronScheduleLabel(j))}
           &nbsp;·&nbsp; ${escHtml(j.workspace_id || 'workspace_admin')}
           &nbsp;·&nbsp; ${j.enabled ? 'next ' + escHtml(cronNextRunLabel(j)) : 'disabled'}
-          ${j.last_run ? '&nbsp;·&nbsp; last ' + new Date(j.last_run).toLocaleString() : ''}
+          ${j.last_run ? '&nbsp;·&nbsp; last ' + formatUserDateTime(j.last_run) : ''}
           ${!j.tracker_status && j.last_result && j.last_result !== 'ok' ? `${NI.warn()} ${escHtml(j.last_result)}` : ''}
         </div>
         ${j.scheduler_status === 'waiting_for_capacity' ? '<div class="cron-meta">Waiting for a worker</div>' : j.scheduler_status === 'running' ? '<div class="cron-meta">Running now</div>' : ''}
@@ -19437,7 +19653,11 @@ def _custom_api_connection_test_details(body: dict[str, Any]) -> dict[str, objec
             status_code = getattr(response, "status", 200)
             response.read(1_000_000)
     except urllib.error.HTTPError as exc:
-        detail = exc.read(2000).decode("utf-8", "ignore").strip()
+        from nullion.http_transport import close_http_error_response
+        try:
+            detail = exc.read(2000).decode("utf-8", "ignore").strip()
+        finally:
+            close_http_error_response(exc)
         raise RuntimeError(f"Custom API bridge returned HTTP {exc.code}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach custom API bridge: {exc.reason}") from exc
@@ -19823,6 +20043,9 @@ def _web_merge_required_attachment_extensions(
     required_attachment_extensions: list[str] | tuple[str, ...] | None,
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
 ) -> tuple[str, ...]:
+    from nullion.source_selection import current_read_only_local_scope
+    if current_read_only_local_scope(tool_results):
+        return ()
     extensions: list[str] = []
     for raw_extension in required_attachment_extensions or ():
         extension = str(raw_extension or "").strip().lower()
@@ -20072,49 +20295,17 @@ def _store_web_agent_turn_limit_extension_approval(
     if store is None:
         return None
     try:
-        from nullion.approvals import create_approval_request
-
-        approval = create_approval_request(
-            requested_by=conversation_id,
-            action=AGENT_TURN_LIMIT_EXTENSION_ACTION,
-            resource=conversation_id,
-            request_kind=AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND,
-            context=build_agent_turn_limit_extension_context(
-                current_max_iterations=current_max_iterations,
-                tool_result_count=len(tool_results),
-                conversation_id=conversation_id,
-                requested_extensions=required_attachment_extensions,
-            ),
-        )
-        store.add_approval_request(approval)
-        resume_token = build_agent_turn_limit_resume_token(current_max_iterations=current_max_iterations)
+        from nullion.agent_turn_limits import store_budget_approval
         head = store.get_conversation_head(conversation_id)
-        if head and head.get("active_turn_id"):
-            resume_token["conversation_turn_id"] = head["active_turn_id"]
-        store.add_suspended_turn(
-            SuspendedTurn(
-                approval_id=approval.approval_id,
-                conversation_id=conversation_id,
-                chat_id=None,
-                message=f"/chat {user_text}",
-                request_id=request_id,
-                message_id=request_id,
-                created_at=datetime.now(UTC),
-                mission_id=None,
-                pending_step_idx=None,
-                messages_snapshot=messages_snapshot
-                or [{"role": "user", "content": [{"type": "text", "text": user_text}]}],
-                pending_tool_calls=[],
-                resume_token=resume_token,
-            )
-        )
-        try:
-            runtime.checkpoint()
-        except Exception:
-            logger.debug("Unable to checkpoint web agent turn limit approval", exc_info=True)
-        return approval.approval_id
+        resume_state = ({'conversation_turn_id': head['active_turn_id']}
+                        if head and head.get('active_turn_id') else {})
+        return store_budget_approval(runtime, conversation_id=conversation_id,
+            message=f'/chat {user_text}', request_id=request_id, message_id=request_id,
+            messages_snapshot=messages_snapshot, current_max_iterations=current_max_iterations,
+            tool_result_count=len(tool_results), requested_extensions=required_attachment_extensions,
+            resume_state=resume_state)
     except Exception:
-        logger.debug("Unable to store web agent turn limit approval", exc_info=True)
+        logger.debug('Unable to store web agent turn limit approval', exc_info=True)
         return None
 
 
@@ -20509,6 +20700,7 @@ def _web_local_discovery_reply_for_tool_results(
     tool_results: list[ToolResult] | tuple[ToolResult, ...] | None,
     *,
     required_extensions: Iterable[str] | None = None,
+    reply: str | None = None,
 ) -> str | None:
     if _web_required_local_discovery_paths(
         tool_results,
@@ -20530,6 +20722,11 @@ def _web_local_discovery_reply_for_tool_results(
         return None
     paths = _web_local_discovery_paths_from_tool_results(tool_results)
     if not paths:
+        return None
+    from nullion.chat_operator import _composed_local_discovery_reply_paths
+    from nullion.response_sanitizer import is_raw_tool_payload_reply
+    if _composed_local_discovery_reply_paths(str(reply or ""), paths, tool_results) and not is_raw_tool_payload_reply(
+            reply=str(reply or ""), tool_results=tool_results):
         return None
     return _web_local_discovery_results_reply(paths)
 
@@ -20817,14 +21014,9 @@ def _report_web_client_issue(runtime, *, issue_type: str, message: str, details:
 
 
 def _doctor_action_can_try_fix(action: dict[str, Any]) -> bool:
-    text = " ".join(
-        str(action.get(key) or "").lower()
-        for key in ("recommendation_code", "summary", "reason", "source_reason", "error")
-    )
-    return "telegram" in text and (
-        "typing_indicator" in text
-        or "typing indicator" in text
-        or "telegram_bot" in text
+    return any(
+        command in {"doctor:restart_bot", "doctor:reconnect_telegram"}
+        for _label, command in remediation_buttons_for_recommendation_code(action.get("recommendation_code"))
     )
 
 
@@ -20835,7 +21027,7 @@ def _try_doctor_fix(action: dict[str, Any]) -> str:
     return _restart_chat_services()
 
 
-def _run_doctor_remediation_command(runtime: PersistentRuntime, action_id: str, command: str) -> tuple[dict[str, str | None], str]:
+def _run_doctor_remediation_command(runtime: PersistentRuntime, action_id: str, command: str) -> DoctorPlaybookResult:
     result = execute_doctor_playbook_command(
         runtime,
         action_id=action_id,
@@ -20843,7 +21035,7 @@ def _run_doctor_remediation_command(runtime: PersistentRuntime, action_id: str, 
         source_label="web UI",
         restart_chat_services=_restart_chat_services,
     )
-    return result.action, result.message
+    return result
 
 
 def _chat_service_enabled_from_env(name: str) -> bool:
@@ -21134,6 +21326,8 @@ def create_app(runtime, orchestrator, registry):
     globals()["WebSocket"] = WebSocket
 
     app = FastAPI(title="Nulliøn Web UI")
+    from nullion.turn_dispatch_graph import AsyncTurnDispatchTracker
+    web_turn_tracker = AsyncTurnDispatchTracker()
     try:
         if registry is not None:
             runtime.active_tool_registry = registry
@@ -21273,10 +21467,18 @@ def create_app(runtime, orchestrator, registry):
         provider: str | None = None,
         model_name: str | None = None,
         reload_browser: bool = False,
+        reload_media: bool = False,
     ) -> dict[str, str]:
         errors: dict[str, str] = {}
         _clear_web_stable_context_cache(reason=reason)
         _refresh_live_app_settings()
+        if reload_media:
+            try:
+                from nullion.runtime_config import refresh_media_tool_registry
+                refresh_media_tool_registry(registry, app_settings)
+            except Exception as exc:
+                errors["media_reload_error"] = _short_error_text(exc)
+                logger.warning("Live media tool refresh failed after %s: %s", reason, exc)
         if reload_browser:
             try:
                 _refresh_live_browser_tools()
@@ -21364,36 +21566,39 @@ def create_app(runtime, orchestrator, registry):
         activity_callback=None,
         text_delta_callback=None,
         turn_dispatch_decision: object | None = None,
+        cancellation_checker=None,
     ):
         from nullion.platform_chat import PlatformChatRequest, run_platform_chat_request
 
         payload = request_payload or {}
-        return run_platform_chat_request(
-            runtime,
-            PlatformChatRequest(
-                platform="web",
-                conversation_id=conversation_id,
-                text=user_text,
-                turn_id=str(payload.get("turn_id") or "") or None,
-                attachments=attachments if isinstance(attachments, list) else None,
-                settings=app_settings,
-                request_id=str(payload.get("request_id") or "") or None,
-                message_id=str(payload.get("message_id") or "") or None,
-                model_client=getattr(orchestrator, "model_client", None),
-                agent_orchestrator=orchestrator,
-                service=None,
-                activity_callback=activity_callback,
-                text_delta_callback=text_delta_callback,
-                allow_mini_agents=allow_mini_agents,
-                turn_dispatch_decision=turn_dispatch_decision,
-                conversation_ingress_id=str(
-                    payload.get("turn_id")
-                    or payload.get("request_id")
-                    or payload.get("message_id")
-                    or ""
-                ) or None,
-            ),
-        )
+        with _runtime_turn_guard():
+            return run_platform_chat_request(
+                runtime,
+                PlatformChatRequest(
+                    platform="web",
+                    conversation_id=conversation_id,
+                    text=user_text,
+                    turn_id=str(payload.get("turn_id") or "") or None,
+                    attachments=attachments if isinstance(attachments, list) else None,
+                    settings=app_settings,
+                    request_id=str(payload.get("request_id") or "") or None,
+                    message_id=str(payload.get("message_id") or "") or None,
+                    model_client=getattr(orchestrator, "model_client", None),
+                    agent_orchestrator=orchestrator,
+                    service=None,
+                    activity_callback=activity_callback,
+                    text_delta_callback=text_delta_callback,
+                    allow_mini_agents=allow_mini_agents,
+                    turn_dispatch_decision=turn_dispatch_decision,
+                    cancellation_checker=cancellation_checker,
+                    conversation_ingress_id=str(
+                        payload.get("turn_id")
+                        or payload.get("request_id")
+                        or payload.get("message_id")
+                        or ""
+                    ) or None,
+                ),
+            )
 
     def _shared_web_platform_chat_artifacts(
         result: object,
@@ -21413,6 +21618,15 @@ def create_app(runtime, orchestrator, registry):
             if str(path or "").strip()
         ]
         tool_results = list(getattr(result, "tool_results", ()) or ())
+        from nullion.artifact_lifecycle import delivery_manifest
+        terminal_manifest = delivery_manifest(tool_results)
+        if terminal_manifest is not None:
+            # The shared runtime already selected and reviewed these exact
+            # versions. A second format/materialization pass can resurrect a
+            # packaged source or rejected draft and also adds a model call.
+            return _web_artifact_descriptors(
+                runtime, list(terminal_manifest), principal_id=conversation_id,
+            )
         # The shared turn has already selected its output. Only ask a model
         # to disambiguate format when that output contains artifact evidence.
         # Plain replies must not pay for another provider call during delivery.
@@ -21521,7 +21735,13 @@ def create_app(runtime, orchestrator, registry):
             conversation_id=conversation_id,
             user_text=user_text,
         )
-        if artifacts:
+        from nullion.artifact_lifecycle import delivery_manifest
+        terminal_manifest = delivery_manifest(getattr(result, "tool_results", ()) or ())
+        # Selection already owns this package. Re-inferring a format from the
+        # request here can discard independently requested siblings after a
+        # linked member was packaged. The descriptor boundary still validates
+        # actual paths and bytes; preserve its exact manifest selection.
+        if artifacts and terminal_manifest is None:
             candidate_paths = [
                 str(artifact.get("path") or "")
                 for artifact in artifacts
@@ -21561,6 +21781,13 @@ def create_app(runtime, orchestrator, registry):
             if isinstance(artifact, dict) and str(artifact.get("path") or "").strip()
         ]
         reply_text = str(getattr(result, "text", "") or "")
+        expected_paths = (tuple(terminal_manifest) if terminal_manifest is not None
+                          else tuple(getattr(result, "artifact_paths", None) or ()))
+        if expected_paths and not artifacts:
+            reply_text = (
+                "The file was created, but I could not attach it to this chat. "
+                "No download is available yet."
+            )
         if artifacts:
             artifact_text_candidate_paths = list(
                 dict.fromkeys(
@@ -21619,7 +21846,6 @@ def create_app(runtime, orchestrator, registry):
         if path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
             return None
         try:
-            import sqlite3
 
             tables = (
                 "approvals",
@@ -21637,7 +21863,7 @@ def create_app(runtime, orchestrator, registry):
                 "tasks_missions",
             )
             rows: list[tuple[str, int, str]] = []
-            with sqlite3.connect(str(path), timeout=1) as conn:
+            with sqlite_connection(str(path), timeout=1) as conn:
                 existing = {
                     str(row[0])
                     for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -21992,9 +22218,13 @@ def create_app(runtime, orchestrator, registry):
                 "conversation_id": conv_id,
             }
             payload.update(extra)
-            runtime.store.add_event(make_event(event_type, "cron_scheduler", payload))
-            runtime.store.add_audit_record(make_audit_record(event_type, "cron_scheduler", payload))
-            runtime.checkpoint()
+            from nullion.cron_delivery import checkpoint_cron_delivery_records
+            store = runtime.store
+            event = make_event(event_type, "cron_scheduler", payload)
+            audit = make_audit_record(event_type, "cron_scheduler", payload)
+            store.add_event(event)
+            store.add_audit_record(audit)
+            checkpoint_cron_delivery_records(runtime, store=store, events=(event,), audit_records=(audit,))
         except Exception:
             logger.debug("Could not record cron delivery event", exc_info=True)
 
@@ -22049,6 +22279,8 @@ def create_app(runtime, orchestrator, registry):
                     **({"message_only": True} if message_only else {}),
                 )
             )
+        except UnconfirmedDelivery:
+            raise
         except Exception:
             logger.warning("Cron Telegram delivery failed [%s]", getattr(job, "id", ""), exc_info=True)
             return False
@@ -22061,17 +22293,18 @@ def create_app(runtime, orchestrator, registry):
         delivered_text: str,
     ) -> None:
         try:
-            record_cron_delivery_chat_turn(
-                runtime.store,
+            store = runtime.store
+            event = record_cron_delivery_chat_turn(
+                store,
                 job,
                 conversation_id=conversation_id,
                 delivery_channel=delivery_channel,
                 delivery_target=delivery_target,
                 delivered_text=delivered_text,
             )
-            # The scheduler saves its job state after this callback. Persist the
-            # terminal chat event first so a later store refresh cannot lose it.
-            runtime.checkpoint(force=True)
+            from nullion.cron_delivery import checkpoint_cron_delivery_records
+            if event is not None:
+                checkpoint_cron_delivery_records(runtime, store=store, conversation_events=(event,))
         except Exception:
             logger.debug("Could not persist scheduled-task delivery context turn", exc_info=True)
 
@@ -22121,6 +22354,8 @@ def create_app(runtime, orchestrator, registry):
                     principal_id=f"discord:{target}",
                     **({"message_only": True} if message_only else {}),
                 ))
+        except UnconfirmedDelivery:
+            raise
         except Exception:
             logger.warning("Cron %s delivery failed [%s]", channel, getattr(job, "id", ""), exc_info=True)
         return False
@@ -22193,6 +22428,8 @@ def create_app(runtime, orchestrator, registry):
         *,
         label: str,
         cancellation_checker=None,
+        budget_resume=None,
+        delivery_conversation_id=None,
     ) -> dict[str, object]:
         from nullion.cron_delivery import run_single_agent_cron_turn
 
@@ -22212,6 +22449,8 @@ def create_app(runtime, orchestrator, registry):
             record_event=_record_cron_delivery_event,
             turn_guard=_runtime_turn_guard,
             cancellation_checker=cancellation_checker,
+            budget_resume=budget_resume,
+            delivery_conversation_id=delivery_conversation_id,
         )
 
     def _notify_cron_approval_required(cron_job, channel: str, target: str, result: dict[str, object]) -> None:
@@ -22237,6 +22476,9 @@ def create_app(runtime, orchestrator, registry):
         label: str,
         manual_delivery_channel: str | None = None,
         manual_delivery_target: str | None = None,
+        budget_resume=None,
+        execution_callback=None,
+        cancellation_checker=None,
     ) -> dict:
         def _effective_channel_for_run(cron_job) -> str:
             if manual_delivery_channel:
@@ -22248,17 +22490,16 @@ def create_app(runtime, orchestrator, registry):
                 return manual_delivery_target
             return _cron_delivery_target(cron_job, channel)
 
-        return run_cron_delivery_workflow(
-            job,
-            label=label,
-            callbacks=CronRunDeliveryCallbacks(
+        callbacks = CronRunDeliveryCallbacks(
                 effective_channel=_effective_channel_for_run,
                 delivery_target=_delivery_target_for_run,
-                run_agent_turn=lambda cron_job, conv_id, cancellation_checker=None: _run_single_agent_cron_for_delivery(
+                run_agent_turn=lambda cron_job, conv_id, cancellation_checker=None, delivery_conversation_id=None: _run_single_agent_cron_for_delivery(
                     cron_job,
                     conv_id,
                     label=label,
                     cancellation_checker=cancellation_checker,
+                    budget_resume=budget_resume,
+                    delivery_conversation_id=delivery_conversation_id,
                 ),
                 record_event=_record_cron_delivery_event,
                 block_reason=cron_delivery_block_reason,
@@ -22283,8 +22524,22 @@ def create_app(runtime, orchestrator, registry):
                 notify_approval_required=_notify_cron_approval_required,
                 record_chat_turn=_record_cron_delivery_chat_turn,
                 health_store_path=tracker_health_path,
-            ),
-        )
+            )
+        if budget_resume is not None:
+            from nullion.scheduled_budget import run_scheduled_continuation
+            return run_scheduled_continuation(job, budget_resume, callbacks=callbacks,
+                execution_callback=execution_callback, cancellation_checker=cancellation_checker)
+        return run_cron_delivery_workflow(job, label=label, callbacks=callbacks,
+            **({'cancellation_checker': cancellation_checker} if cancellation_checker else {}))
+
+    def _resume_scheduled_budget(job, continuation, execution_callback=None, cancellation_checker=None):
+        channel, _, target = continuation.checkpoint['conversation_id'].partition(':')
+        return _run_cron_agent_turn(job, label='Scheduled task', budget_resume=continuation,
+            execution_callback=execution_callback, cancellation_checker=cancellation_checker,
+            manual_delivery_channel=channel,
+            manual_delivery_target=continuation.checkpoint['conversation_id'] if channel == 'web' else target)
+
+    runtime.scheduled_budget_runner = _resume_scheduled_budget
 
     def _cron_fire(job):
         """Fire a cron by sending its task string through a synthetic agent turn."""
@@ -22525,6 +22780,186 @@ def create_app(runtime, orchestrator, registry):
     except Exception as _cron_err:
         logger.warning("Could not register cron tools: %s", _cron_err)
 
+    # Live tracking owns a separate bounded worker pool; no cron/agent turn is started per check.
+    from nullion.live_tracking import LiveTrackerStore, LiveTrackerEngine, public_tracker, utcnow
+    from nullion.live_tracking_tools import register_live_tracker_tools
+    _live_store = LiveTrackerStore(tracker_health_path or (Path(os.environ.get("NULLION_HOME", str(Path.home() / ".nullion"))) / "runtime.db"))
+    registry.live_tracker_store_path = _live_store.path
+    register_live_tracker_tools(registry, model_client_getter=lambda: getattr(orchestrator, "model_client", None))
+
+    def _deliver_live_tracker(job, text, notice_id):
+        from nullion.events import make_event
+        conv_id = job["conversation_id"]
+        channel, target = conv_id.split(":", 1)
+        from nullion.chat_store import get_chat_store
+        history = get_chat_store()
+        if any((m.get("metadata") or {}).get("live_notice_id") == notice_id for m in history.load_messages(conv_id, limit=100)):
+            return True
+        if channel == "web":
+            visible = prepare_reply_for_platform_delivery(text, principal_id=conv_id, allow_attachments=False).text
+        else:
+            current_settings = load_settings()
+            visible = text
+            if channel == "telegram":
+                from nullion.telegram_entrypoint import _send_operator_telegram_delivery
+                token = current_settings.telegram.bot_token
+                if not token: return False
+                sent = _run_cron_platform_delivery(lambda: _send_operator_telegram_delivery(
+                    token, target, text, principal_id=conv_id, suppress_link_preview=True, message_only=True, request_id=notice_id))
+            elif channel == "slack":
+                from nullion.slack_app import send_slack_platform_delivery
+                token = current_settings.slack.bot_token
+                if not token: return False
+                sent = _run_cron_platform_delivery(lambda: send_slack_platform_delivery(
+                    bot_token=token, channel=target, text=text, principal_id=conv_id, message_only=True))
+            elif channel == "discord":
+                from nullion.discord_app import send_discord_platform_delivery
+                token = current_settings.discord.bot_token
+                if not token: return False
+                sent = _run_cron_platform_delivery(lambda: send_discord_platform_delivery(
+                    bot_token=token, channel_id=target, text=text, principal_id=conv_id, message_only=True))
+            else:
+                return False
+            if not sent: return False
+        metadata = {"source":"live_tracker", "live_tracker_id":job["id"], "live_notice_id":notice_id}
+        offer_id = job.get("extension_offer_id")
+        offer = _live_store.extension_offer(offer_id) if offer_id else None
+        if offer and offer["notice_id"] == notice_id:
+            metadata["live_tracker_extension_choice"] = offer_id
+            metadata["live_tracker_choice_created_at"] = utcnow().isoformat()
+        try:
+            history.save_message(conv_id, "bot", visible, channel=channel, channel_label=channel.title(),
+                metadata=metadata)
+        except Exception:
+            if channel == "web":
+                raise
+            # The external acknowledgement is authoritative. A secondary local
+            # history failure must not resend an already delivered alert.
+            logger.warning("Live alert delivered; history persistence failed", exc_info=True)
+        # Tracker state commits before notification delivery. Its completion
+        # message must not refresh the dashboard from an older cached snapshot.
+        _invalidate_status_cache()
+        if channel == "web" and _WEB_DELIVERY_LOOP is not None and not _WEB_DELIVERY_LOOP.is_closed():
+            asyncio.run_coroutine_threadsafe(_broadcast_web_background_message(conv_id, visible, live_notice_id=notice_id), _WEB_DELIVERY_LOOP)
+        event = make_event("live_tracker.notification.sent", "live_tracker", {
+            "tracker_id":job["id"], "workspace_id":job["workspace_id"], "conversation_id":conv_id,
+            "notice_id":notice_id, "outcome":job["last_outcome"]})
+        runtime.store.add_event(event)
+        # History and the notice ledger are the durable delivery receipts. A
+        # whole-runtime snapshot here delays finish_notice and every next alert.
+        checkpoint_event = getattr(runtime, "checkpoint_runtime_events", None)
+        if callable(checkpoint_event):
+            try:
+                checkpoint_event((event,), timeout_seconds=0.1)
+            except (OSError, sqlite3.Error):
+                logger.debug("Live notice delivered; secondary audit checkpoint is busy", exc_info=True)
+        return True
+
+    def _live_tracker_start_receipt_ready(job):
+        if job["state"] == "expired" or not job.get("require_start_receipt"):
+            return True
+        # Expiration is a terminal outcome even if the original start receipt
+        # was lost; do not silently suppress the notice and its renewal menu.
+        # Extension consent and the exact new deadline commit together. This
+        # remains authoritative if a later history checkpoint was busy or the
+        # chat process restarted before saving its secondary conversation log.
+        if job.get("extension_count") and _live_store.extension_choice_committed(job):
+            return True
+        for turn in reversed(runtime.store.list_recent_conversation_events(job["conversation_id"], event_type="conversation.chat_turn", limit=30)):
+            if turn.get("event_type") != "conversation.chat_turn":
+                continue
+            for result in turn.get("tool_results") or []:
+                output=result.get("output") or {}
+                receipt=output.get("action_receipt") or {}
+                if (result.get("status")=="completed" and receipt.get("object_type")=="live_tracker"
+                        and receipt.get("action")==("extended" if job.get("extension_count") else "created")
+                        and receipt.get("object_id")==job["id"] and output.get("expires_at")==job["expires_at"]):
+                    return _live_store.confirm_start_receipt(job["id"], job["expires_at"])
+        return False
+
+    _live_engine = LiveTrackerEngine(_live_store, registry=registry, runtime_store=lambda: runtime.store,
+        deliver=_deliver_live_tracker, model_client=getattr(orchestrator, "model_client", None),
+        ready_to_deliver=_live_tracker_start_receipt_ready)
+    registry.live_tracker_wake = _live_engine.wake
+    app.state.live_tracker_store = _live_store
+    app.state.live_tracker_engine = _live_engine
+    app.router.on_startup.append(_live_engine.start)
+    app.router.on_shutdown.append(_live_engine.stop)
+
+    @app.get("/api/live-trackers")
+    async def list_live_trackers_endpoint(request: Request):
+        workspace = request.query_params.get("workspace_id")
+        return JSONResponse({"trackers":[public_tracker(j) for j in _live_store.list(workspace)],
+            "max_parallel_jobs":_live_store.capacity(), "default_interval_seconds":15,
+            "max_duration_seconds":None, "deadline_required":True})
+
+    @app.post("/api/live-trackers")
+    async def create_live_tracker_endpoint(request: Request):
+        from nullion.tools import ToolInvocation
+        from nullion.reminders import reminder_chat_context
+        from nullion.runtime import invoke_tool_with_boundary_policy
+        try:
+            body = await request.json()
+            if not isinstance(body, dict): raise ValueError("Expected a JSON object")
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error":str(exc)},status_code=400)
+        conversation = body.pop("conversation_id", "web:operator")
+        if not isinstance(conversation, str) or not conversation.startswith("web:"):
+            return JSONResponse({"error":"Use the current Web conversation as the alert destination"}, status_code=400)
+        with reminder_chat_context(conversation):
+            result = invoke_tool_with_boundary_policy(runtime.store,
+                ToolInvocation("live-create-"+uuid4().hex,"create_live_tracker",conversation,body,
+                    capsule_id=request.headers.get("Idempotency-Key") or "live-create-"+uuid4().hex),registry=registry)
+        if result.status != "completed":
+            return JSONResponse({"error":result.error, "message":(result.output or {}).get("clarification")},status_code=400)
+        return JSONResponse(result.output)
+
+    @app.put("/api/live-trackers/settings")
+    async def live_tracker_settings_endpoint(request: Request):
+        try:
+            body=await request.json()
+            if not isinstance(body,dict): raise ValueError("Expected a JSON object")
+            maximum=_live_store.set_capacity(body.get("max_parallel_jobs"))
+            _live_engine.wake()
+            return JSONResponse({"ok":True,"max_parallel_jobs":maximum})
+        except (ValueError,TypeError) as exc:
+            return JSONResponse({"error":str(exc)},status_code=400)
+
+    @app.patch('/api/live-trackers/{tracker_id}')
+    async def amend_live_tracker_endpoint(tracker_id: str, request: Request):
+        from nullion.tools import ToolInvocation
+        from nullion.runtime import invoke_tool_with_boundary_policy
+        job=_live_store.get(tracker_id)
+        if job is None:return JSONResponse({'error':'Live tracker not found'},status_code=404)
+        try:
+            body=await request.json()
+            if not isinstance(body,dict):raise ValueError('Expected a JSON object')
+            conversation=body.pop('conversation_id',job['conversation_id'])
+            if conversation!=job['conversation_id']:
+                return JSONResponse({'error':'Amend this tracker in its original chat'},status_code=403)
+            result=invoke_tool_with_boundary_policy(runtime.store,ToolInvocation(
+                'live-update-'+uuid4().hex,'update_live_tracker',conversation,{**body,'id':tracker_id},
+                capsule_id=request.headers.get('Idempotency-Key') or 'live-update-'+uuid4().hex,
+                flow_context={'conversation_id':conversation}),registry=registry)
+            if result.status!='completed':
+                return JSONResponse({'error':result.error,'message':(result.output or {}).get('clarification')},status_code=400)
+            return JSONResponse(result.output)
+        except (ValueError,TypeError) as exc:
+            return JSONResponse({'error':str(exc)},status_code=400)
+
+    @app.post("/api/live-trackers/{tracker_id}/{action}")
+    async def live_tracker_action_endpoint(tracker_id: str, action: str):
+        job=_live_store.get(tracker_id)
+        if job is None: return JSONResponse({"error":"Live tracker not found"},status_code=404)
+        try:
+            if action == "stop": job=_live_store.stop(tracker_id,job["workspace_id"])
+            elif action == "resume": job=_live_store.resume(tracker_id,job["workspace_id"])
+            else: return JSONResponse({"error":"Unknown live tracker action"},status_code=400)
+            _live_engine.wake()
+            return JSONResponse({"ok":True,"tracker":public_tracker(job)})
+        except ValueError as exc:
+            return JSONResponse({"error":str(exc)},status_code=400)
+
     # ── Cron REST endpoints ────────────────────────────────────────────────────
 
     app.state.cron_scheduler = _cron_scheduler
@@ -22545,14 +22980,14 @@ def create_app(runtime, orchestrator, registry):
             return JSONResponse({"ok":False,"error":str(exc)},status_code=400)
 
     @app.get("/api/crons")
-    async def list_crons_endpoint():
+    def list_crons_endpoint():
         from nullion.crons import cron_display_fields, cron_display_timezone, load_crons
         from nullion.tracker_status import tracker_statuses
 
         rows = []
         cron_tz = cron_display_timezone()
-        jobs = load_crons()
-        health = tracker_statuses(tracker_health_path, jobs)
+        jobs = load_crons(refresh_next_runs=False)
+        health = tracker_statuses(tracker_health_path, jobs, reconcile=False)
         scheduling = _cron_scheduler.snapshot(jobs)
         for job in jobs:
             item = job.to_dict()
@@ -22597,6 +23032,8 @@ def create_app(runtime, orchestrator, registry):
                 delivery_target=delivery_target,
                 html_image_delivery_mode=html_image_delivery_mode,
                 artifact_delivery_options=artifact_delivery_options,
+                execution_window=body.get("execution_window"),
+                schedule_timezone=body.get("schedule_timezone"),
             )
             return JSONResponse({"ok": True, "job": job.to_dict()})
         except ValueError as exc:
@@ -22621,7 +23058,7 @@ def create_app(runtime, orchestrator, registry):
                 return JSONResponse({"ok": True, "job": job.to_dict()})
             from nullion.crons import update_cron
             job = update_cron(cron_id, **{k: v for k, v in body.items()
-                                          if k in {"name", "schedule", "task", "enabled", "workspace_id", "delivery_channel", "delivery_target", "html_image_delivery_mode", "artifact_delivery_options"}})
+                                          if k in {"name", "schedule", "task", "enabled", "workspace_id", "delivery_channel", "delivery_target", "html_image_delivery_mode", "artifact_delivery_options", "execution_window", "schedule_timezone"}})
             if job is None:
                 return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
             return JSONResponse({"ok": True, "job": job.to_dict()})
@@ -22647,6 +23084,11 @@ def create_app(runtime, orchestrator, registry):
         try:
             if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
                 return JSONResponse({"ok": False, "error": "date must be YYYY-MM-DD"}, status_code=400)
+            revoked_replies = {
+                event.get("turn_id") for event in runtime.store.list_recent_conversation_events(
+                    conv_id, event_type="conversation.reply_superseded", limit=5000,
+                )
+            }
             if turn_ids:
                 requested_ids = json.loads(turn_ids)
                 if not isinstance(requested_ids, list) or len(requested_ids) > 50 or any(
@@ -22659,7 +23101,8 @@ def create_app(runtime, orchestrator, registry):
                 )
                 replies = []
                 for event in reversed(events):
-                    if event.get("turn_id") not in wanted or not str(event.get("assistant_reply") or "").strip():
+                    if (event.get("turn_id") in revoked_replies or event.get("turn_id") not in wanted
+                            or not str(event.get("assistant_reply") or "").strip()):
                         continue
                     wanted.discard(event["turn_id"])
                     from nullion.chat_store import _artifact_metadata_from_runtime_turn
@@ -22678,11 +23121,14 @@ def create_app(runtime, orchestrator, registry):
             if str(sync_runtime or "").strip().lower() in {"1", "true", "yes"}:
                 _sync_runtime_chat_history_to_store(runtime, store)
             store.ensure_conversation(conv_id)
-            msgs = _hydrate_chat_history_media(
-                runtime,
-                store.load_messages(conv_id, limit=5000 if date else 300, local_date=date or None),
-                principal_id=conv_id,
-            )
+            history = store.load_messages(conv_id, limit=5000 if date else 300,
+                                          local_date=date or None, _include_runtime_identity=True)
+            history = [row for row in history if not (
+                row.get("role") == "bot" and row.get("runtime_turn_id") in revoked_replies
+            )]
+            for row in history:
+                row.pop("runtime_turn_id", None)
+            msgs = _hydrate_chat_history_media(runtime, history, principal_id=conv_id)
             conv = store.get_conversation(conv_id) or {}
             return JSONResponse({
                 "ok": True,
@@ -22723,10 +23169,12 @@ def create_app(runtime, orchestrator, registry):
     async def archive_chat(conv_id: str):
         """Archive a conversation (hides from main chat, keeps in history)."""
         try:
-            store = _get_chat_store()
-            store.ensure_conversation(conv_id)
-            store.archive_conversation(conv_id)
-            _record_web_conversation_reset(runtime, conv_id, history_retained=True)
+            def archive():
+                store = _get_chat_store()
+                store.ensure_conversation(conv_id)
+                store.archive_conversation(conv_id)
+                _record_web_conversation_reset(runtime, conv_id, history_retained=True)
+            await asyncio.to_thread(archive)
             return JSONResponse({"ok": True})
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -22815,11 +23263,9 @@ def create_app(runtime, orchestrator, registry):
                 _sync_runtime_chat_history_to_store(runtime, store)
             if not month:
                 try:
-                    from nullion.preferences import detect_system_timezone, load_preferences, resolve_timezone
+                    from nullion.preferences import load_preferences, resolve_timezone
 
                     preferred_tz = str(load_preferences().timezone or "").strip()
-                    if preferred_tz.upper() == "UTC":
-                        preferred_tz = detect_system_timezone(default="UTC")
                     month = datetime.now(resolve_timezone(preferred_tz)).strftime("%Y-%m")
                 except Exception:
                     month = _dt.date.today().strftime("%Y-%m")
@@ -22912,8 +23358,8 @@ def create_app(runtime, orchestrator, registry):
                 ],
             })
         except Exception as exc:
-            log.warning("conversation_analyze endpoint error: %s", exc)
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            logger.warning("Conversation analysis failed: %s", type(exc).__name__)
+            return JSONResponse({"ok": False, "error": "Conversation analysis could not be completed."}, status_code=500)
 
     @app.post("/api/chat/accept-skill/{conv_id}/{index}")
     async def accept_skill_proposal(conv_id: str, index: int):
@@ -22948,10 +23394,12 @@ def create_app(runtime, orchestrator, registry):
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
+        from nullion.preferences import time_presentation_context
         bootstrap = (
             "<script>"
             f"window.__NULLION_CSRF_TOKEN__ = {json.dumps(csrf_token)};"
             f"window.__NULLION_SLASH_COMMANDS__ = {json.dumps(operator_command_suggestions())};"
+            f"window.__NULLION_TIME_PRESENTATION__ = {json.dumps(time_presentation_context())};"
             "</script>"
         )
         return _HTML.replace("<script>", bootstrap + "\n<script>", 1)
@@ -23391,15 +23839,18 @@ def create_app(runtime, orchestrator, registry):
         nonlocal status_cache_payload, status_cache_created_at
         cache_ttl_s = _status_cache_ttl_s()
         async with status_cache_lock:
-            _sync_runtime_store_from_checkpoint()
+            # Dashboard reloads can read a large checkpoint. Keep that work
+            # off the ASGI event loop so chat completion and health requests
+            # can be delivered while a status refresh is in progress.
+            await asyncio.to_thread(_sync_runtime_store_from_checkpoint)
             current_fingerprint = _status_cache_fingerprint()
             cache_now = time.monotonic()
             cached = _status_cache_response(cache_now, cache_ttl_s, fingerprint=current_fingerprint)
             if cached is not None:
                 return cached
-            return await _status_uncached(cache_ttl_s=cache_ttl_s, fingerprint=current_fingerprint)
+            return await asyncio.to_thread(_status_uncached, cache_ttl_s=cache_ttl_s, fingerprint=current_fingerprint)
 
-    async def _status_uncached(*, cache_ttl_s: float, fingerprint: str | None):
+    def _status_uncached(*, cache_ttl_s: float, fingerprint: str | None):
         nonlocal status_cache_payload, status_cache_created_at, status_cache_fingerprint
         status_started_at = time.perf_counter()
         run_maintenance = _status_maintenance_due()
@@ -23810,6 +24261,7 @@ def create_app(runtime, orchestrator, registry):
             (
                 {
                     **action,
+                    "can_try_fix": _doctor_action_can_try_fix(action),
                     "remediation_actions": [
                         {"label": label, "command": command}
                         for label, command in remediation_buttons_for_recommendation_code(
@@ -23880,6 +24332,7 @@ def create_app(runtime, orchestrator, registry):
             "task_frames": task_frames,
             "mini_agent_tasks": mini_agent_tasks,
             "cron_delivery_tasks": cron_delivery_tasks,
+            "live_trackers": [public_tracker(j) for j in _live_store.list(None)],
             "skills": skills,
             "memory": memory,
             "health": health,
@@ -24324,27 +24777,29 @@ def create_app(runtime, orchestrator, registry):
     @app.post("/api/doctor/{action_id}/{action}")
     async def update_doctor_action(action_id: str, action: str):
         try:
+            current = runtime.store.get_doctor_action(action_id)
+            if current is None:
+                return JSONResponse({"ok": True, "action_id": action_id, "status": "gone", "message": "Doctor alert is no longer available.", "effect": "none", "repair_verified": False})
             if action == "start":
                 updated = runtime.start_doctor_action(action_id)
             elif action == "repair":
-                current = runtime.store.get_doctor_action(action_id)
-                if current is None:
-                    return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
                 if str(current.get("status") or "").lower() in {"completed", "cancelled", "failed", "dismissed", "resolved"}:
-                    return JSONResponse({"ok": True, "item": current, "message": "This Doctor item is already closed."})
-                message = _try_doctor_fix(current)
-                updated = runtime.complete_doctor_action(action_id)
-                return JSONResponse({"ok": True, "item": updated, "message": message})
+                    notice = health_action_notice("doctor", "complete", str(current["status"]), already_handled=True)
+                    return JSONResponse({"ok": True, "item": current, **notice.as_payload()})
+                _try_doctor_fix(current)
+                updated = runtime.start_doctor_action(action_id)
+                return JSONResponse({"ok": True, "item": updated, "message": "Chat-service restart requested. Recovery has not been verified yet; send a test message after reconnecting.", "notice_title": "Doctor repair requested", "effect": "operation_requested", "repair_verified": False})
             elif action.startswith("doctor:"):
-                updated, message = _run_doctor_remediation_command(runtime, action_id, action)
-                return JSONResponse({"ok": True, "item": updated, "message": message})
+                result = _run_doctor_remediation_command(runtime, action_id, action)
+                return JSONResponse({"ok": result.effect != "unsupported", "item": result.action, "message": result.message, "error": result.message if result.effect == "unsupported" else None, "notice_title": "Doctor update", "effect": result.effect, "repair_verified": result.repair_verified}, status_code=400 if result.effect == "unsupported" else 200)
             elif action == "complete":
                 updated = runtime.complete_doctor_action(action_id)
             elif action == "dismiss":
                 updated = runtime.cancel_doctor_action(action_id, reason="Dismissed from web UI")
             else:
                 return JSONResponse({"ok": False, "error": "unknown doctor action"}, status_code=400)
-            return JSONResponse({"ok": True, "item": updated})
+            notice = health_action_notice("doctor", action, str(updated.get("status") or ""), already_handled=str(current.get("status")) in {"completed", "resolved", "cancelled", "dismissed", "failed"})
+            return JSONResponse({"ok": True, "item": updated, **notice.as_payload()})
         except KeyError:
             return JSONResponse({"ok": True, "action_id": action_id, "status": "gone", "message": "Doctor item is already cleared."})
         except ValueError as exc:
@@ -24369,7 +24824,7 @@ def create_app(runtime, orchestrator, registry):
                         "escalation_id": escalation_id,
                         "status": current_status,
                     },
-                    "message": "Sentinel item is already updated.",
+                    **health_action_notice("sentinel", action, current_status, already_handled=True).as_payload(),
                 })
             if action == "acknowledge":
                 updated = runtime.acknowledge_sentinel_escalation(escalation_id)
@@ -24383,6 +24838,7 @@ def create_app(runtime, orchestrator, registry):
                     "escalation_id": updated.escalation_id,
                     "status": str(getattr(updated.status, "value", updated.status)),
                 },
+                **health_action_notice("sentinel", action, str(getattr(updated.status, "value", updated.status))).as_payload(),
             })
         except KeyError:
             return JSONResponse({"ok": True, "escalation_id": escalation_id, "status": "gone", "message": "Sentinel item is already cleared."})
@@ -24393,225 +24849,226 @@ def create_app(runtime, orchestrator, registry):
 
     @app.post("/api/approve/{approval_id}")
     async def approve(approval_id: str, request: Request):
-        try:
-            body = await request.json()
-            if not isinstance(body, dict):
+        with _runtime_turn_guard():
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    body = {}
+            except Exception:
                 body = {}
-        except Exception:
-            body = {}
-        try:
-            from nullion.approval_decisions import approve_request_with_mode, normalize_approval_mode
+            try:
+                from nullion.approval_decisions import approve_request_with_mode, normalize_approval_mode
 
-            store = runtime.store
-            from nullion.approval_resume import approval_resume_claimed
-            if approval_resume_claimed(runtime, approval_id):
-                return JSONResponse({"ok": True, "approval_id": approval_id,
-                    "already_handled": True, "resume": None, "resumed_text": None})
-            suspended_turn = store.get_suspended_turn(approval_id)
+                store = runtime.store
+                from nullion.approval_resume import approval_resume_claimed
+                if approval_resume_claimed(runtime, approval_id):
+                    return JSONResponse({"ok": True, "approval_id": approval_id,
+                        "already_handled": True, "resume": None, "resumed_text": None})
+                suspended_turn = store.get_suspended_turn(approval_id)
 
-            async def resume_existing_suspended_turn() -> dict[str, Any] | None:
-                if suspended_turn is None:
-                    return None
-                try:
-                    if _suspended_turn_origin_channel(suspended_turn) == "telegram":
-                        return await _resume_telegram_turn_from_web_approval(
-                            runtime,
-                            approval_id=approval_id,
-                            suspended_turn=suspended_turn,
-                            orchestrator=orchestrator,
-                            bot_token=os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", ""),
-                        )
-                    return await asyncio.to_thread(
-                        _resume_web_turn_from_snapshot, runtime,
-                        approval_id=approval_id, orchestrator=orchestrator, registry=registry,
-                    )
-                except Exception as exc:
-                    logger.exception("Failed to resume approval %s", approval_id)
-                    return {
-                        "type": "message",
-                        "text": (
-                            "I saved that approval, but I hit an error while resuming the paused response.\n\n"
-                            f"{_short_error_text(exc)}\n\n"
-                            "Send the request again and I’ll continue with the saved approval."
-                        ),
-                    }
-
-            def resume_approved_tool_from_context() -> dict[str, Any] | None:
-                if suspended_turn is not None:
-                    return None
-                current_req = store.get_approval_request(approval_id)
-                if current_req is None:
-                    return None
-                if getattr(current_req, "action", None) != "use_tool":
-                    return None
-                requested_by = str(getattr(current_req, "requested_by", "") or "").strip()
-                if not requested_by.startswith("web:"):
-                    return None
-                try:
-                    from nullion.chat_operator import execute_approved_tool_call_from_approval_context
-
-                    direct_tool_result = execute_approved_tool_call_from_approval_context(
-                        runtime,
-                        approval_id,
-                        tool_registry=registry,
-                    )
-                except Exception:
-                    logger.exception("Failed to execute approved tool context for approval %s", approval_id)
-                    direct_tool_result = None
-                if direct_tool_result is None:
-                    return None
-                if normalize_tool_status(getattr(direct_tool_result, "status", None)) != "approval_required":
+                async def resume_existing_suspended_turn() -> dict[str, Any] | None:
+                    if suspended_turn is None:
+                        return None
                     try:
-                        store.remove_suspended_turn(approval_id)
-                    except Exception:
-                        logger.debug("Unable to clear suspended turn after approved tool-context resume", exc_info=True)
-                try:
-                    runtime.checkpoint()
-                except Exception:
-                    logger.debug("Unable to checkpoint after approved tool-context resume", exc_info=True)
-                return _web_direct_tool_result_resume_payload(
-                    runtime,
-                    conversation_id=requested_by,
-                    user_text=f"Approved {getattr(current_req, 'resource', 'tool')} action",
-                    tool_result=direct_tool_result,
-                    prior_tool_results=_web_completed_pending_tool_results_from_suspended_turn(suspended_turn),
-                )
+                        if _suspended_turn_origin_channel(suspended_turn) == "telegram":
+                            return await _resume_telegram_turn_from_web_approval(
+                                runtime,
+                                approval_id=approval_id,
+                                suspended_turn=suspended_turn,
+                                orchestrator=orchestrator,
+                                bot_token=os.environ.get("NULLION_TELEGRAM_BOT_TOKEN", ""),
+                            )
+                        return await asyncio.to_thread(
+                            _resume_web_turn_from_snapshot, runtime,
+                            approval_id=approval_id, orchestrator=orchestrator, registry=registry,
+                        )
+                    except Exception as exc:
+                        logger.exception("Failed to resume approval %s", approval_id)
+                        return {
+                            "type": "message",
+                            "text": (
+                                "I saved that approval, but I hit an error while resuming the paused response.\n\n"
+                                f"{_short_error_text(exc)}\n\n"
+                                "Send the request again and I’ll continue with the saved approval."
+                            ),
+                        }
 
-            req = store.get_approval_request(approval_id)
-            if req is None:
-                resume_payload = await resume_existing_suspended_turn()
-                if resume_payload is not None:
-                    resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                def resume_approved_tool_from_context() -> dict[str, Any] | None:
+                    if suspended_turn is not None:
+                        return None
+                    current_req = store.get_approval_request(approval_id)
+                    if current_req is None:
+                        return None
+                    if getattr(current_req, "action", None) != "use_tool":
+                        return None
+                    requested_by = str(getattr(current_req, "requested_by", "") or "").strip()
+                    if not requested_by.startswith("web:"):
+                        return None
+                    try:
+                        from nullion.chat_operator import execute_approved_tool_call_from_approval_context
+
+                        direct_tool_result = execute_approved_tool_call_from_approval_context(
+                            runtime,
+                            approval_id,
+                            tool_registry=registry,
+                        )
+                    except Exception:
+                        logger.exception("Failed to execute approved tool context for approval %s", approval_id)
+                        direct_tool_result = None
+                    if direct_tool_result is None:
+                        return None
+                    if normalize_tool_status(getattr(direct_tool_result, "status", None)) != "approval_required":
+                        try:
+                            store.remove_suspended_turn(approval_id)
+                        except Exception:
+                            logger.debug("Unable to clear suspended turn after approved tool-context resume", exc_info=True)
+                    try:
+                        runtime.checkpoint()
+                    except Exception:
+                        logger.debug("Unable to checkpoint after approved tool-context resume", exc_info=True)
+                    return _web_direct_tool_result_resume_payload(
+                        runtime,
+                        conversation_id=requested_by,
+                        user_text=f"Approved {getattr(current_req, 'resource', 'tool')} action",
+                        tool_result=direct_tool_result,
+                        prior_tool_results=_web_completed_pending_tool_results_from_suspended_turn(suspended_turn),
+                    )
+
+                req = store.get_approval_request(approval_id)
+                if req is None:
+                    resume_payload = await resume_existing_suspended_turn()
+                    if resume_payload is not None:
+                        resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                        return JSONResponse(
+                            {
+                                "ok": True,
+                                "approval_id": approval_id,
+                                "already_handled": True,
+                                "resume": resume_payload,
+                                "resumed_text": resumed_text,
+                            }
+                        )
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "stale": True,
+                            "approval_id": approval_id,
+                            "error": "That approval is no longer pending. I refreshed approvals.",
+                        },
+                        status_code=410,
+                        )
+                req_status = getattr(getattr(req, "status", None), "value", getattr(req, "status", None))
+                if str(req_status or "").strip().lower() == "approved" and suspended_turn is not None:
+                    resume_payload = resume_approved_tool_from_context()
+                    if resume_payload is None:
+                        resume_payload = await resume_existing_suspended_turn()
+                    if resume_payload is not None:
+                        resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                        return JSONResponse(
+                            {
+                                "ok": True,
+                                "approval_id": approval_id,
+                                "already_handled": True,
+                                "resume": resume_payload,
+                                "resumed_text": resumed_text,
+                            }
+                        )
+                if str(req_status or "").strip().lower() == "approved" and suspended_turn is None:
+                    resume_payload = resume_approved_tool_from_context()
+                    if resume_payload is not None:
+                        resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                        return JSONResponse(
+                            {
+                                "ok": True,
+                                "approval_id": approval_id,
+                                "already_handled": True,
+                                "resume": resume_payload,
+                                "resumed_text": resumed_text,
+                            }
+                        )
+                if (
+                    getattr(req, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND
+                    and str(req_status or "").strip().lower() == "approved"
+                    and suspended_turn is None
+                ):
                     return JSONResponse(
                         {
                             "ok": True,
                             "approval_id": approval_id,
                             "already_handled": True,
-                            "resume": resume_payload,
-                            "resumed_text": resumed_text,
+                            "resume": None,
+                            "resumed_text": None,
                         }
                     )
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "stale": True,
-                        "approval_id": approval_id,
-                        "error": "That approval is no longer pending. I refreshed approvals.",
-                    },
-                    status_code=410,
-                    )
-            req_status = getattr(getattr(req, "status", None), "value", getattr(req, "status", None))
-            if str(req_status or "").strip().lower() == "approved" and suspended_turn is not None:
+                if getattr(req, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
+                    multiplier = multiplier_for_limit_extension_mode(body.get("mode"))
+                    if multiplier is None:
+                        return JSONResponse(
+                            {"ok": False, "error": "Choose 2x, 5x, or 10x to continue this run."},
+                            status_code=409,
+                        )
+                    mode = limit_extension_mode_for_multiplier(multiplier)
+                    expires_at = None
+                    run_expires_at = None
+                else:
+                    mode = normalize_approval_mode(body.get("mode", "once"))
+                    expires_at = _permission_memory_expires_at(body.get("expires")) if mode == "always" else None
+                    run_expires_at = _web_session_allow_expires_at() if mode == "run" else None
+                decision = approve_request_with_mode(
+                    runtime,
+                    approval_id,
+                    mode=mode,
+                    source="web UI",
+                    expires_at=expires_at,
+                    run_expires_at=run_expires_at,
+                    auto_approve_run_boundaries=True,
+                )
+                auto_approved_ids = list(decision.auto_approved_ids)
+                confirmation_text = _approval_confirmation_text_for_web(decision.approval, action="approve", mode=mode)
+
+                # Resume the suspended turn (non-fatal). Web-origin tool approvals
+                # with saved arguments should execute the approved tool directly
+                # before any prompt replay path can re-run unrelated work.
                 resume_payload = resume_approved_tool_from_context()
                 if resume_payload is None:
                     resume_payload = await resume_existing_suspended_turn()
-                if resume_payload is not None:
-                    resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
-                    return JSONResponse(
-                        {
-                            "ok": True,
-                            "approval_id": approval_id,
-                            "already_handled": True,
-                            "resume": resume_payload,
-                            "resumed_text": resumed_text,
-                        }
-                    )
-            if str(req_status or "").strip().lower() == "approved" and suspended_turn is None:
-                resume_payload = resume_approved_tool_from_context()
-                if resume_payload is not None:
-                    resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
-                    return JSONResponse(
-                        {
-                            "ok": True,
-                            "approval_id": approval_id,
-                            "already_handled": True,
-                            "resume": resume_payload,
-                            "resumed_text": resumed_text,
-                        }
-                    )
-            if (
-                getattr(req, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND
-                and str(req_status or "").strip().lower() == "approved"
-                and suspended_turn is None
-            ):
-                return JSONResponse(
-                    {
-                        "ok": True,
-                        "approval_id": approval_id,
-                        "already_handled": True,
-                        "resume": None,
-                        "resumed_text": None,
-                    }
-                )
-            if getattr(req, "request_kind", None) == AGENT_TURN_LIMIT_EXTENSION_REQUEST_KIND:
-                multiplier = multiplier_for_limit_extension_mode(body.get("mode"))
-                if multiplier is None:
-                    return JSONResponse(
-                        {"ok": False, "error": "Choose 2x, 5x, or 10x to continue this run."},
-                        status_code=409,
-                    )
-                mode = limit_extension_mode_for_multiplier(multiplier)
-                expires_at = None
-                run_expires_at = None
-            else:
-                mode = normalize_approval_mode(body.get("mode", "once"))
-                expires_at = _permission_memory_expires_at(body.get("expires")) if mode == "always" else None
-                run_expires_at = _web_session_allow_expires_at() if mode == "run" else None
-            decision = approve_request_with_mode(
-                runtime,
-                approval_id,
-                mode=mode,
-                source="web UI",
-                expires_at=expires_at,
-                run_expires_at=run_expires_at,
-                auto_approve_run_boundaries=True,
-            )
-            auto_approved_ids = list(decision.auto_approved_ids)
-            confirmation_text = _approval_confirmation_text_for_web(decision.approval, action="approve", mode=mode)
-
-            # Resume the suspended turn (non-fatal). Web-origin tool approvals
-            # with saved arguments should execute the approved tool directly
-            # before any prompt replay path can re-run unrelated work.
-            resume_payload = resume_approved_tool_from_context()
-            if resume_payload is None:
-                resume_payload = await resume_existing_suspended_turn()
-            resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
-            if resume_payload is None:
-                resume_payload = resume_approved_tool_from_context()
                 resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
-            try:
                 if resume_payload is None:
-                    from nullion.chat_operator import resume_approved_telegram_request
-                    conv_id = getattr(req, "conversation_id", None)
-                    chat_id = None
-                    if isinstance(conv_id, str) and conv_id.startswith("telegram:"):
-                        chat_id = conv_id.split(":", 1)[1] or None
-                    resumed_text = resume_approved_telegram_request(
-                        runtime,
-                        approval_id=approval_id,
-                        chat_id=chat_id,
-                        model_client=None,
-                        agent_orchestrator=orchestrator,
-                    )
-                    if resumed_text:
-                        resume_payload = {"type": "message", "text": resumed_text}
-            except Exception:
-                pass
+                    resume_payload = resume_approved_tool_from_context()
+                    resumed_text = resume_payload.get("text") if isinstance(resume_payload, dict) else None
+                try:
+                    if resume_payload is None:
+                        from nullion.chat_operator import resume_approved_telegram_request
+                        conv_id = getattr(req, "conversation_id", None)
+                        chat_id = None
+                        if isinstance(conv_id, str) and conv_id.startswith("telegram:"):
+                            chat_id = conv_id.split(":", 1)[1] or None
+                        resumed_text = resume_approved_telegram_request(
+                            runtime,
+                            approval_id=approval_id,
+                            chat_id=chat_id,
+                            model_client=None,
+                            agent_orchestrator=orchestrator,
+                        )
+                        if resumed_text:
+                            resume_payload = {"type": "message", "text": resumed_text}
+                except Exception:
+                    pass
 
-            return JSONResponse({
-                "ok": True,
-                "approval_id": approval_id,
-                "mode": mode,
-                "expires_at": run_expires_at.isoformat() if run_expires_at else (expires_at.isoformat() if expires_at else None),
-                "auto_approved_ids": auto_approved_ids,
-                "resume": resume_payload,
-                "resumed_text": resumed_text,
-                "confirmation_text": confirmation_text,
-            })
-        except ValueError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
-        except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+                return JSONResponse({
+                    "ok": True,
+                    "approval_id": approval_id,
+                    "mode": mode,
+                    "expires_at": run_expires_at.isoformat() if run_expires_at else (expires_at.isoformat() if expires_at else None),
+                    "auto_approved_ids": auto_approved_ids,
+                    "resume": resume_payload,
+                    "resumed_text": resumed_text,
+                    "confirmation_text": confirmation_text,
+                })
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
     def _active_connector_connection_exists() -> bool:
         try:
@@ -24802,7 +25259,7 @@ def create_app(runtime, orchestrator, registry):
         })
 
     @app.get("/api/config")
-    async def get_config():
+    def get_config():
         """Return current config (secrets masked). Reads env vars + encrypted credential fallback."""
         import os
         creds = _read_credentials_json()
@@ -25809,6 +26266,7 @@ def create_app(runtime, orchestrator, registry):
             runtime.model_client = _new_client
         except Exception:
             pass
+        _live_engine.set_model_client(_new_client)
         logger.info(
             "Model client hot-swapped after %s (provider=%s model=%s)",
             reason,
@@ -26536,10 +26994,15 @@ def create_app(runtime, orchestrator, registry):
             "perplexity_search_key",
             "web_access",
         }
+        _media_keys = {"media_models", "media_providers_enabled", "enabled_plugins", "provider_bindings"}
+        _media_keys.update(f"{capability}_{field}" for capability in
+            ("audio_transcribe", "image_ocr", "image_generate", "video_input")
+            for field in ("enabled", "provider", "model", "command"))
         live_reload_errors = _hot_reload_live_config(
             reason="settings save",
             swap_model=bool(_model_keys.intersection(body) and not is_disabling),
             reload_browser=bool(_browser_keys.intersection(body) or _web_research_keys.intersection(body)),
+            reload_media=bool(_media_keys.intersection(body)),
         )
 
         return JSONResponse({"ok": True, "updated": list(updates.keys()), **live_reload_errors})
@@ -26847,6 +27310,13 @@ def create_app(runtime, orchestrator, registry):
     async def post_preferences(request: Request):
         from nullion.preferences import load_preferences, save_preferences, Preferences, _DEFAULTS
         body = await request.json()
+        from nullion.preferences import _validated_timezone_name
+        if not isinstance(body, dict):
+            return JSONResponse({'ok': False, 'error': 'Preferences must be an object.'}, status_code=400)
+        if ('timezone' in body and not _validated_timezone_name(body['timezone'])
+                or 'time_format' in body and body['time_format'] not in ('12h', '24h')
+                or 'date_format' in body and body['date_format'] not in ('YYYY-MM-DD', 'MM/DD/YYYY', 'DD/MM/YYYY')):
+            return JSONResponse({'ok': False, 'error': 'Choose a valid timezone, date format, and clock format.'}, status_code=400)
         current = load_preferences().to_dict()
         # Merge in only known keys
         for k in _DEFAULTS:
@@ -26960,6 +27430,11 @@ def create_app(runtime, orchestrator, registry):
                 "python": sys.version,
                 "packages": pkgs,
                 "startup_warnings": list(_STARTUP_WARNINGS),
+                "live_tracking": {
+                    "recovery_model_available": _live_engine.model_client is not None,
+                    "repairable_tool_count": sum(bool(getattr(spec, "observation_repair_parameters", ()))
+                        for spec in registry.list_specs()),
+                },
             }
         )
 
@@ -26988,11 +27463,13 @@ def create_app(runtime, orchestrator, registry):
         activity_label: str | None = None,
         include_activity: bool | None = None,
         artifacts: list[dict[str, object]] | None = None,
+        live_notice_id: str | None = None,
     ) -> None:
         payload = json.dumps({
             "type": "task_status" if is_status and group_id else "background_message",
             "conversation_id": conversation_id,
             "text": text,
+            **({"live_notice_id": live_notice_id} if live_notice_id else {}),
             **({"group_id": group_id} if group_id else {}),
             **({"status_kind": status_kind} if status_kind else {}),
             **({"task_id": task_id} if task_id else {}),
@@ -27210,8 +27687,10 @@ def create_app(runtime, orchestrator, registry):
                         logger.debug("Could not broadcast web mini-agent artifact delivery failure", exc_info=True)
                 return False
             if kwargs.get("is_status"):
+                from nullion.chat_operator import activity_trace_enabled_for_chat
+                include_activity = activity_trace_enabled_for_chat(runtime, chat_id=conversation_id)
                 status_kind = str(kwargs.get("status_kind") or "")
-                if status_kind != "task_summary" and not activity_trace_enabled():
+                if status_kind != "task_summary" and not include_activity:
                     return True
                 status_text = text
                 if status_kind == "tool_activity":
@@ -27234,7 +27713,7 @@ def create_app(runtime, orchestrator, registry):
                                 task_id=str(kwargs.get("task_id") or ""),
                                 activity_id=str(kwargs.get("activity_id") or ""),
                                 activity_label=str(kwargs.get("activity_label") or ""),
-                                include_activity=activity_trace_enabled(),
+                                include_activity=include_activity,
                             ),
                             loop,
                         )
@@ -27393,6 +27872,7 @@ def create_app(runtime, orchestrator, registry):
     async def chat_http(request: Request):
         """HTTP chat fallback for environments where WebSocket upgrades fail."""
         conv_id = "web:0"
+        registration = None
         try:
             try:
                 payload = await request.json()
@@ -27418,8 +27898,31 @@ def create_app(runtime, orchestrator, registry):
                 _record_web_conversation_reset(runtime, conv_id)
                 return JSONResponse({"type": "conversation_reset", "text": "Fresh conversation started."})
 
+            if is_stop_command_text(user_text):
+                cancelled_turn_ids = await web_turn_tracker.cancel_conversation(conv_id)
+                stopped = await stop_session_async(
+                    conversation_id=conv_id, runtime=runtime, agent_orchestrator=orchestrator)
+                result = SessionStopResult(
+                    cancelled_turn_ids=cancelled_turn_ids,
+                    cancelled_task_count=stopped.cancelled_task_count,
+                    cancelled_background_count=stopped.cancelled_background_count,
+                    cancelled_task_frame=stopped.cancelled_task_frame)
+                return JSONResponse({"type":"message", "text":stop_session_reply(result),
+                    "cancelled_turn_ids":list(cancelled_turn_ids), "artifacts":[]})
+
             loop = asyncio.get_event_loop()
             planner_command = parse_planner_command(user_text)
+
+            if not is_operator_command_text(user_text) or planner_command.requested:
+                payload["turn_id"] = str(payload.get("turn_id") or f"turn-web-{uuid4().hex[:12]}")
+                registration = await web_turn_tracker.register(
+                    conv_id, user_text, turn_id=payload["turn_id"], runtime_store=runtime.store,
+                    model_client=getattr(orchestrator, "model_client", None),
+                    active_turn_followup_evidence=has_structured_turn_relationship_evidence(
+                        user_text, attachments=attachments,
+                    ),
+                )
+                await registration.wait_for_dependencies()
 
             def _shared_platform_chat_turn(*, allow_mini_agents: bool = False):
                 return _run_shared_web_platform_chat_turn(
@@ -27428,6 +27931,8 @@ def create_app(runtime, orchestrator, registry):
                     attachments=attachments,
                     allow_mini_agents=allow_mini_agents,
                     request_payload=payload,
+                    turn_dispatch_decision=registration.decision if registration is not None else None,
+                    cancellation_checker=registration.is_cancelled if registration is not None else None,
                 )
 
             def _http_platform_chat_message_payload(result: object) -> dict[str, object]:
@@ -27439,12 +27944,16 @@ def create_app(runtime, orchestrator, registry):
                 if not bool(payload.get("show_thinking")):
                     response_payload["thinking"] = ""
                 response_payload["type"] = "message"
+                response_payload["turn_id"] = payload.get("turn_id")
+                response_payload["conversation_id"] = conv_id
                 return response_payload
 
             if planner_command.requested:
                 if not planner_command.prompt:
                     return JSONResponse({"type": "message", "text": "Usage: /planner <message>"})
                 result = await loop.run_in_executor(None, lambda: _shared_platform_chat_turn(allow_mini_agents=True))
+                if registration is not None and await registration.is_superseded():
+                    return JSONResponse({"type": "message", "text": "", "superseded": True, "artifacts": []})
                 if result.suspended_for_approval:
                     return JSONResponse(_web_approval_required_payload(
                         {"approval_id": result.approval_id or "", "is_web_request": True},
@@ -27453,12 +27962,9 @@ def create_app(runtime, orchestrator, registry):
                     ))
                 return JSONResponse(_http_platform_chat_message_payload(result))
 
-            # Slash command in HTTP fallback path
-            if is_operator_command_text(user_text):
-                result = await loop.run_in_executor(None, lambda: _shared_platform_chat_turn(allow_mini_agents=False))
-                return JSONResponse({"type": "message", "text": result.text or ""})
-
             result = await loop.run_in_executor(None, lambda: _shared_platform_chat_turn(allow_mini_agents=False))
+            if registration is not None and await registration.is_superseded():
+                return JSONResponse({"type": "message", "text": "", "superseded": True, "artifacts": []})
             if result.suspended_for_approval:
                 return JSONResponse(_web_approval_required_payload(
                     {"approval_id": result.approval_id or "", "is_web_request": True},
@@ -27466,6 +27972,10 @@ def create_app(runtime, orchestrator, registry):
                     runtime=runtime, turn_id=payload.get("turn_id"),
                 ))
             return JSONResponse(_http_platform_chat_message_payload(result))
+        except asyncio.CancelledError:
+            if registration is None or not registration.is_cancelled():
+                raise
+            return JSONResponse({"type":"message", "text":"", "superseded":True, "artifacts":[]})
         except Exception as exc:
             _report_web_client_issue(
                 runtime,
@@ -27474,6 +27984,10 @@ def create_app(runtime, orchestrator, registry):
                 details={"conversation_id": conv_id, "error": _short_error_text(exc)},
             )
             return JSONResponse({"type": "error", "text": f"Error: {_short_error_text(exc)}"}, status_code=500)
+
+        finally:
+            if registration is not None:
+                await registration.finish()
 
     @app.websocket("/ws/chat")
     async def chat_ws(websocket: WebSocket):
@@ -27491,18 +28005,33 @@ def create_app(runtime, orchestrator, registry):
         active_turn_tasks_by_id: dict[str, asyncio.Task] = {}
         active_turn_text_by_id: dict[str, str] = {}
         active_turn_order: list[str] = []
-        superseded_turn_ids: set[str] = set()
+        turn_registrations = {}
+        withdrawn_turn_ids: set[str] = set()
 
         async def send_websocket_event(event: dict[str, Any]) -> None:
+            registration = turn_registrations.get(str(event.get("turn_id") or ""))
+            if registration is not None and event.get("type") in {
+                "chunk", "done", "thinking", "approval_required", "task_status", "error",
+            }:
+                if not await registration.publication_gate.wait():
+                    turn_id = registration.turn_id
+                    if turn_id not in withdrawn_turn_ids:
+                        withdrawn_turn_ids.add(turn_id)
+                        async with send_lock:
+                            await websocket.send_text(json.dumps({
+                                "type": "done", "turn_id": turn_id, "superseded": True, "artifacts": [],
+                            }))
+                    return
             async with send_lock:
                 await websocket.send_text(json.dumps(event))
 
         async def stop_active_web_session(conversation_id: str, stop_turn_id: str) -> None:
-            cancelled_turn_ids = tuple(
+            tracked_turn_ids = await web_turn_tracker.cancel_conversation(conversation_id)
+            cancelled_turn_ids = tuple(dict.fromkeys((*tracked_turn_ids, *(
                 turn_id
                 for turn_id in active_turn_order
                 if (task := active_turn_tasks_by_id.get(turn_id)) is not None and not task.done()
-            )
+            ))))
             for turn_id in cancelled_turn_ids:
                 task = active_turn_tasks_by_id.get(turn_id)
                 if task is not None and not task.done():
@@ -27535,6 +28064,7 @@ def create_app(runtime, orchestrator, registry):
             dependency_tasks: tuple[asyncio.Task, ...] = (),
             dispatch_decision: object | None = None,
             latency_recorder: TurnLatencyRecorder | None = None,
+            registration=None,
         ) -> None:
             for dependency_task in dependency_tasks:
                 try:
@@ -27714,6 +28244,7 @@ def create_app(runtime, orchestrator, registry):
                                 else None
                             ),
                             turn_dispatch_decision=dispatch_decision,
+                            cancellation_checker=registration.is_cancelled if registration is not None else None,
                         ),
                         conversation_id=str(conv_id),
                         user_text=planner_command.prompt,
@@ -27789,32 +28320,8 @@ def create_app(runtime, orchestrator, registry):
                 }))
                 return
 
-            if is_operator_command_text(user_text):
-                await send_activity_event({"id": "command", "label": "Running command", "status": "running"})
-                try:
-                    from nullion.operator_commands import handle_operator_command
-                    reply = await loop.run_in_executor(
-                        None,
-                        lambda: handle_operator_command(runtime, user_text),
-                    )
-                except Exception as exc:
-                    _report_web_client_issue(
-                        runtime,
-                        issue_type="error",
-                        message="Web slash command failed.",
-                        details={"conversation_id": conv_id, "command": user_text, "error": _short_error_text(exc)},
-                    )
-                    reply = f"⚠️ Command error: {exc}"
-                    await send_activity_event({"id": "command", "label": "Running command", "status": "failed"})
-                else:
-                    await send_activity_event({"id": "command", "label": "Running command", "status": "done"})
-                await send_activity_event({"id": "respond", "label": "Writing response", "status": "running"})
-                await send_reply_text(reply)
-                await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})
-                await send_websocket_event(turn_payload({"type": "done", "text": reply, "artifacts": []}))
-                return
-
-            # ── Normal AI turn ────────────────────────────────────────────
+            # Commands and ordinary turns share execution, approvals and the
+            # complete result payload, including native artifact descriptors.
             try:
                 await send_activity_event({"id": "queued", "label": "Started run", "status": "done"})
                 result = await loop.run_in_executor(
@@ -27833,6 +28340,7 @@ def create_app(runtime, orchestrator, registry):
                                 else None
                             ),
                             turn_dispatch_decision=dispatch_decision,
+                            cancellation_checker=registration.is_cancelled if registration is not None else None,
                         ),
                         conversation_id=str(conv_id),
                         user_text=user_text,
@@ -27852,7 +28360,7 @@ def create_app(runtime, orchestrator, registry):
                 }))
                 return
 
-            if turn_id and turn_id in superseded_turn_ids:
+            if registration is not None and await registration.is_superseded():
                 await send_activity_event({"id": "respond", "label": "Writing response", "status": "done"})
                 await send_websocket_event(turn_payload({
                     "type": "done",
@@ -27939,66 +28447,27 @@ def create_app(runtime, orchestrator, registry):
                         await asyncio.gather(*tuple(active_turn_tasks), return_exceptions=True)
                     await process_chat_payload(payload)
                     continue
-                from nullion.conversation_runtime import ConversationTurnDisposition
-                from nullion.turn_dispatch_graph import route_turn_dispatch_with_context
+                async def run_registered_turn(current_payload):
+                    registration = await web_turn_tracker.register(
+                        str(current_payload.get("conversation_id") or "web:0"),
+                        str(current_payload.get("text") or ""),
+                        turn_id=current_payload["turn_id"], runtime_store=runtime.store,
+                        model_client=getattr(orchestrator, "model_client", None),
+                        active_turn_followup_evidence=has_structured_turn_relationship_evidence(
+                            str(current_payload.get("text") or ""),
+                            attachments=current_payload.get("attachments"),
+                        ),
+                    )
+                    turn_registrations[registration.turn_id] = registration
+                    try:
+                        await registration.wait_for_dependencies()
+                        await process_chat_payload(current_payload, dispatch_decision=registration.decision,
+                                                   registration=registration)
+                    finally:
+                        await registration.finish()
+                        turn_registrations.pop(registration.turn_id, None)
 
-                dispatch_started_at = time.perf_counter()
-                latency_recorder = TurnLatencyRecorder(
-                    surface="web",
-                    conversation_id=str(payload.get("conversation_id") or "web:0"),
-                    turn_id=turn_id,
-                    feed_visible=bool(payload.get("activity_trace")) and _feature_enabled("NULLION_ACTIVITY_TRACE_ENABLED"),
-                    logger=logger,
-                )
-                latency_recorder.mark("ingress_received", once=True)
-                latency_recorder.mark("dispatch_start", once=True)
-                dispatch_decision = await asyncio.to_thread(
-                    route_turn_dispatch_with_context,
-                    user_text,
-                    active_turn_ids=tuple(active_turn_order),
-                    active_turn_texts=tuple(active_turn_text_by_id.get(active_turn_id, "") for active_turn_id in active_turn_order),
-                    active_turn_followup_evidence=has_structured_turn_relationship_evidence(
-                        user_text,
-                        attachments=payload.get("attachments") if isinstance(payload.get("attachments"), list) else None,
-                    ),
-                    model_client=getattr(orchestrator, "model_client", None),
-                )
-                dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000
-                latency_recorder.mark("dispatch_done", once=True, detail=round(dispatch_ms, 1))
-                try:
-                    dispatch_slow_ms = float(os.environ.get("NULLION_WEB_DISPATCH_SLOW_LOG_MS", "500"))
-                except ValueError:
-                    dispatch_slow_ms = 500.0
-                # Keep dispatch timing distinct from the main model/tool turn:
-                # this catches wasted "follow-up or separate?" preflights while
-                # the UI still says "Preparing request."
-                if active_turn_order or dispatch_ms >= dispatch_slow_ms:
-                    logger.info(
-                        "web dispatch timing conversation_id=%s turn_id=%s active_turns=%s dependencies=%s policy=%s disposition=%s reason=%s total_ms=%.1f",
-                        payload.get("conversation_id", "web:0"),
-                        turn_id,
-                        len(active_turn_order),
-                        len(getattr(dispatch_decision, "dependency_turn_ids", ()) or ()),
-                        getattr(getattr(dispatch_decision, "policy", None), "value", getattr(dispatch_decision, "policy", None)),
-                        getattr(getattr(dispatch_decision, "disposition", None), "value", getattr(dispatch_decision, "disposition", None)),
-                        getattr(dispatch_decision, "reason", None),
-                        dispatch_ms,
-                    )
-                dependency_tasks = tuple(
-                    active_turn_tasks_by_id[dependency_turn_id]
-                    for dependency_turn_id in dispatch_decision.dependency_turn_ids
-                    if dependency_turn_id in active_turn_tasks_by_id
-                )
-                if dispatch_decision.disposition in {
-                    ConversationTurnDisposition.REVISE,
-                    ConversationTurnDisposition.INTERRUPT,
-                }:
-                    superseded_turn_ids.update(
-                        dependency_turn_id
-                        for dependency_turn_id in dispatch_decision.dependency_turn_ids
-                        if dependency_turn_id in active_turn_tasks_by_id
-                    )
-                task = asyncio.create_task(process_chat_payload(payload, dependency_tasks, dispatch_decision, latency_recorder))
+                task = asyncio.create_task(run_registered_turn(payload))
                 active_turn_tasks.add(task)
                 active_turn_tasks_by_id[turn_id] = task
                 active_turn_text_by_id[turn_id] = user_text
@@ -28013,7 +28482,7 @@ def create_app(runtime, orchestrator, registry):
                         active_turn_order.remove(completed_turn_id)
                     except ValueError:
                         pass
-                    superseded_turn_ids.discard(completed_turn_id)
+                    withdrawn_turn_ids.discard(completed_turn_id)
                     if done_task.cancelled():
                         return
                     try:
@@ -28147,6 +28616,8 @@ def _web_approval_required_payload(
         "trigger_flow_label": result.get("trigger_flow_label") or display_trigger_flow_label,
         "is_web_request": bool(result.get("is_web_request") or display_is_web_request),
         "request_kind": request_kind,
+        **({"display_title": display_title, "display_copy": display_copy}
+           if display_title or display_copy else {}),
         "web_session_allow_label": _web_session_allow_duration_label(),
     }
 
@@ -28279,7 +28750,18 @@ def _is_new_command(text: str) -> bool:
 
 
 def _record_web_conversation_reset(runtime, conversation_id: str, *, history_retained: bool = False) -> None:
-    reset_conversation_session(runtime, conversation_id, history_retained=history_retained)
+    reset_conversation_session(runtime, conversation_id, history_retained=history_retained, checkpoint=False)
+    checkpoint_events = getattr(runtime, "checkpoint_conversation_events", None)
+    if callable(checkpoint_events):
+        try:
+            checkpoint_events(conversation_id=conversation_id, timeout_seconds=0.1)
+        except Exception:
+            logger.debug("Conversation reset checkpoint deferred", exc_info=True)
+            _schedule_web_checkpoint(runtime)
+    else:
+        checkpoint = getattr(runtime, "checkpoint", None)
+        if callable(checkpoint):
+            checkpoint()
 
 
 def _parse_history_timestamp(value: object) -> datetime | None:
@@ -28388,18 +28870,8 @@ def _web_task_frame_summary(user_text: str, *, limit: int = 90) -> str:
 
 
 def _web_dispatch_kwargs(turn_dispatch_decision: object | None) -> dict[str, object]:
-    if turn_dispatch_decision is None:
-        return {}
-    dependency_turn_ids = tuple(
-        str(dependency_id).strip()
-        for dependency_id in getattr(turn_dispatch_decision, "dependency_turn_ids", ()) or ()
-        if str(dependency_id).strip()
-    )
-    return {
-        "dispatch_disposition": getattr(turn_dispatch_decision, "disposition", None),
-        "dispatch_dependency_turn_ids": dependency_turn_ids,
-        "dispatch_reason": getattr(turn_dispatch_decision, "reason", None),
-    }
+    from nullion.chat_operator import _conversation_dispatch_kwargs
+    return _conversation_dispatch_kwargs(turn_dispatch_decision)
 
 
 def _web_conversation_context_boundary_prompt(conversation_result: object | None) -> str | None:
@@ -28617,7 +29089,6 @@ def _persist_terminal_web_task_frame(runtime, *, conversation_id: str, frame: Ta
     if path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
         return
     try:
-        import sqlite3
         from nullion.runtime_persistence import (
             _encode_sqlite_runtime_payload,
             _serialize_task_frame,
@@ -28627,7 +29098,7 @@ def _persist_terminal_web_task_frame(runtime, *, conversation_id: str, frame: Ta
         now = datetime.now(UTC).isoformat()
         payload = _serialize_task_frame(frame)
         encoded = _encode_sqlite_runtime_payload("task_frames", path, payload)
-        with sqlite3.connect(str(path), timeout=10) as conn:
+        with sqlite_connection(str(path), timeout=10) as conn:
             conn.execute("PRAGMA journal_mode=DELETE")
             conn.executescript(_sqlite_runtime_ddl())
             conn.execute(
@@ -29782,6 +30253,14 @@ def _compact_web_tool_output_for_context(
         encoded = str(redacted)
     if len(encoded) <= _MAX_STORED_TOOL_OUTPUT_CHARS:
         return redacted
+    if tool_name == "request_tool_scope" and isinstance(redacted, dict):
+        from nullion.source_selection import compact_scope_evidence
+        return compact_scope_evidence(redacted, original_chars=len(encoded))
+    from nullion.source_selection import compact_source_identity_evidence
+    identity_evidence = compact_source_identity_evidence(redacted, encoded=encoded,
+        max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
+    if identity_evidence is not None:
+        return identity_evidence
     return {
         "truncated": True,
         "original_chars": len(encoded),
@@ -30249,17 +30728,34 @@ def _schedule_web_checkpoint(runtime, *, force: bool = False) -> None:
     runtime_id = id(runtime)
 
     with _WEB_CHECKPOINT_LOCK:
+        if force:
+            _WEB_CHECKPOINT_FORCE.add(runtime_id)
         if runtime_id in _WEB_CHECKPOINT_INFLIGHT:
             _WEB_CHECKPOINT_DIRTY.add(runtime_id)
             return
-        _WEB_CHECKPOINT_INFLIGHT.add(runtime_id)
+        owner = object()
+        _WEB_CHECKPOINT_INFLIGHT[runtime_id] = owner
+
+    def _retire() -> None:
+        # Caller holds the lock. A new writer may already own this runtime
+        # when the previous thread reaches its finally block.
+        if _WEB_CHECKPOINT_INFLIGHT.get(runtime_id) is owner:
+            _WEB_CHECKPOINT_INFLIGHT.pop(runtime_id, None)
+            _WEB_CHECKPOINT_DIRTY.discard(runtime_id)
+            _WEB_CHECKPOINT_FORCE.discard(runtime_id)
 
     def _run() -> None:
         try:
             while True:
+                with _WEB_CHECKPOINT_LOCK:
+                    requested_force = runtime_id in _WEB_CHECKPOINT_FORCE
+                    _WEB_CHECKPOINT_FORCE.discard(runtime_id)
+                    # Requests already queued are covered by this pass. Only
+                    # requests arriving during the save need another pass.
+                    _WEB_CHECKPOINT_DIRTY.discard(runtime_id)
                 try:
                     checkpoint_kwargs: dict[str, object] = {}
-                    if force:
+                    if requested_force:
                         try:
                             checkpoint_signature = inspect.signature(runtime.checkpoint)
                             if "force" in checkpoint_signature.parameters or any(
@@ -30276,14 +30772,18 @@ def _schedule_web_checkpoint(runtime, *, force: bool = False) -> None:
                     if runtime_id in _WEB_CHECKPOINT_DIRTY:
                         _WEB_CHECKPOINT_DIRTY.remove(runtime_id)
                         continue
-                    _WEB_CHECKPOINT_INFLIGHT.discard(runtime_id)
+                    _retire()
                     return
         finally:
             with _WEB_CHECKPOINT_LOCK:
-                _WEB_CHECKPOINT_INFLIGHT.discard(runtime_id)
-                _WEB_CHECKPOINT_DIRTY.discard(runtime_id)
+                _retire()
 
-    threading.Thread(target=_run, daemon=True).start()
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except BaseException:
+        with _WEB_CHECKPOINT_LOCK:
+            _retire()
+        raise
 
 
 def _smart_cleanup_enabled() -> bool:
@@ -31043,6 +31543,11 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     if suspended_turn is None:
         return None
 
+    from nullion.scheduled_budget import is_scheduled_budget_turn, resume_scheduled_budget_approval
+    if is_scheduled_budget_turn(suspended_turn):
+        reply = resume_scheduled_budget_approval(runtime, suspended_turn, background=True)
+        return {"type": "message", "text": reply or "", "delivery_handled": not reply}
+
     from nullion.approval_resume import claim_approval_resume
     if not claim_approval_resume(runtime, approval_id):
         return None
@@ -31124,10 +31629,13 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
             "artifacts": screenshot_payload.get("artifacts", []),
         }
     prior_tool_results = _web_completed_pending_tool_results_from_suspended_turn(suspended_turn)
+    from nullion.chat_operator import approved_read_needs_continuation
+    continue_read = approved_read_needs_continuation(runtime, suspended_turn,
+        tool_registry=registry, orchestrator=orchestrator)
     try:
         from nullion.chat_operator import execute_approved_pending_tool_call
 
-        direct_tool_result = execute_approved_pending_tool_call(
+        direct_tool_result = None if continue_read else execute_approved_pending_tool_call(
             runtime,
             suspended_turn,
             tool_registry=registry,
@@ -31135,7 +31643,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
     except Exception:
         logger.exception("Failed to execute approved pending tool call for approval %s", approval_id)
         direct_tool_result = None
-    if direct_tool_result is None:
+    if direct_tool_result is None and not continue_read:
         try:
             from nullion.chat_operator import execute_approved_tool_call_from_approval_context
 
@@ -31177,6 +31685,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
                 principal_id=conversation_id,
                 user_message=user_text,
                 messages_snapshot=suspended_turn.messages_snapshot or [],
+                **({"suspended_tool_calls": list(suspended_turn.pending_tool_calls or [])} if continue_read else {}),
                 tool_registry=registry,
                 policy_store=store,
                 approval_store=store,
@@ -31316,6 +31825,7 @@ def _resume_web_turn_from_snapshot(runtime, *, approval_id: str, orchestrator, r
         local_discovery_reply = _web_local_discovery_reply_for_tool_results(
             tool_results,
             required_extensions=requested_attachment_extensions,
+            reply=final_text,
         )
         if local_discovery_reply:
             final_text = local_discovery_reply
@@ -31588,7 +32098,8 @@ def _orchestrator_with_interactive_fast_profile(orchestrator, *, enabled: bool, 
         from nullion.agent_orchestrator import AgentOrchestrator
 
         if isinstance(orchestrator, AgentOrchestrator):
-            return AgentOrchestrator(model_client=profiled_client)
+            return AgentOrchestrator(model_client=profiled_client, workflow_model_client=(
+                getattr(orchestrator, "workflow_model_client", None) or current_client))
     except Exception:
         logger.debug("Could not clone orchestrator with interactive fast profile", exc_info=True)
     return orchestrator
@@ -31746,12 +32257,15 @@ def _run_web_server(args) -> None:
     print(f"  │  http://{args.host}:{args.port}       │")
     print(f"  └─────────────────────────────────┘\n")
 
+    from nullion.http_transport import WEB_KEEPALIVE_TIMEOUT_SECONDS
+
     uvicorn.run(
         app,
         host=args.host,
         port=args.port,
         reload=args.reload,
         timeout_graceful_shutdown=5,
+        timeout_keep_alive=WEB_KEEPALIVE_TIMEOUT_SECONDS,
     )
 
 

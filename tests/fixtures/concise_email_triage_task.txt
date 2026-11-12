@@ -1,0 +1,28 @@
+Email deadline triage using the configured email and calendar tools available to this workspace.
+
+Goal:
+- Search recent email for deadlines, action items, payments, renewals, appointments, confirmations, and other dated obligations.
+- Read the relevant messages before reporting or creating calendar events.
+- Create calendar events only for clearly identified dated obligations, after checking for an existing matching event on or near the due date.
+- Deliver a concise Telegram report with what was found, what was scheduled, and any uncertainty.
+
+Tool guidance:
+- Prefer structured account tools such as email_search, email_read, and calendar tools when they are available in the run scope.
+- If a connector gateway is the only available account path, use connector_request with the active provider metadata and app-specific reference docs.
+- If an account connector reports that its remote connection is pending, failed, expired, or needs reconnect, stop and report that state clearly instead of trying browser/API workarounds.
+- Do not use browser navigation for private email/calendar APIs unless the tool system explicitly exposes that as an authenticated account path.
+
+Search guidance:
+- Focus on recent messages, roughly the last 14 days, with terms related to due dates and required action: deadline, due, action required, please review, invoice, bill, statement, payment, renewal, appointment, schedule, by tomorrow, by EOD, urgent, confirmation.
+Output instructions (current user preference):
+- Routine triage should be a short phone-screen summary, roughly 120–160 words. Expand only to preserve additional material obligations or essential exceptions; there is no item-count limit.
+- Give a brief decision report: what needs attention, upcoming dated obligations, and material confirmations or cancellations that change an obligation. Keep every material amount, deadline and required action.
+- Use short outcome fragments rather than explanatory sentences. Each ordinary item gets one short outcome line; extra clauses are reserved for a current required action or a meaningful conflict.
+- Use one short bullet per item: identifying sender/obligation, date, amount and status or necessary next action. Use brief factual clauses such as "scheduled; posting unconfirmed" instead of explaining what the email proves.
+- Mention meaningful discrepancies briefly, including an outdated amount in a calendar entry. Do not narrate routine checks, search history, or the absence of later emails for each item.
+- Give the calendar outcome once: events created and existing reminders retained. Do not cite calendar checks or repeat why a duplicate was skipped.
+- Do not append sender/subject/received-date inventories or search/calendar evidence citations. Use a short identifying subject in the item itself; include received dates only when needed to resolve an ambiguity or a conflicting notice. Keep the full provenance available for a requested detailed audit.
+- Keep direct user-action links when useful and available; do not replace them with generic search links.
+- Omit routine informational messages with neither a dated obligation nor a concrete required action. An order still processing with no ready/pickup date or required response is not an action item. A significant undated action may have one brief action line. Completed or past items get only a brief status; omit original processing-window boilerplate. Calendar placeholder end-times need not be explained unless the user must act on them.
+- No repeated summary, verification-method explanation, account-settlement lecture, or general disclaimer at the end. A real coverage failure or material uncertainty must still be disclosed briefly and specifically.
+- This changes presentation only: preserve the search window, full relevant-message review, calendar duplicate checks and conditional event-creation rules above.

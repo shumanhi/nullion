@@ -1,4 +1,5 @@
 """Real chat, SQLite and download boundaries; only provider responses are scripted."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 from datetime import UTC, datetime
 import json
 import os
@@ -19,6 +20,9 @@ def tool(name, args):
 
 class ScriptedProvider:
     def auxiliary(self, kwargs):
+        from tests.workflow_provider_protocol import workflow_provider_reply
+        reply = workflow_provider_reply(kwargs)
+        if reply is not None: return reply
         names={row['name'] for row in kwargs.get('tools',[])}
         system=str(kwargs.get('system') or '')
         if 'select_attachment_format' in names:
@@ -74,6 +78,8 @@ def test_recall_older_telegram_document_through_chat_api_and_download(tmp_path,m
         deliver=True
         history_requested=False
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             auxiliary=self.auxiliary(kwargs)
             if auxiliary:return auxiliary
             if self.steps>=5:
@@ -142,6 +148,8 @@ def test_telegram_memory_save_then_web_recall_after_restart(tmp_path,monkeypatch
     class Memory(ScriptedProvider):
         def __init__(self,save):self.save=save;self.steps=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             auxiliary=self.auxiliary(kwargs)
             if auxiliary:return auxiliary
             names={row['name'] for row in kwargs.get('tools',[])}
@@ -187,6 +195,8 @@ def test_memory_tools_leave_plain_requests_on_one_call_fast_path(tmp_path,monkey
         class Plain:
             calls=0
             def create(self,**kwargs):
+                protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                if protocol_reply is not None: return protocol_reply
                 self.calls+=1
                 assert self.calls==1 and {r['name'] for r in kwargs['tools']}=={'request_tool_scope','terminal_exec','chat_history_search','memory_search'}
                 return response('Hello.')
@@ -207,6 +217,8 @@ def test_chat_cannot_claim_saved_memory_without_a_receipt(tmp_path,monkeypatch):
     monkeypatch.setenv('NULLION_MEMORY_ENABLED','1')
     class NoSave(ScriptedProvider):
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             auxiliary=self.auxiliary(kwargs)
             if auxiliary:return auxiliary
             names={row['name'] for row in kwargs.get('tools',[])}
@@ -265,6 +277,8 @@ def test_web_polling_recovers_attachment_without_exposing_internal_directives(tm
     class Delivery(ScriptedProvider):
         steps=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if 'select_attachment_format' in {row['name'] for row in kwargs.get('tools',[])}:
                 return tool('select_attachment_format',{'extension':'.pdf','confidence':1,'embedded_media_extensions':[]})
             auxiliary=self.auxiliary(kwargs)
@@ -330,8 +344,14 @@ def test_unresolved_document_lookup_finishes_without_inventory_or_budget_prompt(
     class Unresolved(ScriptedProvider):
         calls=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             auxiliary=self.auxiliary(kwargs)
             if auxiliary:return auxiliary
+            # Background memory/skill maintenance is not a continuation of
+            # the producer's bounded tool loop. Its messages carry their own
+            # system role instead of the top-level system argument.
+            if not kwargs.get('tools'):return response('{}')
             self.calls+=1
             if self.calls==1:return tool('request_tool_scope',{'capabilities':['conversation_history'],'tool_names':['chat_history_search']})
             if self.calls==2:return tool('chat_history_search',{'query':'Cedar','artifact_extensions':['.pdf']})
@@ -377,6 +397,9 @@ def test_retrieval_repair_delivers_original_bytes_without_exposing_writers(tmp_p
     class Recover:
         calls=0
         def create(self,**kwargs):
+            from tests.workflow_provider_protocol import workflow_provider_reply
+            auxiliary=workflow_provider_reply(kwargs)
+            if auxiliary is not None:return auxiliary
             self.calls+=1
             names={spec['name'] for spec in kwargs.get('tools',[])}
             assert not {'pdf_create','pdf_edit','file_write','file_patch','memory_save'}.intersection(names)

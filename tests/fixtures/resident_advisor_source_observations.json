@@ -1,0 +1,92 @@
+{
+  "blocker": null,
+  "completion_scope": "tool_step",
+  "goal_status": "answered",
+  "next_action": "report",
+  "observations": [
+    {
+      "label": "Event title",
+      "quote": "Club Rawhide SATURDAY NIGHT 10.24.26 w/ Word of Command, Mez Monty, Cyler Says",
+      "semantic_role": "entity",
+      "source_index": 0,
+      "value": "Club Rawhide SATURDAY NIGHT 10.24.26 w/ Word of Command, Mez Monty, Cyler Says"
+    },
+    {
+      "label": "Venue and address",
+      "quote": "Venue\nClub Rawhide\n250 W 26TH ST",
+      "semantic_role": "attribute",
+      "source_index": 1,
+      "value": "Venue\nClub Rawhide\n250 W 26TH ST"
+    },
+    {
+      "label": "City",
+      "quote": "New York City",
+      "semantic_role": "attribute",
+      "source_index": 0,
+      "value": "New York City"
+    },
+    {
+      "label": "Date and time",
+      "quote": "Date\nSat, 24 Oct 2026\n21:00 - 04:00",
+      "semantic_role": "attribute",
+      "source_index": 0,
+      "value": "Date\nSat, 24 Oct 2026\n21:00 - 04:00"
+    },
+    {
+      "label": "Complete lineup",
+      "quote": "LINEUP\nWord of Command, Mez Monty, Cyler Says",
+      "semantic_role": "attribute",
+      "source_index": 1,
+      "value": "LINEUP\nWord of Command, Mez Monty, Cyler Says"
+    },
+    {
+      "label": "Genres",
+      "quote": "Genres\nTechno\nHouse",
+      "semantic_role": "attribute",
+      "source_index": 0,
+      "value": "Genres\nTechno\nHouse"
+    },
+    {
+      "label": "Event description",
+      "quote": "The Legacy of New York Nightlife, Reimagined.\nHonoring the clubs & culture that defined Chelsea 1979-2012.\nCLUB Rawhide: Waking Up Manhattan SINCE 2026.",
+      "semantic_role": "attribute",
+      "source_index": 0,
+      "value": "The Legacy of New York Nightlife, Reimagined.\nHonoring the clubs & culture that defined Chelsea 1979-2012.\nCLUB Rawhide: Waking Up Manhattan SINCE 2026."
+    },
+    {
+      "label": "Venue",
+      "quote": "Club Rawhide",
+      "semantic_role": "entity",
+      "source_index": 0,
+      "value": "Club Rawhide"
+    },
+    {
+      "label": "Venue address",
+      "quote": "250 W 26TH ST",
+      "semantic_role": "attribute",
+      "source_index": 0,
+      "value": "250 W 26TH ST"
+    },
+    {
+      "label": "DJ/artist: Word of Command",
+      "quote": "Word of Command, Mez Monty, Cyler Says",
+      "semantic_role": "entity",
+      "source_index": 0,
+      "value": "Word of Command"
+    }
+  ],
+  "page_url": "https://ra.co/events/2556108",
+  "report_status": "completed",
+  "result_kind": "source_observations",
+  "unknowns": [],
+  "sources": [
+    {
+      "captured_at": 1792889754.7919009,
+      "page_url_ref": true
+    },
+    {
+      "captured_at": 1792889742.7141309,
+      "page_url_ref": true
+    }
+  ]
+}

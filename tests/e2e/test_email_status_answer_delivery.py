@@ -1,4 +1,5 @@
 """Real chat/API, SQLite and Telegram delivery with external account/model fakes."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio,json,os,time
 from types import SimpleNamespace
 import pytest
@@ -78,6 +79,8 @@ def test_account_status_answer_survives_mixed_searches_and_reaches_platform(tmp_
  class Model:
   calls=0
   def create(self,**kwargs):
+   protocol_reply = workflow_provider_reply(kwargs, completion=True)
+   if protocol_reply is not None: return protocol_reply
    names={t['name'] for t in kwargs.get('tools',[])}
    if not names:
     # External intent/scope selection, never a core phrase detector.
@@ -145,7 +148,7 @@ def test_account_status_answer_survives_mixed_searches_and_reaches_platform(tmp_
   reply=handle_chat_operator_message(runtime,prompt,chat_id='90200',settings=settings,model_client=model,
     agent_orchestrator=orchestrator,append_activity_trace=False,allow_mini_agents=False)
  if history_found and draft_mode!='answer' and recovery_mode!='answer':
-  answer=("time limit" if recovery_mode=='timeout' else "I read the email, but couldn't verify the answer to your question.")
+  answer=("The model timed out while preparing the response." if recovery_mode=='timeout' else "I read the email, but couldn't verify the answer to your question.")
  assert answer in reply
  assert 'Preview:' not in reply and 'From:' not in reply
  events=[e for e in runtime.store.list_conversation_events(conv) if e.get('event_type')=='conversation.chat_turn']
@@ -207,6 +210,8 @@ def test_plain_chat_latency_has_no_account_verification_call(tmp_path,monkeypatc
  class Model:
   calls=0
   def create(self,**kwargs):
+   protocol_reply = workflow_provider_reply(kwargs, completion=True)
+   if protocol_reply is not None: return protocol_reply
    self.calls+=1
    if self.calls>1:
     time.sleep(3);raise AssertionError('Optional account classifier entered the ordinary hot path')

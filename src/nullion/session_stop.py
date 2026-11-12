@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import logging
+import threading
 from typing import Any
 
 from nullion.task_frames import TaskFrameStatus
@@ -123,9 +124,24 @@ def cancel_active_task_frame(runtime: object, conversation_id: str | None) -> bo
         updated = replace(frame, status=TaskFrameStatus.CANCELLED, updated_at=datetime.now(UTC))
         store.add_task_frame(updated)
         store.set_active_task_frame_id(conversation_key, None)
-        checkpoint = getattr(runtime, "checkpoint", None)
+        add_event = getattr(store, "add_conversation_event", None)
+        if callable(add_event):
+            add_event({"event_type": "conversation.session_stopped",
+                "conversation_id": conversation_key, "frame_id": updated.frame_id, "created_at": updated.updated_at.isoformat()})
+        checkpoint = getattr(runtime, "checkpoint_conversation_events", None)
         if callable(checkpoint):
-            checkpoint()
+            try:
+                checkpoint(conversation_id=conversation_key, timeout_seconds=0.1)
+            except Exception:
+                # Cancellation is already effective in memory. The normal
+                # checkpoint can persist it after the other writer finishes.
+                logger.debug("Session cancellation checkpoint deferred", exc_info=True)
+                def persist_after_writer():
+                    try:
+                        checkpoint(conversation_id=conversation_key, timeout_seconds=60)
+                    except Exception:
+                        logger.warning("Unable to persist deferred session cancellation", exc_info=True)
+                threading.Thread(target=persist_after_writer, name="session-stop-checkpoint", daemon=True).start()
         return True
     except Exception:
         logger.debug("Unable to mark active task frame cancelled", exc_info=True)
@@ -197,7 +213,17 @@ async def stop_session_async(
             logger.debug("Unable to cancel active turn tracker tasks", exc_info=True)
     cancelled_task_count = await cancel_orchestrator_conversation(agent_orchestrator, conversation_id)
     cancelled_background_count = cancel_manual_cron_background_runs_for_conversation(conversation_id)
-    cancelled_task_frame = cancel_active_task_frame(runtime, conversation_id)
+    cancelled_task_frame = await asyncio.to_thread(cancel_active_task_frame, runtime, conversation_id)
+    # Turn cleanup deliberately retains conversation-owned browser leases for
+    # follow-ups. An explicit session stop releases that owner's leases, even
+    # when the last turn has already completed. Never run global cleanup here.
+    registry = getattr(runtime, "active_tool_registry", None)
+    cleanup = getattr(registry, "run_cleanup_hooks", None)
+    if conversation_id and callable(cleanup):
+        try:
+            await asyncio.to_thread(cleanup, scope_id=f"conversation:{conversation_id}")
+        except Exception:
+            logger.warning("Unable to release stopped conversation resources", exc_info=True)
     return SessionStopResult(
         cancelled_turn_ids=cancelled_turn_ids,
         cancelled_task_count=cancelled_task_count,

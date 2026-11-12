@@ -957,7 +957,7 @@ def _branch_name_from_input(raw: str, *, repo_key: str) -> str:
         value = f"{repo_key}-{datetime.now().strftime('%Y-%m-%d-%H%M')}"
     if "/" not in value:
         value = f"nullion/{value}"
-    check = _run(["git", "check-ref-format", "--branch", value], timeout=4)
+    check = _run(["git", "-C", str(_repo_for_key(repo_key)), "check-ref-format", "--branch", value], timeout=4)
     if not check["ok"]:
         raise ValueError(check["stderr"] or check["stdout"] or f"invalid branch name: {value}")
     return value

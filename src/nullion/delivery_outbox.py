@@ -1,11 +1,12 @@
 """Durable delivery plans and receipts, separate from completed agent work."""
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
-import sqlite3
 import time
 
 from nullion.entrypoint_guard import SingleInstanceLock
@@ -21,15 +22,11 @@ class DeliveryOutbox:
     @contextmanager
     def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.execute("""CREATE TABLE IF NOT EXISTS delivery_outbox (
-            group_id TEXT PRIMARY KEY, payload TEXT NOT NULL)""")
-        connection.commit()
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        with sqlite_connection(self.path, timeout=10) as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS delivery_outbox (
+                group_id TEXT PRIMARY KEY, payload TEXT NOT NULL)""")
+            connection.commit()
+            yield connection
 
     def get(self, group_id: str) -> dict | None:
         if self.path is None:
@@ -67,7 +64,7 @@ class DeliveryOutbox:
                     query += " AND substr(json_extract(payload,'$.conversation_id'),1,instr(json_extract(payload,'$.conversation_id'),':')-1) IN (" + ",".join("?" for _ in surfaces) + ")"
                     parameters.extend(surfaces)
                 rows = [(row[0], json.loads(row[1])) for row in connection.execute(query + " LIMIT 20", parameters)]
-        return [key for key, record in rows if record.get("status") != "delivered"
+        return [key for key, record in rows if record.get("status") in {"pending", "failed", "delivering"}
                 and (surfaces is None or record.get("conversation_id", "").partition(":")[0] in surfaces)
                 and record.get("attempts", 0) < 3 and record.get("retry_at", 0) <= time.time()][:20]
 

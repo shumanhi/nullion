@@ -1,4 +1,5 @@
 """Real chat/SQLite/browser boundaries; only the external language model is scripted."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import time
@@ -55,6 +56,8 @@ def test_inspection_unknown_observation_never_changes_scheduler(tmp_path, monkey
         mutate = False
         ordinary_calls = 0
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {d['name'] for d in kw.get('tools', [])}
             if not names:
                 time.sleep(0.4)

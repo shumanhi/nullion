@@ -24,8 +24,8 @@ separately, `calendar_plugin`; both may bind to `google_workspace_provider`.
 | `browser_plugin` | Agent browser sessions, screenshots, page inspection | Available | Auto visible browser; existing CDP URL; Playwright headless Chromium |
 | `workspace_plugin` | File/project workspace tools inside allowed roots | Available | Local filesystem |
 | `media_plugin` | Audio transcription, image OCR, optional image generation | Available | Local media tools |
-| `email_plugin` | Search/read email | Preview | Google Workspace preview; Microsoft 365 and IMAP/SMTP planned |
-| `calendar_plugin` | List calendar events | Preview | Google Workspace preview; Microsoft 365 and Apple Calendar planned |
+| `email_plugin` | Search/read email | Preview | Google Workspace, IMAP/SMTP and custom HTTP API previews; Microsoft 365 planned |
+| `calendar_plugin` | List and provider-supported create/update/respond/delete operations | Preview | Google Workspace preview; Microsoft 365 and Apple Calendar planned |
 | `messaging_plugin` | Account-level messaging tools | Planned | Telegram/Slack/Twilio style providers planned |
 
 Telegram and Web are chat adapters today. They are not the same thing as
@@ -152,7 +152,8 @@ NULLION_PROVIDER_BINDINGS=search_plugin=brave_search_provider
 NULLION_BRAVE_SEARCH_API_KEY=...
 
 # No-key fallback: leave direct search credentials unset. Nullion uses browser
-# navigation, page extraction, and screenshots for public web research.
+# navigation and page extraction for public web research. Visual capture is
+# used when the task needs it.
 NULLION_BROWSER_ENABLED=true
 NULLION_BROWSER_BACKEND=auto
 
@@ -179,8 +180,7 @@ removed.
 
 ## Chat commands
 
-These commands work from Telegram and any future chat adapter that routes
-operator commands through the platform-agnostic command handler:
+These commands use the shared operator handler on supported chat surfaces:
 
 ```text
 /plugins
@@ -226,7 +226,7 @@ specific behavior out of the kernel.
 Minimum plugin shape:
 
 ```python
-from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass
+from nullion.tools import ToolRegistry, ToolSpec, ToolResult, ToolRiskLevel, ToolSideEffectClass
 
 
 def register_example_plugin(registry: ToolRegistry, *, provider_callable) -> None:
@@ -235,10 +235,14 @@ def register_example_plugin(registry: ToolRegistry, *, provider_callable) -> Non
             name="example_lookup",
             description="Look up something through the example provider.",
             risk_level=ToolRiskLevel.LOW,
-            side_effect_class=ToolSideEffectClass.READ_ONLY,
+            side_effect_class=ToolSideEffectClass.READ,
             requires_approval=True,
+            timeout_seconds=15,
         ),
-        lambda invocation: provider_callable(invocation.arguments),
+        lambda invocation: ToolResult(
+            invocation.invocation_id, invocation.tool_name, "completed",
+            provider_callable(invocation.arguments),
+        ),
     )
     registry.mark_plugin_installed("example_plugin")
 ```
@@ -282,3 +286,16 @@ See `docs/skill-packs.md` for Google Skills and other external `SKILL.md`
 reference packs. Skill packs are deliberately separate from plugins: enabling a
 Google skill pack should not grant Gmail, Calendar, Drive, or Cloud access by
 itself.
+
+## Repeated observations
+
+A dedicated read tool can serve as a live-tracker probe only when it declares
+a positive timeout of at most 30 seconds, returns bounded structured output,
+and performs no writes, delegated agent work, or artifact capture. A successful
+setup observation must expose the fields used by the typed matcher. Session
+handles and ownership come from trusted runtime context, not arbitrary user
+arguments. See [Live tracking](live-tracking.md).
+
+Core route selection uses typed tool metadata and plans. Provider-specific
+defaults, URLs and behavior belong in the provider adapter or skill pack. Do
+not implement English keyword lists to select tools or split user requests.

@@ -9,11 +9,93 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Iterable
 from urllib.parse import quote
 from uuid import uuid4
 
 _MIN_HTML_ARTIFACT_BYTES = 64
+
+
+def demote_unrequested_source_artifacts(tool_results, *, source_only_tool_names,
+                                       requirement_contract, required_extensions) -> list[str]:
+    """A scope hint cannot make an evidence-only tool's files user outputs."""
+    def field(value, key, default=None):
+        return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+    eligible = {name for row in requirement_contract
+                if field(row, "requirement_kind") == "deliverable" and field(row, "delivery_required", True)
+                for name in field(row, "eligible_evidence_tool_names", ())}
+    formats = set(normalize_artifact_extensions(required_extensions))
+    demoted = []
+    for result in tool_results or ():
+        name = field(result, "tool_name")
+        output = field(result, "output")
+        if name not in source_only_tool_names or not isinstance(output, dict):
+            continue
+        for descriptor in output.get("artifact_descriptors") or ():
+            if not isinstance(descriptor, dict) or descriptor.get("role") != "deliverable":
+                continue
+            path = descriptor.get("path")
+            if isinstance(path, str) and (name not in eligible or artifact_format_extension(path) not in formats):
+                descriptor["role"] = ARTIFACT_ROLE_SOURCE
+                demoted.append(path)
+    return list(dict.fromkeys(demoted))
+
+
+def requested_source_artifact_candidates(tool_results, *, artifact_roots, requirement_contract=(),
+                                        required_extensions=(), promote=False) -> list[str]:
+    """Bind current source files to independently requested deliverable outcomes.
+
+    Merely taking a screenshot or reading a file does not request its delivery.
+    A validated material contract must name its producer as eligible evidence
+    and request its format. Final-version selection remains the lifecycle's job.
+    """
+    from nullion.tools import normalize_tool_status
+
+    def field(value, key, default=None):
+        return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+
+    eligible = {name for row in requirement_contract
+                if field(row, "requirement_kind") == "deliverable" and field(row, "delivery_required", True)
+                for name in field(row, "eligible_evidence_tool_names", ())}
+    formats = set(normalize_artifact_extensions(required_extensions))
+    if promote and (not eligible or not formats):
+        return []
+    paths = []
+    for result in tool_results or ():
+        if normalize_tool_status(field(result, "status")) != "completed":
+            continue
+        if promote and field(result, "tool_name") not in eligible:
+            continue
+        output = field(result, "output")
+        if not isinstance(output, dict):
+            continue
+        descriptors = output.get("artifact_descriptors")
+        if not isinstance(descriptors, list):
+            continue
+        for index, source in enumerate(descriptors):
+            if not isinstance(source, dict) or source.get("role") != ARTIFACT_ROLE_SOURCE:
+                continue
+            raw_path = source.get("path")
+            if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+                continue
+            try:
+                path = Path(raw_path).resolve()
+                if promote and artifact_format_extension(path) not in formats:
+                    continue
+                descriptor = next((value for root in artifact_roots
+                    if (value := artifact_descriptor_for_path(path, artifact_root=Path(root))) is not None), None)
+                if descriptor is None or source.get("size_bytes") != descriptor.size_bytes:
+                    continue
+                if source.get("artifact_id") and source["artifact_id"] != descriptor.artifact_id:
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            paths.append(str(path))
+            if promote:
+                descriptors[index] = {**source, **descriptor.to_dict(), "role": "deliverable",
+                    "origin": "requested_current_source_artifact"}
+    return list(dict.fromkeys(paths))
 
 
 def history_artifact_reference_paths(tool_results) -> list[str]:
@@ -245,6 +327,12 @@ def path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def artifact_format_extension(path: str | Path) -> str:
+    """Normalize a path's known format alias without inspecting user prose."""
+    suffix = Path(path).suffix.lower()
+    return ".html" if suffix == ".htm" else suffix
+
+
 def normalize_artifact_extensions(extensions: Iterable[str] | None) -> tuple[str, ...]:
     normalized: list[str] = []
     for raw_extension in extensions or ():
@@ -253,6 +341,7 @@ def normalize_artifact_extensions(extensions: Iterable[str] | None) -> tuple[str
             continue
         if not extension.startswith("."):
             extension = f".{extension}"
+        extension = artifact_format_extension("file" + extension)
         if extension not in normalized:
             normalized.append(extension)
     return tuple(normalized)
@@ -412,6 +501,7 @@ def output_has_artifact_descriptors(output: object) -> bool:
 
 def filter_source_artifact_paths(paths: Iterable[str], tool_results: Iterable[object]) -> list[str]:
     """Explicit source/intermediate roles survive prose and raw path forwarding."""
+    tool_results = tuple(tool_results or ())
     blocked: set[str] = set()
     deliverable: set[str] = set()
     excluded_extensions: set[str] = set()
@@ -434,8 +524,11 @@ def filter_source_artifact_paths(paths: Iterable[str], tool_results: Iterable[ob
             elif role in {ARTIFACT_ROLE_SOURCE, ARTIFACT_ROLE_INTERMEDIATE}:
                 blocked.add(identity(descriptor["path"]))
     blocked.difference_update(deliverable)
+    from nullion.artifact_lifecycle import restored_delivery_paths
+    restored = restored_delivery_paths(tool_results)
     return [path for path in paths if identity(path) not in blocked
-            and (".html" if Path(path).suffix.lower() == ".htm" else Path(path).suffix.lower()) not in excluded_extensions]
+            and (artifact_format_extension(path) not in excluded_extensions
+                 or identity(path) in restored)]
 
 def promote_supporting_asset_artifact_paths(
     artifact_paths: list[str] | tuple[str, ...] | None,
@@ -579,9 +672,20 @@ def artifact_path_for_generated_workspace_file(
     principal_id: str | None,
     suffix: str,
     stem: str = "nullion-artifact",
+    filename: str | None = None,
 ) -> Path:
     root = artifact_root_for_principal(principal_id)
     normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    if filename is not None:
+        # Keep the public filename independent from collision-free storage.
+        # Allocate a private export namespace rather than changing the name or
+        # overwriting another request's artifact with the same requested name.
+        if (not isinstance(filename, str) or not filename or filename in {'.', '..'}
+                or any(char in filename for char in ('/', '\\', '\0'))
+                or Path(filename).suffix.lower() != normalized_suffix.lower()):
+            raise ValueError('Use a filename with the declared artifact extension')
+        root.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix='export-', dir=root)) / filename
     return root / f"{stem}-{uuid4().hex[:12]}{normalized_suffix}"
 
 
@@ -657,6 +761,24 @@ def is_safe_artifact_path(path: Path, *, artifact_root: Path | None = None) -> b
     return False
 
 
+def _media_directive_path_text(value: str) -> str:
+    """One protocol line carries one complete path, optionally quoted."""
+    value=value.strip()
+    if value.startswith('"') and value.endswith('"'):
+        import json
+        try:
+            decoded=json.loads(value)
+        except ValueError:
+            pass
+        else:
+            if isinstance(decoded,str):
+                return decoded
+    for start,end in (('"','"'),("'","'"),('`','`'),('<','>')):
+        if len(value)>=2 and value.startswith(start) and value.endswith(end):
+            return value.strip('`') if start=='`' else value[1:-1]
+    return value
+
+
 def parse_media_directive_line(raw_line: str) -> MediaDirective | None:
     line = str(raw_line or "").strip().lstrip(_MEDIA_DIRECTIVE_STRIP_CHARS).strip()
     directive_prefix = ""
@@ -674,7 +796,7 @@ def parse_media_directive_line(raw_line: str) -> MediaDirective | None:
             candidate_prefix = line[:word_index].strip()
             if candidate_prefix and candidate_prefix.lstrip("-*•> ").strip():
                 continue
-            attachment_path = line[word_index + len(word) :].strip().split(maxsplit=1)[0].strip("`'\"<>")
+            attachment_path = _media_directive_path_text(line[word_index + len(word) :])
             if not _looks_like_attachment_path(attachment_path):
                 continue
             raw_text = str(raw_line or "")
@@ -692,7 +814,9 @@ def parse_media_directive_line(raw_line: str) -> MediaDirective | None:
     if prefix and not prefix.lstrip("-*•> ").strip():
         prefix = ""
     attachment_path = line[media_index:].removeprefix(directive_prefix).strip()
-    attachment_path = attachment_path.split(maxsplit=1)[0].strip("`'\"<>")
+    if not attachment_path:
+        return None
+    attachment_path = _media_directive_path_text(attachment_path)
     if not attachment_path:
         return None
     return MediaDirective(path=Path(attachment_path), prefix=prefix)

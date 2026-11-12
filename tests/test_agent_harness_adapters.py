@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 
 import asyncio
 from pathlib import Path
@@ -283,6 +284,8 @@ def test_langchain_adapter_keeps_replayable_arguments_for_remote_spreadsheet_ima
         "spreadsheet_create image_paths and screenshot_paths must be local artifact file paths.",
     )
 
+    result.response_requirements = {'_native_artifact_media': {'version': 1, 'extension': '.xlsx', 'required': False}}
+    result.recovered_by = ('prior-repair',)
     enriched = _with_replayable_artifact_arguments(
         result,
         {
@@ -293,6 +296,8 @@ def test_langchain_adapter_keeps_replayable_arguments_for_remote_spreadsheet_ima
 
     assert enriched.output["invocation_arguments"]["rows"][0]["image_path"] == "https://example.com/image"
     assert enriched.error == result.error
+    assert enriched.response_requirements == result.response_requirements
+    assert enriched.recovered_by == result.recovered_by
 
 
 @pytest.mark.asyncio
@@ -363,6 +368,8 @@ async def test_deepagents_default_path_tracks_artifacts_and_progress(monkeypatch
             self.calls = 0
 
         def create(self, **kwargs):
+            reply = workflow_provider_reply(kwargs)
+            if reply is not None: return reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -451,6 +458,8 @@ async def test_deepagents_default_path_can_pause_for_user_input(monkeypatch) -> 
 
     class Client:
         def create(self, **kwargs):
+            reply = workflow_provider_reply(kwargs)
+            if reply is not None: return reply
             return {
                 "stop_reason": "tool_use",
                 "content": [
@@ -575,6 +584,8 @@ async def test_scheduled_deep_agent_evidence_fallback_uses_safe_summary_on_inval
 
     class InvalidClient:
         def create(self, **kwargs):  # noqa: ANN003
+            reply = workflow_provider_reply(kwargs)
+            if reply is not None: return reply
             _ = kwargs
             return {"content": [{"type": "text", "text": "not-json"}]}
 
@@ -671,3 +682,33 @@ def test_builtin_deep_agent_profiles_infer_skills_and_subagents() -> None:
     )
     assert deep_agent_subagents_for_task(scheduled) == []
     assert deep_agent_skill_files_for_task(scheduled) == {}
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('required',[False,True])
+async def test_langchain_native_media_repair_uses_the_owning_task_contract(tmp_path,required):
+    from nullion.tools import ToolRegistry,ToolSpec,ToolRiskLevel,ToolSideEffectClass,_build_spreadsheet_create_handler
+    from nullion.langchain_adapters import nullion_tools_as_langchain_tools
+    registry=ToolRegistry(filesystem_allowed_roots=[tmp_path]);native=_build_spreadsheet_create_handler(tmp_path,allowed_roots=[tmp_path]);calls=[];results=[]
+    def create(inv):calls.append(inv);return native(inv)
+    registry.register(ToolSpec('spreadsheet_create','Native workbook',ToolRiskLevel.LOW,ToolSideEffectClass.WRITE,False,10),create)
+    context={'required_embedded_media_extensions':('.xlsx',) if required else (), 'browser_session_scope':'owned-task'}
+    adapted=nullion_tools_as_langchain_tools(registry,allowed_tools=['spreadsheet_create'],principal_id='fixture:user',
+        cleanup_scope='owned-task',tool_result_callback=results.append,tool_flow_context=context)[0]
+    args={'output_path':str(tmp_path/'result.xlsx'),'columns':['Name'],'rows':[['値53']]}
+    await adapted.ainvoke({**args,'image_paths':['https://example.invalid/not-fetched.png']})
+    assert results[0].status=='failed' and results[0].output['reason']=='remote_image_paths_not_supported'
+    assert results[0].response_requirements['_native_artifact_media']['required'] is required
+    await adapted.ainvoke(args)
+    assert results[-1].status==('failed' if required else 'completed')
+    assert len(calls)==(1 if required else 2)
+    assert all(call.flow_context==context and call.flow_context is not context for call in calls)
+
+
+def test_deep_agent_tool_context_uses_task_metadata_not_dependency_payload():
+    from types import SimpleNamespace
+    from nullion.deep_agent_runner import _task_tool_flow_context
+    config=SimpleNamespace(task=SimpleNamespace(task_id='owned',metadata={}),
+        context_in={'required_embedded_media_extensions':['.pdf']})
+    assert _task_tool_flow_context(config)['required_embedded_media_extensions']==()
+    config.task.metadata={'required_embedded_media_extensions':['.htm']}
+    assert _task_tool_flow_context(config)['required_embedded_media_extensions']==('.html',)

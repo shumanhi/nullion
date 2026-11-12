@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
@@ -14,6 +14,8 @@ import tempfile
 import threading
 import time as _time
 from typing import Any, Callable, Iterator
+
+from nullion.http_transport import SharedHttpClient, http_pool_limits
 
 try:  # pragma: no cover - import guard
     from openai import OpenAI
@@ -614,19 +616,44 @@ def _anthropic_thinking_kwargs(effort: str | None, max_tokens: int) -> dict[str,
     return {"thinking": {"type": "enabled", "budget_tokens": budget}}
 
 
+class ToolArgumentsDecodeError(ValueError):
+    """Safe protocol diagnostics; raw arguments never become executable input."""
+
+    def __init__(self, code: str, arguments: Any, *, offset: int | None = None):
+        import hashlib
+        self.diagnostic = {"code": code}
+        if isinstance(arguments, str):
+            self.diagnostic.update(argument_chars=len(arguments),
+                argument_digest=hashlib.sha256(arguments.encode()).hexdigest())
+        if offset is not None:
+            self.diagnostic["offset"] = offset
+        super().__init__(code)
+
+
 def parse_tool_arguments(arguments: Any) -> dict[str, Any]:
     if isinstance(arguments, dict):
         return dict(arguments)
     if not isinstance(arguments, str):
-        return {"arguments": arguments}
+        raise ToolArgumentsDecodeError("expected_object", arguments)
     try:
         parsed = json.loads(arguments or "{}")
-    except Exception:
-        return {"arguments": arguments}
-    return _coerce_tool_input(parsed)
+    except json.JSONDecodeError as exc:
+        raise ToolArgumentsDecodeError("invalid_json", arguments, offset=exc.pos) from None
+    if not isinstance(parsed, dict):
+        raise ToolArgumentsDecodeError("expected_object", arguments)
+    return parsed
 
 
 _parse_tool_arguments = parse_tool_arguments
+
+
+def _tool_use_block(call_id: str, name: str, arguments: Any) -> dict[str, Any]:
+    try:
+        return {"type": "tool_use", "id": call_id, "name": name,
+                "input": parse_tool_arguments(arguments)}
+    except ToolArgumentsDecodeError as exc:
+        return {"type": "tool_use", "id": call_id, "name": name,
+                "input": {}, "input_error": exc.diagnostic}
 
 
 @dataclass(slots=True)
@@ -814,8 +841,7 @@ class OpenAIChatCompletionsModelClient:
                 arguments = getattr(function, "arguments", "{}")
                 if not isinstance(name, str) or not isinstance(call_id, str):
                     continue
-                parsed_input = _parse_tool_arguments(arguments)
-                blocks.append({"type": "tool_use", "id": call_id, "name": name, "input": parsed_input})
+                blocks.append(_tool_use_block(call_id, name, arguments))
             if blocks:
                 return "tool_use", blocks
         text = getattr(message, "content", None)
@@ -866,7 +892,10 @@ class OpenAIChatCompletionsModelClient:
         response = client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         stop_reason, content = self._content_blocks_from_choice(choice)
-        return {"stop_reason": stop_reason, "content": content}
+        result = {"stop_reason": stop_reason, "content": content}
+        if getattr(choice, "finish_reason", None) == "length":
+            result["completion"] = {"status": "incomplete", "reason": "max_output_tokens"}
+        return result
 
 
 @dataclass(slots=True)
@@ -950,10 +979,13 @@ class AnthropicMessagesModelClient:
                         "input": _coerce_tool_input(getattr(block, "input", {}) or {}),
                     }
                 )
-        return {
+        result = {
             "stop_reason": "tool_use" if getattr(response, "stop_reason", None) == "tool_use" else "end_turn",
             "content": content_blocks,
         }
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            result["completion"] = {"status": "incomplete", "reason": "max_output_tokens"}
+        return result
 
     def create(
         self,
@@ -1005,6 +1037,11 @@ class CodexResponsesModelClient:
     max_tokens: int | None = None
     reasoning_effort: str | None = None
     refresh_token: str | None = None
+    _http: SharedHttpClient = field(default_factory=SharedHttpClient, repr=False, compare=False)
+
+    def close(self) -> None:
+        """Close the pool shared by this client and its model variants."""
+        self._http.close()
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -1183,13 +1220,7 @@ class CodexResponsesModelClient:
                 has_tool = True
                 call_id = item.get("call_id") or item.get("id", "")
                 args = item.get("arguments", "{}")
-                parsed = _parse_tool_arguments(args)
-                content_blocks.append({
-                    "type": "tool_use",
-                    "id": call_id,
-                    "name": item.get("name", ""),
-                    "input": parsed,
-                })
+                content_blocks.append(_tool_use_block(call_id, item.get("name", ""), args))
         stop_reason = "tool_use" if has_tool else "end_turn"
         return {"stop_reason": stop_reason, "content": content_blocks,
                 "completion": CodexResponsesModelClient._completion_metadata(data)}
@@ -1290,95 +1321,89 @@ class CodexResponsesModelClient:
                 terminal_content: list[dict[str, Any]] | None = None
                 # track in-progress function call by item index
                 fn_calls: dict[int, dict[str, Any]] = {}
-                with _httpx.Client(timeout=remaining_budget()) as client:
-                    with client.stream("POST", self._ENDPOINT, json=payload, headers=self._headers()) as resp:
-                        if resp.status_code >= 400:
-                            detail = resp.read().decode("utf-8", errors="replace")
-                            detail = " ".join(detail.split())
-                            if (
-                                resp.status_code == 401
-                                and attempt == 0
-                                and _codex_token_refreshable_response(detail)
-                                and self._refresh_access_token_after_401()
-                            ):
-                                logger.info("Recovered Codex OAuth credentials after an authentication error; retrying request once")
-                                continue
-                            if len(detail) > 500:
-                                detail = detail[:497].rstrip() + "..."
-                            raise ModelClientConfigurationError(
-                                f"Codex Responses request failed with HTTP {resp.status_code}: {detail or resp.reason_phrase}"
-                            )
-                        resp.raise_for_status()
-                        for raw_line in _deadline_response_lines(resp, request_deadline):
-                            line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].lstrip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                ev = json.loads(data_str)
-                            except Exception:
-                                continue
+                client = self._http.get(lambda: _httpx.Client(timeout=remaining_budget(), limits=http_pool_limits()))
+                with client.stream("POST", self._ENDPOINT, json=payload, headers=self._headers(), timeout=remaining_budget()) as resp:
+                    if resp.status_code >= 400:
+                        detail = resp.read().decode("utf-8", errors="replace")
+                        detail = " ".join(detail.split())
+                        if (
+                            resp.status_code == 401
+                            and attempt == 0
+                            and _codex_token_refreshable_response(detail)
+                            and self._refresh_access_token_after_401()
+                        ):
+                            logger.info("Recovered Codex OAuth credentials after an authentication error; retrying request once")
+                            continue
+                        if len(detail) > 500:
+                            detail = detail[:497].rstrip() + "..."
+                        raise ModelClientConfigurationError(
+                            f"Codex Responses request failed with HTTP {resp.status_code}: {detail or resp.reason_phrase}"
+                        )
+                    resp.raise_for_status()
+                    for raw_line in _deadline_response_lines(resp, request_deadline):
+                        line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode().strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].lstrip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            ev = json.loads(data_str)
+                        except Exception:
+                            continue
 
-                            etype = ev.get("type", "")
-                            if etype == "error":
-                                completion = self._completion_metadata({"status": "failed", "error": ev})
-                                break
-                            if etype in {"response.completed", "response.incomplete", "response.failed", "response.cancelled"}:
-                                terminal = ev.get("response")
-                                terminal = dict(terminal) if isinstance(terminal, dict) else {}
-                                terminal.setdefault("status", etype.split(".", 1)[1])
-                                completion = self._completion_metadata(terminal)
-                                if isinstance(terminal.get("output"), list) and terminal["output"]:
-                                    terminal_content = self._parse(terminal)["content"]
-                                break
+                        etype = ev.get("type", "")
+                        if etype == "error":
+                            completion = self._completion_metadata({"status": "failed", "error": ev})
+                            break
+                        if etype in {"response.completed", "response.incomplete", "response.failed", "response.cancelled"}:
+                            terminal = ev.get("response")
+                            terminal = dict(terminal) if isinstance(terminal, dict) else {}
+                            terminal.setdefault("status", etype.split(".", 1)[1])
+                            completion = self._completion_metadata(terminal)
+                            if isinstance(terminal.get("output"), list) and terminal["output"]:
+                                terminal_content = self._parse(terminal)["content"]
+                            break
 
-                            if etype == "response.output_text.delta":
-                                delta = ev.get("delta", "")
-                                text_parts.append(delta)
-                                if text_delta_callback is not None and delta:
-                                    try:
-                                        text_delta_callback(delta)
-                                    except Exception:
-                                        logger.debug("Codex Responses text delta callback failed", exc_info=True)
-                            elif etype in {
-                                "response.reasoning_summary_text.delta",
-                                "response.reasoning_text.delta",
-                            }:
-                                thinking_parts.append(ev.get("delta", ""))
+                        if etype == "response.output_text.delta":
+                            delta = ev.get("delta", "")
+                            text_parts.append(delta)
+                            if text_delta_callback is not None and delta:
+                                try:
+                                    text_delta_callback(delta)
+                                except Exception:
+                                    logger.debug("Codex Responses text delta callback failed", exc_info=True)
+                        elif etype in {
+                            "response.reasoning_summary_text.delta",
+                            "response.reasoning_text.delta",
+                        }:
+                            thinking_parts.append(ev.get("delta", ""))
 
-                            elif etype == "response.output_item.added":
-                                item = ev.get("item", {})
-                                if item.get("type") == "function_call":
-                                    idx = ev.get("output_index", len(fn_calls))
-                                    fn_calls[idx] = {
-                                        "id": item.get("call_id") or item.get("id", ""),
-                                        "name": item.get("name", ""),
-                                        "arguments": item.get("arguments", ""),
-                                    }
-                                elif item.get("type") in {"reasoning", "thinking"}:
-                                    for block in item.get("summary", []) or item.get("content", []):
-                                        if isinstance(block, dict) and isinstance(block.get("text"), str):
-                                            thinking_parts.append(block["text"])
+                        elif etype == "response.output_item.added":
+                            item = ev.get("item", {})
+                            if item.get("type") == "function_call":
+                                idx = ev.get("output_index", len(fn_calls))
+                                fn_calls[idx] = {
+                                    "id": item.get("call_id") or item.get("id", ""),
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                }
+                            elif item.get("type") in {"reasoning", "thinking"}:
+                                for block in item.get("summary", []) or item.get("content", []):
+                                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                                        thinking_parts.append(block["text"])
 
-                            elif etype == "response.function_call_arguments.delta":
-                                idx = ev.get("output_index", -1)
-                                if idx in fn_calls:
-                                    fn_calls[idx]["arguments"] += ev.get("delta", "")
+                        elif etype == "response.function_call_arguments.delta":
+                            idx = ev.get("output_index", -1)
+                            if idx in fn_calls:
+                                fn_calls[idx]["arguments"] += ev.get("delta", "")
 
-                            elif etype == "response.output_item.done":
-                                item = ev.get("item", {})
-                                if item.get("type") == "function_call":
-                                    call_id = item.get("call_id") or item.get("id", "")
-                                    args_str = item.get("arguments", "{}")
-                                    parsed_input = _parse_tool_arguments(args_str)
-                                    tool_blocks.append({
-                                        "type": "tool_use",
-                                        "id": call_id,
-                                        "name": item.get("name", ""),
-                                        "input": parsed_input,
-                                    })
+                        elif etype == "response.output_item.done":
+                            item = ev.get("item", {})
+                            if item.get("type") == "function_call":
+                                call_id = item.get("call_id") or item.get("id", "")
+                                args_str = item.get("arguments", "{}")
+                                tool_blocks.append(_tool_use_block(call_id, item.get("name", ""), args_str))
                 if completion.get("status") in {"failed", "cancelled"}:
                     code = str(completion.get("error_code") or completion["status"])
                     retryable = code in {"failed", "server_error", "temporarily_unavailable", "overloaded_error"}
@@ -1403,13 +1428,11 @@ class CodexResponsesModelClient:
             for fc in fn_calls.values():
                 if fc["id"] not in seen_ids:
                     args_str = fc.get("arguments", "{}")
-                    parsed_input = _parse_tool_arguments(args_str)
-                    tool_blocks.append({
-                        "type": "tool_use",
-                        "id": fc["id"],
-                        "name": fc["name"],
-                        "input": parsed_input,
-                    })
+                    block = _tool_use_block(fc["id"], fc["name"], args_str)
+                    # A valid-looking prefix is still not a completed call.
+                    if completion.get("status") != "completed":
+                        block["input_error"] = {"code": "unfinished_tool_call"}
+                    tool_blocks.append(block)
 
             content_blocks: list[dict[str, Any]] = []
             full_thinking = "".join(thinking_parts).strip()
@@ -1426,6 +1449,10 @@ class CodexResponsesModelClient:
                 content_blocks = terminal_content
                 tool_blocks = [block for block in content_blocks if block.get("type") == "tool_use"]
 
+            if completion.get("status") == "incomplete":
+                for block in tool_blocks:
+                    block.setdefault("input_error", {"code": "incomplete_response",
+                        "completion_reason": completion.get("reason")})
             stop_reason = "tool_use" if tool_blocks else "end_turn"
             return {"stop_reason": stop_reason, "content": content_blocks, "completion": completion}
 

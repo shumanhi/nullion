@@ -169,15 +169,11 @@ def _deferred_cron_status_from_output(output: object) -> tuple[str, str] | None:
             rows.append(f"◐ Running: {label}")
     if not rows:
         return None
-    status_text = "\n".join(
-        [
-            "⏰ **SCHEDULED TASKS**",
-            "",
-            f"Manual scheduled task runs: {len(deferred_results)}",
-            *rows,
-            "  Results will be delivered to the configured destinations when ready.",
-        ]
-    )
+    from nullion.chat_text import UserMessage, ReplySection, render_user_message
+    status_text = render_user_message(UserMessage(title='SCHEDULED TASKS',kind='scheduled',
+        summary=f'Manual scheduled task runs: {len(deferred_results)}',
+        sections=(ReplySection(items=tuple(rows)),),
+        footer='Results will be delivered to the configured destinations when ready.'))
     return group_id, status_text
 
 

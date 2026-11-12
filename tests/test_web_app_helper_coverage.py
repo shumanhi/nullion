@@ -896,9 +896,12 @@ def test_manual_cron_run_uses_job_workspace_memory_without_reinforcing(monkeypat
     monkeypatch.setattr(crons, "get_cron", lambda cron_id: job if cron_id == job.id else None)
     monkeypatch.setattr(web_app, "run_cron_delivery_workflow", fake_run_cron_delivery_workflow)
 
+    runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    monkeypatch.setattr(crons, "_runtime_db_path", lambda: tmp_path / "runtime.db")
+    crons.save_crons([job])
     registry = ToolRegistry()
     web_app.create_app(
-        bootstrap_persistent_runtime(tmp_path / "runtime.db"),
+        runtime,
         orchestrator=FakeOrchestrator(),
         registry=registry,
     )
@@ -966,9 +969,12 @@ def test_manual_web_cron_run_targets_originating_web_conversation(monkeypatch, t
     monkeypatch.setattr(crons, "get_cron", lambda cron_id: job if cron_id == job.id else None)
     monkeypatch.setattr(web_app, "run_cron_delivery_workflow", fake_run_cron_delivery_workflow)
 
+    runtime = bootstrap_persistent_runtime(tmp_path / "runtime.db")
+    monkeypatch.setattr(crons, "_runtime_db_path", lambda: tmp_path / "runtime.db")
+    crons.save_crons([job])
     registry = ToolRegistry()
     web_app.create_app(
-        bootstrap_persistent_runtime(tmp_path / "runtime.db"),
+        runtime,
         orchestrator=FakeOrchestrator(),
         registry=registry,
     )
@@ -989,8 +995,9 @@ def test_manual_web_cron_run_targets_originating_web_conversation(monkeypatch, t
     assert captured["principal_id"] == "web:chat-origin"
     assert result.output.get("mini_agent_dispatch") is None
     assert result.output["task_group_id"].startswith(f"grp-{job.id}-")
-    assert "⏰ SCHEDULED TASK: Origin scoped watcher" in result.output["progress_status_text"]
+    assert "**SCHEDULED TASK: Origin scoped watcher" in result.output["progress_status_text"]
     assert "◐ Origin scoped watcher" in result.output["progress_status_text"]
+
 
 
 def test_web_app_publishes_registry_for_tools_operator_command(tmp_path) -> None:
@@ -3698,7 +3705,8 @@ def test_reporting_doctor_and_chat_service_helpers(monkeypatch) -> None:
     web_app._report_web_client_issue(runtime, issue_type="nonsense", message="", details={"x": "y"})
     assert runtime.health_issues[0]["source"] == "web_app"
 
-    assert web_app._doctor_action_can_try_fix({"summary": "Telegram typing indicator stuck"})
+    assert web_app._doctor_action_can_try_fix({"recommendation_code": "telegram_bot_unreachable", "summary": "接続を確認"})
+    assert not web_app._doctor_action_can_try_fix({"summary": "Telegram typing indicator stuck"})
     assert not web_app._doctor_action_can_try_fix({"summary": "unrelated"})
     with pytest.raises(ValueError):
         web_app._try_doctor_fix({"summary": "unrelated"})
@@ -4213,8 +4221,9 @@ def test_manual_web_cron_uses_shared_single_agent_runner(tmp_path, monkeypatch) 
     assert flow_context["browser_session_scope"].startswith("cron-cron-single-fast-")
     assert "mini_agent_dispatch" not in result.output
     assert result.output["task_group_id"].startswith(f"grp-{job.id}-")
-    assert "⏰ SCHEDULED TASK: Single fast cron" in result.output["progress_status_text"]
+    assert "**SCHEDULED TASK: Single fast cron" in result.output["progress_status_text"]
     assert "◐ Single fast cron" in result.output["progress_status_text"]
+
 
 
 def test_manual_web_cron_ignores_multi_task_preview_and_stays_single_agent(tmp_path, monkeypatch) -> None:
@@ -4272,8 +4281,9 @@ def test_manual_web_cron_ignores_multi_task_preview_and_stays_single_agent(tmp_p
     assert captured["conversation_id"] == "web:multi-deep"
     assert "mini_agent_dispatch" not in result.output
     assert result.output["task_group_id"].startswith(f"grp-{job.id}-")
-    assert "⏰ SCHEDULED TASK: Multi deep cron" in result.output["progress_status_text"]
+    assert "**SCHEDULED TASK: Multi deep cron" in result.output["progress_status_text"]
     assert "◐ Multi deep cron" in result.output["progress_status_text"]
+
 
 
 def test_web_attachment_extension_preflight_uses_literal_evidence_without_model(monkeypatch) -> None:
@@ -5186,6 +5196,7 @@ def test_run_web_server_bounds_graceful_shutdown(monkeypatch) -> None:
             "port": 8742,
             "reload": False,
             "timeout_graceful_shutdown": 5,
+            "timeout_keep_alive": 75,
         }
     ]
 

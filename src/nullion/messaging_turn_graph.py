@@ -138,6 +138,7 @@ def _coerce_stored_tool_results(raw_results: object) -> list[object]:
                 str(item.get("status") or ""),
                 output if isinstance(output, dict) else {},
                 str(item.get("error")) if item.get("error") is not None else None,
+                response_requirements=item.get("response_requirements") if isinstance(item.get("response_requirements"), dict) else None,
             )
         )
     return results
@@ -1635,6 +1636,10 @@ def _required_attachment_extensions_for_platform_delivery(
     artifact_paths: list[str],
     tool_results: list[object] | None = None,
 ) -> tuple[str, ...]:
+    from nullion.request_delivery_requirements import reviewed_request_delivery_requirements
+    reviewed = reviewed_request_delivery_requirements(tool_results, request_text)
+    if reviewed is not None:
+        return tuple(reviewed['required_attachment_extensions'])
     try:
         from nullion.chat_operator import _requested_attachment_extensions
 
@@ -1988,16 +1993,24 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
         local_discovery_or_sidecar = False
     if local_discovery_or_sidecar:
         stored_artifact_paths = []
-        discovery_reply = _local_discovery_reply_from_tool_results(stored_tool_results)
-        if discovery_reply:
-            delivery_text = discovery_reply
-        elif stored_reply:
-            stored_media_paths = tuple(str(path) for path in _media_paths_from_reply_text(stored_reply))
-            delivery_text = (
-                _strip_media_lines_for_paths(stored_reply, stored_media_paths)
-                if stored_media_paths
-                else stored_reply
-            )
+        # A source read can support an answer without delivering its input.
+        # Attachment suppression must not replace a composed answer with an
+        # inventory of the files used to obtain it.
+        from nullion.response_sanitizer import is_raw_tool_payload_reply
+        from nullion.chat_operator import (_local_discovery_only_has_file_identities,
+            _local_discovery_paths_from_tool_results, _composed_local_discovery_reply_paths)
+        identity_only = _local_discovery_only_has_file_identities([
+            item for item in stored_tool_results
+            if str(getattr(item, "tool_name", "")) not in _LOCAL_DISCOVERY_CLEANUP_TOOL_NAMES])
+        selected_identity = _composed_local_discovery_reply_paths(str(delivery_text or ""),
+            _local_discovery_paths_from_tool_results(stored_tool_results), stored_tool_results)
+        if (identity_only and not selected_identity) or not str(delivery_text or "").strip() or is_raw_tool_payload_reply(
+                reply=delivery_text, tool_results=stored_tool_results):
+            delivery_text = _local_discovery_reply_from_tool_results(stored_tool_results) or delivery_text
+        if isinstance(delivery_text, str):
+            source_media = tuple(str(path) for path in _media_paths_from_reply_text(delivery_text))
+            if source_media:
+                delivery_text = _strip_media_lines_for_paths(delivery_text, source_media)
     if isinstance(delivery_text, str):
         previous_delivery_text = delivery_text
         delivery_text = _browser_extract_text_fallback_for_unrequested_screenshot(
@@ -2108,6 +2121,7 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
     delivery = prepare_reply_for_platform_delivery(
         delivery_text,
         principal_id=principal_id,
+        tool_results=stored_tool_results,
         delivery_contract=delivery_contract_for_turn(
                 request.text,
                 reply=delivery_text,
@@ -2118,10 +2132,11 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
                 # false attachment failure on Web and messaging surfaces.
                 requires_attachment_delivery=bool(
                     not completed_run_cron_reply
+                    and not local_discovery_or_sidecar
                     and (stored_artifact_paths or required_attachment_extensions)
                 ),
                 required_attachment_extensions=(
-                    () if completed_run_cron_reply else required_attachment_extensions
+                    () if completed_run_cron_reply or local_discovery_or_sidecar else required_attachment_extensions
                 ),
             ),
         )
@@ -2129,7 +2144,7 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
     attachment_paths = [str(path) for path in delivery.attachments]
     if local_discovery_or_sidecar:
         attachment_paths = []
-        response_text = _local_discovery_reply_from_tool_results(stored_tool_results) or response_text
+        response_text = response_text or _local_discovery_reply_from_tool_results(stored_tool_results)
     elif stored_artifact_paths and (
         not _same_path_set(attachment_paths, stored_artifact_paths)
         or str(response_text or "").strip() in _ATTACHMENT_FAILURE_TEXTS
@@ -2158,12 +2173,8 @@ def run_platform_chat_request(runtime: object, request: PlatformChatRequest) -> 
         )
     from nullion.artifact_lifecycle import filter_delivery_paths
     attachment_paths = filter_delivery_paths(attachment_paths, stored_tool_results)
-    from nullion.artifact_lifecycle import artifact_review_unavailable_reply
-    review_notice = artifact_review_unavailable_reply(stored_tool_results)
-    if attachment_paths and review_notice:
-        response_text = review_notice
     from nullion.artifact_lifecycle import artifact_terminal_failure_reply
-    failure_notice = artifact_terminal_failure_reply(stored_tool_results)
+    failure_notice = artifact_terminal_failure_reply(stored_tool_results, user_message=request.text)
     if not attachment_paths and failure_notice:
         response_text = failure_notice
     return PlatformChatResponse(
@@ -2187,6 +2198,7 @@ class MessagingTurnState(TypedDict, total=False):
     raw_reply: str | None
     raw_artifact_paths: tuple[str, ...]
     raw_reply_already_sent: bool
+    tool_results: tuple[object, ...]
     visible_reply: str | None
     reply: str | None
     artifact_paths: tuple[str, ...]
@@ -2195,6 +2207,7 @@ class MessagingTurnState(TypedDict, total=False):
     status: Literal["running", "reply_ready", "no_reply"]
     turn_dispatch_decision: Any
     text_delta_callback: Any
+    cancellation_checker: Any
     activity_callback: Any
 
 
@@ -2205,6 +2218,7 @@ class MessagingTurnResult:
     status: Literal["reply_ready", "no_reply"]
     reply_already_sent: bool = False
     artifact_paths: tuple[str, ...] = ()
+    tool_results: tuple[object, ...] = ()
 
 
 def _capture_decision_snapshot_node(state: MessagingTurnState) -> dict[str, object]:
@@ -2243,6 +2257,8 @@ def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
         kwargs["turn_dispatch_decision"] = state.get("turn_dispatch_decision")
     if _handle_text_message_accepts_kw(handler, "text_delta_callback"):
         kwargs["text_delta_callback"] = state.get("text_delta_callback")
+    if _handle_text_message_accepts_kw(handler, "cancellation_checker"):
+        kwargs["cancellation_checker"] = state.get("cancellation_checker")
     if _handle_text_message_accepts_kw(handler, "activity_callback"):
         kwargs["activity_callback"] = state.get("activity_callback")
     if _handle_text_message_accepts_kw(handler, "conversation_ingress_id"):
@@ -2256,6 +2272,7 @@ def _run_service_node(state: MessagingTurnState) -> dict[str, object]:
     reply = getattr(raw_reply, "text", raw_reply)
     return {
         "raw_reply": reply,
+        "tool_results": tuple(getattr(raw_reply, "tool_results", ()) or ()),
         "raw_artifact_paths": artifact_paths,
         "raw_reply_already_sent": bool(getattr(raw_reply, "reply_already_sent", False)),
     }
@@ -2337,6 +2354,7 @@ def run_messaging_turn_graph(
     turn_dispatch_decision=None,
     text_delta_callback=None,
     activity_callback=None,
+    cancellation_checker=None,
 ) -> MessagingTurnResult:
     final_state = _compiled_messaging_turn_graph().invoke(
         {
@@ -2345,6 +2363,7 @@ def run_messaging_turn_graph(
             "turn_dispatch_decision": turn_dispatch_decision,
             "text_delta_callback": text_delta_callback,
             "activity_callback": activity_callback,
+            "cancellation_checker": cancellation_checker,
         },
         config={"configurable": {"thread_id": ingress.request_id or ingress.operator_chat_id}},
     )
@@ -2359,6 +2378,7 @@ def run_messaging_turn_graph(
         delivery_contract=delivery_contract,
         status=status,
         reply_already_sent=bool(final_state.get("reply_already_sent")),
+        tool_results=tuple(final_state.get("tool_results") or ()),
         artifact_paths=tuple(
             str(path)
             for path in final_state.get("artifact_paths", ()) or ()

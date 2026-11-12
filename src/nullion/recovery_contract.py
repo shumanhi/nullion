@@ -8,6 +8,7 @@ about a command's effects.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from nullion.tools import ToolResult, ToolSideEffectClass
 
@@ -17,6 +18,7 @@ class RequestRecoveryContract:
     decision: object
     action_tools: frozenset[str]
     source_tags: frozenset[str] = frozenset()
+    packaging_sources: frozenset[str] = frozenset()
 
     @classmethod
     def from_registry(cls, registry):
@@ -43,6 +45,43 @@ class RequestRecoveryContract:
                 source_tags.update(set(spec.capability_tags) - {"connector", "account_read", "account_write"})
         return cls(decision, frozenset(actions), frozenset(source_tags))
 
+    def for_artifact_packaging(self, request):
+        """Continue a runtime-selected deliverable, without granting other writes."""
+        if not isinstance(request, dict) or not self.decision.requested_artifact_extensions:
+            return self
+        linked, retained = request.get("linked_paths"), request.get("retained_paths")
+        if not isinstance(linked, list) or not linked or not isinstance(retained, list):
+            return self
+        from nullion.artifact_evidence import artifact_structure_evidence
+        from urllib.parse import urlparse, unquote
+        sources = set()
+        for raw in linked:
+            if not isinstance(raw, str):
+                return self
+            path = Path(raw).resolve()
+            if path.suffix.lower() not in {".html", ".htm"} or not path.is_file():
+                return self
+            evidence = artifact_structure_evidence(path)
+            assets = evidence.get("linked_local_image_assets")
+            if not assets or evidence.get("linked_local_image_assets_complete") is not True:
+                return self
+            sources.add(str(path))
+            for asset in assets:
+                parsed = urlparse(str(asset.get("reference") or ""))
+                if parsed.scheme not in {"", "file"} or parsed.netloc not in {"", "localhost"}:
+                    return self
+                dependency = (path.parent / unquote(parsed.path)).resolve()
+                if not dependency.is_file():
+                    return self
+                sources.add(str(dependency))
+        original = self.decision
+        decision = replace(original,
+            requested_tool_names=tuple(dict.fromkeys((*original.requested_tool_names, "archive_create"))),
+            requested_artifact_extensions=tuple(dict.fromkeys((*original.requested_artifact_extensions, ".zip"))),
+            excluded_artifact_extensions=tuple(extension for extension in original.excluded_artifact_extensions if extension != ".zip"))
+        return replace(self, decision=decision, action_tools=self.action_tools | {"archive_create"},
+            packaging_sources=frozenset(sources))
+
     def bind(self, registry):
         if isinstance(registry, RequestRecoveryRegistry) and registry.contract is self:
             return registry
@@ -57,8 +96,15 @@ class RequestRecoveryRegistry:
         self.contract = contract
         current = getattr(delegate, "turn_tool_scope_decision", None)
         original = contract.decision
+        # A runtime-approved bundle may replace an intermediate HTML format.
+        # Preserve standalone siblings unless a new typed scope excludes that
+        # member format; never let discovery change any other output contract.
+        packaged_exclusions = (set(getattr(current, "excluded_artifact_extensions", ())).intersection({".html", ".htm"})
+            if contract.packaging_sources else set())
         self.turn_tool_scope_decision = replace(current,
+            evidence_policy=original.evidence_policy,
             requested_outcome=original.requested_outcome,
+            tracking_mode=original.tracking_mode,
             scheduler_effect_actions=original.allowed_scheduler_actions,
             connector_source_user_requested=original.connector_source_user_requested,
             connector_source_evidence=original.connector_source_evidence,
@@ -66,9 +112,9 @@ class RequestRecoveryRegistry:
             source_artifact_delivery_requested=original.source_artifact_delivery_requested,
             source_artifact_request_evidence=original.source_artifact_request_evidence,
             source_artifact_retrieval_only=original.source_artifact_retrieval_only,
-            excluded_artifact_extensions=original.excluded_artifact_extensions,
-            requested_artifact_extensions=original.requested_artifact_extensions,
-            required_embedded_media_extensions=original.required_embedded_media_extensions,
+            excluded_artifact_extensions=tuple(dict.fromkeys((*original.excluded_artifact_extensions, *sorted(packaged_exclusions)))),
+            requested_artifact_extensions=tuple(extension for extension in original.requested_artifact_extensions if extension not in packaged_exclusions),
+            required_embedded_media_extensions=tuple(extension for extension in original.required_embedded_media_extensions if extension not in packaged_exclusions),
             required_tool_names=tuple(dict.fromkeys((*original.required_tool_names,
                 *(name for name in current.required_tool_names if self._effect_allowed(name))))),
         ) if current is not None else original
@@ -83,6 +129,10 @@ class RequestRecoveryRegistry:
             spec = self._delegate.get_spec(name)
         except KeyError:
             return False
+        if self.contract.decision.evidence_policy == 'retained':
+            from nullion.turn_context_policy import tool_uses_external_observation
+            if tool_uses_external_observation(spec):
+                return False
         if spec.side_effect_class == ToolSideEffectClass.DANGEROUS_EXEC:
             # This is availability, not approval or a read-only shell sandbox.
             return True
@@ -124,9 +174,45 @@ class RequestRecoveryRegistry:
             return ToolResult(invocation.invocation_id, invocation.tool_name, "denied",
                 {"reason": "turn_effect_not_authorized"},
                 error="Recovery cannot add an action absent from the original request plan.")
+        if invocation.tool_name == "archive_create" and self.contract.packaging_sources:
+            # A recovery-only packager may include the selected page and its
+            # captured dependencies, never an unrelated workspace directory.
+            arguments = invocation.arguments
+            raw_sources = list(arguments.get("source_paths") or ())
+            if arguments.get("source_dir"):
+                raw_sources.append(arguments["source_dir"])
+            sources = set()
+            try:
+                for raw in raw_sources:
+                    path = Path(raw).expanduser().resolve()
+                    if path.is_file():
+                        sources.add(str(path))
+                    elif path.is_dir():
+                        for member in path.rglob("*"):
+                            if member.is_file():
+                                sources.add(str(member.resolve()))
+                            if len(sources) > len(self.contract.packaging_sources):
+                                break
+                allowed = sources and sources.issubset(self.contract.packaging_sources)
+            except (OSError, TypeError, ValueError):
+                allowed = False
+            if not allowed:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "denied",
+                    {"reason": "artifact_packaging_sources_not_selected",
+                     "selected_source_paths": sorted(self.contract.packaging_sources)},
+                    error="Package only the selected HTML and its existing image dependencies using exact source_paths.")
         return self._delegate.invoke(invocation)
 
+    def prepare_artifact_packaging(self, request):
+        if self.contract.packaging_sources:
+            return self
+        contract = self.contract.for_artifact_packaging(request)
+        return contract.bind(self._delegate) if contract is not self.contract else self
+
     def apply_scope_request(self, invocation):
+        prepared = self.prepare_artifact_packaging((invocation.flow_context or {}).get("artifact_packaging_request"))
+        if prepared is not self:
+            return prepared.apply_scope_request(invocation)
         apply = getattr(self._delegate, "apply_scope_request", None)
         if not callable(apply):
             return ToolResult(invocation.invocation_id, invocation.tool_name, "denied",
@@ -145,6 +231,7 @@ class RequestRecoveryRegistry:
                         if name in self.contract.decision.required_tool_names or bound._effect_allowed(name)]
             decision = bound.turn_tool_scope_decision
             output.update(
+                evidence_policy=decision.evidence_policy,
                 requested_outcome=decision.requested_outcome,
                 scheduler_effect_actions=list(decision.allowed_scheduler_actions),
                 connector_source_user_requested=decision.connector_source_user_requested,

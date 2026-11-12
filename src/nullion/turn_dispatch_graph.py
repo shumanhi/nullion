@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 import json
@@ -13,6 +14,7 @@ import threading
 import time
 from typing import TypedDict
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from langgraph.graph import END, START, StateGraph
 
@@ -349,6 +351,69 @@ def route_turn_dispatch_with_context(
     return TurnDispatchDecision(policy=TurnDispatchPolicy.PARALLEL)
 
 
+class TurnPublicationRevoked(BaseException):
+    """A superseded publication is control flow, never a transport retry."""
+
+
+class TurnPublicationGate:
+    """Revoke obsolete generations and pause publication during overlap decisions."""
+
+    def __init__(self, *, on_revoke=None) -> None:
+        self._on_revoke = on_revoke
+        self._ready = asyncio.Event()
+        self._ready.set()
+        self._revoked = threading.Event()
+        self._pending = 0
+
+    def hold(self) -> None:
+        self._pending += 1
+        self._ready.clear()
+
+    def release(self) -> None:
+        self._pending = max(0, self._pending - 1)
+        if not self._pending:
+            self._ready.set()
+
+    def revoke(self) -> None:
+        if self.revoked:
+            return
+        self._revoked.set()
+        self._ready.set()
+        if self._on_revoke is not None:
+            try:
+                self._on_revoke()
+            except Exception:
+                logger.warning("Could not persist turn publication revocation", exc_info=True)
+
+    @property
+    def revoked(self) -> bool:
+        return self._revoked.is_set()
+
+    def can_publish(self) -> bool:
+        return not self.revoked and self._ready.is_set()
+
+    def guard(self, operation, *, withdraw=None):
+        async def guarded(*args, **kwargs):
+            if not await self.wait():
+                raise TurnPublicationRevoked()
+            result = await operation(*args, **kwargs)
+            if not await self.wait():
+                if withdraw is not None:
+                    try:
+                        await withdraw(result)
+                    except Exception:
+                        logger.warning("Could not withdraw superseded delivery", exc_info=True)
+                raise TurnPublicationRevoked()
+            return result
+        return guarded
+
+    async def wait(self) -> bool:
+        if self.revoked:
+            return False
+        await self._ready.wait()
+        return not self.revoked
+
+
 @dataclass(slots=True)
 class ActiveTurnRegistration:
     conversation_id: str
@@ -356,15 +421,18 @@ class ActiveTurnRegistration:
     decision: TurnDispatchDecision
     dependency_tasks: tuple[asyncio.Task, ...]
     cancellation_event: threading.Event
+    publication_gate: TurnPublicationGate
     _tracker: "AsyncTurnDispatchTracker"
     _finished: bool = False
+    finish_after_processing: bool = True
 
     async def __aenter__(self) -> "ActiveTurnRegistration":
         await self.wait_for_dependencies()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
-        await self.finish()
+        if self.finish_after_processing:
+            await self.finish()
 
     async def wait_for_dependencies(self) -> None:
         for dependency_task in self.dependency_tasks:
@@ -384,7 +452,8 @@ class ActiveTurnRegistration:
         await self._tracker.finish(self.conversation_id, self.turn_id)
 
     async def is_superseded(self) -> bool:
-        return await self._tracker.is_superseded(self.conversation_id, self.turn_id)
+        await self.publication_gate.wait()
+        return self.publication_gate.revoked
 
     def is_cancelled(self) -> bool:
         return self.cancellation_event.is_set()
@@ -395,6 +464,8 @@ class AsyncTurnDispatchTracker:
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
+        self._admission_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._publication_by_conversation: dict[str, dict[str, TurnPublicationGate]] = {}
         self._tasks_by_conversation: dict[str, dict[str, asyncio.Task]] = {}
         self._order_by_conversation: dict[str, list[str]] = {}
         self._text_by_conversation: dict[str, dict[str, str]] = {}
@@ -411,6 +482,39 @@ class AsyncTurnDispatchTracker:
         model_client: object | None = None,
         reply_context: dict[str, object] | None = None,
         active_turn_followup_evidence: bool = False,
+        finish_after_processing: bool = True,
+        runtime_store=None,
+    ) -> ActiveTurnRegistration:
+        conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
+        # Serialise only overlapping admission decisions for this conversation.
+        # Waiting successors then observe the revision that preceded them.
+        admission = self._admission_locks.setdefault(conversation_key, asyncio.Lock())
+        async with admission:
+            async with self._lock:
+                held = tuple(self._publication_by_conversation.get(conversation_key, {}).values())
+                for gate in held:
+                    gate.hold()
+            try:
+                return await self._register(conversation_id, text, turn_id=turn_id, task=task,
+                    model_client=model_client, reply_context=reply_context,
+                    active_turn_followup_evidence=active_turn_followup_evidence,
+                    finish_after_processing=finish_after_processing, runtime_store=runtime_store)
+            finally:
+                for gate in held:
+                    gate.release()
+
+    async def _register(
+        self,
+        conversation_id: object,
+        text: object,
+        *,
+        turn_id: object | None = None,
+        task: asyncio.Task | None = None,
+        model_client: object | None = None,
+        reply_context: dict[str, object] | None = None,
+        active_turn_followup_evidence: bool = False,
+        finish_after_processing: bool = True,
+        runtime_store=None,
     ) -> ActiveTurnRegistration:
         conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
         turn_key = _normalize_key(turn_id, fallback=f"turn-{uuid4().hex[:12]}")
@@ -483,7 +587,24 @@ class AsyncTurnDispatchTracker:
                     for dependency_turn_id in decision.dependency_turn_ids
                     if dependency_turn_id in active_tasks and active_tasks[dependency_turn_id] is not current_task
                 )
+                for dependency_turn_id in decision.dependency_turn_ids:
+                    if dependency_turn_id not in active_tasks or active_tasks[dependency_turn_id] is current_task:
+                        continue
+                    gate = self._publication_by_conversation.get(conversation_key, {}).get(dependency_turn_id)
+                    if gate is not None:
+                        gate.revoke()
+                    cancel = self._cancel_events_by_conversation.get(conversation_key, {}).get(dependency_turn_id)
+                    if cancel is not None:
+                        cancel.set()
             cancellation_event = threading.Event()
+            def record_revocation():
+                if runtime_store is not None:
+                    runtime_store.add_conversation_event({
+                        "event_type": "conversation.reply_superseded", "conversation_id": conversation_key,
+                        "turn_id": turn_key, "created_at": datetime.now(timezone.utc).isoformat(),
+                    })
+            publication_gate = TurnPublicationGate(on_revoke=record_revocation)
+            self._publication_by_conversation.setdefault(conversation_key, {})[turn_key] = publication_gate
             active_tasks[turn_key] = current_task
             self._order_by_conversation.setdefault(conversation_key, []).append(turn_key)
             self._text_by_conversation.setdefault(conversation_key, {})[turn_key] = str(text or "")
@@ -494,13 +615,20 @@ class AsyncTurnDispatchTracker:
             decision=decision,
             dependency_tasks=dependency_tasks,
             cancellation_event=cancellation_event,
+            publication_gate=publication_gate,
             _tracker=self,
+            finish_after_processing=finish_after_processing,
         )
 
     async def finish(self, conversation_id: object, turn_id: object) -> None:
         conversation_key = _normalize_key(conversation_id, fallback="conversation:default")
         turn_key = _normalize_key(turn_id, fallback="")
         async with self._lock:
+            publications = self._publication_by_conversation.get(conversation_key)
+            if publications is not None:
+                publications.pop(turn_key, None)
+                if not publications:
+                    self._publication_by_conversation.pop(conversation_key, None)
             active_tasks = self._tasks_by_conversation.get(conversation_key)
             if active_tasks is not None:
                 active_tasks.pop(turn_key, None)
@@ -562,7 +690,11 @@ class AsyncTurnDispatchTracker:
             active_texts = self._text_by_conversation.get(conversation_key)
             active_order = self._order_by_conversation.get(conversation_key)
             cancel_events = self._cancel_events_by_conversation.get(conversation_key)
+            publications = self._publication_by_conversation.get(conversation_key, {})
             for turn_key, _task in tasks_to_cancel:
+                gate = publications.pop(turn_key, None)
+                if gate is not None:
+                    gate.revoke()
                 if cancel_events is not None:
                     cancel_event = cancel_events.pop(turn_key, None)
                     if cancel_event is not None:
@@ -602,6 +734,7 @@ __all__ = [
     "GLOBAL_TURN_DISPATCH_TRACKER",
     "TurnDispatchDecision",
     "TurnDispatchPolicy",
+    "TurnPublicationGate",
     "route_turn_dispatch",
     "route_turn_dispatch_with_context",
 ]

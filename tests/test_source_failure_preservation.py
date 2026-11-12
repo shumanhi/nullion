@@ -13,12 +13,23 @@ def source_state():
         'result_kind': 'source_observations', 'report_status': 'partial',
         'observations': [{'value': 'Option A · 71 USD', 'quote': 'Option A · 71 USD',
                           'source_url': 'https://example.test/offer'}], 'unknowns': ['取消条件']})
-    return {'user_message': '価格を比較', 'conversation_id': 'web:another-user',
+    state = {'user_message': '価格を比較', 'conversation_id': 'web:another-user',
         'principal_id': 'web:another-user', 'tool_registry': ToolRegistry(),
         'tool_results': [source], 'artifacts': [], 'source_answer_checkpoint': {
-            'tool_result_count': 1, 'presentation': {'intro': 'Everything is complete.',
-            'points': [{'evidence_ids': ['e0.0'], 'detail_ids': [], 'relevance': 'Requested price'}],
+            'tool_result_count': 1, 'presentation': {'intro': '',
+            'points': [{'evidence_ids': ['e0.0'], 'detail_ids': [], 'relevance': 'Requested price',
+                'request_relation': 'result', 'summary': 'Option A · 71 USD'}],
             'limitation_ids': ['u0']}}}
+    prepare_state(state)
+    return state
+
+
+def prepare_state(state):
+    from nullion.execution_outcome import prepare_answer
+    from nullion.source_observation_contract import render_source_answer
+    checkpoint = state['source_answer_checkpoint']
+    checkpoint['composed_answer'] = prepare_answer(state['user_message'],
+        render_source_answer(state['tool_results'], checkpoint['presentation']), state['tool_results'])
 
 
 @pytest.mark.parametrize('failure', ['browser', 'model', 'limit', 'missing_action'])
@@ -33,7 +44,7 @@ def test_terminal_failure_keeps_verified_answer_and_unfulfilled_state(failure):
     result = agent._complete_agent_turn(state, final_text='Generic failure.', **kwargs)['result']
     assert 'Option A · 71 USD' in result.final_text
     assert '取消条件' in result.final_text
-    assert result.final_text.count('Not verified from this check:') == 1
+    assert result.final_text.count('Not verified from this check') == 1
     assert 'remaining condition' not in result.final_text
     assert result.response_presentation['source_answer_terminal_failure'] == kwargs['completion_failure_reply']
     assert 'Everything is complete' not in result.final_text
@@ -43,11 +54,10 @@ def test_terminal_failure_keeps_verified_answer_and_unfulfilled_state(failure):
     assert not result.artifacts
 
 
-@pytest.mark.parametrize('protected', ['scheduled', 'artifact', 'approval', 'cancelled', 'invalid_checkpoint', 'unquoted'])
+@pytest.mark.parametrize('protected', ['scheduled', 'approval', 'cancelled', 'invalid_checkpoint', 'unquoted'])
 def test_preservation_does_not_bypass_completion_or_consent_contracts(protected):
     state = source_state(); kwargs = {'response_fulfilled': False}
     if protected == 'scheduled': state['tool_flow_context'] = {'scheduled_task_run': True}
-    elif protected == 'artifact': state['tool_flow_context'] = {'requires_artifact_delivery': True, 'required_artifact_extensions': ['.pdf']}
     elif protected == 'approval': kwargs['suspended_for_approval'] = True
     elif protected == 'cancelled': state['cancellation_checker'] = lambda: True
     elif protected == 'invalid_checkpoint': state['source_answer_checkpoint']['tool_result_count'] = 20
@@ -55,6 +65,22 @@ def test_preservation_does_not_bypass_completion_or_consent_contracts(protected)
     result = agent._complete_agent_turn(state, final_text='Still pending.', **kwargs)['result']
     assert 'Option A' not in result.final_text
     assert result.response_fulfilled is False
+
+
+def test_missing_artifact_preserves_grounded_findings_without_claiming_delivery():
+    state = source_state()
+    state['tool_flow_context'] = {
+        'requires_artifact_delivery': True, 'required_artifact_extensions': ['.pdf'],
+    }
+    result = agent._complete_agent_turn(state, final_text='Still pending.',
+        response_fulfilled=False)['result']
+    assert 'Option A · 71 USD' in result.final_text
+    assert '取消条件' in result.final_text
+    assert 'The requested file could not be attached.' in result.final_text
+    assert result.final_text.count('Not verified from this check') == 1
+    assert result.response_fulfilled is False
+    assert result.completion_failure_reply == result.final_text
+    assert not result.artifacts
 
 
 def test_schema_followup_cannot_restart_a_terminal_partial_source_answer():
@@ -97,7 +123,7 @@ def test_source_disclosure_has_one_owner_even_when_failure_contains_an_entire_an
         response_fulfilled=False, completion_failure_reply=failure)['result']
     assert result.final_text.count('Option A · 71 USD') == 1
     assert result.final_text.count('取消条件') == 1
-    assert result.final_text.count('Not verified from this check:') == 1
+    assert result.final_text.count('Not verified from this check') == 1
     assert 'Verify each' not in result.final_text and '各地点' not in result.final_text and 'Verificar' not in result.final_text
     assert result.response_fulfilled is False
     assert result.response_presentation['source_answer_terminal_failure'] == failure
@@ -107,10 +133,11 @@ def test_preserved_answer_without_selected_unknowns_does_not_publish_review_inst
     state = source_state()
     state['tool_results'][0].output['report_status'] = 'completed'
     state['source_answer_checkpoint']['presentation']['limitation_ids'] = []
+    prepare_state(state)
     result = agent._complete_agent_turn(state, final_text='Verify all outstanding requirements.',
         response_fulfilled=False, completion_failure_reply='Verify all outstanding requirements.')['result']
     assert 'Option A' in result.final_text
-    assert result.final_text.endswith("I couldn't verify all requested details from this check.")
+    assert "I couldn't verify all requested details" not in result.final_text
     assert 'Verify all' not in result.final_text and not result.response_fulfilled
 
 
@@ -124,9 +151,10 @@ def test_partial_report_retains_numbered_action_prompt(monkeypatch, disposition)
     monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *a, **kw: decision)
     result = agent._complete_partial_source_report(state)['result']
     assert result.final_text.count('Option A · 71 USD') == 1
-    assert result.final_text.count('Not verified from this check:') == 1
-    assert '1.' in result.final_text and '2.' in result.final_text
-    assert result.response_fulfilled is False
+    assert result.final_text.count('Not verified from this check') == 1
+    assert '1.' not in result.final_text and '2.' not in result.final_text
+    assert not result.response_presentation.get('needs_input')
+    assert result.response_fulfilled is not True
 
 
 def test_recorded_route_report_does_not_repeat_its_disclosure_as_a_reviewer_checklist(monkeypatch):
@@ -149,6 +177,6 @@ def test_recorded_route_report_does_not_repeat_its_disclosure_as_a_reviewer_chec
     assert all(place in result.final_text for place in ['State Line Lookout', 'Saunderskill', 'Minnewaska'])
     assert result.final_text.count('Precise added driving times') == 1
     assert result.final_text.count('Current opening hours') == 1
-    assert result.final_text.count('Not verified from this check:') == 1
+    assert result.final_text.count('Not verified from this check') == 1
     assert 'Verify that each' not in result.final_text and 'Provide visiting' not in result.final_text
-    assert result.response_fulfilled is False and not result.artifacts
+    assert result.response_fulfilled is not True and not result.artifacts

@@ -1,4 +1,5 @@
-"""Real browser -> runtime/SQLite -> Telegram presentation, no result-verification gate."""
+"""Real browser, shared outcome review, persistence and platform delivery."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import socket
@@ -29,7 +30,7 @@ def test_browser_text_reaches_chat_without_revalidation(tmp_path, monkeypatch, r
             self.end_headers()
             articles = ''.join(f'<article><h2><a href="/bulletin/{n}">Service item {n:02d}</a></h2><p>Route {n} resumes at 10:30.</p></article>' for n in range(1, 21))
             if mode == 'items_dense':
-                articles = ''.join(f'<article><h2><a href="/bulletin/{n}?token={"x" * 700}">Service item {n:02d}</a></h2><p>Route {n} resumes at 10:30.</p></article>' for n in range(1, 21))
+                articles = ''.join(f'<article><h2><a href="/bulletin/{n}?view={"x" * 700}">Service item {n:02d}</a></h2><p>Route {n} resumes at 10:30.</p></article>' for n in range(1, 21))
             self.wfile.write(('<html><body><h1>Service bulletin</h1><p>Route 47 resumes at 10:30.</p>' + '<button>Search</button><main>' + articles + '</main></body></html>').encode())
         def log_message(self, *args):
             pass
@@ -92,7 +93,21 @@ def test_browser_text_reaches_chat_without_revalidation(tmp_path, monkeypatch, r
 
             class Model:
                 calls = 0
+                reviews = 0
                 def create(self, **kwargs):
+                    protocol_reply = workflow_provider_reply(kwargs, completion=True)
+                    if protocol_reply is not None:
+                        if mode == 'budget' and 'semantic completion reviewer' in str(kwargs.get('system', '')):
+                            self.reviews += 1
+                            if self.reviews == 1:
+                                value = json.loads(protocol_reply['content'][0]['text'])
+                                value.update(disposition='retry', unresolved_requirements=['A final answer from the collected source is still needed.'])
+                                protocol_reply['content'][0]['text'] = json.dumps(value)
+                        if mode == 'failure' and 'semantic completion reviewer' in str(kwargs.get('system', '')):
+                            value = json.loads(protocol_reply['content'][0]['text'])
+                            value.update(disposition='blocked', user_facing_failure=reply)
+                            protocol_reply['content'][0]['text'] = json.dumps(value)
+                        return protocol_reply
                     if 'use_direct' in str(kwargs.get('system', '')):
                         raise TimeoutError('External argument planner unavailable')
                     names = {t['name'] for t in kwargs.get('tools', [])}
@@ -205,7 +220,12 @@ def test_browser_text_reaches_chat_without_revalidation(tmp_path, monkeypatch, r
                         assert runtime.store.get_suspended_turn(approval_id) is None
             elapsed.append(time.monotonic() - start)
             delivered = prepare_reply_for_platform_delivery(result, principal_id='telegram_chat')
-            assert delivered.text == reply
+            if mode == 'failure':
+                # Preserve the producer's localized explanation of the actual failure.
+                assert delivered.text == reply, delivered.text
+                assert 'private provider' not in delivered.text
+            else:
+                assert delivered.text == reply
             assert model.calls == expected_model_calls
             turns = [e for e in runtime.store.list_conversation_events(conversation_id) if e.get('event_type') == 'conversation.chat_turn']
             if mode != 'budget':
@@ -213,8 +233,19 @@ def test_browser_text_reaches_chat_without_revalidation(tmp_path, monkeypatch, r
                     assert cancelled.wait(0.5)
                     assert any(r['status'] == 'failed' and r['output'].get('reason') == 'handler_timeout'
                                for r in turns[-1]['tool_results'])
-                assert turns[-1]['assistant_reply'] == reply
+                assert turns[-1]['assistant_reply'] == (delivered.text if mode == 'failure' else reply)
                 assert [r['tool_name'] for r in turns[-1]['tool_results'] if r['tool_name'] != 'request_tool_scope'] == requested_names
+                if mode == 'items_dense':
+                    captured=next(r['output'] for r in turns[-1]['tool_results'] if r['tool_name']=='browser_extract_items')
+                    assert captured['result_kind']=='source_identity_inventory'
+                    assert captured['source_identity_record_count']==20
+                    assert {url+'bulletin/'+str(n) for n in range(1,21)}.issubset(set(captured['source_identity_url_paths']))
+                    assert 'source_record_collections' not in captured and captured['truncated'] is True
+                    runtime.checkpoint()
+                    restored=bootstrap_persistent_runtime(tmp_path / f'{i}.db')
+                    saved=next(e for e in reversed(restored.store.list_conversation_events(conversation_id)) if e.get('event_type')=='conversation.chat_turn')
+                    saved_items=next(r['output'] for r in saved['tool_results'] if r['tool_name']=='browser_extract_items')
+                    assert saved_items['source_identity_url_paths']==captured['source_identity_url_paths']
         record_property('elapsed_seconds', json.dumps(elapsed))
         if mode == 'items_dense':
             record_property('provider_seconds', json.dumps(provider_samples))
@@ -257,6 +288,13 @@ def test_failed_browser_action_is_terminal_and_reports_cause(tmp_path, monkeypat
     class Model:
         calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                if 'semantic completion reviewer' in str(kwargs.get('system', '')):
+                    value = json.loads(protocol_reply['content'][0]['text'])
+                    value.update(disposition='blocked', user_facing_failure='The page interaction failed. No result was confirmed.')
+                    protocol_reply['content'][0]['text'] = json.dumps(value)
+                return protocol_reply
             names = {t['name'] for t in kwargs.get('tools', [])}
             if 'select_attachment_format' in names:
                 return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'format',

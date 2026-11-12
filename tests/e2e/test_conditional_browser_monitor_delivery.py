@@ -1,4 +1,5 @@
 """Real browser, scheduler graph, runtime and delivery; scripted external model."""
+from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import json
 import os
 import threading
@@ -53,10 +54,12 @@ def test_monitor_verifies_selected_scope_before_alerting(tmp_path,monkeypatch,ta
     class Provider:
         main=0;calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             self.calls+=1;system=str(kw.get('system') or '')
             if system.startswith('You are a material-requirements planner'):
                 payload=json.loads(kw['messages'][0]['content'][0]['text']);assert payload['original_request']==task
-                return text(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[
+                return text(json.dumps({**fixture_source_plan(payload,scope='restricted'),'all_material_requirements_enumerated':True,'material_requirements':[
                     {'requirement':'Verify date, venue, format and booking condition','requirement_kind':'fact',
                      'evidence_subject_id':'screening','eligible_evidence_tool_names':['browser_extract_text']}]}))
             if system.startswith('You are a semantic completion reviewer'):
@@ -67,7 +70,8 @@ def test_monitor_verifies_selected_scope_before_alerting(tmp_path,monkeypatch,ta
                 if outcome=='unverified':good=False
                 ids=[r['invocation_id'] for r in payload['tool_evidence'] if r.get('tool_name')=='browser_extract_text']
                 row=payload['material_requirement_contract'][0]
-                return text(json.dumps({'disposition':'complete' if good else 'retry',
+                return text(json.dumps({**fixture_source_assessment(payload,conclusion='positive' if outcome=='match' else 'negative',sufficient=good),
+                    'disposition':'complete' if good else 'retry',
                     'unresolved_requirements':[] if good else ['Verify applied date and conditional booking evidence'],
                     'retry_tool_names':[] if good else ['browser_select_combobox','browser_click','browser_extract_text'],
                     'all_material_requirements_enumerated':True,'material_requirements':[
@@ -145,6 +149,8 @@ def test_plain_web_chat_keeps_one_model_call_with_optional_browser(tmp_path,monk
     class Provider:
         calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             if kw.get('system','').startswith(('You are a material-requirements planner','You are a semantic completion reviewer')):
                 time.sleep(2);raise AssertionError('Scheduled browser verification entered plain chat')
             self.calls+=1

@@ -12,7 +12,7 @@ from nullion.tools import ToolResult
 
 
 @pytest.mark.asyncio
-async def test_scheduled_completion_failure_keeps_findings_internal(monkeypatch) -> None:
+async def test_scheduled_critique_preserves_producer_findings(monkeypatch) -> None:
     import nullion.deep_agent_runner as deep_agent_runner
     from nullion.deep_agent_runner import DeepAgentMiniAgentRunner
 
@@ -20,7 +20,7 @@ async def test_scheduled_completion_failure_keeps_findings_internal(monkeypatch)
 
     class FakeDeepAgent:
         async def ainvoke(self, _payload, config=None):  # noqa: ANN001
-            return {"content": [{"type": "text", "text": "draft output"}]}
+            return {"content": [{"type": "text", "text": "Verified listing mention."}]}
 
     monkeypatch.setitem(
         sys.modules,
@@ -57,30 +57,42 @@ async def test_scheduled_completion_failure_keeps_findings_internal(monkeypatch)
         group_id="g1",
         conversation_id="telegram:1",
         principal_id="telegram:1",
-        title="Search lodging options",
-        description="Search listings and summarize verified findings.",
+        title="Summarize supplied findings",
+        description="Summarize the supplied notes without new source research.",
         status=TaskStatus.QUEUED,
         priority=TaskPriority.NORMAL,
         allowed_tools=["browser_extract_text"],
         dependencies=[],
         metadata={"scheduled_task_run": True},
     )
-    result = await DeepAgentMiniAgentRunner()._run_inner(
+    def review_reply(**kwargs):
+        import json
+        if "material-requirements planner" in kwargs.get("system", ""):
+            value = {"all_material_requirements_enumerated": True, "requested_artifact_extensions": [],
+                "material_requirements": [{"requirement": "Verified listings", "requirement_kind": "fact",
+                    "evidence_subject_id": "source", "eligible_evidence_tool_names": ["browser_extract_text"]}]}
+        else:
+            value = {"disposition": "blocked", "unresolved_requirements": ["Insufficient verified evidence."],
+                "user_facing_failure": "Insufficient verified evidence.", "retry_tool_names": []}
+        return {"content": [{"type": "text", "text": json.dumps(value)}]}
+    result = await DeepAgentMiniAgentRunner().run(
         MiniAgentConfig(agent_id="a1", task=task, can_request_user_input=False),
-        anthropic_client=SimpleNamespace(create=lambda **_kwargs: {"content": []}),
+        anthropic_client=SimpleNamespace(create=review_reply),
         tool_registry=object(),
-        policy_store=object(),
+        policy_store=None,
+        approval_store=None,
         context_bus=SimpleNamespace(get=lambda *_args, **_kwargs: None),
         progress_queue=asyncio.Queue(),
     )
 
-    assert result.status == "failure"
-    assert result.output is None and result.context_out is None and not result.artifacts
-    assert result.error == "Insufficient verified evidence."
+    assert result.status == "success"
+    assert result.output == "Verified listing mention."
+    assert result.error is None
+    assert result.report_presentation["outcome_review_role"] == "helper"
 
 
 @pytest.mark.asyncio
-async def test_scheduled_completion_failure_without_tool_evidence_stays_failure(monkeypatch) -> None:
+async def test_scheduled_synthesis_does_not_need_editor_permission(monkeypatch) -> None:
     import nullion.deep_agent_runner as deep_agent_runner
     from nullion.deep_agent_runner import DeepAgentMiniAgentRunner
 
@@ -112,22 +124,24 @@ async def test_scheduled_completion_failure_without_tool_evidence_stays_failure(
         group_id="g1",
         conversation_id="telegram:1",
         principal_id="telegram:1",
-        title="Search lodging options",
-        description="Search listings and summarize verified findings.",
+        title="Summarize supplied findings",
+        description="Summarize the supplied notes without new source research.",
         status=TaskStatus.QUEUED,
         priority=TaskPriority.NORMAL,
         allowed_tools=["browser_extract_text"],
         dependencies=[],
         metadata={"scheduled_task_run": True},
     )
-    result = await DeepAgentMiniAgentRunner()._run_inner(
+    result = await DeepAgentMiniAgentRunner().run(
         MiniAgentConfig(agent_id="a1", task=task, can_request_user_input=False),
         anthropic_client=SimpleNamespace(create=lambda **_kwargs: {"content": []}),
         tool_registry=object(),
-        policy_store=object(),
+        policy_store=None,
+        approval_store=None,
         context_bus=SimpleNamespace(get=lambda *_args, **_kwargs: None),
         progress_queue=asyncio.Queue(),
     )
 
-    assert result.status == "failure"
-    assert "Insufficient verified evidence." in str(result.error)
+    assert result.status == "success"
+    assert result.output == "draft output" and result.error is None
+    assert result.report_presentation["outcome_review_role"] == "helper"

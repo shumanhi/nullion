@@ -7,6 +7,7 @@ Use the factory functions to build probes that capture the target
 from __future__ import annotations
 
 import logging
+import json
 import re
 import time
 from typing import Awaitable, Callable
@@ -21,6 +22,37 @@ _HTTP_STATUS_RE = re.compile(r"\bHTTP\s+(\d{3})\b|\"status\"\s*:\s*(\d{3})")
 _RESETS_IN_SECONDS_RE = re.compile(r'"resets_in_seconds"\s*:\s*(\d+)')
 _TERMINAL_AUTH_CODES = {"token_invalidated", "token_revoked", "invalid_api_key", "invalid_token"}
 _TERMINAL_QUOTA_TYPES = {"usage_limit_reached", "insufficient_quota"}
+
+
+def recorded_model_error_details(record: dict[str, object]) -> dict[str, object]:
+    """Read provider diagnostics without inspecting a recorded user's message."""
+    details = record.get("details")
+    if isinstance(details, dict) and details.get("category") in ("quota", "auth"):
+        return {key: details[key] for key in ("category", "terminal", "http_status", "provider_code", "error_type", "retry_after_seconds") if key in details}
+    diagnostic = record.get("error") or ""
+    reason = str(record.get("reason") or record.get("source_reason") or "")
+    offset = 0
+    for part in reason.split(";"):
+        key, separator, value = part.partition("=")
+        if key.strip() == "message_text":
+            break
+        if not diagnostic and separator and key.strip() in ("error", "detail", "backend_detail"):
+            diagnostic = value.strip()
+            # A JSON error message may contain semicolons. Consume that complete
+            # object before the legacy envelope's later user-message fields.
+            remainder = reason[offset + len(key) + 1:]
+            if "{" in remainder:
+                start = remainder.index("{")
+                try:
+                    if start >= len(remainder.split(";message_text=", 1)[0]):
+                        break
+                    body, _ = json.JSONDecoder().raw_decode(remainder[start:])
+                    diagnostic = remainder[:start] + json.dumps(body)
+                except ValueError:
+                    pass
+            break
+        offset += len(part) + 1
+    return _model_probe_error_details(RuntimeError(str(diagnostic)))
 
 
 def _model_probe_error_details(exc: Exception) -> dict[str, object]:

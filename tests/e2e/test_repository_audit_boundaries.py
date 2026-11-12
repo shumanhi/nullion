@@ -1,5 +1,6 @@
 """Real API, SQLite, browser, scheduler, and transport boundary regressions."""
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 from datetime import UTC, datetime, timedelta
 import json
@@ -182,6 +183,8 @@ def test_scheduler_monitor_threshold_reaches_agent_and_visible_chat(environment,
     class Model(ScriptedProvider):
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             auxiliary=self.auxiliary(kw)
             if auxiliary:return auxiliary
             self.steps+=1;assert self.steps<=4
@@ -373,6 +376,8 @@ def test_multilingual_source_delivery_follows_typed_scope(environment,tmp_path,m
         searched=False
         read=False
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             auxiliary=self.auxiliary(kw)
             if auxiliary:return auxiliary
             if not self.scope:
@@ -418,7 +423,7 @@ def test_telegram_outbox_failure_restart_and_slow_transport_leave_api_responsive
         async def __aenter__(self):return self
         async def __aexit__(self,*a):pass
         async def send_message(self,**kw):
-            if state['fail']:raise RuntimeError('Fixture transport unavailable')
+            if state['fail']:raise telegram.error.BadRequest('Fixture request rejected before acceptance')
             started.set()
             assert await asyncio.to_thread(release.wait,3),'Fixture never released external transport'
             sent.append(kw['text'])
@@ -478,6 +483,16 @@ def test_attachment_followup_replaces_prior_delivery_contract_and_plain_chat_sta
     class Provider(ScriptedProvider):
         mode='create';written=False;searched=False;scope_calls=[]
         def create(self,**kw):
+            if self.mode=='followup' and 'material-requirements planner' in (kw.get('system') or ''):
+                # This fixture asks to locate a filename, not to generate or
+                # attach the extension mentioned in that filename.
+                return response(json.dumps({'all_material_requirements_enumerated':True,
+                    'requested_artifact_extensions':[], 'material_requirements':[{
+                        'requirement':'Report the existing filename without attachment',
+                        'requirement_kind':'fact','evidence_subject_id':'filename',
+                        'eligible_evidence_tool_names':['file_search']}]}))
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names={item['name'] for item in kw.get('tools',[])};system=kw.get('system','')
             if not names and 'web_action' in system and 'scheduler_action' in system:
                 self.scope_calls.append(self.mode)
@@ -530,7 +545,11 @@ def test_attachment_followup_replaces_prior_delivery_contract_and_plain_chat_sta
         original_bytes=artifact.read_bytes();provider.mode='followup'
         result=client.post('/api/chat',json={'text':followup,'conversation_id':'web:artifact-followup'})
         assert result.status_code==200,result.text
-        assert result.json()['artifacts']==[] and artifact.name in result.json()['text'],result.text
+        if result.json().get('artifacts') is None:
+            from pathlib import Path
+            events=runtime.store.list_conversation_events('web:artifact-followup')
+            Path('/outputs/attachment-scope-diagnostic.json').write_text(json.dumps(events,default=str,ensure_ascii=False))
+        assert result.json().get('artifacts')==[] and artifact.name in result.json()['text'],result.text
         assert artifact.read_bytes()==original_bytes
         turns=[event for event in runtime.store.list_conversation_events('web:artifact-followup') if event.get('event_type')=='conversation.chat_turn']
         assert turns[-1]['parent_turn_id']==turns[-2]['turn_id']
@@ -593,6 +612,8 @@ def test_interactive_artifact_helper_recovers_scratch_and_delivers_real_image(en
     class Model(ScriptedProvider):
         calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system=kw.get('system','')
             if 'material-requirements planner' in system:
                 return response(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[
@@ -682,6 +703,8 @@ def test_history_source_lookup_cannot_override_real_conversion_or_publish_input(
     class Model(ScriptedProvider):
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system=kw.get('system','')
             if 'material-requirements planner' in system:
                 return response(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[
@@ -775,6 +798,8 @@ def test_standalone_existing_source_is_not_a_second_output_requirement(environme
     class Model(ScriptedProvider):
         read=False;written=False;calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system=kw.get('system','');names={t['name'] for t in kw.get('tools',[])}
             if 'material-requirements planner' in system:
                 return response(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[

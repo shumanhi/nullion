@@ -834,6 +834,19 @@ def test_internal_scope_request_structurally_adds_scheduler_tools_without_prompt
     assert "delete_cron" not in names
 
 
+@pytest.mark.parametrize('capabilities,flag,allowed', [
+    (['local_shell'],True,True), (['local_files'],True,True),
+    (['web'],True,False), (['local_shell'],'true',False), (['local_shell'],False,False)])
+def test_local_path_detail_scope_requires_typed_local_capability(capabilities,flag,allowed):
+    scoped=scoped_turn_tool_registry(_registry(),
+        evidence=build_turn_tool_evidence(user_message='確認。',conversation_result=None),
+        model_client=None,user_message='確認。')
+    result,_=scoped.apply_scope_request(ToolInvocation('paths','request_tool_scope','telegram:1',
+        {'capabilities':capabilities,'include_local_path_details':flag}))
+    assert result.status=='completed'
+    assert result.output['include_local_path_details'] is allowed
+
+
 def test_scheduler_run_exact_scope_keeps_list_crons_dependency() -> None:
     scoped = scoped_turn_tool_registry(
         _registry(),
@@ -1565,7 +1578,7 @@ def test_internal_scope_request_accepts_required_embedded_media_alias() -> None:
     assert widened.turn_tool_scope_decision.required_embedded_media_extensions == (".xlsx",)
 
 
-def test_scope_request_drops_unrealizable_generated_media_contract_without_image_tool() -> None:
+def test_scope_request_keeps_native_inline_document_media_without_image_tool() -> None:
     registry = _registry()
     registry.unregister("image_generate")
     scoped = scoped_turn_tool_registry(
@@ -1590,14 +1603,14 @@ def test_scope_request_drops_unrealizable_generated_media_contract_without_image
 
     assert result.status == "completed"
     assert result.output["artifact_extensions"] == [".pdf", ".html"]
-    assert result.output["embedded_media_artifact_extensions"] == []
+    assert result.output["embedded_media_artifact_extensions"] == [".pdf", ".html"]
     assert "image_generate" not in result.output["available_tools"]
     assert {"pdf_create", "file_write"} <= set(result.output["available_tools"])
     assert widened.turn_tool_scope_decision.requested_artifact_extensions == (".pdf", ".html")
-    assert widened.turn_tool_scope_decision.required_embedded_media_extensions == ()
+    assert widened.turn_tool_scope_decision.required_embedded_media_extensions == (".pdf", ".html")
 
 
-def test_initial_scope_decision_drops_unrealizable_embedded_media_contract_without_source_tool() -> None:
+def test_initial_scope_decision_keeps_native_inline_document_media_without_source_tool() -> None:
     registry = _registry()
     registry.unregister("image_generate")
     client = _ScopeClient(
@@ -1617,7 +1630,7 @@ def test_initial_scope_decision_drops_unrealizable_embedded_media_contract_witho
     )
 
     assert {"pdf_create", "file_write"} <= set(decision.requested_tool_names)
-    assert decision.required_embedded_media_extensions == ()
+    assert decision.required_embedded_media_extensions == (".pdf", ".html")
     assert {".pdf", ".html"} <= set(decision.requested_artifact_extensions)
 
 
@@ -2907,6 +2920,7 @@ def test_custom_gateway_connection_inherits_matching_installed_skill_pack_contex
     assert providers[0]["skill_pack_id"] == "example/api-gateway-skill"
     assert "references/example-drive/README.md" in providers[0]["reference_paths"]
     assert "example-drive" in providers[0]["active_app_ids"]
+    assert providers[0]["app_inventory_kind"] == "supported_catalogue"
     assert result.output["connector_app_ids"] == ["example-drive"]
     assert result.output["available_tools"] == ["connector_request", "skill_pack_read"]
     assert "connector_request" in names
@@ -3678,6 +3692,18 @@ def test_request_tool_scope_can_explicitly_require_current_source_tool() -> None
     assert widened.can_invoke_tool("file_write")
 
 
+@pytest.mark.parametrize('prompt',['Acquire this archive.', 'Descarga este archivo.', 'この書庫を取得してください。'])
+def test_required_file_download_is_a_web_source_entry_without_browser_navigation(prompt):
+    scoped=scoped_turn_tool_registry(_registry(),evidence=build_turn_tool_evidence(
+        user_message=prompt,conversation_result=None,requested_extensions=('.xlsx',)))
+    result,widened=scoped.apply_scope_request(ToolInvocation('download-scope','request_tool_scope','web:download',{
+        'capabilities':['web','local_files'],'tool_names':['file_download','archive_extract','spreadsheet_create'],
+        'required_tool_names':['file_download','archive_extract','spreadsheet_create'],'artifact_extensions':['.xlsx']}))
+    assert result.status=='completed'
+    assert set(result.output['required_tool_names'])=={'file_download','archive_extract','spreadsheet_create'}
+    assert 'browser_navigate' not in widened.turn_tool_scope_decision.required_tool_names
+
+
 def test_request_tool_scope_web_capability_requires_callable_web_entry_tool() -> None:
     scoped = scoped_turn_tool_registry(
         _registry(),
@@ -4381,7 +4407,7 @@ def test_artifact_evidence_fallback_exposes_only_matching_artifact_tools() -> No
     assert "terminal_exec" in names
 
 
-def test_structured_artifact_scope_prefers_dedicated_tool_over_required_shell() -> None:
+def test_structured_artifact_scope_keeps_explicit_shell_and_dedicated_tool() -> None:
     scoped = scoped_turn_tool_registry(
         _registry(),
         evidence=build_turn_tool_evidence(
@@ -4408,7 +4434,7 @@ def test_structured_artifact_scope_prefers_dedicated_tool_over_required_shell() 
 
     assert result.status == "completed"
     assert "spreadsheet_create" in result.output["available_tools"]
-    assert "terminal_exec" not in result.output["available_tools"]
+    assert "terminal_exec" in result.output["available_tools"]
     assert result.output["required_tool_names"] == []
     names = {definition["name"] for definition in widened.list_tool_definitions()}
     assert "spreadsheet_create" in names
@@ -4442,7 +4468,7 @@ def test_structured_artifact_scope_inherits_typed_extension_when_shell_request_o
     assert result.status == "completed"
     assert result.output["artifact_extensions"] == [".xlsx"]
     assert "spreadsheet_create" in result.output["available_tools"]
-    assert "terminal_exec" not in result.output["available_tools"]
+    assert "terminal_exec" in result.output["available_tools"]
     assert result.output["required_tool_names"] == []
     names = {definition["name"] for definition in widened.list_tool_definitions()}
     assert "spreadsheet_create" in names
@@ -4914,6 +4940,7 @@ def test_connector_provider_context_derives_google_typed_tools_from_pack_referen
     providers = turn_context_policy._active_connector_provider_context()
 
     assert providers[0]["active_app_ids"] == ["google-mail", "google-calendar", "notion"]
+    assert providers[0]["app_inventory_kind"] == "supported_catalogue"
     assert providers[0]["structured_tools"] == [
         "connector_request",
         "email_search",
@@ -4986,3 +5013,11 @@ def test_collection_scope_discards_cached_mandatory_detail_reads(monkeypatch, pr
     assert len(client.calls) == 1
     assert set(decision.requested_tool_names) == {"email_search", "email_read"}
     assert decision.required_tool_names == ("email_search",)
+
+
+@pytest.mark.parametrize("tool,extension", [("document_create",".docx"),("document_create",".pdf"),
+    ("document_create",".html"),("pdf_create",".pdf"),("presentation_create",".pptx"),
+    ("spreadsheet_create",".xlsx"),("file_write",".html")])
+def test_native_embedding_requirement_survives_without_a_separate_source_tool(tool,extension):
+    from nullion.turn_context_policy import _supported_scope_embedded_media_extensions
+    assert _supported_scope_embedded_media_extensions([tool],[extension]) == (extension,)

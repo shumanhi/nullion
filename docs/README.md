@@ -17,10 +17,12 @@ This docs folder is written for a mixed audience:
 - If something is not working, use `docs/support.md`.
 - If you are configuring capabilities, use `docs/plugins.md` and
   `docs/skill-packs.md`.
-- If you are operating Telegram in production, use the runbooks in
-  `docs/operations/`.
-- If you are contributing to product direction, the dated files in
-  `docs/plans/` and `docs/progress/` record design history.
+- For commands and setup, use [Commands](commands.md) and
+  [Configuration](configuration.md).
+- For time-sensitive monitoring, use [Live tracking](live-tracking.md).
+- For release highlights, see [v0.10.0 release notes](releases/v0.10.0.md).
+- For contributors, use [Architecture](architecture.md) and
+  [Testing](e2e-testing.md).
 
 ## What ships today
 
@@ -63,9 +65,9 @@ Core systems:
 Capability status:
 
 - Available: search, web fetch, browser automation, workspace files, local
-  media tools, reminders, crons, Telegram, Slack, Discord, Web UI.
-- Preview: email search/read and calendar listing through explicit provider
-  bindings.
+  media tools, reminders, crons, temporary live trackers, Telegram, Slack, Discord, Web UI.
+- Preview: email search/read and provider-supported calendar reads and writes
+  through explicit provider bindings. Calendar writes remain approval-bound.
 - Planned: account-level messaging plugins. Telegram, Slack, and Discord are
   chat adapters today, not messaging account tools.
 
@@ -170,20 +172,24 @@ runtime.
 
 ## Documentation map
 
-- `plugins.md` explains plugins, providers, account connections, and tool
-  registration.
-- `skill-packs.md` explains reference instruction packs and why they do not
-  grant real account access.
-- `support.md` gives first-response troubleshooting steps.
-- `runtime-persistence.md` covers local runtime checkpoint behavior.
-- The online docs at `website/docs/index.html` mirror the current website copy
-  shown on https://nullion.ai/docs/.
-- `operations/recovery-control-plane.md` covers break-glass recovery,
-  config snapshots, service restarts, and Telegram takeover mode.
-- `operations/telegram-operator-runbook.md` covers Telegram operations.
-- `operations/deploy-telegram-operator.md` covers Telegram deployment.
-- `philosophy/kernel-plugins-skills-policy.md` explains the kernel/plugin/skill
-  separation.
+| Guide | Covers |
+| --- | --- |
+| [Commands](commands.md) | Shared chat-command catalog and terminal entry points |
+| [Configuration](configuration.md) | Models, adapters, file roots, visibility, data and encryption |
+| [Live tracking](live-tracking.md) | Temporary watches versus reminders/crons, reuse, limits, controls and API |
+| [Plugins](plugins.md) | Capability registration, provider setup and account connections |
+| [Skill packs](skill-packs.md) | Instruction packs, dependencies and authoring |
+| [Support](support.md) | Diagnosis, recovery, updates and reporting |
+| [Architecture](architecture.md) | Routing, follow-ups, delivery, persistence and source map |
+| [Testing](e2e-testing.md) | Repository-local suites, Docker and local operations |
+| [Security](../SECURITY.md) | Vulnerability reporting and local-data protection |
+| [Browser tasks](../src/nullion/plugins/browser_plugin/README.md) | Low-level sessions and the optional Browser Use worker |
+
+The [online guide](https://www.nullion.ai/docs/) is maintained in the separate
+`nullion-website` repository. This app repository owns the guides listed above;
+it no longer contains a `website/` directory or the retired operations/plan
+documents previously linked here. Documentation follows this source checkout;
+an older installed release can have fewer tools or controls.
 
 ## Safety model in one minute
 
@@ -218,14 +224,12 @@ The same idea is used across web, Telegram, Slack, and Discord:
 
 ## Planner, activity, and background work
 
-Planner cards and verbose activity are separate controls. The Planner card
-setting controls whether supported chat surfaces show the request summary and
-task checklist. Verbose controls the extra activity feed below that card.
-When planner cards are enabled, Web, Telegram, Slack, and Discord render the
-planner header, request summary, task count/title, and task rows from typed
-task-status state. If verbose activity is off, the Activity section is omitted;
-if verbose activity is on, the same card includes compact, deduped tool and
-mini-agent activity below it.
+Planner cards and verbose activity are separate. The current runtime keeps
+task planner cards enabled; the former planner-feed environment toggles do not
+change this build's behavior. With verbose activity off, cards show their
+request summary and task rows without tool details. With activity on, they
+include compact, deduped tool and mini-agent activity. Final results and
+requested artifacts must still be delivered.
 
 Use `/planner <message>` when you want a request to run through the explicit
 step-by-step planner path. It is not a visibility toggle; it starts a planned
@@ -238,7 +242,7 @@ or activity cards were already shown.
 
 ![Nullion web console showing planner cards, activity, generated artifacts, approvals, schedules, and runtime controls](https://www.nullion.ai/assets/nullion-web-console-real.png)
 
-When background tasks are enabled, independent turns can run without blocking a
+Independent turns can run without blocking a
 new message. Follow-ups wait only when the typed turn dispatcher links them to
 an active task frame or prior turn. The dispatcher uses structured runtime
 evidence such as task state, attachments, URLs, file extensions, UI actions,
@@ -255,3 +259,16 @@ and creates Builder proposal cards before installing packages. Built-in
 catalog entries include pandas, openpyxl, Pillow, pypdf, python-docx,
 python-pptx, and soundfile. Custom PyPI or GitHub package requests also create
 a reviewable Builder proposal instead of installing silently.
+
+## Temporary watches and recurring work
+
+Use a live tracker for frequent bounded observations, a cron for continuing
+recurring work, and a reminder for a known notification time. Live trackers
+reuse prepared source state and stop on a match or deadline. The agent asks
+numbered questions when it cannot choose confidently. The Web service must
+remain running for live checks and alerts. See [Live tracking](live-tracking.md).
+
+Follow-ups can amend a running request. When replying to an earlier message,
+keep the reply anchor attached so the runtime can identify the intended task.
+A cancellation of a recently created schedule uses its verified receipt; if
+several targets could match, Nullion should ask which one to cancel.

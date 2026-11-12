@@ -16,12 +16,15 @@ class CronNotice:
 ISSUES = {
     'model_timeout': 'The model/provider did not respond before the check timed out.',
     'source_unverified': 'The source evidence could not be verified.',
+    'review_timeout': 'The final review timed out, so completion could not be confirmed.',
+    'review_unavailable': 'The final review was unavailable, so completion could not be confirmed.',
     'delivery_failed': 'The result could not be delivered.',
     'interrupted': 'The worker stopped before recording a completed result.',
     'incomplete': 'The check did not produce a verified, complete outcome. No more specific cause was recorded.',
 }
 
 def cron_notice(job, facts: dict, *, label: str, schedule: str, last_success: str, next_check: str) -> CronNotice | None:
+    from nullion.chat_text import UserMessage, ReplySection, render_user_message
     if not job.enabled or facts.get('state') in {'running','waiting_for_approval','cancelled'}:
         return None
     limit = facts.get('doctor_streak_limit',STREAK_LIMIT)
@@ -30,18 +33,27 @@ def cron_notice(job, facts: dict, *, label: str, schedule: str, last_success: st
     next_label = 'Scheduled check (overdue)' if facts.get('overdue') else 'Next scheduled check'
     if failed >= limit:
         kind='failure';episode=facts.get('failure_since')
-        text=(f'"{label}" could not complete its last {failed} checks, so its current result is unknown.\n\n'
-              f'Latest recorded problem: {ISSUES.get(facts.get("last_issue"), ISSUES["incomplete"])}\n'
-              f'Last successful check: {last_success}.\n'
-              f'The task remains enabled. {next_label}: {next_check}. '
-              'No repair has been confirmed. Review its source access, permissions, and task settings if the problem continues.')
+        review_unavailable = facts.get('last_issue') in {'review_timeout', 'review_unavailable'}
+        summary = (f'"{label}" has not reached verified completion in its last {failed} runs.' if review_unavailable else
+            f'"{label}" could not complete its last {failed} checks, so its current result is unknown.')
+        if review_unavailable and facts.get('last_delivery_succeeded') is True:
+            summary += ' The latest result was delivered, but its final review is unconfirmed.'
+        advice = ('The review needs a successful retry before completion can be confirmed. Source access may still have separate limitations.'
+            if review_unavailable else
+            'No repair has been confirmed. Review its source access, permissions, and task settings if the problem continues.')
+        text=render_user_message(UserMessage(kind='warning',
+            summary=summary,
+            sections=(ReplySection('Latest recorded problem', paragraphs=(
+                ISSUES.get(facts.get('last_issue'), ISSUES['incomplete']),)),),
+            footer=f'Last successful check: {last_success}.\nThe task remains enabled. {next_label}: {next_check}. '
+                + advice))
     elif empty >= limit:
         kind='no_match';episode=facts.get('no_match_since')
-        text=(f'I checked "{label}" {empty} consecutive times successfully. '
-              'No match met its saved conditions.\n\n'
-              f'The tracker is still active. Schedule: {schedule}.\n'
-              f'Latest successful check: {last_success}. {next_label}: {next_check}.\n'
-              'I will alert you when a verified match is found. This is one status notice for this streak.')
+        text=render_user_message(UserMessage(kind='update',
+            summary=f'I checked "{label}" {empty} consecutive times successfully. No match met its saved conditions.',
+            paragraphs=(f'The tracker is still active. Schedule: {schedule}.',),
+            footer=f'Latest successful check: {last_success}. {next_label}: {next_check}.\n'
+                'I will alert you when a verified match is found. This is one status notice for this streak.'))
     else:
         return None
     if not episode:

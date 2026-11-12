@@ -56,7 +56,7 @@ async def test_slack_callback_fallback_does_not_show_external_html():
     async def sender(text):
         calls.append(text)
         if len(calls) == 1:
-            raise RuntimeError("formatted send failed")
+            raise _FormattingRejected("formatted send rejected")
 
     formatted, plain = _slack_reply_chunks("<b>Result:</b> **No new mentions**")[0]
     await _send_slack_callable_with_plain_fallback(sender, formatted_text=formatted, plain_text=plain)
@@ -72,11 +72,18 @@ class FakeTurnRegistration:
         self.waited = False
         self.finished = False
         self.superseded = superseded
+        from nullion.turn_dispatch_graph import TurnPublicationGate
+        self.publication_gate = TurnPublicationGate()
+        if superseded:
+            self.publication_gate.revoke()
         self.decision = SimpleNamespace(
             dependency_turn_ids=(),
             disposition=None,
             reason="test_dispatch_decision",
         )
+
+    def is_cancelled(self):
+        return self.superseded
 
     async def wait_for_dependencies(self):
         self.waited = True
@@ -322,7 +329,7 @@ class FakeDiscordChannel:
         self.attempts.append(text)
         if self.fail_first:
             self.fail_first = False
-            raise RuntimeError("formatted send failed")
+            raise _FormattingRejected("formatted send rejected")
         self.sent.append(text)
 
 
@@ -376,3 +383,7 @@ async def test_discord_chunks_normalize_quote_fenced_code_blocks():
     await _send_discord_chunks_with_plain_fallback(channel, "'''svg\n<svg></svg>\n'''", limit=1900)
 
     assert channel.sent == ["```svg\n<svg></svg>\n```"]
+
+
+class _FormattingRejected(RuntimeError):
+    status_code = 400

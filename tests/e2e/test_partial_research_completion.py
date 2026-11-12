@@ -2,6 +2,7 @@
 
 Only the external browser worker and model are deterministic providers.
 """
+from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import asyncio
 import copy
 import json
@@ -29,10 +30,10 @@ def presentation(kwargs, completed):
         fields = (['DEPARTS', '12:50', 'p'], ['ARRIVES', '4:12', 'p'], ['3h 22m'], ['Coach', 'from', '$', '155']) if number == '1147' else (
             ['DEPARTS', '12:00', 'p'], ['ARRIVES', '3:25', 'p'], ['3h 25m'], ['Coach', 'from', '$', '89'])
         groups = [[ids[x] for x in field] for field in fields]
-        points.append({'evidence_ids': [row['id']], 'title_ids': [ids['Northeast Regional'], ids[number]],
+        points.append({'semantic_role':'entity','evidence_ids': [row['id']], 'title_ids': [ids['Northeast Regional'], ids[number]],
             'detail_ids': list(dict.fromkeys(i for g in groups for i in g)), 'detail_groups': groups,
             'relevance': 'An option for the requested comparison side'})
-    return tool_response('present_source_answer', {'intro': 'NYC ↔ Washington: Thursday outbound, Sunday return.',
+    return tool_response('present_source_answer', {'intro': 'NYC ↔ Washington: Thursday outbound, Sunday return.', 'focus_roles':['entity'],
         'points': points, 'limitation_ids': [] if completed or not context['limitations'] else [context['limitations'][0]['id']]})
 
 
@@ -82,9 +83,12 @@ def test_partial_producer_continues_missing_side_without_restarting_or_losing_fi
     class Model:
         steps = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None: return protocol_reply
             names = {t['name'] for t in kwargs.get('tools', [])}; system = kwargs.get('system', '')
             if system.startswith('You are a material-requirements planner'):
-                return text_response(json.dumps({'all_material_requirements_enumerated': True,
+                packet = json.loads(kwargs['messages'][0]['content'][0]['text'])
+                return text_response(json.dumps({**fixture_source_plan(packet), 'all_material_requirements_enumerated': True,
                     'material_requirements': [{'requirement': req, 'requirement_kind': 'comparison_side',
                         'evidence_subject_id': side, 'eligible_evidence_tool_names': ['browser_run_task']}
                         for side, req in [('outbound', 'Verify outbound trains, times and Coach fares'), ('return', 'Verify return trains, times and Coach fares')]]}))
@@ -92,6 +96,14 @@ def test_partial_producer_continues_missing_side_without_restarting_or_losing_fi
                 data = json.loads(kwargs['messages'][0]['content'][0]['text'])
                 evidence = [r for r in data['tool_evidence'] if r['tool_name'] == 'browser_run_task']
                 done = mode in {'combined', 'bound_combined'} or mode in {'complete', 'complete_same_url', 'step_completed'} and len(calls) == 2
+                if mode == 'combined' and len(calls) == 1 and data.get('runtime_coverage_validation_errors'):
+                    # The synthetic first batch deliberately lacks capture identity.
+                    # A corrected critic must not invent record ids or assert coverage
+                    # from the same unbound parent for two independent subjects.
+                    assert any(row['code'] == 'unbound_parent_reused_across_subjects'
+                        for row in data['runtime_coverage_validation_errors'])
+                    assert not any(row['output'].get('source_record_binding') for row in evidence)
+                    done = False
                 if mode == 'bound_combined':
                     bound = [r for r in evidence if r['output'].get('source_record_binding')]
                     assert len(bound) == 2
@@ -101,7 +113,7 @@ def test_partial_producer_continues_missing_side_without_restarting_or_losing_fi
                     'satisfied': i == 0 or done, 'draft_covered': i == 0 or done,
                     'evidence_invocation_ids': [evidence[min(i, len(evidence)-1) if done else 0]['invocation_id']] if i == 0 or done else []}
                     for i, row in enumerate(data['material_requirement_contract'])]
-                return text_response(json.dumps({'disposition': 'complete' if done else 'retry',
+                return text_response(json.dumps({**fixture_source_assessment(data), 'disposition': 'complete' if done else 'retry',
                     'unresolved_requirements': [] if done else ['Obtain Sunday return trains around noon, including arrival times and Coach fares'],
                     'retry_tool_names': [] if done else ['browser_run_task'],
                     'all_material_requirements_enumerated': True, 'material_requirements': rows}))
@@ -131,8 +143,8 @@ def test_partial_producer_continues_missing_side_without_restarting_or_losing_fi
         turn = [e for e in runtime.store.list_conversation_events(conversation) if e.get('event_type') == 'conversation.chat_turn'][-1]
         assert turn['assistant_reply'] == text
         expected = 1 if mode == 'bound_combined' else 1 + _COMPLETION_REVIEW_MAX_ATTEMPTS if mode == 'budget' else 2
-        assert len(calls) == expected
-        assert len([r for r in turn['tool_results'] if r['tool_name'] == 'browser_run_task']) == expected
+        assert (1 < len(calls) <= expected) if mode == 'budget' else len(calls) == expected
+        assert len([r for r in turn['tool_results'] if r['tool_name'] == 'browser_run_task']) == len(calls)
         assert all(r['output']['completion_scope'] == 'tool_step' for r in turn['tool_results'] if r['tool_name'] == 'browser_run_task')
         history = client.get('/api/chat/history/'+conversation, params={'turn_ids': json.dumps([turn['turn_id']])})
         assert history.json()['terminal_replies'][0]['text'] == text

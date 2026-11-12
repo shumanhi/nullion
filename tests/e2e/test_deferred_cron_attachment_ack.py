@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.workflow_provider_protocol import is_tool_scope_request, workflow_provider_reply
 import json
 import os
 import time
@@ -51,11 +52,13 @@ def test_real_http_cron_dispatch_ack_is_not_a_missing_attachment_and_final_file_
     class Provider:
         scope=False;foreground=False;background=0;calls=[]
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names={t['name'] for t in kwargs.get('tools',[])}
             self.calls.append({'tools':sorted(names),'system':str(kwargs.get('system',''))[:100],'tokens':kwargs.get('max_tokens')})
             if names=={'select_attachment_format'}:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'format','name':'select_attachment_format','input':{'extension':'.html','confidence':1,'embedded_media_extensions':[]}}]}
-            if not names and kwargs.get('max_tokens')==96:
+            if is_tool_scope_request(kwargs):
                 return {'content':[{'type':'text','text':json.dumps({'requested_outcome':'unspecified','scheduler_action':'run',
                     'scheduler_selection_policy':'user_selected','requested_tool_names':['run_cron'],'required_tool_names':['run_cron'],
                     'requested_artifact_extensions':['.html'],'confidence':1})}]}

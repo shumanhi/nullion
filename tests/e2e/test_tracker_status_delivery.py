@@ -1,4 +1,5 @@
 """Real API, SQLite, notification worker, platform adapter and rendered Web UI."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -39,6 +40,33 @@ def add(client,name='Aviso',channel='web',target='web:fixture'):
     return get_cron(response.json()['job']['id'])
 
 
+@pytest.mark.parametrize('approval', [True, False])
+def test_late_terminal_receipt_replaces_interruption_in_real_status_api(tmp_path, monkeypatch, approval):
+    from fastapi.testclient import TestClient
+    from nullion.cron_scheduler_state import connection, scheduled_token
+    from nullion.crons import load_crons
+    from nullion.tracker_status import start_check, finish_check, tracker_statuses
+    app, runtime, db = setup(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    with TestClient(app) as client:
+        j = add(client, name='期限の確認')
+        token = 'fixture:expired-worker'
+        with connection(db) as conn:
+            conn.execute('INSERT INTO cron_execution_leases VALUES (?,?,?)',
+                (j.id, token, (now - timedelta(minutes=1)).isoformat()))
+        with scheduled_token(token):
+            start_check(db, j, 'delayed-persistence', now=now - timedelta(minutes=5))
+        assert tracker_statuses(db, [j], now=now)[j.id]['last_outcome'] == 'interrupted'
+        result = ({'suspended_for_approval': True} if approval else
+            {'execution_outcome': {'execution_succeeded': True}, 'response_fulfilled': True,
+             'cron_alert_delivery_decision': 'send', 'cron_alert_delivery_reason': 'verified_match'})
+        finish_check(db, j, 'delayed-persistence', result, now=now)
+        status = next(row['tracker_status'] for row in client.get('/api/crons').json() if row['id'] == j.id)
+        assert status['last_outcome'] == ('waiting_for_approval' if approval else 'match')
+        assert status['consecutive_failures'] == 0
+        assert app.state.tracker_status_tick(load_crons(refresh_next_runs=False), now) == 0
+
+
 def record(db,j,kind,when):
     from nullion.tracker_status import start_check,finish_check
     run_id=j.id+':'+when.isoformat()
@@ -75,6 +103,40 @@ def test_real_worker_delivers_one_doctor_notice_and_silently_resolves(tmp_path,m
         assert [e.payload['notification_kind'] for e in events]==['failure']
 
 
+@pytest.mark.parametrize('timeout',[True,False])
+def test_report_review_outage_delivered_result_and_doctor_reason_reach_real_web_history(tmp_path,monkeypatch,timeout):
+    from fastapi.testclient import TestClient
+    from nullion.crons import load_crons
+    from nullion.tracker_status import start_check,finish_check
+    app,runtime,db=setup(tmp_path,monkeypatch);now=datetime.now(timezone.utc)
+    with TestClient(app) as client:
+        j=add(client,name='資料の報告')
+        patch=client.patch('/api/crons/'+j.id,json={'artifact_delivery_options':{
+            'alert_delivery_mode':'report_each_run','tracker_health_notifications':True}})
+        assert patch.status_code==200
+        from nullion.crons import get_cron
+        j=get_cron(j.id)
+        for index in range(12):
+            when=now-timedelta(seconds=120-index*5);identity=str(index)
+            start_check(db,j,identity,now=when)
+            finish_check(db,j,identity,{'response_fulfilled':False,
+                'cron_source_verification_required':True,'cron_source_verification_satisfied':False,
+                'response_presentation':{'outcome_review_status':'unavailable','outcome_review_timeout':timeout},
+                'execution_outcome':{'execution_succeeded':False,'delivery_succeeded':True}},now=when+timedelta(seconds=1))
+        assert app.state.tracker_status_tick(load_crons(refresh_next_runs=False),now)==1
+        assert app.state.tracker_status_tick(load_crons(refresh_next_runs=False),now+timedelta(seconds=1))==0
+        messages=client.get('/api/chat/history/web%3Afixture?sync_runtime=1').json()['messages']
+        assert len(messages)==1
+        text=messages[0]['text']
+        assert 'last 12 runs' in text and 'latest result was delivered' in text
+        assert ('final review timed out' if timeout else 'final review was unavailable') in text
+        assert 'source evidence could not be verified' not in text and 'source access, permissions' not in text
+        status=client.get('/api/crons').json()[0]['tracker_status']
+        assert status['consecutive_failures']==12 and status['last_success_at'] is None
+        assert status['last_issue']==('review_timeout' if timeout else 'review_unavailable')
+        assert len(runtime.store.list_doctor_actions())==1
+
+
 def test_tracker_notification_uses_actual_telegram_formatter_and_receipt(tmp_path,monkeypatch):
     from fastapi.testclient import TestClient
     from nullion import config, web_app
@@ -88,7 +150,8 @@ def test_tracker_notification_uses_actual_telegram_formatter_and_receipt(tmp_pat
         async def send_message(self,chat_id,text,**kw):
             deliveries.append((str(chat_id),text,kw));return SimpleNamespace(message_id=len(deliveries))
         async def send_document(self,*a,**kw):raise AssertionError('Tracker status must not attach files')
-    monkeypatch.setitem(sys.modules,'telegram',SimpleNamespace(Bot=Bot))
+    import telegram as telegram_sdk
+    monkeypatch.setattr(telegram_sdk, "Bot", Bot)
     settings=NullionSettings(doctor_enabled=False,telegram=TelegramSettings(bot_token='12345:synthetic'))
     monkeypatch.setattr(config,'load_settings',lambda *a,**kw:settings)
     monkeypatch.setattr(web_app,'load_settings',lambda *a,**kw:settings)
@@ -179,6 +242,8 @@ def test_plain_chat_does_not_load_tracker_history_or_add_model_calls(tmp_path,mo
     class Provider:
         calls=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls+=1
             return {'content':[{'type':'text','text':'24'}]}
     p=Provider();app,runtime,db=setup(tmp_path,monkeypatch,p)
@@ -216,7 +281,8 @@ def test_delayed_and_slow_checks_do_not_deliver_false_health_alerts(tmp_path,mon
         async def send_message(self,chat_id,text,**kw):
             deliveries.append((str(chat_id),text,kw));return SimpleNamespace(message_id=len(deliveries))
         async def send_document(self,*a,**kw):raise AssertionError('Tracker status must not attach files')
-    monkeypatch.setitem(sys.modules,'telegram',SimpleNamespace(Bot=Bot))
+    import telegram as telegram_sdk
+    monkeypatch.setattr(telegram_sdk, "Bot", Bot)
     settings=NullionSettings(doctor_enabled=False,telegram=TelegramSettings(bot_token='12345:synthetic'))
     monkeypatch.setattr(config,'load_settings',lambda *a,**kw:settings)
     monkeypatch.setattr(web_app,'load_settings',lambda *a,**kw:settings)

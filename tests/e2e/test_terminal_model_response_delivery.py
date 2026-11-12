@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -109,6 +110,8 @@ def test_real_cron_skips_review_and_telegram_uploads_produced_report_bytes(tmp_p
     class AgentProvider:
         calls=0
         def create(self,**kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kwargs.get('tools'): return adapter.create(**kwargs)
             self.calls+=1
             if self.calls==1:
@@ -170,6 +173,8 @@ def test_real_cron_skips_review_and_telegram_uploads_produced_report_bytes(tmp_p
         assert page.locator('script').count()==0
         browser.close()
     runtime.checkpoint(force=True)
-    turns=[r for r in load_runtime_store(db).list_conversation_events() if r.get('cron_id')==job.id]
+    saved_events=load_runtime_store(db).list_conversation_events()
+    assert any(r.get('cron_id')==job.id and r.get('event_type')=='conversation.cron_run' for r in saved_events)
+    turns=[r for r in saved_events if r.get('cron_id')==job.id and r.get('event_type')=='conversation.chat_turn']
     assert len(turns)==1 and turns[0]['delivery_channel']=='telegram'
     assert 'MEDIA:'+str(artifact) in turns[0]['assistant_reply']

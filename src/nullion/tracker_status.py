@@ -17,6 +17,7 @@ import sqlite3
 import unicodedata
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
+from nullion.delivery_acknowledgement import UnconfirmedDelivery
 
 log = logging.getLogger(__name__)
 DAY = timedelta(days=1)
@@ -129,12 +130,26 @@ def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: dat
                 and not any(result.get(k) for k in ("cron_report_failed", "cron_run_failed", "cron_delivery_failed"))
                 and (result.get("cron_source_verification_required") is not True
                      or result.get("cron_source_verification_satisfied") is True))
+    if ((result.get('response_presentation') or {}).get('outcome_review_role') == 'helper'
+            and (result.get('response_presentation') or {}).get('outcome_review_status') in {'unavailable','advice'}):
+        verified = False
     if result.get("suspended_for_approval"):
         status = "waiting_for_approval"
     elif result.get("cron_run_cancelled"):
         status = "cancelled"
     elif result.get("cron_delivery_failed"):
         status = "delivery_failed"
+    elif (not verified and isinstance(outcome, dict) and outcome.get('delivery_succeeded') is True
+            and outcome.get('status') in {'succeeded','partially_succeeded'}
+            and not outcome.get('failure_reason') and not outcome.get('missing_requirements')
+            and result.get('response_fulfilled') is not False and not result.get('cron_report_partial')
+            and (result.get('response_presentation') or {}).get('outcome_review_role') == 'helper'
+            and (result.get('response_presentation') or {}).get('outcome_review_status') in {'unavailable','advice'}
+            and not is_tracker(job) and result.get('cron_alert_delivery_mode') != 'verified_matches_only'
+            and not any(result.get(key) for key in ('cron_report_failed','cron_run_failed'))):
+        # An unavailable editor neither proves task completion nor establishes
+        # a failed execution. Keep the delivery and diagnostic facts distinct.
+        status = 'delivered'
     elif verified and (is_tracker(job) or result.get("cron_alert_delivery_mode") == "verified_matches_only"):
         reason = result.get("cron_alert_delivery_reason")
         decision = result.get("cron_alert_delivery_decision")
@@ -143,9 +158,13 @@ def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: dat
     else:
         status = "succeeded" if verified else "incomplete"
     with _db(path) as conn:
-        row = conn.execute("SELECT started_at,finished_at FROM cron_tracker_runs WHERE run_id=? AND scope=?", (run_id, scope)).fetchone()
-        if not row or row["finished_at"]:
+        row = conn.execute("SELECT started_at,finished_at,status FROM cron_tracker_runs WHERE run_id=? AND scope=?", (run_id, scope)).fetchone()
+        if not row or (row["finished_at"] and row['status'] != 'interrupted'):
             return
+        # Lease expiry is a provisional observation. The owning execution can
+        # still return a real terminal result after a delayed checkpoint. Keep
+        # that fact (including approval pauses) rather than a stale interruption.
+        # The started_at guard below still protects a newer attempt's state.
         conn.execute("UPDATE cron_tracker_runs SET finished_at=?,status=? WHERE run_id=?", (now.isoformat(), status, run_id))
         state = _state(conn, scope)
         # Concurrent manual/automatic checks must not overwrite a newer attempt.
@@ -162,9 +181,15 @@ def finish_check(path: Path, job: object, run_id: str, result: dict, *, now: dat
                 state["no_match_since"] = state.get("no_match_since") or row["started_at"]
             else:
                 state.update(consecutive_no_matches=0, no_match_since=None)
-            state["last_issue"] = ("model_timeout" if result.get("reason") == "cron_run_model_timeout" else
+            presentation = result.get("response_presentation") or {}
+            state["last_delivery_succeeded"] = isinstance(outcome, dict) and outcome.get("delivery_succeeded") is True
+            state["last_issue"] = (None if status in SUCCESS or status == 'delivered' else
+                "delivery_failed" if status == "delivery_failed" else
+                ("review_timeout" if presentation.get("outcome_review_timeout") is True else "review_unavailable")
+                    if presentation.get("outcome_review_status") == "unavailable" and presentation.get('outcome_review_role') != 'helper' else
+                "model_timeout" if result.get("reason") == "cron_run_model_timeout" or result.get("model_timed_out") is True else
                 "source_unverified" if result.get("cron_source_verification_required") is True and result.get("cron_source_verification_satisfied") is not True else
-                "delivery_failed" if status == "delivery_failed" else "incomplete" if status == "incomplete" else None)
+                "incomplete" if status == "incomplete" else None)
             if status in SUCCESS:
                 state.update(last_success_at=now.isoformat(), consecutive_failures=0, failure_since=None)
             elif status in {"incomplete", "delivery_failed"}:
@@ -209,7 +234,8 @@ def _reconcile_interrupted_checks(conn: sqlite3.Connection, job: object, now: da
             active = leases_exist and conn.execute(
                 "SELECT 1 FROM cron_execution_leases WHERE cron_id=? AND token=? AND expires_at>?",
                 (row["cron_id"], row["lease_token"], now.isoformat())).fetchone()
-            if active:
+            from nullion.cron_scheduler_state import lease_owner_alive
+            if active and lease_owner_alive(row["lease_token"]) is not False:
                 continue
         elif now - _date(row["started_at"]) < MISSED_CHECK_GRACE:
             # Legacy/manual fixtures without ownership get a bounded startup grace.
@@ -267,17 +293,20 @@ def _status(conn: sqlite3.Connection, job: object, now: datetime) -> dict:
             "consecutive_no_matches": int(state.get("consecutive_no_matches", 0)),
             "no_match_since": state.get("no_match_since"), "failure_since": state.get("failure_since"),
             "last_issue": state.get("last_issue"),
+            "last_delivery_succeeded": state.get("last_delivery_succeeded") is True,
             "overdue": bool(overdue), "last_outcome": state.get("outcome")}
 
 
-def tracker_statuses(path: Path | None, jobs: Iterable[object], *, now: datetime | None = None) -> dict[str, dict]:
+def tracker_statuses(path: Path | None, jobs: Iterable[object], *, now: datetime | None = None,
+                     reconcile: bool = True) -> dict[str, dict]:
     """One batched read for the requested scheduler/UI/tool surface only."""
     jobs = tuple(jobs)
     if not jobs or path is None:
         return {}
-    with _db(path) as conn:
-        for job in jobs:
-            _reconcile_interrupted_checks(conn, job, _utc(now))
+    with _db(path, write=reconcile) as conn:
+        if reconcile:
+            for job in jobs:
+                _reconcile_interrupted_checks(conn, job, _utc(now))
         return {str(job.id): _status(conn, job, _utc(now)) for job in jobs}
 
 
@@ -295,11 +324,8 @@ def _time(value: object, job: object) -> str:
     dt = _date(value)
     if dt is None:
         return "Not yet"
-    try:
-        tz = ZoneInfo(str(getattr(job, "schedule_timezone", "") or "UTC"))
-    except (ValueError, KeyError):
-        tz = timezone.utc
-    return dt.astimezone(tz).strftime("%b %d, %I:%M %p %Z")
+    from nullion.preferences import format_user_datetime
+    return format_user_datetime(dt)
 
 
 def _details(job: object, status: dict) -> str:
@@ -310,7 +336,7 @@ def _details(job: object, status: dict) -> str:
 def _claim(conn: sqlite3.Connection, key: str, now: datetime) -> bool:
     row = conn.execute("SELECT payload FROM cron_tracker_notices WHERE notice_key=?", (key,)).fetchone()
     payload = json.loads(row[0]) if row else {}
-    if payload.get("sent_at") or (_date(payload.get("retry_at")) or now) > now:
+    if payload.get("sent_at") or payload.get("delivery_status") == "unknown" or (_date(payload.get("retry_at")) or now) > now:
         return False
     payload = {"retry_at": (now + timedelta(minutes=5)).isoformat()}
     conn.execute("INSERT INTO cron_tracker_notices VALUES (?,?) ON CONFLICT(notice_key) DO UPDATE SET payload=excluded.payload", (key, json.dumps(payload)))
@@ -362,7 +388,28 @@ def dispatch_tracker_updates(path: Path | None, jobs: Iterable[object], *,
                     schedule=cron_display_fields(job)["schedule_description"],
                     last_success=_time(status["last_success_at"],job), next_check=_time(status["next_check_at"],job))
                 observations.append((job,status,notice,scope))
-                if notice and health_notifications_enabled(job):
+                interrupted = None
+                if status["last_outcome"] == "interrupted" and status["state"] != "running":
+                    interrupted = conn.execute(
+                        """SELECT r.run_id FROM cron_tracker_runs r
+                        JOIN cron_tracker_owners o ON o.run_id=r.run_id
+                        WHERE r.scope=? AND r.status='interrupted' AND r.started_at=? AND r.finished_at>=?
+                        ORDER BY r.finished_at DESC LIMIT 1""",
+                        (scope, status["last_attempt_at"], (now-DAY).isoformat()),
+                    ).fetchone()
+                if interrupted is not None:
+                    key = f"{scope}:{_route_scope(route)}:interrupted:{interrupted['run_id']}"
+                    if _claim(conn, key, now):
+                        from nullion.chat_text import UserMessage, render_user_message
+                        text = render_user_message(UserMessage(kind='warning',
+                            title=f'Scheduled task interrupted: {_label(job.name)}',
+                            summary='The worker stopped or lost its execution lease before a final result was delivered. '
+                                'No completed report was sent for this run.',
+                            footer='Actions completed before the interruption may still apply. '
+                                'Ask me to run this task again when you are ready. '
+                                f'Its next scheduled check is {_time(status["next_check_at"], job)}.'))
+                        pending.append((key, scope, 'interrupted', job, route, text))
+                elif notice and health_notifications_enabled(job):
                     key = f"{scope}:{_route_scope(route)}:doctor:{notice.kind}:{notice.episode}"
                     if _claim(conn,key,now):
                         pending.append((key,scope,notice.kind,job,route,notice.message))
@@ -383,10 +430,19 @@ def dispatch_tracker_updates(path: Path | None, jobs: Iterable[object], *,
         with _db(path,write=False) as conn:
             latest = _status(conn,job,now)
         limit = _streak_limit(job)
+        if kind == "interrupted" and latest["last_outcome"] != "interrupted":
+            continue
         if latest["state"] == "running" or (kind == "failure" and latest["consecutive_failures"] < limit) or (kind == "no_match" and latest["consecutive_no_matches"] < limit):
             continue
         try:
             delivered = send(job, route[1], route[2], text, kind) is True
+        except UnconfirmedDelivery as exc:
+            with _db(path) as conn:
+                conn.execute("UPDATE cron_tracker_notices SET payload=? WHERE notice_key=?",
+                    (json.dumps({"delivery_status": "unknown", "attempted_at": now.isoformat(),
+                        "delivery_progress": exc.progress()}), key))
+            log.warning("Tracker status acknowledgement is unknown; not replaying")
+            continue
         except Exception:
             log.warning("Tracker status delivery failed", exc_info=True)
             delivered = False

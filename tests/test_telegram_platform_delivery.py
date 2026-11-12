@@ -50,7 +50,7 @@ async def test_operator_telegram_delivery_formats_markdown_for_cron(monkeypatch,
         (
             "send_message",
             "chat-1",
-            "⏰ <b>SCHEDULED TASK: Watch</b>\n\n<b>Result:</b> No new mentions. Check <code>site:reddit.com</code>.",
+            "<b>SCHEDULED TASK: Watch</b>\n\n<b>Result:</b> No new mentions. Check <code>site:reddit.com</code>.",
             {"disable_web_page_preview": True, "parse_mode": "HTML"},
         )
     ]
@@ -59,6 +59,7 @@ async def test_operator_telegram_delivery_formats_markdown_for_cron(monkeypatch,
         for line in (tmp_path / "delivery_receipts.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert receipts[-1]["message_id"] == "3001"
+
 
 
 @pytest.mark.asyncio

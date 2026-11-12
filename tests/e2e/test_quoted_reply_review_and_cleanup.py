@@ -1,4 +1,5 @@
 """Real Telegram ingress/review and real cron terminal execution boundaries."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import json
 import os
@@ -52,6 +53,8 @@ def test_telegram_quote_survives_scope_requirement_review_and_final_delivery(tmp
     class Model:
         phase=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system=str(kw.get('system') or '');names={tool['name'] for tool in kw.get('tools',[])}
             if ('allowed_target_indexes' in json.dumps(kw.get('messages',[]))
                     or ('relationship' in system and 'target_index' in system)):
@@ -84,8 +87,8 @@ def test_telegram_quote_survives_scope_requirement_review_and_final_delivery(tmp
                 tool=next(tool for tool in kw['tools'] if tool['name']=='present_source_answer')
                 schema=tool['input_schema']['properties']['points']['items']['properties']
                 identity=schema['evidence_ids']['items']['enum'][0]
-                return call('present_source_answer',{'intro':'Links for the quoted products',
-                    'points':[{'evidence_ids':[identity],'detail':'https://example.test/alpha https://example.test/beta',
+                return call('present_source_answer',{'intro':'Links for the quoted products','focus_roles':['entity'],
+                    'points':[{'semantic_role':'entity','evidence_ids':[identity],'detail':'https://example.test/alpha https://example.test/beta',
                         'relevance':'These are the referenced product links.'}],'limitation_ids':[]})
             if not names:return text('{}')
             if 'web_fetch' not in names:return call('request_tool_scope',{'capabilities':['web'],'tool_names':['web_fetch']})
@@ -131,6 +134,8 @@ def test_scheduled_terminal_source_cleanup_does_not_ask_or_delete(tmp_path,monke
     class Model:
         phase=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.phase+=1
             if self.phase==1:return call('terminal_exec',{'command':"python -c 'print(\"x\" * 6000)'",'network_mode':'inherit'})
             if self.phase==2:

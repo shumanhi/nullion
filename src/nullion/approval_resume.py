@@ -6,9 +6,10 @@ than silently executing an action whose outcome is unknown.
 """
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from datetime import UTC, datetime
 from pathlib import Path
-import sqlite3
 import threading
 
 _LOCK = threading.Lock()
@@ -26,7 +27,7 @@ def claim_approval_resume(runtime, approval_id: str) -> bool:
         if path.is_file() and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
             # This independent table is not rewritten by store checkpoints.
             # INSERT's unique key also arbitrates separate adapter processes.
-            with sqlite3.connect(str(path), timeout=10) as conn:
+            with sqlite_connection(str(path), timeout=10) as conn:
                 conn.execute("""CREATE TABLE IF NOT EXISTS approval_resume_claims (
                     approval_id TEXT PRIMARY KEY, claimed_at TEXT NOT NULL)""")
                 result = conn.execute(
@@ -46,7 +47,7 @@ def approval_resume_claimed(runtime, approval_id: str) -> bool:
     path = Path(str(getattr(runtime, "checkpoint_path", "") or ""))
     if not path.is_file() or path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
         return False
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10) as conn:
+    with sqlite_connection(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as conn:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='approval_resume_claims'").fetchone():
             return False
         return conn.execute("SELECT 1 FROM approval_resume_claims WHERE approval_id=?", (approval_id,)).fetchone() is not None

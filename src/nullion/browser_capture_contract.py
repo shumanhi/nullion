@@ -14,7 +14,8 @@ def _capture_results(tool_results: object) -> tuple:
 
     return tuple(
         ToolResult(str(result.get("invocation_id") or ""), str(result.get("tool_name") or ""),
-                   str(result.get("status") or ""), result.get("output"))
+                   str(result.get("status") or ""), result.get("output"),
+                   recovered_by=tuple(result.get("recovered_by") or ()))
         if isinstance(result, Mapping) else result
         for result in (tool_results or ())
     )
@@ -23,7 +24,10 @@ def repaired_browser_results(tool_results: object) -> tuple:
     """Ignore a correctable failure only after its same-session repair completes."""
     from nullion.tool_repair_contract import tool_repair_kind
 
-    results = _capture_results(tool_results)
+    from nullion.workflow_recovery import recovered_failure_ids, result_id
+    rows = tuple(tool_results or ())
+    recovered = recovered_failure_ids(rows)
+    results = tuple(result for result in _capture_results(rows) if result_id(result) not in recovered)
     unresolved = []
     for index, result in enumerate(results):
         kind = tool_repair_kind(result) if result.tool_name in CAPTURE_TOOLS else None

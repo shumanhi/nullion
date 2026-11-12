@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
@@ -127,7 +128,7 @@ def _open_page(base_url: str, *, configure_page=None):
         page.on("pageerror", lambda exc: errors.append(str(exc)))
         page.on(
             "console",
-            lambda msg: errors.append(msg.text) if msg.type == "error" else None,
+            lambda msg: errors.append(msg.text + " " + json.dumps(msg.location)) if msg.type == "error" else None,
         )
         if configure_page is not None:
             configure_page(page)
@@ -174,6 +175,8 @@ def test_output_lists_links_and_literal_code_render_through_real_web_chat(tmp_pa
     report='1. **公園** — 19:30\n[Source](https://example.com)\n\n2. **Plaza** — 20:00\n\n| Name | Time |\n| --- | --- |\n| | 19:30 | 未対応 |\n\n```python\n    <b>literal</b>\n```'
     class Model:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             return {'stop_reason':'end_turn', 'content':[{'type':'text','text':report}]}
     runtime=bootstrap_persistent_runtime(tmp_path/'output.db')
     model=Model(); runtime.model_client=model
@@ -933,6 +936,8 @@ def test_web_chat_plain_turn_latency_budget(tmp_path: Path, monkeypatch: pytest.
 
     class SlowAttachmentModel:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if any(tool.get("name") == "select_attachment_format" for tool in kwargs.get("tools", [])):
                 attachment_model_calls.append(kwargs)
                 time.sleep(1.5)
@@ -1347,6 +1352,8 @@ def test_web_chat_scheduler_setup_scopes_future_artifact_work_to_cron_run(
             self.visible_tools_by_call: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if any(tool['name']=='select_attachment_format' for tool in kwargs.get('tools',[])):
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'format',
                     'name':'select_attachment_format','input':{'extension':None,'output_kind':'internal',
@@ -1479,6 +1486,8 @@ def test_web_chat_exposes_multiple_artifact_tools_only_after_a_structured_scope(
             self.visible_tools_by_call: list[set[str]] = []
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if any(tool['name']=='select_attachment_format' for tool in kwargs.get('tools',[])):
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'format',
                     'name':'select_attachment_format','input':{'extension':'.pdf','output_kind':'attachment',
@@ -1543,11 +1552,16 @@ def test_web_chat_exposes_multiple_artifact_tools_only_after_a_structured_scope(
     assert "document_create" not in model_client.visible_tools_by_call[0]
     widened_tools = model_client.visible_tools_by_call[1]
     assert {"document_create","presentation_create","spreadsheet_create","pdf_create","file_write"} <= widened_tools
-    assert "couldn't complete" in response.json()['text']
+    # No creation tool executed. The terminal message must identify the
+    # requested missing files; it cannot claim to have created the pack.
+    assert response.json()['text'] == "I couldn't complete the request because a required step didn't run."
+    assert 'Review warning:' not in response.json()['text']
     assert not response.json().get('artifacts')
     turn=next(e for e in reversed(runtime.store.list_conversation_events('web:multi-artifact-scope'))
         if e.get('event_type')=='conversation.chat_turn')
     assert any(r['tool_name']=='request_tool_scope' and r['status']=='completed' for r in turn['tool_results'])
+    assert not any(r['tool_name'] in {'document_create', 'presentation_create', 'spreadsheet_create',
+        'pdf_create', 'file_write'} for r in turn['tool_results'])
 
 
 def test_web_chat_bulk_cron_run_reply_overrides_stale_cron_listing(
@@ -1765,6 +1779,8 @@ def test_web_chat_builder_memory_reaches_dashboard_without_runtime_id_noise(tmp_
             self.memory_calls = 0
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             tools = kwargs.get("tools") or []
             if tools and tools[0].get("name") == "select_attachment_format":
                 return {"content": [{"type": "tool_use", "name": "select_attachment_format", "input": {"extension": None}}]}
@@ -2036,6 +2052,8 @@ def test_web_config_memory_limits_apply_to_next_builder_memory_turn(tmp_path: Pa
             self.builder_payloads: list[dict] = []
 
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             messages = kwargs.get("messages") or []
             user_text = messages[-1]["content"][0]["text"]
             payload = json.loads(user_text)
@@ -2468,6 +2486,8 @@ def test_websocket_slash_planner_forces_single_task_planner_card(
 
     class FakeStructuredPlannerModel:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             captured["model_messages"] = kwargs.get("messages")
             return {
                 "content": [
@@ -2588,6 +2608,7 @@ def test_websocket_can_generate_txt_artifacts_from_fetched_content(tmp_path: Pat
             final_text=f"Created requested file for {conversation_id}: {user_message[:40]}",
             artifacts=[str(txt_path)],
             tool_results=[
+                ToolResult('write-text', 'file_write', 'completed', {'path': str(txt_path)}),
                 ToolResult(
                     "fetch-text",
                     "web_fetch",
@@ -2887,6 +2908,7 @@ def test_websocket_can_deliver_multi_format_artifacts_from_a_multi_step_turn(tmp
                 final_text=f"{conversation_id}: multi-format artifacts generated",
                 artifacts=[str(txt_path), str(xlsx_path)],
                 tool_results=[
+                    ToolResult('write-txt', 'file_write', 'completed', {'path': str(txt_path)}),
                     ToolResult(
                         "artifact-txt",
                         "web_fetch",
@@ -3068,6 +3090,8 @@ def test_websocket_pdf_request_only_surfaces_requested_pdf_artifact(tmp_path: Pa
 
     class StructuredFormatModel:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             tools = kwargs.get("tools") or []
             if tools and tools[0].get("name") == "select_attachment_format":
                 return {
@@ -3756,6 +3780,8 @@ def test_browser_ui_uses_saved_history_before_asking_numbered_clarification(
         calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {tool['name'] for tool in kwargs.get('tools', [])}
             if 'select_attachment_format' in names:
                 return {'content': [{'type': 'tool_use', 'id': 'format', 'name': 'select_attachment_format',
@@ -5855,6 +5881,8 @@ def test_pending_web_reply_recovery_uses_turn_identity(tmp_path, monkeypatch, pr
     class Model:
         calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {tool['name'] for tool in kwargs.get('tools', [])}
             if 'select_attachment_format' in names:
                 return {'content': [{'type': 'tool_use', 'id': 'format', 'name': 'select_attachment_format', 'input': {'extension': None, 'confidence': 1}}]}
@@ -5951,6 +5979,13 @@ def test_web_budget_approval_preserves_turn_and_keeps_server_responsive(tmp_path
     class Model:
         rounds = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                if 'semantic completion reviewer' in str(kwargs.get('system') or '') and not entered.is_set():
+                    value=json.loads(protocol_reply['content'][0]['text'])
+                    value.update(disposition='retry',unresolved_requirements=['The complete requested observation collection is still missing.'])
+                    protocol_reply['content'][0]['text']=json.dumps(value)
+                return protocol_reply
             names = {t['name'] for t in kwargs.get('tools', [])}
             if 'select_attachment_format' in names:
                 return {'content':[{'type':'tool_use','id':'format','name':'select_attachment_format',
@@ -6031,6 +6066,8 @@ def test_web_reply_links_preserve_urls_and_keep_code_and_html_inert(tmp_path, mo
 
     class Model:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             return {'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': reply}]}
 
     runtime = bootstrap_persistent_runtime(tmp_path / 'runtime.db')
@@ -6086,6 +6123,8 @@ def test_web_followup_is_not_replaced_by_connector_builder_suggestion(tmp_path, 
     class Model:
         scope_calls = 0
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if 'Return only a JSON object matching this schema: {"requested_outcome"' in str(kwargs.get('system', '')):
                 self.scope_calls += 1
                 time.sleep(3)

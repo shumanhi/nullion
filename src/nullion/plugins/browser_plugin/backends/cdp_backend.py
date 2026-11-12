@@ -1021,13 +1021,26 @@ class _RawCDPClient:
             await self._ws.send(json.dumps({"id": message_id, "method": method, "params": params or {}}))
         return await asyncio.wait_for(future, timeout=timeout)
 
-    async def wait_event(self, method: str, *, timeout: float) -> dict[str, object]:
-        backlog = self._event_backlog.get(method)
-        if backlog:
-            return backlog.pop(0)
-        future = asyncio.get_running_loop().create_future()
-        self._event_waiters.setdefault(method, []).append(future)
-        return await asyncio.wait_for(future, timeout=timeout)
+    async def wait_event(self, method: str, *, timeout: float, predicate=None) -> dict[str, object]:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            backlog = self._event_backlog.get(method)
+            if backlog:
+                params = backlog.pop(0)
+            else:
+                future = asyncio.get_running_loop().create_future()
+                waiters = self._event_waiters.setdefault(method, [])
+                waiters.append(future)
+                try:
+                    params = await asyncio.wait_for(future,
+                        timeout=max(0, deadline - asyncio.get_running_loop().time()))
+                finally:
+                    if future in waiters:
+                        waiters.remove(future)
+            if predicate is None or predicate(params):
+                return params
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("No matching browser lifecycle event arrived")
 
     async def close(self) -> None:
         if self._reader_task is not None:
@@ -1071,15 +1084,43 @@ class _RawCDPPage:
 
     async def goto(self, url: str, **_kwargs: object) -> object:
         await self._ensure_page_enabled()
-        await self._client.send("Page.navigate", {"url": url}, timeout=10)
+        lifecycle_enabled = True
         try:
-            await self._client.wait_event("Page.domContentEventFired", timeout=30)
-        except Exception:
+            await self._client.send("Page.setLifecycleEventsEnabled", {"enabled": True}, timeout=5)
+        except RuntimeError:
+            # Older CDP endpoints may lack lifecycle events. Their fresh DOM
+            # event is still preferable to an earlier document's queued event.
+            lifecycle_enabled = False
+        for method in ("Page.domContentEventFired", "Page.loadEventFired",
+                       "Page.lifecycleEvent", "Page.navigatedWithinDocument"):
+            self._client._event_backlog.pop(method, None)
+        navigation = await self._client.send("Page.navigate", {"url": url}, timeout=10)
+        if navigation.get("errorText"):
+            raise RuntimeError("Browser navigation failed: " + str(navigation["errorText"]))
+        if navigation.get("isDownload"):
+            raise RuntimeError("Navigation started a download rather than loading a source document")
+        loader_id, frame_id = navigation.get("loaderId"), navigation.get("frameId")
+        if loader_id and lifecycle_enabled:
+            await self._client.wait_event("Page.lifecycleEvent", timeout=30,
+                predicate=lambda event: event.get("loaderId") == loader_id
+                    and event.get("frameId") == frame_id
+                    and event.get("name") in {"DOMContentLoaded", "load"})
+        elif frame_id and not loader_id:
+            # The protocol omits loaderId for same-document navigation. It does
+            # not generate another document-load event or require a 30s wait.
             try:
-                await self._client.wait_event("Page.loadEventFired", timeout=2)
-            except Exception:
+                await self._client.wait_event("Page.navigatedWithinDocument", timeout=2,
+                    predicate=lambda event: event.get("frameId") == frame_id)
+            except TimeoutError:
                 pass
-        self.url = url
+        else:
+            await self._client.wait_event("Page.domContentEventFired", timeout=30)
+        document = await self.evaluate("() => ({url: location.href, readyState: document.readyState})")
+        # A requested URL is a navigation argument, not observed provenance.
+        # Redirects and unsupported readback must not inherit that argument.
+        self.url = str(document.get("url") or "") if isinstance(document, dict) else ""
+        if isinstance(document, dict) and document.get("readyState") not in {"interactive", "complete"}:
+            raise RuntimeError("The navigated browser document is not ready")
         return SimpleNamespace(status=0)
 
     async def click(self, selector: str, **_kwargs: object) -> None:
@@ -1176,16 +1217,55 @@ class _RawCDPPage:
 
         return _Locator()
 
-    async def evaluate(self, script: str) -> object:
-        payload = await self._client.send(
-            "Runtime.evaluate",
-            {"expression": script, "awaitPromise": True, "returnByValue": True},
-            timeout=10,
-        )
-        result = payload.get("result") if isinstance(payload, dict) else {}
-        if isinstance(result, dict) and result.get("subtype") == "error":
-            raise RuntimeError(str(result.get("description") or result.get("value") or "browser script failed"))
-        return result.get("value") if isinstance(result, dict) else None
+    async def evaluate(self, script: str, arg: object = None) -> object:
+        expression = script
+        source = script.strip().rstrip(";").rstrip()
+        if source.startswith(("function", "async function")):
+            # A function declaration string is an expression in Playwright's
+            # evaluate API. Ask the JS parser before wrapping it; a declaration
+            # followed by statements must still execute as one original program.
+            candidate = "(" + source + "\n)"
+            await self._client.send("Runtime.enable", timeout=5)
+            compiled = await self._client.send("Runtime.compileScript", {
+                "expression": candidate, "sourceURL": "", "persistScript": False}, timeout=10)
+            if not isinstance(compiled, dict) or not compiled.get("exceptionDetails"):
+                expression = candidate
+        handles: set[str] = set()
+
+        def checked_result(payload):
+            result = payload.get("result") if isinstance(payload, dict) else {}
+            details = payload.get("exceptionDetails") if isinstance(payload, dict) else None
+            exception = details.get("exception") if isinstance(details, dict) else None
+            for remote in (result, exception):
+                if isinstance(remote, dict) and isinstance(remote.get("objectId"), str):
+                    handles.add(remote["objectId"])
+            if details or (isinstance(result, dict) and result.get("subtype") == "error"):
+                error = exception if isinstance(exception, dict) else result
+                raise RuntimeError(str(error.get("description") or error.get("value")
+                    or (details.get("text") if isinstance(details, dict) else None) or "browser script failed"))
+            return result if isinstance(result, dict) else {}
+
+        try:
+            result = checked_result(await self._client.send("Runtime.evaluate", {
+                "expression": expression, "awaitPromise": True, "returnByValue": False}, timeout=10))
+            object_id = result.get("objectId")
+            if object_id:
+                # Returning a function by value silently loses its result in
+                # native CDP. Invoke the exact handle once, with its argument,
+                # then serialize. Objects likewise need explicit serialization.
+                parameters = {"objectId": object_id, "awaitPromise": True, "returnByValue": True,
+                    "functionDeclaration": "function(arg) { return this(arg); }"
+                        if result.get("type") == "function" else "function() { return this; }"}
+                if result.get("type") == "function":
+                    parameters["arguments"] = [{"value": arg}]
+                result = checked_result(await self._client.send("Runtime.callFunctionOn", parameters, timeout=10))
+            return result.get("value")
+        finally:
+            for object_id in handles:
+                try:
+                    await self._client.send("Runtime.releaseObject", {"objectId": object_id}, timeout=.1)
+                except Exception:
+                    pass
 
     async def wait_for_selector(self, selector: str, timeout: int) -> None:
         deadline = asyncio.get_running_loop().time() + (timeout / 1000)
@@ -1374,6 +1454,19 @@ class CDPBackend:
         self._remember_backend_owned_pages(browser)
         return browser
 
+    async def _stop_failed_playwright_connection(self, playwright) -> None:
+        # Disconnect only this adapter's driver. Never close the borrowed
+        # browser, and never let failed transport cleanup block raw-CDP recovery.
+        try:
+            stop = getattr(playwright, "stop", None)
+            if callable(stop):
+                await asyncio.wait_for(stop(), timeout=2)
+        except Exception:
+            pass
+        finally:
+            if self._playwright is playwright:
+                self._playwright = None
+
     async def _ensure_browser(self) -> "Browser | _RawCDPBrowser":
         if self._browser is None or not self._browser.is_connected():
             await _async_cdp_targets(self._cdp_url)
@@ -1384,14 +1477,11 @@ class CDPBackend:
                     pw.chromium.connect_over_cdp(self._cdp_url),
                     timeout=5,
                 )
-            except Exception as exc:
-                try:
-                    stop = getattr(pw, "stop", None)
-                    if callable(stop):
-                        await stop()
-                except Exception:
-                    pass
-                self._playwright = None
+            except asyncio.CancelledError:
+                await self._stop_failed_playwright_connection(pw)
+                raise
+            except Exception:
+                await self._stop_failed_playwright_connection(pw)
                 return await self._ensure_raw_browser()
         return self._browser
 
@@ -1648,7 +1738,9 @@ class CDPBackend:
             text = (await el.inner_text()).strip()
             tag = await el.evaluate("e => e.tagName.toLowerCase()")
             href = await el.get_attribute("href") or ""
-            results.append({"tag": tag, "text": text[:200], "href": href})
+            results.append({"tag": tag, "text": text[:200], "href": href,
+                "text_length": len(text), "text_truncated": len(text) > 200,
+                "total_matches": len(elements), "matches_truncated": len(elements) > 50})
         return results
 
     async def run_js(self, session_id: str, script: str) -> Any:

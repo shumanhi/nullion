@@ -48,6 +48,9 @@ def setup(tmp_path, monkeypatch, probe):
         answer = ''
         pending_probe = False
         def create(self, **kw):
+            from tests.workflow_provider_protocol import workflow_provider_reply
+            reply = workflow_provider_reply(kw, reasoned=True)
+            if reply is not None: return reply
             if 'assistant_no_tool_draft' in str(kw.get('messages', [])) and not kw.get('tools'):
                 self.scope_calls += 1
 
@@ -123,7 +126,10 @@ def test_full_answer_survives_shell_and_plain_turns_stay_fast(tmp_path, monkeypa
             page.get_by_role('button', name='Send', exact=True).click()
             from playwright.sync_api import expect
             for line in answer.splitlines():
-                expect(page.locator('#messages')).to_contain_text(line, timeout=15000)
+                # Ordered-list numbering is supplied by the browser's <ol>,
+                # while textContent contains only each item's authored text.
+                rendered = line.split('. ',1)[1] if line[:1].isdigit() and '. ' in line else line
+                expect(page.locator('#messages')).to_contain_text(rendered, timeout=15000)
             conversation = next(row['conversation_id'] for row in reversed(runtime.store.list_conversation_events())
                 if row.get('event_type') == 'conversation.chat_turn' and row.get('assistant_reply') == answer)
             assert page.get_by_text('Local terminal capability verified.', exact=True).count() == 0

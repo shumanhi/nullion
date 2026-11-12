@@ -1,4 +1,5 @@
 """Real artifact tools, graph, FastAPI/SQLite/history, and attachment bytes."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 import io
 import json
@@ -56,6 +57,8 @@ def test_only_selected_files_cross_delivery_and_history_boundaries(tmp_path,monk
     class Model:
         steps=0;reviews=0;trace=[];plain_mode=False;plain_calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             system=kw.get('system','');names={t['name'] for t in kw.get('tools',[])}
             self.trace.append((self.steps,system[:100],sorted(names),str(kw.get('messages',[])[-1:])[-2500:]))
             if self.plain_mode:
@@ -68,7 +71,7 @@ def test_only_selected_files_cross_delivery_and_history_boundaries(tmp_path,monk
             if system.startswith('You are a semantic completion reviewer'):
                 self.reviews+=1
                 if mode=='review_unavailable':return text_response('{invalid')
-                if mode=='blocked':return text_response(json.dumps({'disposition':'blocked','unresolved_requirements':['Required source verification failed.']}))
+                if mode=='blocked':return text_response(json.dumps({'disposition':'blocked','unresolved_requirements':['Required source verification failed.'],'user_facing_failure':'The source could not be reached.'}))
                 payload=json.loads(kw['messages'][0]['content'][0]['text']);rows=payload['material_requirement_contract']
                 # The final reviewer must never inspect superseded candidates.
                 assert payload['artifact_candidate_filenames']==(['candidate-a'+extension,'candidate-b'+extension] if mode=='two_outputs' else ['candidate-b'+extension])
@@ -77,6 +80,11 @@ def test_only_selected_files_cross_delivery_and_history_boundaries(tmp_path,monk
                     'material_requirements':[{**r,'satisfied':True,'draft_covered':True,'evidence_invocation_ids':ids} for r in rows]}))
             if 'select_attachment_format' in names:return tool_response('select_attachment_format',{'extension':None,'confidence':1})
             if not names and self.steps<final_step:return text_response('{}')
+            if names=={'select_artifact_delivery'} and mode in {'selection_repair','two_outputs'}:
+                from nullion.prompt_injection import UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START,UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END
+                raw=kw['messages'][0]['content'][0]['text'].split(UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START+'\n',1)[1].split('\n'+UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END,1)[0]
+                selected=[c['candidate_id'] for c in json.loads(raw) if mode=='two_outputs' or c['filename']==Path(paths[-1]).name]
+                return tool_response('select_artifact_delivery',{'status':'selected','selected_ids':selected,'reason':'The final prepared revision'})
             self.steps+=1
             if self.steps==1:return tool_response('request_tool_scope',{'capabilities':['web','local_files'] if source_required else ['local_files'],'tool_names':['web_fetch',tool,'file_read'] if source_required else [tool,'file_read'],'required_tool_names':['web_fetch',tool,'file_read'] if source_required else [tool,'file_read'],'artifact_extensions':[extension]})
             if source_required and self.steps==2:return tool_response('web_fetch',{'url':'https://example.com/source'})
@@ -92,16 +100,21 @@ def test_only_selected_files_cross_delivery_and_history_boundaries(tmp_path,monk
     with TestClient(app) as client:
         response=client.post('/api/chat',json={'text':prompt,'conversation_id':'web:revision-case'})
         assert response.status_code==200,response.text
-        payload=response.json();expected=[] if mode=='ambiguous' or (mode=='blocked' and model.reviews) else paths if mode=='two_outputs' else paths[1:]
+        payload=response.json();expected=[] if mode=='ambiguous' else paths if mode=='two_outputs' else paths[1:]
         actual=[a['path'] for a in payload['artifacts']]
         if actual != expected or len(writes)!=2:
             print(json.dumps({'trace':model.trace,'writes':[r.output for r in writes],'payload':payload},indent=2,default=str))
         assert actual==expected,(payload,model.trace,[(r.status,r.error) for r in writes])
         assert len(writes)==2 and all(r.status=='completed' for r in writes),writes
-        if mode=='review_unavailable' and model.reviews:assert 'final content review could not be completed' in payload['text'],payload
+        if mode=='review_unavailable' and model.reviews:assert 'final content review could not be completed' not in payload['text'],payload
         assert 'completion remains unverified' not in payload['text']
         if mode=='ambiguous':assert "couldn't determine which versions" in payload['text'],payload
-        if mode=='blocked' and model.reviews:assert 'Required source verification failed' in payload['text'],payload
+        if mode=='blocked' and model.reviews:
+            # The fake reviewer supplied this claim without any failed source
+            # receipt. An editorial blocked verdict cannot revoke valid selected files or invent
+            # an access failure from its free-form diagnostic.
+            assert 'The source could not be reached.' not in payload['text'],payload
+            assert 'The final result is incomplete.' not in payload['text'],payload
         events=runtime.store.list_conversation_events('web:revision-case');turns=[e for e in events if e.get('event_type')=='conversation.chat_turn'];assert turns,(payload,model.trace,[(r.status,r.error) for r in writes]);turn=turns[-1]
         assert turn.get('artifact_paths',[])==expected
         history=client.get('/api/chat/history/web:revision-case',params={'turn_ids':json.dumps([turn['turn_id']])}).json()
@@ -109,7 +122,7 @@ def test_only_selected_files_cross_delivery_and_history_boundaries(tmp_path,monk
         from nullion.artifacts import split_media_reply_attachments
         stored_caption,_=split_media_reply_attachments(turn['assistant_reply'],is_safe_attachment_path=lambda path:path.is_file())
         assert history['terminal_replies'][0]['text']==stored_caption
-        if mode=='review_unavailable' and model.reviews:assert 'final content review could not be completed' in history['terminal_replies'][0]['text']
+        if mode=='review_unavailable' and model.reviews:assert 'final content review could not be completed' not in history['terminal_replies'][0]['text']
         from nullion.artifact_validation import validate_artifact_paths
         assert validate_artifact_paths(actual).ok
         if family=='pdf':
@@ -173,6 +186,28 @@ def test_image_and_terminal_artifacts_share_final_selection(tmp_path,monkeypatch
     class Model:
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
+            names={row['name'] for row in kw.get('tools',[])};system=str(kw.get('system') or '')
+            if names=={'select_artifact_delivery'}:
+                from nullion.prompt_injection import UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START,UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END
+                raw=kw['messages'][0]['content'][0]['text'].split(UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START+'\n',1)[1].split('\n'+UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END,1)[0]
+                candidates=json.loads(raw)
+                return tool_response('select_artifact_delivery',{'status':'selected',
+                    'selected_ids':[c['candidate_id'] for c in candidates if both or c['filename']=='image-b.png'],
+                    'reason':'These are the separately requested final image outputs.'})
+            if system.startswith('You are a material-requirements planner'):
+                return text_response(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[
+                    {'requirement':'Deliver '+Path(path).name,'requirement_kind':'deliverable','evidence_subject_id':Path(path).name,
+                     'eligible_evidence_tool_names':[producer]} for path in (paths if both else paths[1:])]}))
+            if system.startswith('You are a semantic completion reviewer'):
+                payload=json.loads(kw['messages'][0]['content'][0]['text'])
+                records=[r for r in payload['tool_evidence'] if isinstance(r.get('output'),dict) and r['output'].get('artifact_record_binding')]
+                bindings={r['output']['artifact_record_binding']['filename']:r['invocation_id'] for r in records}
+                return text_response(json.dumps({'disposition':'complete','all_material_requirements_enumerated':True,
+                    'unresolved_requirements':[],'material_requirements':[
+                        {**row,'satisfied':True,'draft_covered':True,'evidence_invocation_ids':[bindings[row['evidence_subject_id']]]}
+                        for row in payload['material_requirement_contract']]}))
             self.steps+=1
             assert self.steps<=5,'Artifact workflow restarted'
             if self.steps<=2:
@@ -187,8 +222,16 @@ def test_image_and_terminal_artifacts_share_final_selection(tmp_path,monkeypatch
     result=AgentOrchestrator(model_client=model).run_turn(conversation_id=principal,principal_id=principal,user_message=prompt,
         conversation_history=[],tool_registry=registry,policy_store=runtime.store,approval_store=runtime.store,
         tool_flow_context={'artifact_extensions':['.png'],'requires_artifact_delivery':True})
-    expected=paths if both else paths[1:]
+    expected_sources=paths if both else paths[1:]
+    aliases={descriptor['source_path']:descriptor['path'] for record in result.tool_results
+             for descriptor in record.output.get('artifact_descriptors',[]) if descriptor.get('source_path')}
+    expected=[aliases.get(path,path) for path in expected_sources]
     assert result.artifacts==expected,[(r.tool_name,r.status,r.error,r.output) for r in result.tool_results]
+    assert all(Path(delivered).read_bytes()==Path(original).read_bytes()
+               for delivered,original in zip(result.artifacts,expected_sources,strict=True))
+    if scratch and producer=='terminal_exec':
+        assert all(Path(path).is_relative_to(root) for path in result.artifacts)
+        assert all(path not in paths for path in result.artifacts)
     assert len(result.tool_results)==4
     assert [r.status for r in result.tool_results]==['completed','completed','failed','completed']
     assert result.tool_results[2].output['reason']=='local_artifact_already_available'
@@ -225,6 +268,8 @@ def test_selected_revision_must_itself_contain_required_media(tmp_path,monkeypat
     class Model:
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.steps+=1
             assert self.steps<=5,'Selected revision repair restarted the workflow'
             if self.steps==1:return tool_response('pdf_create',{'output_path':str(original),'html_pages':['<p>Text only</p>',f'<img src="{image}">'],'expected_page_count':2})
@@ -242,9 +287,9 @@ def test_selected_revision_must_itself_contain_required_media(tmp_path,monkeypat
     if repair:assert len(PdfReader(final).pages)==1 and sum(len(p.images) for p in PdfReader(final).pages)>0
 
 
-@pytest.mark.parametrize('prompt',['Convert the draft to a final document.','下書きを最終文書に変換。'])
+@pytest.mark.parametrize('prompt,both_suffix',[('Convert the draft to a final document.','Deliver both the source PDF and final DOCX.'),('下書きを最終文書に変換。','元のPDFと最終DOCXの両方を添付。')])
 @pytest.mark.parametrize('both',[True,False])
-def test_different_formats_still_require_an_explicit_final_selection(tmp_path,monkeypatch,prompt,both):
+def test_different_formats_still_require_an_explicit_final_selection(tmp_path,monkeypatch,prompt,both,both_suffix):
     from nullion.tools import ToolRegistry,ToolSpec,ToolRiskLevel,ToolSideEffectClass,_build_pdf_create_handler,_build_document_create_handler
     from nullion.artifacts import artifact_root_for_principal
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -256,6 +301,24 @@ def test_different_formats_still_require_an_explicit_final_selection(tmp_path,mo
     class Model:
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
+            system=kw.get('system','');names={t['name'] for t in kw.get('tools',[])}
+            if system.startswith('You are a material-requirements planner'):
+                return text_response(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[
+                    {'requirement':'Deliver the selected file','requirement_kind':'deliverable','evidence_subject_id':fmt,
+                     'eligible_evidence_tool_names':[producer]} for fmt,producer in ([('pdf','pdf_create'),('doc','document_create')] if both else [('doc','document_create')])]}))
+            if system.startswith('You are a semantic completion reviewer'):
+                payload=json.loads(kw['messages'][0]['content'][0]['text']);rows=payload['material_requirement_contract']
+                assert sorted(payload['artifact_candidate_filenames'])==sorted([Path(p).name for p in ([pdf,doc] if both else [doc])])
+                records={r['tool_name']:r['invocation_id'] for r in payload['tool_evidence'] if r.get('output',{}).get('result_kind')=='artifact_receipt'}
+                return text_response(json.dumps({'disposition':'complete','all_material_requirements_enumerated':True,'material_requirements':[
+                    {**row,'satisfied':True,'draft_covered':True,'evidence_invocation_ids':[records[row['eligible_evidence_tool_names'][0]]]} for row in rows]}))
+            if names=={'select_artifact_delivery'}:
+                from nullion.prompt_injection import UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START,UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END
+                raw=kw['messages'][0]['content'][0]['text'].split(UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START+'\n',1)[1].split('\n'+UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END,1)[0]
+                selected=[c['candidate_id'] for c in json.loads(raw) if both or c['extension']=='.docx']
+                return tool_response('select_artifact_delivery',{'status':'selected','selected_ids':selected,'reason':'Explicit requested formats'})
             self.steps+=1
             assert self.steps<=4,'Selection regenerated the documents'
             if self.steps==1:return tool_response('pdf_create',{'output_path':pdf,'text_pages':['Source document.'],'expected_page_count':1})
@@ -264,7 +327,7 @@ def test_different_formats_still_require_an_explicit_final_selection(tmp_path,mo
             assert not kw.get('tools')
             return text_response('Ready.\n'+'\n'.join('MEDIA:'+p for p in ([pdf,doc] if both else [doc])))
     model=Model();runtime.model_client=model
-    result=AgentOrchestrator(model_client=model).run_turn(conversation_id=principal,principal_id=principal,user_message=prompt,
+    result=AgentOrchestrator(model_client=model).run_turn(conversation_id=principal,principal_id=principal,user_message=(prompt+' '+both_suffix if both else prompt),
         conversation_history=[],tool_registry=registry,policy_store=runtime.store,approval_store=runtime.store,
         tool_flow_context={'requires_artifact_delivery':True})
     assert result.artifacts==([pdf,doc] if both else [doc]),result.final_text
@@ -288,6 +351,8 @@ def test_existing_pdf_edit_needs_no_new_images_or_preliminary_read(tmp_path,monk
     class Model:
         steps=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.steps+=1
             assert self.steps<=2,'The edit should not enter recovery or regenerate content'
             if self.steps==1:return tool_response('pdf_edit',{'input_path':str(source),'output_path':str(final),'rotate_degrees':180,'expected_page_count':1})

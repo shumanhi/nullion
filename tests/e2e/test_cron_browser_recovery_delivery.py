@@ -1,3 +1,4 @@
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 from datetime import UTC, datetime
@@ -11,7 +12,8 @@ pytestmark = pytest.mark.skipif(os.environ.get("NULLION_RUN_E2E") != "1", reason
 @pytest.mark.parametrize("task", ["条件に合う情報だけ通知。", "Notifica solo resultados que cumplen la condición."])
 @pytest.mark.parametrize("match", [True, False])
 @pytest.mark.parametrize("stop", ["limit", "provider_failure"])
-def test_real_cron_salvages_browser_evidence_and_obeys_alert_policy(tmp_path, monkeypatch, task, match, stop):
+@pytest.mark.parametrize("writer_fails", [False, True])
+def test_real_cron_salvages_browser_evidence_and_obeys_alert_policy(tmp_path, monkeypatch, record_property, task, match, stop, writer_fails):
     from nullion import crons
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.cron_delivery import (run_single_agent_cron_turn, run_cron_delivery_workflow,
@@ -40,9 +42,14 @@ def test_real_cron_salvages_browser_evidence_and_obeys_alert_policy(tmp_path, mo
     registry = ToolRegistry(); register_browser_tools(registry)
     runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(rule_id="public", principal_id=GLOBAL_PERMISSION_PRINCIPAL,
         kind=BoundaryKind.OUTBOUND_NETWORK, mode=PolicyMode.ALLOW, selector="*", created_by="owner", created_at=datetime.now(UTC)))
+    provider_calls = []
     class Provider:
         steps = 0; repairs = 0
         def create(self, **kwargs):
+            provider_calls.append({'system': kwargs.get('system'), 'tools': [r['name'] for r in kwargs.get('tools', [])],
+                'messages': kwargs.get('messages')})
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None: return protocol_reply
             if not kwargs.get("tools"):
                 if kwargs.get("system", "").startswith("You are a material-requirements planner"):
                     return {"content": [{"type": "text", "text": json.dumps({
@@ -62,6 +69,8 @@ def test_real_cron_salvages_browser_evidence_and_obeys_alert_policy(tmp_path, mo
                             "draft_covered": True, "evidence_invocation_ids": refs}]})}]}
                 if kwargs.get("system", "").startswith("You repair scheduled-task final answers"):
                     self.repairs += 1
+                    if writer_fails:
+                        raise ModelClientResponseError("server_error", retryable=True)
                     prompt = kwargs["messages"][0]["content"][0]["text"]
                     assert task in prompt and "62 USD" in prompt
                     return {"content": [{"type": "text", "text": json.dumps({
@@ -94,6 +103,15 @@ def test_real_cron_salvages_browser_evidence_and_obeys_alert_policy(tmp_path, mo
         record_chat_turn=lambda j, conv, c, target, text: record_cron_delivery_chat_turn(
             runtime.store, j, conversation_id=conv, delivery_channel=c, delivery_target=target, delivered_text=text))
     result = run_cron_delivery_workflow(job, label="Scheduled task", callbacks=callbacks)
+    record_property('runtime_evidence', json.dumps(result, default=str))
+    record_property('provider_calls', json.dumps(provider_calls, default=str))
+    if writer_fails:
+        assert 1 <= provider.repairs <= 2
+        assert result["response_fulfilled"] is False, result
+        assert result["execution_outcome"]["status"] != "succeeded", result
+        assert not result.get("cron_source_verification_satisfied"), result
+        assert not any("62 USD" in text for text in sent)
+        return
     assert provider.repairs == 1, result
     assert result["response_fulfilled"] is True and result["reached_iteration_limit"] is False
     assert not result.get("cron_report_failed"), result

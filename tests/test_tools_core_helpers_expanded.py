@@ -226,6 +226,7 @@ def test_read_only_tool_timeout_returns_terminal_failure() -> None:
     assert time.perf_counter() - started < 0.5
     assert result.status == "failed"
     assert result.output["reason"] == "handler_timeout"
+    assert result.output["failure_scope"] == "invocation"
     assert "timed out" in str(result.error)
 
 
@@ -1414,15 +1415,15 @@ def test_archive_extract_skips_metadata_and_blocks_unsafe_members(tmp_path) -> N
     assert Path(result.output["manifest_json_path"]).is_file()
     assert Path(result.output["manifest_xlsx_path"]).is_file()
     assert result.output["manifest_xlsx_path"] in result.output["manifest_artifact_paths"]
-    assert result.output["artifact_paths"] == []
-    assert result.output["artifact_path"] == ""
+    assert result.output.get("artifact_paths", []) == []
+    assert "artifact_path" not in result.output
     roles_by_path = {item["path"]: item["role"] for item in result.output["artifact_descriptors"]}
     assert roles_by_path[str(archive_path)] == "source"
     assert roles_by_path[result.output["manifest_xlsx_path"]] == "intermediate"
     assert roles_by_path[result.output["manifest_csv_path"]] == "intermediate"
     assert roles_by_path[result.output["manifest_json_path"]] == "intermediate"
-    assert result.output["manifest_csv_path"] not in result.output["artifact_paths"]
-    assert result.output["manifest_json_path"] not in result.output["artifact_paths"]
+    assert result.output["manifest_csv_path"] not in result.output.get("artifact_paths", [])
+    assert result.output["manifest_json_path"] not in result.output.get("artifact_paths", [])
     assert not any(str(column).startswith("Part ") for column in result.output["manifest_columns"])
     assert (output_dir / "report.html").read_text(encoding="utf-8") == "<h1>Report</h1>"
     assert (output_dir / "nested" / "data.csv").read_text(encoding="utf-8") == "name,value\nA,1\n"
@@ -1496,7 +1497,8 @@ def test_archive_extract_manifest_embeds_images_without_filename_transform_logic
     assert result.status == "completed"
     manifest_path = Path(result.output["manifest_xlsx_path"])
     assert manifest_path.is_file()
-    assert result.output["artifact_paths"] == []
+    assert result.output.get("artifact_paths", []) == []
+    assert "artifact_path" not in result.output
     assert result.output["manifest_embedded_image_count"] == 1
     assert len(result.output["embedded_images"]) == 1
     assert result.output["source_image_paths"] == result.output["embedded_images"]
@@ -1792,6 +1794,9 @@ def test_file_download_saves_remote_bytes_without_terminal_exec(monkeypatch, tmp
     assert result.output["artifact_paths"] == [str(output_path)]
     assert result.output["artifact_descriptors"][0]["role"] == "source"
     assert result.output["content_type"] == "application/zip"
+    from nullion.search_coverage import discovery_ledger
+    assert discovery_ledger([result])['observed_sources']==[{
+        'url':'https://93.184.216.34/archive.zip','observation_invocation_ids':['download']}]
 
 
 def test_file_download_retries_truncated_archive(monkeypatch, tmp_path) -> None:
@@ -2181,3 +2186,33 @@ def test_weather_location_resolution_is_cached_for_same_location_text() -> None:
     assert first == second
     assert first["latitude"] == 40.7128
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('scope,expected',[(None,True),('tool',True),('invocation',False)])
+def test_recovery_respects_adapter_declared_failure_scope(scope,expected):
+    from nullion.agent_orchestrator import _should_block_failed_tool_during_recovery
+    result=ToolResult('failed','web_fetch','failed',{'reason':'handler_timeout',**({'failure_scope':scope} if scope else {})},'接続できません')
+    assert _should_block_failed_tool_during_recovery(result) is expected
+
+
+@pytest.mark.parametrize('scope,available',[('invocation',True),('tool',False)])
+def test_recovery_scope_receipt_keeps_reader_after_invocation_failure(scope,available):
+    from nullion.agent_orchestrator import _maybe_widen_scope_after_repeated_tool_failure
+    registry=ToolRegistry()
+    for name in ('web_fetch','browser_navigate'):
+        registry.register(ToolSpec(name,'Public read',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,1),
+            lambda inv:ToolResult(inv.invocation_id,inv.tool_name,'completed',{}))
+    result=ToolResult('failed','web_fetch','failed',{'reason':'handler_timeout','failure_scope':scope},'読めません')
+    recovery=_maybe_widen_scope_after_repeated_tool_failure({'principal_id':'p','cleanup_scope':'owned'},
+        result=result,tool_registry=registry,tool_results=[result],tool_recovery_scopes_attempted=[])
+    assert recovery is not None
+    assert ('web_fetch' in recovery[1].output['available_tools']) is available
+    assert 'browser_navigate' in recovery[1].output['available_tools']
+
+
+@pytest.mark.parametrize('query',['別の公開記録','otra fuente pública'])
+def test_empty_search_is_query_failure_not_tool_outage(query):
+    handler=tools_module._build_web_search_handler(lambda _query,_limit:[])
+    result=handler(ToolInvocation('empty','web_search','p',{'query':query}))
+    assert result.status=='failed' and result.output['reason']=='no_usable_search_results'
+    assert result.output['failure_scope']=='invocation'

@@ -31,7 +31,7 @@ def test_page_text_keeps_research_tools_and_requires_outcome_review(prompt, exte
     assert _focus_tools_for_ready_artifact_production(state, tool_registry=tools, tool_results=results) is tools
     # All tools returning success does not establish comparison coverage.
     assert _completion_review_required(state, tool_results=results)
-    assert not _completion_review_required({'user_message': prompt, 'tool_registry': tools}, tool_results=results)
+    assert _completion_review_required({'user_message': prompt, 'tool_registry': tools}, tool_results=results)
 
 
 def test_pdf_argument_error_survives_focused_history_compaction(tmp_path):

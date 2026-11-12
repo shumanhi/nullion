@@ -566,8 +566,10 @@ def _build_system_prompt(
     conversation_context: str | None = None,
     memory_context: str | None = None,
     connector_context: str | None = None,
+    include_reasoning: bool = True,
 ) -> str | None:
-    sections: list[str] = []
+    from nullion.workflow_reasoning import WORKFLOW_REASONING_INSTRUCTION
+    sections: list[str] = [WORKFLOW_REASONING_INSTRUCTION] if include_reasoning else []
     if conversation_context:
         sections.append(f"Recent conversation:\n{conversation_context}")
     if memory_context:
@@ -589,6 +591,7 @@ def _build_orchestrator_conversation_history(
         conversation_context=conversation_context,
         memory_context=memory_context,
         connector_context=connector_context,
+        include_reasoning=False,  # The graph injects its one shared contract.
     )
     if not prompt:
         return []

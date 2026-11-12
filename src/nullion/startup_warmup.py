@@ -110,6 +110,7 @@ def run_chat_startup_warmup(
     def warm_chat_contexts() -> None:
         from nullion import chat_operator
 
+        chat_operator._compact_tool_scope_awareness_prompt(registry)
         chat_operator._chat_capability_inventory_prompt(runtime, tool_registry=registry)
         chat_operator._enabled_skill_pack_index_prompt(settings)
         chat_operator._chat_delivery_contract_prompt(runtime, principal_id=None)

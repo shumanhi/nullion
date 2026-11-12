@@ -1,6 +1,7 @@
 """Real browser interaction, selected controls, API persistence and delivery."""
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import re
@@ -72,6 +73,8 @@ def test_dynamic_times_prices_and_stock_keep_live_control_evidence(tmp_path, mon
                 browser_calls = 0
                 outer_calls = 0
                 def create(self, **kwargs):
+                    protocol_reply = workflow_provider_reply(kwargs, completion=False)
+                    if protocol_reply is not None: return protocol_reply
                     texts = [text for m in kwargs['messages'] for text in ([m['content']] if isinstance(m.get('content'), str) else [part.get('text', '') for part in m.get('content', []) if part.get('type') == 'text'])]
                     schema_messages = [text for text in texts if text.startswith('Return valid JSON matching this schema: ')]
                     def reply(text):

@@ -1,4 +1,5 @@
 """The real chat routes synthesize captured observations; only external boundaries are scripted."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import copy
 import json
 import os
@@ -56,6 +57,8 @@ def run_case(tmp_path,monkeypatch,prompt,surface,bad_mode=None,review=None):
     class Provider:
         calls=0;presentations=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names={d['name'] for d in kw.get('tools',[])}
             system=str(kw.get('system') or '')
             if 'select_attachment_format' in names:return tool('select_attachment_format',{'extension':None,'confidence':1})
@@ -74,8 +77,8 @@ def run_case(tmp_path,monkeypatch,prompt,surface,bad_mode=None,review=None):
                 if bad_mode=='always_invalid' or self.presentations==1 and bad_mode=='malformed':return text('Malformed presentation')
                 if self.presentations==1 and bad_mode=='extra_tool':return tool('browser_run_task',{'task':'unnecessary retry'})
                 chosen=[REPORT['observations'][i] for i in (6,11,12)]
-                answer={'intro':'For the concern you mentioned, prioritize these options:',
-                    'points':[{'evidence_ids':[rows[r['value']]['id']], 'detail_ids':[next(excerpt['id'] for excerpt in rows[r['value']]['excerpts'] if excerpt['text']==r['quote'].split('\n')[-1])],
+                answer={'intro':'For the concern you mentioned, prioritize these options:', 'focus_roles':['entity'],
+                    'points':[{'semantic_role':'entity','evidence_ids':[rows[r['value']]['id']], 'detail_ids':[next(excerpt['id'] for excerpt in rows[r['value']]['excerpts'] if excerpt['text']==r['quote'].split('\n')[-1])],
                                'relevance':'Relevant to the requested skin concern'} for r in chosen],
                     'limitation_ids':['u0','u1']}
                 if self.presentations==1 and bad_mode=='invented_excerpt':answer['points'][0]['detail_ids']=['invented-support']
@@ -132,6 +135,8 @@ def test_plain_turns_never_enter_slow_source_synthesis(tmp_path,monkeypatch,reco
     class Provider:
         main_calls=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names={t['name'] for t in kw.get('tools',[])};system=str(kw.get('system') or '')
             if 'select_attachment_format' in names:return tool('select_attachment_format',{'extension':None,'confidence':1})
             if 'relationship' in system:return text(json.dumps({'relationship':'independent','effect':'none','confidence':1,'target_index':None}))

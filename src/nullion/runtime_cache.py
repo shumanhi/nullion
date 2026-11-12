@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -170,7 +172,7 @@ def get_json(
         if target is None:
             return RuntimeCacheResult(None, False, "miss", (time.perf_counter() - started) * 1000)
         try:
-            with sqlite3.connect(str(target), timeout=1) as conn:
+            with sqlite_connection(str(target), timeout=1) as conn:
                 _ensure_table(conn)
                 row = conn.execute(
                     f"SELECT value_json, expires_at FROM {_CACHE_TABLE} WHERE cache_id = ?",
@@ -227,7 +229,7 @@ def set_json(
         expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat() if ttl_seconds and ttl_seconds > 0 else None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(str(target), timeout=1) as conn:
+            with sqlite_connection(str(target), timeout=1) as conn:
                 _ensure_table(conn)
                 conn.execute(
                 f"""
@@ -278,7 +280,7 @@ def invalidate_namespace(namespace: str, *, db_path: str | Path | None = None) -
     if target is None or not target.exists():
         return
     try:
-        with sqlite3.connect(str(target), timeout=1) as conn:
+        with sqlite_connection(str(target), timeout=1) as conn:
             _ensure_table(conn)
             conn.execute(f"DELETE FROM {_CACHE_TABLE} WHERE namespace = ?", (namespace,))
     except Exception:
@@ -295,7 +297,7 @@ def invalidate_prefix(prefix: str, *, db_path: str | Path | None = None) -> None
     if target is None or not target.exists():
         return
     try:
-        with sqlite3.connect(str(target), timeout=1) as conn:
+        with sqlite_connection(str(target), timeout=1) as conn:
             _ensure_table(conn)
             conn.execute(
                 f"DELETE FROM {_CACHE_TABLE} WHERE namespace = ? OR namespace LIKE ?",

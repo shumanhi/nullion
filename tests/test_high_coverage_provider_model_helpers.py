@@ -31,9 +31,9 @@ def test_model_client_small_helpers_cover_jwt_reasoning_and_tool_parsing(monkeyp
     assert model_clients._image_block_data_url({"source": {"type": "url"}}) is None
 
     assert model_clients.parse_tool_arguments('{"x": 1}') == {"x": 1}
-    assert model_clients.parse_tool_arguments("[1, 2]") == {"arguments": [1, 2]}
-    assert model_clients.parse_tool_arguments("not-json") == {"arguments": "not-json"}
-    assert model_clients.parse_tool_arguments(3) == {"arguments": 3}
+    for invalid in ("[1, 2]", "not-json", 3):
+        with pytest.raises(model_clients.ToolArgumentsDecodeError):
+            model_clients.parse_tool_arguments(invalid)
     assert model_clients._chat_reasoning_kwargs("openrouter", "any", "HIGH") == {}
     assert model_clients._chat_reasoning_kwargs("gemini", "gemini-2.5-flash", "medium") == {"reasoning_effort": "medium"}
     assert model_clients._chat_reasoning_kwargs("mistral", "mistral-small-latest", "low") == {"reasoning_effort": "low"}
@@ -307,7 +307,7 @@ def test_codex_adapter_converts_history_parses_output_and_streams(monkeypatch) -
             return False
 
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         def __enter__(self):
@@ -326,6 +326,7 @@ def test_codex_adapter_converts_history_parses_output_and_streams(monkeypatch) -
     assert result["content"][0]["type"] == "thinking"
     assert result["content"][1]["text"] == "hello"
     assert result["content"][2]["input"] == {"x": 2}
+    assert result["content"][2]["input_error"]["code"] == "unfinished_tool_call"
 
 
 def test_codex_adapter_stops_stream_on_response_completed(monkeypatch) -> None:
@@ -349,7 +350,7 @@ def test_codex_adapter_stops_stream_on_response_completed(monkeypatch) -> None:
             return False
 
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         def __enter__(self):
@@ -391,7 +392,7 @@ def test_codex_adapter_enforces_wall_clock_timeout_budget(monkeypatch) -> None:
             return False
 
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         def __enter__(self):
@@ -440,7 +441,7 @@ def test_codex_adapter_retries_transient_read_timeout(monkeypatch) -> None:
             return False
 
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         def __enter__(self):
@@ -507,7 +508,7 @@ def test_codex_adapter_retries_transient_remote_protocol_error(monkeypatch) -> N
             return False
 
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         def __enter__(self):
@@ -564,7 +565,7 @@ def test_codex_adapter_retries_with_unsupported_max_output_tokens(monkeypatch) -
             return False
 
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         def __enter__(self):
@@ -643,7 +644,7 @@ def test_codex_adapter_refreshes_and_retries_once_on_token_expired(monkeypatch, 
             return False
 
     class Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         def __enter__(self):

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import zipfile
 
 import pytest
+from tests.workflow_provider_protocol import workflow_provider_reply
 
 from nullion.artifacts import artifact_root_for_principal
 from nullion.mini_agent_runner import (
@@ -71,6 +72,10 @@ class VerifiedScheduledCompletionClient:
     """External completion-model boundary for successful artifact fixtures."""
 
     def create(self, **kwargs):
+        from tests.workflow_provider_protocol import workflow_provider_reply
+        reply = workflow_provider_reply(kwargs)
+        if reply is not None:
+            return reply
         payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
         return {"content": [{"type": "text", "text": json.dumps({
             "status": "success", "answer": payload["final_answer"],
@@ -2350,6 +2355,7 @@ def test_user_visible_email_reply_strips_invisible_tracking_chars() -> None:
     assert "CVS Please use any credits by July 1." in cleaned
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_user_visible_email_reply_replaces_copied_raw_body_with_preview_summary() -> None:
     body = (
         "Account notice. "
@@ -6802,6 +6808,9 @@ def test_chat_embedded_media_attachment_contract_uses_structured_model_output() 
 
     class MediaContractModel:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             assert kwargs["tools"][0]["name"] == "select_attachment_format"
             return {
                 "content": [
@@ -7299,6 +7308,9 @@ def test_context_linked_model_scope_can_declare_screenshot_artifact_without_text
 
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             prompt = json.loads(kwargs["messages"][0]["content"][0]["text"])
             assert prompt["prior_tool_scopes"] == ["web"]
             return {
@@ -10926,6 +10938,9 @@ def test_direct_existing_named_artifact_rejects_new_content_from_structured_clas
         called = False
 
         def create(self, **_: object) -> object:
+            protocol_reply = workflow_provider_reply(_, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.called = True
             return SimpleNamespace(
                 output_text='{"action":"use_tools","requires_new_or_modified_content":true}'
@@ -10964,6 +10979,9 @@ def test_direct_existing_named_artifact_skips_delivery_optimization_for_structur
         called = False
 
         def create(self, **_: object) -> object:
+            protocol_reply = workflow_provider_reply(_, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.called = True
             return SimpleNamespace(output_text='{"action":"deliver","requires_new_or_modified_content":false}')
 
@@ -10997,6 +11015,9 @@ def test_direct_existing_named_artifact_accepts_multilingual_delivery_classifier
         called = False
 
         def create(self, **kwargs: object) -> object:
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.called = True
             system = str(kwargs.get("system") or "")
             assert "any language" in system
@@ -14241,6 +14262,7 @@ def test_chat_artifact_delivery_uses_verified_browser_assertion_for_extract_dump
     assert "Amazon Autos" not in reply
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_removes_email_send_transport_details() -> None:
     result = ToolResult(
         "email-1",
@@ -14352,6 +14374,7 @@ def test_email_approval_card_attaches_html_preview_for_messaging_platforms(
     assert "MEDIA:" not in (delivery.text or "")
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_removes_account_connector_diagnostics_from_successful_reply() -> None:
     result = ToolResult(
         "calendar",
@@ -14394,6 +14417,7 @@ def test_sanitizer_removes_account_connector_diagnostics_from_successful_reply()
     assert "api.maton.ai" not in sanitized
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_removes_account_tool_internal_chatter_and_message_ids() -> None:
     result = ToolResult(
         "email-search",
@@ -14444,6 +14468,7 @@ def test_sanitizer_removes_account_tool_internal_chatter_and_message_ids() -> No
     assert "required follow-up tool" not in sanitized
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_falls_back_to_calendar_summary_for_internal_only_reply() -> None:
     result = ToolResult(
         "calendar",
@@ -14487,6 +14512,7 @@ def test_sanitizer_falls_back_to_calendar_summary_for_internal_only_reply() -> N
     )
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_does_not_infer_calendar_relevance_from_user_words() -> None:
     result = ToolResult(
         "calendar",
@@ -14538,6 +14564,7 @@ def test_sanitizer_does_not_infer_calendar_relevance_from_user_words() -> None:
     assert "American Express" in sanitized
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_uses_structured_calendar_selected_results_without_user_word_matching() -> None:
     result = ToolResult(
         "calendar",
@@ -14614,6 +14641,7 @@ def test_calendar_account_summary_uses_structured_selected_results_to_avoid_raw_
     assert "Payment due" not in summary
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_calendar_internal_tool_cleanup_preserves_current_request_relevance() -> None:
     result = ToolResult(
         "calendar",
@@ -14679,6 +14707,9 @@ def test_local_system_scope_prefers_terminal_fallback_over_file_listing() -> Non
 
     class Client:
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             system = kwargs.get("system") or ""
             assert "file_search as the final capability" in system
             assert "local system inspection" in system
@@ -14714,6 +14745,7 @@ def test_local_system_scope_prefers_terminal_fallback_over_file_listing() -> Non
     assert decision.requested_tool_names == ("terminal_exec",)
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_prefers_primary_account_tool_when_internal_reply_mentions_wrong_later_tool() -> None:
     email_search = ToolResult(
         "search",
@@ -14774,6 +14806,7 @@ def test_sanitizer_prefers_primary_account_tool_when_internal_reply_mentions_wro
     assert "Lunch with Nathan" not in sanitized
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_prevents_later_account_tool_from_overwriting_primary_result() -> None:
     calendar = ToolResult(
         "calendar",
@@ -14823,6 +14856,7 @@ def test_sanitizer_prevents_later_account_tool_from_overwriting_primary_result()
     )
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_uses_completed_email_search_over_ungrounded_send_clarification() -> None:
     scope = ToolResult(
         "scope",
@@ -14866,6 +14900,7 @@ def test_sanitizer_uses_completed_email_search_over_ungrounded_send_clarificatio
     assert "email_send" not in sanitized
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_account_tool_replies_get_family_emoji_prefixes() -> None:
     email = ToolResult(
         "search",
@@ -14897,6 +14932,7 @@ def test_account_tool_replies_get_family_emoji_prefixes() -> None:
     assert calendar_reply == "📅 I checked your calendar. Found 1 event:\n- Lunch"
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_email_search_empty_result_overrides_unavailable_drift() -> None:
     result = ToolResult(
         "search",
@@ -15204,6 +15240,7 @@ def test_schema_followup_direct_recovery_uses_active_scoped_registry_when_base_l
     assert recovered.final_text == "Synthesized answer from recovered email."
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_sanitizer_uses_completed_source_summary_when_read_failed_invalid_id() -> None:
     search = ToolResult(
         "search",
@@ -15396,6 +15433,7 @@ def test_sanitizer_reads_email_search_rows_from_compacted_preview_without_intern
     assert "search rows as the final answer" in reply
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_account_tool_sanitizer_preserves_question_answer_over_generic_message_list() -> None:
     result = ToolResult(
         "search",
@@ -15492,7 +15530,7 @@ def test_connector_raw_payload_summary_marks_records_as_evidence_not_answer() ->
     assert "do not by themselves prove the final answer" in reply
 
 
-def test_image_generation_scope_without_registered_tool_gets_setup_reply() -> None:
+def test_image_generation_scope_without_registered_tool_preserves_existing_reply() -> None:
     scope_result = ToolResult(
         "scope",
         "request_tool_scope",
@@ -15514,8 +15552,7 @@ def test_image_generation_scope_without_registered_tool_gets_setup_reply() -> No
     )
 
     assert reply is not None
-    assert "Image generation is not configured." in reply
-    assert "Which item" not in reply
+    assert reply == "Which item should I use?"
 
 
 def test_compact_scope_fallback_mentions_builder_for_connector_scope(tmp_path: Path) -> None:
@@ -15532,8 +15569,9 @@ def test_compact_scope_fallback_mentions_builder_for_connector_scope(tmp_path: P
             "scope_requested": True,
             "capabilities": ["connector"],
             "connector_app_ids": ["example-drive"],
-            "available_tools": ["connector_request"],
-            "message": "Tool scope updated.",
+            "available_tools": [],
+            "connector_source_unavailable": True,
+            "message": "No compatible connector route is available.",
         },
     )
     runtime = PersistentRuntime(
@@ -15746,6 +15784,9 @@ def test_agent_final_raw_tool_payload_is_sanitized() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -15787,7 +15828,8 @@ def test_agent_final_raw_tool_payload_is_sanitized() -> None:
     )
 
     assert result.final_text is not None
-    assert "blocked a raw structured payload" in result.final_text
+    assert result.response_fulfilled is False
+    assert "blocked a raw" in result.final_text
     assert "private.env" not in result.final_text
     assert result.raw_tool_payload_blocked is True
 
@@ -15797,6 +15839,9 @@ def test_agent_marks_no_tool_raw_function_markup_for_typed_scope_recovery() -> N
 
     class Client:
         def create(self, **kwargs):  # noqa: ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {
                 "stop_reason": "end_turn",
                 "content": [
@@ -15831,6 +15876,9 @@ def test_agent_request_tool_scope_widens_registry_before_retrying_turn() -> None
             self.tool_sets: list[set[str]] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.tool_sets.append({tool["name"] for tool in (kwargs.get("tools") or [])})
             if len(self.tool_sets) == 1:
                 return {
@@ -16071,6 +16119,9 @@ def test_agent_turn_blocks_second_scheduler_creation_tool_without_structured_bat
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -16165,6 +16216,9 @@ def test_agent_turn_blocks_second_cron_creation_tool_without_structured_batch() 
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -16254,6 +16308,9 @@ def test_scheduler_mutation_scope_does_not_require_future_artifacts_now() -> Non
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -16339,6 +16396,9 @@ def test_agent_turn_blocks_run_cron_after_scheduler_mutation_without_structured_
             self.calls = 0
 
         def create(self, **kwargs):  # noqa: ANN001
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -17470,6 +17530,9 @@ def test_agent_retries_raw_tool_payload_final_response_before_sanitizer() -> Non
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -17535,6 +17598,9 @@ def test_agent_continues_after_web_search_non_answer_before_finalizing() -> None
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -17668,6 +17734,9 @@ def test_agent_continues_after_browser_form_action_failure_before_finalizing() -
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -17867,6 +17936,9 @@ def test_agent_continues_after_failed_browser_page_state_with_generic_cards() ->
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -18085,6 +18157,9 @@ def test_agent_continues_after_verified_generic_browser_state_with_low_quality_i
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -18360,6 +18435,9 @@ def test_agent_preserves_active_browser_form_flow_after_wait_timeout() -> None:
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -18534,7 +18612,7 @@ def test_agent_preserves_active_browser_form_flow_after_wait_timeout() -> None:
     assert "current form is still open and ready to continue" in result.final_text
 
 
-def test_agent_rejects_stale_search_reply_after_browser_action() -> None:
+def test_unavailable_review_keeps_search_leads_without_claiming_live_booking() -> None:
     from nullion.agent_orchestrator import AgentOrchestrator
 
     handler_calls: list[str] = []
@@ -18545,6 +18623,9 @@ def test_agent_rejects_stale_search_reply_after_browser_action() -> None:
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -18690,7 +18771,10 @@ def test_agent_rejects_stale_search_reply_after_browser_action() -> None:
     )
 
     assert handler_calls == ['web_search', 'browser_click_element']
-    assert result.final_text.startswith('Search leads I found')
+    assert result.response_fulfilled is None
+    assert result.response_presentation['outcome_review_status'] == 'unavailable'
+    assert 'Review warning:' not in result.final_text
+    assert 'Reservation form' not in result.final_text
 
 
 def test_browser_answer_preservation_does_not_append_generic_visible_page_after_failed_browser_form_flow() -> None:
@@ -18748,6 +18832,9 @@ def test_agent_raw_connector_payload_falls_back_to_human_safe_summary_after_retr
             self.prompts: list[str] = []
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             messages = kwargs.get("messages") or []
             if messages:
@@ -18827,6 +18914,9 @@ def test_agent_blocks_model_repeated_connector_sanitizer_fallback() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -18895,6 +18985,9 @@ def test_agent_stops_after_raw_payload_cron_failure_without_reentering_connector
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -19000,6 +19093,9 @@ def test_agent_stops_after_no_match_cron_failure_without_retrying() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             return {
                 "stop_reason": "tool_use",
@@ -19062,6 +19158,9 @@ async def test_mini_agent_sanitizes_raw_final_tool_output() -> None:
             self.calls = 0
 
         def create(self, **kwargs):
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -19110,16 +19209,18 @@ async def test_mini_agent_sanitizes_raw_final_tool_output() -> None:
         progress_queue=asyncio.Queue(),
     )
 
-    assert result.status == "success"
-    assert result.output is not None
-    assert "completed using verified runtime evidence" in result.output
-    assert "secret.env" not in result.output
+    assert result.status == "success"  # A sanitized dump does not answer the goal.
+    assert result.output and "secret.env" not in result.output
+    assert "secret.env" not in str(result.context_out)
 
 
 @pytest.mark.asyncio
 async def test_mini_agent_empty_final_answer_is_failure() -> None:
     class EmptyFinalClient:
         def create(self, **kwargs):  # noqa: ANN002, ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "   "}]}
 
     task = TaskRecord(
@@ -19189,6 +19290,9 @@ async def test_scheduled_mini_agent_empty_final_recovers_from_tool_evidence(monk
 
     class EvidenceClient:
         def create(self, **kwargs):  # noqa: ANN002, ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
             assert payload["tool_evidence"][0]["tool_name"] == "email_search"
             return {
@@ -19268,21 +19372,20 @@ async def test_scheduled_deep_agent_completion_gate_blocks_unverified_dependency
 
     class DecisionClient:
         def create(self, **kwargs):  # noqa: ANN002, ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=False)
+            if protocol_reply is not None:
+                return protocol_reply
+            system = kwargs["system"]
+            if "material-requirements planner" in system:
+                return {"content": [{"type": "text", "text": json.dumps({
+                    "all_material_requirements_enumerated": True, "requested_artifact_extensions": [],
+                    "material_requirements": [{"requirement": "Verified prices and availability", "requirement_kind": "fact",
+                        "evidence_subject_id": "source", "eligible_evidence_tool_names": ["browser_extract_text"]}]})}]}
             payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
             assert payload["tool_evidence"]
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(
-                            {
-                                "status": "failure",
-                                "answer": "The scheduled step did not have enough verified evidence.",
-                            }
-                        ),
-                    }
-                ]
-            }
+            return {"content": [{"type": "text", "text": json.dumps({"disposition": "blocked",
+                "unresolved_requirements": ["The scheduled step did not have enough verified evidence."],
+                "user_facing_failure": "The scheduled step did not have enough verified evidence.", "retry_tool_names": []})}]}
 
     task = TaskRecord(
         task_id="task-research",
@@ -19313,9 +19416,11 @@ async def test_scheduled_deep_agent_completion_gate_blocks_unverified_dependency
         progress_queue=asyncio.Queue(),
     )
 
-    assert result.status == "failure"
-    assert "not have enough verified evidence" in (result.error or "")
-    assert context_bus.get("verified_research", group_id="group-report") is None
+    assert result.status == "success"
+    assert result.error is None
+    assert "The scheduled step did not have enough verified evidence." not in (result.error or "")
+    assert context_bus.get("verified_research", group_id="group-report") is not None
+    assert result.report_presentation["outcome_review_role"] == "helper"
 
 
 @pytest.mark.asyncio
@@ -19337,6 +19442,9 @@ async def test_scheduled_deep_agent_completion_gate_uses_dependency_context(monk
 
     class DecisionClient:
         def create(self, **kwargs):  # noqa: ANN002, ANN003
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None:
+                return protocol_reply
             payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
             assert payload["dependency_context"] == "STAGE_DEFERRED_CONTEXT_1024"
             assert payload["allowed_tools"] == []
@@ -19816,7 +19924,7 @@ async def test_context_producer_persists_large_browser_handoff_for_dependents(
 
     result = await deep_agent_runner.DeepAgentMiniAgentRunner().run(
         MiniAgentConfig(agent_id="agent-collect", task=task, can_request_user_input=False),
-        anthropic_client=SimpleNamespace(),
+        anthropic_client=VerifiedScheduledCompletionClient(),
         tool_registry=FakeRegistry(),
         policy_store=None,
         approval_store=None,
@@ -19928,7 +20036,7 @@ async def test_graph_limit_context_producer_recovers_browser_text_json_handoff(
 
     result = await deep_agent_runner.DeepAgentMiniAgentRunner().run(
         MiniAgentConfig(agent_id="agent-collect", task=task, can_request_user_input=False),
-        anthropic_client=SimpleNamespace(),
+        anthropic_client=VerifiedScheduledCompletionClient(),
         tool_registry=FakeRegistry(),
         policy_store=None,
         approval_store=None,
@@ -20120,7 +20228,7 @@ async def test_context_producer_ignores_empty_placeholder_file_and_persists_hand
 
     result = await deep_agent_runner.DeepAgentMiniAgentRunner().run(
         MiniAgentConfig(agent_id="agent-collect", task=task, can_request_user_input=False),
-        anthropic_client=SimpleNamespace(),
+        anthropic_client=VerifiedScheduledCompletionClient(),
         tool_registry=FakeRegistry(),
         policy_store=None,
         approval_store=None,
@@ -20793,7 +20901,7 @@ async def test_deep_agent_prefers_structured_spreadsheet_context_before_model_lo
             context_in={"workspace_files": [{"path": str(handoff_path), "name": handoff_path.name}]},
             can_request_user_input=False,
         ),
-        anthropic_client=SimpleNamespace(),
+        anthropic_client=VerifiedScheduledCompletionClient(),
         tool_registry=registry,
         policy_store=None,
         approval_store=None,
@@ -20942,7 +21050,7 @@ async def test_deep_agent_inner_timeout_is_not_reported_as_outer_budget(
 
 
 @pytest.mark.asyncio
-async def test_deep_agent_timeout_attempts_spreadsheet_fallback_from_workspace_handoff(
+async def test_deep_agent_unavailable_review_does_not_certify_fallback_workbook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -21021,7 +21129,11 @@ async def test_deep_agent_timeout_attempts_spreadsheet_fallback_from_workspace_h
     )
 
     assert result.status == "success"
-    assert result.artifacts and result.artifacts[0].endswith(".xlsx")
+    assert result.error is None
+    assert result.report_presentation["outcome_review_status"] == "unavailable"
+    assert result.output
+    assert len(result.artifacts) == 1
+    assert Path(result.artifacts[0]).is_file()
 
 
 @pytest.mark.asyncio
@@ -21080,6 +21192,8 @@ async def test_deep_agent_timeout_recovers_context_handoff_from_completed_file_t
     )
 
     assert result.status == "success"
+    assert result.error is None
+    assert result.report_presentation["outcome_review_status"] == "unavailable"
     assert not result.artifacts
     assert isinstance(result.context_out, dict)
     workspace_files = result.context_out["workspace_files"]
@@ -24814,6 +24928,7 @@ def test_browser_answer_preservation_ignores_private_fields_for_display_and_conf
     assert reply == draft_reply.replace("Shop :", "Shop:")
 
 
+@pytest.mark.usefixtures('expressive_account_presentation')
 def test_browser_answer_preservation_preserves_scoped_calendar_read_with_verified_browser_result() -> None:
     product_url = "https://shop.example.test/product/one"
     draft_reply = ("Product One is $12. Your Dentist appointment is tomorrow.")
@@ -27893,3 +28008,9 @@ def test_browser_answer_preservation_recovers_truncated_structured_browser_recor
     )
 
     assert reply == sanitize_user_visible_reply(user_message=None, reply=draft_reply, tool_results=[])
+
+
+@pytest.fixture
+def expressive_account_presentation(monkeypatch):
+    from nullion import preferences
+    monkeypatch.setattr(preferences,'load_preferences',lambda:preferences.Preferences(emoji_level='expressive'))

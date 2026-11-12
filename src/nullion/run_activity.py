@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from enum import Enum
 import os
-from pathlib import PurePosixPath
 from typing import Any, Iterable
-from urllib.parse import urlparse
 
 from nullion.approval_markers import is_tool_approval_marker
-from nullion.prompt_injection import is_untrusted_tool_name, safe_untrusted_tool_metadata
 
 SKILL_USAGE_GLYPH = "⧁"
 ACTIVITY_GROUP_ICON = "→"
@@ -191,26 +188,11 @@ def _short_tool_detail(tool_result: Any) -> str:
     if error:
         if _is_image_generation_setup_error(tool_name, str(error)):
             return "provider not configured"
-        return str(error).strip()[:140]
-    output = _tool_field(tool_result, "output")
-    structured_detail = _safe_structured_tool_detail(tool_name, output)
-    if structured_detail:
-        return structured_detail
-    if is_untrusted_tool_name(tool_name):
-        metadata = safe_untrusted_tool_metadata(tool_name, output)
-        for key in ("url", "title", "path", "query", "status_code", "content_type"):
-            value = metadata.get(key)
-            if value:
-                return _compact_tool_detail_value(key, value)
         return ""
-    if isinstance(output, dict):
-        for key in ("reason", "summary", "message", "path", "url"):
-            value = output.get(key)
-            if value:
-                return _compact_tool_detail_value(key, value)
-    if isinstance(output, str) and output.strip():
-        return _compact_tool_detail_value("", output)
-    return ""
+    # Activity is a status surface, not a second tool-result delivery channel.
+    # Only explicitly supported structured summaries belong here. Native errors,
+    # filenames, URLs and arbitrary adapter prose remain in runtime evidence.
+    return _safe_structured_tool_detail(tool_name, _tool_field(tool_result, "output"))
 
 
 def _is_image_generation_setup_error(tool_name: str, error: str) -> bool:
@@ -239,9 +221,6 @@ def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
     if normalized_tool == "email_read":
         return "✉️ message read"
     if normalized_tool == "email_attachment_read":
-        filename = output.get("filename")
-        if isinstance(filename, str) and filename.strip():
-            return f"✉️ attachment {filename.strip()[:80]}"
         return "✉️ attachment read"
     if normalized_tool == "email_send":
         return "✉️ sent"
@@ -259,29 +238,9 @@ def _safe_structured_tool_detail(tool_name: str, output: Any) -> str:
         return f"{count} scheduled task{'s' if count != 1 else ''}"
     if normalized_tool == "run_cron":
         delivery_status = output.get("delivery_status") or output.get("cron_delivery_status")
-        if isinstance(delivery_status, str) and delivery_status.strip():
-            if delivery_status.strip().lower() == "deferred":
-                return "background run started"
-            return f"delivery {delivery_status.strip()[:80]}"
-        name = output.get("name")
-        if isinstance(name, str) and name.strip():
-            return name.strip()[:140]
+        if delivery_status == "deferred":
+            return "background run started"
     return ""
-
-
-def _compact_tool_detail_value(key: str, value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if key == "url" or text.startswith(("http://", "https://")):
-        parsed = urlparse(text)
-        if parsed.netloc:
-            return parsed.netloc[:140]
-    if key == "path" or text.startswith(("/", "~/")):
-        name = PurePosixPath(text).name
-        if name:
-            return name[:140]
-    return text[:140]
 
 
 def _skill_usage_title(skill_use: Any) -> str | None:

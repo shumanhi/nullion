@@ -239,3 +239,27 @@ def test_existing_find_approval_rows_are_shown_as_search_scopes():
     assert 'Delete matching entries within:' in detail
     assert 'About to delete 1 path' not in detail
     assert 'exact matches have not been enumerated' in detail
+
+
+@pytest.mark.parametrize('exit_code',[0,7])
+@pytest.mark.parametrize('cancelled',[False,True])
+def test_published_exited_worker_keeps_native_report_and_cancellation_priority(tmp_path,monkeypatch,exit_code,cancelled):
+    from nullion.plugins.browser_plugin import browser_use_worker as worker
+    from nullion.plugins.browser_plugin.browser_use_adapter import BrowserTask
+    from nullion.plugins.browser_plugin.browser_policy import BrowserPolicy
+    monkeypatch.setenv('NULLION_HOME',str(tmp_path/'home'))
+    monkeypatch.setattr('nullion.plugins.browser_plugin.browser_resources.browser_temporary_root',lambda:tmp_path/'sdk-temp')
+    monkeypatch.setattr('nullion.tools.tool_execution_cancelled',lambda:cancelled)
+    monkeypatch.setattr(worker.platform,'system',lambda:'Windows')
+    def launch(args,**kwargs):
+        worker._publish_worker_result(Path(args[-1]),{'report_status':'partial','observations':[{'value':37}]})
+        return SimpleNamespace(returncode=exit_code,pid=999,wait=lambda **kwargs:None,poll=lambda:exit_code)
+    monkeypatch.setattr(worker.subprocess,'Popen',launch)
+    monkeypatch.setattr(worker,'_signal_worker',lambda *args,**kwargs:pytest.fail('Exited Windows PID must not be signalled'))
+    def run():
+        return worker.run_isolated_browser_task(BrowserTask(task='確認',url='https://example.com'),client=object(),principal_id='operator',policy=BrowserPolicy(),timeout=1,python=sys.executable)
+    if cancelled:
+        with pytest.raises(InterruptedError):run()
+    else:
+        result=run();assert result['report_status']=='partial' and result['observations']==[{'value':37}]
+    assert not list((tmp_path/'home'/'browser-task-scratch').glob('run-*'))

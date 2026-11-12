@@ -54,6 +54,7 @@ class TaskResult:
     error: str | None = None
     context_out: object = None                            # published to context bus
     resume_token: dict[str, object] = field(default_factory=dict)
+    report_presentation: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,6 +98,8 @@ class TaskGroup:
     tasks: list[TaskRecord] = field(default_factory=list)
     planner_metadata: dict[str, object] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    cancel_requested: bool = False
 
     def all_terminal(self) -> bool:
         return all(t.is_terminal() for t in self.tasks)
@@ -212,6 +215,9 @@ class TaskRegistry:
 
     async def cancel_group(self, group_id: str) -> int:
         """Cancel all non-terminal tasks in *group_id*. Returns count cancelled."""
+        group = self.get_group(group_id)
+        if group is not None:
+            group.cancel_requested = True
         count = 0
         for task in self.list_by_group(group_id):
             if not task.is_terminal():

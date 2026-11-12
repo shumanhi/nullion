@@ -1,5 +1,6 @@
 """Collection and detail scopes through real API, persistence, and delivery."""
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import time
@@ -7,7 +8,8 @@ import pytest
 pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason='container E2E only')
 
 @pytest.mark.parametrize('prompt,detail', [('Check my email',False),('Revisa mi bandeja',False),('受信箱を確認して',False),('Open the second message',True)])
-def test_optional_detail_visibility_does_not_replace_collection_answer(tmp_path, monkeypatch, prompt, detail):
+@pytest.mark.parametrize('has_more', [False, True])
+def test_optional_detail_visibility_does_not_replace_collection_answer(tmp_path, monkeypatch, prompt, detail, has_more):
     from fastapi.testclient import TestClient
     from nullion import web_app, turn_context_policy
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -23,6 +25,10 @@ def test_optional_detail_visibility_does_not_replace_collection_answer(tmp_path,
         output={'results':[{'id':'message-one','subject':'First notice','from':'one@example.com','snippet':'First update'},
                            {'id':'message-two','subject':'Second notice','from':'two@example.com','snippet':'Second update'}],
                 'body_included':False,'body_requires_tool':'email_read','next_tool_for_body':'email_read'}
+        if has_more:
+            from nullion.workflow_reasoning import cursor_page_evidence
+            output.update(has_more=True,source_pagination=cursor_page_evidence(
+                scope={'fixture':'selected-inbox'},cursor=None,next_cursor='next-page',result_count=2))
         if inv.tool_name=='email_read':
             output={'message':{'id':'message-two','subject':'Second notice','body':'The second message has the requested detail.'}}
         return ToolResult(inv.invocation_id,inv.tool_name,'completed',output)
@@ -34,6 +40,12 @@ def test_optional_detail_visibility_does_not_replace_collection_answer(tmp_path,
     required=['email_search','email_read'] if detail else ['email_search']
     class Model:
         def create(self,**kw):
+            if 'semantic completion reviewer' in kw.get('system','') and has_more:
+                packet=json.loads(kw['messages'][0]['content'][0]['text'])
+                assert packet['source_pagination'][0]['complete'] is False
+                assert 'remaining cursor alone does not make' in kw['system']
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names={t['name'] for t in kw.get('tools',[])}
             if not names:
                 return {'stop_reason':'end_turn','content':[{'type':'text','text':json.dumps({
@@ -48,7 +60,7 @@ def test_optional_detail_visibility_does_not_replace_collection_answer(tmp_path,
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'search','name':'email_search','input':{'query':'in:inbox'}}]}
             if detail and 'email_read' not in calls:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'read','name':'email_read','input':{'id':'message-two'}}]}
-            text='Second notice: The second message has the requested detail.' if detail else 'Two inbox messages: First notice — First update; Second notice — Second update.'
+            text='Second notice: The second message has the requested detail.' if detail else 'Two recent inbox messages I checked: First notice — First update; Second notice — Second update.'
             return {'stop_reason':'end_turn','content':[{'type':'text','text':text}]}
     runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');model=Model();runtime.model_client=model
     from datetime import UTC, datetime

@@ -129,7 +129,7 @@ def test_browser_image_collect_registers_with_browser_web_scope_without_direct_f
     assert "web_fetch" not in names
 
 
-def test_media_provider_uses_svg_fallback_when_configured_image_model_fails(tmp_path, monkeypatch) -> None:
+def test_media_provider_preserves_configured_image_model_failure(tmp_path, monkeypatch) -> None:
     from nullion import providers
     from nullion.providers import resolve_plugin_provider_kwargs
 
@@ -147,11 +147,10 @@ def test_media_provider_uses_svg_fallback_when_configured_image_model_fails(tmp_
     output = tmp_path / "image.png"
     result = registry.invoke(_invoke("image_generate", {"prompt": "a peacock", "output_path": str(output)}))
 
-    assert result.status == "completed"
-    assert result.output["provider"] == "local_svg_fallback"
-    assert result.output["fallback_error"] == "boom"
-    assert (tmp_path / "image.svg").is_file()
-    assert (tmp_path / "image.png").is_file()
+    assert result.status == "failed"
+    assert result.output["reason"] == "generation_failed" and result.error == "boom"
+    assert not (tmp_path / "image.svg").exists()
+    assert not (tmp_path / "image.png").exists()
 
 
 def test_spreadsheet_create_fails_when_requested_images_are_skipped(tmp_path) -> None:
@@ -746,7 +745,7 @@ def test_document_create_can_write_linked_html_output(tmp_path) -> None:
     assert 'src="assets/source.png"' in content
 
 
-def test_spreadsheet_create_rejects_placeholder_image_objects_in_case_insensitive_image_column(tmp_path) -> None:
+def test_spreadsheet_create_rejects_placeholder_image_objects_in_explicit_row_media_field(tmp_path) -> None:
     handler = tools._build_spreadsheet_create_handler(workspace_root=tmp_path)
     output_path = tmp_path / "placeholder.xlsx"
 
@@ -755,7 +754,7 @@ def test_spreadsheet_create_rejects_placeholder_image_objects_in_case_insensitiv
             "spreadsheet_create",
             {
                 "output_path": str(output_path),
-                "columns": ["Name", "Link", "Image"],
+                "columns": ["Name", "Link"],
                 "rows": [
                     {
                         "Name": "Item",
@@ -774,12 +773,13 @@ def test_spreadsheet_create_rejects_placeholder_image_objects_in_case_insensitiv
     assert not output_path.exists()
 
 
-def test_spreadsheet_create_embeds_svg_companion_raster(tmp_path) -> None:
+def test_spreadsheet_create_renders_svg_and_preserves_unrelated_companion(tmp_path) -> None:
     svg_path = tmp_path / "fallback.svg"
     png_path = tmp_path / "fallback.png"
     output_path = tmp_path / "with-image.xlsx"
-    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='120' height='80'><rect width='120' height='80' fill='red'/></svg>", encoding="utf-8")
     _write_content_png(png_path)
+    companion_bytes=png_path.read_bytes()
     handler = tools._build_spreadsheet_create_handler(workspace_root=tmp_path)
 
     result = handler(
@@ -794,7 +794,9 @@ def test_spreadsheet_create_embeds_svg_companion_raster(tmp_path) -> None:
     )
 
     assert result.status == "completed"
-    assert result.output["embedded_images"] == [str(png_path)]
+    rendered=Path(result.output["embedded_images"][0])
+    assert rendered.is_file() and rendered!=png_path
+    assert png_path.read_bytes()==companion_bytes
     assert result.output["skipped_images"] == []
     with ZipFile(output_path) as archive:
         assert any(name.startswith("xl/media/") for name in archive.namelist())
@@ -827,14 +829,15 @@ def test_spreadsheet_create_rasterizes_svg_without_companion(tmp_path) -> None:
     )
 
     assert result.status == "completed"
-    assert png_path.exists()
-    assert result.output["embedded_images"] == [str(png_path)]
+    assert not png_path.exists()
+    rendered=Path(result.output["embedded_images"][0])
+    assert rendered.is_file() and rendered.suffix==".png"
     assert result.output["skipped_images"] == []
     with ZipFile(output_path) as archive:
         assert any(name.startswith("xl/media/") for name in archive.namelist())
 
 
-def test_spreadsheet_create_treats_capital_image_column_as_embed_path(tmp_path) -> None:
+def test_spreadsheet_create_treats_capital_row_media_field_as_embed_path(tmp_path) -> None:
     image_path = _write_content_png(tmp_path / "image.png")
     output_path = tmp_path / "capital-image.xlsx"
     handler = tools._build_spreadsheet_create_handler(workspace_root=tmp_path)
@@ -844,7 +847,7 @@ def test_spreadsheet_create_treats_capital_image_column_as_embed_path(tmp_path) 
             "spreadsheet_create",
             {
                 "output_path": str(output_path),
-                "columns": ["Name", "Link", "Image"],
+                "columns": ["Name", "Link"],
                 "rows": [
                     {
                         "Name": "Item",
@@ -863,7 +866,7 @@ def test_spreadsheet_create_treats_capital_image_column_as_embed_path(tmp_path) 
         assert any(name.startswith("xl/media/") for name in archive.namelist())
 
 
-def test_spreadsheet_create_embeds_local_image_path_cells_without_reserved_header(tmp_path) -> None:
+def test_spreadsheet_create_embeds_explicit_image_paths_without_reserved_header(tmp_path) -> None:
     image_path = _write_content_png(tmp_path / "image.png")
     output_path = tmp_path / "image-file-column.xlsx"
     handler = tools._build_spreadsheet_create_handler(workspace_root=tmp_path)
@@ -874,6 +877,7 @@ def test_spreadsheet_create_embeds_local_image_path_cells_without_reserved_heade
             {
                 "output_path": str(output_path),
                 "columns": ["Product", "Image File"],
+                "image_paths": [str(image_path)],
                 "rows": [{"Product": "QA item", "Image File": str(image_path)}],
             },
         )
@@ -885,7 +889,7 @@ def test_spreadsheet_create_embeds_local_image_path_cells_without_reserved_heade
         assert any(name.startswith("xl/media/") for name in archive.namelist())
 
 
-def test_spreadsheet_create_rejects_remote_image_url_cells_before_plain_file_save(tmp_path) -> None:
+def test_spreadsheet_create_keeps_remote_image_url_cells_as_data(tmp_path) -> None:
     output_path = tmp_path / "remote-image-url.xlsx"
     handler = tools._build_spreadsheet_create_handler(workspace_root=tmp_path)
 
@@ -905,11 +909,13 @@ def test_spreadsheet_create_rejects_remote_image_url_cells_before_plain_file_sav
         )
     )
 
-    assert result.status == "failed"
-    assert result.output["reason"] == "remote_image_paths_not_supported"
-    assert result.output["remote_image_urls"] == ["https://cdn.example.test/products/qa-item.jpg"]
-    assert "local artifact file paths" in (result.error or "")
-    assert not output_path.exists()
+    assert result.status == "completed"
+    assert result.output["embedded_images"] == []
+    from openpyxl import load_workbook
+    workbook = load_workbook(output_path)
+    assert workbook.active["B2"].hyperlink.target == "https://cdn.example.test/products/qa-item.jpg"
+    with ZipFile(output_path) as archive:
+        assert not any(name.startswith("xl/media/") for name in archive.namelist())
 
 
 def test_spreadsheet_create_rejects_structured_expected_row_count_mismatch(tmp_path) -> None:
@@ -1109,6 +1115,7 @@ def test_spreadsheet_create_rejects_incomplete_mixed_media_link_price_rows(tmp_p
                         "Listing Price": "$12.34",
                         "Listing Link": "https://example.com/item/1",
                         "Image File": str(image_path),
+                        "image_path": str(image_path),
                     },
                     {
                         "Product": "Incomplete row",
@@ -1444,8 +1451,9 @@ def test_browser_image_collect_materializes_embeddable_spreadsheet_images(tmp_pa
             "spreadsheet_create",
             {
                 "output_path": str(output_path),
-                "columns": ["Product", "Image"],
-                "rows": [{"Product": "QA item", "Image": image_paths[0]}],
+                "columns": ["Product"],
+                "rows": [{"Product": "QA item"}],
+                "image_paths": image_paths,
             },
             principal_id="telegram:1",
         )
@@ -1851,12 +1859,13 @@ def test_visual_artifact_tools_embed_optimized_images_without_losing_source_cont
         assert max(media_sizes) < source.stat().st_size
 
 
-def test_document_create_embeds_svg_companion_raster(tmp_path) -> None:
+def test_document_create_renders_svg_and_preserves_unrelated_companion(tmp_path) -> None:
     svg_path = tmp_path / "fallback.svg"
     png_path = tmp_path / "fallback.png"
     output_path = tmp_path / "with-image.docx"
-    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='120' height='80'><rect width='120' height='80' fill='red'/></svg>", encoding="utf-8")
     _write_content_png(png_path)
+    companion_bytes=png_path.read_bytes()
     handler = tools._build_document_create_handler(workspace_root=tmp_path)
 
     result = handler(
@@ -1872,7 +1881,9 @@ def test_document_create_embeds_svg_companion_raster(tmp_path) -> None:
     )
 
     assert result.status == "completed"
-    assert result.output["embedded_images"] == [str(png_path)]
+    rendered=Path(result.output["embedded_images"][0])
+    assert rendered.is_file() and rendered!=png_path
+    assert png_path.read_bytes()==companion_bytes
     assert result.output["skipped_images"] == []
     with ZipFile(output_path) as archive:
         assert any(name.startswith("word/media/") for name in archive.namelist())
@@ -1990,12 +2001,13 @@ def test_presentation_create_fails_when_requested_images_are_skipped(tmp_path) -
     assert not output_path.exists()
 
 
-def test_presentation_create_embeds_svg_companion_raster(tmp_path) -> None:
+def test_presentation_create_renders_svg_and_preserves_unrelated_companion(tmp_path) -> None:
     svg_path = tmp_path / "fallback.svg"
     png_path = tmp_path / "fallback.png"
     output_path = tmp_path / "with-image.pptx"
-    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+    svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='120' height='80'><rect width='120' height='80' fill='red'/></svg>", encoding="utf-8")
     _write_content_png(png_path)
+    companion_bytes=png_path.read_bytes()
     handler = tools._build_presentation_create_handler(workspace_root=tmp_path)
 
     result = handler(
@@ -2010,7 +2022,9 @@ def test_presentation_create_embeds_svg_companion_raster(tmp_path) -> None:
     )
 
     assert result.status == "completed"
-    assert result.output["embedded_images"] == [str(png_path)]
+    rendered=Path(result.output["embedded_images"][0])
+    assert rendered.is_file() and rendered!=png_path
+    assert png_path.read_bytes()==companion_bytes
     assert result.output["skipped_images"] == []
     with ZipFile(output_path) as archive:
         assert any(name.startswith("ppt/media/") for name in archive.namelist())
@@ -2344,6 +2358,12 @@ def test_html_pdf_renderer_inlines_media_assets_as_data_uris(tmp_path, monkeypat
     captured: dict[str, object] = {}
 
     class FakePage:
+        def set_viewport_size(self, size):
+            captured["viewport"] = size
+
+        def emulate_media(self, *, media):
+            captured["media"] = media
+
         def set_content(self, html, wait_until=None):  # noqa: ANN001
             captured["html"] = html
             captured["wait_until"] = wait_until
@@ -2393,6 +2413,7 @@ def test_html_pdf_renderer_inlines_media_assets_as_data_uris(tmp_path, monkeypat
     assert output_path.is_file()
     assert "data:image/png;base64," in str(captured["html"])
     assert image_path.as_uri() not in str(captured["html"])
+    assert image_path.name not in str(captured["html"])
     assert "Embedded Visual Assets" not in str(captured["html"])
 
 
@@ -2404,6 +2425,12 @@ def test_html_pdf_renderer_places_primary_media_when_layout_has_no_image(tmp_pat
     captured: dict[str, object] = {}
 
     class FakePage:
+        def set_viewport_size(self, size):
+            captured["viewport"] = size
+
+        def emulate_media(self, *, media):
+            captured["media"] = media
+
         def set_content(self, html, wait_until=None):  # noqa: ANN001
             captured["html"] = html
             captured["wait_until"] = wait_until
@@ -2461,6 +2488,12 @@ def test_html_pdf_renderer_strips_decorative_emoji_text(tmp_path, monkeypatch) -
     captured: dict[str, object] = {}
 
     class FakePage:
+        def set_viewport_size(self, size):
+            captured["viewport"] = size
+
+        def emulate_media(self, *, media):
+            captured["media"] = media
+
         def set_content(self, html, wait_until=None):  # noqa: ANN001
             captured["html"] = html
 
@@ -2520,6 +2553,12 @@ def test_html_pdf_renderer_flows_bottom_anchored_elements_before_print(tmp_path,
     captured: dict[str, object] = {}
 
     class FakePage:
+        def set_viewport_size(self, size):
+            captured["viewport"] = size
+
+        def emulate_media(self, *, media):
+            captured["media"] = media
+
         def set_content(self, html, wait_until=None):  # noqa: ANN001
             captured["html"] = html
             captured["wait_until"] = wait_until
@@ -2588,6 +2627,12 @@ def test_html_pdf_renderer_repairs_broken_image_slots_from_verified_media(tmp_pa
     captured: dict[str, object] = {"evaluations": []}
 
     class FakePage:
+        def set_viewport_size(self, size):
+            captured["viewport"] = size
+
+        def emulate_media(self, *, media):
+            captured["media"] = media
+
         def set_content(self, html, wait_until=None):  # noqa: ANN001
             captured["html"] = html
             captured["wait_until"] = wait_until
@@ -2655,6 +2700,12 @@ def test_html_pdf_renderer_uses_dynamic_print_scale_for_designed_pages(tmp_path,
     captured: dict[str, object] = {"evaluations": []}
 
     class FakePage:
+        def set_viewport_size(self, size):
+            captured["viewport"] = size
+
+        def emulate_media(self, *, media):
+            captured["media"] = media
+
         def set_content(self, html, wait_until=None):  # noqa: ANN001
             captured["html"] = html
 
@@ -2709,6 +2760,8 @@ def test_html_pdf_renderer_uses_dynamic_print_scale_for_designed_pages(tmp_path,
     assert 'class="designed-page"><div class="designed-page-inner">' in html_text
     assert any("nullionPrintScale" in script for script, _ in captured["evaluations"])
     assert captured["pdf_kwargs"]["scale"] == 0.98
+    assert captured["viewport"] == {"width": 816, "height": 1056}
+    assert captured["media"] == "print"
 
 
 def test_pdf_create_splits_single_structured_report_page_to_align_media(tmp_path, monkeypatch) -> None:
@@ -3003,10 +3056,18 @@ def test_list_crons_exposes_typed_zero_result_count(monkeypatch) -> None:
     result = registry.invoke(_invoke("list_crons", {}))
 
     assert result.status == "completed"
+    assert isinstance(result.output['inventory_version'], str) and len(result.output['inventory_version']) == 64
     assert result.output == {
         "crons": [],
         "count": 0,
         "message": "No crons scheduled.",
+        "inventory_scope": {"scheduler_kind": "cron", "coverage": "single_kind_only"},
+        "offset": 0,
+        "limit": 100,
+        "matched_count": 0,
+        "inventory_version": result.output['inventory_version'],
+        "has_more": False,
+        "next_offset": None,
     }
 
 
@@ -4189,7 +4250,7 @@ def test_update_reminder_changes_text_time_and_reenables_task(monkeypatch) -> No
     assert runtime.checkpoints == 1
 
 
-def test_set_reminder_uses_detected_local_timezone_when_saved_preference_is_default_utc(monkeypatch) -> None:
+def test_set_reminder_preserves_explicit_utc_preference_on_non_utc_host(monkeypatch) -> None:
     import nullion.preferences as preferences
 
     class RuntimeWithReminder:
@@ -4226,10 +4287,10 @@ def test_set_reminder_uses_detected_local_timezone_when_saved_preference_is_defa
     )
 
     assert result.status == "completed"
-    assert runtime.scheduled_due_at == datetime(2026, 5, 16, 15, 0, tzinfo=timezone.utc)
-    assert result.output["due_at"] == "2026-05-16T15:00:00+00:00"
-    assert result.output["due_at_local"] == "2026-05-16T11:00:00-04:00"
-    assert result.output["timezone"] == "America/New_York"
+    assert runtime.scheduled_due_at == datetime(2026, 5, 16, 11, 0, tzinfo=timezone.utc)
+    assert result.output["due_at"] == "2026-05-16T11:00:00+00:00"
+    assert result.output["due_at_local"] == "2026-05-16T11:00:00+00:00"
+    assert result.output["timezone"] == "UTC"
     assert runtime.checkpoints == 1
 
 
@@ -4274,6 +4335,7 @@ def test_cron_schema_generation_does_not_depend_on_private_helper(monkeypatch) -
         "delivery_target",
         "html_image_delivery_mode",
         "artifact_delivery_options",
+        "execution_window",
     }
     assert create_schema["properties"] is not update_schema["properties"]
     assert create_schema["properties"]["delivery_channel"]["type"] == "string"

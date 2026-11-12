@@ -144,6 +144,7 @@ _EMBEDDED_MEDIA_ARTIFACT_EXTENSION_ALIASES = {
 _EMBEDDED_MEDIA_ARTIFACT_EXTENSIONS = frozenset({".docx", ".html", ".pdf", ".pptx", ".xlsx"})
 _SCOPE_ACTION_REQUIRED_TOOL_CANDIDATES = frozenset(
     {
+        "create_live_tracker", "stop_live_tracker", "resume_live_tracker", "update_live_tracker",
         "archive_create",
         "archive_extract",
         "create_cron",
@@ -220,8 +221,31 @@ _CONNECTOR_FIRST_CLASS_WRITE_TOOLS = frozenset({
 })
 _TURN_DECISION_REQUIRED_TOOL_CANDIDATES = _SCOPE_REQUIRED_TOOL_CANDIDATES | _CONNECTOR_FIRST_CLASS_WRITE_TOOLS
 _DIRECT_PUBLIC_READ_CAPABILITY_TAGS = frozenset({"market_data", "quote", "weather", "forecast"})
+
+
+def tool_uses_external_observation(spec) -> bool:
+    """Source access metadata shared by ordinary scoping and recovery."""
+    return (spec.name in _URL_BOUNDARY_TOOLS | _CONNECTOR_FIRST_CLASS_READ_TOOLS
+            | {'web_search', 'web_fetch', 'file_download', 'weather_forecast', 'market_quote', 'connector_request'}
+        or spec.side_effect_class == ToolSideEffectClass.READ
+            and bool(set(spec.capability_tags).intersection(
+                _CONNECTOR_CAPABILITY_TAGS | _DIRECT_PUBLIC_READ_CAPABILITY_TAGS)))
+
+
 _SOURCE_MEDIA_TOOLS = frozenset({"audio_transcribe", "image_extract_text"})
+_LIVE_TRACKING_TOOLS = frozenset({"create_live_tracker", "list_live_trackers", "stop_live_tracker", "resume_live_tracker", "update_live_tracker"})
 _SCHEDULER_READ_TOOLS = frozenset({"list_crons", "list_reminders"})
+
+
+def _scheduler_inventory_read_selection(registry, names) -> bool:
+    specs = []
+    for name in names:
+        try:
+            specs.append(registry.get_spec(name))
+        except (KeyError, AttributeError):
+            continue
+    return (bool(specs) and all(spec.side_effect_class is ToolSideEffectClass.READ for spec in specs)
+        and any('scheduler_inventory' in getattr(spec, 'capability_tags', ()) for spec in specs))
 _SCHEDULER_RUN_TOOLS = frozenset({"run_cron"})
 _SCHEDULER_MUTATE_TOOLS = frozenset({
     "create_cron",
@@ -259,6 +283,8 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "scope so the runtime can report active sources and expose safe structured read tools. "
         "Include tool_names when the exact structured account tool is already known rather than widening "
         "a generic connector scope into every account tool. "
+        "A user can select a source by its function without naming a vendor. Resolve the matching exact "
+        "read tool from registered metadata before asking them to choose an account provider. "
         "When a successful result from an exact source or verification tool is essential to the requested "
         "outcome, include that exact name in both tool_names and required_tool_names. This lets the runtime "
         "prevent a confident final reply from bypassing missing source evidence and report a structurally "
@@ -288,13 +314,15 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "Use web for public websites, live public lookups, and public source data "
         "that will be written into a local artifact such as CSV, HTML, PDF, DOCX, or XLSX. Use skill_pack only "
         "when detailed installed-pack reference docs are needed. Capabilities: web, "
-        "scheduler_read, scheduler_run, scheduler_mutate, connector, skill_pack, conversation_history, personal_tasks, weather, "
+        "scheduler_read, scheduler_run, scheduler_mutate, live_tracking, connector, skill_pack, conversation_history, personal_tasks, weather, "
         "market_data, "
         "image_generation, local_files, local_shell, local_tools. "
         "When scheduler_run should run exactly one eligible scheduled task chosen from structured list_crons output, "
         "set scheduler_selection_policy to delegate_one. "
         "When the turn needs a downloadable or attached file in a specific format, include artifact_extensions with the required "
         "final suffix so the runtime can expose the matching structured artifact tool. "
+        "Do not add intermediate or archive-member formats to artifact_extensions. Select exact helper tools such as "
+        "file_write for supporting inputs without changing the requested final formats. "
         "For an existing report or document lookup, use chat_history_search with artifact_extensions matching the desired file type. "
         "If the user asks for that existing file, including asking whether the earlier file is available, set source_artifact_delivery_requested "
         "and quote the current request as source_artifact_request_evidence. This is a read-only retrieval of unchanged files. For requested creation or editing, use a production plan with source_artifact_delivery_requested=false. Preserve its artifact_extensions; do not create a replacement. "
@@ -303,7 +331,10 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
         "and supply source_artifact_request_evidence quoting the user's actual request to receive those files. "
         "When that final artifact must contain images, screenshots, generated visuals, or other media inside "
         "the file itself, also include the same suffix in embedded_media_artifact_extensions so the runtime "
-        "can expose media collection/generation tools and verify embedded media bytes."
+        "can expose media collection/generation tools and verify embedded media bytes. "
+        "Only require those media bytes when the user or structured output contract requests image files. "
+        "Charts, tables, colors, typography, and polished layout alone do not require raster images. "
+        "Apply each media obligation only to the requested file format, not every file in a package."
     ),
     risk_level=ToolRiskLevel.LOW,
     side_effect_class=ToolSideEffectClass.READ,
@@ -318,7 +349,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "Tool families to expose for this same turn. connector exposes active connected-account "
                     "source metadata and safe structured read tools unless tool_names names exact structured "
                     "account tools; "
-                    "scheduler_read/run/mutate exposes Nullion cron/reminder "
+                    "live_tracking exposes bounded frequent observation tools; scheduler_read/run/mutate exposes Nullion cron/reminder "
                     "tools only; personal_tasks exposes the durable task list; conversation_history exposes saved turns in the current chat; "
                 "web exposes public web/browser tools; browser is accepted as an alias for web; skill_pack exposes exact "
                     "installed skill-pack docs; weather, market_data, and image_generation expose their direct tools; "
@@ -335,6 +366,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "scheduler_read",
                         "scheduler_run",
                         "scheduler_mutate",
+                        "live_tracking",
                         "connector",
                         "skill_pack",
                         "conversation_history",
@@ -347,6 +379,23 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "local_tools",
                     ],
                 },
+            },
+            "direct_read_complete_request": {
+                "type": "boolean",
+                "description": (
+                    "True only when a single weather_forecast or market_quote result is the entire requested "
+                    "answer. Keep false for a probe, monitoring setup, comparison, transformation, explanation, "
+                    "or any remaining action. Selecting a source tool does not by itself complete the request."
+                ),
+            },
+            "include_local_path_details": {
+                "type": "boolean",
+                "description": (
+                    "True only when the requested answer needs exact local filesystem or executable paths. "
+                    "Use only with local_shell or local_files. This permits paths grounded in completed "
+                    "local reads, not invented paths or unrelated internal artifact/state details. "
+                    "Keep false for ordinary generated-file delivery."
+                ),
             },
             "connector_app_ids": {
                 "type": "array",
@@ -396,6 +445,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                         "list_crons",
                         "list_reminders",
                         "run_cron",
+                        "create_live_tracker", "list_live_trackers", "stop_live_tracker", "resume_live_tracker", "update_live_tracker",
                         "create_cron",
                         "update_cron",
                         "delete_cron",
@@ -462,6 +512,7 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "Optional final artifact suffixes required by this turn, such as .xlsx, .pdf, "
                     ".pptx, or .docx. Use this only for a requested downloadable/attached artifact; "
                     "the runtime validates the suffix and exposes the matching structured artifact tool. "
+                    "Exclude supporting input files and archive-member formats; request their exact helper tools instead. "
                     "If the artifact itself must contain embedded media, repeat that suffix in "
                     "embedded_media_artifact_extensions instead of relying on artifact_extensions alone."
                 ),
@@ -522,7 +573,9 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                     "Optional final artifact suffixes that must contain requested image/screenshot/media files "
                     "embedded inside the artifact itself, not merely linked, captioned, attached separately, or listed as URLs. "
                     "Use this for visual workbooks, image-bearing PDFs/DOCX/PPTX, flyers, posters, playbooks, "
-                    "or reports where the final file must include actual media bytes."
+                    "or reports where the user requires actual media bytes. Charts, tables, CSS, and polished "
+                    "formatting alone do not require raster images. Do not spread one format's media requirement "
+                    "to other formats in the package."
                 ),
                 "items": {"type": "string", "enum": sorted(_EMBEDDED_MEDIA_ARTIFACT_EXTENSIONS)},
             },
@@ -534,6 +587,8 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
                 ),
                 "items": {"type": "string", "enum": sorted(_EMBEDDED_MEDIA_ARTIFACT_EXTENSIONS)},
             },
+            "tracking_mode": {"type":"string", "enum":["unspecified","live","recurring","clarify"],
+                "description":"Choose live for bounded urgent checks, recurring for continuing schedules. If intent or lifetime is uncertain, use clarify and ask numbered options before creating either."},
             "reason": {"type": "string", "description": "Brief structured reason for the requested scope."},
         },
         "required": ["capabilities"],
@@ -542,14 +597,14 @@ _SCOPE_REQUEST_TOOL_SPEC = ToolSpec(
     capability_tags=("scope_request",),
 )
 _KNOWN_PRIOR_TOOL_SCOPES = frozenset(
-    {"connector", "conversation_history", "scheduler", "scheduler_mutate", "scheduler_read", "scheduler_run", "skill_pack", "personal_tasks", "web"}
+    {"connector", "conversation_history", "scheduler", "scheduler_mutate", "scheduler_read", "scheduler_run", "live_tracking", "skill_pack", "personal_tasks", "web"}
 )
 _WEB_ACTIONS = frozenset({"none", "open_url", "live_research", "browser_interaction"})
 _SCHEDULER_ACTIONS = frozenset({"none", "inspect", "run", "mutate"})
 _SKILL_PACK_ACTIONS = frozenset({"none", "reference", "connector"})
 _REQUESTED_OUTCOMES = frozenset({"unspecified", "generated_media"})
 _TOOL_SCOPE_DECISION_CACHE_NAMESPACE = "tool_scope.decision"
-_TOOL_SCOPE_DECISION_CACHE_VERSION = "v53"
+_TOOL_SCOPE_DECISION_CACHE_VERSION = "v55-linked-source-research"
 _TOOL_SCOPE_DECISION_CACHE_TTL_SECONDS = 24 * 60 * 60
 _SCOPE_CAPABILITY_ALIASES = {
     "browser": "web",
@@ -602,6 +657,14 @@ def _validated_artifact_extensions(value: object) -> tuple[str, ...]:
     return tuple(extensions)
 
 
+def _explicit_scope_tool_names(arguments: Mapping[str, object]) -> tuple[str, ...]:
+    """Required tools are exact selections too, not merely completion hints."""
+    return tuple(dict.fromkeys(str(value).strip()
+        for key in ("tool_names", "required_tool_names")
+        for value in (arguments.get(key) if isinstance(arguments.get(key), list) else ())
+        if isinstance(value, str) and value.strip()))
+
+
 def _validated_embedded_media_artifact_extensions(value: object) -> tuple[str, ...]:
     values = value if isinstance(value, list) else ()
     extensions: list[str] = []
@@ -647,6 +710,8 @@ def _exact_scope_tools_for_capability(capability: str, tool_names: Iterable[str]
     capability_tools: frozenset[str]
     if capability == "connector":
         capability_tools = _CONNECTOR_TYPED_TOOLS | _SKILL_PACK_TOOLS
+    elif capability == "live_tracking":
+        capability_tools = _LIVE_TRACKING_TOOLS
     elif capability == "scheduler_read":
         capability_tools = _SCHEDULER_READ_TOOLS
     elif capability == "scheduler_run":
@@ -698,14 +763,18 @@ _EMBEDDED_MEDIA_SOURCE_TOOLS = frozenset(
 )
 
 
-def _scope_tool_names_can_source_embedded_media(tool_names: Iterable[str]) -> bool:
-    return bool(
-        {
-            str(tool_name or "").strip()
-            for tool_name in tool_names
-            if str(tool_name or "").strip()
-        }.intersection(_EMBEDDED_MEDIA_SOURCE_TOOLS)
-    )
+def _supported_scope_embedded_media_extensions(
+    tool_names: Iterable[str], extensions: Iterable[str],
+) -> tuple[str, ...]:
+    names = {str(name or "").strip() for name in tool_names}
+    if names.intersection(_EMBEDDED_MEDIA_SOURCE_TOOLS):
+        return tuple(extensions)
+    # A native writer can embed an existing input without a separate source
+    # or generation tool. Preserve the declared requirement; actual bytes,
+    # input permissions and media availability are verified during execution.
+    return tuple(extension for extension in extensions if names.intersection(
+        set(_ARTIFACT_EXTENSION_TOOLS.get(extension, ())).union(
+            {"document_create"} if extension in {".pdf", ".html", ".htm"} else set())))
 
 
 def _with_local_artifact_companion_tools(
@@ -801,6 +870,8 @@ class TurnToolEvidence:
     numbered_option_selected: bool = False
     prior_tool_scopes: tuple[str, ...] = ()
     current_user_message: str = ""
+    linked_user_messages: tuple[str, ...] = ()
+    retained_read_available: bool = False
 
     @property
     def artifact_requested(self) -> bool:
@@ -814,9 +885,33 @@ class TurnToolEvidence:
         return scope in set(self.prior_tool_scopes)
 
 
+def _source_quote_is_verified(evidence, quote, *, tool_names=(), registry=None):
+    normalized = " ".join(str(quote or "").split()).casefold()
+    if not normalized:
+        return False
+    if normalized in " ".join(evidence.current_user_message.split()).casefold():
+        return True
+    # Only an exact, structurally linked request can supply a source omitted
+    # by a clarification reply. It can select reads, never account writes.
+    names = tuple(tool_names)
+    if not evidence.context_linked or not names or registry is None:
+        return False
+    for name in names:
+        try:
+            spec = registry.get_spec(name)
+        except (KeyError, AttributeError):
+            return False
+        if (spec.side_effect_class != ToolSideEffectClass.READ
+                or not {"connector", "account_read"}.issubset(spec.capability_tags)):
+            return False
+    return any(normalized in " ".join(message.split()).casefold()
+               for message in evidence.linked_user_messages)
+
+
 @dataclass(frozen=True, slots=True)
 class TurnToolScopeDecision:
     requested_outcome: str = "unspecified"
+    tracking_mode: str = "unspecified"
     web_action: str = "none"
     scheduler_action: str = "none"
     scheduler_toggle_enabled: bool | None = None
@@ -840,6 +935,7 @@ class TurnToolScopeDecision:
     required_embedded_media_extensions: tuple[str, ...] = ()
     confidence: float = 0.0
     valid: bool = False
+    evidence_policy: str = "fresh"
 
     @property
     def allow_web_tools(self) -> bool:
@@ -997,6 +1093,11 @@ class ScopedTurnToolRegistry:
         tool_name = str(name or "").strip()
         if tool_name == _SCOPE_REQUEST_TOOL_NAME:
             return True
+        mode = self.turn_tool_scope_decision.tracking_mode
+        if mode in {"live", "clarify"} and tool_name in {"create_cron", "set_reminder"}:
+            return False
+        if mode in {"recurring", "clarify"} and tool_name == "create_live_tracker":
+            return False
         if not tool_name or not self._is_allowed_tool_name(tool_name):
             return False
         can_invoke = getattr(self._delegate, "can_invoke_tool", None)
@@ -1053,7 +1154,9 @@ class ScopedTurnToolRegistry:
             tags = self._spec_tags(self._delegate.get_spec(tool_name))
         except KeyError:
             return False
-        return bool(tags.intersection(CRON_EXECUTION_BLOCKED_CAPABILITY_TAGS))
+        # A cron execution policy also blocks live-tracker controls, but that
+        # does not make those controls recurring-scheduler tools in chat.
+        return "scheduler" in tags
 
     def _is_connector_tool_name(self, tool_name: str) -> bool:
         if tool_name in _CONNECTOR_TOOLS:
@@ -1111,9 +1214,32 @@ class ScopedTurnToolRegistry:
             or bool(self.turn_tool_scope_decision.required_embedded_media_extensions)
         )
 
+    def _requested_names_with_read_continuations(self) -> frozenset[str]:
+        selected = tuple(self.turn_tool_scope_decision.requested_tool_names)
+        cached = getattr(self, "_read_continuation_cache", None)
+        if cached is not None and cached[0] == selected:
+            return cached[1]
+        names = set(selected)
+        # One hop of declared metadata supplies optional read alternatives. This
+        # does not make them required, invoke them, or bypass their own gates.
+        for name in selected:
+            try:
+                spec = self._delegate.get_spec(name)
+            except (KeyError, AttributeError):
+                continue
+            for candidate in getattr(spec, "continuation_tools", ()):
+                try:
+                    continuation = self._delegate.get_spec(candidate)
+                except (KeyError, AttributeError):
+                    continue
+                if continuation.side_effect_class is ToolSideEffectClass.READ:
+                    names.add(candidate)
+        result = frozenset(names)
+        self._read_continuation_cache = (selected, result)
+        return result
+
     def _requested_names_in(self, names: frozenset[str]) -> frozenset[str]:
-        requested = frozenset(str(name or "") for name in self.turn_tool_scope_decision.requested_tool_names)
-        return requested.intersection(names)
+        return self._requested_names_with_read_continuations().intersection(names)
 
     def _active_connector_default_read_tools(self) -> frozenset[str]:
         if self._active_connector_read_tools is not None:
@@ -1192,7 +1318,28 @@ class ScopedTurnToolRegistry:
             or capability_set.intersection({"web", "image_generation"})
         )
 
+    def _requires_explicit_scope(self, tool_name: str) -> bool:
+        try:
+            spec = self._delegate.get_spec(tool_name)
+        except (KeyError, AttributeError):
+            return False
+        return "explicit_scope_only" in getattr(spec, "capability_tags", ())
+
+    def _requires_required_scope(self, tool_name: str) -> bool:
+        try:
+            spec = self._delegate.get_spec(tool_name)
+        except (KeyError, AttributeError):
+            return False
+        return "required_scope_only" in getattr(spec, "capability_tags", ())
+
     def _is_allowed_tool_name(self, tool_name: str) -> bool:
+        if self.turn_tool_scope_decision.evidence_policy == 'retained':
+            try:
+                spec = self._delegate.get_spec(tool_name)
+            except KeyError:
+                return False
+            if tool_uses_external_observation(spec):
+                return False
         # Core execution remains discoverable across capability scopes. The
         # delegate still enforces availability, approval and execution policy.
         if tool_name in _LOCAL_SHELL_TOOLS:
@@ -1203,6 +1350,13 @@ class ScopedTurnToolRegistry:
             except KeyError:
                 return False
             return spec.side_effect_class == ToolSideEffectClass.READ and not spec.requires_approval
+        if (self._requires_required_scope(tool_name)
+                and tool_name not in self.turn_tool_scope_decision.required_tool_names):
+            return False
+        if (self._requires_explicit_scope(tool_name)
+                and tool_name not in self.turn_tool_scope_decision.requested_tool_names
+                and tool_name not in self.turn_tool_scope_decision.required_tool_names):
+            return False
         requested_extensions = set(self._evidence.requested_extensions).union(
             set(self.turn_tool_scope_decision.requested_artifact_extensions)
         ).union(
@@ -1222,7 +1376,8 @@ class ScopedTurnToolRegistry:
                 return False
             if tool_name == "presentation_create" and existing_named_extensions.intersection(_PRESENTATION_EXTENSIONS):
                 return False
-            if tool_name == "document_create" and existing_named_extensions.intersection(_DOCUMENT_EXTENSIONS):
+            if tool_name == "document_create" and existing_named_extensions.intersection(
+                    _DOCUMENT_EXTENSIONS | {".pdf", ".html", ".htm"}):
                 return False
             if tool_name == "pdf_create" and existing_named_extensions.intersection(_PDF_EXTENSIONS):
                 return False
@@ -1232,6 +1387,7 @@ class ScopedTurnToolRegistry:
             return False
         if (
             tool_name == "file_write"
+            and tool_name not in self.turn_tool_scope_decision.requested_tool_names
             and requested_extensions
             and not set(requested_extensions).intersection(_TEXT_WRITE_EXTENSIONS)
             and any(extension not in _TEXT_WRITE_EXTENSIONS for extension in requested_extensions)
@@ -1245,7 +1401,7 @@ class ScopedTurnToolRegistry:
         ):
             return False
         scheduler_action = str(self.turn_tool_scope_decision.scheduler_action or "").strip().lower()
-        requested_tool_names = set(self.turn_tool_scope_decision.requested_tool_names)
+        requested_tool_names = set(self._requested_names_with_read_continuations())
         if (self.turn_tool_scope_decision.source_artifact_retrieval_only
                 and tool_name in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS | _LOCAL_SHELL_TOOLS)):
             return False
@@ -1259,6 +1415,11 @@ class ScopedTurnToolRegistry:
         if tool_name in {"delete_cron", "delete_reminder"} and tool_name not in requested_tool_names:
             return False
         is_scheduler_tool = self._is_scheduler_tool_name(tool_name)
+        if tool_name in requested_tool_names:
+            spec = self._delegate.get_spec(tool_name)
+            if (spec.side_effect_class is ToolSideEffectClass.READ
+                    and 'scheduler_inventory' in spec.capability_tags):
+                return True
         if (
             tool_name in _LOCAL_FILE_MUTATION_TOOLS
             and tool_name not in requested_tool_names
@@ -1382,6 +1543,18 @@ class ScopedTurnToolRegistry:
             return tool_name in requested_tool_names
         if tool_name == "file_read" and self._evidence.slash_prefixed_literal and not self._evidence.has_attachments:
             return False
+        try:
+            discovery_spec = self._delegate.get_spec(tool_name)
+        except (KeyError, AttributeError):
+            discovery_spec = None
+        if (discovery_spec is not None and discovery_spec.side_effect_class is ToolSideEffectClass.READ
+                and "public_source_discovery" in discovery_spec.capability_tags):
+            # A URL or selected web scope authorizes discovery as an optional
+            # read alternative. An empty exact-tool selection must not hide it
+            # on linked source amendments. Invocation still enforces consent.
+            return bool(tool_name in requested_tool_names or (
+                self.turn_tool_scope_decision.requested_outcome != "generated_media"
+                and (self._evidence.has_url_target or self.turn_tool_scope_decision.allow_web_tools)))
         if tool_name in _URL_BOUNDARY_TOOLS:
             if (
                 tool_name == "browser_navigate"
@@ -1437,7 +1610,9 @@ class ScopedTurnToolRegistry:
                 return True
             return bool(requested_extensions.intersection(_SPREADSHEET_EXTENSIONS))
         if tool_name == "document_create":
-            return bool(requested_extensions.intersection(_DOCUMENT_EXTENSIONS))
+            return bool(requested_extensions.intersection(_DOCUMENT_EXTENSIONS) or (
+                tool_name in requested_tool_names
+                and requested_extensions.intersection({".pdf", ".html", ".htm"})))
         if tool_name in _LOCAL_SHELL_TOOLS:
             return tool_name in requested_tool_names
         if tool_name in requested_tool_names and not self._is_connector_tool_name(tool_name):
@@ -1460,9 +1635,24 @@ class ScopedTurnToolRegistry:
             return tool_name in requested_tool_names
         return True
 
+    def _scope_request_spec(self):
+        # The static catalogue documents possible tools; only the current
+        # runtime's registered metadata may advertise an exact selectable tool.
+        names = sorted(self._delegate_tool_names() - {_SCOPE_REQUEST_TOOL_NAME})
+        schema = dict(_SCOPE_REQUEST_TOOL_SPEC.input_schema)
+        properties = dict(schema["properties"])
+        for key in ("tool_names", "required_tool_names"):
+            field = dict(properties[key])
+            field["items"] = {"type": "string", **({"enum": names} if names else {})}
+            if not names:
+                field["maxItems"] = 0
+            properties[key] = field
+        schema["properties"] = properties
+        return replace(_SCOPE_REQUEST_TOOL_SPEC, input_schema=schema)
+
     def get_spec(self, name: str):
         if name == _SCOPE_REQUEST_TOOL_NAME:
-            return _SCOPE_REQUEST_TOOL_SPEC
+            return self._scope_request_spec()
         if not self.can_invoke_tool(name):
             raise KeyError(f"Unknown tool: {name}")
         return self._delegate.get_spec(name)
@@ -1475,7 +1665,7 @@ class ScopedTurnToolRegistry:
             and self.can_invoke_tool(str(getattr(spec, "name", "") or ""))
         ]
         if self._is_allowed_tool_name(_SCOPE_REQUEST_TOOL_NAME):
-            specs.insert(0, _SCOPE_REQUEST_TOOL_SPEC)
+            specs.insert(0, self._scope_request_spec())
         return list({spec.name: spec for spec in specs}.values())
 
     def list_tool_definitions(self, *args, **kwargs) -> list[dict[str, object]]:
@@ -1486,12 +1676,13 @@ class ScopedTurnToolRegistry:
             and self.can_invoke_tool(str(definition.get("name") or ""))
         ]
         if self._is_allowed_tool_name(_SCOPE_REQUEST_TOOL_NAME):
+            scope_spec = self._scope_request_spec()
             definitions.insert(
                 0,
                 {
                     "name": _SCOPE_REQUEST_TOOL_SPEC.name,
                     "description": _SCOPE_REQUEST_TOOL_SPEC.description,
-                    "input_schema": _SCOPE_REQUEST_TOOL_SPEC.input_schema,
+                    "input_schema": scope_spec.input_schema,
                     "capability_tags": list(_SCOPE_REQUEST_TOOL_SPEC.capability_tags),
                     "side_effect_class": _SCOPE_REQUEST_TOOL_SPEC.side_effect_class.value,
                     "risk_level": _SCOPE_REQUEST_TOOL_SPEC.risk_level.value,
@@ -1533,14 +1724,7 @@ class ScopedTurnToolRegistry:
                     ]
                 )
             )
-        raw_tool_names = arguments.get("tool_names")
-        exact_tool_names = tuple(
-            dict.fromkeys(
-                str(value or "").strip()
-                for value in (raw_tool_names if isinstance(raw_tool_names, list) else ())
-                if str(value or "").strip()
-            )
-        )
+        exact_tool_names = _explicit_scope_tool_names(arguments)
         scheduler_scope_must_stay_read_only = (
             self._evidence.has_prior_tool_scope("scheduler_mutate")
             and set(capabilities).intersection({"scheduler_run", "scheduler_mutate"})
@@ -1610,6 +1794,16 @@ class ScopedTurnToolRegistry:
         )
         requested: list[str] = []
         available = self._delegate_tool_names()
+        if "live_tracking" in capabilities:
+            # A prepared observation may use an installed dedicated read tool.
+            # Keep exact selection available on clarification follow-ups too;
+            # normal connector and boundary checks still apply in can_invoke_tool.
+            for name in exact_tool_names:
+                if name not in available:
+                    continue
+                spec = self._delegate.get_spec(name)
+                if spec.side_effect_class is ToolSideEffectClass.READ and not spec.delegated_tools and spec.timeout_seconds <= 30:
+                    requested.append(name)
         requested.extend(name for name in exact_tool_names if name in _CONVERSATION_HISTORY_TOOLS and name in available)
         raw_connector_app_ids = arguments.get("connector_app_ids")
         requested_connector_app_ids = _unique_connector_app_ids(
@@ -1671,7 +1865,7 @@ class ScopedTurnToolRegistry:
                     requested.extend(_ARTIFACT_EXTENSION_TOOLS.get(extension, ()))
                 continue
             if capability == "local_shell" and (
-                suppress_web_artifact_shell
+                (suppress_web_artifact_shell and not set(exact_tool_names).intersection(_LOCAL_SHELL_TOOLS))
                 or connector_account_workflow
                 or "connector" in capabilities
             ):
@@ -1713,6 +1907,8 @@ class ScopedTurnToolRegistry:
                 requested.extend(["web_search", "file_download", "web_fetch", *_BROWSER_INTERACTION_SCOPE_TOOLS])
                 if self._contextual_browser_screenshot_allowed():
                     requested.append("browser_screenshot")
+            elif capability == "live_tracking":
+                requested.append("list_live_trackers")
             elif capability == "scheduler_read":
                 requested.extend(sorted(_SCHEDULER_READ_TOOLS))
             elif capability == "scheduler_run":
@@ -1770,7 +1966,8 @@ class ScopedTurnToolRegistry:
             requested.extend(_BROWSER_INTERACTION_SCOPE_TOOLS)
             requested.append("file_download")
             requested.append("web_fetch")
-            requested = [tool_name for tool_name in requested if tool_name not in _LOCAL_SHELL_TOOLS]
+            requested = [tool_name for tool_name in requested
+                         if tool_name not in _LOCAL_SHELL_TOOLS or tool_name in exact_tool_names]
         if (
             not scheduler_mutation_scope
             and ".png" in set(requested_artifact_extensions)
@@ -1781,9 +1978,11 @@ class ScopedTurnToolRegistry:
             requested.extend(_BROWSER_INTERACTION_SCOPE_TOOLS)
             requested.append("file_download")
             requested.append("web_fetch")
-            requested = [tool_name for tool_name in requested if tool_name not in _LOCAL_SHELL_TOOLS]
+            requested = [tool_name for tool_name in requested
+                         if tool_name not in _LOCAL_SHELL_TOOLS or tool_name in exact_tool_names]
         if (
             requested_artifact_extensions
+            and "file_write" not in exact_tool_names
             and not set(requested_artifact_extensions).intersection(_TEXT_WRITE_EXTENSIONS)
             and any(extension not in _TEXT_WRITE_EXTENSIONS for extension in requested_artifact_extensions)
         ):
@@ -1792,7 +1991,8 @@ class ScopedTurnToolRegistry:
             requested_artifact_extensions,
             available_tools=available,
         ):
-            requested = [tool_name for tool_name in requested if tool_name not in _LOCAL_SHELL_TOOLS]
+            requested = [tool_name for tool_name in requested
+                         if tool_name not in _LOCAL_SHELL_TOOLS or tool_name in exact_tool_names]
         if local_file_listing_without_artifact_request:
             requested = [
                 tool_name
@@ -1819,7 +2019,24 @@ class ScopedTurnToolRegistry:
             requested = [name for name in requested
                          if name not in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS)]
             requested.extend(sorted(_LOCAL_FILE_READ_TOOLS | (_CONVERSATION_HISTORY_TOOLS - {"memory_save"})))
-        return _with_local_artifact_companion_tools(requested, available_tools=available)
+        # Optional adapter tools can be selected by registered identity without
+        # relying on a hardcoded family/name table. Their normal side-effect,
+        # account-source and permission checks still apply below and at invoke.
+        requested.extend(name for name in exact_tool_names
+                         if name in available and self._requires_explicit_scope(name))
+        # A scheduler label does not establish its persisted resource kind.
+        # Once an inventory read is selected, expose related read inventories
+        # by native metadata without loading their records or enabling writes.
+        inventory_tag = 'scheduler_inventory'
+        if _scheduler_inventory_read_selection(self._delegate, exact_tool_names or requested):
+            requested.extend(name for name in available
+                if inventory_tag in self._delegate.get_spec(name).capability_tags
+                and self._delegate.get_spec(name).side_effect_class is ToolSideEffectClass.READ)
+        explicitly_selected = set(exact_tool_names).union(self.turn_tool_scope_decision.requested_tool_names,
+            self.turn_tool_scope_decision.required_tool_names)
+        requested = _with_local_artifact_companion_tools(requested, available_tools=available)
+        return tuple(name for name in requested
+                     if not self._requires_explicit_scope(name) or name in explicitly_selected)
 
     def _required_tool_names_for_scope_request(
         self,
@@ -1827,14 +2044,7 @@ class ScopedTurnToolRegistry:
         available_tools: Iterable[str],
     ) -> tuple[str, ...]:
         available = set(available_tools)
-        raw_tool_names = arguments.get("tool_names")
-        exact_tool_names = tuple(
-            dict.fromkeys(
-                str(value or "").strip()
-                for value in (raw_tool_names if isinstance(raw_tool_names, list) else ())
-                if str(value or "").strip()
-            )
-        )
+        exact_tool_names = _explicit_scope_tool_names(arguments)
         raw_required_tool_names = arguments.get("required_tool_names")
         explicit_required_tool_names = {
             str(value or "").strip()
@@ -1872,10 +2082,12 @@ class ScopedTurnToolRegistry:
                 tool_name in implicit_required_candidates
                 or (
                     tool_name in explicit_required_tool_names
-                    and tool_name in _SCOPE_REQUIRED_TOOL_CANDIDATES
+                    and (tool_name in _SCOPE_REQUIRED_TOOL_CANDIDATES
+                         or (tool_name in available and self._requires_required_scope(tool_name)))
                 )
             )
-            and (tool_name not in _LOCAL_SHELL_TOOLS or not dedicated_artifact_tools)
+            and (tool_name not in _LOCAL_SHELL_TOOLS or not dedicated_artifact_tools
+                 or tool_name in explicit_required_tool_names)
         )
 
     @staticmethod
@@ -1896,7 +2108,7 @@ class ScopedTurnToolRegistry:
             for name in required_tool_names
             if str(name or "").strip()
         }
-        web_source_tools = {"web_fetch", "browser_navigate", "browser_open", "browser_run_task"}
+        web_source_tools = {"web_fetch", "file_download", "browser_navigate", "browser_open", "browser_run_task"}
         if required.intersection(web_source_tools):
             return ()
         for candidate in ("web_fetch", "browser_navigate", "browser_open", "browser_run_task"):
@@ -1919,7 +2131,60 @@ class ScopedTurnToolRegistry:
         )
 
     def apply_scope_request(self, invocation: ToolInvocation) -> tuple[ToolResult, "ScopedTurnToolRegistry"]:
+        packaging = (invocation.flow_context or {}).get("artifact_packaging_request")
+        prepare = getattr(self._delegate, "prepare_artifact_packaging", None)
+        if isinstance(packaging, dict) and callable(prepare):
+            delegate = prepare(packaging)
+            if delegate is not self._delegate:
+                return ScopedTurnToolRegistry(delegate, evidence=self._evidence,
+                    tool_scope_decision=self.turn_tool_scope_decision).apply_scope_request(invocation)
         scope_arguments = dict(invocation.arguments)
+        mode = scope_arguments.get("tracking_mode", self.turn_tool_scope_decision.tracking_mode)
+        if mode not in {"unspecified", "live", "recurring", "clarify"}:
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {"reason":"invalid_tracking_mode"}), self
+        requested_names = set(_explicit_scope_tool_names(scope_arguments))
+        if mode == 'clarify' and 'tracking_mode' not in scope_arguments:
+            # A later structured creation plan can resolve an earlier choice.
+            # Visibility never grants consent or performs the mutation, and an
+            # explicit clarify decision or conflicting plan still waits.
+            available = self._delegate_tool_names()
+            selected_modes = {selected for name, selected in (
+                ('create_live_tracker', 'live'), ('create_cron', 'recurring'))
+                if name in requested_names and name in available}
+            if len(selected_modes) == 1:
+                return self.apply_scope_request(ToolInvocation(
+                    invocation.invocation_id, invocation.tool_name, invocation.principal_id,
+                    {**scope_arguments, 'tracking_mode': selected_modes.pop()},
+                    capsule_id=invocation.capsule_id, flow_context=invocation.flow_context))
+        # Reading one inventory does not establish the kind of a named task.
+        # A selected live mutation does establish that operation's resource kind.
+        if mode == "unspecified" and requested_names.intersection(_LIVE_TRACKING_TOOLS - {'list_live_trackers'}):
+            mode = "live"
+        if mode == "clarify":
+            from nullion.live_tracking_tools import TRACKING_CHOICE
+            decision = replace(self.turn_tool_scope_decision, tracking_mode="clarify", scheduler_action="none",
+                scheduler_effect_actions=(), required_tool_names=(), valid=True)
+            widened = ScopedTurnToolRegistry(self._delegate, evidence=self._evidence, tool_scope_decision=decision)
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {
+                "reason":"live_tracking_needs_details", "clarification":TRACKING_CHOICE,
+                "message":TRACKING_CHOICE, "tracking_mode":"clarify", "available_tools":[], "suppress_activity":True}), widened
+        if mode == "live" and self.turn_tool_scope_decision.scheduler_action != "none":
+            # An explicit temporary-observation plan supersedes stale recurring
+            # action obligations retained from the preceding context.
+            prior = self.turn_tool_scope_decision
+            cleared = replace(prior, scheduler_action="none", scheduler_effect_actions=(),
+                requested_tool_names=tuple(n for n in prior.requested_tool_names if n not in _SCHEDULER_TOOLS),
+                required_tool_names=tuple(n for n in prior.required_tool_names if n not in _SCHEDULER_TOOLS))
+            scope_arguments["tracking_mode"] = "live"
+            reset = ScopedTurnToolRegistry(self._delegate, evidence=self._evidence, tool_scope_decision=cleared)
+            return reset.apply_scope_request(ToolInvocation(invocation.invocation_id, invocation.tool_name,
+                invocation.principal_id, scope_arguments, capsule_id=invocation.capsule_id,
+                flow_context=invocation.flow_context))
+        if mode == "live":
+            scope_arguments["capabilities"] = [c for c in scope_arguments.get("capabilities", ()) if c not in {"scheduler_mutate","scheduler_run"}] + ["live_tracking"]
+            scope_arguments.pop("scheduler_action", None)
+            for key in ("tool_names", "required_tool_names"):
+                scope_arguments[key] = [n for n in scope_arguments.get(key, ()) if n not in {"create_cron","set_reminder"}]
         allowed_actions = self.turn_tool_scope_decision.allowed_scheduler_actions
         capabilities = set(scope_arguments.get("capabilities") or ())
         names = set(scope_arguments.get("tool_names") or ()).union(scope_arguments.get("required_tool_names") or ())
@@ -2021,8 +2286,8 @@ class ScopedTurnToolRegistry:
             scope_arguments,
             tool_names,
         )
-        if embedded_media_extensions and not _scope_tool_names_can_source_embedded_media(tool_names):
-            embedded_media_extensions = ()
+        embedded_media_extensions = _supported_scope_embedded_media_extensions(
+            tool_names, embedded_media_extensions)
         raw_capabilities = invocation.arguments.get("capabilities")
         capabilities = {
             _normalize_scope_capability(value)
@@ -2096,12 +2361,7 @@ class ScopedTurnToolRegistry:
             raw_connector_app_ids if isinstance(raw_connector_app_ids, list) else ()
         )
         connector_app_ids = requested_connector_app_ids
-        raw_tool_names = invocation.arguments.get("tool_names")
-        explicitly_requested_tools = {
-            str(value or "").strip()
-            for value in (raw_tool_names if isinstance(raw_tool_names, list) else ())
-            if str(value or "").strip()
-        }
+        explicitly_requested_tools = set(_explicit_scope_tool_names(scope_arguments))
         connector_specific_requested_tools = explicitly_requested_tools.intersection(
             (_CONNECTOR_TYPED_TOOLS - _CONNECTOR_TOOLS) | _CONNECTOR_FIRST_CLASS_WRITE_TOOLS
         )
@@ -2130,13 +2390,8 @@ class ScopedTurnToolRegistry:
             or generic_single_connector_source_selected
         )
         source_evidence = str(invocation.arguments.get("source_evidence") or "").strip()
-        normalized_source_evidence = " ".join(source_evidence.split()).casefold()
-        normalized_current_message = " ".join(self._evidence.current_user_message.split()).casefold()
-        source_evidence_verified = bool(
-            normalized_source_evidence
-            and normalized_current_message
-            and normalized_source_evidence in normalized_current_message
-        )
+        source_evidence_verified = _source_quote_is_verified(
+            self._evidence, source_evidence, tool_names=explicitly_requested_tools, registry=self._delegate)
         connector_source_user_requested = (
             (
                 bool(invocation.arguments.get("source_user_requested"))
@@ -2146,6 +2401,21 @@ class ScopedTurnToolRegistry:
             or (self._evidence.context_linked and self._evidence.has_prior_tool_scope("connector"))
             or self.turn_tool_scope_decision.connector_source_user_requested
         )
+        if connector_source_user_requested and not required_tool_names:
+            read_targets = []
+            for name in explicitly_requested_tools:
+                try:
+                    spec = self._delegate.get_spec(name)
+                except KeyError:
+                    continue
+                if (spec.side_effect_class == ToolSideEffectClass.READ
+                        and {"connector", "account_read"}.issubset(spec.capability_tags)):
+                    read_targets.append(name)
+            if len(read_targets) == 1:
+                # The model selected one exact authorized account read, not
+                # merely generic capability discovery. Keep that read in the
+                # completion contract even if it omitted the redundant field.
+                required_tool_names = tuple(dict.fromkeys((*required_tool_names, *read_targets)))
         connector_account_workflow = connector_source_user_requested and (
             "connector" in capabilities or self.turn_tool_scope_decision.connector_source_user_requested
         )
@@ -2322,6 +2592,16 @@ class ScopedTurnToolRegistry:
             and not connector_source_user_requested
             and not tool_names
         )
+        # Naming the source and resolving its adapter are separate decisions.
+        # A verified model declaration can request metadata-only resolution;
+        # it still grants no account read until an exact target is selected.
+        source_resolution_required = bool(
+            source_selection_required
+            and invocation.arguments.get("source_user_requested") is True
+            and source_evidence_verified
+            and not source_request_has_selected_target
+        )
+        source_selection_required = source_selection_required and not source_resolution_required
         connector_source_evidence_required = bool(
             "connector" in capabilities
             and (typed_connector_tool_requested or connector_write_tool_requested)
@@ -2350,6 +2630,8 @@ class ScopedTurnToolRegistry:
         elif "scheduler_run" in capabilities:
             scheduler_action = "run"
         elif "scheduler_read" in capabilities:
+            scheduler_action = "inspect"
+        elif _scheduler_inventory_read_selection(self._delegate, _explicit_scope_tool_names(scope_arguments) or tool_names):
             scheduler_action = "inspect"
         scheduler_selection_policy = "none"
         if scheduler_action == "run":
@@ -2382,6 +2664,15 @@ class ScopedTurnToolRegistry:
             and not self.can_invoke_tool(name)
             and name not in required_tool_names
         )
+        # A corrected model scope may supersede an unregistered name from an
+        # earlier scope decision. Registered effect/consent requirements are
+        # never cleared by this correction.
+        registered_names = set(self._delegate_tool_names())
+        superseded_unselected_required = tuple(dict.fromkeys([
+            *superseded_unselected_required,
+            *(name for name in existing.required_tool_names
+              if name not in registered_names and name not in required_tool_names),
+        ]))
         merged_required_tool_names = _filter_scheduler_requested_tool_names_for_action(
             tuple(dict.fromkeys([
                 *(name for name in existing.required_tool_names if name not in superseded_unselected_required),
@@ -2412,6 +2703,8 @@ class ScopedTurnToolRegistry:
             evidence=self._evidence,
             tool_scope_decision=TurnToolScopeDecision(
                 requested_outcome=existing.requested_outcome,
+                evidence_policy=existing.evidence_policy,
+                tracking_mode=mode,
                 web_action=web_action,
                 scheduler_action=scheduler_action,
                 scheduler_effect_actions=existing.allowed_scheduler_actions or (
@@ -2453,17 +2746,38 @@ class ScopedTurnToolRegistry:
             and capabilities.issubset({"conversation_history", "local_files"})
             and set(callable_tool_names).intersection(_LOCAL_FILE_READ_TOOLS | _CONVERSATION_HISTORY_TOOLS)
             and not set(callable_tool_names).intersection(_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS))
-        if read_only_source_delivery:
+        declared_tools = set(invocation.arguments.get("tool_names") or ()).union(
+            invocation.arguments.get("required_tool_names") or ())
+        declared_read_plan = invocation.arguments.get("artifact_extensions") == [] or (
+            "artifact_extensions" not in invocation.arguments and "local_files" in capabilities
+            and invocation.arguments.get("source_artifact_delivery_requested") is False
+            and set(invocation.arguments.get("required_tool_names") or ()).intersection(
+                _LOCAL_FILE_READ_TOOLS | _CONVERSATION_HISTORY_TOOLS))
+        local_read_only_scope = bool(declared_read_plan
+            and capabilities and capabilities.issubset({"conversation_history", "local_files"})
+            and not embedded_media_extensions
+            and declared_tools.intersection(_LOCAL_FILE_READ_TOOLS | _CONVERSATION_HISTORY_TOOLS)
+            and not declared_tools.intersection(_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS | _LOCAL_SHELL_TOOLS))
+        if read_only_source_delivery or local_read_only_scope:
             selected_reads = set(invocation.arguments.get("tool_names") or ()).union(
                 invocation.arguments.get("required_tool_names") or ())
             unselected_helpers = tuple(name for name in merged_required_tool_names
                                       if name in _LOCAL_FILE_READ_TOOLS and name not in selected_reads)
             superseded_unselected_required = tuple(dict.fromkeys([
-                *superseded_unselected_required, *unselected_helpers]))
+                *superseded_unselected_required, *unselected_helpers,
+                *(name for name in merged_required_tool_names
+                  if name in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS))]))
             merged_required_tool_names = tuple(name for name in merged_required_tool_names
                                                if name not in (_STRUCTURED_ARTIFACT_TOOLS | _LOCAL_FILE_MUTATION_TOOLS)
                                                and name not in unselected_helpers)
             widened.turn_tool_scope_decision = replace(widened.turn_tool_scope_decision, required_tool_names=merged_required_tool_names)
+            if local_read_only_scope and not read_only_source_delivery:
+                # An explicitly empty current delivery scope retires inherited
+                # format obligations. Current files and independently planned
+                # deliverables retain their own lifecycle/completion evidence.
+                widened.turn_tool_scope_decision = replace(widened.turn_tool_scope_decision,
+                    requested_artifact_extensions=(), required_embedded_media_extensions=())
+                artifact_extensions = ()
         callable_required_tool_names = tuple(
             tool_name for tool_name in merged_required_tool_names if tool_name in callable_tool_names
         )
@@ -2472,6 +2786,34 @@ class ScopedTurnToolRegistry:
             for tool_name in merged_required_tool_names
             if tool_name not in set(callable_required_tool_names)
         )
+        if unavailable_required_tool_names:
+            registered_names = set(self._delegate_tool_names())
+            unknown_required = tuple(name for name in unavailable_required_tool_names if name not in registered_names
+                                     and not ("connector" in capabilities and name in (_CONNECTOR_TYPED_TOOLS | _CONNECTOR_TOOLS)))
+            if unknown_required:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {
+                    "reason": "invalid_tool_arguments", "scope_changed": False,
+                    "unavailable_required_tool_names": list(unknown_required),
+                    "available_tools": list(callable_tool_names),
+                    "recovery": {"kind": "correct_arguments", "retry_tool_name": "request_tool_scope",
+                        "argument_constraints": {"required_tool_names": "Use only registered tools exposed by a valid scope request."}},
+                }, "The required tools are not registered. Scope was not changed. Select available tools for the same user outcome; do not keep unavailable tools as mandatory steps."), self
+            delegates = []
+            current = self._delegate
+            for _ in range(6):
+                delegates.append(type(current).__name__)
+                nested = getattr(current, "_delegate", None) or getattr(current, "_registry", None)
+                if nested is None or nested is current:
+                    break
+                current = nested
+            logger.warning(
+                "scope required tools unavailable conversation_id=%s tools=%s delegate_chain=%s "
+                "registered_count=%s existing_formats=%s requires_new_content=%s requested_formats=%s",
+                (invocation.flow_context or {}).get("conversation_id", invocation.principal_id),
+                list(unavailable_required_tool_names), delegates, len(self._delegate_tool_names()),
+                list(self._evidence.existing_named_artifact_extensions),
+                self._evidence.existing_named_artifact_requires_new_content, list(artifact_extensions),
+            )
         connector_source_unavailable = bool(
             "connector" in capabilities
             and invocation.arguments.get("source_user_requested")
@@ -2489,10 +2831,23 @@ class ScopedTurnToolRegistry:
                 status="completed",
                 output={
                     "scope_requested": True,
+                    "include_local_path_details": (
+                        scope_arguments.get("include_local_path_details") is True
+                        and bool(capabilities.intersection({"local_shell", "local_files"}))
+                    ),
+                    "direct_read_complete_request": (
+                        scope_arguments.get("direct_read_complete_request") is True
+                        and capabilities.issubset({"weather", "market_data"})
+                        and widened.turn_tool_scope_decision.tracking_mode == "unspecified"
+                        and len(callable_required_tool_names) == 1
+                        and set(callable_required_tool_names).issubset({"weather_forecast", "market_quote"})
+                    ),
                     "capabilities": sorted(capabilities),
                     "scheduler_action": scheduler_action,
                     "scheduler_effect_actions": list(widened.turn_tool_scope_decision.allowed_scheduler_actions),
                     "requested_outcome": widened.turn_tool_scope_decision.requested_outcome,
+                    "evidence_policy": widened.turn_tool_scope_decision.evidence_policy,
+                    "tracking_mode": widened.turn_tool_scope_decision.tracking_mode,
                     "connector_source_user_requested": widened.turn_tool_scope_decision.connector_source_user_requested,
                     "connector_source_evidence": widened.turn_tool_scope_decision.connector_source_evidence,
                     "scheduler_toggle_enabled": widened.turn_tool_scope_decision.scheduler_toggle_enabled,
@@ -2513,21 +2868,35 @@ class ScopedTurnToolRegistry:
                     "connector_app_ids": list(connector_app_ids),
                     "available_sources": available_sources,
                     "source_selection_required": source_selection_required,
+                    "source_resolution_required": source_resolution_required,
                     "connector_source_evidence_required": connector_source_evidence_required,
                     "source_evidence_verified": source_evidence_verified,
                     "source_artifact_delivery_requested": source_delivery_requested,
                     "read_only_source_delivery": read_only_source_delivery,
+                    "read_only_local_scope": local_read_only_scope and not read_only_source_delivery,
                     "source_artifact_request_evidence": request_quote if source_delivery_requested else "",
                     "active_connector_providers": list(active_connector_providers),
                     "missing_connector_app_scope": missing_connector_app_scope,
                     "message": (
+                        "The source_evidence quote occurs in user context; quote verification alone does not "
+                        "establish that a specific account was selected or that reading it is authorized. "
+                        "Respect the original request and any requirement to ask before reading. If the user "
+                        "selected a specific source, resolve its exact read tool and app from available_sources "
+                        "metadata and request that exact scope. Otherwise request connector discovery again "
+                        "with source_user_requested=false, then ask the runtime's numbered source choice. "
+                        "No account read is authorized by this metadata result. Do not offer unrelated sources."
+                        if source_resolution_required
+                        else (
                         "Connected-account tools were not exposed because the request did not include verified "
                         "current-turn source evidence. Retry only if the user selected that source, and include "
-                        "an exact source_evidence substring from the current user turn."
+                        "an exact source_evidence quote from the current request or its structurally linked user request for a read-only source."
                         if connector_source_evidence_required
                         else (
-                        "Active connected-account read sources are available. Ask the user to choose a source "
-                        "before reading account data, then call request_tool_scope again with exact tool_names."
+                        "This metadata scope grants no account read. Check the original request: if the user "
+                        "already selected and authorized a source, resolve its matching exact read tool and request "
+                        "that scope with source_user_requested=true and its exact source_evidence quote. Do not "
+                        "ask the same source again. If the source is ambiguous or the user requires a choice "
+                        "before reading, ask the numbered source options and wait. Never choose an unrelated account."
                         if source_selection_required
                         else (
                         "Tool scope updated. Continue the same user request using the newly available tools."
@@ -2539,6 +2908,7 @@ class ScopedTurnToolRegistry:
                         )
                         if missing_connector_app_scope
                         else "No registered tools matched the requested capability scope."
+                        )
                         )
                         )
                     ),
@@ -2654,6 +3024,8 @@ def build_turn_tool_evidence(
     saved_history_available: bool = False,
     numbered_option_selected: bool = False,
     prior_tool_scopes: Iterable[str] | None = None,
+    linked_user_messages: Iterable[str] = (),
+    retained_read_available: bool = False,
 ) -> TurnToolEvidence:
     normalized_extensions = tuple(
         dict.fromkeys(
@@ -2698,6 +3070,9 @@ def build_turn_tool_evidence(
         numbered_option_selected=bool(numbered_option_selected),
         prior_tool_scopes=normalized_prior_tool_scopes,
         current_user_message=str(user_message or ""),
+        linked_user_messages=tuple(str(message) for message in linked_user_messages)
+            if turn_is_context_linked(conversation_result) else (),
+        retained_read_available=bool(retained_read_available and turn_is_context_linked(conversation_result)),
     )
 
 
@@ -2776,6 +3151,9 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
     requested_outcome = str(payload.get("requested_outcome") or "unspecified").strip().lower()
     if requested_outcome not in _REQUESTED_OUTCOMES:
         requested_outcome = "unspecified"
+    evidence_policy = payload.get('evidence_policy', 'fresh')
+    if not isinstance(evidence_policy, str) or evidence_policy not in {'fresh', 'retained'}:
+        return TurnToolScopeDecision()
     web_action = str(payload.get("web_action") or "none").strip().lower()
     if web_action not in _WEB_ACTIONS:
         web_action = "none"
@@ -2846,6 +3224,8 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
     connector_source_evidence = str(payload.get("connector_source_evidence") or "").strip()
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
+        evidence_policy=evidence_policy,
+        tracking_mode=payload.get("tracking_mode") if payload.get("tracking_mode") in {"live","recurring","clarify"} else "unspecified",
         web_action=web_action,
         scheduler_action=scheduler_action,
         scheduler_toggle_enabled=scheduler_toggle_enabled,
@@ -2870,6 +3250,8 @@ def _parse_turn_tool_scope_decision(text: str) -> TurnToolScopeDecision:
 def _tool_scope_decision_to_payload(decision: TurnToolScopeDecision) -> dict[str, object]:
     return {
         "requested_outcome": decision.requested_outcome,
+        "evidence_policy": decision.evidence_policy,
+        "tracking_mode": decision.tracking_mode,
         "web_action": decision.web_action,
         "scheduler_action": decision.scheduler_action,
         "scheduler_toggle_enabled": decision.scheduler_toggle_enabled,
@@ -2896,6 +3278,9 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
         return None
     requested_outcome = str(payload.get("requested_outcome") or "unspecified").strip().lower()
     if requested_outcome not in _REQUESTED_OUTCOMES:
+        return None
+    evidence_policy = payload.get('evidence_policy', 'fresh')
+    if not isinstance(evidence_policy, str) or evidence_policy not in {'fresh', 'retained'}:
         return None
     web_action = str(payload.get("web_action") or "none").strip().lower()
     scheduler_action = str(payload.get("scheduler_action") or "none").strip().lower()
@@ -2963,6 +3348,8 @@ def _tool_scope_decision_from_payload(payload: object) -> TurnToolScopeDecision 
     connector_source_evidence = str(payload.get("connector_source_evidence") or "").strip()
     return TurnToolScopeDecision(
         requested_outcome=requested_outcome,
+        evidence_policy=evidence_policy,
+        tracking_mode=payload.get("tracking_mode") if payload.get("tracking_mode") in {"live","recurring","clarify"} else "unspecified",
         web_action=web_action,
         scheduler_action=scheduler_action,
         scheduler_toggle_enabled=scheduler_toggle_enabled,
@@ -3016,9 +3403,9 @@ def _tool_scope_registry_signature(registry: object) -> object:
 
 def _tool_scope_classifier_max_tokens() -> int:
     try:
-        value = int(os.environ.get("NULLION_TOOL_SCOPE_CLASSIFIER_MAX_TOKENS", "96"))
+        value = int(os.environ.get("NULLION_TOOL_SCOPE_CLASSIFIER_MAX_TOKENS", "512"))
     except ValueError:
-        value = 96
+        value = 512
     return max(32, value)
 
 
@@ -3108,7 +3495,11 @@ def _active_connector_provider_context() -> list[dict[str, object]]:
                         if app_id and app_id not in app_ids:
                             app_ids.append(app_id)
                 if app_ids:
+                    # These identifiers advertise supported routes, not OAuth
+                    # connections. Keep the scope field compatible, but carry
+                    # its provenance to every downstream model decision.
                     entry["active_app_ids"] = app_ids[:500]
+                    entry["app_inventory_kind"] = "supported_catalogue"
                     read_tools: list[str] = []
                     write_tools: list[str] = []
                     if "google-mail" in app_ids:
@@ -3381,14 +3772,15 @@ def _connector_read_source_summaries(
             continue
         raw_app_ids = provider.get("active_app_ids")
         app_ids = _unique_connector_app_ids(raw_app_ids if isinstance(raw_app_ids, (list, tuple)) else ())
-        summaries.append(
-            {
-                "display_name": str(provider.get("display_name") or "Connected account").strip(),
-                "active_app_ids": list(app_ids),
-                "read_tools": read_tools,
-                "permission_mode": str(provider.get("permission_mode") or "read").strip() or "read",
-            }
-        )
+        summary = {
+            "display_name": str(provider.get("display_name") or "Connector provider").strip(),
+            "active_app_ids": list(app_ids),
+            "read_tools": read_tools,
+            "permission_mode": str(provider.get("permission_mode") or "read").strip() or "read",
+        }
+        if provider.get("app_inventory_kind") == "supported_catalogue":
+            summary["app_inventory_kind"] = "supported_catalogue"
+        summaries.append(summary)
     return summaries[:12]
 
 
@@ -3566,17 +3958,14 @@ def _validated_turn_tool_scope_decision(
     registry,
     active_connector_providers: Iterable[object],
 ) -> TurnToolScopeDecision:
+    if decision.evidence_policy == 'retained' and not evidence.context_linked:
+        decision = replace(decision, evidence_policy='fresh')
     normalized_current_user_message = " ".join(
         str(getattr(evidence, "current_user_message", "") or "").split()
     ).casefold()
-    normalized_connector_source_evidence = " ".join(
-        str(getattr(decision, "connector_source_evidence", "") or "").split()
-    ).casefold()
-    connector_source_evidence_verified = bool(
-        normalized_connector_source_evidence
-        and normalized_current_user_message
-        and normalized_connector_source_evidence in normalized_current_user_message
-    )
+    connector_source_evidence_verified = _source_quote_is_verified(
+        evidence, decision.connector_source_evidence,
+        tool_names=decision.requested_tool_names, registry=registry)
     prior_connector_source_selected = bool(
         evidence.context_linked and evidence.has_prior_tool_scope("connector")
     )
@@ -3707,12 +4096,9 @@ def _validated_turn_tool_scope_decision(
         requested_tool_names,
         decision.scheduler_action,
     )
-    if (
-        trusted_embedded_extensions
-        and requested_tool_names
-        and not _scope_tool_names_can_source_embedded_media(requested_tool_names)
-    ):
-        trusted_embedded_extensions = ()
+    if requested_tool_names:
+        trusted_embedded_extensions = _supported_scope_embedded_media_extensions(
+            requested_tool_names, trusted_embedded_extensions)
     if (
         trusted_embedded_extensions
         and not set(trusted_requested_extensions).intersection(_EMBEDDED_MEDIA_ARTIFACT_EXTENSIONS)
@@ -3736,6 +4122,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             requested_outcome=decision.requested_outcome,
+            evidence_policy=decision.evidence_policy,
+            tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
@@ -3762,6 +4150,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             requested_outcome=decision.requested_outcome,
+            evidence_policy=decision.evidence_policy,
+            tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
@@ -3788,6 +4178,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             requested_outcome=decision.requested_outcome,
+            evidence_policy=decision.evidence_policy,
+            tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
@@ -3813,6 +4205,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             requested_outcome=decision.requested_outcome,
+            evidence_policy=decision.evidence_policy,
+            tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
@@ -3842,6 +4236,8 @@ def _validated_turn_tool_scope_decision(
             source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
             source_artifact_request_evidence=decision.source_artifact_request_evidence,
             requested_outcome=decision.requested_outcome,
+            evidence_policy=decision.evidence_policy,
+            tracking_mode=decision.tracking_mode,
             web_action="none" if image_generation_unavailable else decision.web_action,
             scheduler_action=decision.scheduler_action,
             scheduler_toggle_enabled=decision.scheduler_toggle_enabled
@@ -3866,6 +4262,8 @@ def _validated_turn_tool_scope_decision(
         source_artifact_delivery_requested=decision.source_artifact_delivery_requested,
         source_artifact_request_evidence=decision.source_artifact_request_evidence,
         requested_outcome=decision.requested_outcome,
+        evidence_policy=decision.evidence_policy,
+            tracking_mode=decision.tracking_mode,
         web_action="none" if image_generation_unavailable else decision.web_action,
         scheduler_action=decision.scheduler_action,
         scheduler_toggle_enabled=decision.scheduler_toggle_enabled
@@ -3930,6 +4328,16 @@ def _tool_scope_model_signature(model_client: object | None) -> object:
     )
 
 
+def _scope_linked_request_context(evidence: TurnToolEvidence) -> list[str]:
+    if not evidence.context_linked:
+        return []
+    messages = list(evidence.linked_user_messages)
+    # Keep recent amendments and the original request, bounded independently
+    # of the full transcript. Independent chat never loads this context.
+    selected = messages if len(messages) <= 4 else [*messages[:3], messages[-1]]
+    return [str(message)[:1500] for message in selected]
+
+
 def _tool_scope_cache_key(
     *,
     user_message: str,
@@ -3954,6 +4362,8 @@ def _tool_scope_cache_key(
             "slash_prefixed_literal": evidence.slash_prefixed_literal,
             "numbered_option_selected": evidence.numbered_option_selected,
             "prior_tool_scopes": list(evidence.prior_tool_scopes),
+            "retained_read_available": evidence.retained_read_available,
+            "linked_request_user_messages": _scope_linked_request_context(evidence),
         },
         "active_connector_providers": list(active_connector_providers),
         "skill_pack_index": str(skill_pack_index or ""),
@@ -4149,6 +4559,8 @@ def build_turn_tool_scope_decision(
         "requested_extensions": list(evidence.requested_extensions),
         "numbered_option_selected": evidence.numbered_option_selected,
         "prior_tool_scopes": list(evidence.prior_tool_scopes),
+        "retained_read_available": evidence.retained_read_available,
+        "linked_request_user_messages": _scope_linked_request_context(evidence),
         "active_connector_providers": active_connector_providers,
         "installed_skill_pack_index": skill_pack_index,
         "available_special_tool_scopes": available_special_tool_scopes,
@@ -4166,7 +4578,7 @@ def build_turn_tool_scope_decision(
         prompt["assistant_no_tool_draft"] = str(assistant_no_tool_draft or "")[:1600]
     system = (
         "Return only a JSON object matching this schema: "
-        '{"requested_outcome":"unspecified|generated_media",'
+        '{"requested_outcome":"unspecified|generated_media","evidence_policy":"fresh|retained","tracking_mode":"unspecified|live|recurring|clarify",'
         '"web_action":"none|open_url|live_research|browser_interaction",'
         '"scheduler_action":"none|inspect|run|mutate","scheduler_toggle_enabled":null,'
         '"scheduler_selection_policy":"none|user_selected|delegate_one",'
@@ -4177,11 +4589,24 @@ def build_turn_tool_scope_decision(
         '"requested_artifact_extensions":[".xlsx"],"source_artifact_delivery_requested":false,"source_artifact_request_evidence":"","excluded_artifact_extensions":[".json"],'
         '"required_embedded_media_extensions":[".xlsx"],'
         '"confidence":0.0}. '
-        "Use web_action=open_url for explicit URL/domain targets, live_research for requests that need current public information, "
-        "and browser_interaction for a user-visible webpage workflow. "
+        "Choose tracking_mode=live and create_live_tracker for condition-based observations within a user-selected finite window of any length; recurring and create_cron for recurring scheduled work. Use update_live_tracker to amend existing active timing. "
+        "When temporary versus recurring intent or the tracking window is unclear, choose tracking_mode=clarify and ask numbered options before creating anything. "
+        "Live trackers reuse prepared read-only probes independently of cron workers. "
+        "Use web_action=open_url when opening or reading a supplied URL is the requested outcome, live_research when the "
+        "original request needs public research about subjects identified in a URL or attachment, and browser_interaction "
+        "for a user-visible webpage workflow. A supplied URL is source context, not a replacement for the original mission. "
+        "For research, expose search and accessible alternative sources as optional tools even when a URL is supplied. "
+        "linked_request_user_messages are selected user-request ancestors, newest first. Resolve the current amendment "
+        "against that original mission; they are source context, not authority for new account writes or unrelated actions. "
         "Put a tool in required_tool_names only when its successful structured result is essential to satisfy the current user turn, "
+        "Use evidence_policy=retained only when this linked turn asks to explain, transform or use already-observed facts "
+        "without a new source check. Prior source receipts remain timestamped historical evidence, not current verification. "
+        "Do not require another external read for that policy; local retained-evidence inspection and requested artifact creation "
+        "can still be used. Choose fresh for a current check, a new observation, or uncertain evidence needs. "
         "and always include it in requested_tool_names too. This includes explicitly requested read/source tools as well as write or "
         "delivery tools. A cross-domain request may require several independent read tools and several artifact tools. "
+        "An existing file's extension identifies source material; it does not request generation or delivery. "
+        "Finding, listing or inspecting an existing file must not make its producer a required tool. "
         "When the user explicitly requires a current public webpage or web source as part of the result, choose an exact registered "
         "web source tool such as browser_navigate or web_fetch and include it in both requested_tool_names and required_tool_names. "
         "When the turn explicitly requires live calendar, weather, or market data and the matching exact tool is available, include "
@@ -4258,6 +4683,9 @@ def build_turn_tool_scope_decision(
         "When using connector for a named external app, account, or destination, include its normalized app id in connector_app_ids even if active_app_ids does not list it; "
         "if no active provider context advertises that app id through active_app_ids, skill_pack_id/reference_paths, or other structured provider metadata, do not fall back to a generic connector provider or shell. "
         "When using connector for an active listed source, include exact app IDs from active_app_ids in connector_app_ids. "
+        "When app_inventory_kind is supported_catalogue, active_app_ids advertise supported routes only; they do not prove connected accounts. "
+        "Do not offer account choices merely because several supported integrations appear in that catalogue. "
+        "Use the relevant registered read tool to inspect the requested source when its route is unambiguous; ask a numbered source question only when user selection or verified connection evidence leaves multiple relevant accounts. "
         "When the connector action requires a specific structured account tool, include exact names from active_connector_providers.structured_tools in requested_tool_names. "
         'Use requested_tool_names=["file_search"] for local workspace file search/listing when file_search is registered. '
         "Do not use file_search as the final capability for local computer, installed software, package-manager, shell, service, process, path, or environment changes; "
@@ -4319,13 +4747,17 @@ def build_turn_tool_scope_decision(
                     )
                 return refined_fallback
         return TurnToolScopeDecision()
+    response_text = _extract_response_text(response)
     decision = _validated_turn_tool_scope_decision(
-        _parse_turn_tool_scope_decision(_extract_response_text(response)),
+        _parse_turn_tool_scope_decision(response_text),
         evidence=evidence,
         registry=registry,
         active_connector_providers=active_connector_providers,
     )
     if not decision.valid:
+        logger.warning('Tool scope returned an invalid decision (text_chars=%d, stop_reason=%s, output_budget=%d)',
+            len(response_text), response.get('stop_reason') if isinstance(response, dict) else None,
+            _tool_scope_classifier_max_tokens())
         return TurnToolScopeDecision()
     decision = _refine_ambiguous_artifact_extension_contract(
         model_client=model_client,
@@ -4552,7 +4984,7 @@ class PlainFastPathToolRegistry:
 
 
 class PlainNoToolFastPathRegistry:
-    """Empty registry for first-pass turns with no structured tool evidence."""
+    """Empty registry for a turn whose selected scope requires no tools."""
 
     def __init__(self, delegate: object) -> None:
         self._delegate = delegate
@@ -4763,6 +5195,8 @@ def scoped_turn_tool_registry(
 
 def turn_tool_evidence_needs_model_scope_decision(evidence: TurnToolEvidence) -> bool:
     return bool(
+        (evidence.context_linked and evidence.retained_read_available)
+        or
         getattr(evidence, "has_url_target", False)
         or getattr(evidence, "has_attachments", False)
         or getattr(evidence, "has_email_address_target", False)

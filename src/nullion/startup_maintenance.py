@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from nullion.sqlite_connections import sqlite_connection
+
 from dataclasses import dataclass, asdict
 from datetime import UTC, datetime
 import json
@@ -60,7 +62,7 @@ def run_startup_maintenance(checkpoint_path: str | Path) -> dict[str, object]:
     timeout = _env_float("NULLION_STARTUP_MAINTENANCE_SQLITE_TIMEOUT_S", 5.0)
     try:
         try:
-            with sqlite3.connect(str(checkpoint), timeout=timeout) as conn:
+            with sqlite_connection(str(checkpoint), timeout=timeout) as conn:
                 conn.row_factory = sqlite3.Row
                 if not _table_exists(conn, "runtime_meta"):
                     result.skipped = True
@@ -116,7 +118,7 @@ def run_startup_maintenance(checkpoint_path: str | Path) -> dict[str, object]:
 
     if result.backup_path and _env_flag("NULLION_STARTUP_MAINTENANCE_VACUUM", default=True):
         try:
-            with sqlite3.connect(str(checkpoint), timeout=timeout) as conn:
+            with sqlite_connection(str(checkpoint), timeout=timeout) as conn:
                 conn.execute("VACUUM")
             result.vacuumed = True
         except sqlite3.Error as exc:
@@ -261,6 +263,14 @@ def _compact_tool_output(tool_name: str, output: object) -> object:
     encoded = _json_size_text(candidate)
     if len(encoded) <= _MAX_STORED_TOOL_OUTPUT_CHARS:
         return candidate
+    if tool_name == "request_tool_scope" and isinstance(candidate, dict):
+        from nullion.source_selection import compact_scope_evidence
+        return compact_scope_evidence(candidate, original_chars=len(encoded))
+    from nullion.source_selection import compact_source_identity_evidence
+    identity_evidence = compact_source_identity_evidence(candidate, encoded=encoded,
+        max_chars=_MAX_STORED_TOOL_OUTPUT_CHARS)
+    if identity_evidence is not None:
+        return identity_evidence
     return {
         "truncated": True,
         "original_chars": len(encoded),

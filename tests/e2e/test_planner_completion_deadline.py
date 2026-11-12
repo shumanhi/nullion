@@ -1,3 +1,4 @@
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json,os,time
 from pathlib import Path
 import pytest
@@ -20,9 +21,11 @@ def test_timed_out_planner_falls_back_to_real_chat_and_delivers_complete_html(tm
     class Model:
         planner_calls=0; deadlines=[]; feedback=[]
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.feedback.append(kw['messages'][-1])
             system=str(kw.get('system') or '');names={t['name'] for t in kw.get('tools',[])}
-            if system.startswith('You are a language-neutral structured planner'):
+            if 'You are a language-neutral structured planner' in system:
                 self.planner_calls+=1;self.deadlines.append(kw.get('timeout'))
                 if not kw.get('timeout'):time.sleep(1.5)
                 raise TimeoutError('Simulated previously unbounded planner provider')

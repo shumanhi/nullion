@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,6 +64,8 @@ class _StructuredMemoryModel:
         self.calls: list[dict] = []
 
     def create(self, **kwargs):
+        protocol_reply = workflow_provider_reply(kwargs, completion=True)
+        if protocol_reply is not None: return protocol_reply
         self.calls.append(kwargs)
         return {"content": [{"type": "text", "text": self.text}]}
 
@@ -259,7 +262,7 @@ def test_cron_messaging_delivery_never_promotes_attachment_text_over_final_reply
 
     assert result["cron_delivery_status"] == "sent"
     assert sent == [
-        "⏰ **SCHEDULED TASK: Repo watcher**\n\n"
+        "**SCHEDULED TASK: Repo watcher**\n\n"
         "One dated notice was reviewed; no deadline was clear enough to schedule."
     ]
     assert str(artifact) not in sent[0]

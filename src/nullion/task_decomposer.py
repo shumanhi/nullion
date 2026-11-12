@@ -425,7 +425,8 @@ def _call_decomposer_model_text(
 
 
 def _decomposer_system_prompt(*, scheduled_preview_mode: bool = False) -> str:
-    base = _DECOMPOSE_SYSTEM_PROMPT
+    from nullion.workflow_reasoning import WORKFLOW_REASONING_INSTRUCTION
+    base = WORKFLOW_REASONING_INSTRUCTION + "\n\n" + _DECOMPOSE_SYSTEM_PROMPT
     if scheduled_preview_mode:
         return base + _DECOMPOSE_SYSTEM_PROMPT_SCHEDULED_PREVIEW_APPEND
     return base

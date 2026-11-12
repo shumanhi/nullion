@@ -49,7 +49,10 @@ def test_agent_turn_runs_scoped_browser_cleanup_hook() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def create(self, *, messages, tools):  # noqa: ANN001
+        def create(self, *, messages, tools, **kwargs):  # noqa: ANN001
+            from tests.workflow_provider_protocol import workflow_provider_reply
+            reply = workflow_provider_reply({**kwargs, "messages": messages, "tools": tools})
+            if reply is not None: return reply
             self.calls += 1
             if self.calls == 1:
                 return {
@@ -154,3 +157,17 @@ def test_conversation_navigation_survives_retry_capsules_and_owner_cleanup():
     assert backend.closed_sessions == [first.output["session_id"]]
     tools.close_tracked_sessions("conversation:two")
     assert backend.closed_sessions == [first.output["session_id"], other.output["session_id"]]
+
+
+def test_shared_stop_releases_only_conversation_resource_scope():
+    import asyncio
+    from types import SimpleNamespace
+    from nullion.session_stop import stop_session_async
+    calls = []
+    registry = ToolRegistry()
+    registry.register_cleanup_hook(lambda scope: calls.append(scope))
+    runtime = SimpleNamespace(active_tool_registry=registry, store=None)
+    asyncio.run(stop_session_async(conversation_id='telegram:17', runtime=runtime))
+    assert calls == ['conversation:telegram:17']
+    asyncio.run(stop_session_async(conversation_id='', runtime=runtime))
+    assert len(calls) == 1

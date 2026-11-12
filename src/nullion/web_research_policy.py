@@ -113,6 +113,8 @@ def format_web_research_guidance(*, tool_registry: Any, settings: Any) -> str | 
         return (
             "Public web research mode:\n"
             "- Use web_search for source discovery and browser_navigate, browser_extract_text, and browser_screenshot for page evidence.\n"
+            "- Cite direct source URLs beside the material findings or subject profiles they support; keep them readable and do not invent links.\n"
+            "- Search to discover enough suitable sources, then read those pages to verify the requested facts before producing a researched report. Avoid repeatedly broadening discovery when the remaining need is a specific fact on an already identified page.\n"
             "- Direct web_fetch is not registered in this session."
         )
     provider = configured_search_provider(settings) or "not configured"

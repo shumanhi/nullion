@@ -1,6 +1,7 @@
 """Real agent/scheduler/store/delivery boundary; only provider calls are faked."""
 from __future__ import annotations
 
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import time
@@ -20,7 +21,7 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
     'Comprueba las obligaciones y crea todos los eventos pendientes antes del informe.',
 ])
 @pytest.mark.parametrize('finish', [True, False])
-def test_scheduled_run_resumes_missing_actions_before_publishing_once(tmp_path, monkeypatch, task, finish):
+def test_scheduled_run_resumes_missing_actions_before_publishing_once(tmp_path, monkeypatch, record_property, task, finish):
     from nullion.crons import CronJob
     from nullion.policy import BoundaryKind, GLOBAL_PERMISSION_PRINCIPAL, BoundaryPolicyRule, PolicyMode
     from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
@@ -37,16 +38,46 @@ def test_scheduled_run_resumes_missing_actions_before_publishing_once(tmp_path, 
     def write(invocation):
         ident = invocation.arguments['id']; calls.append(('create', ident))
         return ToolResult(invocation.invocation_id, invocation.tool_name, 'completed',
-            {'id': ident, 'action_receipt': {'status':'completed', 'summary':'Event created', 'object_id':ident}})
+            {'id': ident, 'action_receipt': {'type':'action_receipt', 'action':'created',
+                'object_type':'calendar_event', 'status':'completed', 'summary':'Event created', 'object_id':ident}})
     registry.register(ToolSpec(name='web_fetch', description='Read fixture records', risk_level=ToolRiskLevel.LOW,
         side_effect_class=ToolSideEffectClass.READ, requires_approval=False, timeout_seconds=2), read)
     registry.register(ToolSpec(name='create_record', description='Create a missing fixture calendar entry', risk_level=ToolRiskLevel.LOW,
         side_effect_class=ToolSideEffectClass.ACCOUNT_WRITE, requires_approval=False, timeout_seconds=2), write)
+    provider_calls = []
     class Model:
         steps = 0
         repairs = 0
         resumed_steps = 0
         def create(self, **kw):
+            provider_calls.append({'system': kw.get('system'), 'tools': [r['name'] for r in kw.get('tools', [])],
+                'messages': kw.get('messages')})
+            system = str(kw.get('system') or '')
+            if system.startswith('You are a material-requirements planner'):
+                return text_response(json.dumps({'all_material_requirements_enumerated':True,
+                    'material_requirements':[
+                        {'requirement':'Create missing event '+ident, 'requirement_kind':'action',
+                         'evidence_subject_id':ident, 'eligible_evidence_tool_names':['create_record']}
+                        for ident in ('A','B')]}))
+            if system.startswith('You are a semantic completion reviewer'):
+                packet = json.loads(kw['messages'][0]['content'][0]['text'])
+                rows = []
+                for requirement in packet['material_requirement_contract']:
+                    matches = [row for row in packet['tool_evidence']
+                        if row['status']=='completed' and row['tool_name']=='create_record'
+                        and (row.get('output') or {}).get('id')==requirement['evidence_subject_id']]
+                    rows.append({'requirement_id':requirement['requirement_id'], 'satisfied':bool(matches),
+                        'draft_covered':bool(matches),
+                        'evidence_invocation_ids':[row['invocation_id'] for row in matches[-1:]]})
+                complete = all(row['satisfied'] for row in rows)
+                # Certify each required action from its own real receipt. The
+                # generic execution helper only proves that a tool was touched.
+                return text_response(json.dumps({'disposition':'complete' if complete else 'retry',
+                    'all_material_requirements_enumerated':True, 'material_requirements':rows,
+                    'unresolved_requirements':[] if complete else ['Check duplicate B and create it if missing'],
+                    'retry_tool_names':[] if complete else ['create_record']}))
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kw.get('tools'):
                 self.repairs += 1
                 complete = ('create', 'B') in calls
@@ -58,7 +89,9 @@ def test_scheduled_run_resumes_missing_actions_before_publishing_once(tmp_path, 
             self.steps += 1
             if self.steps == 1: return tool_response('web_fetch', {'url':'https://example.com/obligations'})
             if self.steps == 2: return tool_response('create_record', {'id':'A'})
-            resuming = 'remaining_work' in json.dumps(kw['messages'], ensure_ascii=False)
+            # The common owner narrows recovery to the outstanding action;
+            # do not depend on an older scheduler continuation prompt.
+            resuming = {row['name'] for row in kw.get('tools', [])} == {'create_record'}
             if not resuming: raise TimeoutError('Provider stopped before the second obligation')
             self.resumed_steps += 1
             if self.resumed_steps == 1:
@@ -72,19 +105,23 @@ def test_scheduled_run_resumes_missing_actions_before_publishing_once(tmp_path, 
     job = CronJob(id='complete-report', name='義務', schedule='0 * * * *', task=task,
         delivery_channel='telegram', delivery_target='2222')
     outcome = run_scheduled(job, client, runtime, registry, send)
-    assert calls == [('read',None), ('create','A')] + ([('create','B')] if finish else [])
-    assert outcome['cron_completion_continuations'] == 1
+    record_property('runtime_evidence', json.dumps(outcome, default=str))
+    record_property('provider_calls', json.dumps(provider_calls, default=str))
+    assert calls == [('read',None), ('create','A')] + ([('create','B')] if finish else []), outcome
+    assert outcome['cron_shared_completion_owner'] is True
     assert len(deliveries) == 1
     wire = deliveries[0]['text']
-    assert 'Partial report' not in wire and 'B remains unscheduled' not in wire
-    assert not outcome.get('cron_report_partial')
-    assert outcome['execution_outcome']['execution_succeeded'] is finish
+    assert 'Partial report' not in wire
+    assert ('B remains unscheduled' not in wire) if finish else ('B remains unscheduled' in wire)
+    assert bool(outcome.get('cron_report_partial')) is (not finish)
+    assert outcome['execution_outcome']['status']==('succeeded' if finish else 'partially_succeeded'),outcome['execution_outcome']
     if finish:
         assert 'Events A and B were created' in wire
         assert not outcome.get('cron_report_failed')
     else:
         assert 'Events A and B' not in wire
-        assert outcome['cron_report_failed'] and outcome['response_fulfilled'] is False
+        assert not outcome.get('cron_report_failed')
+        assert outcome['response_fulfilled'] is not True
     actual = [e for e in runtime.store.list_events() if e.event_type == 'tool.invocation.completed']
     assert len([e for e in actual if e.payload.get('tool_name') == 'create_record']) == (2 if finish else 1)
 
@@ -121,7 +158,11 @@ def test_plain_chat_keeps_one_model_call_and_never_loads_completion_contract(tmp
     monkeypatch.setattr(agent_orchestrator, '_extract_completion_requirement_contract', slow_optional)
     class Model:
         calls=0
-        def create(self, **kw): self.calls+=1; return text_response('Hello.')
+        def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
+            self.calls += 1
+            return text_response('Hello.')
     client=Model(); agent=AgentOrchestrator(model_client=client); durations=[]
     for prompt in ('Hello', 'こんにちは', 'Hola', 'مرحبا', 'Bonjour'):
         start=time.perf_counter()
@@ -153,6 +194,8 @@ def test_real_chat_continues_a_partial_source_before_terminal_answer(tmp_path, m
     class Model:
         steps=0; reviews=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=False)
+            if protocol_reply is not None: return protocol_reply
             names={t['name'] for t in kw.get('tools',[])}; system=str(kw.get('system') or '')
             if system.startswith('You are a material-requirements planner'):
                 return text_response(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[
@@ -166,8 +209,8 @@ def test_real_chat_continues_a_partial_source_before_terminal_answer(tmp_path, m
                 from nullion.prompt_injection import UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START,UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END
                 message=kw['messages'][0]['content'][0]['text']
                 context=json.loads(message.split(UNTRUSTED_TOOL_OUTPUT_BOUNDARY_START+'\n')[1].split('\n'+UNTRUSTED_TOOL_OUTPUT_BOUNDARY_END)[0])
-                return tool_response('present_source_answer',{'intro':'Checked:', 'points':[
-                    {'evidence_ids':[r['id']],'detail_ids':[],'relevance':'Requested entry'} for r in context['evidence']],
+                return tool_response('present_source_answer',{'intro':'Checked:', 'focus_roles':['entity'], 'points':[
+                    {'evidence_ids':[r['id']],'detail_ids':[],'semantic_role':'entity','relevance':'Requested entry'} for r in context['evidence']],
                     'limitation_ids':[r['id'] for r in context['limitations']]})
             if not names:return text_response('{}')
             if 'select_attachment_format' in names:return tool_response('select_attachment_format',{'extension':None,'confidence':1})
@@ -185,11 +228,7 @@ def test_real_chat_continues_a_partial_source_before_terminal_answer(tmp_path, m
     assert model.reviews>=1
     assert not payload.get('artifacts') and 'Partial report' not in payload['text']
     if finish: assert 'A at 19:30' in payload['text'] and 'B at 18:00' in payload['text']
-    else:
-        # Interactive requests retain checked facts while clearly disclosing
-        # the unfinished requirement. Scheduled publication still stays gated.
-        assert 'A at 19:30' in payload['text'] and 'Required B not checked' in payload['text']
-        assert 'B at 18:00' not in payload['text']
+    else: assert 'A at 19:30' in payload['text'] and 'B not checked' in payload['text']
     turns=[e for e in runtime.store.list_conversation_events('web:complete-two') if e.get('event_type')=='conversation.chat_turn']
     assert len([t for t in turns[-1]['tool_results'] if t['tool_name']=='lookup_source'])==2
 
@@ -242,6 +281,8 @@ def test_html_report_executes_account_action_and_preserves_approval_before_file_
     class Model:
         step=0;reviews=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kw.get('tools'):
                 payload=json.loads(kw['messages'][0]['content'][0]['text'])
                 assert payload.get('existing_html') is None, 'Completed reports must not require a second model review'

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 import html
@@ -32,7 +32,7 @@ from nullion.approval_markers import split_tool_approval_marker, strip_tool_appr
 from nullion.attachment_format_graph import ATTACHMENT_TOKEN_EXTENSIONS, VALID_ATTACHMENT_EXTENSIONS, plan_attachment_format
 from nullion.builder import format_builder_proposal_notification
 from nullion.chat_attachments import guess_media_type
-from nullion.chat_text import make_markdown_tables_chat_readable
+from nullion.chat_text import UserMessage, make_markdown_tables_chat_readable, render_user_message
 from nullion.config import NullionSettings
 from nullion.remediation import remediation_buttons_for_recommendation_code
 from nullion.response_sanitizer import _sanitize_local_paths, sanitize_user_visible_reply
@@ -42,6 +42,7 @@ from nullion.task_frames import TaskFrameStatus
 
 
 logger = logging.getLogger(__name__)
+from nullion.delivery_acknowledgement import UnconfirmedDelivery, send_error_replay_safety
 WORKING_ACK_TEXT = "⌛ On it! Feel free to send other tasks — I can handle multiple at once."
 
 
@@ -121,6 +122,7 @@ class PlatformDeliveryReceipt:
     created_at: datetime | None = None
     delivered_text: str | None = None
     attachment_names: tuple[str, ...] = ()
+    delivery_progress: dict | None = None
 
     def to_record(self) -> dict[str, object]:
         created_at = self.created_at or datetime.now(UTC)
@@ -140,6 +142,7 @@ class PlatformDeliveryReceipt:
             "created_at": created_at.isoformat(),
             "delivered_text": self.delivered_text,
             "attachment_names": list(self.attachment_names),
+            "delivery_progress": self.delivery_progress,
         }
 
 
@@ -150,6 +153,7 @@ class PlatformDeliveryResult:
     text_sent: bool = False
     attachments_sent: bool = False
     fallback_text_sent: bool = False
+    unconfirmed: UnconfirmedDelivery | None = None
 
     @property
     def ok(self) -> bool:
@@ -308,6 +312,17 @@ def build_platform_delivery_receipt(
             else ()
         ),
     )
+
+
+def record_unconfirmed_delivery(delivery, exc, *, channel, target_id, request_id=None):
+    receipt = replace(build_platform_delivery_receipt(channel=channel, target_id=target_id,
+        delivery=delivery, transport_ok=False, request_id=request_id), status=exc.status,
+        attachment_count=len(exc.confirmed), attachment_names=tuple(Path(p).name for p in exc.confirmed),
+        error=str(exc), delivery_progress=exc.progress(), text_delivered=exc.confirmed_text,
+        delivered_text=delivery.text if exc.confirmed_text else None,
+        message_id=exc.message_ids[0] if exc.message_ids else None)
+    record_platform_delivery_receipt(receipt)
+    return receipt
 
 
 def record_platform_delivery_receipt(
@@ -725,6 +740,7 @@ def handle_messaging_ingress_result(
     turn_dispatch_decision=None,
     text_delta_callback=None,
     activity_callback=None,
+    cancellation_checker=None,
 ):
     from nullion.messaging_turn_graph import run_messaging_turn_graph
 
@@ -734,6 +750,7 @@ def handle_messaging_ingress_result(
         turn_dispatch_decision=turn_dispatch_decision,
         text_delta_callback=text_delta_callback,
         activity_callback=activity_callback,
+        cancellation_checker=cancellation_checker,
     )
 
 
@@ -1694,10 +1711,10 @@ def _normalize_platform_scheduled_task_heading(line: str) -> str | None:
         if raw_label.upper() != label:
             continue
         if upper == label:
-            return f"⏰ **{label}**"
+            return render_user_message(UserMessage(title=label, kind='scheduled'))
         if upper.startswith(f"{label}:"):
             suffix = collapsed.split(":", 1)[1].strip()
-            return f"⏰ **{label}: {suffix}**" if suffix else f"⏰ **{label}**"
+            return render_user_message(UserMessage(title=f'{label}: {suffix}' if suffix else label, kind='scheduled'))
     return None
 
 
@@ -1724,41 +1741,21 @@ def _normalize_platform_product_heading_blocks(
     return f"{heading}{separator}{body}"
 
 
-def _compact_platform_scheduled_task_caption_spacing(text: str | None) -> str | None:
-    if text is None:
-        return None
-    lines = str(text or "").splitlines()
-    if len(lines) < 3:
-        return text
-    first = lines[0].strip()
-    first_normalized = first
-    if first_normalized.startswith("⏰"):
-        first_normalized = first_normalized[1:].strip()
-    first_normalized = first_normalized.strip("*_ ")
-    if not first_normalized.casefold().startswith(("scheduled task:", "manual scheduled task run:")):
-        return text
-    compacted = [lines[0]]
-    index = 1
-    while index < len(lines) and not lines[index].strip():
-        index += 1
-    compacted.extend(lines[index:])
-    return "\n".join(compacted).strip()
-
 
 def _sanitize_platform_visible_text(
     text: str | None,
     *,
     compact_scheduled_task_spacing: bool = False,
+    tool_results=None,
 ) -> str | None:
     if text is None:
         return None
     sanitized = sanitize_user_visible_reply(
         user_message=None,
         reply=text,
-        tool_results=None,
+        tool_results=tool_results,
         source="platform_delivery",
     ) or text
-    sanitized = _sanitize_local_paths(sanitized)
     return _normalize_platform_product_heading_blocks(
         sanitized,
         compact_spacing=compact_scheduled_task_spacing,
@@ -1888,17 +1885,25 @@ def _hold_large_attachments_for_confirmation(
 
 
 def prepare_reply_for_platform_delivery(
-    reply: str | None,
+    reply: str | UserMessage | None,
     *,
     principal_id: str | None = None,
     allow_attachments: bool | None = None,
     delivery_contract: DeliveryContract | None = None,
     artifact_paths: list[str] | tuple[str, ...] | None = None,
     max_attachment_bytes: int | None = None,
+    tool_results=None,
 ) -> PlatformDelivery:
+    def sanitize_visible(text, **kwargs):
+        return _sanitize_platform_visible_text(text, tool_results=tool_results, **kwargs)
+
+    def unavailable_attachment_reply():
+        from nullion.response_fulfillment_contract import artifact_delivery_failure_reply
+        return sanitize_visible(artifact_delivery_failure_reply(tool_results, default=_ATTACHMENT_UNAVAILABLE_REPLY))
+
     if reply is None:
         return PlatformDelivery(text=None, attachments=())
-    text = make_markdown_tables_chat_readable(sanitize_external_inline_markup(str(reply)))
+    text = make_markdown_tables_chat_readable(sanitize_external_inline_markup(render_user_message(reply)))
     text = _strip_platform_internal_markers(text)
     text = _rewrite_sandbox_artifact_links_for_delivery(text, principal_id=principal_id)
     if delivery_contract is None:
@@ -1945,14 +1950,14 @@ def prepare_reply_for_platform_delivery(
                 batch_limit=automatic_batch_limit,
             )
             return PlatformDelivery(
-                text=_sanitize_platform_visible_text(confirmation_text),
+                text=sanitize_visible(confirmation_text),
                 attachments=(),
                 media_directive_count=len(attachments),
                 pending_attachment_count=len(attachments),
             )
         if attachments:
             base_text = _caption_without_unattached_filename_lines(
-                _sanitize_platform_visible_text(
+                sanitize_visible(
                     text if text else None,
                 ),
                 attachments=attachments,
@@ -1963,7 +1968,7 @@ def prepare_reply_for_platform_delivery(
                 attachments,
             )
             return PlatformDelivery(
-                text=_sanitize_platform_visible_text(
+                text=sanitize_visible(
                     visible_text,
                 ),
                 attachments=attachments,
@@ -2009,7 +2014,7 @@ def prepare_reply_for_platform_delivery(
     plain_candidates = _plain_candidate_paths_from_text(text)
     if media_candidates and not delivery_contract.allow_attachment_delivery:
         return PlatformDelivery(
-            text=_sanitize_platform_visible_text(caption if caption else None),
+            text=sanitize_visible(caption if caption else None),
             attachments=(),
             media_directive_count=0,
         )
@@ -2046,7 +2051,7 @@ def prepare_reply_for_platform_delivery(
                     batch_limit=automatic_batch_limit,
                 )
                 return PlatformDelivery(
-                    text=_sanitize_platform_visible_text(confirmation_text),
+                    text=sanitize_visible(confirmation_text),
                     attachments=(),
                     media_directive_count=len(plain_attachments),
                     pending_attachment_count=len(plain_attachments),
@@ -2063,7 +2068,7 @@ def prepare_reply_for_platform_delivery(
             )
             visible_text = _caption_with_attached_file_names(visible_text, plain_attachments) or visible_text
             return PlatformDelivery(
-                text=_sanitize_platform_visible_text(
+                text=sanitize_visible(
                     visible_text,
                 ),
                 attachments=plain_attachments,
@@ -2072,12 +2077,12 @@ def prepare_reply_for_platform_delivery(
     if not media_candidates:
         if delivery_contract.requires_attachment_delivery:
             return PlatformDelivery(
-                text=_ATTACHMENT_UNAVAILABLE_REPLY,
+                text=unavailable_attachment_reply(),
                 attachments=(),
                 media_directive_count=1,
                 unavailable_attachment_count=1,
             )
-        return PlatformDelivery(text=_sanitize_platform_visible_text(text if text else None), attachments=())
+        return PlatformDelivery(text=sanitize_visible(text if text else None), attachments=())
     attachments = _drop_primary_artifact_text_sidecars(
         _attachments_matching_contract(attachments, delivery_contract),
         required_extensions=delivery_contract.required_attachment_extensions,
@@ -2100,7 +2105,7 @@ def prepare_reply_for_platform_delivery(
             batch_limit=automatic_batch_limit,
         )
         return PlatformDelivery(
-            text=_sanitize_platform_visible_text(confirmation_text),
+            text=sanitize_visible(confirmation_text),
             attachments=(),
             media_directive_count=raw_media_directive_count,
             pending_attachment_count=len(attachments),
@@ -2139,7 +2144,7 @@ def prepare_reply_for_platform_delivery(
     )
     if not attachments:
         return PlatformDelivery(
-            text=_ATTACHMENT_UNAVAILABLE_REPLY,
+            text=unavailable_attachment_reply(),
             attachments=(),
             media_directive_count=raw_media_directive_count,
             unavailable_attachment_count=unavailable_count or len(media_candidates),
@@ -2157,7 +2162,7 @@ def prepare_reply_for_platform_delivery(
     )
     delivery_text = _caption_without_attached_filename_list(delivery_text, attachments)
     delivery_text = _caption_with_attached_file_names(delivery_text, attachments)
-    delivery_text = _sanitize_platform_visible_text(
+    delivery_text = sanitize_visible(
         delivery_text,
     )
     if unavailable_count:
@@ -2192,6 +2197,8 @@ async def execute_platform_reply_delivery(
     send_text: PlatformTextSender,
     send_attachments: PlatformAttachmentSender | None = None,
     finalize_stream: PlatformTextSender | None = None,
+    publication_gate=None,
+    tool_results=None,
 ) -> PlatformDeliveryResult:
     """Run the common final-delivery boundary for chat platforms.
 
@@ -2200,18 +2207,44 @@ async def execute_platform_reply_delivery(
     text delivery, persist receipts, and use one failure message for upload
     failures.
     """
+    if publication_gate is not None:
+        from nullion.turn_dispatch_graph import TurnPublicationRevoked
+        try:
+            if not await publication_gate.wait():
+                raise TurnPublicationRevoked()
+            return await execute_platform_reply_delivery(
+                reply, channel=channel, target_id=target_id, principal_id=principal_id,
+                tool_results=tool_results,
+                delivery_contract=delivery_contract, artifact_paths=artifact_paths,
+                request_id=request_id, message_id=message_id, reply_already_sent=reply_already_sent,
+                send_text=publication_gate.guard(send_text),
+                send_attachments=publication_gate.guard(send_attachments) if send_attachments else None,
+                finalize_stream=publication_gate.guard(finalize_stream) if finalize_stream else None,
+            )
+        except TurnPublicationRevoked:
+            delivery = prepare_reply_for_platform_delivery("", allow_attachments=False)
+            receipt = build_platform_delivery_receipt(channel=channel, target_id=target_id,
+                delivery=delivery, transport_ok=False, request_id=request_id,
+                message_id=message_id, error="turn_superseded")
+            return PlatformDeliveryResult(delivery=delivery, receipt=receipt)
     delivery = prepare_reply_for_platform_delivery(
         reply,
         principal_id=principal_id,
         delivery_contract=delivery_contract,
         artifact_paths=artifact_paths,
+        tool_results=tool_results,
     )
     target = None if target_id is None else str(target_id)
     if delivery.text and not delivery.attachments and finalize_stream is not None:
         try:
             # The adapter owns the transport acknowledgement. Reuse its existing
             # streamed message only after the final text is confirmed delivered.
-            stream_delivered = bool(await finalize_stream(delivery.text))
+            stream_delivered = bool(await retry_messaging_delivery_operation(
+                lambda: finalize_stream(delivery.text), attempts=1, replay_safe=False))
+        except UnconfirmedDelivery as exc:
+            receipt = record_unconfirmed_delivery(delivery, exc, channel=channel,
+                target_id=target, request_id=request_id)
+            return PlatformDeliveryResult(delivery=delivery, receipt=receipt, unconfirmed=exc)
         except Exception:
             logger.debug("Stream finalization failed; falling back to final delivery", exc_info=True)
             stream_delivered = False
@@ -2233,6 +2266,16 @@ async def execute_platform_reply_delivery(
         if send_attachments is not None:
             try:
                 uploaded = bool(await send_attachments(delivery.text, delivery.attachments))
+            except UnconfirmedDelivery as exc:
+                receipt = record_unconfirmed_delivery(delivery, exc, channel=channel,
+                    target_id=target, request_id=request_id)
+                try:
+                    exc.notice_attempted = True
+                    exc.notice_sent = await send_text(exc.notice()) is not False
+                except Exception:
+                    pass
+                return PlatformDeliveryResult(delivery=delivery, receipt=receipt,
+                    text_sent=exc.notice_sent, fallback_text_sent=exc.notice_sent, unconfirmed=exc)
             except Exception:
                 uploaded = False
         if uploaded:
@@ -2272,7 +2315,12 @@ async def execute_platform_reply_delivery(
 
     text = delivery.text or ""
     try:
-        text_ok = bool(await send_text(text))
+        text_ok = bool(await retry_messaging_delivery_operation(
+            lambda: send_text(text), attempts=1, replay_safe=False))
+    except UnconfirmedDelivery as exc:
+        receipt = record_unconfirmed_delivery(delivery, exc, channel=channel,
+            target_id=target, request_id=request_id)
+        return PlatformDeliveryResult(delivery=delivery, receipt=receipt, unconfirmed=exc)
     except Exception:
         text_ok = False
     receipt = build_platform_delivery_receipt(
@@ -2329,6 +2377,8 @@ async def retry_messaging_delivery_operation(
     *,
     attempts: int = _MESSAGING_ATTACHMENT_UPLOAD_ATTEMPTS,
     retry_delay_seconds: float = _MESSAGING_ATTACHMENT_UPLOAD_RETRY_DELAY_SECONDS,
+    replay_safe: bool = True,
+    retry_policy=None,
 ) -> object:
     last_exc: Exception | None = None
     for attempt in range(max(1, attempts)):
@@ -2338,8 +2388,14 @@ async def retry_messaging_delivery_operation(
                 return await result
             return result
         except Exception as exc:
+            if isinstance(exc, UnconfirmedDelivery):
+                raise
+            safety = (retry_policy or send_error_replay_safety)(exc) if not replay_safe else None
+            if not replay_safe and safety not in {'retry', 'rejected'}:
+                raise UnconfirmedDelivery() from exc
             last_exc = exc
-            if attempt >= attempts - 1 or not is_retryable_messaging_delivery_error(exc):
+            if attempt >= attempts - 1 or not (safety == 'retry' or
+                    replay_safe and is_retryable_messaging_delivery_error(exc)):
                 break
             await asyncio.sleep(
                 _messaging_delivery_retry_delay_seconds(exc, retry_delay_seconds * (attempt + 1))
@@ -2438,10 +2494,16 @@ async def send_with_plain_text_fallback(
     try:
         await send_formatted(formatted_text or "")
         return
-    except Exception:
-        logger.warning("%s formatted message delivery failed; retrying as plain text.", platform, exc_info=True)
+    except UnconfirmedDelivery:
+        raise
+    except Exception as exc:
+        if send_error_replay_safety(exc) == 'unknown':
+            raise UnconfirmedDelivery() from exc
+        logger.warning("%s formatted message was not accepted; retrying as plain text.", platform, exc_info=True)
     fallback_sender = send_plain or send_formatted
-    await fallback_sender(platform_plain_format_fallback_text(platform, plain_text or ""))
+    await retry_messaging_delivery_operation(
+        lambda: fallback_sender(platform_plain_format_fallback_text(platform, plain_text or "")),
+        attempts=1, replay_safe=False)
 
 
 def save_messaging_attachment(

@@ -228,6 +228,24 @@ def test_chat_verbose_command_uses_activity_on_off_per_session(tmp_path, monkeyp
     assert _handle_verbose_command_for_chat(runtime, "/verbos off", chat_id="chat-1") is None
 
 
+@pytest.mark.parametrize('chat_id',['web:one','telegram:one','slack:one','discord:one'])
+@pytest.mark.parametrize('setting,global_enabled',[(False,False),(False,True),(True,False),(None,False),(None,True)])
+def test_progress_callback_cannot_override_activity_visibility(monkeypatch,chat_id,setting,global_enabled):
+    from nullion import chat_operator
+    def history(*args):
+        raise AssertionError('Indexed session settings must not scan history')
+    runtime=SimpleNamespace(store=SimpleNamespace(
+        get_conversation_session_setting=lambda conversation,key:setting,
+        list_conversation_events=history))
+    monkeypatch.setattr(chat_operator,'activity_trace_enabled',lambda:global_enabled)
+    expected=global_enabled if setting is None else setting
+    for callback in (None,lambda *args,**kwargs:None):
+        assert chat_operator._should_append_activity_trace_for_chat(runtime,chat_id=chat_id,
+            activity_callback=callback) is expected
+        assert not chat_operator._should_append_activity_trace_for_chat(runtime,chat_id=chat_id,
+            activity_callback=callback,append_activity_trace=False)
+
+
 def test_telegram_verbose_card_uses_activity_on_off() -> None:
     source = Path("src/nullion/telegram_app.py").read_text(encoding="utf-8")
 
@@ -1065,10 +1083,12 @@ def test_tool_activity_details_summarize_status_output_and_safe_untrusted_metada
 
     detail = format_tool_activity_detail(results)
 
-    assert "✓ file_write — report.txt" in detail
+    assert "✓ file_write" in detail
+    assert "report.txt" not in detail
     assert "⊘ web_fetch — denied" in detail
-    assert "⊗ shell — command failed" in detail
-    assert "→ custom — long text detail" in detail
+    assert "⊗ shell — failed" in detail
+    assert "→ custom — running" in detail
+    assert "long text detail" not in detail
     assert "✓ run_cron — background run started" in detail
     assert "web_search" in detail
     assert format_tool_activity_line({"tool_name": "mystery", "status": "weird", "output": {}}) == "  • mystery — weird"
@@ -1114,3 +1134,20 @@ def test_run_activity_trace_and_append_reply_cover_tools_skills_mini_agents_and_
     assert append_activity_trace_to_reply("Reply", enabled=False, tool_results=[ToolResult("1", "x", "completed", {})]) == "Reply"
     assert append_activity_trace_to_reply("Reply", enabled=True, skill_uses=["Skill"]).startswith("Reply\n\nActivity")
     assert append_activity_trace_to_reply("", enabled=True, suspended_for_approval=True).startswith("Activity")
+
+
+@pytest.mark.parametrize("tool_name", ["pdf_create", "file_read", "file_write", "run_cron",
+    "list_crons", "email_attachment_read", "connector_request", "browser_navigate", "custom"])
+@pytest.mark.parametrize("private_text", ["/Users/private/artifacts/secret.pdf",
+    "Internal repair: recreate the current artifact", "内部の修復指示と秘密のファイル名"])
+def test_activity_never_delivers_tool_payloads_or_internal_errors(tool_name, private_text):
+    for status, error in (("completed", None), ("failed", private_text)):
+        output = dict.fromkeys(("reason", "summary", "message", "path", "url", "filename",
+                                "name", "cron_delivery_status"), private_text)
+        result = ToolResult("private", tool_name, status, output, error=error)
+        rendered = format_tool_activity_detail([result])
+        assert tool_name in rendered
+        assert private_text not in rendered
+        assert "secret.pdf" not in rendered
+        # Full evidence is preserved for diagnosis; only the display is narrowed.
+        assert result.output == output and result.error == error

@@ -87,6 +87,27 @@ def telegram_media_read_timeout_seconds() -> float:
     )
 
 
+def telegram_document_timeout_kwargs() -> dict[str, float | int]:
+    timeouts = telegram_request_timeout_kwargs()
+    return {"connect_timeout": timeouts["connect_timeout"], "pool_timeout": timeouts["pool_timeout"],
+        "read_timeout": telegram_media_read_timeout_seconds(),
+        "write_timeout": timeouts["media_write_timeout"]}
+
+
+def telegram_send_error_replay_safety(exc):
+    """Normalize the Telegram SDK's typed rejection contract at its adapter."""
+    from nullion.delivery_acknowledgement import send_error_replay_safety
+    try:
+        from telegram.error import RetryAfter, BadRequest, Forbidden, InvalidToken
+    except ImportError:
+        return send_error_replay_safety(exc)
+    if isinstance(exc, RetryAfter):
+        return 'retry'
+    if isinstance(exc, (BadRequest, Forbidden, InvalidToken)):
+        return 'rejected'
+    return send_error_replay_safety(exc)
+
+
 def telegram_bot_api_endpoint_kwargs() -> dict[str, str | bool]:
     """Return Bot API endpoint overrides for hosted or local Telegram transport."""
 

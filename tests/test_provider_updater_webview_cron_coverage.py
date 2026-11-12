@@ -295,11 +295,16 @@ def test_cron_tool_handlers_cover_create_list_delete_toggle_and_run(tmp_path, mo
     assert "mini_agent_dispatch" not in background_owned.output
     assert "planner_status_owned_by_background" not in background_owned.output
     assert str(background_owned.output["task_group_id"]).startswith("manual-cron-")
-    assert "⏰ **MANUAL SCHEDULED TASK RUN" in str(background_owned.output["progress_status_text"])
+    assert "**MANUAL SCHEDULED TASK RUN" in str(background_owned.output["progress_status_text"])
     assert background_owned.output.get("foreground_reply_suppressed") is not True
 
     failed_run = _build_run_cron_handler(lambda job: {"reached_iteration_limit": True, "text": "stopped"})
     assert failed_run(invoke("run_cron", {"id": cron_id})).status == "failed"
+
+    # This fake reported a deferred run without starting a worker. Complete
+    # its owned run stamp before testing another manual invocation.
+    from nullion.cron_scheduler_state import save_result
+    save_result(crons._runtime_db_path(), crons.get_cron(cron_id), "fixture deferred run complete")
 
     raw_payload_failed = _build_run_cron_handler(
         lambda job: {
@@ -384,6 +389,7 @@ def test_cron_tool_handlers_cover_create_list_delete_toggle_and_run(tmp_path, mo
     assert delete(invoke("delete_cron", {})).error == "id is required"
     assert delete(invoke("delete_cron", {"id": second.output["id"]})).status == "completed"
     assert delete(invoke("delete_cron", {"id": "missing"})).error == "No cron found with id='missing'"
+
 
 
 def test_create_cron_updates_existing_same_delivery_name_instead_of_duplicating(tmp_path, monkeypatch,registered_cron_operator) -> None:
@@ -816,9 +822,16 @@ def test_messaging_runtime_manual_cron_blocks_raw_connector_payload_before_platf
     assert result.output["delivery_status"] == "deferred"
     manual_cron_workers()
     assert len(sent) == 1
-    assert "source checks did not produce a complete report" in sent[0]
+    assert "source checks" in sent[0]
     assert "msg-1" not in sent[0] and "Deadline" not in sent[0]
     assert "structured item" not in sent[0]
+    from nullion.cron_delivery import cron_conversation_id
+    from nullion.runtime_persistence import load_runtime_store
+    runs = load_runtime_store(checkpoint).list_recent_conversation_events(
+        cron_conversation_id(job, channel, target), event_type='conversation.cron_run', limit=10)
+    terminal = next(row for row in runs if row.get('cron_id') == job.id)
+    assert terminal['report_failed'] and terminal['response_fulfilled'] is False
+    assert terminal['reason'] == 'cron_report_incomplete'
 
 
 @pytest.mark.parametrize(
@@ -903,9 +916,10 @@ def test_messaging_runtime_manual_cron_can_send_non_telegram_platform_delivery(
     manual_cron_workers()
     assert len(sent) == 1
     assert sent[0][0] == channel
-    assert "⏰ **MANUAL SCHEDULED TASK RUN: Platform delivery cron**" in sent[0][1]
+    assert "**MANUAL SCHEDULED TASK RUN: Platform delivery cron**" in sent[0][1]
     assert sent[0][1].count("Platform delivery cron") == 1
     assert "Here is the concise cron report." in sent[0][1]
+
 
 
 def test_telegram_entrypoint_exits_without_polling_when_chat_disabled(tmp_path) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from nullion.preferences import current_presentation_prompt
+
 import asyncio
 from collections import deque
 from contextlib import suppress
@@ -42,6 +44,14 @@ from nullion.task_queue import TaskResult
 from nullion.workspace_storage import workspace_storage_roots_for_principal
 
 logger = logging.getLogger(__name__)
+
+
+def _task_tool_flow_context(config: Any) -> dict[str, Any]:
+    from nullion.response_fulfillment_contract import normalize_artifact_media_required_extensions
+    metadata = dict(getattr(config.task, "metadata", {}) or {})
+    required = metadata.get("required_embedded_media_extensions", metadata.get("embedded_media_artifact_extensions", ()))
+    return {**metadata, "browser_session_scope": config.task.task_id,
+            "required_embedded_media_extensions": normalize_artifact_media_required_extensions(required)}
 
 
 class DeepAgentUserInputRequested(RuntimeError):
@@ -107,6 +117,51 @@ class DeepAgentMiniAgentRunner:
     """Run a Nullion mini-agent task through the optional deepagents harness."""
 
     async def run(
+        self, config, **kwargs,
+    ) -> TaskResult:
+        from datetime import datetime, timezone
+        from nullion.workflow_reasoning import action_reasoning_scope, assess_action, action_review_evidence
+        from nullion.tools import ToolResult
+        from nullion.tools import tool_execution_cancellation_scope
+        from threading import Event
+        from time import monotonic
+        evidence = []
+        invocations = {}
+        admitted_action_ids = set()
+        cancelled = Event()
+
+        def preflight(spec, invocation):
+            if invocation.principal_id != config.task.principal_id:
+                return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                    {"reason": "request_owner_mismatch", "executed": False})
+            invocations[invocation.invocation_id] = (spec, invocation)
+            decision = assess_action(model_client=kwargs["anthropic_client"],
+                request=config.task.description, context={"dependency_context": config.context_in},
+                invocation=invocation, spec=spec, evidence=action_review_evidence(evidence), retained_results=evidence,
+                now=datetime.now(timezone.utc).isoformat())
+            if decision.decision == "proceed":
+                admitted_action_ids.add(invocation.invocation_id)
+                return None
+            from nullion.tool_repair_contract import plan_revision_recovery
+            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
+                {"reason": "request_plan_conflict", "executed": False, "issues": list(decision.issues),
+                 "review_decision": decision.decision,
+                 "clarification": {"question": decision.question, "options": list(decision.options)}
+                    if decision.decision == "clarify" else None,
+                 "retryable": decision.error is None and decision.decision == "revise",
+                 **({"recovery": plan_revision_recovery(invocation.tool_name)}
+                    if decision.error is None and decision.decision == "revise" else {})})
+
+        try:
+            with action_reasoning_scope(preflight), tool_execution_cancellation_scope(cancelled.is_set):
+                return await self._run(config, **kwargs, tool_results=evidence, action_invocations=invocations,
+                    admitted_action_ids=admitted_action_ids,
+                    cancelled_event=cancelled, review_deadline=monotonic() + config.timeout_s)
+        finally:
+            cancelled.set()
+            await _run_tool_registry_cleanup(kwargs["tool_registry"], scope_id=config.task.task_id)
+
+    async def _run(
         self,
         config,
         *,
@@ -116,8 +171,12 @@ class DeepAgentMiniAgentRunner:
         approval_store: Any,
         context_bus: Any,
         progress_queue: asyncio.Queue,
+        tool_results: list[Any],
+        action_invocations: dict,
+        admitted_action_ids: set[str],
+        cancelled_event: Any,
+        review_deadline: float,
     ) -> TaskResult:
-        del approval_store
         task = config.task
         await _emit_progress(
             progress_queue,
@@ -125,7 +184,6 @@ class DeepAgentMiniAgentRunner:
             kind="task_started",
             message=task.title,
         )
-        tool_results: list[Any] = []
         try:
             config = _config_with_resolved_context_in(config, context_bus)
             artifact_preflight = await _artifact_task_fallback_from_tool_evidence(
@@ -145,6 +203,7 @@ class DeepAgentMiniAgentRunner:
                     context_bus=context_bus,
                     progress_queue=progress_queue,
                     tool_results=tool_results,
+                    admitted_action_ids=admitted_action_ids,
                 )
                 guarded_run_coro = _preserve_inner_timeout(run_coro)
                 if _is_scheduled_background_config(config):
@@ -170,6 +229,7 @@ class DeepAgentMiniAgentRunner:
                 ),
             )
         except DeepAgentInnerTimeoutError as exc:
+            cancelled_event.set()
             logger.warning("DeepAgent mini-agent %s inner operation timed out: %s", config.agent_id, exc)
             artifact_fallback = await _artifact_task_fallback_from_tool_evidence(
                 config,
@@ -195,6 +255,7 @@ class DeepAgentMiniAgentRunner:
                         error=str(exc) or "A mini-agent operation timed out before the outer task budget was reached.",
                     )
         except asyncio.TimeoutError:
+            cancelled_event.set()
             logger.warning("DeepAgent mini-agent %s timed out after %.0fs", config.agent_id, config.timeout_s)
             artifact_fallback = await _artifact_task_fallback_from_tool_evidence(
                 config,
@@ -220,11 +281,19 @@ class DeepAgentMiniAgentRunner:
                         error=f"Timed out after {config.timeout_s:.0f}s",
                     )
         except Exception as exc:
+            cancelled_event.set()
             logger.warning("DeepAgent mini-agent %s failed: %s", config.agent_id, exc, exc_info=True)
             result = TaskResult(task_id=task.task_id, status="failure", error=str(exc))
-        finally:
-            await _run_tool_registry_cleanup(tool_registry, scope_id=task.task_id)
 
+        report_layout = {}
+        if _is_scheduled_background_config(config) and isinstance(result.output, str):
+            from nullion.chat_text import render_report_envelope
+            result.output = render_report_envelope(result.output, diagnostics=report_layout)
+            if report_layout: result.report_presentation = report_layout
+
+        from nullion.tool_repair_contract import resolve_plan_revisions
+        for row in tool_results:
+            resolve_plan_revisions(tool_results, row, preflight_proceeded=row.invocation_id in admitted_action_ids)
         contract_failure = _artifact_contract_failure_for_task_result(task, result)
         if contract_failure is not None:
             result = TaskResult(
@@ -233,6 +302,103 @@ class DeepAgentMiniAgentRunner:
                 error=contract_failure,
                 context_out=getattr(result, "context_out", None),
             )
+
+        if tool_results and result.status in {"success", "failure"} and not result.resume_token and contract_failure is None:
+            from time import monotonic
+            from nullion.agent_orchestrator import AgentOrchestrator, TurnResult
+            from nullion.agent_orchestrator import _tool_invocation_signature
+            from nullion.workflow_reasoning import action_reasoning_scope, durable_action_receipt
+            # The shared graph owns any further repair and its action preflight;
+            # do not run the delegated scope's preflight a second time.
+            completed_actions = {}
+            for row in tool_results:
+                record = action_invocations.get(row.invocation_id)
+                if record and durable_action_receipt(record[0], row):
+                    completed_actions[_tool_invocation_signature(tool_name=row.tool_name, tool_input=record[1].arguments)] = row
+            review_remaining = review_deadline - monotonic()
+            from nullion.tool_repair_contract import exhausted_plan_revision_tool
+            if exhausted_plan_revision_tool(tool_results):
+                from nullion.agent_orchestrator import _CompletionReviewDecision, _completion_review_open_task_reply
+                notice = _completion_review_open_task_reply(_CompletionReviewDecision('blocked',
+                    runtime_failure_code='preflight_revision_stalled'))
+                reviewed = TurnResult(task.task_id, notice, list(tool_results),
+                    response_fulfilled=False, response_presentation={
+                        'terminal_recovery_code':'preflight_revision_stalled', 'recovery_exhausted':True})
+                result.error = notice
+            elif cancelled_event.is_set() or review_remaining <= 0:
+                # Review cannot revoke the task's already completed output.
+                result.report_presentation = {**dict(getattr(result, 'report_presentation', None) or {}),
+                    'outcome_review_role':'helper','outcome_review_status':'unavailable'}
+                reviewed = None
+            else:
+                try:
+                    with action_reasoning_scope(None):
+                        reviewed = await asyncio.wait_for(asyncio.to_thread(AgentOrchestrator(model_client=anthropic_client).review_turn_result,
+                    TurnResult(task.task_id, result.output or result.error, list(tool_results), artifacts=list(result.artifacts),
+                        completed_action_results=completed_actions, response_presentation=report_layout),
+                    conversation_id=task.conversation_id, principal_id=task.principal_id,
+                    user_message=task.description, conversation_history=[{"role": "user", "content": [{"type": "text",
+                        "text": json.dumps({"dependency_context": config.context_in}, ensure_ascii=False, default=str)}]}],
+                    tool_registry=tool_registry, policy_store=policy_store, approval_store=approval_store,
+                    tool_flow_context=_task_tool_flow_context(config),
+                    cancellation_checker=cancelled_event.is_set), timeout=min(60.0, review_remaining))
+                except asyncio.TimeoutError:
+                    cancelled_event.set()
+                    reviewed = None
+                    logger.warning('Outcome helper timed out for task %s; preserving producer result',task.task_id)
+                    result.report_presentation = {**dict(getattr(result, 'report_presentation', None) or {}),
+                        'outcome_review_role':'helper','outcome_review_status':'unavailable',
+                        'outcome_review_timeout':True}
+            if reviewed is not None:
+                tool_results[:] = reviewed.tool_results
+            if reviewed is not None and reviewed.suspended_for_approval:
+                result = TaskResult(task_id=task.task_id, status="partial", output=reviewed.final_text,
+                    resume_token=_resume_token_for_pause(config, reason="approval", payload={"approval_id": reviewed.approval_id}))
+            elif (reviewed is not None and reviewed.response_fulfilled is None
+                    and result.status == "failure"):
+                # An unavailable quality grader cannot repair an independent
+                # execution, provenance, validation or timeout failure.
+                reviewed.response_fulfilled = False
+                reviewed.artifacts = []
+                reviewed.final_text = reviewed.completion_failure_reply = result.error or reviewed.final_text
+            elif reviewed is not None and reviewed.response_fulfilled is False:
+                receipt = reviewed.outcome_review_receipt
+                needs_input = (getattr(receipt, "disposition", None) == "needs_user_input"
+                    and getattr(config, "can_request_user_input", True) and not _is_scheduled_background_config(config))
+                result = TaskResult(task_id=task.task_id, status="partial" if needs_input else "failure",
+                    output=reviewed.final_text if needs_input else None, error=None if needs_input else result.error or reviewed.final_text,
+                    resume_token=_resume_token_for_pause(config, reason="user_input", payload={"question": reviewed.final_text}) if needs_input else {})
+            elif reviewed is not None:
+                result = TaskResult(task_id=task.task_id, status="success", output=reviewed.final_text,
+                    artifacts=list(reviewed.artifacts), context_out=_context_out_for_task(config,
+                        output_text=reviewed.final_text or "", deliverable_artifacts=reviewed.artifacts,
+                        tool_results=tool_results, context_in=config.context_in),
+                    report_presentation=dict(reviewed.response_presentation or {}))
+            result.verified_turn_result = reviewed
+
+        from nullion.request_delivery_requirements import required_action_receipt_delivery
+        if getattr(result, 'verified_turn_result', None) is None and required_action_receipt_delivery(tool_results):
+            # If the helper never returned, retain the existing native receipt
+            # fallback rather than treating deferred copy as verified.
+            if isinstance(result.output, str):
+                result.output = sanitize_user_visible_reply(user_message=task.description, reply=result.output,
+                    tool_results=tool_results, source='deep-agent') or result.output
+            elif isinstance(result.error, str):
+                result.error = sanitize_user_visible_reply(user_message=task.description, reply=result.error,
+                    tool_results=tool_results, source='deep-agent') or result.error
+
+        # Synthesis-only scheduled steps already have a dedicated dependency
+        # review. Keep that owner when no tool workflow entered the shared gate.
+        if not tool_results and result.status == "success" and _is_scheduled_background_config(config):
+            decision = await _scheduled_task_completion_decision(config, output_text=result.output or "",
+                tool_results=[], model_client=anthropic_client,
+                report_presentation=result.report_presentation)
+            if decision is not None and decision['status']=='success':
+                result.output = decision['answer']
+                result.report_presentation.update(decision.get('report_presentation') or {})
+            result.report_presentation = {**dict(getattr(result,'report_presentation',None) or {}),
+                'outcome_review_role':'helper','outcome_review_status':(
+                    'unavailable' if decision is None else 'complete' if decision['status']=='success' else 'advice')}
 
         if result.status == "success" and task.context_key_out and result.context_out is not None:
             context_bus.publish(
@@ -261,6 +427,7 @@ class DeepAgentMiniAgentRunner:
         context_bus: Any,
         progress_queue: asyncio.Queue,
         tool_results: list[Any] | None = None,
+        admitted_action_ids: set[str] | None = None,
     ) -> TaskResult:
         try:
             from deepagents import create_deep_agent
@@ -282,7 +449,13 @@ class DeepAgentMiniAgentRunner:
 
         def record_tool_result(result: Any) -> None:
             tool_results.append(result)
+            from nullion.tool_repair_contract import resolve_plan_revisions
+            resolve_plan_revisions(tool_results, result,
+                preflight_proceeded=result.invocation_id in (admitted_action_ids or ()))
             _emit_tool_progress(progress_queue, config=config, result=result)
+            from nullion.tool_repair_contract import exhausted_plan_revision_tool
+            if exhausted_plan_revision_tool(tool_results):
+                raise DeepAgentStalledLoopError('preflight_revision_stalled: proposals changed without admitted execution')
 
         tools = [
             *nullion_tools_as_langchain_tools(
@@ -292,6 +465,7 @@ class DeepAgentMiniAgentRunner:
                 cleanup_scope=task.task_id,
                 policy_store=policy_store,
                 tool_result_callback=record_tool_result,
+                tool_flow_context=_task_tool_flow_context(config),
             ),
             *_deep_agent_meta_tools(config, progress_queue=progress_queue),
         ]
@@ -365,6 +539,7 @@ class DeepAgentMiniAgentRunner:
             reply=output_text,
             tool_results=tool_results,
             source="deep-agent",
+            defer_action_receipts=True,
         ) or output_text
         if is_safe_raw_tool_payload_replacement_reply(reply=output_text, tool_results=tool_results):
             try:
@@ -485,26 +660,6 @@ class DeepAgentMiniAgentRunner:
             tool_results=tool_results,
             context_in=context_in,
         )
-        completion_decision = await _scheduled_task_completion_decision(
-            config,
-            output_text=output_text,
-            tool_results=tool_results,
-            model_client=anthropic_client,
-        )
-        if completion_decision is not None and completion_decision.get("status") != "success":
-            reason = str(
-                completion_decision.get("answer")
-                or "The scheduled task could not verify enough evidence to complete this step."
-            ).strip()
-            return TaskResult(
-                task_id=task.task_id,
-                status="failure",
-                error=reason,
-            )
-        if completion_decision is not None:
-            answer = str(completion_decision.get("answer") or "").strip()
-            if answer:
-                output_text = answer
         return TaskResult(
             task_id=task.task_id,
             status="success",
@@ -594,6 +749,7 @@ async def _persist_context_handoff_from_tool_evidence(
                 "content": json.dumps(payload, ensure_ascii=False, indent=2, default=str),
             },
             capsule_id=task.task_id,
+            flow_context=_task_tool_flow_context(config),
         ),
     )
     tool_results.append(result)
@@ -763,6 +919,7 @@ async def _artifact_task_fallback_from_tool_evidence(
                     "output_path": str(output_path),
                 },
                 capsule_id=config.task.task_id,
+                flow_context=_task_tool_flow_context(config),
             ),
     )
     tool_results.append(result)
@@ -871,6 +1028,7 @@ async def _retry_spreadsheet_after_remote_image_failure(
             config.task.principal_id,
             retry_arguments,
             capsule_id=config.task.task_id,
+            flow_context=_task_tool_flow_context(config),
         ),
     )
     tool_results.append(retry_result)
@@ -945,6 +1103,7 @@ async def _collect_remote_spreadsheet_images(
                     "timeout_seconds": 30,
                 },
                 capsule_id=config.task.task_id,
+                flow_context=_task_tool_flow_context(config),
             ),
         )
         tool_results.append(result)
@@ -1909,6 +2068,7 @@ async def _collect_browser_item_images(
                     "timeout_seconds": 30,
                 },
                 capsule_id=config.task.task_id,
+                flow_context=_task_tool_flow_context(config),
             ),
         )
         tool_results.append(result)
@@ -2043,6 +2203,8 @@ def _artifact_fallback_file_stem(task: Any) -> str:
 
 
 def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = None) -> str:
+    from nullion.workflow_reasoning import WORKFLOW_REASONING_INSTRUCTION
+    from datetime import datetime, timezone
     task = config.task
     artifact_root = _artifact_root_for_prompt(task)
     tool_inventory = _scoped_tool_inventory_for_prompt(task, tool_registry=tool_registry)
@@ -2149,7 +2311,7 @@ def _system_prompt_for_task(config, *, context_in: Any, tool_registry: Any = Non
             "\n- Compare artifact claims against dependency context and tool evidence; fail if the artifact "
             "contains unsupported options, counts, or claims from inconclusive upstream evidence."
         )
-    return prompt
+    return WORKFLOW_REASONING_INSTRUCTION + "\nRuntime UTC: " + datetime.now(timezone.utc).isoformat() + "\n\n" + prompt + "\n\n" + current_presentation_prompt()
 
 
 def _scoped_tool_inventory_for_prompt(task: Any, *, tool_registry: Any) -> str:
@@ -3033,6 +3195,23 @@ def _relocate_external_artifact_paths_for_task(config, artifact_paths: list[str]
         logger.debug("Could not resolve artifact root for external artifact relocation", exc_info=True)
         return list(dict.fromkeys(artifact_paths))
 
+    # A relocated bundle must retain relative links as well as public names.
+    # Only selected external files are copied; never export their parent tree.
+    external_sources = []
+    for raw in artifact_paths:
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            source = Path(raw).expanduser().resolve()
+            if source.is_file() and artifact_descriptor_for_path(source, artifact_root=artifact_root) is None:
+                external_sources.append(source)
+        except Exception:
+            continue  # Preserve the existing per-file failure isolation below.
+    try:
+        common_root = Path(os.path.commonpath([str(source.parent) for source in external_sources]))
+    except ValueError:
+        common_root = None
+    export_root = None
     relocated: list[str] = []
     for raw_path in artifact_paths:
         if not isinstance(raw_path, str) or not raw_path:
@@ -3053,12 +3232,17 @@ def _relocate_external_artifact_paths_for_task(config, artifact_paths: list[str]
         if not resolved_source.is_file():
             continue
         suffix = resolved_source.suffix or ".bin"
-        target_path = artifact_path_for_generated_workspace_file(
-            principal_id=task.principal_id,
-            suffix=suffix,
-            stem=resolved_source.stem or "artifact",
-        )
         try:
+            if export_root is None or common_root is None:
+                allocated = artifact_path_for_generated_workspace_file(
+                    principal_id=task.principal_id, suffix=suffix,
+                    stem=resolved_source.stem or 'artifact',
+                    filename=resolved_source.name if resolved_source.suffix else resolved_source.name + suffix)
+                export_root = allocated.parent
+            relative = resolved_source.relative_to(common_root) if common_root is not None else Path(resolved_source.name)
+            if not relative.suffix:
+                relative = relative.with_suffix(suffix)
+            target_path = export_root / relative
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(resolved_source, target_path)
             target_descriptor = artifact_descriptor_for_path(target_path, artifact_root=artifact_root)
@@ -3335,13 +3519,14 @@ async def _scheduled_task_completion_decision(
     output_text: str,
     tool_results: list[Any],
     model_client: Any,
-) -> dict[str, str] | None:
-    """Validate scheduled mini-agent completion before publishing dependency context."""
+    report_presentation: dict | None = None,
+) -> dict[str, Any] | None:
+    """Assist a synthesis step without taking ownership of its task status."""
     if not _is_scheduled_background_config(config):
         return None
     create = getattr(model_client, "create", None)
     if create is None or not _model_client_can_make_evidence_fallback_decision(model_client):
-        return {"status": "failure", "answer": "The required completion could not be verified because the model is unavailable."}
+        return None
     task = getattr(config, "task", None)
     evidence = _tool_evidence_payload(tool_results)
     system_prompt = (
@@ -3349,16 +3534,23 @@ async def _scheduled_task_completion_decision(
         "Use only the assigned task, dependency context, final answer, and verified tool-result evidence. "
         "Output only JSON with this schema: "
         '{"status":"success"|"failure","answer":"string"}. '
-        "Set status=failure when required evidence, data, side effects, or verification are insufficient. "
-        "Reasoning and synthesis steps must also satisfy every assigned requirement. Unavailable optional "
-        "fields may be disclosed, but unfinished required work cannot become success by summarizing a subset "
-        "of findings or adding caveats. Keep insufficient findings internal and set status=failure. "
+        "Act as a helper improving the producer's result. Use status=success for a grounded improved answer, "
+        "or status=failure for internal advice when you cannot improve it. This is not authority to revoke "
+        "the task result, hide usable findings, grant permission, or certify an unperformed action. "
+        "Preserve useful findings, requested provenance and concrete limitations. "
         "External platform delivery is performed by Nullion after this step; do not require proof that a "
         "message, report, or artifact was already sent unless the assigned task had an available side-effect "
         "tool and the final answer claims that tool-side effect already happened. "
         "For success, keep answer as the concise user-facing task result. "
         "Do not mention internal validation, tools, or orchestration."
     )
+    structured_report = (report_presentation or {}).get('report_presentation') in {'structured', 'content_fallback'}
+    if structured_report:
+        from nullion.chat_text import report_presentation_instructions
+        system_prompt += (' The producer supplied a shared report. To improve it, include an optional '
+            'report_message using that same contract; answer is only a brief fallback. Preserve the '
+            'current compact or detailed ownership of supporting explanations. '
+            + report_presentation_instructions())
     user_payload = {
         "task": str(getattr(task, "description", "") or getattr(task, "title", "") or ""),
         "allowed_tools": list(getattr(task, "allowed_tools", ()) or ()),
@@ -3366,6 +3558,11 @@ async def _scheduled_task_completion_decision(
         "final_answer": str(output_text or ""),
         "tool_evidence": evidence,
     }
+    if structured_report:
+        user_payload['report_presentation'] = report_presentation
+        from nullion.chat_text import report_delivery_context
+        user_payload['report_delivery_context'] = report_delivery_context(
+            artifact_delivery_required=_task_requires_user_file_delivery(task))
     create_kwargs = {
         "messages": [
             {
@@ -3374,8 +3571,8 @@ async def _scheduled_task_completion_decision(
             }
         ],
         "tools": [],
-        "max_tokens": 700,
-        "system": system_prompt,
+        "max_tokens": min(4000, max(700, 400 + len(output_text) // 2)) if structured_report else 700,
+        "system": system_prompt + "\n\n" + current_presentation_prompt(),
     }
     try:
         response = await asyncio.wait_for(
@@ -3384,15 +3581,30 @@ async def _scheduled_task_completion_decision(
         )
     except Exception:
         logger.warning(
-            "DeepAgent scheduled completion validation failed; withholding unverified result "
+            "DeepAgent scheduled outcome helper unavailable; preserving producer result "
             "agent_id=%s task_id=%s",
             getattr(config, "agent_id", ""),
             str(getattr(task, "task_id", "") or ""),
             exc_info=True,
         )
-        return {"status": "failure", "answer": "The model could not verify that all required work finished."}
-    return _parse_evidence_fallback_decision(_extract_response_text(response)) or {
-        "status": "failure", "answer": "The required completion could not be verified."}
+        return None
+    raw = _extract_response_text(response)
+    decision = _parse_evidence_fallback_decision(raw)
+    if structured_report and decision is not None and decision['status'] == 'success':
+        # A plain editorial rewrite cannot discard the producer's typed report
+        # or expand its optional context back into the compact answer.
+        decision['answer'] = output_text
+        try:
+            body = json.loads(raw)
+        except (ValueError, TypeError):
+            body = None
+        if isinstance(body, dict) and isinstance(body.get('report_message'), dict):
+            from nullion.chat_text import render_report_message
+            layout = {}
+            answer = render_report_message(body['report_message'], diagnostics=layout, fallback=output_text)
+            if layout.get('report_presentation') == 'structured':
+                decision.update(answer=answer, report_presentation=layout)
+    return decision
 
 
 async def _fallback_answer_from_tool_evidence(
@@ -3436,7 +3648,7 @@ async def _fallback_answer_from_tool_evidence(
         ],
         "tools": [],
         "max_tokens": 900,
-        "system": system_prompt,
+        "system": system_prompt + "\n\n" + current_presentation_prompt(),
     }
     try:
         response = await asyncio.wait_for(

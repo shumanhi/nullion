@@ -1,4 +1,5 @@
 """Real scheduler, agent runner, SQLite, delivery and UI; only provider is fake."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 import os,time,threading,json
 from datetime import datetime,timedelta,timezone
 import pytest
@@ -12,6 +13,10 @@ def test_parallel_runs_deliver_and_plain_chat_stays_fast(tmp_path,monkeypatch,re
     class Provider:
         def __init__(self):self.entered=[];self.gate=threading.Event();self.lock=threading.Lock();self.local=threading.local()
         def create(self,**kw):
+            # This fixture asks for arithmetic, with no source or action. Its
+            # structured planner reply must declare that evidence-free outcome.
+            protocol_reply = workflow_provider_reply(kw, completion=True, reasoned=True)
+            if protocol_reply is not None: return protocol_reply
             if threading.current_thread().name.startswith('nullion-cron-') and not getattr(self.local,'seen',False):
                 self.local.seen=True
                 with self.lock:self.entered.append(time.monotonic())
@@ -91,3 +96,34 @@ def test_capacity_validation_at_real_api_boundary(tmp_path,monkeypatch,value):
         response=client.put('/api/cron-scheduler',json={'max_parallel_jobs':value})
         assert response.status_code==400,response.text
         assert client.get('/api/cron-scheduler').json()['max_parallel_jobs']==4
+
+
+def test_late_initial_capacity_response_cannot_overwrite_an_edited_limit(tmp_path,monkeypatch):
+    import asyncio
+    from playwright.sync_api import sync_playwright,expect
+    from test_tracker_status_delivery import setup
+    from test_web_surface_contracts import _UvicornThread,_free_port
+    app,runtime,db=setup(tmp_path,monkeypatch)
+    reads=0
+    @app.middleware('http')
+    async def delay_old_snapshot(request,call_next):
+        nonlocal reads
+        delay=False
+        if request.url.path=='/api/cron-scheduler' and request.method=='GET':
+            reads+=1;delay=reads==1
+        response=await call_next(request)
+        if delay:await asyncio.sleep(.7)
+        return response
+    with _UvicornThread(app,_free_port()) as server,sync_playwright() as pw:
+        browser=pw.chromium.launch(headless=True);page=browser.new_page()
+        try:
+            page.goto(server.base_url);page.locator('#settings-btn').click()
+            page.locator('.settings-nav button',has_text='Crons').click()
+            field=page.get_by_label('Maximum parallel scheduled jobs')
+            expect(field).to_be_enabled();field.fill('3')
+            page.get_by_role('button',name='Save parallel limit').click()
+            expect(page.locator('#cron-parallel-message')).to_have_text('Saved')
+            page.wait_for_timeout(800)
+            expect(field).to_have_value('3')
+            assert page.request.get(server.base_url+'/api/cron-scheduler').json()['max_parallel_jobs']==3
+        finally:browser.close()

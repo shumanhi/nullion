@@ -286,7 +286,8 @@ async def test_failed_final_text_stays_retryable_across_aggregator_restart(tmp_p
     def fail(*args,**kwargs): calls.append((args,kwargs));return False
     task=TaskRecord('t','g','web:fixture','operator','Fixture','Fixture',TaskStatus.COMPLETE,TaskPriority.NORMAL,[],[],result=TaskResult('t','success',output='Final fixture'))
     group=TaskGroup('g','web:fixture','Fixture',[task]);await registry.add_group(group)
-    first=ResultAggregator(deliver_fn=fail,task_registry=registry,outbox_path=tmp_path/'outbox.db')
+    model=__import__('types').SimpleNamespace(create=lambda **kwargs: {'content':[{'type':'text','text':__import__('json').dumps({'status':'complete','answer':'Final fixture','evaluated_task_ids':['t'],'missing_outcomes':[]})}]})
+    first=ResultAggregator(deliver_fn=fail,task_registry=registry,model_client=model,outbox_path=tmp_path/'outbox.db')
     state=GroupState('g','web:fixture','Fixture')
     await first._on_group_complete(state,group)
     assert group.planner_metadata['delivery_status']=='failed'

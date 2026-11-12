@@ -11449,6 +11449,7 @@ def test_chat_operator_connector_skill_fallback_does_not_rebuild_accepted_skill(
     reply = chat_operator._connector_scope_builder_fallback(
         [ToolResult("scope", "request_tool_scope", "completed", {
             "capabilities": ["connector"], "connector_app_ids": ["google-drive"],
+            "connector_source_unavailable": True,
         })],
         runtime=runtime,
     )
@@ -14198,9 +14199,10 @@ def test_orchestrator_transport_timeout_does_not_plain_chat_fallback(tmp_path, m
         activity_callback=events.append,
     )
 
-    assert "timed out" in reply
+    assert "timeout" in reply.lower()
     assert "No tool result was produced" in reply
     assert "currently have access" not in reply
+    assert "Activity\n" not in reply
     assert any(event.get("status") == "blocked" for event in events)
 
 
@@ -15532,9 +15534,9 @@ def test_telegram_cards_and_decision_actions(tmp_path, monkeypatch) -> None:
     runtime.start_doctor_action = lambda action_id: {"action_id": action_id, "status": "running", "summary": "Started"}
     runtime.complete_doctor_action = lambda action_id: {"action_id": action_id, "status": "completed"}
     runtime.cancel_doctor_action = lambda action_id, reason: {"action_id": action_id, "status": "cancelled", "reason": reason}
-    assert telegram_app._execute_decision_action(service, kind="doctor", action="start", record_id="doc-1")[0] == "Started"
-    assert telegram_app._execute_decision_action(service, kind="doctor", action="complete", record_id="doc-1") == ("Completed", "Action completed.")
-    assert telegram_app._execute_decision_action(service, kind="doctor", action="cancel", record_id="doc-1") == ("Dismissed", "Action dismissed.")
+    assert telegram_app._execute_decision_action(service, kind="doctor", action="start", record_id="doc-1")[0] == "In progress"
+    assert telegram_app._execute_decision_action(service, kind="doctor", action="complete", record_id="doc-1") == ("Resolved", "Doctor alert marked as resolved.\n\nThis records your choice; it does not verify a repair.")
+    assert telegram_app._execute_decision_action(service, kind="doctor", action="cancel", record_id="doc-1") == ("Dismissed", "Doctor alert dismissed.\n\nThe underlying issue has not been marked as fixed.")
 
     assert telegram_app._execute_decision_action(service, kind="setting", action="set", record_id="verbose_on", chat_id="123")[0] == "Verbose on"
     assert telegram_app._execute_decision_action(service, kind="setting", action="set", record_id="streaming_on", chat_id="123") == (
@@ -15689,7 +15691,7 @@ def test_telegram_decision_snapshot_cards_and_delivery_edges(tmp_path, monkeypat
     assert message.edits[-1][0] == "edited reply"
 
     class BadRequest(Exception):
-        pass
+        status_code = 400
 
     class FormattingFailureMessage:
         def __init__(self) -> None:
@@ -15705,8 +15707,7 @@ def test_telegram_decision_snapshot_cards_and_delivery_edges(tmp_path, monkeypat
     assert len(formatting_failure.replies) == 2
     assert formatting_failure.replies[0][1]["parse_mode"] == "HTML"
     assert "parse_mode" not in formatting_failure.replies[1][1]
-    assert formatting_failure.replies[1][0].startswith("Telegram could not render the formatted reply")
-    assert "```text\nUse **bold**\n```" in formatting_failure.replies[1][0]
+    assert formatting_failure.replies[1][0] == "Use bold"
 
 
 def test_telegram_card_error_and_run_polling_helpers(tmp_path, monkeypatch) -> None:
@@ -16221,9 +16222,9 @@ def test_operator_commands_status_doctor_readme_and_reminder_paths(tmp_path, mon
     runtime.start_doctor_action = lambda action_id: {"status": "running"}
     runtime.complete_doctor_action = lambda action_id: {"status": "completed"}
     runtime.cancel_doctor_action = lambda action_id, reason: {"status": "cancelled"}
-    assert "Started Doctor action doc-1" in operator_commands._doctor_action_cmd(runtime, "start", "1")
-    assert "Completed Doctor action doc-1" in operator_commands._doctor_action_cmd(runtime, "complete", "doc-1")
-    assert "Dismissed Doctor action doc-1" in operator_commands._doctor_action_cmd(runtime, "dismiss", "doc-1")
+    assert "Doctor alert marked as in progress" in operator_commands._doctor_action_cmd(runtime, "start", "1")
+    assert "Doctor alert marked as resolved" in operator_commands._doctor_action_cmd(runtime, "complete", "doc-1")
+    assert "Doctor alert dismissed" in operator_commands._doctor_action_cmd(runtime, "dismiss", "doc-1")
     assert operator_commands._doctor_action_cmd(runtime, "start", None).startswith("Usage")
     monkeypatch.setattr(operator_commands, "execute_doctor_playbook_command", lambda *args, **kwargs: SimpleNamespace(message="playbook ran"))
     assert operator_commands._doctor_run_cmd(runtime, "1", "doctor:repair") == "playbook ran"
@@ -16809,7 +16810,7 @@ def test_telegram_document_timeout_kwargs_uses_media_timeouts(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_telegram_document_attachment_upload_retries_transient_timeout(tmp_path, monkeypatch) -> None:
+async def test_telegram_document_attachment_upload_does_not_retry_unconfirmed_timeout(tmp_path, monkeypatch) -> None:
     sleeps: list[float] = []
 
     async def fake_sleep(delay):
@@ -16833,11 +16834,13 @@ async def test_telegram_document_attachment_upload_retries_transient_timeout(tmp
     attachment = tmp_path / "artifact.png"
     attachment.write_bytes(b"image")
 
-    await telegram_app._reply_document_attachment(message, attachment, caption="caption")
+    from nullion.delivery_acknowledgement import UnconfirmedDelivery
+    with pytest.raises(UnconfirmedDelivery):
+        await telegram_app._reply_document_attachment(message, attachment, caption="caption")
 
-    assert message.calls == 2
-    assert message.payloads == [b"image", b"image"]
-    assert sleeps == [0.5]
+    assert message.calls == 1
+    assert message.payloads == [b"image"]
+    assert sleeps == []
 
 
 @pytest.mark.asyncio
@@ -16852,8 +16855,7 @@ async def test_telegram_document_attachment_upload_retries_connect_timeout(tmp_p
     class TelegramTimedOut(Exception):
         pass
 
-    class ConnectTimeout(Exception):
-        pass
+    from httpx import ConnectTimeout
 
     class Message:
         def __init__(self) -> None:
@@ -17213,7 +17215,8 @@ async def test_telegram_failed_stream_edit_falls_back_to_primary_delivery(tmp_pa
             return SimpleNamespace(message_id=92, edit_text=self.edit_text)
 
         async def edit_text(self, text, **kwargs):  # noqa: ANN001, ANN003
-            raise RuntimeError("simulated Telegram edit failure")
+            from telegram.error import BadRequest
+            raise BadRequest("Explicit Telegram edit rejection")
 
     async def no_download(message, context, settings=None):  # noqa: ANN001
         return []

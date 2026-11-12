@@ -10,6 +10,7 @@ import json
 import asyncio
 import inspect
 import os
+from dataclasses import replace
 from importlib.util import find_spec
 from typing import Any
 from uuid import uuid4
@@ -41,6 +42,7 @@ def nullion_tools_as_langchain_tools(
     cleanup_scope: str,
     policy_store: Any = None,
     tool_result_callback: Any = None,
+    tool_flow_context: dict[str, Any] | None = None,
 ) -> list[Any]:
     """Expose scoped Nullion tools as LangChain StructuredTool objects.
 
@@ -65,6 +67,7 @@ def nullion_tools_as_langchain_tools(
                 policy_store=policy_store,
                 tool_result_callback=tool_result_callback,
                 prior_tool_results=shared_tool_results,
+                tool_flow_context=tool_flow_context,
             ),
             name=str(tool_def.get("name")),
             description=_enhanced_tool_description(tool_def),
@@ -76,7 +79,7 @@ def nullion_tools_as_langchain_tools(
     ]
 
 
-def nullion_client_as_langchain_chat_model(client: Any, *, default_max_tokens: int = 2048) -> Any:
+def nullion_client_as_langchain_chat_model(client: Any, *, default_max_tokens: int | None = None) -> Any:
     """Wrap a Nullion model client as a LangChain chat model.
 
     The wrapped client must expose Nullion's normalized ``create`` interface:
@@ -97,7 +100,7 @@ def nullion_client_as_langchain_chat_model(client: Any, *, default_max_tokens: i
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
         nullion_client: Any = Field(exclude=True)
-        default_max_tokens: int = tokens_default
+        default_max_tokens: int | None = tokens_default
         bound_tools: tuple[Any, ...] = ()
 
         @property
@@ -180,6 +183,7 @@ def _make_langchain_tool_coroutine(
     policy_store: Any,
     tool_result_callback: Any,
     prior_tool_results: list[ToolResult],
+    tool_flow_context: dict[str, Any] | None = None,
 ):
     async def _run_nullion_tool(**kwargs: Any) -> str:
         invocation = ToolInvocation(
@@ -188,12 +192,16 @@ def _make_langchain_tool_coroutine(
             principal_id=principal_id,
             arguments=dict(kwargs),
             capsule_id=cleanup_scope,
+            flow_context=dict(tool_flow_context) if tool_flow_context is not None else None,
         )
-        result = artifact_media_plain_replacement_guard_result(invocation, prior_tool_results) or _invoke_nullion_tool(
-            invocation,
-            tool_registry=tool_registry,
-            policy_store=policy_store,
-        )
+        result = artifact_media_plain_replacement_guard_result(invocation, prior_tool_results,
+            required_embedded_media_extensions=(tool_flow_context or {}).get("required_embedded_media_extensions"))
+        if result is None:
+            from nullion.artifact_lifecycle import artifact_read_reference_recovery
+            result = artifact_read_reference_recovery(invocation, prior_tool_results, registry=tool_registry)
+        if result is None:
+            result = await asyncio.to_thread(_invoke_nullion_tool, invocation,
+                tool_registry=tool_registry, policy_store=policy_store)
         result = _with_replayable_artifact_arguments(result, invocation.arguments)
         emitted_results = [result]
         if _result_allows_fallback(result):
@@ -204,12 +212,14 @@ def _make_langchain_tool_coroutine(
                     principal_id=principal_id,
                     arguments=dict(kwargs),
                     capsule_id=cleanup_scope,
+                    flow_context=dict(tool_flow_context) if tool_flow_context is not None else None,
                 )
-                fallback_result = _invoke_nullion_tool(
-                    fallback_invocation,
-                    tool_registry=tool_registry,
-                    policy_store=policy_store,
-                )
+                fallback_result = artifact_media_plain_replacement_guard_result(fallback_invocation,
+                    [*prior_tool_results, *emitted_results],
+                    required_embedded_media_extensions=(tool_flow_context or {}).get("required_embedded_media_extensions"))
+                if fallback_result is None:
+                    fallback_result = await asyncio.to_thread(_invoke_nullion_tool, fallback_invocation,
+                        tool_registry=tool_registry, policy_store=policy_store)
                 fallback_result = _with_replayable_artifact_arguments(fallback_result, fallback_invocation.arguments)
                 emitted_results.append(fallback_result)
                 if not _result_allows_fallback(fallback_result):
@@ -238,13 +248,7 @@ def _with_replayable_artifact_arguments(result: ToolResult, arguments: dict[str,
         return result
     enriched_output = dict(output)
     enriched_output["invocation_arguments"] = dict(arguments)
-    return ToolResult(
-        result.invocation_id,
-        result.tool_name,
-        result.status,
-        enriched_output,
-        result.error,
-    )
+    return replace(result, output=enriched_output)
 
 
 def _invoke_nullion_tool(
@@ -286,12 +290,23 @@ def _tool_retry_attempts() -> int:
 
 def _result_allows_fallback(result: ToolResult) -> bool:
     output = result.output if isinstance(result.output, dict) else {}
+    from nullion.tool_repair_contract import tool_repair_kind
+    if tool_repair_kind(result):
+        return False
     if output.get("reason") == "approval_required" or output.get("requires_approval"):
+        return False
+    if output.get("reason") == "request_plan_conflict" and output.get("executed") is False:
+        # Preflight rejected the proposal, not this implementation. An
+        # alternate tool must not receive the same rejected arguments before
+        # the model corrects them or answers the clarification.
         return False
     return str(result.status).lower() in {"failed", "failure", "error"} or bool(result.error)
 
 
 def _tool_result_text(result: ToolResult) -> str:
+    from nullion.tool_repair_contract import tool_repair_kind
+    if tool_repair_kind(result):
+        return json.dumps({'status': result.status, 'output': result.output, 'error': result.error}, ensure_ascii=True)
     if result.error:
         return result.error
     output = result.output
@@ -308,7 +323,7 @@ async def _call_nullion_model(
     *,
     messages: list[Any],
     tools: tuple[Any, ...],
-    default_max_tokens: int,
+    default_max_tokens: int | None,
     message_types: tuple[type, type, type, type],
 ) -> dict[str, Any]:
     lc_messages, system = _nullion_messages_from_langchain_messages(messages, message_types=message_types)
@@ -401,6 +416,11 @@ def _nullion_messages_from_langchain_messages(
                         "input": dict(tool_call.get("args") or {}),
                     }
                 )
+            if getattr(message, "invalid_tool_calls", None):
+                content.append({"type": "text", "text":
+                    "Tool argument protocol correction required: the preceding invalid calls were not executed. "
+                    "Return complete tool arguments matching the registered schema; split long work into "
+                    "complete calls and reuse existing source results."})
             converted.append({"role": "assistant", "content": content or [{"type": "text", "text": ""}]})
             continue
         converted.append({"role": "user", "content": [{"type": "text", "text": _message_text(getattr(message, "content", ""))}]})
@@ -532,6 +552,7 @@ def _chat_result_from_nullion_response(response: dict[str, Any]):
     content_blocks = response.get("content") or []
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    invalid_tool_calls: list[dict[str, Any]] = []
     if isinstance(content_blocks, str):
         text_parts.append(content_blocks)
     elif isinstance(content_blocks, list):
@@ -544,6 +565,14 @@ def _chat_result_from_nullion_response(response: dict[str, Any]):
             if block.get("type") == "text":
                 text_parts.append(str(block.get("text") or ""))
             elif block.get("type") == "tool_use":
+                completion = response.get("completion")
+                invalid = isinstance(block.get("input_error"), dict) or (
+                    isinstance(completion, dict) and completion.get("status") == "incomplete")
+                if invalid:
+                    invalid_tool_calls.append({"name": str(block.get("name") or ""),
+                        "id": str(block.get("id") or f"tool-{uuid4().hex[:8]}"), "args": None,
+                        "error": "Incomplete or malformed tool arguments; this call was not executed."})
+                    continue
                 tool_calls.append(
                     {
                         "name": str(block.get("name") or ""),
@@ -551,7 +580,10 @@ def _chat_result_from_nullion_response(response: dict[str, Any]):
                         "id": str(block.get("id") or f"tool-{uuid4().hex[:8]}"),
                     }
                 )
-    message = AIMessage(content="".join(text_parts), tool_calls=tool_calls)
+    if invalid_tool_calls and not tool_calls:
+        text_parts.append("The model returned an incomplete or malformed tool call. That call was not executed.")
+    message = AIMessage(content="".join(text_parts), tool_calls=tool_calls,
+        invalid_tool_calls=invalid_tool_calls)
     return ChatResult(generations=[ChatGeneration(message=message)])
 
 

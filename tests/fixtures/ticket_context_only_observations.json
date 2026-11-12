@@ -1,0 +1,117 @@
+{
+  "result_kind": "source_observations",
+  "report_status": "partial",
+  "goal_status": "partial",
+  "next_action": "report",
+  "unknowns": [
+    "No live, bookable Ramayana screening was verified for Monday, 2026-11-16 near ZIP 10024.",
+    "No qualifying showtime after 7:00 PM was verified for the requested date.",
+    "Requested-date theater and format details remain unconfirmed.",
+    "Current seat availability or requested-date seat-map evidence was not established.",
+    "No exact direct ticket or checkout URL was available for a requested-date screening.",
+    "Atom’s calendar exposed dates only through Thursday, November 12, not Monday, November 16.",
+    "AMC identified nearby theaters but had not displayed Ramayana showtimes for the requested date."
+  ],
+  "blocker": "The checked ticketing calendars did not expose Monday, November 16, 2026 inventory: Atom’s selector stopped at November 12, Fandango returned no exact-title search result, and AMC had not displayed date-specific showtimes. Therefore, listings for November 16 cannot be treated as available or bookable.",
+  "observations": [
+    {
+      "label": "Fandango exact-title search result",
+      "quote": " NO RESULTS FOR “RAMAYANA (2026)”",
+      "semantic_role": "attribute",
+      "source_index": 0,
+      "value": " NO RESULTS FOR “RAMAYANA (2026)”"
+    },
+    {
+      "label": "Atom Ramayana listing and selected search context",
+      "quote": "Ramayana\n 3hr 15m \n    \n    \n  (66)\n \n 3.6/5 (10.3K)\n \n 100%\n\nAn ancient epic follows a young prince and princess whose marriage and subsequent exile mark the beginning of a legendary journey. Their story of love, duty and destiny sets the stage for greater challenges ahead.\n\nMore Details »\nAdd to Watch List \nFind Movie Theaters & Showtimes for \n Today\nSelect Date\nToday\nTomorrow\nTue, Nov 10\nWed, Nov 11\nThu, Nov 12\n×\n near \n Manhattan\n in \nAll Formats",
+      "semantic_role": "context",
+      "source_index": 1,
+      "value": "Ramayana\n 3hr 15m \n    \n    \n  (66)\n \n 3.6/5 (10.3K)\n \n 100%\n\nAn ancient epic follows a young prince and princess whose marriage and subsequent exile mark the beginning of a legendary journey. Their story of love, duty and destiny sets the stage for greater challenges ahead.\n\nMore Details »\nAdd to Watch List \nFind Movie Theaters & Showtimes for \n Today\nSelect Date\nToday\nTomorrow\nTue, Nov 10\nWed, Nov 11\nThu, Nov 12\n×\n near \n Manhattan\n in \nAll Formats"
+    },
+    {
+      "label": "Atom date selector currently offered dates",
+      "quote": "Select Date\nToday\nTomorrow\nTue, Nov 10\nWed, Nov 11\nThu, Nov 12",
+      "semantic_role": "interface_control",
+      "source_index": 1,
+      "value": "Select Date\nToday\nTomorrow\nTue, Nov 10\nWed, Nov 11\nThu, Nov 12"
+    },
+    {
+      "label": "Fandango exact-title search result",
+      "quote": " NO RESULTS FOR “RAMAYANA (2026)”",
+      "semantic_role": "context",
+      "source_index": 2,
+      "value": " NO RESULTS FOR “RAMAYANA (2026)”"
+    },
+    {
+      "label": "Atom exact Ramayana listing",
+      "quote": "Ramayana\n 3hr 15m ",
+      "semantic_role": "entity",
+      "source_index": 3,
+      "value": "Ramayana\n 3hr 15m "
+    },
+    {
+      "label": "Atom selected date, location, and available calendar range",
+      "quote": "Find Movie Theaters & Showtimes for \n Today\nSelect Date\nToday\nTomorrow\nTue, Nov 10\nWed, Nov 11\nThu, Nov 12\n×\n near \n Manhattan\n in \nAll Formats",
+      "semantic_role": "interface_control",
+      "source_index": 3,
+      "value": "Find Movie Theaters & Showtimes for \n Today\nSelect Date\nToday\nTomorrow\nTue, Nov 10\nWed, Nov 11\nThu, Nov 12\n×\n near \n Manhattan\n in \nAll Formats"
+    },
+    {
+      "label": "Ramayana language and accessibility features shown by Atom",
+      "quote": "RESERVED SEATING, HINDI SPOKEN, ENGLISH SUBTITLES",
+      "semantic_role": "attribute",
+      "source_index": 3,
+      "value": "RESERVED SEATING, HINDI SPOKEN, ENGLISH SUBTITLES"
+    },
+    {
+      "label": "Closest AMC theater to ZIP 10024",
+      "quote": "AMC 84th Street 6\n0 mi",
+      "semantic_role": "entity",
+      "source_index": 4,
+      "value": "AMC 84th Street 6\n0 mi"
+    },
+    {
+      "label": "Second-closest AMC theater",
+      "quote": "AMC Lincoln Square 13\n0.8 mi",
+      "semantic_role": "entity",
+      "source_index": 4,
+      "value": "AMC Lincoln Square 13\n0.8 mi"
+    },
+    {
+      "label": "Third-closest AMC theater",
+      "quote": "AMC Orpheum 7\n1.3 mi",
+      "semantic_role": "entity",
+      "source_index": 4,
+      "value": "AMC Orpheum 7\n1.3 mi"
+    },
+    {
+      "label": "AMC showtime prerequisite",
+      "quote": "Showtimes\n\nIn order to display showtimes, please select a nearby theatre.\n\nSelect a Theatre",
+      "semantic_role": "interface_control",
+      "source_index": 4,
+      "value": "Showtimes\n\nIn order to display showtimes, please select a nearby theatre.\n\nSelect a Theatre"
+    }
+  ],
+  "sources": [
+    {
+      "source_url": "https://www.fandango.com/search?q=Ramayana+%282026%29&mode=all",
+      "captured_at": 1794119826.526869
+    },
+    {
+      "source_url": "https://www.atomtickets.com/movies/ramayana/395593",
+      "captured_at": 1794119926.7287612
+    },
+    {
+      "source_url": "https://www.fandango.com/search?q=Ramayana+%282026%29&mode=all",
+      "captured_at": 1794119836.1614988
+    },
+    {
+      "source_url": "https://www.atomtickets.com/movies/ramayana/395593",
+      "captured_at": 1794119941.5042381
+    },
+    {
+      "captured_at": 1794119997.8595781,
+      "source_url": "https://www.amctheatres.com/movies/ramayana-84991/showtimes"
+    }
+  ]
+}

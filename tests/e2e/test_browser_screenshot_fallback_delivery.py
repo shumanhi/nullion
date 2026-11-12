@@ -1,3 +1,4 @@
+from tests.workflow_provider_protocol import is_tool_scope_request, workflow_provider_reply
 import asyncio
 import io
 import json
@@ -50,10 +51,20 @@ def test_telegram_capture_preserves_real_browser_session_and_finishes_without_re
         opening = False
 
         def create(self, **kwargs):
+            if 'material-requirements planner' in str(kwargs.get('system') or ''):
+                return {"content": [{"type": "text", "text": json.dumps({
+                    "all_material_requirements_enumerated": True,
+                    "requested_artifact_extensions": [] if self.opening else [".png"],
+                    "material_requirements": [{"requirement": "Open the requested page" if self.opening else "Deliver the current screenshot",
+                        "requirement_kind": "action" if self.opening else "deliverable",
+                        "evidence_subject_id": "navigation" if self.opening else ".png",
+                        "eligible_evidence_tool_names": ["browser_navigate", "browser_open"] if self.opening else ["browser_screenshot"]}]})}]}
+            protocol_reply = workflow_provider_reply(kwargs, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {t["name"] for t in kwargs.get("tools", [])}
             if "select_attachment_format" in names:
                 return {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "format", "name": "select_attachment_format", "input": {"extension": None if self.opening else ".png", "confidence": 1.0}}]}
-            if int(kwargs.get("max_tokens", 0)) == 96 and not names:
+            if is_tool_scope_request(kwargs):
                 if scope_mode not in {"preclassified", "preclassified_open_url", "followup", "followup_focus", "followup_read_failure"}:
                     return {"content": [{"type": "text", "text": "{}"}]}
                 decision = {"requested_outcome": "unspecified", "web_action": "browser_interaction",

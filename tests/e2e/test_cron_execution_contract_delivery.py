@@ -1,4 +1,5 @@
 """Real runner, SQLite, tool policy and platform formatter; only provider IO is fake."""
+from tests.workflow_provider_protocol import workflow_provider_reply
 from types import SimpleNamespace
 import asyncio
 import json
@@ -26,7 +27,7 @@ def setup(tmp_path, monkeypatch, approval=False, existing=False):
     for name, effect, output in [
         ('records_scan',ToolSideEffectClass.READ, {'results':[{'id':'record-a','subject':'期限','due_date':'2026-11-07'}]}),
         ('schedule_scan',ToolSideEffectClass.READ, {'events':[{'id':'existing-event','due_date':'2026-11-07'}] if existing else []}),
-        ('schedule_add',ToolSideEffectClass.ACCOUNT_WRITE, {'action_receipt':{'status':'created','id':'event-a'}}),
+        ('schedule_add',ToolSideEffectClass.ACCOUNT_WRITE, {'action_receipt':{'type':'action_receipt','action':'create','object_type':'calendar_event','summary':'Created event for 2026-11-07','status':'created','id':'event-a'}}),
     ]:
         def handler(invocation, output=output):
             called.append(invocation.tool_name)
@@ -47,7 +48,8 @@ def setup(tmp_path, monkeypatch, approval=False, existing=False):
 
 @pytest.mark.parametrize('saved_request', ['Read records and create missing events.', '記録を確認して、未登録の予定を作成。'])
 @pytest.mark.parametrize('approval,existing', [(False,False),(True,False),(False,True)])
-def test_requested_conditional_account_action_finishes_or_pauses_at_real_approval(tmp_path,monkeypatch,saved_request,approval,existing):
+@pytest.mark.parametrize('scope_response_seconds', [0, 6])
+def test_requested_conditional_account_action_finishes_or_pauses_at_real_approval(tmp_path,monkeypatch,saved_request,approval,existing,scope_response_seconds):
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.cron_delivery import run_single_agent_cron_turn
     from nullion.crons import CronJob
@@ -55,8 +57,14 @@ def test_requested_conditional_account_action_finishes_or_pauses_at_real_approva
     class Model:
         step = 0
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True, action=True)
+            if protocol_reply is not None: return protocol_reply
             if not kw.get('tools'):
                 if 'available_structured_write_tools' in kw['messages'][0]['content'][0]['text']:
+                    # Simulate a provider response beyond the former five-second
+                    # cutoff without sleeping or replacing Nullion's scope path.
+                    if kw['timeout'] < scope_response_seconds:
+                        raise TimeoutError('simulated scope response exceeded request deadline')
                     return response({'requires_account_connector':True,'provider_ids':['skill_pack_connector_records'],
                         'confidence':1,'write_tool_names':['schedule_add'],'delivery_mode':'report_each_run'})
                 return response({'disposition':'complete','reason':'Completed requested checks and action.',
@@ -86,7 +94,54 @@ def test_requested_conditional_account_action_finishes_or_pauses_at_real_approva
         assert runtime.store.get_approval_request(result['approval_id']) is not None
         assert load_runtime_store(runtime.checkpoint_path).get_approval_request(result['approval_id']) is not None
     else:
-        assert '11月7日' in result['text'] and not result.get('cron_report_failed'), result
+        assert '11月7日' in result['text'] and not result.get('cron_report_failed'), json.dumps({key: value for key, value in result.items() if key.startswith(('cron_', 'reason', 'response_'))}, default=str)
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'malformed', 'incomplete'])
+def test_failed_saved_setup_stops_before_sources_and_delivers_specific_failure(tmp_path, monkeypatch, failure):
+    from nullion.agent_orchestrator import AgentOrchestrator
+    from nullion.cron_delivery import (run_single_agent_cron_turn, run_cron_delivery_workflow,
+        CronRunDeliveryCallbacks, cron_structured_result_block_reason)
+    from nullion.crons import CronJob
+    from nullion.telegram_app import _deliver_reply
+    runtime, registry, called = setup(tmp_path, monkeypatch)
+    preflight, wire, calls = [], [], []
+    class Model:
+        def create(self, **kw):
+            calls.append(1)
+            assert not kw['tools'], 'Failed setup must not launch a producer or account action'
+            if failure == 'timeout':
+                raise TimeoutError('private-connection-record')
+            return {'completion':{'status':'incomplete' if failure == 'incomplete' else 'completed'},
+                    'content':[{'type':'text','text':'not-json'}]}
+    model = Model()
+    job = CronJob(id='setup-failure', name='確認', task='期限を確認し、必要な予定を登録。', schedule='0 * * * *')
+    class Message:
+        chat=SimpleNamespace(id=123); message_id=11
+        async def reply_text(self, text, **kw): wire.append((text, kw))
+    def run(job, conversation_id, **kw):
+        return run_single_agent_cron_turn(job, conversation_id, label='Scheduled task',
+            orchestrator=AgentOrchestrator(model_client=model), runtime=runtime, settings=SimpleNamespace(),
+            tool_registry=registry, model_client=model, record_event=lambda *a, **kw:preflight.append(kw))
+    def send(job, channel, target, text):
+        asyncio.run(_deliver_reply(Message(), text, principal_id='telegram:123'))
+        return True
+    result = run_cron_delivery_workflow(job, label='Scheduled task', callbacks=CronRunDeliveryCallbacks(
+        effective_channel=lambda j:'telegram', delivery_target=lambda j,c:'123', run_agent_turn=run,
+        record_event=lambda *a, **kw:None,
+        block_reason=lambda r,t,a:cron_structured_result_block_reason(r,text=t,artifacts=a),
+        save_web_delivery=lambda *a:False, send_platform_delivery=send, record_chat_turn=lambda *a:None,
+        health_store_path=runtime.checkpoint_path))
+    assert calls == [1] and called == []
+    assert result['response_fulfilled'] is False and result['cron_report_failed'] is True
+    assert result['reason'] == 'cron_source_scope_unresolved'
+    assert result['tool_results'] == [] and result['artifacts'] == []
+    assert preflight[-1]['connector_scope_valid'] is False
+    assert preflight[-1]['connector_scope_failure']
+    assert len(wire) == 1 and wire[0][1].get('parse_mode') in {None, 'HTML'}
+    assert 'could not start' in wire[0][0] and 'Retry' in wire[0][0]
+    assert ('timed out' in wire[0][0]) is (failure == 'timeout')
+    assert 'private-connection-record' not in wire[0][0]
 
 
 @pytest.mark.parametrize('decision,reason', [('silent','no_verified_match'),('silent','insufficient_evidence'),('send','verified_match')])
@@ -101,6 +156,8 @@ def test_legacy_conditional_monitor_uses_typed_policy_at_delivery_boundary(tmp_p
     class Model:
         step=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kw.get('tools'):
                 if 'available_structured_write_tools' in kw['messages'][0]['content'][0]['text']:
                     return response({'requires_account_connector':True,'provider_ids':['skill_pack_connector_records'],
@@ -149,6 +206,8 @@ def test_repeated_scheduled_runs_cache_scope_and_keep_plain_chat_fast(tmp_path,m
     class Model:
         step=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             if not kw.get('tools'):
                 planning.append(1)
                 time.sleep(1.5)  # Simulate the previously slow planner/provider boundary.
@@ -173,6 +232,8 @@ def test_repeated_scheduled_runs_cache_scope_and_keep_plain_chat_fast(tmp_path,m
     assert sum(elapsed)/len(elapsed)<0.8 and max(elapsed)<1.2,elapsed
     class PlainModel:
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             assert kw.get('tools')
             return response('こんにちは。')
     plain=[]
@@ -188,7 +249,8 @@ def test_repeated_scheduled_runs_cache_scope_and_keep_plain_chat_fast(tmp_path,m
 
 
 @pytest.mark.parametrize('label', ['Deferred digest','期限の確認','Informe aplazado'])
-def test_named_paused_task_lookup_runs_verified_id_through_real_runner(tmp_path,monkeypatch,label):
+@pytest.mark.parametrize('decision', ['proceed', 'clarify'])
+def test_named_paused_task_lookup_runs_verified_id_through_real_runner(tmp_path,monkeypatch,label,decision):
     from nullion import crons
     from nullion.runtime import bootstrap_persistent_runtime
     from nullion.tools import ToolRegistry,ToolSpec,ToolResult,ToolRiskLevel,ToolSideEffectClass,register_cron_tools
@@ -203,6 +265,8 @@ def test_named_paused_task_lookup_runs_verified_id_through_real_runner(tmp_path,
     class WorkerModel:
         step=0
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.step+=1
             if self.step==1:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'count','name':'records_count','input':{}}]}
@@ -223,7 +287,18 @@ def test_named_paused_task_lookup_runs_verified_id_through_real_runner(tmp_path,
     registry=ToolRegistry();register_cron_tools(registry,cron_runner=runner)
     class ChatModel:
         calls=0
+        preflights=0
         def create(self,**kw):
+            if 'Workflow action preflight.' in str(kw.get('system', '')):
+                self.preflights += 1
+                packet = json.loads(kw['messages'][0]['content'][0]['text'])
+                assert packet['proposed_action']['tool_name'] == 'run_cron'
+                assert packet['proposed_action']['arguments'] == {'id': job.id}
+                if decision == 'clarify':
+                    return response({'decision': 'clarify', 'issues': ['The saved target needs a new date.'],
+                        'question': 'Which dates should I check?', 'options': ['Upcoming dates', 'Original date']})
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             self.calls+=1
             if self.calls==1:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'scope','name':'request_tool_scope',
@@ -236,6 +311,12 @@ def test_named_paused_task_lookup_runs_verified_id_through_real_runner(tmp_path,
         user_message='ابدأ المهمة التي اخترتها؛ اترك الجدول متوقفاً.',conversation_history=[],
         tool_registry=ScopedTurnToolRegistry(registry,evidence=TurnToolEvidence()),
         policy_store=runtime.store,approval_store=runtime.store,max_iterations=6)
+    assert client.preflights == 1
+    if decision == 'clarify':
+        assert started == [] and invoked == []
+        assert '1. Upcoming dates\n2. Original date' in result.final_text
+        assert crons.get_cron(job.id).enabled is False
+        return
     assert started==[job.id] and invoked==['records_count'],result
     assert client.calls==2 and '7' in result.final_text,result
     assert crons.get_cron(job.id).enabled is False

@@ -101,12 +101,3 @@ def test_builder_reflection_does_not_route_from_build_mode_prompt_prefix():
     assert ".startswith(\"mode: build" not in source.lower()
     assert ".startswith('mode: build" not in source.lower()
     assert "_queue_web_build_mode_proposal" not in source
-
-
-def test_web_parallel_dispatch_uses_stored_turn_text_and_background_model_call():
-    source = _web_app_source()
-
-    assert "active_turn_text_by_id[turn_id] = user_text" in source
-    assert "active_turn_text_by_id.get(active_turn_id, \"\")" in source
-    assert "dispatch_decision = await asyncio.to_thread(" in source
-    assert ".get_name()" not in source

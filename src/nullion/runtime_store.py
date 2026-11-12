@@ -5,6 +5,20 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_CONVERSATION_EVENT_OBSERVER = ContextVar("conversation_event_observer", default=None)
+
+
+@contextmanager
+def conversation_event_observer(observer):
+    """Observe this execution's events without attaching to a shared store."""
+    token = _CONVERSATION_EVENT_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _CONVERSATION_EVENT_OBSERVER.reset(token)
 
 from nullion.approvals import ApprovalRequest, BoundaryPermit, PermissionGrant
 from nullion.audit import AuditRecord
@@ -518,6 +532,18 @@ class RuntimeStore:
                 for key in _CONVERSATION_SESSION_SETTING_FIELDS:
                     if key in normalized:
                         settings[key] = normalized.get(key)
+        observer = _CONVERSATION_EVENT_OBSERVER.get()
+        if observer is not None:
+            try:
+                metadata = observer(deepcopy(normalized))
+                if isinstance(metadata, dict):
+                    # Retain correlation on later full checkpoints as well.
+                    # Observers may add metadata, never replace event facts.
+                    for key, value in metadata.items():
+                        normalized.setdefault(key, deepcopy(value))
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning("Conversation diagnostic persistence failed", exc_info=True)
 
     def get_conversation_session_setting(self, conversation_id: str, key: str) -> Any | None:
         return deepcopy(self._conversation_session_settings.get(conversation_id, {}).get(key))

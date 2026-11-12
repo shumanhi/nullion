@@ -37,13 +37,15 @@ def test_unfulfilled_result_preserves_only_structured_failure():
     assert outcome is chat_operator.TurnOutcome.PARTIAL
 
 
-def test_terminal_review_reason_survives_orchestrator_completion():
-    review = _CompletionReviewDecision(disposition="blocked", unresolved_requirements=("the search service refused the connection",))
+def test_runtime_owned_timeout_survives_orchestrator_completion():
+    review = _CompletionReviewDecision(disposition="blocked", unresolved_requirements=("the search service refused the connection",),
+        user_facing_failure="Private reviewer correction", runtime_failure_code="deadline")
     reply = _completion_review_open_task_reply(review)
     result = _complete_agent_turn({"tool_results": [], "artifacts": []}, final_text=reply,
         response_fulfilled=False, completion_failure_reply=reply)["result"]
     assert result.completion_failure_reply == reply
-    assert "refused the connection" in chat_operator._unfulfilled_turn_reply(result)[0]
+    assert "before the response time limit" in chat_operator._unfulfilled_turn_reply(result)[0]
+    assert "Private reviewer correction" not in reply
     assert "still open" not in reply
 
 

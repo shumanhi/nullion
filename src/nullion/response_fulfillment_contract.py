@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import zipfile
 
 from nullion.artifacts import (
     ARTIFACT_DELIVERY_ROLES,
+    artifact_format_extension,
     artifact_descriptors_for_paths,
     artifact_paths_from_output_descriptors,
     is_unrequested_internal_sidecar_artifact,
@@ -181,13 +183,47 @@ def _artifact_media_tool_extension(tool_name: object) -> str | None:
     return _MEDIA_ARTIFACT_TOOL_EXTENSIONS.get(str(tool_name or "").strip())
 
 
+
+def _artifact_invocation_media_extension(invocation: ToolInvocation) -> str | None:
+    """Resolve a native creator's actual format from its structured target."""
+    extension = _artifact_media_tool_extension(invocation.tool_name)
+    if extension is None:
+        return None
+    target = invocation.arguments.get("output_path") or invocation.arguments.get("path")
+    if isinstance(target, str):
+        suffix = Path(target).suffix.lower()
+        if suffix in _MEDIA_CAPABLE_ARTIFACT_EXTENSIONS:
+            return ".html" if suffix == ".htm" else suffix
+        if invocation.tool_name == "spreadsheet_create" and suffix in {".csv", ".tsv"}:
+            return None
+    return extension
+
+def _artifact_result_is_producer_receipt(result: ToolResult) -> bool:
+    """A referenced path is not evidence that an inspection rewrote a file."""
+    name = str(getattr(result, "tool_name", ""))
+    output = result.output if isinstance(result.output, Mapping) else {}
+    if _artifact_media_tool_extension(name) or name in {"file_write", "file_patch", "terminal_exec"}:
+        return True
+    descriptors = output.get("artifact_descriptors")
+    if isinstance(descriptors, (list, tuple)) and descriptors:
+        return any(isinstance(row, Mapping) and row.get("role") == "deliverable" for row in descriptors)
+    # Third-party writers must declare generated artifacts through their result
+    # schema. Reader output containing only path/content retains read semantics.
+    return bool(output.get("artifact_path") or output.get("artifact_paths")
+        or output.get("artifact_producer_receipt_id"))
+
+
 def _artifact_result_media_extension(result: ToolResult) -> str | None:
     static_extension = _artifact_media_tool_extension(getattr(result, "tool_name", None))
     output = result.output if isinstance(result.output, dict) else {}
-    for path in _artifact_result_paths(result):
+    paths = tuple(_artifact_result_paths(result))
+    for path in paths:
         suffix = Path(path).suffix.lower()
         if suffix in _MEDIA_CAPABLE_ARTIFACT_EXTENSIONS:
             return ".html" if suffix == ".htm" else suffix
+    if (str(getattr(result, "tool_name", "")) == "spreadsheet_create" and paths
+            and all(Path(path).suffix.lower() in {".csv", ".tsv"} for path in paths)):
+        return None
     return static_extension
 
 
@@ -309,7 +345,8 @@ def _artifact_invocation_has_media_inputs(invocation: ToolInvocation) -> bool:
         return True
     # HTML image elements are structured media inputs too. The PDF handler
     # resolves/validates their sources and final fulfillment inspects the bytes.
-    return any(isinstance(page, str) and _HTML_IMAGE_SOURCE_RE.search(page)
+    from nullion.artifact_evidence import inline_svg_fragments
+    return any(isinstance(page, str) and (_HTML_IMAGE_SOURCE_RE.search(page) or inline_svg_fragments(page))
                for page in arguments.get("html_pages", ()) or ())
 
 
@@ -467,7 +504,12 @@ def artifact_file_embedded_media_count(path: str | Path) -> int:
     if suffix in _OFFICE_EMBEDDED_MEDIA_PREFIXES:
         return _office_artifact_embedded_media_count(artifact_path)
     if suffix in {".html", ".htm"}:
-        return _html_raster_media_count(artifact_path)
+        from nullion.artifact_evidence import self_contained_html_svg_count
+        try:
+            svg_count = self_contained_html_svg_count(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            svg_count = 0
+        return _html_raster_media_count(artifact_path) + svg_count
     if suffix == ".pdf":
         return _pdf_embedded_media_count(artifact_path)
     return 0
@@ -678,7 +720,7 @@ def _union_scope_extensions(groups: Iterable[_ArtifactScopeExtensionGroup]) -> t
     return tuple(extensions)
 
 
-def scoped_artifact_extensions_from_tool_results(tool_results: Iterable[object] | None) -> tuple[str, ...]:
+def scoped_artifact_extensions_from_tool_results(tool_results: Iterable[object] | None, *, user_message: str | None = None) -> tuple[str, ...]:
     """Return the best final artifact-extension contract from typed tool evidence.
 
     A turn can request helper artifacts while building the final answer. Delivery
@@ -687,6 +729,17 @@ def scoped_artifact_extensions_from_tool_results(tool_results: Iterable[object] 
     deliverable artifacts, and prefer media-bearing scopes when they exist.
     """
     results = tuple(tool_results or ())
+    from nullion.request_delivery_requirements import reviewed_request_delivery_requirements
+    current = reviewed_request_delivery_requirements(results, user_message)
+    if current is not None:
+        return tuple(current['required_attachment_extensions'])
+    from nullion.artifact_lifecycle import reviewed_delivery_extensions
+    reviewed = reviewed_delivery_extensions(results)
+    if reviewed is not None:
+        # A current completed file manifest owns delivery. Intermediate scope
+        # guesses and packaging exclusions cannot narrow its reviewed siblings.
+        return reviewed
+
     groups = _artifact_scope_extension_groups(results)
     if not groups:
         return _completed_structural_artifact_extensions_in_order(results)
@@ -769,6 +822,20 @@ def _artifact_result_reports_media_failure(result: ToolResult) -> bool:
     )
 
 
+
+def _artifact_failure_requires_media(result: ToolResult) -> bool:
+    if not _artifact_result_reports_media_failure(result):
+        return False
+    requirements = getattr(result, "response_requirements", None)
+    native = requirements.get("_native_artifact_media") if isinstance(requirements, dict) else None
+    if (isinstance(native, dict) and native.get("version") == 1
+            and native.get("extension") == _artifact_result_media_extension(result)
+            and isinstance(native.get("required"), bool)):
+        return native["required"]
+    # Legacy receipts retain their original semantics. New native executions
+    # carry a runtime-owned contract; provider output cannot supply that flag.
+    return True
+
 def _browser_image_collection_failed(result: ToolResult) -> bool:
     if str(getattr(result, "tool_name", "") or "") != "browser_image_collect":
         return False
@@ -810,12 +877,28 @@ def _path_matches_identities(path: object, identities: set[str]) -> bool:
 
 
 def _collected_browser_image_path_identities(tool_results: Iterable[ToolResult] | None) -> set[str]:
-    return {
+    results = tuple(tool_results or ())
+    identities = {
         identity
-        for result in tool_results or ()
+        for result in results
         for path in _browser_image_collection_paths(result)
         for identity in _path_identity_variants(path)
     }
+    if not identities:
+        return identities
+    # A later successful source-image download can replace an earlier browser
+    # collection candidate. Provenance follows typed source receipts, not the
+    # incidental choice of acquisition tool or the first downloaded filename.
+    for result in results:
+        if normalize_tool_status(getattr(result, "status", None)) != "completed":
+            continue
+        output = result.output if isinstance(result.output, Mapping) else {}
+        for descriptor in output.get("artifact_descriptors") or ():
+            if (isinstance(descriptor, Mapping) and descriptor.get("role") == "source"
+                    and isinstance(descriptor.get("path"), str)
+                    and Path(descriptor["path"]).suffix.lower() in _RASTER_IMAGE_ATTACHMENT_EXTENSIONS):
+                identities.update(_path_identity_variants(descriptor["path"]))
+    return identities
 
 
 def _artifact_result_embedded_source_image_paths(result: ToolResult) -> tuple[str, ...]:
@@ -863,8 +946,24 @@ def _completed_media_artifact_paths_matching_collected_image(
 
 
 def _browser_page_context_used(result: ToolResult) -> bool:
+    """Detect structured source-image evidence, not merely browser use.
+
+    A page's numeric/text observations can support a generated chart. They do
+    not declare that the user requested source photographs. Explicit asset
+    candidates and failed image collection still retain their provenance guard.
+    """
     tool_name = str(getattr(result, "tool_name", "") or "")
-    return tool_name.startswith("browser_") and tool_name not in {"browser_image_collect", "browser_screenshot"}
+    if not tool_name.startswith("browser_") or tool_name in {"browser_image_collect", "browser_screenshot"}:
+        return False
+    image_fields = {"img", "image_url", "image_src", "image_paths", "image_urls", "images", "source_image_paths"}
+    def has_assets(value, depth=0):
+        if depth > 8:
+            return False
+        if isinstance(value, dict):
+            return any((key in image_fields and _has_nonempty_media_value(item))
+                       or has_assets(item, depth + 1) for key, item in value.items())
+        return isinstance(value, (list, tuple)) and any(has_assets(item, depth + 1) for item in value)
+    return has_assets(getattr(result, "output", None))
 
 
 def _artifact_result_required_media_extensions(result: ToolResult) -> tuple[str, ...]:
@@ -874,7 +973,7 @@ def _artifact_result_required_media_extensions(result: ToolResult) -> tuple[str,
         for extension in normalize_artifact_media_required_extensions(output.get(key)):
             if extension not in extensions:
                 extensions.append(extension)
-    if not extensions and _artifact_result_reports_media_failure(result):
+    if not extensions and _artifact_failure_requires_media(result):
         extension = _artifact_result_media_extension(result)
         if extension:
             extensions.append(extension)
@@ -888,6 +987,8 @@ def artifact_media_required_extensions(tool_results: Iterable[ToolResult] | None
     collected_image_identities = _collected_browser_image_path_identities(results)
     if collected_image_identities:
         for result in results:
+            if not _artifact_result_is_producer_receipt(result):
+                continue
             extension = _artifact_result_media_extension(result)
             if extension is None:
                 continue
@@ -934,6 +1035,8 @@ def artifact_media_embedding_obligation_outstanding(tool_results: Iterable[ToolR
     verified_browser_screenshot_identities = _browser_screenshot_path_identities(results, verified=True)
     if collected_image_identities:
         for result in results:
+            if not _artifact_result_is_producer_receipt(result):
+                continue
             extension = _artifact_result_media_extension(result)
             if extension is None:
                 continue
@@ -948,6 +1051,8 @@ def artifact_media_embedding_obligation_outstanding(tool_results: Iterable[ToolR
     for result in results:
         for extension in _artifact_result_required_media_extensions(result):
             outstanding.add(extension)
+        if not _artifact_result_is_producer_receipt(result):
+            continue
         extension = _artifact_result_media_extension(result)
         if extension is None:
             continue
@@ -965,7 +1070,7 @@ def artifact_media_embedding_obligation_outstanding(tool_results: Iterable[ToolR
                 continue
             outstanding.discard(extension)
             continue
-        if _artifact_result_reports_media_failure(result):
+        if _artifact_failure_requires_media(result):
             outstanding.add(extension)
     return bool(outstanding)
 
@@ -997,6 +1102,31 @@ def _artifact_result_paths_matching_extension(result: ToolResult, extension: str
     return tuple(path for path in _artifact_result_paths(result) if Path(path).suffix.lower() == normalized)
 
 
+def artifact_valid_plain_media_siblings(tool_results, selected_paths, *, required_extensions=()) -> frozenset[str]:
+    """Allow separately selected plain outputs beside a verified media output.
+
+    A typed final manifest can preserve multiple requested files of one format;
+    it cannot satisfy the media obligation with an unselected older draft.
+    """
+    from nullion.artifact_lifecycle import delivery_manifest
+    selected = tuple(dict.fromkeys(str(path) for path in selected_paths))
+    selected_ids = _path_identity_set(selected)
+    required_counts = Counter(required_extensions)
+    manifest = delivery_manifest(tool_results)
+    if manifest is not None:
+        manifest_ids = _path_identity_set(manifest)
+        for extension, count in Counter(Path(path).suffix.lower() for path in selected).items():
+            if all(_path_matches_identities(path, manifest_ids) for path in selected):
+                required_counts[extension] = max(required_counts[extension], count)
+    verified_formats = {
+        Path(path).suffix.lower()
+        for path in artifact_completed_embedded_media_paths(tool_results)
+        if _path_matches_identities(path, selected_ids) and Path(path).is_file()
+    }
+    return frozenset(path for path in selected
+        if required_counts[Path(path).suffix.lower()] > 1 and Path(path).suffix.lower() in verified_formats)
+
+
 def artifact_plain_replacement_artifact_paths(tool_results: Iterable[ToolResult] | None) -> tuple[str, ...]:
     results = tuple(tool_results or ())
     outstanding: set[str] = set()
@@ -1006,6 +1136,8 @@ def artifact_plain_replacement_artifact_paths(tool_results: Iterable[ToolResult]
     verified_browser_screenshot_identities = _browser_screenshot_path_identities(results, verified=True)
     if collected_image_identities:
         for result in results:
+            if not _artifact_result_is_producer_receipt(result):
+                continue
             extension = _artifact_result_media_extension(result)
             if extension is None:
                 continue
@@ -1020,6 +1152,8 @@ def artifact_plain_replacement_artifact_paths(tool_results: Iterable[ToolResult]
     for result in results:
         for extension in _artifact_result_required_media_extensions(result):
             outstanding.add(extension)
+        if not _artifact_result_is_producer_receipt(result):
+            continue
         extension = _artifact_result_media_extension(result)
         if extension is None:
             continue
@@ -1033,9 +1167,39 @@ def artifact_plain_replacement_artifact_paths(tool_results: Iterable[ToolResult]
             elif extension in outstanding:
                 paths.extend(_artifact_result_paths_matching_extension(result, extension))
             continue
-        if _artifact_result_reports_media_failure(result):
+        if _artifact_failure_requires_media(result):
             outstanding.add(extension)
-    return tuple(dict.fromkeys(paths))
+    # A repair can overwrite the same managed path. The old receipt remains
+    # audit history; its missing media must not invalidate the verified newer
+    # file. Only the latest completed producer for that exact path can clear it.
+    latest_by_path = {}
+    for result in results:
+        if not _artifact_result_is_producer_receipt(result):
+            continue
+        extension = _artifact_result_media_extension(result)
+        if extension is None or normalize_tool_status(result.status) != "completed":
+            continue
+        for path in _artifact_result_paths_matching_extension(result, extension):
+            latest_by_path.update({variant: result for variant in _path_identity_variants(path)})
+    repaired = set()
+    for path in paths:
+        latest = next((latest_by_path[variant] for variant in _path_identity_variants(path)
+                       if variant in latest_by_path), None)
+        if latest is None:
+            continue
+        if (_artifact_result_media_count(latest,
+                known_browser_screenshot_identities=browser_screenshot_identities,
+                verified_browser_screenshot_identities=verified_browser_screenshot_identities) > 0
+                and (not collected_image_identities or any(
+                    _path_matches_identities(source, collected_image_identities)
+                    for source in _artifact_result_embedded_source_image_paths(latest)))):
+            repaired.update(_path_identity_variants(path))
+    paths = [path for path in paths if not _path_matches_identities(path, repaired)]
+    from nullion.artifact_lifecycle import delivery_manifest
+    manifest = delivery_manifest(results)
+    allowed = artifact_valid_plain_media_siblings(results, manifest) if manifest is not None else frozenset()
+    allowed_ids = _path_identity_set(allowed)
+    return tuple(path for path in dict.fromkeys(paths) if not _path_matches_identities(path, allowed_ids))
 
 
 def artifact_media_plain_replacement_guard_result(
@@ -1065,7 +1229,12 @@ def artifact_media_plain_replacement_guard_result(
             },
             error,
         )
-    extension = _artifact_media_tool_extension(invocation.tool_name)
+    extension = _artifact_invocation_media_extension(invocation)
+    if (invocation.tool_name == "spreadsheet_create"
+            and Path(str(invocation.arguments.get("output_path") or "")).suffix.lower() in {".csv", ".tsv"}):
+        # These native spreadsheet output variants are data exports. They
+        # cannot embed media and do not replace the visual workbook sibling.
+        return None
     if extension is None:
         return None
     outstanding_extensions = set(normalize_artifact_media_required_extensions(required_embedded_media_extensions))
@@ -1078,19 +1247,19 @@ def artifact_media_plain_replacement_guard_result(
             collected_browser_images_available = True
             continue
         outstanding_extensions.update(_artifact_result_required_media_extensions(result))
-        result_extension = _artifact_media_tool_extension(getattr(result, "tool_name", None))
+        result_extension = _artifact_result_media_extension(result)
         if result_extension is None:
             continue
         output = result.output if isinstance(result.output, dict) else {}
-        media_count = _artifact_media_count(
-            output,
+        media_count = _artifact_result_media_count(
+            result,
             known_browser_screenshot_identities=browser_screenshot_identities,
             verified_browser_screenshot_identities=verified_browser_screenshot_identities,
         )
         if normalize_tool_status(getattr(result, "status", None)) == "completed" and media_count > 0:
             outstanding_extensions.discard(result_extension)
             continue
-        if _artifact_result_reports_media_failure(result):
+        if _artifact_failure_requires_media(result):
             outstanding_extensions.add(result_extension)
             if result_extension == extension:
                 prior_media_failure = True
@@ -1105,6 +1274,17 @@ def artifact_media_plain_replacement_guard_result(
         # preliminary read are unnecessary; the permission-checked handler
         # inspects the saved PDF and final fulfillment checks its real media.
         return None
+    target = invocation.arguments.get("output_path") or invocation.arguments.get("path")
+    if isinstance(target, str) and Path(target).is_absolute():
+        # A distinct plain sibling is only a candidate. The typed selector and
+        # final per-format media check still require the verified illustrated
+        # output; a plain draft cannot replace it. This permits a separate memo
+        # beside a poster without treating both as revisions of one document.
+        target_id = str(Path(target).expanduser().resolve())
+        if any(Path(path).suffix.lower() == extension and Path(path).is_file()
+               and str(Path(path).expanduser().resolve()) != target_id
+               for path in artifact_completed_embedded_media_paths(prior_results)):
+            return None
     label = _artifact_media_label(extension)
     first_attempt_required = extension in set(normalize_artifact_media_required_extensions(required_embedded_media_extensions))
     reason = (
@@ -1127,9 +1307,20 @@ def artifact_media_plain_replacement_guard_result(
     )
     error = (
         error_prefix
-        + "Do not create or deliver a replacement artifact without embedded media; fetch or save local raster "
-        "artifact files first, then retry with row- or artifact-aligned image/screenshot path inputs."
+        + "Supply the actual supported artwork and preserve the requested layout and formats. "
+        "PDF/HTML can use complete self-contained inline SVG drawings; native image-path adapters also "
+        "support compatible local artwork. Do not regenerate a separate plain sibling or the whole package."
     )
+    from nullion.artifact_evidence import html_svg_media_summary
+    pages = invocation.arguments.get("html_pages") or ()
+    pages = pages if isinstance(pages, (list, tuple)) else ()
+    text_pages = invocation.arguments.get("text_pages") or ()
+    text_pages = text_pages if isinstance(text_pages, (list, tuple)) else ()
+    media_input_summary = {
+        "html_page_count": len(pages),
+        "text_page_count": len(text_pages),
+        "html_media": [html_svg_media_summary(page) for page in pages[:20] if isinstance(page, str)],
+    }
     return ToolResult(
         invocation.invocation_id,
         invocation.tool_name,
@@ -1137,9 +1328,11 @@ def artifact_media_plain_replacement_guard_result(
         {
             "reason": reason,
             "message": error,
+            "media_input_summary": media_input_summary,
             "artifact_extensions": [extension],
             "embedded_media_artifact_extensions": [extension],
-            "required_arguments": ["image_paths", "screenshot_paths"],
+            "required_arguments": (["image_paths", "screenshot_paths", "html_pages"]
+                                   if extension == ".pdf" else ["image_paths", "screenshot_paths"]),
         },
         error,
     )
@@ -1149,7 +1342,7 @@ def spreadsheet_media_embedding_was_required(tool_results: Iterable[ToolResult] 
     return "spreadsheet_create" in {
         result.tool_name
         for result in tool_results or ()
-        if _artifact_result_reports_media_failure(result)
+        if _artifact_failure_requires_media(result)
     }
 
 
@@ -1248,7 +1441,7 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
                 path
                 for path in _terminal_exec_stdout_artifact_paths(output)
                 if not scoped_required_extensions
-                or Path(path).suffix.lower() in scoped_required_extensions
+                or artifact_format_extension(path) in scoped_required_extensions
             )
         if output_has_artifact_descriptors(output):
             paths.extend(artifact_paths_from_output_descriptors(output, roles=ARTIFACT_DELIVERY_ROLES))
@@ -1275,7 +1468,7 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
                     continue
                 if (
                     scoped_required_extensions
-                    and Path(path).suffix.lower() not in scoped_required_extensions
+                    and artifact_format_extension(path) not in scoped_required_extensions
                 ):
                     continue
                 paths.append(path)
@@ -1297,7 +1490,7 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
                 if (
                     tool_name in {"file_write", "terminal_exec"}
                     and scoped_required_extensions
-                    and Path(value).suffix.lower() not in scoped_required_extensions
+                    and artifact_format_extension(value) not in scoped_required_extensions
                 ):
                     continue
                 paths.append(value)
@@ -1316,7 +1509,7 @@ def artifact_paths_from_tool_results(tool_results: Iterable[ToolResult] | None) 
                     and not (
                         tool_name in {"file_write", "terminal_exec"}
                         and scoped_required_extensions
-                        and Path(value).suffix.lower() not in scoped_required_extensions
+                        and artifact_format_extension(value) not in scoped_required_extensions
                     )
                 )
     from nullion.artifact_lifecycle import filter_delivery_paths
@@ -1662,6 +1855,7 @@ def _required_extension_counts(required_attachment_extensions: Iterable[str] | N
             continue
         if not normalized.startswith("."):
             normalized = f".{normalized}"
+        normalized = artifact_format_extension("file" + normalized)
         if is_domain_suffix_extension(normalized):
             continue
         counts[normalized] = counts.get(normalized, 0) + 1
@@ -1671,7 +1865,7 @@ def _required_extension_counts(required_attachment_extensions: Iterable[str] | N
 def _paths_matching_required_extension(paths: Iterable[str], required_extension: str | None) -> list[str]:
     if required_extension is None:
         return list(paths)
-    return [path for path in paths if Path(path).suffix.lower() == required_extension]
+    return [path for path in paths if artifact_format_extension(path) == artifact_format_extension("file" + required_extension)]
 
 
 def _path_extension_counts(paths: Iterable[str]) -> dict[str, int]:
@@ -1684,7 +1878,7 @@ def _path_extension_counts(paths: Iterable[str]) -> dict[str, int]:
         if path in seen_paths:
             continue
         seen_paths.add(path)
-        suffix = Path(path).suffix.lower()
+        suffix = artifact_format_extension(path)
         if not suffix:
             continue
         counts[suffix] = counts.get(suffix, 0) + 1
@@ -1809,51 +2003,61 @@ def _missing_dependency_reply(tool_results: Iterable[ToolResult] | None) -> str 
         output = result.output if isinstance(result.output, dict) else {}
         if output.get("reason") != "missing_dependency":
             continue
-        package = str(output.get("package") or output.get("dependency") or "").strip()
-        if not package:
-            continue
-        license_name = str(output.get("license") or "").strip()
-        install_command = str(output.get("install_command") or "").strip()
-        tool_name = str(getattr(result, "tool_name", "") or "tool").strip()
-        lines = [
-            f"I need the open-source `{package}` package before I can create this file with `{tool_name}`.",
-        ]
-        if license_name:
-            lines.append(f"License: {license_name}.")
-        if install_command:
-            lines.append(f"Install command: `{install_command}`.")
-        lines.append("Please approve installing it, then I can retry the file delivery.")
-        return "\n".join(lines)
+        return ("A required dependency is unavailable. Installation requires approval before retrying.")
+
     return None
 
 
-def _failed_artifact_producer_setup_reply(tool_results: Iterable[ToolResult] | None) -> str | None:
-    for result in tool_results or ():
-        if normalize_tool_status(getattr(result, "status", None)) not in {"failed", "denied"}:
+def _failed_artifact_producer_setup_reply(tool_results: Iterable[ToolResult] | None, *, provider_rejections_only=False) -> str | None:
+    for result in reversed(tuple(tool_results or ())):
+        field = result.get if isinstance(result, Mapping) else lambda key, default=None: getattr(result, key, default)
+        if normalize_tool_status(field("status")) not in {"failed", "denied"}:
             continue
-        tool_name = str(getattr(result, "tool_name", "") or "").strip()
+        tool_name = str(field("tool_name", "") or "").strip()
         if tool_name not in STRUCTURED_ARTIFACT_PRODUCER_TOOLS:
             continue
-        error = str(getattr(result, "error", "") or "").strip()
-        output = result.output if isinstance(result.output, dict) else {}
+        error = str(field("error", "") or "").strip()
+        output = field("output") if isinstance(field("output"), Mapping) else {}
         reason = str(output.get("reason") or "").strip()
+        status = output.get("http_status_code")
+        if isinstance(status, int):
+            explanations = {
+                401: "The file provider rejected authentication (HTTP 401). Update its credentials in Settings, then retry.",
+                402: "The file provider requires payment or credits (HTTP 402). Add credits or update its billing, then retry.",
+                403: "The file provider denied this request (HTTP 403). Check its permissions and model access, then retry.",
+                429: "The file provider is rate limited (HTTP 429). Wait before retrying.",
+            }
+            if status in explanations:
+                return explanations[status]
+            if status >= 500:
+                return f"The file provider failed (HTTP {status}). Retry when the provider is available."
+        if provider_rejections_only:
+            continue
         if reason == "binary_file_read_boundary":
             continue
-        if tool_name == "image_generate":
-            detail = error or reason or "image generation did not complete"
+        if reason == "provider_not_configured":
             lines = [
-                "I couldn't generate the requested image because the configured image provider is not ready.",
-                f"Tool result: {detail}.",
+                "The requested file could not be generated because its provider is not configured.",
                 "Options:",
-                "1. Add the missing image provider API key in Settings, then retry.",
-                "2. Switch image generation to a configured local command or provider.",
-                "3. Ask me to create a non-image fallback artifact such as a PDF, SVG, or Markdown brief.",
+                "1. Configure the provider in Settings, then retry.",
+                "2. Choose another configured generator.",
+                "3. Choose another output format.",
             ]
             return "\n".join(lines)
+        if reason == "missing_dependency":
+            return "The requested file could not be generated because a required dependency is unavailable. Approve its installation before retrying."
+        if reason == "handler_timeout":
+            return "The file-generation step timed out. The requested file has not been confirmed."
+        if reason == "request_plan_conflict":
+            return "The proposed file-generation step was withheld because its plan needed correction. The requested file has not been confirmed."
         if error or reason:
-            label = tool_name.replace("_", " ")
-            return f"I couldn't create the requested file with `{label}`: {error or reason}."
+            return "A file-generation step failed. The requested file has not been confirmed."
     return None
+
+
+def artifact_delivery_failure_reply(tool_results, *, default="I couldn't attach the requested file.") -> str:
+    """Shared failure content for fulfillment and platform delivery boundaries."""
+    return _failed_artifact_producer_setup_reply(tool_results, provider_rejections_only=True) or default
 
 
 def _reply_is_failed_artifact_producer_setup_reply(
@@ -1868,15 +2072,35 @@ def _reply_is_failed_artifact_producer_setup_reply(
         setup_reply = _failed_artifact_producer_setup_reply((result,))
         if setup_reply and normalized_text == setup_reply.rstrip("."):
             return True
+        # Content-safety compatibility for old formatter output: the exact
+        # private diagnostic is unsafe in any surrounding language. This
+        # changes only copy after files have independently passed selection
+        # and validation; it grants no delivery or completion authority.
+        diagnostic = str(getattr(result, 'error', '') or '').strip().rstrip('.')
+        if (result.tool_name in STRUCTURED_ARTIFACT_PRODUCER_TOOLS
+                and len(diagnostic) >= 40 and diagnostic in normalized_text):
+            return True
     return False
 
 
-def operation_failure_reply(tool_results: Iterable[ToolResult]) -> str:
+def operation_failure_reply(tool_results: Iterable[ToolResult], *, required_tool_names=None) -> str:
     """Explain typed failures without leaking provider payloads or promising a retry."""
     from nullion.browser_capture_contract import repaired_browser_results
 
     tool_results = repaired_browser_results(tool_results)
     failures = [result for result in tool_results if normalize_tool_status(result.status) in {"failed", "denied"}]
+    if required_tool_names is not None:
+        failures = [r for r in failures if r.tool_name in set(required_tool_names)]
+    elif any(normalize_tool_status(r.status) == "completed" and isinstance(r.output, dict)
+             and (r.output.get('text') or r.output.get('source_record_collections')
+                  or r.output.get('action_receipt')) for r in tool_results):
+        # Useful evidence is not proof of universal recovery. Without a
+        # requirement/failure binding it is also not proof that an earlier
+        # failed attempt caused the current gap.
+        failures = []
+    if failures and all(isinstance(r.output, dict) and r.output.get('executed') is False
+                        and r.output.get('reason') == 'request_plan_conflict' for r in failures):
+        return "A proposed step was withheld because its plan needed correction. The requested result remains unconfirmed."
     browser_failures = [result for result in failures if result.tool_name.startswith("browser_")]
     if browser_failures:
         reasons = {result.output.get("reason") for result in browser_failures
@@ -1886,7 +2110,7 @@ def operation_failure_reply(tool_results: Iterable[ToolResult]) -> str:
         if "browser_action_failed" in reasons:
             return "I couldn't finish because the page interaction failed. The requested result wasn't confirmed."
         return "I couldn't finish because the browser operation failed. The requested result wasn't confirmed."
-    if any(result.status == "denied" for result in failures):
+    if any(normalize_tool_status(result.status) == "denied" for result in failures):
         return "I couldn't complete the request because the required action wasn't authorized."
     if failures:
         return "I couldn't complete the request because a required step failed."
@@ -1909,15 +2133,43 @@ def evaluate_response_fulfillment(
     excluded_artifact_paths: Iterable[str] | None = None,
 ) -> ResponseFulfillmentDecision:
     """Validate that a final response is backed by required runtime evidence."""
-    frame = _active_frame_for_contract(store, conversation_id)
     normalized_results = [
         (result, normalize_tool_status(getattr(result, "status", None)))
         for result in (tool_results or ())
     ]
+    from nullion.request_delivery_requirements import reviewed_request_delivery_requirements
+    reviewed_requirements = reviewed_request_delivery_requirements(
+        [result for result, _status in normalized_results], user_message)
+    from nullion.execution_review_evidence import reviewed_execution_evidence
+    execution_review = reviewed_execution_evidence([r for r, _ in normalized_results], user_message, reply)
+    frame = None if reviewed_requirements is not None else _active_frame_for_contract(store, conversation_id)
+    if reviewed_requirements is not None:
+        required_attachment_extensions = reviewed_requirements['required_attachment_extensions']
     completed_tool_names = {result.tool_name for result, status in normalized_results if status == "completed"}
     attempted_tool_names = {result.tool_name for result, _status in normalized_results}
 
-    explicit_required_extension_counts = _required_extension_counts(required_attachment_extensions)
+    current_scopes = [result.output for result, status in normalized_results
+        if result.tool_name == "request_tool_scope" and status == "completed" and isinstance(result.output, Mapping)]
+    from nullion.source_selection import current_read_only_local_scope
+    read_only_lookup = current_read_only_local_scope(result for result, _status in normalized_results)
+    superseded_tools = set(current_scopes[-1].get("superseded_unselected_required_tool_names", ())) if read_only_lookup else set()
+    # These names come only from the runtime's blocked-registry scope result,
+    # after checking ToolSpec.READ. Retiring an implementation never supplies
+    # evidence for the source goal, which the independent outcome gate checks.
+    failed_tools = {result.tool_name for result, status in normalized_results if status in {"failed", "denied", "error"}}
+    for scope in current_scopes:
+        superseded_tools.update(name for name in scope.get("retired_preparatory_read_tools", ()) if name in failed_tools)
+    required_tool_names = tuple(name for name in (required_tool_names or ()) if name not in superseded_tools)
+    if reviewed_requirements is not None and 'eligible_evidence_tool_names' in reviewed_requirements:
+        required_tool_names = tuple(name for name in required_tool_names
+            if name in reviewed_requirements['eligible_evidence_tool_names'])
+    excluded_extensions = set(_normalize_valid_attachment_extensions(
+        current_scopes[-1].get("excluded_artifact_extensions", ()))) if current_scopes else set()
+    from nullion.artifact_lifecycle import restored_delivery_paths
+    excluded_extensions.difference_update(artifact_format_extension(path) for path in restored_delivery_paths(
+        result for result, _status in normalized_results))
+    explicit_required_extension_counts = {} if read_only_lookup else {extension: count for extension, count in
+        _required_extension_counts(required_attachment_extensions).items() if extension not in excluded_extensions}
     explicit_required_extensions = tuple(explicit_required_extension_counts)
     required_tools: set[str] = set()
     required_tools.update(
@@ -1928,14 +2180,21 @@ def evaluate_response_fulfillment(
     requires_artifact = False
     artifact_kind = explicit_required_extensions[0].removeprefix(".") if explicit_required_extensions else "file"
     if frame is not None:
-        required_tools.update(frame.finish.required_tool_completion)
-        requires_artifact = bool(frame.finish.requires_artifact_delivery)
-        artifact_kind = frame.finish.required_artifact_kind or frame.output.artifact_kind or artifact_kind
+        required_tools.update(name for name in frame.finish.required_tool_completion if name not in superseded_tools)
+        requires_artifact = bool(frame.finish.requires_artifact_delivery) and not read_only_lookup
+        if not read_only_lookup:
+            artifact_kind = frame.finish.required_artifact_kind or frame.output.artifact_kind or artifact_kind
         if frame.status is TaskFrameStatus.WAITING_INPUT and not normalized_results and not artifact_paths:
             # Waiting-input frames represent an explicit clarification turn.
             # Do not convert that question into an artifact-delivery failure.
             return ResponseFulfillmentDecision(True, reply)
     required_extension = _required_extension_for_artifact_kind(artifact_kind)
+    if required_extension in excluded_extensions:
+        # A current validated scope can replace the output contract inherited
+        # from an older task frame. A filename-only follow-up must not recreate
+        # or reattach an explicitly excluded prior report.
+        required_extension = None
+        requires_artifact = False
     if required_extension is None and explicit_required_extensions:
         required_extension = explicit_required_extensions[0]
     if explicit_required_extensions:
@@ -1949,6 +2208,10 @@ def evaluate_response_fulfillment(
             ]
         )
     )
+    media_required_extensions = tuple(extension for extension in media_required_extensions if extension not in excluded_extensions)
+    if reviewed_requirements is not None:
+        media_required_extensions = tuple(extension for extension in media_required_extensions
+            if extension in reviewed_requirements['required_attachment_extensions'])
     if explicit_required_extensions:
         media_required_extensions = tuple(
             extension
@@ -1986,6 +2249,18 @@ def evaluate_response_fulfillment(
         for path in artifact_plain_replacement_artifact_paths(result for result, _status in normalized_results)
     }
     if invalid_plain_media_artifact_paths:
+        # An extension-level media obligation requires a verified media output;
+        # it does not turn a separately requested linked/plain sibling into a
+        # failed replacement. Only current, explicitly selected files qualify.
+        allowed_siblings = artifact_valid_plain_media_siblings(
+            [result for result, _status in normalized_results],
+            _existing_deliverable_paths(artifact_paths or (), artifact_roots=artifact_roots),
+            required_extensions=tuple(extension for extension, count in explicit_required_extension_counts.items()
+                for _ in range(count)))
+        allowed_ids = _path_identity_set(allowed_siblings)
+        invalid_plain_media_artifact_paths = {path for path in invalid_plain_media_artifact_paths
+            if not _path_matches_identities(path, allowed_ids)}
+    if invalid_plain_media_artifact_paths:
         combined_artifact_paths = [
             path
             for path in combined_artifact_paths
@@ -1997,9 +2272,15 @@ def evaluate_response_fulfillment(
             for path in combined_artifact_paths
             if str(path or "").strip() and str(Path(path).expanduser()) not in excluded_paths
         ]
+    # A scope that did not request source delivery cannot acquire a new
+    # attachment obligation solely from a model-written MEDIA pointer. Real
+    # producer receipts and explicit frame/format requirements still apply.
+    source_delivery_not_requested = bool(
+        (reviewed_requirements is not None and not reviewed_requirements['required_attachment_extensions'])
+        or (current_scopes and current_scopes[-1].get("source_artifact_delivery_requested") is False))
     delivery_contract = delivery_contract_for_turn(
         None,
-        reply=reply,
+        reply=("" if source_delivery_not_requested and not requires_artifact and not combined_artifact_paths else reply),
         artifact_paths=combined_artifact_paths,
         requires_attachment_delivery=requires_artifact,
         required_attachment_extensions=(
@@ -2092,10 +2373,23 @@ def evaluate_response_fulfillment(
         if requirement not in missing:
             missing.append(requirement)
     if missing:
-        setup_reply = _failed_artifact_producer_setup_reply(result for result, status in normalized_results if status != "completed")
+        logging.getLogger(__name__).warning(
+            "response fulfillment incomplete conversation_id=%s missing=%s completed=%s",
+            conversation_id, tuple(missing), tuple(sorted(completed_tool_names)))
+        review = execution_review
+        partial_reply = (review.partial_reply if review else None) or (
+            reviewed_requirements.get('partial_reply') if reviewed_requirements else None)
+        if partial_reply:
+            return ResponseFulfillmentDecision(False, partial_reply, tuple(missing))
+        # Producer failures cannot explain an unrelated missing action. Use
+        # only failure receipts relevant to the unmet output/tool contract.
+        failure_results = [result for result, status in normalized_results if status != "completed"
+            and (any(item.startswith(('attachment:', 'attachment_with_embedded_media:')) for item in missing)
+                 or result.tool_name in missing_tools)]
+        setup_reply = _failed_artifact_producer_setup_reply(failure_results)
         if setup_reply and not existing_deliverables:
             return ResponseFulfillmentDecision(False, setup_reply, tuple(missing))
-        missing_dependency_reply = _missing_dependency_reply(result for result, status in normalized_results if status != "completed")
+        missing_dependency_reply = _missing_dependency_reply(failure_results)
         if missing_dependency_reply and not existing_deliverables:
             return ResponseFulfillmentDecision(False, missing_dependency_reply, tuple(missing))
         missing_attachments = [
@@ -2105,16 +2399,26 @@ def evaluate_response_fulfillment(
         ]
         attachment_missing = bool(missing_attachments)
         if attachment_missing:
+            if (reviewed_requirements and isinstance(reviewed_requirements.get('partial_reply'), str)
+                    and len(missing_attachments) == len(missing)):
+                return ResponseFulfillmentDecision(False, reviewed_requirements['partial_reply'], tuple(missing))
             response = (
                 "I couldn't attach all of the requested files."
                 if existing_deliverables and (len(missing_attachments) > 1 or len(explicit_required_extensions) > 1)
                 else "I couldn't attach the requested file."
             )
         elif attempted_tool_names:
-            response = operation_failure_reply(result for result, _status in normalized_results)
+            response = operation_failure_reply((result for result, _status in normalized_results),
+                required_tool_names=missing_tools)
         else:
             response = "I need more output before this task can be completed."
+        if attachment_missing:
+            response = artifact_delivery_failure_reply(failure_results, default=response)
         return ResponseFulfillmentDecision(False, response, tuple(missing))
+
+    if execution_review is not None and not execution_review.complete:
+        return ResponseFulfillmentDecision(False, execution_review.partial_reply or reply,
+            ("outcome:unconfirmed",))
 
     if valid_artifacts and _reply_mentions_only_wrong_extension(
         reply,
@@ -2239,6 +2543,8 @@ def evaluate_response_execution_outcome(
             if str(path or "").strip() and str(Path(path).expanduser()) not in excluded_paths
         ]
     delivered_artifacts = combined_artifacts if platform_artifact_count or delivery_status in {"sent", "saved"} else ()
+    from nullion.execution_review_evidence import reviewed_execution_evidence
+    review = reviewed_execution_evidence(tool_results, user_message, reply)
     outcome = build_execution_outcome(
         requested_outcome=user_message,
         user_visible_message=decision.reply,
@@ -2248,6 +2554,7 @@ def evaluate_response_execution_outcome(
         delivery_status=delivery_status,
         fulfillment_satisfied=decision.satisfied,
         missing_requirements=_display_missing_requirements(decision.missing_requirements),
+        reviewed_execution=review,
     )
     reply = decision.reply
     required_delivered_artifacts: list[str] = []
@@ -2264,7 +2571,11 @@ def evaluate_response_execution_outcome(
     ):
         reply = _artifact_package_delivery_reply(required_delivered_artifacts)
     if outcome.status is ExecutionStatus.NEEDS_USER_ACTION and outcome.failure_reason:
-        reply = _needs_user_action_reply(outcome.failure_reason, outcome.next_action)
+        notice = _needs_user_action_reply(outcome.failure_reason, outcome.next_action)
+        # A request/evidence-bound partial answer already contains the owner's
+        # findings and actionable blocker. Rewriting it here invalidates that
+        # binding; a second adapter would then replace it with only a notice.
+        reply = review.partial_reply if review and review.partial_reply else notice
     satisfied = decision.satisfied and outcome.status not in {
         ExecutionStatus.NEEDS_USER_ACTION,
         ExecutionStatus.FAILED,

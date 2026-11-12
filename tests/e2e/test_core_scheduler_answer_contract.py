@@ -1,5 +1,6 @@
 """Real chat route, scheduler store and core execution discovery; provider is fake."""
 from __future__ import annotations
+from tests.workflow_provider_protocol import workflow_provider_reply
 import json
 import os
 import time
@@ -24,6 +25,8 @@ def test_scheduler_question_synthesizes_relevant_answer(tmp_path, monkeypatch, p
     class Model:
         def __init__(self): self.phase = 0; self.tools = []; self.plain = False
         def create(self, **kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             names = {tool['name'] for tool in kw.get('tools', [])}
             self.tools.append(names)
             if self.plain:
@@ -88,6 +91,8 @@ def test_core_exec_scope_preserves_real_runtime_approval_gate(tmp_path,monkeypat
         lambda inv:executed.append(inv) or ToolResult(inv.invocation_id,inv.tool_name,'completed',{'stdout':'fixture'}))
     class Model:
         def create(self,**kw):
+            protocol_reply = workflow_provider_reply(kw, completion=True)
+            if protocol_reply is not None: return protocol_reply
             assert 'terminal_exec' in {t['name'] for t in kw.get('tools',[])}
             return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'exec','name':'terminal_exec',
                 'input':{'command':'printf fixture'}}]}
