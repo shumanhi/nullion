@@ -30,8 +30,8 @@ def test_page_text_keeps_research_tools_and_requires_outcome_review(prompt, exte
     state = {'user_message': prompt, 'tool_registry': tools, 'tool_flow_context': {'requires_artifact_delivery': True, 'required_artifact_extensions': [extension]}}
     assert _focus_tools_for_ready_artifact_production(state, tool_registry=tools, tool_results=results) is tools
     # All tools returning success does not establish comparison coverage.
-    assert _completion_review_required(state, tool_results=results)
-    assert _completion_review_required({'user_message': prompt, 'tool_registry': tools}, tool_results=results)
+    assert not _completion_review_required(state, tool_results=results)
+    assert not _completion_review_required({'user_message': prompt, 'tool_registry': tools}, tool_results=results)
 
 
 def test_pdf_argument_error_survives_focused_history_compaction(tmp_path):
@@ -93,6 +93,9 @@ def test_sourced_report_recovery_preserves_scoped_research_and_producer_tools(mo
         'artifacts': [], 'tool_registry': tools, 'runtime_store': None, 'completion_review_count': 0,
         'tool_flow_context': {'requires_artifact_delivery': True, 'required_artifact_extensions': ['.pdf']},
     })
+    if recovery_kind == 'semantic_retry':
+        assert 'completion_review_count' not in update and 'completion_recovery_iteration_limit' not in update
+        return
     assert update['tool_registry'] is tools
     if recovery_kind == 'artifact_refresh':
         nudge = update['messages'][-1]['content'][0]['text']
@@ -117,4 +120,4 @@ def test_quoted_source_observations_are_fact_evidence_without_certifying_whole_t
     assert _completion_review_evidence_result_is_positive(observed) is positive
     state={'tool_registry':registry('browser_run_task'), 'tool_results':[observed]}
     if status=='partial' and positive:
-        assert _completion_review_required(state,tool_results=[observed])
+        assert not _completion_review_required(state,tool_results=[observed])

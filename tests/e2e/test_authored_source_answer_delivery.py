@@ -16,7 +16,7 @@ CAPTURE = json.loads((Path(__file__).parents[1]/'fixtures/ticket_context_only_ob
 @pytest.mark.parametrize('surface', ['web', 'telegram'])
 @pytest.mark.parametrize('mode', ['no_result', 'verified_result'])
 @pytest.mark.parametrize('prompt', ['次の次の月曜の夜の上映を探して。', 'Busca una función para el lunes siguiente, por la noche.'])
-def test_review_timeout_preserves_authored_answer_without_context_dump(tmp_path, monkeypatch, surface, mode, prompt):
+def test_primary_answer_preserves_requested_findings_without_context_dump(tmp_path, monkeypatch, surface, mode, prompt):
     from fastapi.testclient import TestClient
     from nullion import web_app, chat_operator, crons
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -50,6 +50,7 @@ def test_review_timeout_preserves_authored_answer_without_context_dump(tmp_path,
         if mode == 'verified_result' else 'I could not verify a Ramayana screening for Monday, November 16 after 7 PM.')
     class Provider:
         presentations = 0
+        observed = False
         def create(self, **kw):
             system = kw.get('system') or ''
             names = {tool['name'] for tool in kw.get('tools') or ()}
@@ -87,6 +88,9 @@ def test_review_timeout_preserves_authored_answer_without_context_dump(tmp_path,
             if 'browser_run_task' not in names:
                 return tool_response('request_tool_scope', {'capabilities': ['web'], 'tool_names': ['browser_run_task'],
                     'required_tool_names': ['browser_run_task']})
+            if self.observed:
+                return text_response(summary + '\n\nThe remaining ticket sources did not provide a requested-date result.')
+            self.observed = True
             return tool_response('browser_run_task', {'url': 'https://tickets.example/', 'task': prompt, 'max_steps': 6})
     provider = Provider()
     orchestrator = AgentOrchestrator(model_client=provider)
@@ -105,5 +109,5 @@ def test_review_timeout_preserves_authored_answer_without_context_dump(tmp_path,
     assert 'Select Date' not in reply and 'Select a Theatre' not in reply and '3hr 15m' not in reply
     assert 'AMC 84th Street' not in reply and 'Here are the findings' not in reply
     assert 'remaining ticket sources' in reply
-    assert len(calls) == 1 and provider.presentations == 1
-    assert '8 PM; 89 seats available.' in reply if mode == 'verified_result' else '- **' not in reply
+    assert len(calls) == 1 and provider.presentations == 0
+    assert '89 seats available' in reply if mode == 'verified_result' else '- **' not in reply

@@ -137,8 +137,8 @@ def test_search_identity_preserves_supported_outcome_without_unnecessary_researc
             if not discoveries:return tool_response('opaque_discover',{})
             if not reads:return tool_response('opaque_read',{'url':FILTERED})
             if mode not in {'collection','negative'} and BOOK not in reads:return tool_response('opaque_read',{'url':BOOK})
-            if self.reviews and mode=='negative' and ALT not in reads:return tool_response('opaque_read',{'url':ALT})
-            if self.reviews and mode=='wrong_filter' and reads.count(BOOK)<2:return tool_response('opaque_read',{'url':BOOK})
+            if mode=='negative' and ALT not in reads:return tool_response('opaque_read',{'url':ALT})
+            if mode=='wrong_filter' and reads.count(BOOK)<2:return tool_response('opaque_read',{'url':BOOK})
             return text_response('No qualifying options in the checked sources.' if mode=='negative' else '82 seats available. Booking: '+BOOK)
     model=Model()
     if surface=='web':
@@ -163,27 +163,15 @@ def test_search_identity_preserves_supported_outcome_without_unnecessary_researc
     client.close()
     events=runtime.store.list_recent_conversation_events(conversation,event_type='conversation.completion_review')
     assert len(discoveries)==1
-    if mode in {'protocol_error','inconsistent_summary'}:
-        assert '82' in reply and 'Some requested work remains incomplete' not in reply, ({k:v for k,v in data.items() if isinstance(v,(str,bool,int,float,type(None)))}, events[-1])
-        assert events[-1]['review_error']==('invalid_search_coverage_assessment' if mode=='protocol_error' else 'inconsistent_search_coverage_assessment')
-        assert data.get('response_fulfilled') is not True
-        assert not events[-1]['runtime_failure_code']
-        assert len(reads)==2 and model.reviews==1
+    assert not events and model.reviews == 0
+    assert 'Some requested work remains incomplete' not in reply
+    if mode == 'negative': assert reads == [FILTERED, ALT]
+    elif mode == 'wrong_filter': assert reads == [FILTERED, BOOK, BOOK]
     else:
-        assert events[-1]['disposition']=='complete' and not events[-1]['search_coverage_errors'],events
-        assert not events[-1]['runtime_failure_code']
-        assert 'Some requested work remains incomplete' not in reply
-        if mode=='negative':
-            assert reads==[FILTERED,ALT] and model.reviews==2
-        elif mode=='wrong_filter':
-            assert reads==[FILTERED,BOOK,BOOK] and model.reviews==2
-        else:
-            assert '82' in reply and 'Some requested work remains incomplete' not in reply, ({k:v for k,v in data.items() if isinstance(v,(str,bool,int,float,type(None)))}, events[-1])
-            # The typed collection already supports the final answer. Keeping
-            # that answer through publication avoids a second cron repair/review.
-            assert len(reads)==(1 if mode=='collection' else 2) and model.reviews==1
-            assert events[-1]['search_coverage_diagnostics']==['unobserved_candidate']
-        if surface=='cron': assert data.get('cron_delivery_status')=='sent',data
+        assert '82' in reply
+        assert len(reads) == (1 if mode == 'collection' else 2)
+    if surface == 'cron': assert data.get('cron_delivery_status') == 'sent',data
+
 
 
 @pytest.mark.parametrize('surface',['web','cron'])

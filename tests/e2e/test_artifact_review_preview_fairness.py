@@ -62,7 +62,7 @@ def test_seven_deliverables_keep_per_file_review_and_download_bytes(tmp_path,mon
         assert not model.errors,model.errors
         data=response.json();assert {r['path'] for r in data['artifacts']}==set(bodies),data
         for row in data['artifacts']:assert client.get(row['url']).content==bodies[row['path']].encode()
-        assert len(writes)==7 and model.reviews==1
+        assert len(writes)==7 and model.reviews==0
     restored=bootstrap_persistent_runtime(tmp_path/'runtime.db')
     turn=next(r for r in restored.store.list_conversation_events('web:preview-budget') if r.get('event_type')=='conversation.chat_turn')
     assert len([r for r in turn['tool_results'] if r['tool_name']=='file_write'])==7

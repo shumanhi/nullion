@@ -16,6 +16,7 @@ def compact_source_observations(output: object, *, max_chars: int = 12_000) -> d
     compact = {key: output[key] for key in (
         'backend', 'result_kind', 'report_status', 'artifact_paths', 'artifact_descriptors', 'continuation', 'goal_status', 'next_action', 'format',
         'elapsed_seconds', 'steps', 'page_url', 'rejected_observations', 'rejection_counts', 'omitted_unknown_count', 'evidence_value_repair_count', 'completion_scope', 'source_record_binding',
+        'artifact_delivery_manifest', 'artifact_producer_receipt_id',
     ) if key in output}
     compact['blocker'] = str(output['blocker'])[:1000] if output.get('blocker') else None
     captured = output.get('captured_documents')

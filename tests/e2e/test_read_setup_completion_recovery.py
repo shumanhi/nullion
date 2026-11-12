@@ -61,12 +61,11 @@ def test_reviewed_source_read_can_open_a_different_source(tmp_path,monkeypatch,p
             self.phase+=1
             if self.phase==1:return tool_response('request_tool_scope',{'capabilities':['web'],'tool_names':['source_read','source_open']})
             if self.phase==2:return tool_response('source_read',{})
-            if self.phase==3:return text_response('現在の値はまだ確認できません。')
-            if self.phase==4:
+            if self.phase==3:
                 assert 'source_open' in names,sorted(names)
                 return tool_response('source_open',{'source':'second'})
-            if self.phase==5:return tool_response('source_read',{})
-            assert self.phase==6,'Recovery repeated an unchanged source'
+            if self.phase==4:return tool_response('source_read',{})
+            assert self.phase==5,'Recovery repeated an unchanged source'
             return text_response('37')
 
     model=Model();runtime.model_client=model
@@ -76,6 +75,6 @@ def test_reviewed_source_read_can_open_a_different_source(tmp_path,monkeypatch,p
         assert calls==[('read','first'),('open','second'),('read','second')]
         turns=[row for row in runtime.store.list_conversation_events('web:reader-setup-recovery') if row.get('event_type')=='conversation.chat_turn']
         assert turns[-1]['response_fulfilled'] is True
-        assert model.reviews==2
+        assert model.reviews == 0
         history=client.get('/api/chat/history/web:reader-setup-recovery?sync_runtime=1').json()['messages']
         assert any(row['role']=='bot' and '37' in row['text'] for row in history)

@@ -56,4 +56,6 @@ def test_batch_toggle_has_distinct_bound_action_records_without_rereads(tmp_path
         turn=runtime.store.list_recent_conversation_events('web:batch-action',event_type='conversation.chat_turn')[-1]
         assert turn['response_fulfilled'] is True,turn
         assert [r['tool_name'] for r in turn['tool_results']]==['request_tool_scope','toggle_cron'],turn
-        assert set(seen)=={j.id for j in jobs} and model.plans==model.reviews==1 and model.phase==3
+        receipt=turn['tool_results'][-1]['output']
+        assert {row['id'] for row in receipt['results']} == {j.id for j in jobs}
+        assert model.plans==model.reviews==0 and model.phase==3

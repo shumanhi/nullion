@@ -88,7 +88,7 @@ async def test_scheduled_critique_preserves_producer_findings(monkeypatch) -> No
     assert result.status == "success"
     assert result.output == "Verified listing mention."
     assert result.error is None
-    assert result.report_presentation["outcome_review_role"] == "helper"
+    assert "outcome_review_role" not in (getattr(result, "report_presentation", None) or {})
 
 
 @pytest.mark.asyncio
@@ -144,4 +144,4 @@ async def test_scheduled_synthesis_does_not_need_editor_permission(monkeypatch) 
 
     assert result.status == "success"
     assert result.output == "draft output" and result.error is None
-    assert result.report_presentation["outcome_review_role"] == "helper"
+    assert "outcome_review_role" not in (getattr(result, "report_presentation", None) or {})

@@ -58,6 +58,7 @@ def test_correctable_browser_calls_recover_within_normal_budget(tmp_path, monkey
             scoped = ScopedTurnToolRegistry(registry, evidence=TurnToolEvidence(has_url_target=True, requested_extensions=(".png",)),
                 tool_scope_decision=TurnToolScopeDecision(valid=True, confidence=1,
                     web_action="browser_interaction", requested_artifact_extensions=(".png",),
+                    source_artifact_delivery_requested=True, source_artifact_request_evidence=f"{prompt} {url}",
                     requested_tool_names=("browser_open", "browser_navigate", "browser_wait_for", "browser_screenshot") + (("browser_extract_text",) if explain else ()),
                     required_tool_names=("browser_screenshot", "browser_wait_for")))
 
@@ -133,7 +134,8 @@ def test_correctable_browser_calls_recover_within_normal_budget(tmp_path, monkey
                 max_iterations=8)
             elapsed.append(time.perf_counter() - started)
             assert not result.reached_iteration_limit and not result.suspended_for_approval
-            assert result.response_fulfilled is not False
+            # The page capture is valid even when its source text reports 403.
+            assert result.response_fulfilled is True
             if explain:
                 assert "Reference A17" in result.final_text
                 assert model.calls == 6

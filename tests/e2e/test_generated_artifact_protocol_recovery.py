@@ -242,7 +242,7 @@ def test_malformed_generation_recovers_and_delivers_real_rendered_file(tmp_path,
             data=uploads[0]
             assert data==output.read_bytes()
         assert len(source_reads)==1 and phase==(5 if failure=='profile_budget' else 6)
-        assert len(reviews)==2
+        assert not reviews
         assert output.is_file()
         if extension=='.png':
             image=Image.open(io.BytesIO(data));assert image.size==(600,800)

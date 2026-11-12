@@ -8293,6 +8293,9 @@ async function sendMessage() {
   const commandLikeInput = rawText.trim().startsWith('/');
   const text = commandLikeInput ? routedMessageText : withModeInstruction(routedMessageText, mode);
   if (!text) return;
+  // A real send owns its history even while startup restoration is pending.
+  _chatUserInteractedSinceLoad = true;
+  _chatSaveEnabled = true;
   localStorage.removeItem('nullion_chat_restore_suppressed');
   const turnId = 'turn:' + Date.now().toString(36) + ':' + Math.random().toString(36).slice(2);
   _skipCurrentTurnSave = routedMessageText.startsWith('/') && !_isNewCommandText(routedMessageText);
@@ -16247,7 +16250,7 @@ finalizeBotMsg = function(fallback = null, isError = false, turnId = null) {
     const artifacts = metadata && Array.isArray(metadata.artifacts) ? metadata.artifacts : [];
     if (cleanText && cleanText !== '(no reply)') rememberDisplayedBotReply(text, artifacts);
     if (cleanText && cleanText !== '(no reply)') clearPendingTerminalReply(turnId || null);
-    if (cleanText && cleanText !== '(no reply)' && !skipSave) _chatSaveMsg('bot', text, isError, { ...(metadata || {}), ...(turnId ? { runtime_turn_id: turnId } : {}) });
+    if (cleanText && cleanText !== '(no reply)' && !skipSave) _chatSaveMsg('bot', text, isError, { ...(metadata || {}), ...(turnId ? { runtime_turn_id: turnId, history_message_kind: 'terminal_reply' } : {}) });
     _messageMetadataByTurn.delete(metadataKey);
     _activityEventsByTurn.delete(metadataKey);
   }

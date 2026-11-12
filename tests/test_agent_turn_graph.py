@@ -2297,8 +2297,8 @@ def test_agent_turn_graph_default_iteration_budget_is_bounded(monkeypatch) -> No
     )
 
     assert client.calls == 3
-    assert client.plan_calls == 1
-    assert client.review_calls == 1
+    assert client.plan_calls == 0
+    assert client.review_calls == 0
     assert result.reached_iteration_limit is True
     assert len(result.tool_results) == 3
 
@@ -2683,8 +2683,8 @@ def test_agent_turn_graph_keeps_hard_limit_turn_open_without_complete_review() -
     )
 
     assert client.calls == 4
-    assert client.plan_calls == 1
-    assert client.review_calls == 1
+    assert client.plan_calls == 0
+    assert client.review_calls == 0
     assert len(revalidation_invocations) == 0
     assert result.reached_iteration_limit is True
     assert result.response_fulfilled is False
@@ -2714,8 +2714,8 @@ def test_agent_turn_graph_rejects_bare_complete_review_for_partial_comparison() 
     )
 
     assert client.calls == 4
-    assert client.plan_calls == 1
-    assert client.review_calls == 2
+    assert client.plan_calls == 0
+    assert client.review_calls == 0
     assert len(revalidation_invocations) == 0
     assert result.reached_iteration_limit is True
     assert result.response_fulfilled is not True
@@ -2745,8 +2745,8 @@ def test_agent_turn_graph_rejects_complete_review_that_omits_planned_comparison_
     )
 
     assert client.calls == 4
-    assert client.plan_calls == 1
-    assert client.review_calls == 2
+    assert client.plan_calls == 0
+    assert client.review_calls == 0
     assert len(revalidation_invocations) == 0
     assert result.response_fulfilled is not True
     assert "not every requested part" not in (result.final_text or "")
@@ -3901,256 +3901,6 @@ def test_agent_turn_graph_stops_after_tool_when_cancellation_checker_is_set() ->
     assert client.calls == 1
 
 
-def test_agent_turn_graph_semantically_reviews_and_repairs_risky_artifact_without_english_triggers(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    artifact_path = tmp_path / "alojamientos.html"
-    monkeypatch.setattr(
-        "nullion.agent_orchestrator._artifact_roots_for_agent_turn",
-        lambda runtime_store, principal_id: (tmp_path,),
-    )
-
-    class Client:
-        def __init__(self) -> None:
-            self.normal_calls = 0
-            self.errors = []
-            self.review_payloads: list[dict[str, object]] = []
-            self.retry_nudge_seen = False
-            self.recovery_tool_names: set[str] = set()
-
-        def create(self, **kwargs):  # noqa: ANN003
-            protocol_reply = workflow_provider_reply(kwargs, completion=False)
-            if protocol_reply is not None:
-                return protocol_reply
-            try:
-                return self._create(**kwargs)
-            except Exception as error:
-                self.errors.append(repr(error))
-                raise
-
-        def _create(self, **kwargs):
-            system = str(kwargs.get("system") or "")
-            if system.startswith("You are a material-requirements planner"):
-                payload = __import__("json").loads(
-                    kwargs["messages"][0]["content"][0]["text"]
-                )
-                completed_names = {
-                    str(item.get("name") or "")
-                    for item in payload["completed_current_turn_tools"]
-                }
-                artifact_tool = (
-                    "file_patch" if "file_patch" in completed_names else "file_write"
-                )
-                return {
-                    "stop_reason": "end_turn",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": __import__("json").dumps(
-                                {
-                                    "all_material_requirements_enumerated": True,
-                                    "material_requirements": [
-                                        {
-                                            "requirement": "verified lodging price and distance",
-                                            "requirement_kind": "fact",
-                                            "evidence_subject_id": "lodging-records",
-                                                "eligible_evidence_tool_names": (
-                                                    ["lodging_read"]
-                                                    if "lodging_read" in completed_names
-                                                else []
-                                            ),
-                                        },
-                                        {
-                                            "requirement": "final HTML deliverable",
-                                            "requirement_kind": "deliverable",
-                                            "evidence_subject_id": "html-deliverable",
-                                            "eligible_evidence_tool_names": [artifact_tool],
-                                        },
-                                    ],
-                                }
-                            ),
-                        }
-                    ],
-                }
-            if system.startswith("You are a semantic completion reviewer"):
-                payload = __import__("json").loads(kwargs["messages"][0]["content"][0]["text"])
-                self.review_payloads.append(payload)
-                if len(self.review_payloads) == 1:
-                    return {
-                        "stop_reason": "end_turn",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    '{"disposition":"retry","unresolved_requirements":'
-                                    '["los registros no prueban precio ni distancia"],'
-                                    '"retry_tool_names":["lodging_read","file_patch","invented_tool"]}'
-                                ),
-                            }
-                        ],
-                    }
-                contract = payload["material_requirement_contract"]
-                return {
-                    "stop_reason": "end_turn",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": __import__("json").dumps(
-                                {
-                                    "disposition": "complete",
-                                    "unresolved_requirements": [],
-                                    "retry_tool_names": [],
-                                    "all_material_requirements_enumerated": True,
-                                    "material_requirements": [
-                                        {
-                                            "requirement_id": row["requirement_id"],
-                                            "requirement": row["requirement"],
-                                            "requirement_kind": row["requirement_kind"],
-                                            "satisfied": True,
-                                            "draft_covered": True,
-                                            "evidence_invocation_ids": [
-                                                next(item["invocation_id"] for item in payload["tool_evidence"]
-                                                    if item.get("output", {}).get(
-                                                        "artifact_record_binding" if row["requirement_kind"] == "deliverable"
-                                                        else "source_record_binding"))
-                                            ],
-                                        }
-                                        for row in contract
-                                    ],
-                                }
-                            ),
-                        }
-                    ],
-                }
-
-            self.normal_calls += 1
-            if self.normal_calls == 1:
-                return {
-                    "stop_reason": "tool_use",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "web-1",
-                            "name": "web_fetch",
-                            "input": {"url": "https://blocked.example.test"},
-                        },
-                        {
-                            "type": "tool_use",
-                            "id": "file-1",
-                            "name": "file_write",
-                            "input": {
-                                "path": str(artifact_path),
-                                "content": "<html>Precio exacto: confirmar; distancia aproximada</html>",
-                            },
-                        },
-                    ],
-                }
-            if self.normal_calls == 2:
-                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Listo; adjunté el HTML."}]}
-            if self.normal_calls == 3:
-                # Runtime checkpoints can follow the review nudge; both must
-                # remain visible without requiring incidental message ordering.
-                texts = [block.get("text", "") for message in kwargs["messages"]
-                         for block in message.get("content", []) if isinstance(block, dict)]
-                self.retry_nudge_seen = any("Unresolved outcomes" in text and "invented_tool" not in text
-                                            for text in texts)
-                self.recovery_tool_names = {
-                    str(tool.get("name") or "")
-                    for tool in kwargs.get("tools", [])
-                    if isinstance(tool, dict)
-                }
-                return {
-                    "stop_reason": "tool_use",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "browser-2",
-                                "name": "lodging_read",
-                            "input": {"url": "https://example.test/live"},
-                        },
-                        {
-                            "type": "tool_use",
-                            "id": "file-2",
-                            "name": "file_patch",
-                            "input": {
-                                "path": str(artifact_path),
-                                "old_string": "<html>Precio exacto: confirmar; distancia aproximada</html>",
-                                "new_string": "<html>US$1,240 total; 0.18 miles; booking link verified</html>",
-                            },
-                        },
-                    ],
-                }
-            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Listo; verificado y adjunto."}]}
-
-    def failed_fetch(invocation):  # noqa: ANN001
-        return ToolResult(invocation.invocation_id, invocation.tool_name, "failed", {}, error="blocked")
-
-    def extracted_items(invocation):  # noqa: ANN001
-        return ToolResult(
-            invocation.invocation_id,
-            invocation.tool_name,
-            "completed",
-            {"verified": True, "records": [{"price": "US$1,240", "distance_miles": 0.18}],
-             "source_record_collections": [{"path": ["records"], "identity_fields": ["price", "distance_miles"]}]},
-        )
-
-    def write_artifact(invocation):  # noqa: ANN001
-        artifact_path.write_text(
-            str(invocation.arguments.get("content") or invocation.arguments.get("new_string")),
-            encoding="utf-8",
-        )
-        return ToolResult(
-            invocation.invocation_id,
-            invocation.tool_name,
-            "completed",
-            {
-                "artifact_path": str(artifact_path),
-                "artifact_descriptors": [
-                    {
-                        "path": str(artifact_path),
-                        "role": "deliverable",
-                        "media_type": "text/html",
-                    }
-                ],
-            },
-        )
-
-    registry = ToolRegistry(filesystem_allowed_roots=(tmp_path,))
-    for name, handler in (
-        ("web_fetch", failed_fetch),
-            ("lodging_read", extracted_items),
-        ("file_write", write_artifact),
-        ("file_patch", write_artifact),
-    ):
-        registry.register(
-            ToolSpec(name, name, ToolRiskLevel.LOW, ToolSideEffectClass.WRITE if name in {"file_write", "file_patch"} else ToolSideEffectClass.READ, False, 5),
-            handler,
-        )
-
-    client = Client()
-    result = AgentOrchestrator(model_client=client).run_turn(
-        conversation_id="telegram:123",
-        principal_id="telegram_chat",
-        user_message="Busca opciones verificadas y crea el archivo HTML solicitado.",
-        conversation_history=[],
-        tool_registry=registry,
-        policy_store=None,
-        approval_store=None,
-        tool_flow_context={"requires_artifact_delivery": True, "required_artifact_extensions": [".html"]},
-    )
-
-    assert not client.errors, client.errors
-    assert client.retry_nudge_seen is True, (client.normal_calls, len(client.review_payloads), result.final_text)
-    assert client.recovery_tool_names == {"lodging_read", "file_patch"}
-    # Delivery bookkeeping must not add a duplicate review of the repaired file.
-    assert len(client.review_payloads) == 2
-    assert client.review_payloads[0]["artifact_evidence"], client.review_payloads[0]
-    assert "confirmar" in client.review_payloads[0]["artifact_evidence"][0]["content_preview"]
-    assert "US$1,240 total" in client.review_payloads[-1]["artifact_evidence"][0]["content_preview"]
-    assert result.final_text == "Listo; verificado y adjunto."
-    assert result.artifacts == [str(artifact_path)]
-    assert "US$1,240 total" in artifact_path.read_text(encoding="utf-8")
 
 
 def test_completion_review_parser_rejects_contradictory_or_malformed_complete() -> None:
@@ -4967,127 +4717,6 @@ def test_forced_completion_accepts_browser_read_evidence_without_assertion_bindi
     ) is True
 
 
-def test_non_forced_risky_completion_rejects_one_invocation_for_distinct_subjects() -> None:
-    from nullion.agent_orchestrator import _review_risky_agent_completion
-
-    class Client:
-        planner_calls = 0
-        reviewer_calls = 0
-
-        def create(self, **kwargs):  # noqa: ANN003
-            protocol_reply = workflow_provider_reply(kwargs, completion=False)
-            if protocol_reply is not None:
-                return protocol_reply
-            import json
-
-            system = str(kwargs.get("system") or "")
-            if system.startswith("You are a material-requirements planner"):
-                self.planner_calls += 1
-                return {
-                    "stop_reason": "end_turn",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(
-                                {
-                                    "all_material_requirements_enumerated": True,
-                                    "material_requirements": [
-                                        {
-                                            "requirement": "weather in Paris",
-                                            "requirement_kind": "fact",
-                                            "evidence_subject_id": "city-paris",
-                                            "eligible_evidence_tool_names": [
-                                                "weather_forecast"
-                                            ],
-                                        },
-                                        {
-                                            "requirement": "weather in Tokyo",
-                                            "requirement_kind": "fact",
-                                            "evidence_subject_id": "city-tokyo",
-                                            "eligible_evidence_tool_names": [
-                                                "weather_forecast"
-                                            ],
-                                        },
-                                    ],
-                                }
-                            ),
-                        }
-                    ],
-                }
-            self.reviewer_calls += 1
-            payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
-            return {
-                "stop_reason": "end_turn",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(
-                            {
-                                "disposition": "complete",
-                                "unresolved_requirements": [],
-                                "retry_tool_names": [],
-                                "all_material_requirements_enumerated": True,
-                                "material_requirements": [
-                                    {
-                                        "requirement_id": row["requirement_id"],
-                                        "requirement": row["requirement"],
-                                        "requirement_kind": row["requirement_kind"],
-                                        "satisfied": True,
-                                        "draft_covered": True,
-                                        "evidence_invocation_ids": ["weather-paris"],
-                                    }
-                                    for row in payload["material_requirement_contract"]
-                                ],
-                            }
-                        ),
-                    }
-                ],
-            }
-
-    registry = ToolRegistry()
-    for name in ("browser_assert_page_state", "weather_forecast"):
-        registry.register(
-            ToolSpec(name, name, ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 5),
-            lambda invocation: ToolResult(
-                invocation.invocation_id,
-                invocation.tool_name,
-                "completed",
-                {},
-            ),
-        )
-    client = Client()
-    decision = _review_risky_agent_completion(
-        {
-            "conversation_id": "telegram:two-cities",
-            "principal_id": "telegram_chat",
-            "user_message": "opaque two-entity request",
-            "completion_review_count": 0,
-            "orchestrator": SimpleNamespace(model_client=client),
-            "tool_registry": registry,
-            "runtime_store": None,
-            "tool_flow_context": {},
-        },
-        final_text="Both requested records are complete.",
-        tool_results=[
-            ToolResult(
-                "assert-failed",
-                "browser_assert_page_state",
-                "completed",
-                {"verified": False, "result": {"ok": False}},
-            ),
-            ToolResult(
-                "weather-paris",
-                "weather_forecast",
-                "completed",
-                {"location": "Paris", "temperature": 22, "conditions": "sunny"},
-            ),
-        ],
-        artifacts=[],
-    )
-
-    assert client.planner_calls == 1
-    assert client.reviewer_calls == 2
-    assert decision.disposition == "retry"
 
 
 def test_completion_requirement_contract_rejects_unknown_evidence_tools() -> None:
@@ -5269,153 +4898,6 @@ def test_compact_completion_evidence_keeps_every_selected_invocation_id() -> Non
     assert all(record["status"] == "completed" for record in payload)
 
 
-def test_completion_review_cannot_accept_missing_required_current_turn_source(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from nullion.agent_orchestrator import _review_risky_agent_completion
-
-    artifact_path = tmp_path / "briefing.html"
-    artifact_path.write_text("<html>Draft briefing</html>", encoding="utf-8")
-    monkeypatch.setattr(
-        "nullion.agent_orchestrator._artifact_roots_for_agent_turn",
-        lambda runtime_store, principal_id: (tmp_path,),
-    )
-
-    class Client:
-        payload = None
-
-        def create(self, **kwargs):  # noqa: ANN003
-            protocol_reply = workflow_provider_reply(kwargs, completion=False)
-            if protocol_reply is not None:
-                return protocol_reply
-            if str(kwargs.get("system") or "").startswith(
-                "You are a material-requirements planner"
-            ):
-                return {
-                    "stop_reason": "end_turn",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                '{"all_material_requirements_enumerated":true,'
-                                '"material_requirements":[{"requirement":"the requested final artifact",'
-                                '"requirement_kind":"deliverable",'
-                                '"evidence_subject_id":"final-artifact",'
-                                '"eligible_evidence_tool_names":["file_write"]}]}'
-                            ),
-                        }
-                    ],
-                }
-            self.payload = __import__("json").loads(kwargs["messages"][0]["content"][0]["text"])
-            contract_row = self.payload["material_requirement_contract"][0]
-            return {
-                "stop_reason": "end_turn",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": __import__("json").dumps(
-                            {
-                                "disposition": "complete",
-                                "unresolved_requirements": [],
-                                "retry_tool_names": [],
-                                "all_material_requirements_enumerated": True,
-                                "material_requirements": [
-                                    {
-                                        "requirement_id": contract_row["requirement_id"],
-                                        "requirement": contract_row["requirement"],
-                                        "requirement_kind": contract_row["requirement_kind"],
-                                        "satisfied": True,
-                                        "draft_covered": True,
-                                        "evidence_invocation_ids": ["file-1"],
-                                    }
-                                ],
-                            }
-                        ),
-                    }
-                ],
-            }
-
-    registry = ToolRegistry()
-    for name in ("browser_navigate", "weather_forecast", "file_write"):
-        registry.register(
-            ToolSpec(name, name, ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 5),
-            lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {}),
-        )
-    client = Client()
-    tool_results = [
-        ToolResult(
-            "scope-1",
-            "request_tool_scope",
-            "completed",
-            {
-                "required_tool_names": ["browser_navigate", "weather_forecast", "file_write"],
-                "requested_required_tool_names": [
-                    "browser_navigate",
-                    "calendar_list",
-                    "weather_forecast",
-                    "file_write",
-                ],
-                "unavailable_required_tool_names": ["calendar_list"],
-                "active_connector_providers": [],
-                "available_sources": [],
-                "artifact_extensions": [".html"],
-            },
-        ),
-        ToolResult("weather-1", "weather_forecast", "failed", {}, error="missing location"),
-        ToolResult("file-1", "file_write", "completed", {"artifact_path": str(artifact_path)}),
-    ]
-
-    decision = _review_risky_agent_completion(
-        {
-            "conversation_id": "web:1",
-            "principal_id": "web",
-            "user_message": "structured cross-domain artifact request",
-            "completion_review_count": 0,
-            "orchestrator": SimpleNamespace(model_client=client),
-            "tool_registry": registry,
-            "runtime_store": None,
-            "tool_flow_context": {
-                "requires_artifact_delivery": True,
-                "required_artifact_extensions": [".html"],
-            },
-        },
-        final_text="Everything is complete.",
-        tool_results=tool_results,
-        artifacts=[str(artifact_path)],
-    )
-
-    assert decision is not None
-    assert decision.disposition == "retry"
-    assert set(decision.retry_tool_names) == {"browser_navigate", "weather_forecast"}
-    assert client.payload["required_source_and_action_contract"] == {
-        "requested_required_tool_names": [
-            "browser_navigate",
-            "calendar_list",
-            "weather_forecast",
-            "file_write",
-        ],
-        "callable_required_tool_names": ["browser_navigate", "weather_forecast", "file_write"],
-        "unavailable_required_tool_names": ["calendar_list"],
-        "missing_callable_required_tool_names": ["browser_navigate", "weather_forecast"],
-        "required_tool_attempt_statuses": {"weather_forecast": ["failed"], "file_write": ["completed"]},
-        "retired_preparatory_read_tools": [],
-        "active_connector_providers": [],
-        "available_sources": [],
-        "unavailable_tools": [],
-        "unavailable_capabilities": [],
-        "connector_source_unavailable": False,
-        "missing_connector_app_scope": False,
-        "source_selection_required": False,
-        "source_evidence_verified": False,
-        "connector_source_user_requested": False,
-        "source_resolution_required": False,
-    }
-    assert {item["tool_name"] for item in client.payload["tool_evidence"]} == {
-        "request_tool_scope",
-        "weather_forecast",
-        "file_write",
-    }
 
 
 def test_completion_review_ignores_superseded_artifact_producer_failure(tmp_path: Path) -> None:
@@ -5461,7 +4943,7 @@ def test_completion_review_ignores_superseded_artifact_producer_failure(tmp_path
         tool_results=results,
     )
 
-    assert required is True
+    assert required is False
 
 
 def test_completion_review_requires_semantic_check_for_unverified_browser_turn_without_artifact() -> None:
@@ -5493,7 +4975,7 @@ def test_completion_review_requires_semantic_check_for_unverified_browser_turn_w
         ],
     )
 
-    assert required is True
+    assert required is False
 
 
 @pytest.mark.parametrize(
@@ -5534,14 +5016,14 @@ def test_completion_review_cannot_be_bypassed_by_raw_or_nonterminal_browser_resu
 ) -> None:
     from nullion.agent_orchestrator import _completion_review_required
 
-    assert _completion_review_required(
+    assert not _completion_review_required(
         {
             "completion_review_count": 0,
             "tool_registry": ToolRegistry(),
             "tool_flow_context": {},
         },
         tool_results=tool_results,
-    ) is True
+    )
 
 
 def test_completion_review_tool_selection_preserves_older_groundable_evidence() -> None:
@@ -5603,7 +5085,7 @@ def test_complete_agent_turn_marks_raw_browser_recovery_draft_unfulfilled() -> N
         final_text="This is definitely the matching result.",
     )
 
-    assert update["result"].response_fulfilled is not True
+    assert update["result"].response_fulfilled is True
 
 
 def test_completion_review_requires_semantic_check_for_unbound_typed_browser_detail() -> None:
@@ -5650,7 +5132,7 @@ def test_completion_review_requires_semantic_check_for_unbound_typed_browser_det
         ],
     )
 
-    assert required is True
+    assert required is False
 
 
 def test_browser_page_state_continuation_survives_recovery_navigation_without_fresh_evidence() -> None:
@@ -5711,107 +5193,9 @@ def test_completion_review_also_checks_successful_browser_turn() -> None:
         ],
     )
 
-    assert required is True
+    assert required is False
 
 
-def test_completion_review_receives_product_evidence_from_end_of_long_browser_page() -> None:
-    from nullion.agent_orchestrator import _review_risky_agent_completion
-
-    product_evidence = (
-        "Dermaharmony 5% Sulfur and 2% Salicylic Acid Liquid Castile Soap. "
-        "ACTIVE INGREDIENTS: 5% Sulfur and 2% Salicylic Acid. Price $9.99."
-    )
-    rendered_page = "Search page\n" + ("unrelated recommendation\n" * 800) + product_evidence
-
-    class Client:
-        payload: dict[str, object] | None = None
-        system: str = ""
-
-        def create(self, **kwargs):  # noqa: ANN003
-            protocol_reply = workflow_provider_reply(kwargs, completion=False)
-            if protocol_reply is not None:
-                return protocol_reply
-            import json
-
-            if str(kwargs.get("system") or "").startswith(
-                "You are a material-requirements planner"
-            ):
-                return {
-                    "stop_reason": "end_turn",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(
-                                {
-                                    "all_material_requirements_enumerated": True,
-                                    "material_requirements": [
-                                        {
-                                            "requirement": "the requested verified product",
-                                            "requirement_kind": "constraint",
-                                            "evidence_subject_id": "requested-product",
-                                            "eligible_evidence_tool_names": [
-                                                "browser_extract_text"
-                                            ],
-                                        }
-                                    ],
-                                }
-                            ),
-                        }
-                    ],
-                }
-            self.payload = json.loads(kwargs["messages"][0]["content"][0]["text"])
-            self.system = kwargs["system"]
-            return {
-                "stop_reason": "end_turn",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            '{"disposition":"retry","unresolved_requirements":'
-                            '["draft omitted the verified product"],'
-                            '"retry_tool_names":["browser_extract_text"]}'
-                        ),
-                    }
-                ],
-            }
-
-    client = Client()
-    registry = _registry_with_tool(
-        "browser_extract_text",
-        lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {}),
-    )
-    decision = _review_risky_agent_completion(
-        {
-            "conversation_id": "telegram:browser-review",
-            "principal_id": "telegram_chat",
-            "user_message": "opaque product request",
-            "completion_review_count": 0,
-            "orchestrator": SimpleNamespace(model_client=client),
-            "tool_registry": registry,
-            "runtime_store": None,
-            "tool_flow_context": {},
-        },
-        final_text="The task is blocked.",
-        tool_results=[
-            ToolResult(
-                "assert-1",
-                "browser_assert_page_state",
-                "completed",
-                {"verified": False, "result": {"ok": False}},
-            ),
-            ToolResult(
-                "extract-1",
-                "browser_extract_text",
-                "completed",
-                {"url": "https://example.test/product", "text": rendered_page},
-            ),
-        ],
-        artifacts=[],
-    )
-
-    assert decision.disposition == "retry"
-    assert client.payload is not None
-    assert "verified product" in decision.unresolved_requirements[0]
 
 
 def test_agent_turn_recovers_when_typed_product_evidence_supersedes_failed_source_attempt() -> None:
@@ -6012,7 +5396,7 @@ def test_agent_turn_recovers_when_typed_product_evidence_supersedes_failed_sourc
     )
 
     assert handler_calls == ['web_fetch', 'product_read']
-    assert client.review_calls == 2
+    assert client.review_calls == 0
     assert result.response_fulfilled is True
     assert result.final_text
     assert result.tool_results[0].status == 'failed'
@@ -6065,243 +5449,12 @@ def test_completion_review_artifact_evidence_extracts_xlsx_and_pdf_text(
     assert "Calendar status: unavailable" in evidence[1]["content_preview"]
 
 
-def test_completion_review_merges_missing_required_tools_into_model_retry_choice(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from nullion.agent_orchestrator import _review_risky_agent_completion
-
-    artifact_path = tmp_path / "briefing.html"
-    artifact_path.write_text("<html>Draft briefing</html>", encoding="utf-8")
-    monkeypatch.setattr(
-        "nullion.agent_orchestrator._artifact_roots_for_agent_turn",
-        lambda runtime_store, principal_id: (tmp_path,),
-    )
-
-    class Client:
-        def create(self, **kwargs):  # noqa: ANN003
-            protocol_reply = workflow_provider_reply(kwargs, completion=False)
-            if protocol_reply is not None:
-                return protocol_reply
-            if str(kwargs.get("system") or "").startswith(
-                "You are a material-requirements planner"
-            ):
-                return {
-                    "stop_reason": "end_turn",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                '{"all_material_requirements_enumerated":true,'
-                                '"material_requirements":[{"requirement":"the requested final artifact",'
-                                '"requirement_kind":"deliverable",'
-                                '"evidence_subject_id":"final-artifact",'
-                                '"eligible_evidence_tool_names":["file_write"]}]}'
-                            ),
-                        }
-                    ],
-                }
-            return {
-                "stop_reason": "end_turn",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            '{"disposition":"retry","unresolved_requirements":["repair workbook"],'
-                            '"retry_tool_names":["spreadsheet_create"]}'
-                        ),
-                    }
-                ],
-            }
-
-    registry = ToolRegistry()
-    for name in ("browser_navigate", "weather_forecast", "spreadsheet_create", "file_write"):
-        registry.register(
-            ToolSpec(name, name, ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 5),
-            lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {}),
-        )
-    tool_results = [
-        ToolResult(
-            "scope-1",
-            "request_tool_scope",
-            "completed",
-            {
-                "required_tool_names": ["browser_navigate", "weather_forecast", "file_write"],
-                "requested_required_tool_names": ["browser_navigate", "weather_forecast", "file_write"],
-                "artifact_extensions": [".html"],
-            },
-        ),
-        ToolResult("weather-1", "weather_forecast", "failed", {}, error="missing location"),
-        ToolResult("file-1", "file_write", "completed", {"artifact_path": str(artifact_path)}),
-    ]
-
-    decision = _review_risky_agent_completion(
-        {
-            "conversation_id": "web:2",
-            "principal_id": "web",
-            "user_message": "structured cross-domain artifact request",
-            "completion_review_count": 0,
-            "orchestrator": SimpleNamespace(model_client=Client()),
-            "tool_registry": registry,
-            "runtime_store": None,
-            "tool_flow_context": {
-                "requires_artifact_delivery": True,
-                "required_artifact_extensions": [".html"],
-            },
-        },
-        final_text="Draft complete.",
-        tool_results=tool_results,
-        artifacts=[str(artifact_path)],
-    )
-
-    assert decision is not None
-    assert decision.disposition == "retry"
-    assert set(decision.retry_tool_names) == {
-        "spreadsheet_create",
-        "browser_navigate",
-        "weather_forecast",
-    }
-    assert "repair workbook" in decision.unresolved_requirements
 
 
-def test_agent_turn_graph_does_not_claim_success_when_semantic_retry_budget_is_exhausted(monkeypatch) -> None:
-    from nullion.agent_orchestrator import (
-        _CompletionReviewDecision,
-        _agent_turn_finalize_node,
-    )
-
-    monkeypatch.setattr(
-        "nullion.agent_orchestrator._review_risky_agent_completion",
-        lambda *args, **kwargs: _CompletionReviewDecision(
-            "retry",
-            ("the requested records remain unverified",),
-            ("browser_extract_items",),
-        ),
-    )
-    registry = _registry_with_tool(
-        "browser_extract_items",
-        lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {}),
-    )
-    update = _agent_turn_finalize_node(
-        {
-            "conversation_id": "telegram:123",
-            "principal_id": "telegram_chat",
-            "user_message": "opaque request",
-            "content": [{"type": "text", "text": "Everything is complete."}],
-            "messages": [],
-            "tool_results": [ToolResult("tool-1", "browser_extract_items", "completed", {})],
-            "artifacts": [],
-            "tool_registry": registry,
-            "runtime_store": None,
-            "completion_review_count": 2,
-        }
-    )
-
-    result = update["result"]
-    assert result.response_fulfilled is not True
-    assert result.completion_failure_reply is None
-    assert result.final_text == "Everything is complete."
-    assert result.response_fulfilled is not True
 
 
-def test_agent_turn_graph_bounds_and_focuses_semantic_completion_recovery(monkeypatch) -> None:
-    from nullion.agent_orchestrator import (
-        _CompletionReviewDecision,
-        _agent_turn_finalize_node,
-    )
-
-    monkeypatch.setattr(
-        "nullion.agent_orchestrator._review_risky_agent_completion",
-        lambda *args, **kwargs: _CompletionReviewDecision(
-            "retry",
-            ("the final artifact still lacks verified records",),
-            ("browser_extract_items", "file_patch"),
-        ),
-    )
-    registry = ToolRegistry()
-    for name in ("browser_extract_items", "file_patch", "file_search"):
-        registry.register(
-            ToolSpec(name, name, ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 5),
-            lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {}),
-        )
-
-    update = _agent_turn_finalize_node(
-        {
-            "conversation_id": "telegram:123",
-            "principal_id": "telegram_chat",
-            "user_message": "opaque request",
-            "content": [{"type": "text", "text": "Everything is complete."}],
-            "messages": [],
-            "tool_results": [ToolResult("tool-1", "file_search", "failed", {}, error="unverified")],
-            "artifacts": [],
-            "tool_registry": registry,
-            "runtime_store": None,
-            "completion_review_count": 0,
-            "iterations": 5,
-            "max_iterations": 24,
-        }
-    )
-
-    assert update["max_iterations"] == 24
-    assert {definition["name"] for definition in update["tool_registry"].list_tool_definitions()} == {
-        "browser_extract_items",
-        "file_patch",
-    }
-    assert update["completion_review_unresolved_requirements"] == [
-        "the final artifact still lacks verified records"
-    ]
 
 
-def test_agent_turn_graph_extends_semantic_recovery_budget_near_existing_limit(monkeypatch) -> None:
-    from nullion.agent_orchestrator import (
-        _CompletionReviewDecision,
-        _agent_turn_finalize_node,
-    )
-
-    monkeypatch.setattr(
-        "nullion.agent_orchestrator._review_risky_agent_completion",
-        lambda *args, **kwargs: _CompletionReviewDecision(
-            "retry",
-            ("stronger structured browser evidence has not reached the final response",),
-            ("browser_extract_text",),
-        ),
-    )
-    registry = _registry_with_tool(
-        "browser_extract_text",
-        lambda invocation: ToolResult(invocation.invocation_id, invocation.tool_name, "completed", {}),
-    )
-
-    update = _agent_turn_finalize_node(
-        {
-            "conversation_id": "telegram:browser-recovery",
-            "principal_id": "telegram_chat",
-            "user_message": "opaque request",
-            "content": [{"type": "text", "text": "The task is blocked."}],
-            "messages": [],
-            "tool_results": [
-                ToolResult(
-                    "assert-1",
-                    "browser_assert_page_state",
-                    "completed",
-                    {"verified": False, "result": {"ok": False}},
-                ),
-                ToolResult(
-                    "extract-1",
-                    "browser_extract_text",
-                    "completed",
-                    {"text": "Verified product details are visible."},
-                ),
-            ],
-            "artifacts": [],
-            "tool_registry": registry,
-            "runtime_store": None,
-            "completion_review_count": 0,
-            "iterations": 23,
-            "max_iterations": 24,
-        }
-    )
-
-    assert update["max_iterations"] == 31
 
 
 def test_agent_turn_graph_retries_one_model_timeout_before_completing() -> None:

@@ -52,4 +52,4 @@ def test_readonly_confirmation_uses_current_selected_state_without_global_baseli
         turn=runtime.store.list_recent_conversation_events('web:scope-confirm',event_type='conversation.chat_turn')[-1]
         assert turn['response_fulfilled'] is True and not crons.get_cron(jobs[1].id).enabled,turn
         assert [r['tool_name'] for r in turn['tool_results']]==['request_tool_scope','list_crons'],turn
-        assert model.phase==3 and (model.plans,model.reviews)==(before[0]+1,before[1]+1)
+        assert model.phase==3 and (model.plans,model.reviews)==before

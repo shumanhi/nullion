@@ -7,26 +7,6 @@ from nullion.agent_orchestrator import _completion_review_request_context, _extr
 from nullion.runtime_source_retention import retained_runtime_source_cleanup_result
 from nullion.tools import ToolInvocation, ToolRegistry, ToolResult, ToolSpec, ToolRiskLevel, ToolSideEffectClass
 
-@pytest.mark.parametrize('quote', ['DripDrop ORS and LMNT', '製品アルファと製品ベータ', 'منتج ألف ومنتج باء'])
-def test_requirement_extraction_retains_quote_and_invalidates_cached_contract(quote):
-    calls=[]
-    class Model:
-        def create(self, **kwargs):
-            payload=json.loads(kwargs['messages'][0]['content'][0]['text']);calls.append(payload)
-            assert payload['request_context']['quoted_message']['reply_to_text'] == quote
-            return {'content':[{'type':'text','text':json.dumps({'all_material_requirements_enumerated':True,
-                'material_requirements':[{'requirement':'Provide the referenced links', 'requirement_kind':'fact',
-                    'evidence_subject_id':'products', 'eligible_evidence_tool_names':['web_fetch']}]})}]}
-    registry=ToolRegistry();registry.register(ToolSpec('web_fetch','Read',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,5),lambda i:None)
-    state={'orchestrator':SimpleNamespace(model_client=Model()),'tool_registry':registry,'user_message':'Links please',
-        'tool_flow_context':{'request_context':{'quoted_message':{'platform':'telegram','reply_to_text':quote}}}}
-    results=[ToolResult('read','web_fetch','completed',{'text':quote})]
-    assert _extract_completion_requirement_contract(state,tool_results=results)
-    assert _extract_completion_requirement_contract(state,tool_results=results)
-    assert len(calls)==1
-    quote+=' updated';state['tool_flow_context']['request_context']['quoted_message']['reply_to_text']=quote
-    assert _extract_completion_requirement_contract(state,tool_results=results)
-    assert len(calls)==2
 
 
 def test_plain_turn_has_no_new_review_context_and_linked_turns_are_bounded():

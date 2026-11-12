@@ -59,31 +59,3 @@ def test_plain_turn_fast_path_does_not_inspect_tool_results():
         def __iter__(self):
             raise AssertionError('Plain turn scanned recovery history')
     assert _completion_progress_recovery_update({'tool_results': NoScan()}) is None
-
-
-def test_initial_recovery_allowance_keeps_existing_sixty_call_ceiling(monkeypatch):
-    import nullion.agent_orchestrator as agent
-    from nullion.tools import ToolRegistry
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *a, **k:
-        agent._CompletionReviewDecision('retry', ('残りの記録',), ('opaque_adapter',)))
-    state = {'iterations': 59, 'max_iterations': 60, 'user_message': '残りの記録',
-        'conversation_id': 'web:budget', 'principal_id': 'web:budget', 'runtime_store': None,
-        'tool_registry': ToolRegistry(), 'messages': [], 'tool_results': [], 'artifacts': [],
-        'content': [{'type': 'text', 'text': 'Préparé.'}]}
-    update = agent._agent_turn_finalize_node(state)
-    assert update['max_iterations'] == 60
-    assert _completion_progress_recovery_update({**state, **update, 'iterations': 60}) is None
-
-
-def test_fixed_scheduled_recovery_budget_is_not_enlarged_by_a_rejected_draft(monkeypatch):
-    import nullion.agent_orchestrator as agent
-    from nullion.tools import ToolRegistry
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *a, **k:
-        agent._CompletionReviewDecision('retry', ('残りの記録',), ('opaque_adapter',)))
-    state = {'iterations': 2, 'max_iterations': 3, 'user_message': '残りの記録',
-        'conversation_id': 'web:budget', 'principal_id': 'web:budget', 'runtime_store': None,
-        'tool_registry': ToolRegistry(), 'messages': [], 'tool_results': [], 'artifacts': [],
-        'tool_flow_context': {'producer_iteration_budget_fixed': True},
-        'content': [{'type': 'text', 'text': 'Préparé.'}]}
-    update = agent._agent_turn_finalize_node(state)
-    assert update['max_iterations'] == 3

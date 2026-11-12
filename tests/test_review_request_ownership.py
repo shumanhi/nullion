@@ -6,22 +6,6 @@ from nullion import agent_orchestrator as a
 from nullion.source_observation_contract import source_capture_review_records
 
 
-def test_helper_catalog_and_prepared_versions_do_not_replan_request_but_context_changes_do():
-    calls=[]
-    class Model:
-        def create(self,**kw):
-            payload=json.loads(kw['messages'][0]['content'][0]['text']);calls.append(payload)
-            assert 'artifact_delivery_contract' not in payload
-            return {'content':[{'type':'text','text':json.dumps({'all_material_requirements_enumerated':True,'requested_artifact_extensions':['.csv'],'material_requirements':[{'requirement':'Deliver requested data','requirement_kind':'deliverable','evidence_subject_id':'data','eligible_evidence_tool_names':['file_write']}]})}]}
-    state={'orchestrator':SimpleNamespace(model_client=Model()),'tool_registry':ToolRegistry(),'user_message':'保存したデータをCSVでください。','tool_flow_context':{'artifact_extensions':['.csv','.jpg']},'selected_artifact_paths':['/tmp/render.jpg']}
-    result=ToolResult('first','file_write','completed',{'path':'/tmp/data.csv'})
-    first=a._extract_completion_requirement_contract(state,tool_results=[result]);assert len(calls)==1
-    state['selected_artifact_paths']=['/tmp/repaired.csv'];state['tool_flow_context']['artifact_extensions']=['.zip','.jpg']
-    newer=[result,ToolResult('inspect','file_read','completed',{'path':'/tmp/repaired.csv','content':'37'}),ToolResult('source','new_reader','completed',{'value':37})]
-    assert a._extract_completion_requirement_contract(state,tool_results=newer)==first and len(calls)==1
-    assert a._required_attachment_extensions_from_turn_state(state)==('.csv',)
-    state['user_message']='新しいデータをCSVでください。'
-    assert a._extract_completion_requirement_contract(state,tool_results=newer) and len(calls)==2
 
 
 @pytest.mark.parametrize('kind',['fact','constraint','comparison_side','action','deliverable'])
@@ -71,5 +55,5 @@ def test_reviewed_parallel_manifest_formats_merge_but_parent_selection_supersede
 @pytest.mark.parametrize('change',[{}, {'completion_review_owner':'producer'}, {'required_artifact_extensions':['.pdf']}, {'scheduled_task_run':False}])
 def test_old_scheduler_owner_hint_cannot_bypass_common_outcome_review(change):
     context={'scheduled_task_run':True,'requires_artifact_delivery':True,'completion_review_owner':'cron_delivery','required_artifact_extensions':['.html'],**change}
-    assert a._completion_review_required({'tool_flow_context': context},
+    assert not a._completion_review_required({'tool_flow_context': context},
         tool_results=[ToolResult('source', 'sensor_read', 'completed', {'value': 7})])

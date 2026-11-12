@@ -1,19 +1,21 @@
 # Testing
 
+The primary agent owns the answer; there is no independent AI quality gate.
+`test_producer_only_completion.py` exercises Web API, Telegram upload bytes,
+scheduled runner delivery, approval resume and delegated execution with real
+routing, SQLite, native tools and transport code. Only external model/network
+boundaries are scripted. The provider rejects any quality-grader invocation.
+Japanese and Spanish requests prove this does not depend on English triggers.
+Missing files still fail native delivery checks, while usable partial source
+answers remain visible. `test_producer_completion.py` covers legacy paused-state
+migration without changing historical data or dropping native media receipts.
+Live stage Web UI and real inbound Telegram validation remain separate acceptance
+steps; deterministic Docker coverage is not a claim that either was exercised.
+
 Tests live alongside the implementation in `tests/`, with real product workflow
 coverage in `tests/e2e/`. A fresh clone contains the complete released suite.
 No second checkout, private-repository key, or live-provider credentials are
 required for ordinary pull requests, including contributions from forks.
-
-Shared fallback/status regressions are covered by
-`test_shared_failure_outcomes.py` and
-`tests/e2e/test_shared_failure_outcome_delivery.py`. These exercise receipt
-invalidation, missing-action/file enforcement, current versus historical
-connector blockers, preserved findings, Web reply/history rendering, scheduled
-delivery/status and native image-provider timeout delivery through the chat API.
-Only external model/source/provider responses are scripted; routing, review,
-persistence, permissions, fulfillment and presentation remain real. These local
-checks do not claim live provider judgment or live stage acceptance.
 
 Scripted providers identify auxiliary scope requests from the structured packet
 through `tests.workflow_provider_protocol.is_tool_scope_request`, rather than
@@ -48,42 +50,16 @@ Pass pytest arguments to either runner for focused work:
 ./scripts/e2e-docker.sh tests/e2e/test_web_surface_contracts.py
 ```
 
-Focused unit runs still enforce overall coverage; use `python -m pytest` directly
-with a temporary HOME for quick unit-only feedback. Browser, installer and E2E
-checks must run in containers or CI runners. Live-stage probes are opt-in and
+Focused unit runs still enforce overall coverage. For a narrow Docker-only check
+while implementing, use `NULLION_TEST_COVERAGE=0 ./scripts/e2e-docker.sh tests/test_producer_completion.py`;
+run the full unit command with coverage before release. Browser, installer and E2E
+checks run in containers or CI runners. Live-stage probes are opt-in and
 require separately authorized services and credentials.
 
-Scheduled-workflow regressions include large hydrated-record batches followed
-by late duplicate checks, conditional writes retained through recovery and normal
-approval, source-selection consent retained in outcome review, and paginated
-inventories with version invalidation. These exercise the graph, SQLite and real
-runner/API boundaries; only external model/network responses are deterministic.
-Monitor coverage also checks native task-specific delivery history in both the
-requirements and outcome-review calls, including first runs and prior receipts
-in two languages. Persisted-history checks cover unrelated chat traffic, fresh
-uncheckpointed receipts, and unavailable databases without inventing an empty
-history.
-Scheduled profile cases use real persisted workspace memory, assert that it
-reaches the producer and both review roles and report recovery, and exclude a
-foreign workspace's profile.
-Requested local-path checks follow exact tool-backed executable paths through
-the real Web route, stored turn, Telegram formatting, and common Slack/Discord
-transport preparation. They cover English and Japanese, typed local scope,
-failed or unrelated evidence, later scope revocation, and request isolation.
-Retained-evidence inspection tests cover two user languages, an exact full-body
-window, and mailbox-scale execution with 96 long source bodies, 30 discovery
-calls and four calendar checks. The scale cases assert one delivered report,
-exact retained-window handoff to review, no repeated source IO, bounded model
-context volume and local orchestration latency. Work-limit cases stop inside
-large batches, preserve usage across resume/chat retry, prevent a scheduled
-producer restart and deliver the concrete failure once. Adjacent cases cover
-fresh reads, write invalidation, failures and the unchanged plain-chat fast path.
-Additional inspection tests cover an exact full-body
-window, one source read across two reviews, and rejection of foreign invocation
-ids, missing pointers and invalid windows. Protocol-recovery cases correct an
-oversized window, foreign reference or missing pointer within three model calls
-while executing the source once, in two languages. Cron API tests preserve UTC, Tokyo and
-New York schedule timezones and reject invalid timezone updates atomically.
+Browser history checks wait for the typed terminal-reply save acknowledgement
+before asserting persistence or reloading the page. Visible streamed text is an
+intermediate state, so matching text alone is not a durable completion receipt.
+Keep reload assertions and the stored reply's identity, content and count checks.
 
 For authorized saved-task diagnosis, `test_live_stage_web_cron_recovery.py` reads
 the explicitly supplied `NULLION_LIVE_CRON_REPLAY_FILE`, creates disabled stage
@@ -177,8 +153,6 @@ uses a native read-only evidence bridge, and exports browser screenshots and
 runtime receipts. For shared reasoning, generated-file bytes and plain-turn
 latency, run:
 
-Live runs default to one sample per scenario. `NULLION_LIVE_REPEAT` explicitly requests more samples; dedicated latency cases retain their own multi-sample assertions. Default scenario identifiers are unique and explicit selections are deduplicated. The API catalogue test stops on its first failure before spending more provider quota; resume only the failed and unrun scenarios after diagnosis. The Docker launcher forwards the named live-fixture controls and still restricts its service connection to stage port 8753. Repeated Web prompts bind evidence to the new turn identity rather than reusing an earlier receipt. Native evidence reads close their SQLite connections and can supply review events without relying on Docker Desktop's live SQLite file view.
-
 The live runner also stops the session when fresh runtime evidence reports a terminal model quota or authentication failure, even when pytest is configured to continue ordinary assertion failures. It checks the native read-only bridge between cases and during long Web/cron waits; this makes no additional model request. The exported `provider-blocked.json` contains only the failure category, HTTP status, safe provider error codes and observation time. Existing historical warnings and user-quoted error text cannot trigger this guard. Remaining cases are unattempted, not passes. Restore the provider allowance or authentication before resuming only failed and unrun cases.
 
 The scheduler enable/follow-up probes name disposable task IDs, use a schedule that cannot become due during the replay, and verify unrelated saved states. Cleanup writes only states actually changed unexpectedly, then fails the probe; it never rewrites every saved job as routine cleanup.
@@ -225,21 +199,6 @@ report, with exactly one calendar read and no duplicate action. Unit coverage
 also checks evidence-budget bounds, every retained check identity, invalid
 pointers, foreign references, and repeated-inspection termination.
 
-Recovery scenarios also cover omitted facts in an already-researched report,
-reuse of the current draft and exact reviewer feedback, a missing source found
-after a report-only correction, repeated draft failure without restarting reads,
-blocked sources, numbered clarifications, verifier outages, and approval-required
-checkpoint writes within disabled saved jobs. Raw CDP tests inject an old
-external load event and a delayed real HTTP document, follow a redirect, and
-check fragment navigation without waiting for another document load.
-Native-calendar coverage includes empty and nonempty returned counts, malformed
-provider payload rejection, and verified no-match results through the real
-adapter, scheduled runner, and Web history boundary for manual and automatic runs.
-Recovery also asserts that the material requirement planner runs once across
-composition, review and execution continuation. Handoff unit checks cover changed
-request/context invalidation, additional proof adapters, explicit saved delivery
-history, absence of runtime objects, and the plain-turn fast path.
-
 ## Keeping documentation current
 
 When changing a command, route, setting or tool contract, check its references
@@ -261,34 +220,6 @@ outputs, a second invalid decision and provider exceptions. They assert one
 source collection, one bounded protocol correction, one delivery on success,
 no matching alert on failure and the persisted final failure category. Exhausted
 report composition must not resume source execution without a validated work gap.
-
-Retained-evidence checks include an action derived from a long source body older
-than sixteen subsequent results, through the real scheduler and file mutation.
-Only one source collection and one write are permitted. A separate case forces
-an inspected completion review to return truncated JSON, then verifies that its
-format correction reuses the inspection and delivers once without producer replay.
-Both cases run with Japanese and Spanish requests.
-
-Alert decision coverage also binds the full-evidence reviewer to actual delivery,
-including conditions based on verified absence. Changed report text, evidence,
-request, recipient, clock, history, preferences, scope and forged receipt objects
-must invalidate reuse. Recovery cases make the composer invent extra work, identify
-real missing work, and encounter an unavailable verifier: the independent contract
-must decide whether execution resumes, and unavailable verification must stop it.
-
-The scheduled-alert Web case starts the real FastAPI app and scheduler, persists
-the source review through SQLite, and checks chat history for exactly one matching
-report or no delivery for a verified negative. Each case isolates both the runtime
-and chat-history store. Repeated delivery formatting is checked with non-Latin and
-symbol-only job names so adapter wrapping cannot duplicate the scheduled header.
-
-Review-protocol regressions require a malformed response after retained-evidence
-inspection to receive concrete validation feedback and a larger truncation budget,
-then deliver once from the same source collection. Unit cases validate the actual
-JSON schema, conditional alert decision pairs, explicitly incomplete responses,
-and malformed transport metadata. Negative composer fixtures return genuinely
-invalid protocol output; a composer's pessimistic completion flag alone is not
-an authoritative failure when independent evidence proves the requested outcome.
 
 Saved no-tool regressions exercise the real runner with a producer that first
 asks an unsupported source question. A selected source must be read once and
@@ -312,93 +243,11 @@ corrected result. Long-running saved-task probes retain the owned job and record
 its ID if the renderer or observation window fails before a terminal run event;
 fixture cleanup must not turn that diagnostic failure into a user cancellation.
 
-Retained-evidence regressions validate the provider response against the actual
-schema supplied in that request, including the inspection alternative. Both
-completion and action review must allow a bounded inspection before it is used
-and require a normal decision afterward; recorded source work and writes must
-not be repeated to recover missing preview fields.
-
-`test_retained_inspection_handoff.py` exercises the real scheduled runner,
-graph, SQLite checkpoint and Telegram delivery pipeline with fakes only at
-external model/source/transport boundaries. Spanish and Japanese cases inspect
-a field omitted from a long preview, carry it from reviewer to composer or
-composer to reviewer, correct the report and deliver exactly once with one
-source read. A still-wrong revision must remain rejected despite its preserved
-source windows. Unit cases in `test_retained_review_inspections.py` invalidate
-changed tool output/status/identity, discard foreign or corrupt descriptors,
-rebind visible aliases, enforce shared budgets and hash each inspected source
-only once per reconstruction. These local cases do not establish live stage
-acceptance; live stage tests remain opt-in.
-
-Pagination coverage tests exercise real native adapter calls through the Web
-route and verify the review packet, stored tool receipts and visible result.
-Unit cases also cover missing initial/middle pages, cycles, conflicting receipts,
-failed calls, duplicate pages and unrelated scopes. A terminal page alone must
-never establish a complete chain. Failure-delivery cases retain the reviewer
-authored confirmed findings without publishing the rejected draft, and keep
-incomplete conditional monitors silent.
-
-`test_progressing_completion_recovery.py` runs the real graph and SQLite store
-against an external-provider fixture that submits a premature draft, then reads
-the remaining selected records. Spanish and Japanese cases verify the final
-answer, completed evidence and durable review/budget events. Adjacent cases
-prove duplicate calls remain bounded and progress cannot expand the turn budget
-after its existing one-time recovery allowance. Unit cases cover failed, denied, negative, unrelated and repeated
-receipts plus the no-scan ordinary chat path.
-
-`test_scheduled_constraint_evidence.py` exercises a five-requirement batch report
-through the scheduled runner, SQLite events, and Telegram transport boundary.
-It verifies shared source proof across execution constraints, findings, action
-checks and report delivery, with a tools-disabled wording correction and no
-repeated source work. Reused proof for independent facts and unknown inspection
-citations cannot certify completion: the corrected report remains available with
-internal helper availability diagnostics. Japanese and Spanish prompts exercise the same typed path.
-
-`test_review_availability_delivery.py` covers unavailable requirement planning,
-review timeouts, invalid JSON and invalid citations through the real graph,
-scheduled runner, SQLite audit, Telegram transport adapter and a local Web UI
-driven with Playwright. It verifies one visible answer without reviewer-status boilerplate, unknown completion,
-no duplicate source work, no duplicate wrapper review, and preservation of successful
-findings/files when a sibling fails. Failed/denied required sources remain negative
-cases; an uncited critique cannot suppress a primary result. External providers/account adapters are
-fakes; these are not live stage or native Telegram acceptance.
-
-`test_profile_clarification_continuation.py` drives real Telegram ingress,
-conversation persistence, tool scoping, the action preflight and outcome graph.
-Scripted external providers reproduce a missing profile default and a linked
-follow-up that produces only a promise. The final result must contain a completed
-regional lookup backed by stored tool receipts. Cases cover current-location
-overrides, cancellation and explanation-only replies, plus a non-English
-continuation. Ordinary-turn parent lookup and cross-workspace rejection are
-covered by `test_profile_pending_context.py`. These container checks do not call
-real account providers or lift the user's hold on live stage acceptance.
-The file cases also reject corrupt selected files and dependent reports whose
-structured prerequisites failed, are missing, or form a cycle. Transitive
-dependencies cannot bypass this boundary. `test_delegated_report_completion.py`
-distinguishes a genuine rejected source from an unavailable review through the
-real Deep Agents runner and Telegram upload adapter, including internal group
-helper status and unchanged delivery-failure behavior.
-
-Live stage acceptance for this change is held by the user. When resumed, replay a
-normal report and a report with a deliberately unavailable review provider on the
-stage Web UI and real inbound stage Telegram app, then verify the single answer
-without reviewer boilerplate and the durable helper/transport states. Exercise a genuine missing-action or
-missing-file case alongside it. Do not inject failures by changing production
-credentials, configuration or runtime data.
-
-For model calibration, annotate sanitized observed traces with `case_id`,
-`expected: {correction_needed: bool, must_block: bool}`,
-`review: {disposition: string, error: string|null}`, and
-`publication: delivered|warned|blocked`, then run
-`python scripts/evaluate_completion_reviews.py labelled-traces.jsonl`.
-Include both successful and defective cases. This offline command measures supplied
-labels; it does not run or certify a model. Scripted E2E coverage is separate.
-
-`test_report_only_completion_revision.py` exercises the full scheduled runner,
-SQLite audit, Telegram formatter and transport boundary. It covers a rejected
-text deliverable whose source read succeeded, proves the producer does not
-restart for a tools-disabled wording correction, and checks exactly one final
-delivery. A deliberately incorrect second draft must remain rejected.
+`test_scheduled_constraint_evidence.py` runs a native batch read, calendar
+check and report through the scheduled runner, SQLite and Telegram. The primary
+agent authors the answer from its tool results; no independent citation grader
+or wording-repair verdict is required. Japanese and Spanish requests use the
+same path.
 
 `test_telegram_pending_send_and_cron_recovery.py` uses the real messaging runner
 and SQLite store with delayed Telegram SDK acknowledgements. English, Japanese,
@@ -408,26 +257,6 @@ case kills a real isolated worker, restarts the app, checks that its dead-owned
 lease is reclaimed, and verifies one interruption notice through Web history and
 status APIs. These are container boundary tests, not native Telegram app or live
 stage acceptance. Live stage replays remain separately opt-in.
-
-`test_report_findings_survive_review.py` runs the real graph, scheduled workflow,
-SQLite delivery history and Telegram formatting/transport boundary with scripted
-external sources and provider responses. Two languages and two source families
-cover a successfully corrected report, exhausted presentation correction with
-item details retained, and unknown finding citations rejected. The tests assert
-one source read, the actual delivered text and persisted history, and honest
-completion state. These fixtures verify runtime contracts; they do not measure
-real model judgement or replace separately authorized live acceptance.
-
-`test_tracker_setup_recovery.py` replays a missing selector, a truncated 40/197
-collection, a reviewer revision that leaves the tracker unregistered, selection
-of a witnessed complete DOM region, an invalid action-review response, and
-successful tracker creation through the real Web chat route.
-Japanese and Spanish fixtures verify a 15-minute interval, four-hour window,
-durable baseline, no early due claim, and one exact-link alert after a new record
-appears. Advancing the SQLite claim clock exercises the later poll without a
-15-minute wall-clock wait. Polling must reuse the prepared plan rather than call
-the chat agent again. Browser/source and model boundaries are local fixtures;
-live stage and real-provider acceptance remain separately opt-in.
 
 `test_report_content_outcome.py` creates real scheduled jobs through FastAPI and
 runs the actual scheduler, SQLite persistence, fallback document producer and Web
@@ -473,18 +302,6 @@ stage and native Telegram acceptance remain separate and must be reported honest
 
 ## Generated artifact protocol recovery
 
-`test_generated_artifact_protocol_recovery.py` exercises the real streaming
-model adapter, chat runner, SQLite store, permission/boundary enforcement,
-action reviewer, local file writer and subprocess renderer. Only the external
-model and calendar are deterministic fixtures. Truncated JSON, a stream ending
-without a completed call, and missing schema arguments must yield a structured
-correction before action review or execution. The repaired workflow must reuse
-one calendar read and produce an actual one-page PNG or PDF. Web cases download
-the file through FastAPI; Telegram cases verify the multipart Bot API upload
-bytes. Pixel checks and PDF page/image inspection reject a text-only fallback.
-The cases cover English, Japanese and Arabic. They are local Docker acceptance,
-not a substitute for live stage Web UI or real inbound Telegram app validation.
-
 `test_tool_argument_protocol_recovery.py` also checks the framework handoff:
 LangChain retains malformed/incomplete calls as invalid calls, and a real
 LangGraph `ToolNode` must not execute a tool's optional default arguments for
@@ -499,15 +316,6 @@ exact inspection across report correction, fresh parallel batches, protocol
 receipt identity, and runtime-owned checkpoint replacement. These deterministic
 container checks do not establish live provider reasoning quality; live stage
 acceptance remains a separate opt-in run.
-
-Reviewer publication coverage exercises real Web chat, Chromium rendering and
-reload, Telegram HTTP delivery, SQLite history, native file creation and uploaded
-report bytes with scripted external review responses. Multilingual editing
-instructions must stay internal. The contracts also cover incomplete requirement
-matrices, missing required execution, numbered clarification/approval, partial
-report details, valid/blocked file delivery and both sides of UTC midnight.
-These local provider-boundary checks do not establish live model judgement
-accuracy; opt-in live stage checks remain separate.
 
 Limitation-role contracts prove that a failed/denied receipt can explain a public
 limitation while the same receipt cannot certify source facts or completion.
@@ -529,15 +337,6 @@ and error-body read failures; adjacent connector, media and loading-screen units
 exercise the same ownership rule.
 These are local container contracts, not live stage or native Telegram acceptance.
 
-Failure-attribution contracts exercise real browser extraction from a controlled
-HTTP page, an HTTP source adapter, outcome review, SQLite history, Web UI/reload
-and Telegram HTTP delivery. Spanish and Japanese cases cover a failed extraction
-followed by useful source facts, a genuinely blocked second subject, an entirely
-failed source path, explicit public limitations, and an update without readback.
-Unit coverage checks failed-receipt bindings, alias resolution, invalid and
-recovered references, consent preservation and recomputation on continuation.
-External model/source responses alone are scripted; no live account is needed.
-
 `tests/e2e/test_live_stage_failure_attribution.py` is separate opt-in Web UI
 acceptance with a real stage model. Besides `NULLION_LIVE_STAGE_E2E=1`, it requires
 an explicit `NULLION_LIVE_FALLBACK_SOURCE_URL` and
@@ -556,32 +355,9 @@ the stage runtime. A recovered extraction must not become a blanket outage.
 The local Telegram HTTP contract and the Web live scenario do not replace that
 native app check; it remains pending while live stage runs are held.
 
-`tests/e2e/test_cron_completion_execution_recovery.py` exercises the real
-scheduled runner, graph, SQLite diagnostics and platform upload boundary with
-external model/source fakes. It covers native and generated partial HTML,
-finishing missing records in the same run, a productive interrupted continuation,
-persistent outages, unchanged partial fallback bytes, one selected report file,
-verified negative browser/native monitor checks, inline requirement correction,
-and action-review pointer correction before one actual write. Assert research
-completion and uploaded content, not merely a nonempty failure message.
-The cancellation case stops at the producer/report-owner handoff and asserts
-zero subsequent model calls while preserving the cancelled terminal outcome.
-
-Focused unit coverage lives in `tests/test_scheduled_completion_execution.py`,
-`tests/test_progressing_recovery_budget.py` and
-`tests/test_action_review_protocol_repair.py`. It includes cross-format partial
-version guards, schema/receipt ownership, missing cursor pages, blocked actions,
-unavailable tools/reviewers and fixed producer budgets. These local contracts do
-not prove the judgment or availability of a live third-party source. Keep opt-in
-live stage probes disabled while the user has held them.
-
-`tests/e2e/test_artifact_summary_revision.py` covers native prepared HTML and source-recovered HTML with a rejected final chat summary, through the real scheduled runner, SQLite review records and Telegram upload bytes. Japanese and Spanish requests verify one bounded tools-disabled revision, fresh review, no repeated source reads or duplicate reports, and report preservation during composer outages. `tests/test_artifact_summary_coverage.py` checks evidence-only coverage against unknown citations, mismatched contracts, failed requirements, blocked/approval/input states and retry tools, plus suppression of private correction prose in captions. The upload contracts also include an internal history dataset, changed-file invalidation during composition, and cancellation before and during summary correction with no later calls or delivery. Live stage remains opt-in and must stay disabled while held.
-
-Search coverage contracts live in `tests/test_search_coverage.py` and `tests/e2e/test_search_coverage_boundary.py`. They exercise Japanese/Spanish requests, primary-empty/alternate-positive results, scoped negatives, early positive completion, incorrect filters, correction of an incorrectly narrowed scope, blocked alternatives with useful partial answers, durable candidate metadata, and measured five-request plain-chat latency with a forbidden slow discovery dependency. The E2E uses the actual graph, SQLite, FastAPI Web route and scheduled Telegram delivery boundary; only external providers and sources are scripted. `tests/test_cron_continuation_review.py` reproduces a resumed producer returning success without an independent receipt, including failure that must retain supported findings.
+Primary-agent source selection uses the source receipts and tool scope it already owns. There is no independent search-coverage grader, correction loop or completion receipt requirement. Tests for a fabricated primary answer being repaired by a reviewer are retired. Keep native browser quote/schema validation, source ownership, read-only permissions, file versions, approval resumptions and actual delivery checks; their failure receipts remain visible without an AI grade.
 
 `tests/test_bounded_comparison.py` and `tests/e2e/test_bounded_comparison_boundary.py` distinguish a scoped recommendation with incidental pending listings from an unresolved ranking contender. The graph/SQLite, Web route and Telegram HTTP delivery tests prove an observed recommendation can finish with thirteen unverified discoveries retained, a credible contender receives a targeted source read, scope-only wording repair performs no further source reads, and blocked contenders keep useful facts with a specific limitation. Platform tests verify one delivered reply and persisted history. Japanese/Spanish prompts share the same typed path. Explicit exhaustive comparisons still inspect the discovered sources; unit cases also cover missing selected-source proof, requested subjects, discovery truncation, incorrect filters and legacy negative/comprehensive coverage. Provider calls and external source adapters are deterministic; no live stage/provider calls are used by these tests.
-
-`tests/e2e/test_live_stage_search_coverage.py` is opt-in through `NULLION_LIVE_STAGE_E2E=1` and `NULLION_LIVE_COVERAGE_CASE`, a JSON file containing `prompt`, `expected_source_url`, and `expected_text` for controlled public fixtures. It submits through stage Web and checks both the visible alternate match and backing source/review evidence. Do not run it while stage acceptance is held. These local tests do not establish a real model's judgment accuracy or current commercial inventory.
 
 Controlled coverage pages are provided under `tests/fixtures/search_coverage/`: the discovery page links to an empty primary catalog and an independently stocked format-specific catalog. When live stage is authorized, serve those pages through the permitted test-fixture origin and generate the live case JSON with that origin, the requested fixture constraints, alternate URL and literal listing ID `COVERAGE-IMAX-007`. Do not treat these pages as real commercial inventory.
 
@@ -589,11 +365,7 @@ Scheduled chat presentation uses the same guidance in the original producer and 
 
 `tests/e2e/test_saved_job_configuration_repairs.py` exercises actual job creation and scoped updates through FastAPI/SQLite, using Japanese and Spanish labels. It checks current-evidence task updates, disabling an expired annual alert without deleting its history, and local market-alert next-fire times in winter and summer. Unrelated settings and jobs must remain unchanged. This is configuration persistence and scheduling coverage; it does not execute real account searches or prove report writing quality.
 
-`tests/e2e/test_review_report_repetition.py` drives the actual runner, scheduled graph, SQLite and Telegram transport boundary with a producer report, a reworded full helper report, and a narrow limitation. Japanese and Spanish variants require one report and one limitation on the wire, with no repeated research. `tests/test_review_assistance.py` covers legacy and structured replacements, explicit additions, covered facts, empty drafts and idempotent handoff. `tests/e2e/test_calendar_nearby_duplicate_review.py` uses the real connector adapter and action preflight: an existing reminder beyond the first three events, on a nearby date, must be visible before the proposed write. Only external provider/model boundaries are faked; no calendar POST may occur. `tests/test_calendar_review_evidence.py` checks opaque continuation replay, provider isolation, malformed pages, preview counts and complete cursor chains.
-
 `tests/e2e/test_scheduled_review_outage.py` also reproduces an evidence inspection followed by a provider timeout. Its model-boundary clock consumes the passed timeout and requires subsequent attempts to stay within the original total allowance. The real scheduled runner, SQLite, shared report renderer and Telegram upload path must retain one concise caption and the exact HTML bytes, without a second research run or a failed-task notice. Unit cases in `test_compact_report_contract.py` cover report envelopes with attachment descriptors across HTML, PDF, Office, image, data and archive extensions, compact/detailed preference preservation, unknown trailing text, and empty media markers. The model and network remain simulated in these boundary tests; a separately recorded real-provider writing replay checks the supplied report's summary quality without repeating live research or delivery.
-
-Attachment acknowledgement regressions are covered by `tests/test_delivery_acknowledgement.py`, `tests/e2e/test_delivery_acknowledgement_boundary.py`, and `tests/e2e/test_adjacent_attachment_acknowledgement.py`. They distinguish server acceptance from an SDK response, inspect actual multipart bytes and persistent receipts, and cover HTML/PDF/Office/image/archive/text data, delayed success, accepted-but-lost acknowledgements, safe pre-connect/rate-limit retries, explicit rejection, acknowledged prefixes in multi-file batches, Telegram scheduled/operator/reply/callback paths, Slack/Discord, and SQLite outbox recovery after an interrupted send. The external HTTP transport or SDK is simulated; no production account is contacted. The cron transport test enters the real delivery graph at its completed-execution boundary; `tests/e2e/test_changed_report_review_boundary.py` separately drives the real producer and native file handlers through research recovery, unchanged-file/new-evidence recovery, reviewer outage and unavailable evidence, asserting final upload bytes and persisted completion status in Japanese and Spanish.
 
 These focused Docker checks do not replace user-authorized live stage acceptance. A lost remote acknowledgement cannot be reconstructed by a boolean send probe; do not claim exactly-once delivery or successful completion from a pending/unknown receipt. Hold broad/live runs when requested.
 
@@ -611,90 +383,11 @@ Telegram coverage additionally exercises ordinary final replies and pending
 stream creation through real SDK requests: unknown acknowledgements survive
 finalization without another message, while typed rejections retain fallback.
 
-Search-validation regressions include paraphrased constraint descriptions with
-stable ids, discovered URLs followed by filtered source and booking pages,
-structured collections, multi-page evidence, earlier selected reads and bounded
-discovery inventories. Positive find-any outcomes retain ancillary diagnostics
-without inventing unfinished work. Wrong filters, unsupported matches, broader
-negative results and incomplete comparisons remain incomplete. Invalid review
-bindings preserve usable findings with a review warning and do not trigger
-another source read. These contracts use local provider/network fakes through
-the real orchestrator, Web API, SQLite and scheduled delivery boundaries; live
-stage remains opt-in.
-
-Source-answer failure recovery is covered by
-`tests/test_source_answer_failure_recovery.py` and
-`tests/e2e/test_source_answer_failure_recovery_boundary.py`. The E2E drives the
-real Web route, LangGraph, SQLite, source renderer and Telegram SDK with external
-model/source/HTTP fakes. Japanese and Spanish cases cover model timeouts,
-transport errors, repeated malformed selections, absent selections and independent
-semantic rejection. They assert selected findings survive, unselected inventory
-and controls stay hidden, research runs once, and exhausted preparation does not
-start another review. These controlled checks do not establish live-provider
-latency or replace an authorized live-stage replay.
-
-`tests/e2e/test_selected_request_objective_boundary.py` exercises Web and real
-Telegram ingress with persisted parent turns and platform delivery receipts.
-It deliberately changes quoted Markdown to platform display text, interleaves
-an unrelated report, and uses two-step numbered clarifications. Japanese,
-Spanish and French height/weight requests first receive a wrong roster answer;
-the real review/execution graph must fetch the missing properties, publish
-them, and record a complete verdict without an unrelated source-discovery
-warning. Raw adapter results and captured source-answer composition are both
-covered. External model, source and send responses are controlled; these tests
-do not establish real-provider reasoning quality. `tests/test_request_lineage.py`
-and the source-attachment regressions cover reset, cancellation, cross-workspace,
-cycle, bounded-context and in-flight input protections. Existing measured plain
-chat contracts continue to guard the unrelated-request fast path.
-
-`tests/e2e/test_plan_revision_recovery_boundary.py` replays a persisted numeric
-height-request follow-up through Web and Telegram after a browser proposal is
-rejected by action preflight. The corrected proposal must execute once and
-deliver the requested properties with source evidence. Additional real graph
-and SQLite cases cover other action tools, approval suspension/resume,
-delegated execution, unchanged rejected proposals, productive scope recovery,
-and a scope loop that must terminate without repeated completion reviews.
-Provider/source/platform responses remain controlled; no paid live stage probe
-is implied. `tests/test_plan_revision_recovery.py` covers malformed contracts,
-non-English diagnostics, proof receipts, checkpoint restoration, and unresolved
-execution failures. These are focused local regressions, not live-provider
-acceptance evidence.
-
-The productive-continuation cases in
-`tests/e2e/test_cron_completion_execution_recovery.py` also guard the report
-boundary after multiple provider interruptions: completed research and an
-updated file must reach independent final review, rather than being stranded
-behind a byte-matching partial/unknown receipt.
-
-`tests/e2e/test_structured_review_layout_boundary.py` runs independently reviewed
-partial comparisons through the real Web API, narrow Web DOM and Telegram HTTP
-transport. Each comparison unit must remain one item with its related values,
-source link and uncertainty. Section headings, item boundaries, inline emphasis
-and limitations must survive SQLite persistence and browser reload without raw
-Markdown or redundant generic disclaimers. Adjacent Web cases cover indented
-details, paragraph continuations, nested items and literal prose. External
-provider responses are controlled; this does not run a paid live stage probe.
-`tests/test_structured_review_layout.py` covers legacy/prose preservation,
-malformed display metadata, evidence-reference resolution, numbered choices,
-review outages and operational notices that must remain visible.
-
 Structured source coverage regressions also live in `tests/test_declared_source_coverage.py` and the structured-adapter cases in `tests/e2e/test_bounded_comparison_boundary.py`. They cover nested declared records with no text, parent-bound evidence aliases, empty/failed records, identity-only compaction, credentials in URLs and linked-target separation. The graph and real Web route must retain verified prices and actionable limitations. `tests/e2e/test_live_stage_bounded_comparison.py` uses the disposable `live_source_server.py` fixture and a real stage Web/provider request to exercise a scoped recommendation. `live_cdp_service.py` supplies an isolated container browser at the configured stage-only endpoint when no external stage browser is running; it never mounts a host browser profile.
 
 The live stage audit runs sequentially and stops on the first failed case. Successful plain/weather preambles with identical arguments are reused within one runner process for at most 30 minutes; affected workflow requests are always executed. A new runner or candidate revision starts fresh baseline measurements. Keep successful case node IDs when resuming an interrupted audit so that provider-funded cases are not repeated unnecessarily. Saved-task replay datasets may be explicitly bounded for the audit; record that scope rather than representing them as full mailbox or full research replays.
 
 ### Shared presentation and live-condition amendments
-
-`test_shared_presentation_delivery.py` saves style settings through FastAPI and
-checks ordinary chat, scheduled runs, Doctor notices and Slack/Discord upload
-bytes. It asserts unchanged facts, artifact bytes, numeric choices and the
-ordinary-turn latency/call-count budget. `test_live_tracker_verified_change_delivery.py`
-checks saved emoji and Markdown settings through real SQLite, evaluation, Web
-history and Telegram delivery. `test_live_tracker_condition_amendment.py` starts
-with an insufficient list-only answer, exercises reviewer recovery through the
-real chat route, verifies the saved matcher receipt, then polls new data and
-delivers only qualifying changes. It also checks original deadlines, snapshots,
-invalid amendments and original-chat ownership. External providers and platform
-network clients are the only scripted boundaries.
 
 `test_live_stage_web_tracker_updates.py` adds a real-provider Web acceptance for
 an existing tracker's condition amendment followed by continuing delivery. It
@@ -715,14 +408,6 @@ tracker after both matches. The source is refreshed in its existing worker tab.
 `test_live_source_fixture.py` verifies the source's clock and two independent
 changes over HTTP, including isolation from a second observation owner.
 
-Native stage evidence GETs share `scripts/live_stage_http.py`. Transport errors
-and 502/503/504 responses receive a bounded retry; authentication, authorization,
-invalid requests and malformed JSON fail immediately. The helper refuses
-mutations and never resubmits the user request. Provider-guard subprocess E2E
-checks cover a transient first read followed by a real SQLite quota receipt,
-proving later paid scenarios still stop. The continuing-tracker acceptance also
-records setup/amendment latency and bounds unnecessary completion-review rounds.
-
 The continuing-alert replay also requires each matched headline and its verified
 direct link to survive generic evaluator summaries. `complete_verified_findings`
 in the shared message layer fills missing context from exact current evidence;
@@ -740,18 +425,6 @@ submissions. Do not repeat already completed provider-funded setup to repair a
 harness assertion. Native evidence outages must not prevent cleanup of an exact
 owned tracker through the stage API; foreign names/conversations stay unchanged.
 
-Requested in-chat questions, wording and response structure use the existing
-`reasoned_answer` proof domain; live facts and external actions retain tool-bound
-proof. `test_response_content_requirement.py` checks both domains in one real
-FastAPI turn with Japanese/Spanish requests. The opt-in Web counterpart
-`test_live_stage_web_response_proof.py` checks real forecasts, visible questions,
-complete reviews and latency. The in-flight WebSocket probe records per-request
-latencies separately from total workflow duration, so its single-request limit
-is not applied to the sum of three requests. `test_live_active_probe_timing.py`
-checks this distinction without provider calls. When coordinating the entire
-live audit, run identical API/Web catalogue prompts once through Web, and retain
-API-only scenarios separately; document that selection explicitly.
-
 Stage file-lookup checks use an owned temporary directory beneath the running
 stage workspace, mounted separately into the Docker probe. They never write
 fixtures into a container-only imitation of the stage home. The launcher removes
@@ -766,27 +439,10 @@ absence within its declared roots and exclusions; denied, interrupted, truncated
 or bounded content-prefix scans cannot prove general absence. Missing output
 files still require successful generation and delivery evidence.
 
-Completed runtime reviews also bind the exact request, response, tool evidence,
-and file versions before optional common retries are considered. Changed
-requests, changed evidence or files, incomplete reviews, and tool-output lookalike
-receipts retain the recovery path. Rejected plans are reconciled with the cached
-material contract before the missing-tool gate; this does not add a planner call
-to ordinary requests. Recovery may omit an unrequested action instead of forcing
-another attempt with the same tool. The API regression includes a rejected write
-and verifies no execution, one review, and preservation of the actual lookup answer.
-
 Advertised artifact download URLs must return the actual bytes. Live checks fail
 on HTTP errors even if a matching local file exists. Exact existing-file delivery
 compares the downloaded SHA-256 with the source fixture; inspection tools alone
 are not failures and do not prove delivery.
-
-Batch scheduler mutations declare item collections with exact task IDs, allowing
-separate requested actions to cite separate runtime-bound records. Batch starts
-expose only successfully started items as action evidence; failed or missing
-items cannot borrow a successful sibling's receipt. The Japanese/Spanish API
-regression verifies two selected tasks change, another remains unchanged, and
-completion needs one planner and one review without task-list rereads. The real
-stage bulk-enable contract retains its existing latency limit.
 
 Paid API scenarios can run individually through
 `test_live_stage_api_scenarios.py`, with an explicit `NULLION_LIVE_SCENARIOS`
@@ -813,32 +469,11 @@ Source artifact handoff coverage: `tests/e2e/test_source_artifact_contract_deliv
 
 The stage Web wrapper mounts its owned ephemeral fixture directory at the same absolute path inside the container and on stage. Both artifact and archive-upload fixture roots point there. Archive and planner probes reject missing or mismatched shared roots before invoking a provider; `tests/test_live_stage_fixture_paths.py` covers that quota guard.
 
-Archive prerequisite coverage: `tests/e2e/test_archive_prerequisite_evidence.py` uses the real API, archive extractor, workbook generator, SQLite state, and downloaded workbook bytes. It requires complete outcome review while keeping an intermediate manifest out of delivery. Archive and retry-guard probes additionally require fulfilled backing source work. Artifact-package acceptance independently checks required files, contents and rendering; an optional review outage is recorded separately, while a known material failure still fails acceptance.
-
-`tests/e2e/test_browser_retained_source_recovery.py` covers browser-to-PDF recovery after a rejected browser-report claim: the real chat route and persistent runtime inspect an earlier retained capture, create one PDF, and verify its downloaded price bytes without a second browser request or guessed file paths. The external browser navigation and provider are scripted; the native evidence collector, retained inspector, PDF generator, routing, review binding, and persistence remain real. `tests/test_browser_retained_documents.py` checks the compact index and rejected-claim boundary.
-
 `tests/e2e/test_generated_artifact_inspection_delivery.py` also exercises abbreviated image, PDF, and CSV inspection paths across three languages. It requires recovery to an exact retained path, one final file set with verified download bytes, and no spurious access approval. Unit coverage in `tests/test_artifact_read_references.py` checks additional formats and ensures a deliberate different-path retry retains normal access policy.
 
 The live flight correction contract permits a numbered clarification when relative dates are ambiguous. It resolves that clarification and requires a fulfilled current turn and one downloadable PDF; keeping the original comparison must preserve its exact bytes without repeating research or generation. Its longer HTTP observer budget does not relax the separate latency assertion or production limits, and a disconnected observer stops only its owned conversation. Status GETs and artifact downloads use the same explicitly configured authority header; transient read retries never replay a chat submission.
 
 `tests/e2e/test_scheduler_inventory_family_discovery.py` starts with an empty live-tracker inventory while the named record exists as a cron or reminder. Multilingual API and rendered Web tests require the actual related inventory read, a fulfilled status answer, and unchanged saved state. Representative plain turns measure average/max latency and require one provider call each. `tests/test_scheduler_inventory_scope.py` covers metadata-based visibility, read-only scope retention, later explicitly planned mutations, and reminder workspace boundaries.
-
-Reusable-tool workflow coverage independently requires the pre-save catalog
-search, durable save, and exact-revision run through the real API/Web, catalog
-SQLite store, terminal boundary, and outcome reviewer. It rejects false partial
-results, duplicate operations, and extra review retries before reusing the saved
-revision in a fresh runtime. The live counterpart checks `response_fulfilled`
-for creation and reuse, alongside the actual revision and computed results.
-Unit cases distinguish untested-definition metadata from current operation
-failure and validate empty catalog search receipts.
-
-Internal working-file tests cover deliverable, action, and execution-only constraint
-contracts in three languages. The real DOCX route must complete review once,
-deliver only the final document, verify its downloaded contents, and preserve
-that selection on history reload. Artifact-binding unit cases cover nine file
-formats and reject external-fact use, public constraints, selected-file
-substitution for internal prerequisites, ineligible or missing/failed producers,
-and unbound record claims.
 
 `test_background_setup_source_coverage.py` uses the real chat route, rendered Web,
 native tracker tools, SQLite state and a controlled HTTP source. Japanese and
@@ -859,61 +494,6 @@ chat route remains one model call with no report-rendering work. The opt-in
 owned fixture records, a disabled one-shot job and rendered Web evidence; it never
 reads personal accounts or creates calendar events.
 
-`test_source_group_repair.py` and `test_source_group_repair_boundary.py` cover
-same-capture title/terms grouping, missing-title repair, foreign-language requests,
-independent snapshot protection, retained limitations and failed-repair partial
-publication through real chat/persistence and Telegram HTTP delivery. The opt-in
-`test_live_stage_web_source_groups.py` checks a rental comparison and an adjacent
-product lookup against disposable pages from `fixtures/source_group_server.py`.
-It asserts rendered Web outcomes and backing selection/review evidence without
-performing real reservations or purchases.
-
-`test_reviewed_presentation_correction.py` rejects incomplete, malformed or
-unbound replacement answers. `test_reviewed_presentation_correction_boundary.py`
-drives the real chat graph through FastAPI, rendered Web UI/history and Telegram
-SDK HTTP bytes with Japanese and Spanish requests. It checks compact output,
-retained amounts and uncertainty, durable completion state, one source read and
-one review with no producer retry. External model/source boundaries are faked;
-routing, review validation, persistence and rendering remain real.
-The source-group boundary also exercises a reviewer-authored correction after
-literal selection repair, and the artifact-summary boundary covers a
-delivery-owned report correction without a separate composer or new file.
-Unknown evidence cannot certify a rewrite; amended requests, evidence, output
-and changed artifact bytes invalidate the cached result.
-The source-group boundary additionally scripts the empty-prerequisite contract
-seen in live acceptance, corrects only its evidence path, and verifies one source
-capture, two planning attempts and one final review. Both the schema and runtime
-parser must reject the invalid contract.
-
-`test_reviewed_shopping_presentation.py` covers catalog-shaped complete and
-partial comparisons in Japanese and Spanish across Web API, rendered Web/history
-and Telegram SDK HTTP delivery. It checks all three options and prices, one
-recommendation, omitted optional catalogs, visible genuine limitations and the
-saved emoji policy, with one source read and one review. Its provider validates
-the emitted review schema and proves legacy prose is not an allowed report
-finding format there. `test_review_report_layout_contract.py` checks citation
-rules still apply, legacy compatibility never changes completion, draft detail
-does not override preferences, and quoted assistant content retains the linked
-user request. Ordinary turns gain no formatting model call.
-
-`test_live_stage_web_review_layout.py` is an opt-in publication replay of an
-actual model review of retained production evidence. Run it with
-`NULLION_LIVE_STAGE_E2E=1` and `NULLION_LIVE_REVIEW_LAYOUT_REPLAY=1` through
-`scripts/live-stage-web-docker.sh`. It checks the rendered answer and durable
-history after reload without repeating source research. Its historical source
-snapshot contains omitted observations, so it verifies a correctly presented
-partial answer; it does not certify a fresh, complete shopping comparison.
-
-The source-answer recovery boundary also reproduces a rejected role selection
-followed by a valid long quoted field, and two invalid composition attempts
-followed by an independently grounded shared report. It checks one source read, one outcome review for cosmetic recovery, concise
-final facts, actual saved fulfillment and Telegram HTTP delivery. A genuinely
-unmet callable fact can still use the existing bounded execution recovery and
-subsequent review. The profile/clarification boundary includes a selected partial
-execution without saved clarification metadata: an acknowledgement must recover
-the actual lookup rather than closing the unfinished goal. Cancellation and
-explanation-only cases retain zero lookup calls.
-
 `test_live_stage_web_source_recovery.py` publishes the bounded real-model
 retained-source composition result through stage's actual history API and Web
 UI, then reloads it. The input is an explicitly fictional three-product fixture;
@@ -921,60 +501,14 @@ this verifies composition and publication, not current merchant prices or a
 fresh browser search. It uses `NULLION_LIVE_REVIEW_LAYOUT_REPLAY=1` with the stage
 Web wrapper and requires a successful saved real-model result first.
 
-`test_native_report_correction_delivery.py` covers a native record report whose
-reviewer authors a corrected report with `source_presentation_valid=null` and no
-browser selection. The real scheduler, graph, SQLite and Telegram boundary must
-publish that correction once with one enclosing title. Japanese and Spanish
-requests cover compact and detailed preferences, requested provenance, material
-uncertainty and aggregate calendar outcomes. The ordinary Web/Telegram report
-correction boundary also uses null when there is no source selection. Unit tests
-retain rejection of an explicit false verdict and an unverified real selection.
-
-`test_live_stage_web_native_report.py` replays the controlled native-record
-review result through stage Web history and rendering, checking one delivery
-title, compact text and mandatory facts after reload. Its inputs are fictional
-retained records; it performs no mailbox search, calendar write or fresh
-production job execution.
-
-Source-answer recovery boundary tests also assert that reviewer-rewritten full
-and partial answers retain both selected public source URLs through the real
-chat route, SQLite history and Telegram upload boundary, excluding unrelated
-inventory URLs. Shopping report fixtures use typed source URLs rather than
-embedding links in labels. Unit coverage checks bound-reference isolation,
-deduplication, compact/detailed output, unsafe targets and cosmetic fallback.
-
-`test_partial_review_and_inspection_delivery.py` covers a real FastAPI chat and
-SQLite history retaining a reviewed partial answer instead of starting an
-adapter retry that would time out. The same answer reaches the Telegram upload
-boundary with its link and incomplete status intact. Japanese/Spanish requests
-exercise the request-bound receipt policy. A second case requests eight retained
-inspection calls in one response, verifies the shared view budget, then retrieves
-an exact field outside that view without another source read or data loss.
-
 Native report delivery also covers the `triage_compact_fixture` failure shape:
 six obligations/notices, repeated metadata and routine calendar results, two
 uncertain outcomes, a conflicting amount and an unconfirmed event end time.
 Compact output retains the decision facts and source links once; detailed
 output retains the optional notification wording.
 
-Scheduled review outages are covered by `test_scheduled_review_outage.py`: the
-real runner, SQLite runtime, and Telegram document boundary preserve HTML bytes
-and an unconfirmed verdict without repeating completed reads or regrading an
-unchanged report. `test_multi_source_review_budget_workflow.py` checks that a
-corrected caption and its separately verified attachment reach the Web API once,
-including under source-capture budget pressure. `test_tracker_status_delivery.py`
-checks the persisted final-review cause, independent delivery receipt, and one
-Doctor notice through the real status worker and Web history route. These cases
-use deterministic providers at the external boundary and consume no model quota.
-
-Outcome-assistance coverage in `test_review_helper_delivery.py` exercises real runner/SQLite, FastAPI history, Telegram SDK HTTP delivery, delegated context publication and grouped artifact acknowledgements. Timeout, invalid-editor and cosmetic-rejection fixtures preserve the usable primary answer without review warnings or repeated reads. A slow editor exercises the delegated outer deadline. Scheduled report coverage feeds its actual acknowledged result into tracker health to prove helper unavailability cannot create a twelve-run Doctor failure streak. Separate cases retain permission, required-action and corrupt-file failures, plus successful grounded corrections and scoped execution-improvement plans. These controller fixtures do not measure model judgment accuracy.
-
 
 ### Partial report attachment and inventory carryover regressions
-
-`test_scheduled_budget_native_attachment.py` covers Japanese and Spanish saved tasks paused for budget, approved through FastAPI and resumed from SQLite. It verifies one actual Telegram upload of the selected bytes when the external reviewer times out across HTML, PDF, spreadsheet, CSV, image, document, archive and audio files, including missing requested embedded images in supported report formats. Incomplete content remains partial; no replacement file or completion claim is manufactured. `test_native_artifact_preparation_versions.py` additionally rejects changed bytes and keeps early completion stricter than terminal partial delivery.
-
-`test_cron_inventory_latency_workflow.py` exercises real chat and inventory routes, SQLite and the independent review packet. All observed task identities, scheduler-kind scope and source-page coverage must survive the detailed-row sample. The live Web inventory case checks visible names and its existing latency threshold; it must not pass by silently omitting later tasks or increasing the deadline.
 
 `test_background_status_chat_visibility.py` starts the Slack and Discord adapters with real SQLite session preferences and the shared card renderer. Only the external SDK endpoints are captured. A chat setting opposite to the global setting must control activity details, preserve the planner and deliver the terminal answer. `test_verbose_final_delivery.py` covers the corresponding real Web UI and reload boundary.
 
@@ -989,8 +523,6 @@ reuse. Its source pushes are covered by an actual HTTP stream test; live tests
 must not assume that background browser timers keep a page current. Static-page
 freshness coverage uses the normal navigation refresh mode instead.
 
-`test_live_tracker_native_preflight.py` drives the actual Web chat route, native browser reads, prepared argument bindings, tracker admission and SQLite review records. A mechanical alias/default suggestion must not block valid creation or repeat producer reads. An explicit constraint must instead preserve the numbered question and create no tracker. `test_preflight_step_scope_boundary.py` also verifies that native mechanical authority cannot bypass an approval-required tool. Shared completion tests bind `awaiting_input` to the exact current question and invalidate it when that state changes.
-
 `test_named_existing_file_delivery.py` checks real chat/API downloads after
 editing an existing file outside managed artifact storage. The original edit,
 one exported filename and exact download bytes must agree. It includes Unicode,
@@ -999,15 +531,6 @@ named versions across eight formats, complete attachment paths and delegated
 relative HTML/image links while excluding unselected sibling files. Live
 transformation chains stop at an unfulfilled intermediate artifact before
 spending provider calls on later transformations.
-
-`test_native_worksheet_counts.py` exercises a real chat request, native count
-failure/correction, multi-sheet XLSX bytes and the saved execution receipt.
-Individual worksheet counts coexist with a strict workbook-total count.
-`test_retained_followup_boundary.py` covers completed-parent read reuse and a
-subsequent fresh read through chat routing and SQLite. Its source is a controlled
-HTTP boundary; Nullion's routing, persistence, scope and review remain real.
-It sends follow-ups without repeating the source URL, exercises generic scope
-recovery, and verifies that only an explicit fresh check reads the source again.
 
 HTTP and WebSocket commands use the ordinary shared result payload. Native
 attachment tests exercise both entry forms on both transports. Static-command
@@ -1025,24 +548,6 @@ external dependencies without network fetches or fabricated replacements.
 `test_inline_svg_media.py` covers exact Unicode/multiline source spans and
 empty, malformed, or definition-only markup. Existing SVG-file tests continue
 to exercise PDF and Office downloads.
-
-The opt-in captured-package Web replay in
-`test_live_stage_web_saved_report_rendering.py` verifies previously generated
-files and renders each PDF page with the test-only PDFium dependency. It makes
-no new model request and keeps the original latency verdict unchanged. Optional
-review outages are recorded separately from actual download/content results.
-The original saved flyer HTML is a checked-in fixture, so the exact inline
-illustration rejection remains reproducible without another provider request.
-The same E2E module also covers English and Japanese HTML creation through the
-real API and download route, comparing unchanged bytes and the browser-rendered
-illustration pixels. HTML creation and final fulfillment share structural SVG
-checks with the PDF renderer's external-resource policy.
-Rendered PDF regression coverage also retains a responsive poster fixture with
-an additional image. It checks the one-page result's bounded text and actual
-rasterized color regions, including the authored dark background behind white
-text. This catches clipping and contrast failures that raw PDF text extraction
-misses. A separate two-PDF chat case verifies an illustrated poster plus a plain
-two-page memo, with no forced image-generation retry for the memo.
 
 SVG artifact cases cover inline markup and base64/percent-encoded image data
 URIs, Unicode, local XLink definitions, and HTML character references. Every
@@ -1064,22 +569,6 @@ request, proving a recovered evidence read cannot start a second paid case.
 Pending evidence reads are drained at case boundaries before another paid case
 can start. A delayed transport or quota result cannot leak into the next case or
 permit it to run without the synchronous provider preflight.
-
-`test_optional_artifact_media_recovery.py` exercises the real chat API, persistent
-runtime, native creators, artifact selection and download. English/Japanese cases
-repair failed optional artwork in PDF/DOCX/PPTX/XLSX without another generation
-loop. An archive containing valid and corrupt PNG files plus a text file must
-import every inventory row literally and deliver only the requested workbook.
-Unit cases retain explicitly required visual checks, reject provider-payload
-provenance spoofing, and preserve native requirement metadata through review.
-Delegated coverage runs the actual Deep Agents graph with native spreadsheet
-creation, then passes the result through aggregation and the Telegram upload
-boundary. Only external model/SDK boundaries are scripted. It verifies one
-workbook's uploaded bytes and successful outcome after an optional image failure,
-including English/Japanese requests and preserved runtime-owned media metadata.
-Live archive acceptance compares the actual downloaded workbook row count with the
-native extraction receipt, excludes metadata sidecars, and checks follow-up
-CSV extension totals against that same archive rather than a stale inventory.
 
 `test_archive_followup_source_history.py` uses real API turns, SQLite history,
 native ZIP extraction, history compaction, and a downloaded CSV. It asserts that
@@ -1106,14 +595,6 @@ and must not continue the prior browser task.
 Timing checks run after functional and artifact-byte verification so a diagnostic
 timing target cannot prevent inspecting the actual delivered files.
 
-Action-receipt presentation coverage verifies actual tracker changes, subsequent
-polling, persisted condition revisions, and exact approved response copy through
-the real chat API. English-style authored copy is exercised with Japanese and
-Spanish requests. Review outages retain native acknowledgements; changed native
-facts, requests, reply text, or invocation identities invalidate presentation
-annotations. Serialization and subsequent requirement recording preserve the
-runtime-owned annotation, while provider-payload lookalikes cannot supply it.
-
 `test_restored_reply_identity.py` seeds replies through the real history route and
 checks active and archived history in a running Web UI in Japanese and Spanish.
 Reloaded replies retain their native runtime turn identity and completed-turn
@@ -1136,15 +617,6 @@ endpoint. The terminal-handoff chat E2E covers both successful partial reads and
 SDK exceptions while the SDK refuses shutdown. Confirmation-choice stage checks
 cover English, Spanish and Japanese without creating a task before consent.
 
-Review scope recovery includes Spanish and Japanese real Web-route/SQLite cases
-where the model initially expands the plan to unrelated contextual metadata.
-The independent typed scope mismatch must replace that plan, remove the extra
-requirement and finish from the original source evidence without another read.
-The live artist-research replay checks the same requested outcome against real
-provider/source evidence. Scheduled coverage recovery accepts either an inner
-producer repair or a scheduler continuation, but requires the actual interruption,
-all required source reads, a complete native review and one final delivery.
-
 Browser report publication tests include real child processes that hang during
 shutdown or exit with code7 immediately after publishing success/error reports.
 Japanese and Spanish real chat-route/SQLite cases require retained observed values
@@ -1160,25 +632,6 @@ A saved-conversation Web replay verifies that exact delivered reply, source link
 and turn identity across reload without repeating paid research. The price/stock
 and legal-research completion checks retain their stricter outcome assertions.
 
-
-The SDK blocker evidence boundary exercises a real disabled choice in Chromium,
-then checks its captured quote/control state in the Web API and SQLite history.
-Japanese and Spanish variants must retain the exact requested date without
-reporting inventory success. Rental and flight stage contracts require a completed
-request-owned review; price-related text alone cannot pass an unfinished lookup.
-Read timeout contracts exercise the actual Web route/store and a healthy second
-source after the first invocation times out; recovery scope receipt checks also
-cover invocation-scoped versus tool-wide failures.
-
-
-Terminal package regressions verify exact HTTP download bytes for four distinct
-requested formats after an unexecuted duplicate proposal and a reviewer outage.
-Same-format drafts and prior excluded/revised candidates retain their selection
-requirements. The children’s live package accepts permitted native producer
-fallbacks and additionally inspects actual Word page-number fields and embedded
-media. Browser blocker tests also exercise an over-expanded either/or plan being
-replaced from typed scope feedback without repeating the browser lookup.
-
 Shared secret-link delivery coverage compares WebSocket text, the HTTP result,
 and durable chat history. Secret query values must be masked consistently while
 Markdown link delimiters and non-secret query parameters remain intact. Separate
@@ -1192,10 +645,6 @@ not a passing workflow or evidence of a provider outage. Preserve the failed
 run and replay it after removing the resource contention. Cleanup may close
 owned test contexts and tasks, never unrelated or unowned browser tabs.
 
-Recovery-focus contracts retain each selected reader's declared, callable READ
-setup tools. A narrowed review must not strand the agent on one page. Real
-Web/store cases cover opening another source after a focused read request.
-
 Native tracker replay covers a results page whose heading ID changes on each
 load. Adapter metadata identifies readiness checks already enforced inside the
 read; replay validates these prerequisites without running stale duplicate
@@ -1203,26 +652,6 @@ waits ahead of the repairable source handler. One bounded repair uses the real
 page snapshot, retains the source/projection/heading constraint, and commits
 the replacement with a correctly bound comparison snapshot. The next real
 value change must produce a notice while the tracker remains active.
-
-A rejected overwrite of a current native artifact package enters the existing
-selection and outcome-review path once. This does not certify the files from
-format presence or suppress missing content/actions. Boundary tests require
-unchanged download bytes and one rejected proposal, including review outages.
-Complex package probes allow a twelve-minute observation window and still
-record latency advice; this does not change product execution budgets.
-
-Shared-media contracts generate distinct native DOCX and PPTX files from one
-downloaded image, then download both through the real Web API and inspect the
-embedded image bytes. Reusing supporting media must not count as reusing a
-deliverable; reusing the same primary file still fails. Adapter-declared
-`source_record_collections[].observed_url_fields` identify actual fetched URLs,
-including binary downloads. Rendered crops use the native screenshot's page
-receipt, never a requested URL or a linked image as proof of observation.
-The DOCX case also requests native page numbering and checks the real footer
-PAGE field in the downloaded ZIP alongside its media. The review packet must
-contain the independently inspected field count. Unit variants cover default
-and disabled numbering, body text that merely says "Page 1", and rejected
-unsupported formats or non-boolean arguments.
 
 PDF content checks use Poppler's logical text extraction when available in the
 Docker runner, while retaining structural, image and nonempty-content checks.
@@ -1236,19 +665,7 @@ artifact link targets and their served bytes; the desktop Save control uses a
 local-save route, not a Playwright browser-download event. Preserve the original
 failed run and record this separately; it is not a fresh research run.
 
-Review correction schema tests compare accepted and rejected source-presentation
-verdicts against the runtime parser with and without a source selection. The
-source-answer recovery E2E validates the actual review response schema while
-repairing an invalid original role, then checks the corrected Web and Telegram
-output and stored outcome without repeating source work. Invalid or incomplete
-corrections retain their existing rejection and partial-publication behavior.
-
-`test_scheduler_pending_input_contract.py` exercises the real Web route and
-SQLite scheduler: the full request waits on its actual confirmation, stores no
-job before the user chooses, creates one paused job after a numeric confirmation,
-and creates nothing or opens no approval when the user chooses to decline.
-Japanese and Spanish requests share the typed path. Unit cases distinguish a
-missing user-controlled input from an unsupported source fact or action claim.
+Native approval and source-selection workflows retain numbered user choices and persistent pending state. Reviewer-invented clarification questions and review-driven repair windows are removed with the quality layer; the primary agent and existing typed task/approval state own those decisions.
 
 Readiness-repair budget tests use multiple source pages in one session through
 the Web API and SQLite. Different-source failures must permit the healthy
@@ -1266,3 +683,28 @@ The live email-to-carrier contract completes a runtime-owned numbered source sel
 The disposable public-source CDP fixture defaults to headed Chromium on Xvfb inside Docker. `--headless` is an explicit comparison option. Web UI tests may still use headless Chromium; that does not establish public-site accessibility in the normal browser mode. A headless-only page error must be compared with headed mode before declaring the source inaccessible. `test_live_cdp_fixture_mode.py` checks the effective browser mode and rendered PNG/DOM in both modes. No host profile, production browser setting or private session is changed by this fixture.
 
 The real CNN setup observer allows 240 seconds for source inspection and a genuine creation-confirmation exchange. The earlier 120-second observer could cancel a valid confirmation before it reached the test. This does not change production timeouts, tracker duration, positive-match evidence, duplicate-alert assertions, or cleanup.
+
+
+Reviewer-only fixtures that deliberately supplied an incorrect primary answer
+and expected a second AI to repair, grade or force source presentation are
+retired with that feature. Native permission, cancellation, pending-context,
+file version, compaction, formatting and transport tests remain. Existing
+partial answers stay visible even when another connector needs reconnection;
+native outcome state still records that blocker.
+
+`test_live_stage_web_producer_completion.py` covers real stage Web PDF download
+and native account-source consent with no independent quality-review events.
+`test_live_stage_web_producer_generation.py` extends this to final DOCX selection,
+a complete twenty-row XLSX, CSV generation during dashboard polling, an existing
+file lookup follow-up, multilingual plain-turn latency, read-only scheduler
+inventory and weather. These opt-in tests use the real configured provider and
+browser UI, retain SQLite evidence, and inspect actual downloaded file bytes.
+They do not establish Telegram app coverage; that requires the unlocked native
+app and a real inbound user-message path.
+
+`test_terminal_reply_history.py` drives the real Web composer with a scripted
+external provider and native CSV writer. It holds startup history loading, sends
+a real user message, checks one terminal attachment after caption revisions and
+runtime synchronization, and reloads the page. Unit cases exercise both arrival
+orders, concurrent independent store connections, separate message parts and
+identical replies belonging to different requests or conversations.

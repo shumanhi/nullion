@@ -71,16 +71,8 @@ def test_discovered_source_does_not_block_accepted_setup_but_mixed_lookup_keeps_
             result=client.post('/api/chat',json={'text':prompt,'conversation_id':cid})
             assert result.status_code==200,(result.text,model.errors)
     turn=next(r for r in reversed(f.runtime.store.list_conversation_events()) if r.get('event_type')=='conversation.chat_turn')
-    if mode=='mixed_missing_coverage':
-        assert turn.get('response_fulfilled') is not True,(turn,model.errors)
-        assert model.plans==2 and model.reviews==0
-        plans=[e for e in f.runtime.store.list_conversation_events() if e.get('event_type')=='conversation.completion_requirement_contract']
-        assert len(plans)==2 and all('invalid_search_coverage_plan' in e['validation_errors'] for e in plans),plans
-    else:
-        assert turn.get('response_fulfilled') is True,(turn['assistant_reply'],model.errors,
-            [{k:e.get(k) for k in ['review_error','unresolved_requirements','search_coverage_errors','response_diagnostics']}
-             for e in f.runtime.store.list_conversation_events() if e.get('event_type')=='conversation.completion_review'])
-        assert model.plans==model.reviews==1
+    assert turn.get('response_fulfilled') is True,(turn['assistant_reply'],model.errors)
+    assert model.plans == model.reviews == 0
     assert [r['tool_name'] for r in turn['tool_results']]==['request_tool_scope','observation_read','create_live_tracker']
     # A separate ordinary turn retains the no-classifier/no-review fast path.
     model.mode='plain'

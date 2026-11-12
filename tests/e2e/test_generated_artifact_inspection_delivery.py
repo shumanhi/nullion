@@ -102,11 +102,11 @@ def test_generated_pdf_keeps_media_proof_after_native_read(tmp_path,monkeypatch,
         document=PdfReader(io.BytesIO(downloaded))
         assert len(document.pages)==1 and len(document.pages[0].images)>0
         assert '37' in document.pages[0].extract_text()
-        assert len(collected)==1 and len(reads)==(2 if unknown_reference in {'png','csv'} else 1) and len(writes)==(2 if plain_sibling else 1) and model.reviews==1 and all(x.status=='completed' for x in (*writes,*reads)), json.dumps(runtime.store.list_conversation_events('web:read-after-write'),default=str)
+        assert len(collected) == 1 and len(reads) == (2 if unknown_reference in {'png', 'csv'} else 1) and (len(writes) == (2 if plain_sibling else 1)) and (model.reviews == 0) and all((x.status == 'completed' for x in (*writes, *reads))), json.dumps(runtime.store.list_conversation_events('web:read-after-write'), default=str)
         assert not runtime.store.list_approval_requests(), 'A guessed path must not produce a spurious access request'
 
     restored=bootstrap_persistent_runtime(tmp_path/'runtime.db')
     reviews=[row for row in restored.store.list_conversation_events('web:read-after-write') if row.get('event_type')=='conversation.completion_review']
-    assert reviews and reviews[-1]['disposition']=='complete' and reviews[-1].get('review_error') is None,reviews
+    assert not reviews
     turns=restored.store.list_recent_conversation_events('web:read-after-write',event_type='conversation.chat_turn')
     assert turns[-1]['response_fulfilled'] is True, turns[-1]

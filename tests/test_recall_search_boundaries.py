@@ -105,8 +105,12 @@ def test_import_migrates_legacy_storage_without_leaking_origin_metadata(tmp_path
     store.save_message('web:a','user','Cedar reference')
     store.save_message('web:a','bot','Recorded Cedar reference')
     with sqlite3.connect(path) as conn:
+        # Reconstruct the old schema, which also predates the identity index.
+        conn.execute('DROP INDEX idx_messages_runtime_reply')
         conn.execute('ALTER TABLE messages DROP COLUMN runtime_turn_id')
     migrated=ChatStore(db_path=path,key_path=tmp_path/'key')
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='idx_messages_runtime_reply'").fetchone()
     assert migrated.import_runtime_chat_turns([turn('original')])==0
     assert migrated.import_runtime_chat_turns([turn('original')])==0
     assert all(row['metadata']=={} and 'runtime_turn_id' not in row for row in migrated.load_messages('web:a'))

@@ -268,7 +268,7 @@ def test_partial_source_delivery_requires_facts_unknowns_and_completed_scope(mon
     monkeypatch.setattr(agent, '_completion_review_scope_contract', lambda *a, **kw: scope)
     monkeypatch.setattr(agent, '_scheduler_action_contract_missing', lambda **kw: None)
     monkeypatch.setattr(agent, '_turn_has_artifact_delivery_contract', lambda state: False)
-    assert agent._partial_source_report_delivery_ready({}, [result])
+    assert not agent._partial_source_report_delivery_ready({}, [result])
     assert partial_source_report_disclosures([result]) == ['表示されていない項目', 'Dato no mostrado']
     assert '$80 Total' in partial_source_report_reply([result],draft={'intro':'','points':[{'evidence_ids':['e0.0'],'detail':'$80 Total','relevance':'Requested price'}],'limitation_ids':['u0']})
     scope['missing_callable_required_tool_names'] = ['send_receipt']

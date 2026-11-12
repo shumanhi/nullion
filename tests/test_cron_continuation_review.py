@@ -47,6 +47,7 @@ def test_scheduler_consumes_owned_review_without_starting_another_controller(tmp
     assert producer.runs == 1
     assert result['response_fulfilled'] is True
     # A stale success flag or unbound handoff cannot certify source coverage.
-    assert result['cron_source_verification_satisfied'] is verified
+    assert 'cron_source_verification_satisfied' not in result
+    assert bool(result.get('cron_execution_contract_satisfied')) is verified
     assert result['text'] == final and result['text'].count('Selected record is 7') == 1
     assert result['cron_shared_completion_owner'] is True

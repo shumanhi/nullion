@@ -86,7 +86,7 @@ def test_native_records_survive_review_and_helper_render_does_not_change_request
             if 'select_attachment_format' in names:return call('select_attachment_format',{'extension':'.html','confidence':1})
             if not names:return text('{}')
             self.phase+=1
-            if self.phase==1:return call('request_tool_scope',{'capabilities':['web','local_files'],'tool_names':['browser_navigate',reader_name,'browser_image_collect','file_write','terminal_exec'],'required_tool_names':['browser_navigate',reader_name,'browser_image_collect','file_write'],'artifact_extensions':['.html','.jpg'],'embedded_media_artifact_extensions':['.html']})
+            if self.phase==1:return call('request_tool_scope',{'capabilities':['web','local_files'],'tool_names':['browser_navigate',reader_name,'browser_image_collect','file_write','terminal_exec'],'required_tool_names':['browser_navigate',reader_name,'browser_image_collect','file_write'],'artifact_extensions':['.html'],'excluded_artifact_extensions':['.jpg'],'embedded_media_artifact_extensions':['.html']})
             if self.phase==2:
                 assert 'browser_run_task' not in names,'A broad source scope exposed the optional full browser worker'
                 return call('browser_navigate',{'url':url})
@@ -114,9 +114,9 @@ def test_native_records_survive_review_and_helper_render_does_not_change_request
             assert [a['path'] for a in data['artifacts']]==[str(report)],data
             downloaded=client.get(data['artifacts'][0]['url']).content
             assert downloaded==report.read_bytes() and b'Admission 37' in downloaded and b'data:image/jpeg;base64,' in downloaded
-            assert render.exists() and model.plans==1 and model.reviews==2 and model.phase==10
+            assert render.exists() and model.plans == 0 and (model.reviews == 0) and (model.phase == 7)
         reopened=bootstrap_persistent_runtime(tmp_path/'runtime.db');events=reopened.store.list_conversation_events(cid)
-        reviews=[r for r in events if r.get('event_type')=='conversation.completion_review'];assert reviews[-1]['disposition']=='complete' and reviews[-1].get('review_error') is None,reviews
-        assert len([r for r in events if r.get('event_type')=='conversation.completion_requirement_contract' and r.get('status')=='completed'])==1
+        reviews=[r for r in events if r.get('event_type')=='conversation.completion_review'];assert not reviews
+        assert not [r for r in events if r.get('event_type')=='conversation.completion_requirement_contract']
     finally:
         registry.run_cleanup_hooks();server.shutdown();server.server_close()

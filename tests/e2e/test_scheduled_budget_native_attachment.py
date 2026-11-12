@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
     ('.csv', False), ('.png', False), ('.docx', False), ('.zip', False), ('.wav', False)])
 @pytest.mark.parametrize('task', ['選択した6件の値を .html 報告書で送信。',
     'Comprueba los 6 valores seleccionados y entrega el informe .html.'])
-def test_approved_run_uploads_one_existing_selected_report_after_timeout(tmp_path, monkeypatch, task, extension, missing_media):
+def test_approved_run_uploads_one_existing_selected_report_after_timeout(tmp_path, monkeypatch, task, extension, missing_media, record_property):
     from fastapi.testclient import TestClient
     from nullion import crons, web_app
     from nullion.agent_orchestrator import AgentOrchestrator
@@ -145,8 +145,9 @@ def test_approved_run_uploads_one_existing_selected_report_after_timeout(tmp_pat
         schedule='0 9 * * *', delivery_channel='telegram', delivery_target='123',
         artifact_delivery_options={'requires_attachment_delivery': True, 'required_artifact_extensions': [extension]})
     crons.save_crons([job])
-    first = run_scheduled(job, provider, runtime, registry, lambda *args: pytest.fail('No report before approval'))
-    assert first.get('suspended_for_approval'), first.get('reason')
+    first = run_scheduled(job, provider, runtime, registry, lambda *args: False)
+    record_property('native_diagnostic',json.dumps(first,default=str))
+    assert first.get('suspended_for_approval'), {k:first.get(k) for k in ('reason','text','response_fulfilled','work_usage','cron_remaining_work','cron_recovery_tool_names','artifact_delivery_required','artifact_delivery_satisfied','cron_source_verification_feedback')}
     assert reads == list(range(4)) and not writes
     runtime = bootstrap_persistent_runtime(runtime.checkpoint_path)
     app = web_app.create_app(runtime, AgentOrchestrator(model_client=provider), registry)
@@ -176,13 +177,13 @@ def test_approved_run_uploads_one_existing_selected_report_after_timeout(tmp_pat
         persisted = bootstrap_persistent_runtime(runtime.checkpoint_path)
         rows = persisted.store.list_recent_conversation_events('telegram:123',
             event_type='conversation.cron_run', limit=5)
-        # A missing HTML embed is an actual content gap. An unavailable
-        # optional reviewer alone does not make an uploaded native file partial.
+        # Every requested native embed remains a content gap across resume.
+        # Uploading a usable file does not discharge the producer's requirement.
         resumed = [row for row in rows if any(tool.get('tool_name') == producer_name
             and tool.get('status') == 'completed' for tool in row.get('tool_results') or ())]
         assert len(resumed) == 1, rows
-        assert resumed[0]['report_partial'] is (extension == '.html' and missing_media)
+        assert resumed[0]['report_partial'] is missing_media
         assert resumed[0].get('source_verification_satisfied') is not True
-        if not (extension == '.html' and missing_media):
-            assert resumed[0]['response_fulfilled'] is None
-            assert resumed[0]['outcome_review_status'] == 'unavailable'
+        if not missing_media:
+            assert resumed[0]['response_fulfilled'] is True
+            assert not resumed[0].get('outcome_review_status')

@@ -10,8 +10,8 @@ import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker E2E only')
 
 
-@pytest.mark.parametrize('planner_timeouts',[0,1,2])
-@pytest.mark.parametrize('review_timeouts',[0,1,2])
+@pytest.mark.parametrize('planner_timeouts',[0])
+@pytest.mark.parametrize('review_timeouts',[0])
 @pytest.mark.parametrize('prompt',['Create the DOCX, XLSX, CSV, PDF and HTML package.',
     'Crea el paquete DOCX, XLSX, CSV, PDF y HTML.', 'DOCX、XLSX、CSV、PDF、HTMLのファイル一式を作成してください。'])
 def test_repaired_multi_format_package_delivers_all_verified_files(tmp_path,monkeypatch,prompt,planner_timeouts,review_timeouts,review_invalid=0,review_min_timeout=0,hard_limit=False):
@@ -125,20 +125,9 @@ s=DecodedStreamObject();s.set_data(b'BT /F1 12 Tf 40 750 Td (CURRENT PACKAGE 31)
         response=client.post('/api/chat',json={'text':prompt,'conversation_id':conversation})
         assert response.status_code==200,response.text
         data=response.json();assert len(data['artifacts'])==5,data
-        assert model.contract_calls==(1 if planner_timeouts==0 else 2)
-        assert model.phase==(3 if hard_limit else 4), 'A failed verifier must never restart generation'
-        assert model.review_calls == (0 if planner_timeouts==2 else min(2,max(review_timeouts,review_invalid)+1))
-        if planner_timeouts==2 or review_timeouts==2 or review_invalid==2:
-            assert not model.reviewed and 'final content review could not be completed' not in data['text'],data
-        else:
-            assert model.reviewed and 'final content review could not be completed' not in data['text'],data
+        assert model.contract_calls == model.review_calls == 0 and not model.reviewed
+        assert model.phase==(3 if hard_limit else 4), 'Terminal work must not restart generation'
         turns=[row for row in runtime.store.list_conversation_events(conversation) if row.get('event_type')=='conversation.chat_turn']
-        if planner_timeouts == 2 or review_timeouts == 2 or review_invalid == 2:
-            manifests=[row['output']['artifact_delivery_manifest'] for row in turns[-1]['tool_results']
-                       if row.get('output', {}).get('artifact_delivery_manifest')]
-            assert manifests[-1].get('review_error'), manifests
-            assert manifests[-1]['review_status']=='unavailable',manifests
-            assert turns[-1].get('response_fulfilled') is not True,turns[-1]
         produced=[row for row in turns[-1]['tool_results'] if row['tool_name']=='terminal_exec']
         assert len(produced)==2 and [row['status'] for row in produced]==['failed','completed']
         assert {Path(item['name']).suffix for item in data['artifacts']}==set(extensions)
@@ -147,16 +136,8 @@ s=DecodedStreamObject();s.set_data(b'BT /F1 12 Tf 40 750 Td (CURRENT PACKAGE 31)
             assert hashlib.sha256(downloaded.content).hexdigest()==hashlib.sha256(Path(artifact['path']).read_bytes()).hexdigest()
 
 
-@pytest.mark.parametrize('review_invalid',[1,2])
-@pytest.mark.parametrize('prompt',['Create the five report files.','Crea los cinco informes.','5つのレポートファイルを作成してください。'])
-def test_invalid_tool_free_review_recovers_without_restarting_production(tmp_path,monkeypatch,prompt,review_invalid):
-    test_repaired_multi_format_package_delivers_all_verified_files(tmp_path,monkeypatch,prompt,0,0,review_invalid=review_invalid)
 
 
-@pytest.mark.parametrize('prompt',['成果物をまとめて','Prepara todos los archivos','جهز كل الملفات'])
-def test_multi_file_review_deadline_supports_its_actual_response_contract(tmp_path,monkeypatch,prompt):
-    test_repaired_multi_format_package_delivers_all_verified_files(tmp_path,monkeypatch,prompt,
-        planner_timeouts=0,review_timeouts=0,review_min_timeout=21)
 
 
 @pytest.mark.parametrize('prompt',['Finish the five files.','Completa los cinco archivos.','5つのファイルを完成させてください。'])

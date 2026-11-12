@@ -59,12 +59,12 @@ async def test_delegated_report_preserves_findings_after_unsubstantiated_critiqu
     model=Model()
     result=await DeepAgentMiniAgentRunner().run(MiniAgentConfig(agent_id='agent',task=task,can_request_user_input=False),
         anthropic_client=model,tool_registry=registry,policy_store=runtime.store,approval_store=runtime.store,context_bus=ContextBus(),progress_queue=asyncio.Queue())
-    assert reads and model.reviews=={'rejected':1,'outage':2,'malformed':2}[review_response]
+    assert reads and model.reviews == 0
     assert result.status == 'success'
     assert not result.artifacts
-    assert result.verified_turn_result.response_fulfilled is not True
-    assert result.verified_turn_result.response_presentation['outcome_review_status'] == (
-        'advice' if review_response == 'rejected' else 'unavailable')
+    assert result.verified_turn_result.response_fulfilled is True
+    assert result.verified_turn_result.outcome_review_receipt is None
+    assert 'outcome_review_status' not in result.verified_turn_result.response_presentation
     assert 'PRIVATE-UNFINISHED-FINDING' in str(result.output)
     artifact=artifact_path_for_generated_workspace_file(principal_id='telegram:2222', suffix='.txt', stem='report')
     artifact.write_text('PRIVATE-UNFINISHED-FINDING')
@@ -85,7 +85,7 @@ async def test_delegated_report_preserves_findings_after_unsubstantiated_critiqu
     assert len([delivery for delivery in deliveries if 'bytes' in delivery]) == 1
     assert 'Review warning:' not in deliveries[-1]['text']
     assert 'PRIVATE-UNFINISHED-FINDING' in deliveries[-1]['text']
-    assert group.planner_metadata['outcome_verified'] is False
+    assert group.planner_metadata['outcome_verified'] is True
     saved=runtime.store.list_conversation_events('telegram:2222')
     assert saved[-1]['assistant_reply']==deliveries[-1]['text']
 

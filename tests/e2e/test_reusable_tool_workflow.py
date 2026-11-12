@@ -114,7 +114,7 @@ def test_chat_create_run_restart_and_reuse_with_new_arguments(tmp_path,monkeypat
     assert created.get('response_fulfilled') is True,created
     assert [r['tool_name'] for r in created['tool_results']]==['request_tool_scope','local_tool_search','local_tool_save','local_tool_run']
     reviews=[e for e in runtime.store.list_conversation_events() if e.get('event_type')=='conversation.completion_review']
-    assert len(reviews)==1 and reviews[0]['disposition']=='complete',reviews
+    assert reviews==[]
     runtime.checkpoint(force=True)
     # New runtime and registry, independent conversation/surface, no prior model messages.
     fresh=bootstrap_persistent_runtime(tmp_path/'runtime.db')

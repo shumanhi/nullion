@@ -75,4 +75,4 @@ def test_native_layout_evidence_survives_optional_renderer_failure(tmp_path,monk
         response=client.post('/api/chat',json={'text':prompt,'conversation_id':cid});data=response.json();assert not model.errors,model.errors
         assert response.status_code==200 and {row['name'] for row in data['artifacts']}=={'report.docx','report.pdf','report.pptx'},data
         for artifact in data['artifacts']:assert client.get(artifact['url']).content==(root/artifact['name']).read_bytes()
-        assert len(created)==3 and all(row.status=='completed' for row in created) and len(commands)==1 and commands[0].status=='failed' and model.reviews==1
+        assert len(created) == 3 and all((row.status == 'completed' for row in created)) and (len(commands) == 1) and (commands[0].status == 'failed') and (model.reviews == 0)

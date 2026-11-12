@@ -81,7 +81,8 @@ class Provider:
             name, arguments = self.calls.pop(0)
             return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use',
                 'id': f'call-{len(self.calls)}', 'name': name, 'input': arguments}]}
-        return text('Rejected draft with unsupported claims.')
+        return text((self.finding + '\n\n' if self.variant != 'entire_failure' else '') +
+            ('A required browser step failed.' if self.variant in {'bound_failure','entire_failure'} else self.limitation))
 
 
 @pytest.mark.parametrize('family', ['browser', 'http'])
@@ -218,14 +219,7 @@ def run_case(tmp_path, monkeypatch, *, family, surface, copy, variant):
         assert finding in turn['assistant_reply'] if variant != 'entire_failure' else turn['assistant_reply'] in answer
         reviews = [e for e in runtime.store.list_conversation_events(turn['conversation_id'])
             if e.get('event_type') == 'conversation.completion_review']
-        assert reviews and all(e['review_error'] is None for e in reviews)
-        if variant in {'bound_failure', 'entire_failure'}:
-            assert reviews[-1]['runtime_failure_code'] == 'browser_operation_failed'
-            assert 'A required browser step failed.' in answer
-        else:
-            assert reviews[-1]['runtime_failure_code'] is None
-            assert 'browser operation failed' not in answer and 'network error' not in answer
-            assert 'A required browser step failed.' not in answer
+        assert not reviews
         if variant != 'entire_failure':
             assert finding in answer and any(r['status'] == 'completed'
                 and r['tool_name'] in {'browser_extract_text', 'web_fetch'} for r in turn['tool_results'])

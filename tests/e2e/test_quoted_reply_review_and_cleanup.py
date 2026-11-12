@@ -111,7 +111,7 @@ def test_telegram_quote_survives_scope_requirement_review_and_final_delivery(tmp
     Message.chat.send_action=lambda **kwargs:asyncio.sleep(0)
     asyncio.run(service.on_message(SimpleNamespace(update_id=500,message=Message()),SimpleNamespace(bot=None)))
     assert any('https://example.test/alpha' in message and 'https://example.test/beta' in message for message in sent),sent
-    assert len(payloads)>=2,'The previously failing completion-review boundary must execute'
+    assert payloads == [], 'No independent quality review may run'
     events=list(runtime.store.list_recent_conversation_events('telegram:123'))
     assert any('https://example.test/alpha' in str(row.get('assistant_reply')) for row in events)
     if explicit:

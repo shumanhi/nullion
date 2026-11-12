@@ -125,16 +125,14 @@ def test_comparison_finishes_useful_scope_but_checks_material_challengers(tmp_pa
             for url in sources[:2]:
                 if url not in reads:
                     return tool_response('opaque_read', {'url': url})
-            if self.reviews and mode in {'frontier', 'blocked'} and sources[2] not in reads:
+            if mode in {'frontier', 'blocked'} and sources[2] not in reads:
                 return tool_response('opaque_read', {'url': sources[2]})
-            if self.reviews and mode == 'exhaustive':
+            if mode == 'exhaustive':
                 for url in sources[2:]:
                     if url not in reads:
                         return tool_response('opaque_read', {'url': url})
-            if mode == 'wording' and not self.reviews:
-                return text('A is the best overall at 9 cents/g; benchmark B is 75 cents/g.')
             return text('Among the checked options, '+('C is 7' if mode == 'frontier' and sources[2] in reads else 'A is 9')+
-                ' cents/g; benchmark B is 75 cents/g.')
+                ' cents/g; benchmark B is 75 cents/g.' + (' 1 shortlisted alternative still needs verification.' if mode == 'blocked' else ''))
 
     provider = Provider()
     runner = AgentOrchestrator(model_client=provider)
@@ -184,28 +182,23 @@ def test_comparison_finishes_useful_scope_but_checks_material_challengers(tmp_pa
     else:
         result = runner.run_turn(conversation_id='web:bounded', principal_id='web:bounded', user_message=prompt,
             conversation_history=[], tool_registry=registry, policy_store=runtime.store, approval_store=runtime.store, max_iterations=25)
-    assert len(discoveries) == (0 if mode=='finite' else 1) and provider.plans == 1
+    assert len(discoveries) == (0 if mode == 'finite' else 1) and provider.plans == 0
     assert 'Other relevant sources remain unchecked' not in result.final_text
     assert '75 cents/g' in result.final_text
     events = runtime.store.list_recent_conversation_events(cid, event_type='conversation.completion_review')
     if mode == 'blocked':
-        assert (telegram or result.response_fulfilled is not True) and reads == sources[:3]
-        assert events[-1]['disposition'] == 'blocked'
+        assert reads == sources[:3]
         assert '1 shortlisted alternative still needs verification' in result.final_text
     else:
         if not telegram and not web:
             assert result.response_fulfilled, result
-        assert events[-1]['disposition'] == 'complete' and not events[-1]['search_coverage_errors']
         assert reads == (sources if mode == 'exhaustive' else sources[:3] if mode == 'frontier' else sources[:2])
         assert 'Among the checked options' in result.final_text
         if mode == 'wording':
-            assert provider.reviews == 2 and 'best overall' not in result.final_text
+            assert provider.reviews == 0 and 'best overall' not in result.final_text
         if mode == 'frontier':
             assert 'C is 7' in result.final_text
-    if mode in {'bounded', 'wording'}:
-        assert sum(row['disposition'] == 'pending' for row in events[-1]['search_coverage']['candidates']) == 13
-    if mode not in {'bounded','finite'}:
-        assert any(row.get('runtime_failure_code') == 'search_coverage_incomplete' for row in events)
+    assert not events and provider.reviews == 0
     if web or telegram:
         rows = [row for row in runtime.store.list_conversation_events(cid) if row.get('event_type') == 'conversation.chat_turn']
         assert rows[-1]['assistant_reply'] == result.final_text

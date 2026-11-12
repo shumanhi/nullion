@@ -26,7 +26,7 @@ def test_plain_turns_never_load_pending_parent_history():
 
 def test_only_a_selected_pending_parent_activates_no_tool_review():
     assert not _completion_review_required({'tool_flow_context': {'pending_request': {}}}, tool_results=[])
-    assert _completion_review_required({'tool_flow_context': {'pending_request': {
+    assert not _completion_review_required({'tool_flow_context': {'pending_request': {
         'parent_turn_id': 'selected', 'original_request': '調査して報告してください。'}}}, tool_results=[])
 
 
@@ -62,7 +62,7 @@ def test_selected_partial_parent_restores_execution_without_parsing_its_words(mo
     context=_selected_pending_request(runtime,SimpleNamespace(turn=turn),selected)
     assert context['original_request']==selected['original_request']
     assert context['tool_names']==['opaque_read']
-    assert _completion_review_required({'tool_flow_context':{'pending_request':context}},tool_results=[])
+    assert not _completion_review_required({'tool_flow_context':{'pending_request':context}},tool_results=[])
     for replacement in (True,None):
         event['response_fulfilled']=replacement
         assert _selected_pending_request(runtime,SimpleNamespace(turn=turn),selected) is None

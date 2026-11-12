@@ -1,5 +1,5 @@
 """A real approval/resume keeps the selected uploaded reference for review."""
-from tests.workflow_provider_protocol import workflow_provider_reply
+from tests.workflow_provider_protocol import workflow_provider_reply, fixture_source_plan, fixture_source_assessment
 import base64,json,os
 import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker real approval API/store')
@@ -49,12 +49,13 @@ def test_approved_source_read_preserves_reference_in_all_internal_decisions(tmp_
                 assert len(media)==1 and base64.b64decode(media[0]['source']['data'])==image
                 self.reference_calls+=1
             if system.startswith('You are a material-requirements planner'):
-                return text(json.dumps({'all_material_requirements_enumerated':True,'material_requirements':[
+                packet=json.loads(kw['messages'][0]['content'][0]['text'])
+                return text(json.dumps({**fixture_source_plan(packet,scope='evidence_summary'), 'all_material_requirements_enumerated':True,'material_requirements':[
                     {'requirement':'Identify the requested reference subject','requirement_kind':'fact',
                      'evidence_subject_id':'subject','eligible_evidence_tool_names':['source_fixture']}]}))
             if system.startswith('You are a semantic completion reviewer'):
                 p=json.loads(kw['messages'][0]['content'][0]['text']);ids=[r['invocation_id'] for r in p['tool_evidence'] if r['tool_name']=='source_fixture' and r['status']=='completed'];assert ids
-                return text(json.dumps({'disposition':'complete','source_presentation_valid':True,'all_material_requirements_enumerated':True,
+                return text(json.dumps({**fixture_source_assessment(p,conclusion='limited'), 'disposition':'complete','source_presentation_valid':True,'all_material_requirements_enumerated':True,
                     'unresolved_requirements':[],'material_requirements':[{**r,'satisfied':True,'draft_covered':True,'evidence_invocation_ids':ids[:1]} for r in p['material_requirement_contract']]}))
             if 'present_source_answer' in names:
                 spec=next(t for t in kw['tools'] if t['name']=='present_source_answer');identity=spec['input_schema']['properties']['points']['items']['properties']['evidence_ids']['items']['enum'][0]
@@ -63,6 +64,7 @@ def test_approved_source_read_preserves_reference_in_all_internal_decisions(tmp_
             if not names:return text('{}')
             self.phase+=1
             if self.phase==1:return tool('request_tool_scope',{'capabilities':['web'],'tool_names':['source_fixture','local_write_fixture'],'required_tool_names':['source_fixture']})
+            if self.phase==3:return text('Dracula is the requested performance.')
             assert self.phase==2
             return {'stop_reason':'tool_use','content':([{'type':'tool_use','id':'write-0','name':'local_write_fixture','input':{}}] if batch_count==2 else [])+[{'type':'tool_use','id':'source-0','name':'source_fixture','input':{'index':0}}]}
     from nullion.preferences import save_preferences
@@ -92,9 +94,9 @@ def test_approved_source_read_preserves_reference_in_all_internal_decisions(tmp_
                 outputs.append(resume_approved_telegram_request(runtime,approval_id=approval_id,chat_id='514132807',
                     agent_orchestrator=runtime.agent_orchestrator if hasattr(runtime,'agent_orchestrator') else AgentOrchestrator(model_client=model)) or '')
             assert reads==[0] and len(writes)==batch_count-1,(reads,writes,outputs)
-        assert 'Dracula' in outputs[-1],outputs
+        assert 'Dracula' in outputs[-1], outputs
         assert not runtime.store.list_suspended_turns()
-        assert model.reference_calls==3
+        assert model.reference_calls == 0
         # Retapping an already consumed approval cannot repeat the read.
         if surface=='web':
             client.post('/api/approve/'+approval_id,json={'mode':'once'},headers={'x-nullion-csrf':session['csrf_token']})

@@ -62,9 +62,7 @@ def test_existing_reminder_on_nearby_date_is_visible_before_create(tmp_path,monk
             self.rounds+=1
             if self.rounds==1:return tool_response('calendar_list',{'provider_id':'fixture',
                 'start':'2028-11-15T00:00:00Z','end':'2028-12-03T00:00:00Z','max':50})
-            if self.rounds==2:return tool_response('calendar_create',{'provider_id':'fixture',
-                'summary':title,'start':'2028-11-17','end':'2028-11-18'})
-            if self.rounds==3 and paged:
+            if self.rounds==2 and paged:
                 assert 'opaque-next' in json.dumps(kw['messages'])
                 return tool_response('calendar_list',{'provider_id':'fixture','start':'2028-11-15T00:00:00Z',
                     'end':'2028-12-03T00:00:00Z','max':50,'page_token':'opaque-next'})
@@ -73,7 +71,7 @@ def test_existing_reminder_on_nearby_date_is_visible_before_create(tmp_path,monk
     result=AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:calendar',principal_id='web:calendar',
         user_message='予定表を確認し、同じ義務の通知を重複させないでください。',conversation_history=[],tool_registry=registry,
         policy_store=runtime.store,approval_store=runtime.store,max_iterations=5)
-    assert provider.action_reviews==1 and len(requests)==(2 if paged else 1)
+    assert provider.action_reviews==0 and len(requests)==(2 if paged else 1)
     assert 'Existing reminder retained' in result.final_text
     events=runtime.store.list_recent_conversation_events('web:calendar',event_type='conversation.action_review')
-    assert events[-1]['decision']=='revise'
+    assert not events

@@ -24,8 +24,8 @@ from tests.source_answer_fixture import source_presentation_response
 
 
 @pytest.mark.parametrize("retry_summary,isolated,direct_evidence,carry_prior,query_deep_page",
-    [(retry,isolated,direct,False,False) for retry in (False,True) for isolated in (False,True) for direct in (False,True)]
-    +[(retry,isolated,True,True,False) for retry in (False,True) for isolated in (False,True)]
+    [(retry,isolated,direct,False,False) for retry in (False,) for isolated in (False,True) for direct in (False,True)]
+    +[(retry,isolated,True,True,False) for retry in (False,) for isolated in (False,True)]
     +[(False,isolated,True,False,True) for isolated in (False,True)])
 def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp_path, monkeypatch, record_property, isolated, retry_summary, source_summary_model_reply, direct_evidence, carry_prior, query_deep_page):
     if not isolated:
@@ -132,7 +132,7 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                             return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'retry','name':'browser_run_task','input':{'task':prompt,'url':url}}]}
                         return source_presentation_response(kwargs)
                     if self.outer_calls == 1:
-                        return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'scope', 'name': 'request_tool_scope', 'input': {'capabilities': ['web'], 'tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task'], 'artifact_extensions': [] if carry_prior else ['.png']}}]}
+                        return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'scope', 'name': 'request_tool_scope', 'input': {'capabilities': ['web'], 'tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task'], 'artifact_extensions': [] if carry_prior else ['.png'], 'source_artifact_delivery_requested': not carry_prior, 'source_artifact_request_evidence': '' if carry_prior else f'{prompt} {url} .png'}}]}
                     if self.outer_calls == 2:
                         assert 'browser_run_task' in tools
                         visual = next(tool for tool in kwargs['tools'] if tool['name'] == 'browser_run_task')
@@ -148,7 +148,8 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                     # The tool owns the PNG; the model supplies only a user-facing answer.
                     if retry_summary:
                         return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'unnecessary-retry', 'name': 'browser_run_task', 'input': {'task': prompt, 'url': url}}]}
-                    return response('Sedan A: $80 total. Sedan B: $88 total. Fuel and return policy unknown.')
+                    from tests.source_answer_fixture import native_png_directives
+                    return response('Sedan A: $80 total. Sedan B: $88 total. Fuel type and After-hours return unknown.' + ('' if carry_prior else native_png_directives(kwargs, latest_only=True)))
             model = Model()
             runtime = bootstrap_persistent_runtime(tmp_path / f'runtime-{index}.db')
             runtime.model_client = model
@@ -162,7 +163,7 @@ def test_visual_browser_task_delivers_observations_and_png_through_real_chat(tmp
                 result = client.post('/api/chat', json={'text': f'{prompt} {url}'+('' if carry_prior else ' .png'), 'conversation_id': conversation})
             samples.append(time.monotonic() - start)
             assert result.status_code == 200, result.text
-            assert (not result.json()['artifacts']) if carry_prior else len(result.json()['artifacts']) >= (1 if direct_evidence else 2), result.json()
+            assert (not result.json()['artifacts']) if carry_prior else len(result.json()['artifacts']) == 1, result.json()
             assert '$80' in result.json()['text'] and '$88' in result.json()['text'], json.dumps({'response_text': result.json()['text'], 'outer_calls': model.outer_calls, 'turns': [{k: e.get(k) for k in ('event_type', 'assistant_reply', 'reply', 'error', 'tool_results')} for e in runtime.store.list_conversation_events(conversation)]})
             assert 'Unshown or unresolved' not in result.json()['text']
             assert 'After-hours return' in result.json()['text']

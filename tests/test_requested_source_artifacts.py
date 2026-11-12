@@ -62,7 +62,7 @@ def test_terminal_receipt_cannot_claim_success_when_requested_attachment_is_unse
     from nullion.tools import ToolRegistry
     state = {'tool_results': [], 'artifacts': [], 'tool_registry': ToolRegistry(),
         'principal_id':'member', 'conversation_id':'web:capture', 'user_message':'現在の画像を送って。',
-        'completion_requirement_contract_cache':{'requested_artifact_extensions':['.png']}}
+        'tool_flow_context':{'requires_artifact_delivery':True,'required_artifact_extensions':['.png']}}
     result = _complete_agent_turn(state, final_text='Current cart: Cedar.', response_fulfilled=True)['result']
     assert result.response_fulfilled is False
     assert result.artifact_delivery_satisfied is False
@@ -92,7 +92,7 @@ def test_verified_capture_also_requires_selected_delivery_identity(tmp_path, mon
     paths = [] if selected=='none' else [str(other if selected=='other' else path)]
     state = {'tool_results': [], 'artifacts': paths, 'tool_registry': ToolRegistry(),
         'principal_id':'member', 'conversation_id':'web:selection', 'user_message':'画像を送って。',
-        'completion_requirement_contract_cache':{'requested_artifact_extensions':['.png']}}
+        'tool_flow_context':{'requires_artifact_delivery':True,'required_artifact_extensions':['.png']}}
     result = agent._complete_agent_turn(state, final_text='Current cart: Cedar.', response_fulfilled=True)['result']
     assert result.response_fulfilled is (selected=='capture')
     assert result.artifact_delivery_satisfied is (selected=='capture')

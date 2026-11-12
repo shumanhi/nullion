@@ -64,11 +64,14 @@ def test_browser_source_delivery_and_alternative_lookup_through_api(tmp_path, mo
             if 'present_source_answer' in names:return source_presentation_response(kw)
             if self.calls==1:
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'scope','name':'request_tool_scope','input':{'capabilities':['web'],'tool_names':['browser_run_task'],'required_tool_names':['browser_run_task'],'artifact_extensions':['.png'], 'source_artifact_delivery_requested':requested, 'source_artifact_request_evidence':prompt if requested else ''}}]}
-            if self.calls==2 or alternative and self.calls==4:
-                target='https://second.example/' if self.calls==4 else 'https://first.example/'
+            if self.calls==2 or alternative and self.calls==3:
+                target='https://second.example/' if self.calls==3 else 'https://first.example/'
                 return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':str(self.calls),'name':'browser_run_task','input':{'task':prompt,'url':target}}]}
-            # Simulate the reported early stop. Runtime must continue instead.
-            value='This source is blocked.' if alternative and self.calls==3 else 'Could not confirm anything. Try https://guessed.example/'
+            if recorded:
+                value='- **Riverfront Park** — Hudson Ave. [Source 1](https://example.com/places)\n\n- **The Peekskill Museum** — 124 Union Ave; (914) 736-0473. [Source 1](https://example.com/places)'
+            else: value='Current opening time: 19:30.'
+            if partial: value+='\n\n**Not verified from this check**\n- Unshown constraint.'
+            if requested: value+='\nMEDIA:'+str(captures[-1])
             return {'stop_reason':'end_turn','content':[{'type':'text','text':value}]}
     runtime=bootstrap_persistent_runtime(tmp_path/'runtime.db');model=Model();runtime.model_client=model
     registry=ToolRegistry();register_browser_tools(registry,policy=BrowserPolicy(),model_client_getter=lambda:model)

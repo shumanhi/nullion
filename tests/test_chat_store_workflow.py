@@ -368,3 +368,42 @@ def test_chat_store_helpers_cover_titles_and_channel_labels() -> None:
     assert _channel_label_for_conversation("slack:T1") == "Slack · T1"
     assert _channel_label_for_conversation("discord:D1") == "Discord · D1"
     assert _channel_label_for_conversation("custom") == "custom"
+
+
+@pytest.mark.parametrize('browser_first', [False, True])
+@pytest.mark.parametrize('caption', ['資料を添付しました。', 'Archivo adjunto.'])
+def test_terminal_reply_receipt_reconciles_different_captions(chat_store, browser_first, caption):
+    event = {'conversation_id':'web:terminal', 'turn_id':'one', 'user_message':'資料',
+        'assistant_reply':'MEDIA:/tmp/result.csv', 'created_at':'2026-11-13T00:00:00+00:00'}
+    metadata = {'runtime_turn_id':'one', 'history_message_kind':'terminal_reply',
+        'artifacts':[{'path':'/tmp/result.csv'}]}
+    if not browser_first: chat_store.import_runtime_chat_turns([event])
+    identity = chat_store.save_message('web:terminal','bot',caption,metadata=metadata)
+    chat_store.import_runtime_chat_turns([event])
+    assert chat_store.save_message('web:terminal','bot',caption,metadata=metadata) == identity
+    messages = chat_store.load_messages('web:terminal')
+    assert [(m['role'],m['text']) for m in messages if m['role']=='bot'] == [('bot',caption)]
+    assert len([m for m in messages if m['role']=='user']) == 1
+    chat_store.save_message('web:terminal','bot','Part A',metadata={'runtime_turn_id':'one','message_part_id':'a'})
+    chat_store.save_message('web:terminal','bot','Part B',metadata={'runtime_turn_id':'one','message_part_id':'b'})
+    chat_store.save_message('web:terminal','bot',caption,metadata={**metadata,'runtime_turn_id':'two'})
+    chat_store.save_message('web:other','bot',caption,metadata=metadata)
+    messages=chat_store.load_messages('web:terminal')
+    assert [m['text'] for m in messages if m['role']=='bot'] == [caption,'Part A','Part B',caption]
+    assert len(chat_store.load_messages('web:other'))==1
+
+
+def test_concurrent_terminal_saves_and_runtime_import_are_idempotent(chat_store):
+    from concurrent.futures import ThreadPoolExecutor
+    event={'conversation_id':'web:parallel','turn_id':'one','user_message':'Request',
+        'assistant_reply':'MEDIA:/tmp/result.csv','created_at':'2026-11-13T00:00:00+00:00'}
+    metadata={'runtime_turn_id':'one','history_message_kind':'terminal_reply'}
+    other = ChatStore(chat_store._path, key_path=chat_store._path.with_suffix('.key'))
+    def deliver(index):
+        store = other if index % 3 else chat_store
+        if index % 2: return store.import_runtime_chat_turns([event])
+        return store.save_message('web:parallel','bot','Final caption',metadata=metadata)
+    with ThreadPoolExecutor(max_workers=6) as pool: list(pool.map(deliver, range(24)))
+    messages=chat_store.load_messages('web:parallel')
+    assert [(m['role'],m['text']) for m in messages if m['role']=='bot']==[('bot','Final caption')]
+    assert len([m for m in messages if m['role']=='user'])==1

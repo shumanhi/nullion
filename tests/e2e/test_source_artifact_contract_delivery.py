@@ -54,17 +54,18 @@ def test_source_capture_material_contract_controls_real_api_delivery(tmp_path, m
                     'requested_artifact_extensions':['.png'] if wants_file and not self.opening else [],
                     'material_requirements':[{'requirement':prompt,'requirement_kind':'action' if self.opening else 'deliverable' if wants_file else 'fact',
                         'evidence_subject_id':'.png' if wants_file and not self.opening else 'page',
-                        'eligible_evidence_tool_names':['browser_navigate'] if self.opening else ['browser_screenshot']}]})
+                        'eligible_evidence_tool_names':['browser_navigate'] if self.opening else ['browser_screenshot'] if wants_file else ['browser_navigate','browser_extract_text']}]})
             protocol=workflow_provider_reply(kw, completion=True)
             if protocol is not None: return protocol
             if 'select_attachment_format' in names: return call('select_attachment_format', {'extension':None,'confidence':1})
             if not names: return text({})
             self.phase += 1
             if self.phase == 1: return call('request_tool_scope', {'capabilities':['web'],
-                'tool_names':['browser_navigate'] if self.opening else ['browser_screenshot'],
-                'required_tool_names':['browser_navigate'] if self.opening else ['browser_screenshot'],
-                'artifact_extensions':[] if self.opening else ['.png'], 'source_artifact_delivery_requested':not self.opening, 'source_artifact_request_evidence':prompt if not self.opening else ''})
-            if self.phase == 2: return call('browser_navigate', {'url':url}) if self.opening else call('browser_screenshot', {})
+                'tool_names':['browser_navigate'] if self.opening else ['browser_screenshot'] if wants_file else ['browser_navigate','browser_extract_text'],
+                'required_tool_names':['browser_navigate'] if self.opening else ['browser_screenshot'] if wants_file else ['browser_navigate','browser_extract_text'],
+                'artifact_extensions':['.png'] if wants_file and not self.opening else [], 'source_artifact_delivery_requested':wants_file and not self.opening, 'source_artifact_request_evidence':prompt if wants_file and not self.opening else ''})
+            if self.phase == 2: return call('browser_screenshot', {}) if not self.opening and wants_file else call('browser_navigate', {'url':url})
+            if self.phase == 3 and not self.opening and not wants_file: return call('browser_extract_text', {})
             # Deliberately no MEDIA directive or path: material contract owns delivery.
             return text('The cart is open.' if self.opening else 'Current cart: Cedar.')
     model=Model(); app,runtime,db=setup(tmp_path,monkeypatch,model)
@@ -93,8 +94,13 @@ def test_source_capture_material_contract_controls_real_api_delivery(tmp_path, m
             turns=runtime.store.list_recent_conversation_events(cid,event_type='conversation.chat_turn')
             turn=turns[-1]
             assert turn['response_fulfilled'] is True, json.dumps({'payload':payload,'events':runtime.store.list_conversation_events(cid)}, default=str)
-            assert model.plans==before+1, 'Reuse the same independent planner for final review'
+            assert model.plans==before==0, 'Source delivery must not call an independent requirements planner'
             captures=[r for r in turn['tool_results'] if r['tool_name']=='browser_screenshot']
+            if not wants_file:
+                assert captures == [] and not payload.get('artifacts'), turn
+                continue_checks = [r for r in turn['tool_results'] if r['tool_name']=='browser_extract_text']
+                assert len(continue_checks)==1 and continue_checks[0]['status']=='completed', turn
+                return
             assert len(captures)==1 and captures[0]['status']=='completed',turn
             navigation=next(r for r in turns[0]['tool_results'] if r['tool_name']=='browser_navigate')
             assert captures[0]['output']['session_id']==navigation['output']['session_id']

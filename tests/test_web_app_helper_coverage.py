@@ -1747,7 +1747,7 @@ def test_web_recovered_artifact_still_requires_complete_extension_set(monkeypatc
     assert paths == [str(docx_path)]
     assert [artifact["name"] for artifact in artifacts] == ["partial_pack.docx"]
     assert fulfilled is False
-    assert "couldn't attach all of the requested files" in text
+    assert "Some requested files are not available for delivery." in text
 
     pdf_result = ToolResult(
         invocation_id="pdf",
@@ -1759,7 +1759,7 @@ def test_web_recovered_artifact_still_requires_complete_extension_set(monkeypatc
         runtime,
         conversation_id="web:1",
         user_message="Create a DOCX and PDF pack.",
-        final_text="Created the package.",
+        final_text=text,
         tool_results=[scope_result, docx_result, pdf_result],
         required_attachment_extensions=(),
         required_embedded_media_extensions=(),
@@ -1768,6 +1768,7 @@ def test_web_recovered_artifact_still_requires_complete_extension_set(monkeypatc
     assert paths == [str(docx_path), str(pdf_path)]
     assert {artifact["name"] for artifact in artifacts} == {"partial_pack.docx", "partial_pack.pdf"}
     assert fulfilled is True
+    assert "not available for delivery" not in text
 
 
 def test_web_delivery_artifact_paths_include_plain_pdf_reply_path(monkeypatch, tmp_path) -> None:
@@ -5562,3 +5563,11 @@ def test_completed_selected_artifact_is_preserved_instead_of_fetch_fallback(tmp_
         principal_id='web:selected',existing_artifact_paths=[str(path)],
         tool_results=[ToolResult('fetch','web_fetch','completed',{'body':'Raw source content: 17'})])==[]
     assert path.read_bytes()==b'Final selected content: 23'
+
+
+def test_filtered_file_caption_preserves_independent_findings_and_native_failure():
+    cleaned = web_app.strip_unselected_artifact_references(
+        "Created the HTML file and text file:\n- report.html\n- notes.txt\n\n"
+        "Cedar value: 37.\n\nA prepared file changed before delivery and was withheld.",
+        selected_paths=["/artifacts/notes.txt"], candidate_paths=["/artifacts/report.html", "/artifacts/notes.txt"])
+    assert cleaned == "Cedar value: 37.\n\nA prepared file changed before delivery and was withheld."

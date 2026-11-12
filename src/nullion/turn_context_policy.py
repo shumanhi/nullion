@@ -976,6 +976,8 @@ def _planned_output_extensions(registry, required_tool_names, declared_extension
             writable.add(spec.name)
     extensions = {extension for extension, producers in _ARTIFACT_EXTENSION_TOOLS.items()
                   if writable.intersection(producers)}
+    extensions.update(extension for name in writable
+        for extension in getattr(registry.get_spec(name), "produced_artifact_extensions", ()))
     declared = set(_validated_artifact_extensions(list(declared_extensions)))
     if writable.intersection(_LOCAL_SHELL_TOOLS):
         extensions.update(declared)
@@ -1040,6 +1042,11 @@ class ScopedTurnToolRegistry:
         contract = getattr(delegate, "contract", None)
         if isinstance(contract, RequestRecoveryContract):
             self.turn_tool_scope_decision = contract.bind(self).turn_tool_scope_decision
+
+    def artifact_production_tools(self, extensions: Iterable[str]) -> tuple[str, ...]:
+        """Discover exact registered producers, without loading external inventories."""
+        from nullion.artifact_production import production_tool_names
+        return production_tool_names(self._delegate, extensions)
 
     def _delegate_tool_names(self) -> set[str]:
         try:
@@ -1381,6 +1388,17 @@ class ScopedTurnToolRegistry:
                 return False
             if tool_name == "pdf_create" and existing_named_extensions.intersection(_PDF_EXTENSIONS):
                 return False
+        try:
+            producer_spec = self._delegate.get_spec(tool_name)
+        except KeyError:
+            producer_spec = None
+        if (producer_spec is not None and getattr(producer_spec, "produced_artifact_extensions", ())
+                and producer_spec.side_effect_class is ToolSideEffectClass.WRITE
+                and not producer_spec.source_artifact_only
+                and not self._is_connector_tool_name(tool_name)
+                and requested_extensions.intersection(producer_spec.produced_artifact_extensions)
+                and tool_name in self.turn_tool_scope_decision.requested_tool_names):
+            return not self.turn_tool_scope_decision.source_artifact_retrieval_only
         if tool_name in _SOURCE_MEDIA_TOOLS and not (
             self._evidence.has_attachments or self._evidence.context_linked
         ):
@@ -2022,6 +2040,14 @@ class ScopedTurnToolRegistry:
         # Optional adapter tools can be selected by registered identity without
         # relying on a hardcoded family/name table. Their normal side-effect,
         # account-source and permission checks still apply below and at invoke.
+        production_names = set(self.artifact_production_tools(requested_artifact_extensions))
+        from nullion.browser_capture_contract import capture_only_scope
+        capture_selection = capture_only_scope(replace(self.turn_tool_scope_decision, valid=True,
+            requested_tool_names=exact_tool_names,
+            required_tool_names=tuple(arguments.get("required_tool_names") or ()),
+            requested_artifact_extensions=tuple(requested_artifact_extensions)))
+        if artifact_scope_allowed and not source_delivery_requested and not scheduler_mutation_scope and not capture_selection:
+            requested.extend(sorted(production_names))
         requested.extend(name for name in exact_tool_names
                          if name in available and self._requires_explicit_scope(name))
         # A scheduler label does not establish its persisted resource kind.
@@ -2819,6 +2845,14 @@ class ScopedTurnToolRegistry:
             and invocation.arguments.get("source_user_requested")
             and not active_connector_providers
         )
+        registered_names = self._delegate_tool_names()
+        unavailable_capabilities = {
+            capability for capability in capabilities if capability != "connector"
+            and not _exact_scope_tools_for_capability(capability, registered_names)
+            and not any(capability in spec.capability_tags for spec in self._delegate.list_specs())
+        }
+        if connector_source_unavailable:
+            unavailable_capabilities.add("connector")
         unavailable_tools = tuple(
             sorted(_CONNECTOR_TYPED_TOOLS | _CONNECTOR_TOOLS)
             if connector_source_unavailable
@@ -2860,7 +2894,7 @@ class ScopedTurnToolRegistry:
                     "explicit_tool_names": sorted(set(existing.requested_tool_names) | explicitly_requested_tools),
                     "unavailable_required_tool_names": list(unavailable_required_tool_names),
                     "unavailable_tools": list(unavailable_tools),
-                    "unavailable_capabilities": ["connector"] if connector_source_unavailable else [],
+                    "unavailable_capabilities": sorted(unavailable_capabilities),
                     "connector_source_unavailable": connector_source_unavailable,
                     "artifact_extensions": list(artifact_extensions),
                     "excluded_artifact_extensions": list(excluded_artifact_extensions),

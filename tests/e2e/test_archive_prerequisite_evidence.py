@@ -91,4 +91,4 @@ def test_internal_extraction_proof_survives_final_artifact_selection(tmp_path,mo
         assert turn.get('response_fulfilled') is True,json.dumps(runtime.store.list_conversation_events(cid),default=str)
         assert 'internal.xlsx' not in payload['text'] and 'review could not' not in payload['text']
         assert [r.tool_name for r in writes]==['archive_extract','spreadsheet_create']
-        assert model.plans==model.reviews==1
+        assert model.plans==model.reviews==0

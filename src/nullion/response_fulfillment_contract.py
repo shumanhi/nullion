@@ -1720,14 +1720,13 @@ def strip_unselected_artifact_references(
     cleaned = "\n".join(lines).strip()
     if not cleaned:
         return None
-    folded = cleaned.casefold()
-    if any(name.casefold() in folded for name in suppressed_names):
-        return None
-    if any(label.casefold() in folded for label in suppressed_labels):
-        return None
-    if any(suffix and suffix.casefold() in folded for suffix in suppressed_suffixes):
-        return None
-    return cleaned
+    # A stale file caption may share a message with valid findings or a native
+    # failure notice. Suppress only the affected paragraph, not that content.
+    forbidden = {value.casefold() for value in (*suppressed_names, *suppressed_labels, *suppressed_suffixes) if value}
+    retained = [paragraph for paragraph in cleaned.split("\n\n")
+        if not any(value in paragraph.casefold() for value in forbidden)]
+    return "\n\n".join(retained).strip() or None
+
 
 
 def _terminal_exec_stdout_artifact_paths(output: dict[str, object]) -> list[str]:
@@ -1953,6 +1952,8 @@ def _completed_scheduler_mutation_without_artifact_attempt(
 
 
 def _active_frame_for_contract(store, conversation_id: str):
+    if not callable(getattr(store, 'get_active_task_frame_id', None)):
+        return None
     active_frame_id = store.get_active_task_frame_id(conversation_id)
     if not isinstance(active_frame_id, str) or not active_frame_id:
         return None
@@ -2060,6 +2061,22 @@ def artifact_delivery_failure_reply(tool_results, *, default="I couldn't attach 
     return _failed_artifact_producer_setup_reply(tool_results, provider_rejections_only=True) or default
 
 
+def _artifact_generation_not_started(results) -> bool:
+    """Only known discovery/read receipts can prove no production was attempted."""
+    read_tools = {"request_tool_scope", "chat_history_search", "memory_search",
+        "file_read", "file_search", "workspace_summary"}
+    for result in results:
+        output = result.output if isinstance(result.output, Mapping) else {}
+        if result.tool_name in read_tools:
+            continue
+        if (output.get("result_kind") == "source_observations"
+                and not any(isinstance(row, Mapping) and row.get("role") == "deliverable"
+                    for row in output.get("artifact_descriptors") or ())):
+            continue
+        return False
+    return True
+
+
 def _reply_is_failed_artifact_producer_setup_reply(
     reply: str,
     tool_results: Iterable[ToolResult] | None,
@@ -2131,6 +2148,7 @@ def evaluate_response_fulfillment(
     required_embedded_media_extensions: Iterable[str] | None = None,
     required_tool_names: Iterable[str] | None = None,
     excluded_artifact_paths: Iterable[str] | None = None,
+    preserve_authored_reply: bool = False,
 ) -> ResponseFulfillmentDecision:
     """Validate that a final response is backed by required runtime evidence."""
     normalized_results = [
@@ -2377,6 +2395,27 @@ def evaluate_response_fulfillment(
             "response fulfillment incomplete conversation_id=%s missing=%s completed=%s",
             conversation_id, tuple(missing), tuple(sorted(completed_tool_names)))
         review = execution_review
+        has_completed_output = any(status == 'completed' and result.tool_name != 'request_tool_scope'
+            and result.output for result, status in normalized_results)
+        selected_media = {str(Path(path).expanduser().resolve()) for path in
+            (*existing_deliverables, *valid_reply_media)}
+        def media_is_selected(path):
+            try:
+                return str(path.expanduser().resolve()) in selected_media
+            except (OSError, RuntimeError, ValueError):
+                return False
+        authored_reply = '\n\n'.join(paragraph for paragraph in reply.split('\n\n')
+            if all(media_is_selected(path) for path in media_candidate_paths_from_text(paragraph))).strip()
+        def incomplete(response):
+            # The primary owns its answer; native missing receipts change
+            # fulfillment, not ownership. Keep its findings and add the exact
+            # native limitation once through the shared message renderer.
+            if preserve_authored_reply and has_completed_output and authored_reply and response not in authored_reply:
+                from nullion.chat_text import UserMessage, render_user_message
+                response = render_user_message(UserMessage(paragraphs=(authored_reply,), footer=response))
+            elif preserve_authored_reply and has_completed_output and response in authored_reply:
+                response = authored_reply
+            return ResponseFulfillmentDecision(False, response, tuple(missing))
         partial_reply = (review.partial_reply if review else None) or (
             reviewed_requirements.get('partial_reply') if reviewed_requirements else None)
         if partial_reply:
@@ -2388,10 +2427,10 @@ def evaluate_response_fulfillment(
                  or result.tool_name in missing_tools)]
         setup_reply = _failed_artifact_producer_setup_reply(failure_results)
         if setup_reply and not existing_deliverables:
-            return ResponseFulfillmentDecision(False, setup_reply, tuple(missing))
+            return incomplete(setup_reply)
         missing_dependency_reply = _missing_dependency_reply(failure_results)
         if missing_dependency_reply and not existing_deliverables:
-            return ResponseFulfillmentDecision(False, missing_dependency_reply, tuple(missing))
+            return incomplete(missing_dependency_reply)
         missing_attachments = [
             item
             for item in missing
@@ -2403,9 +2442,11 @@ def evaluate_response_fulfillment(
                     and len(missing_attachments) == len(missing)):
                 return ResponseFulfillmentDecision(False, reviewed_requirements['partial_reply'], tuple(missing))
             response = (
-                "I couldn't attach all of the requested files."
+                "Some requested files are not available for delivery."
                 if existing_deliverables and (len(missing_attachments) > 1 or len(explicit_required_extensions) > 1)
-                else "I couldn't attach the requested file."
+                else "The requested file has not been created."
+                if _artifact_generation_not_started(result for result, _status in normalized_results)
+                else "The requested file is not available for delivery."
             )
         elif attempted_tool_names:
             response = operation_failure_reply((result for result, _status in normalized_results),
@@ -2414,7 +2455,7 @@ def evaluate_response_fulfillment(
             response = "I need more output before this task can be completed."
         if attachment_missing:
             response = artifact_delivery_failure_reply(failure_results, default=response)
-        return ResponseFulfillmentDecision(False, response, tuple(missing))
+        return incomplete(response)
 
     if execution_review is not None and not execution_review.complete:
         return ResponseFulfillmentDecision(False, execution_review.partial_reply or reply,
@@ -2509,11 +2550,13 @@ def evaluate_response_execution_outcome(
     delivery_status: str | None = None,
 ) -> ExecutionOutcomeEvaluation:
     """Return fulfillment and normalized outcome without adding a model hop."""
+    tool_results = list(tool_results or ())
     decision = evaluate_response_fulfillment(
         store=store,
         conversation_id=conversation_id,
         user_message=user_message,
         reply=reply,
+        preserve_authored_reply=True,
         tool_results=tool_results,
         artifact_paths=artifact_paths,
         artifact_roots=artifact_roots,
@@ -2572,10 +2615,20 @@ def evaluate_response_execution_outcome(
         reply = _artifact_package_delivery_reply(required_delivered_artifacts)
     if outcome.status is ExecutionStatus.NEEDS_USER_ACTION and outcome.failure_reason:
         notice = _needs_user_action_reply(outcome.failure_reason, outcome.next_action)
-        # A request/evidence-bound partial answer already contains the owner's
-        # findings and actionable blocker. Rewriting it here invalidates that
-        # binding; a second adapter would then replace it with only a notice.
-        reply = review.partial_reply if review and review.partial_reply else notice
+        # Native state records the blocker without replacing the primary
+        # agent's findings. It has the actual tool results and owns the answer;
+        # an unavailable connector must not turn useful output into a notice.
+        # The notice is only a fallback when there is no authored content.
+        if review and review.partial_reply:
+            reply = review.partial_reply
+        elif any(normalize_tool_status(getattr(row, 'status', None)) == 'completed'
+                and row.tool_name != 'request_tool_scope' and row.output
+                for row in tool_results or ()) and reply.strip():
+            if notice not in reply and not (outcome.next_action and outcome.next_action in reply):
+                from nullion.chat_text import UserMessage, render_user_message
+                reply = render_user_message(UserMessage(paragraphs=(reply,), footer=notice))
+        else:
+            reply = notice
     satisfied = decision.satisfied and outcome.status not in {
         ExecutionStatus.NEEDS_USER_ACTION,
         ExecutionStatus.FAILED,

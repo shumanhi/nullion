@@ -119,44 +119,26 @@ class DeepAgentMiniAgentRunner:
     async def run(
         self, config, **kwargs,
     ) -> TaskResult:
-        from datetime import datetime, timezone
-        from nullion.workflow_reasoning import action_reasoning_scope, assess_action, action_review_evidence
+        from nullion.workflow_reasoning import action_reasoning_scope
         from nullion.tools import ToolResult
         from nullion.tools import tool_execution_cancellation_scope
         from threading import Event
-        from time import monotonic
         evidence = []
-        invocations = {}
         admitted_action_ids = set()
         cancelled = Event()
 
-        def preflight(spec, invocation):
+        def owner_guard(spec, invocation):
             if invocation.principal_id != config.task.principal_id:
                 return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
                     {"reason": "request_owner_mismatch", "executed": False})
-            invocations[invocation.invocation_id] = (spec, invocation)
-            decision = assess_action(model_client=kwargs["anthropic_client"],
-                request=config.task.description, context={"dependency_context": config.context_in},
-                invocation=invocation, spec=spec, evidence=action_review_evidence(evidence), retained_results=evidence,
-                now=datetime.now(timezone.utc).isoformat())
-            if decision.decision == "proceed":
-                admitted_action_ids.add(invocation.invocation_id)
-                return None
-            from nullion.tool_repair_contract import plan_revision_recovery
-            return ToolResult(invocation.invocation_id, invocation.tool_name, "failed",
-                {"reason": "request_plan_conflict", "executed": False, "issues": list(decision.issues),
-                 "review_decision": decision.decision,
-                 "clarification": {"question": decision.question, "options": list(decision.options)}
-                    if decision.decision == "clarify" else None,
-                 "retryable": decision.error is None and decision.decision == "revise",
-                 **({"recovery": plan_revision_recovery(invocation.tool_name)}
-                    if decision.error is None and decision.decision == "revise" else {})})
+            admitted_action_ids.add(invocation.invocation_id)
+            return None
 
         try:
-            with action_reasoning_scope(preflight), tool_execution_cancellation_scope(cancelled.is_set):
-                return await self._run(config, **kwargs, tool_results=evidence, action_invocations=invocations,
+            with action_reasoning_scope(owner_guard), tool_execution_cancellation_scope(cancelled.is_set):
+                return await self._run(config, **kwargs, tool_results=evidence,
                     admitted_action_ids=admitted_action_ids,
-                    cancelled_event=cancelled, review_deadline=monotonic() + config.timeout_s)
+                    cancelled_event=cancelled)
         finally:
             cancelled.set()
             await _run_tool_registry_cleanup(kwargs["tool_registry"], scope_id=config.task.task_id)
@@ -172,10 +154,8 @@ class DeepAgentMiniAgentRunner:
         context_bus: Any,
         progress_queue: asyncio.Queue,
         tool_results: list[Any],
-        action_invocations: dict,
         admitted_action_ids: set[str],
         cancelled_event: Any,
-        review_deadline: float,
     ) -> TaskResult:
         task = config.task
         await _emit_progress(
@@ -303,81 +283,8 @@ class DeepAgentMiniAgentRunner:
                 context_out=getattr(result, "context_out", None),
             )
 
-        if tool_results and result.status in {"success", "failure"} and not result.resume_token and contract_failure is None:
-            from time import monotonic
-            from nullion.agent_orchestrator import AgentOrchestrator, TurnResult
-            from nullion.agent_orchestrator import _tool_invocation_signature
-            from nullion.workflow_reasoning import action_reasoning_scope, durable_action_receipt
-            # The shared graph owns any further repair and its action preflight;
-            # do not run the delegated scope's preflight a second time.
-            completed_actions = {}
-            for row in tool_results:
-                record = action_invocations.get(row.invocation_id)
-                if record and durable_action_receipt(record[0], row):
-                    completed_actions[_tool_invocation_signature(tool_name=row.tool_name, tool_input=record[1].arguments)] = row
-            review_remaining = review_deadline - monotonic()
-            from nullion.tool_repair_contract import exhausted_plan_revision_tool
-            if exhausted_plan_revision_tool(tool_results):
-                from nullion.agent_orchestrator import _CompletionReviewDecision, _completion_review_open_task_reply
-                notice = _completion_review_open_task_reply(_CompletionReviewDecision('blocked',
-                    runtime_failure_code='preflight_revision_stalled'))
-                reviewed = TurnResult(task.task_id, notice, list(tool_results),
-                    response_fulfilled=False, response_presentation={
-                        'terminal_recovery_code':'preflight_revision_stalled', 'recovery_exhausted':True})
-                result.error = notice
-            elif cancelled_event.is_set() or review_remaining <= 0:
-                # Review cannot revoke the task's already completed output.
-                result.report_presentation = {**dict(getattr(result, 'report_presentation', None) or {}),
-                    'outcome_review_role':'helper','outcome_review_status':'unavailable'}
-                reviewed = None
-            else:
-                try:
-                    with action_reasoning_scope(None):
-                        reviewed = await asyncio.wait_for(asyncio.to_thread(AgentOrchestrator(model_client=anthropic_client).review_turn_result,
-                    TurnResult(task.task_id, result.output or result.error, list(tool_results), artifacts=list(result.artifacts),
-                        completed_action_results=completed_actions, response_presentation=report_layout),
-                    conversation_id=task.conversation_id, principal_id=task.principal_id,
-                    user_message=task.description, conversation_history=[{"role": "user", "content": [{"type": "text",
-                        "text": json.dumps({"dependency_context": config.context_in}, ensure_ascii=False, default=str)}]}],
-                    tool_registry=tool_registry, policy_store=policy_store, approval_store=approval_store,
-                    tool_flow_context=_task_tool_flow_context(config),
-                    cancellation_checker=cancelled_event.is_set), timeout=min(60.0, review_remaining))
-                except asyncio.TimeoutError:
-                    cancelled_event.set()
-                    reviewed = None
-                    logger.warning('Outcome helper timed out for task %s; preserving producer result',task.task_id)
-                    result.report_presentation = {**dict(getattr(result, 'report_presentation', None) or {}),
-                        'outcome_review_role':'helper','outcome_review_status':'unavailable',
-                        'outcome_review_timeout':True}
-            if reviewed is not None:
-                tool_results[:] = reviewed.tool_results
-            if reviewed is not None and reviewed.suspended_for_approval:
-                result = TaskResult(task_id=task.task_id, status="partial", output=reviewed.final_text,
-                    resume_token=_resume_token_for_pause(config, reason="approval", payload={"approval_id": reviewed.approval_id}))
-            elif (reviewed is not None and reviewed.response_fulfilled is None
-                    and result.status == "failure"):
-                # An unavailable quality grader cannot repair an independent
-                # execution, provenance, validation or timeout failure.
-                reviewed.response_fulfilled = False
-                reviewed.artifacts = []
-                reviewed.final_text = reviewed.completion_failure_reply = result.error or reviewed.final_text
-            elif reviewed is not None and reviewed.response_fulfilled is False:
-                receipt = reviewed.outcome_review_receipt
-                needs_input = (getattr(receipt, "disposition", None) == "needs_user_input"
-                    and getattr(config, "can_request_user_input", True) and not _is_scheduled_background_config(config))
-                result = TaskResult(task_id=task.task_id, status="partial" if needs_input else "failure",
-                    output=reviewed.final_text if needs_input else None, error=None if needs_input else result.error or reviewed.final_text,
-                    resume_token=_resume_token_for_pause(config, reason="user_input", payload={"question": reviewed.final_text}) if needs_input else {})
-            elif reviewed is not None:
-                result = TaskResult(task_id=task.task_id, status="success", output=reviewed.final_text,
-                    artifacts=list(reviewed.artifacts), context_out=_context_out_for_task(config,
-                        output_text=reviewed.final_text or "", deliverable_artifacts=reviewed.artifacts,
-                        tool_results=tool_results, context_in=config.context_in),
-                    report_presentation=dict(reviewed.response_presentation or {}))
-            result.verified_turn_result = reviewed
-
         from nullion.request_delivery_requirements import required_action_receipt_delivery
-        if getattr(result, 'verified_turn_result', None) is None and required_action_receipt_delivery(tool_results):
+        if required_action_receipt_delivery(tool_results):
             # If the helper never returned, retain the existing native receipt
             # fallback rather than treating deferred copy as verified.
             if isinstance(result.output, str):
@@ -387,19 +294,17 @@ class DeepAgentMiniAgentRunner:
                 result.error = sanitize_user_visible_reply(user_message=task.description, reply=result.error,
                     tool_results=tool_results, source='deep-agent') or result.error
 
-        # Synthesis-only scheduled steps already have a dedicated dependency
-        # review. Keep that owner when no tool workflow entered the shared gate.
-        if not tool_results and result.status == "success" and _is_scheduled_background_config(config):
-            decision = await _scheduled_task_completion_decision(config, output_text=result.output or "",
-                tool_results=[], model_client=anthropic_client,
-                report_presentation=result.report_presentation)
-            if decision is not None and decision['status']=='success':
-                result.output = decision['answer']
-                result.report_presentation.update(decision.get('report_presentation') or {})
-            result.report_presentation = {**dict(getattr(result,'report_presentation',None) or {}),
-                'outcome_review_role':'helper','outcome_review_status':(
-                    'unavailable' if decision is None else 'complete' if decision['status']=='success' else 'advice')}
-
+        # Preserve native tool/file evidence for the owning workflow without a
+        # post-execution quality model. This receipt is not proof of delivery.
+        from nullion.agent_orchestrator import TurnResult
+        from nullion.completion_pipeline import publish_completion
+        result.verified_turn_result = TurnResult(
+            turn_id=task.task_id, final_text=result.output or result.error,
+            tool_results=list(tool_results), artifacts=list(result.artifacts or ()),
+            response_fulfilled=result.status == "success",
+            response_presentation=dict(getattr(result, 'report_presentation', None) or {}))
+        publish_completion(result.verified_turn_result, task.description, reason='producer_finalized',
+            conversation_id=task.conversation_id, principal_id=task.principal_id)
         if result.status == "success" and task.context_key_out and result.context_out is not None:
             context_bus.publish(
                 task.context_key_out,
@@ -3521,90 +3426,8 @@ async def _scheduled_task_completion_decision(
     model_client: Any,
     report_presentation: dict | None = None,
 ) -> dict[str, Any] | None:
-    """Assist a synthesis step without taking ownership of its task status."""
-    if not _is_scheduled_background_config(config):
-        return None
-    create = getattr(model_client, "create", None)
-    if create is None or not _model_client_can_make_evidence_fallback_decision(model_client):
-        return None
-    task = getattr(config, "task", None)
-    evidence = _tool_evidence_payload(tool_results)
-    system_prompt = (
-        "You validate one completed Nullion scheduled-task step. "
-        "Use only the assigned task, dependency context, final answer, and verified tool-result evidence. "
-        "Output only JSON with this schema: "
-        '{"status":"success"|"failure","answer":"string"}. '
-        "Act as a helper improving the producer's result. Use status=success for a grounded improved answer, "
-        "or status=failure for internal advice when you cannot improve it. This is not authority to revoke "
-        "the task result, hide usable findings, grant permission, or certify an unperformed action. "
-        "Preserve useful findings, requested provenance and concrete limitations. "
-        "External platform delivery is performed by Nullion after this step; do not require proof that a "
-        "message, report, or artifact was already sent unless the assigned task had an available side-effect "
-        "tool and the final answer claims that tool-side effect already happened. "
-        "For success, keep answer as the concise user-facing task result. "
-        "Do not mention internal validation, tools, or orchestration."
-    )
-    structured_report = (report_presentation or {}).get('report_presentation') in {'structured', 'content_fallback'}
-    if structured_report:
-        from nullion.chat_text import report_presentation_instructions
-        system_prompt += (' The producer supplied a shared report. To improve it, include an optional '
-            'report_message using that same contract; answer is only a brief fallback. Preserve the '
-            'current compact or detailed ownership of supporting explanations. '
-            + report_presentation_instructions())
-    user_payload = {
-        "task": str(getattr(task, "description", "") or getattr(task, "title", "") or ""),
-        "allowed_tools": list(getattr(task, "allowed_tools", ()) or ()),
-        "dependency_context": getattr(config, "context_in", None),
-        "final_answer": str(output_text or ""),
-        "tool_evidence": evidence,
-    }
-    if structured_report:
-        user_payload['report_presentation'] = report_presentation
-        from nullion.chat_text import report_delivery_context
-        user_payload['report_delivery_context'] = report_delivery_context(
-            artifact_delivery_required=_task_requires_user_file_delivery(task))
-    create_kwargs = {
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": json.dumps(user_payload, ensure_ascii=False, default=str)}],
-            }
-        ],
-        "tools": [],
-        "max_tokens": min(4000, max(700, 400 + len(output_text) // 2)) if structured_report else 700,
-        "system": system_prompt + "\n\n" + current_presentation_prompt(),
-    }
-    try:
-        response = await asyncio.wait_for(
-            _call_model_create(create, create_kwargs),
-            timeout=_completion_decision_timeout_seconds(),
-        )
-    except Exception:
-        logger.warning(
-            "DeepAgent scheduled outcome helper unavailable; preserving producer result "
-            "agent_id=%s task_id=%s",
-            getattr(config, "agent_id", ""),
-            str(getattr(task, "task_id", "") or ""),
-            exc_info=True,
-        )
-        return None
-    raw = _extract_response_text(response)
-    decision = _parse_evidence_fallback_decision(raw)
-    if structured_report and decision is not None and decision['status'] == 'success':
-        # A plain editorial rewrite cannot discard the producer's typed report
-        # or expand its optional context back into the compact answer.
-        decision['answer'] = output_text
-        try:
-            body = json.loads(raw)
-        except (ValueError, TypeError):
-            body = None
-        if isinstance(body, dict) and isinstance(body.get('report_message'), dict):
-            from nullion.chat_text import render_report_message
-            layout = {}
-            answer = render_report_message(body['report_message'], diagnostics=layout, fallback=output_text)
-            if layout.get('report_presentation') == 'structured':
-                decision.update(answer=answer, report_presentation=layout)
-    return decision
+    """Retired scheduled quality-grading compatibility hook."""
+    return None
 
 
 async def _fallback_answer_from_tool_evidence(

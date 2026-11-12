@@ -114,6 +114,8 @@ CREATE INDEX IF NOT EXISTS idx_conversations_status
 """
 
 _POST_MIGRATION_DDL = """
+CREATE INDEX IF NOT EXISTS idx_messages_runtime_reply
+    ON messages (conversation_id, role, runtime_turn_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_channel
     ON conversations (channel, last_message_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_status_channel_last
@@ -759,8 +761,16 @@ class ChatStore:
         metadata_text = None
         if metadata:
             metadata_text = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+        terminal_identity = (metadata.get('runtime_turn_id') if role == 'bot' and isinstance(metadata, dict)
+            and metadata.get('history_message_kind') == 'terminal_reply' else None)
+        terminal_identity = terminal_identity if isinstance(terminal_identity, str) and terminal_identity else None
         now = _now()
         with self._connect() as conn:
+            if terminal_identity:
+                # One final publication may reach history from both runtime
+                # import and the browser. Serialize this receipt upsert; ordinary
+                # status, multipart and follow-up messages retain append semantics.
+                conn.execute('BEGIN IMMEDIATE')
             # Upsert conversation (channel columns set only on first insert)
             conn.execute(
                 """INSERT OR IGNORE INTO conversations
@@ -778,8 +788,20 @@ class ChatStore:
                         "UPDATE conversations SET title = ? WHERE id = ?",
                         (self._encrypt_text(_make_title(safe_text)), conv_id),
                     )
+            if terminal_identity:
+                owned = conn.execute('SELECT id, metadata FROM messages WHERE conversation_id = ? '
+                    'AND role = ? AND runtime_turn_id = ? ORDER BY id LIMIT 1',
+                    (conv_id, role, terminal_identity)).fetchone()
+                if owned is not None:
+                    previous = self._decrypt_row(owned)['metadata'] or {}
+                    merged = {**previous, **metadata}
+                    conn.execute('UPDATE messages SET text = ?, metadata = ?, is_error = ? WHERE id = ?',
+                        (self._encrypt_text(safe_text), self._encrypt_text(json.dumps(merged,
+                            separators=(',', ':'), sort_keys=True)), int(is_error), owned['id']))
+                    conn.execute('UPDATE conversations SET last_message_at = ? WHERE id = ?', (now, conv_id))
+                    return owned['id']
             latest = conn.execute(
-                """SELECT id, role, text, metadata, is_error
+                """SELECT id, role, text, metadata, is_error, runtime_turn_id
                    FROM messages
                    WHERE conversation_id = ?
                    ORDER BY id DESC
@@ -797,6 +819,8 @@ class ChatStore:
                     and (self._decrypt_text(latest["text"]) or "") == safe_text
                     and bool(latest["is_error"]) == bool(is_error)
                     and not different_notice
+                    and not (terminal_identity and latest['runtime_turn_id']
+                        and latest['runtime_turn_id'] != terminal_identity)
                 ):
                     if latest_metadata == metadata_text:
                         return latest["id"]
@@ -808,9 +832,10 @@ class ChatStore:
                         # row data instead of rendering two identical bubbles.
                         preferred_metadata = metadata_text or latest_metadata
                         conn.execute(
-                            "UPDATE messages SET metadata = ? WHERE id = ?",
+                            "UPDATE messages SET metadata = ?, runtime_turn_id = COALESCE(?, runtime_turn_id) WHERE id = ?",
                             (
                                 self._encrypt_text(preferred_metadata) if preferred_metadata else None,
+                                terminal_identity,
                                 latest["id"],
                             ),
                         )
@@ -822,8 +847,8 @@ class ChatStore:
                     return latest["id"]
             # Insert message
             cur = conn.execute(
-                "INSERT INTO messages (conversation_id, role, text, metadata, is_error, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages (conversation_id, role, text, metadata, is_error, created_at, runtime_turn_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     conv_id,
                     role,
@@ -831,6 +856,7 @@ class ChatStore:
                     self._encrypt_text(metadata_text) if metadata_text else None,
                     1 if is_error else 0,
                     now,
+                    terminal_identity,
                 ),
             )
             # Update last_message_at
@@ -852,11 +878,13 @@ class ChatStore:
         """
         imported = 0
         existing_by_conversation: dict[str, dict[tuple[str, str], list[dict[str, Any]]]] = {}
+        existing_by_identity: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
         sorted_turns = sorted(
             (turn for turn in turns if isinstance(turn, dict)),
             key=lambda turn: str(turn.get("created_at") or ""),
         )
         with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             for turn in sorted_turns:
                 conversation_id = str(turn.get("conversation_id") or "").strip()
                 if not conversation_id.startswith(("web:", "telegram:", "slack:", "discord:")):
@@ -885,13 +913,16 @@ class ChatStore:
                         (conversation_id,),
                     ).fetchall()
                     existing_by_conversation[conversation_id] = {}
+                    existing_by_identity[conversation_id] = {}
                     for row in rows:
                         metadata = self._decrypt_row(row)["metadata"]
                         if not isinstance(metadata, dict):
                             metadata = {}
                         key = (str(row["role"]), self._decrypt_text(row["text"]) or "")
-                        existing_by_conversation[conversation_id].setdefault(key, []).append(
-                            {"id": int(row["id"]), "metadata": metadata, "runtime_turn_id": row["runtime_turn_id"]})
+                        record = {"id": int(row["id"]), "metadata": metadata, "runtime_turn_id": row["runtime_turn_id"]}
+                        existing_by_conversation[conversation_id].setdefault(key, []).append(record)
+                        if row['runtime_turn_id']:
+                            existing_by_identity[conversation_id].setdefault((row['role'], row['runtime_turn_id']), record)
 
                 channel = _channel_for_conversation(conversation_id)
                 channel_label = _channel_label_for_conversation(conversation_id)
@@ -909,7 +940,10 @@ class ChatStore:
                     key = (role, safe_text)
                     metadata = dict((_artifact_metadata_from_runtime_turn(turn) if role == "bot" else None) or {})
                     candidates = existing_by_conversation[conversation_id].get(key, [])
-                    existing = next((row for row in candidates if row["runtime_turn_id"] == runtime_identity), None)
+                    existing = (existing_by_identity[conversation_id].get((role, runtime_identity))
+                        if role == 'bot' else None)
+                    if existing is None:
+                        existing = next((row for row in candidates if row["runtime_turn_id"] == runtime_identity), None)
                     if existing is None:
                         existing = next((row for row in candidates if not row["runtime_turn_id"]), None)
                     if existing is not None:
@@ -926,6 +960,7 @@ class ChatStore:
                             )
                             existing["metadata"] = merged
                             existing["runtime_turn_id"] = runtime_identity
+                        existing_by_identity[conversation_id][(role, runtime_identity)] = existing
                         continue
                     metadata_text = json.dumps(metadata, separators=(",", ":"), sort_keys=True) if metadata else None
                     if role == "user":
@@ -958,8 +993,10 @@ class ChatStore:
                            WHERE id = ?""",
                         (created_at, created_at, conversation_id),
                     )
-                    existing_by_conversation[conversation_id].setdefault(key, []).append(
-                        {"id": int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]), "metadata": metadata, "runtime_turn_id": runtime_identity})
+                    record = {"id": int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]),
+                        "metadata": metadata, "runtime_turn_id": runtime_identity}
+                    existing_by_conversation[conversation_id].setdefault(key, []).append(record)
+                    existing_by_identity[conversation_id][(role, runtime_identity)] = record
                     imported += 1
         return imported
 

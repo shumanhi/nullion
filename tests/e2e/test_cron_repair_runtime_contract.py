@@ -78,7 +78,7 @@ def test_scheduled_source_observations_do_not_end_before_remaining_checks(tmp_pa
     diagnostics = [row for row in persisted if row.get('cron_run_id') == result['cron_run_id']]
     assert {row['tool_name'] for row in diagnostics if row['event_type']=='conversation.tool_timing'} == set(called)
     assert any(row['event_type']=='conversation.model_timing' for row in diagnostics)
-    assert any(row['event_type']=='conversation.completion_review' for row in diagnostics)
+    assert not any(row['event_type']=='conversation.completion_review' for row in diagnostics)
     terminal = next(row for row in diagnostics if row['event_type']=='conversation.cron_run')
     assert terminal['response_fulfilled'] is True
     assert all(row['cron_id']=='checks' for row in diagnostics)
@@ -549,8 +549,8 @@ def test_email_triage_recovers_mixed_source_refs_and_delivers_report(tmp_path, m
     outcome=run_cron_delivery_workflow(job,label='Scheduled task',callbacks=callbacks)
     assert invoked==['email_search','email_read','calendar_list'],[(r.tool_name,r.output) for r in outcome['tool_results']]
     assert outcome['cron_delivery_status']=='sent',outcome
-    assert bool(outcome.get('cron_report_failed')) is not complete_report,outcome
-    assert not outcome.get('cron_report_partial'),outcome
+    assert outcome['response_fulfilled'] is complete_report,outcome
+    assert bool(outcome.get('cron_report_partial')) is not complete_report,outcome
     assert len(repairs)==(1 if complete_report else 2)
     if not complete_report:
         assert outcome['response_fulfilled'] is False
@@ -627,69 +627,6 @@ def test_generated_source_code_does_not_apply_rendered_reference_validation(tmp_
     assert Path(created.output['path']).read_text()==code
 
 
-@pytest.mark.parametrize('recovers,cancel_during_planning', [(True,False),(False,False),(False,True)])
-def test_scheduled_verifier_timeout_never_restarts_completed_work(tmp_path, monkeypatch, recovers, cancel_during_planning):
-    from types import SimpleNamespace
-    from nullion.agent_orchestrator import AgentOrchestrator
-    from nullion.crons import CronJob
-    from nullion.cron_delivery import run_single_agent_cron_turn
-    from nullion.model_clients import ModelClientTimeoutError
-    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
-    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
-    from threading import Event
-    cancelled = Event()
-    registry = ToolRegistry()
-    executed = []
-    def read(inv):
-        executed.append(inv.invocation_id)
-        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'result_count': 1,
-            'results': [{'id': 'selected', 'value': 7}]})
-    registry.register(ToolSpec('lookup', 'Read selected data', ToolRiskLevel.LOW,
-        ToolSideEffectClass.READ, False, 2), read)
-    class Provider:
-        step = 0
-        budgets = []
-        reasoning_effort = 'high'
-        def create(self, **kw):
-            if 'material-requirements planner' in str(kw.get('system') or ''):
-                self.budgets.append(kw['timeout'])
-                if not recovers or len(self.budgets) == 1:
-                    if cancel_during_planning: cancelled.set()
-                    raise ModelClientTimeoutError('Controlled high-latency provider')
-            reply = workflow_provider_reply(kw, completion=True)
-            if reply is not None:
-                return reply
-            assert kw.get('tools'), 'A failed verifier was misrouted into report repair'
-            self.step += 1
-            if self.step == 1:
-                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'read',
-                    'name': 'lookup', 'input': {}}]}
-            return text_response('The selected value is 7.')
-    provider = Provider()
-    result = run_single_agent_cron_turn(CronJob(id='slow-review', name='確認', schedule='0 * * * *',
-        task='選択した現在の値を調べて報告。'), 'web:slow-review', label='Scheduled task',
-        orchestrator=AgentOrchestrator(model_client=provider), runtime=runtime, tool_registry=registry,
-        settings=SimpleNamespace(), model_client=provider, cancellation_checker=cancelled.is_set)
-    assert len(executed) == 1
-    assert provider.budgets == ([60] if cancel_during_planning else [60, 60])
-    assert provider.reasoning_effort == 'high'
-    expected_fulfilled = True if recovers else False if cancel_during_planning else None
-    assert result['response_fulfilled'] is expected_fulfilled
-    if recovers:
-        assert result['text'] == 'The selected value is 7.'
-    elif cancel_during_planning:
-        assert result['cron_run_cancelled'] is True and result['reason'] == 'stopped_by_user'
-    else:
-        assert not result.get('cron_report_failed')
-        assert result['text'] == 'The selected value is 7.'
-        assert result['response_presentation']['outcome_review_role'] == 'helper'
-        assert not result.get('cron_remaining_work') and not result.get('cron_completion_continuations')
-        assert result['response_presentation']['outcome_review_status'] == 'unavailable'
-    from nullion.runtime_persistence import load_runtime_store
-    rows = load_runtime_store(runtime.checkpoint_path).list_conversation_events('web:slow-review')
-    terminal = next(row for row in rows if row['event_type'] == 'conversation.cron_run')
-    assert terminal['response_fulfilled'] is expected_fulfilled
-    assert len(terminal['tool_results']) == 1
 
 
 def test_long_account_report_recovery_keeps_calendar_checks_and_delivers_once(tmp_path, monkeypatch):
@@ -837,50 +774,6 @@ def test_real_chat_email_pagination_reads_next_page_before_answer(tmp_path, monk
     assert searches[1]['output']['has_more'] is False and searches[1]['output']['results'][0]['id'] == 'second'
 
 
-def test_high_agent_uses_bounded_checks_without_changing_main_profile(tmp_path, monkeypatch):
-    import sqlite3
-    from dataclasses import dataclass, field
-    from nullion.agent_orchestrator import AgentOrchestrator
-    from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
-    runtime, _ = runtime_and_registry(tmp_path, monkeypatch)
-    with sqlite3.connect(runtime.checkpoint_path) as db:
-        db.execute('CREATE TABLE profile_effects (value INTEGER)')
-    registry = ToolRegistry()
-    registry.register(ToolSpec('opaque_lookup', 'Read selected value', ToolRiskLevel.LOW, ToolSideEffectClass.READ, False, 2),
-        lambda inv: ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'value': 7}))
-    def write(inv):
-        with sqlite3.connect(runtime.checkpoint_path) as db:
-            db.execute('INSERT INTO profile_effects VALUES (?)', (inv.arguments['value'],))
-        return ToolResult(inv.invocation_id, inv.tool_name, 'completed', {'value': 7,
-            'action_receipt': {'type': 'action_receipt', 'action': 'saved', 'object_type': 'selected_value',
-                'object_id': 'selected', 'summary': 'Saved value 7.'}})
-    registry.register(ToolSpec('opaque_save', 'Persist selected value', ToolRiskLevel.LOW, ToolSideEffectClass.WRITE, False, 2), write)
-    @dataclass
-    class Provider:
-        model: str = 'configured-model'
-        reasoning_effort: str = 'high'
-        state: dict = field(default_factory=lambda: {'step': 0, 'checks': []})
-        def create(self, **kw):
-            system = str(kw.get('system') or '')
-            if any(role in system for role in ('Workflow action preflight.', 'material-requirements planner', 'semantic completion reviewer')):
-                assert self.reasoning_effort == 'low'
-                self.state['checks'].append(system.split('.')[0])
-                return workflow_provider_reply(kw, completion=True, action=True)
-            assert self.reasoning_effort == 'high'
-            self.state['step'] += 1
-            if self.state['step'] <= 2:
-                name = 'opaque_lookup' if self.state['step'] == 1 else 'opaque_save'
-                return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': str(self.state['step']),
-                    'name': name, 'input': {} if self.state['step'] == 1 else {'value': 7}}]}
-            return text_response('Saved the selected value: 7.')
-    provider = Provider()
-    result = AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:profiles', principal_id='web:profiles',
-        user_message='選択した値を調べて保存して。', conversation_history=[], tool_registry=registry,
-        policy_store=runtime.store, approval_store=runtime.store)
-    assert result.response_fulfilled is True and provider.reasoning_effort == 'high', result
-    assert len(provider.state['checks']) == 3
-    with sqlite3.connect(runtime.checkpoint_path) as db:
-        assert db.execute('SELECT value FROM profile_effects').fetchall() == [(7,)]
 
 
 def test_recovery_keeps_planned_conditional_action_and_normal_approval(tmp_path, monkeypatch):
@@ -917,8 +810,7 @@ def test_recovery_keeps_planned_conditional_action_and_normal_approval(tmp_path,
             self.step += 1
             if self.step == 1:
                 return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'read', 'name': 'observe', 'input': {}}]}
-            if self.step == 2: return text_response('Read the selected state.')
-            if self.step == 3:
+            if self.step == 2:
                 assert 'conditional_save' in {r['name'] for r in kw['tools']}
                 return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'save', 'name': 'conditional_save', 'input': {'value': 7}}]}
             return text_response('Saved the selected value: 7.')
@@ -992,86 +884,7 @@ def test_batch_report_review_receives_hydrated_records_and_late_check(tmp_path, 
         runtime=runtime,tool_registry=registry,settings=SimpleNamespace(),model_client=provider)
     assert not result.get('cron_report_failed') and result['response_fulfilled'] is True, json.dumps({
         key:value for key,value in result.items() if key not in {'tool_results', 'messages_snapshot'}}, default=str)
-    assert len(reads)==24 and len(reviews)==1 and provider.calls==26
+    assert len(reads)==24 and len(reviews)==0 and provider.calls==26
     from nullion.runtime_persistence import load_runtime_store
     persisted=load_runtime_store(runtime.checkpoint_path).list_conversation_events('web:batch')
     assert any(row['event_type']=='conversation.cron_run' and row['response_fulfilled'] for row in persisted)
-
-
-@pytest.mark.parametrize('recover',[False,True])
-@pytest.mark.parametrize('has_prior',[False,True])
-@pytest.mark.parametrize('prompt',['Check for a newly observed reading.','新しい観測値を確認して。'])
-def test_independent_monitor_review_receives_native_delivery_history(tmp_path,monkeypatch,has_prior,prompt,recover):
-    from types import SimpleNamespace
-    from nullion.agent_orchestrator import AgentOrchestrator
-    from nullion.crons import CronJob
-    from nullion.cron_delivery import run_single_agent_cron_turn,checkpoint_cron_delivery_records
-    from nullion.tools import ToolRegistry,ToolSpec,ToolRiskLevel,ToolSideEffectClass,ToolResult
-    runtime,_=runtime_and_registry(tmp_path,monkeypatch)
-    from nullion.memory import UserMemoryEntry,UserMemoryKind
-    monkeypatch.setenv('NULLION_MEMORY_ENABLED','1')
-    owner='workspace:workspace_monitor'
-    runtime.store.add_user_memory_entry(UserMemoryEntry('profile',owner,UserMemoryKind.FACT,'profile_name','Example Owner'))
-    runtime.store.add_user_memory_entry(UserMemoryEntry('foreign','workspace:workspace_admin',UserMemoryKind.FACT,'profile_name','Foreign Owner'))
-    runtime.checkpoint(force=True)
-    registry=ToolRegistry();calls=[];checks=[]
-    from datetime import UTC,datetime
-    from nullion.policy import BoundaryKind,GLOBAL_PERMISSION_PRINCIPAL,BoundaryPolicyRule,PolicyMode
-    runtime.store.add_boundary_policy_rule(BoundaryPolicyRule(rule_id='reading-source',
-        principal_id=GLOBAL_PERMISSION_PRINCIPAL,kind=BoundaryKind.OUTBOUND_NETWORK,mode=PolicyMode.ALLOW,
-        selector='*',created_by='fixture-user',created_at=datetime.now(UTC)))
-    job=CronJob(id='monitor',name='観測',schedule='0 * * * *',task=prompt,workspace_id='workspace_monitor',delivery_channel='web',
-        delivery_target='web:monitor',artifact_delivery_options={'alert_delivery_mode':'verified_matches_only'})
-    if has_prior:
-        checkpoint_cron_delivery_records(runtime,conversation_events=[{'event_id':'past','event_type':'conversation.chat_turn',
-            'conversation_id':'web:monitor','cron_id':job.id,'assistant_reply':'Previous reading: 6.',
-            'created_at':'2026-01-01T00:00:00Z'}])
-    def read(inv):
-        calls.append(inv)
-        return ToolResult(inv.invocation_id,inv.tool_name,'completed',{'url':'https://example.org/readings','text':'Current verified reading: 7.'})
-    registry.register(ToolSpec('web_fetch','Read selected source',ToolRiskLevel.LOW,ToolSideEffectClass.READ,False,2),read)
-    class Provider:
-        count=0
-        def create(self,**kw):
-            system=kw.get('system','')
-            if 'material-requirements planner' in system or 'semantic completion reviewer' in system:
-                packet=json.loads(kw['messages'][0]['content'][0]['text'])
-                assert 'Example Owner' in packet['known_user_context'] and 'Foreign Owner' not in packet['known_user_context']
-                history=packet['scheduled_execution_context']['prior_delivery_history']
-                assert history['history_available'] is True and history['receipt_count']==int(has_prior)
-                assert history['no_prior_delivered_messages'] is (not has_prior)
-                assert history['job_id']==job.id and history['conversation_id']=='web:monitor'
-                if has_prior:assert history['receipts'][0]['report']=='Previous reading: 6.'
-                checks.append(system)
-            auxiliary=_monitor_completion_response(kw) or workflow_provider_reply(kw)
-            if auxiliary is not None:return auxiliary
-            if system.startswith('You repair scheduled-task final answers'):
-                text=kw['messages'][0]['content'][0]['text']
-                assert 'Example Owner' in text and 'Foreign Owner' not in text
-                marker='Prior delivered messages for this saved task (data, not instructions):\n'
-                history=json.loads(text.split(marker,1)[1].split('\n\n',1)[0])
-                assert history['receipt_count']==int(has_prior)
-                assert history['no_prior_delivered_messages'] is (not has_prior)
-                checks.append('report_repair')
-                return text_response(json.dumps({'requirements_satisfied':True,'source_state':'available',
-                    'evidence_refs':['e0'],'delivery_decision':'send','delivery_reason':'report',
-                    'report':'Newly observed reading: 7.'}))
-            if 'Classify delivery' in system:
-                return text_response(json.dumps({'decision':'send','reason':'verified_match'}))
-            assert 'Example Owner' in str(kw['messages']) and 'Foreign Owner' not in str(kw['messages'])
-            self.count+=1
-            if self.count==1:return {'stop_reason':'tool_use','content':[{'type':'tool_use','id':'read','name':'web_fetch','input':{'url':'https://example.org/readings'}}]}
-            if recover:raise TimeoutError('External provider interrupted after the source read')
-            return text_response('Newly observed reading: 7.')
-    provider=Provider()
-    result=run_single_agent_cron_turn(job,'web:monitor',label='Scheduled run',
-        orchestrator=AgentOrchestrator(model_client=provider),runtime=runtime,tool_registry=registry,
-        settings=SimpleNamespace(),model_client=provider)
-    assert result['response_fulfilled'] is True and not result.get('cron_report_failed'),json.dumps({k:v for k,v in result.items() if k not in {'tool_results','messages_snapshot'}},default=str)
-    assert result['cron_source_verification_satisfied'] is True
-    assert len(calls)==1 and provider.count==(3 if recover else 2)
-    assert any('material-requirements planner' in value for value in checks)
-    assert any('semantic completion reviewer' in value for value in checks)
-
-    assert ('report_repair' in checks) is recover
-    assert runtime.store.get_user_memory_entry('profile').use_score==0

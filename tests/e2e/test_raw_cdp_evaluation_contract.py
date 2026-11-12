@@ -119,10 +119,7 @@ def test_real_api_raw_browser_captures_three_bound_sources_and_delivers_once(tmp
                 started=time.monotonic();response=client.post('/api/chat',json={'text':prompt,'conversation_id':cid});elapsed=time.monotonic()-started;data=response.json();assert not model.errors,model.errors
                 assert response.status_code==200 and len(data['artifacts'])==1,data
                 assert client.get(data['artifacts'][0]['url']).content==b'Current values: 37, 41, 53.\n'
-                assert elapsed<15 and model.reviews==1 and len(writes)==1,(elapsed,model.reviews,len(writes),[
-                    {k:e[k] for k in ('event_type','validation_errors','review_error','status') if k in e}
-                    for e in runtime.store.list_conversation_events(cid)
-                    if e.get('event_type') in {'conversation.completion_requirement_contract','conversation.completion_review'}])
+                assert elapsed < 15 and model.reviews == 0 and (len(writes) == 1), (elapsed, model.reviews, len(writes), [{k: e[k] for k in ('event_type', 'validation_errors', 'review_error', 'status') if k in e} for e in runtime.store.list_conversation_events(cid) if e.get('event_type') in {'conversation.completion_requirement_contract', 'conversation.completion_review'}])
                 turn=next(e for e in runtime.store.list_conversation_events(cid) if e.get('event_type')=='conversation.chat_turn');extracts=[r for r in turn['tool_results'] if r['tool_name']=='browser_extract_text'];assert len(extracts)==3 and {r['output']['page_url'] for r in extracts}==set(urls)
         finally:browser.close();server.shutdown();server.server_close()
 

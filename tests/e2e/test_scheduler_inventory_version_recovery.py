@@ -58,5 +58,5 @@ def test_changed_inventory_recovers_without_retiring_reader(tmp_path,monkeypatch
         assert turn['response_fulfilled'] is True,turn
         reads=[r for r in turn['tool_results'] if r['tool_name']=='list_crons']
         assert [r['status'] for r in reads]==['completed','failed','completed']
-        assert model.phase==5 and model.reviews==1
+        assert model.phase == 5 and model.reviews == 0
         assert not any(r['tool_name'] in {'toggle_cron','run_cron','list_reminders'} for r in turn['tool_results'])

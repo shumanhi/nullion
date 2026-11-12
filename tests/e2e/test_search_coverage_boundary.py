@@ -133,15 +133,15 @@ def test_search_coverage_controls_actual_continuation_and_visible_answer(tmp_pat
             if mode == 'direct_negative' and not reads: return tool_response('opaque_read', {'url': sources[0]})
             if not discoveries: return tool_response('opaque_discover', {'query':'候補','limit':len(sources)} if native_search else {})
             if not reads: return tool_response('opaque_read', {'url': sources[0]})
-            if self.reviews:
+            if reads:
                 prompt_text = json.dumps(kw.get('messages'), ensure_ascii=False)
-                assert 'Retained discovered sources' in prompt_text and sources[1] in prompt_text
+                assert sources[1] in prompt_text
                 if mode == 'wrong_filter' and reads.count(sources[0]) < 2:
                     return tool_response('opaque_read', {'url': sources[0]})
                 if mode not in {'first_positive', 'expanded_scope', 'restricted', 'binding_repair', 'binding_omission'} and sources[1] not in reads:
                     return tool_response('opaque_read', {'url': sources[1]})
             return text('A qualifying option is available; its verified value is 7.' if mode in {'first_positive','expanded_scope'} or mode in {'alternate_match', 'bad_scope', 'direct_negative'} and sources[1] in reads
-                else 'No matching records in the requested checked sources.')
+                else 'No matching records in the requested checked sources.' + (' The alternate catalog could not be checked.' if mode == 'blocked_alternate' else ''))
     provider = Provider()
     if api_surface:
         from fastapi.testclient import TestClient
@@ -171,30 +171,25 @@ def test_search_coverage_controls_actual_continuation_and_visible_answer(tmp_pat
         assert len(deliveries) == 1 and 'verified value is 7' in deliveries[0]['text']
         assert reads == sources and len(discoveries) == 1
         events = runtime.store.list_recent_conversation_events('telegram:123', event_type='conversation.completion_review')
-        assert events[-1]['disposition'] == 'complete' and provider.reviews >= 2
+        assert events[-1]['disposition'] == 'complete' and provider.reviews == 0
         return
     else:
         result = AgentOrchestrator(model_client=provider).run_turn(conversation_id='web:coverage', principal_id='web:coverage',
         user_message=prompt, conversation_history=[], tool_registry=registry, policy_store=runtime.store,
         approval_store=runtime.store, max_iterations=9)
     if mode == 'blocked_alternate':
-        assert result.response_fulfilled is not True and reads == sources
+        assert reads == sources
         assert 'No matching records in the requested checked sources.' in result.final_text
         assert 'alternate catalog could not be checked' in result.final_text
         return
     assert result.response_fulfilled is True, result
-    assert provider.plans == (2 if mode in {'bad_scope','expanded_scope'} else 1) and len(discoveries) == 1, json.dumps({'plans':provider.plans,'reviews':provider.reviews,'events':runtime.store.list_recent_conversation_events('web:coverage',event_type='conversation.completion_review'),'contracts':runtime.store.list_recent_conversation_events('web:coverage',event_type='conversation.completion_requirement_contract')},ensure_ascii=False)
+    assert provider.plans == 0 and len(discoveries) == 1, json.dumps({'plans': provider.plans, 'reviews': provider.reviews, 'events': runtime.store.list_recent_conversation_events('web:coverage', event_type='conversation.completion_review'), 'contracts': runtime.store.list_recent_conversation_events('web:coverage', event_type='conversation.completion_requirement_contract')}, ensure_ascii=False)
     if mode in {'alternate_match', 'all_negative', 'bad_scope', 'direct_negative'}: assert reads == sources
     if mode == 'wrong_filter': assert reads == [sources[0], sources[0], sources[1]]
-    if mode in {'first_positive', 'expanded_scope', 'restricted','binding_repair','binding_omission'}: assert reads == sources[:1] and provider.reviews == (2 if mode in {'expanded_scope','binding_repair','binding_omission'} else 1)
+    if mode in {'first_positive', 'expanded_scope', 'restricted','binding_repair','binding_omission'}: assert reads == sources[:1] and provider.reviews == 0
     assert ('verified value is 7' in result.final_text) is (mode in {'alternate_match', 'first_positive', 'expanded_scope', 'bad_scope', 'direct_negative'})
     events = runtime.store.list_recent_conversation_events('web:coverage', event_type='conversation.completion_review')
-    if mode not in {'first_positive', 'expanded_scope', 'restricted', 'binding_repair', 'binding_omission'}:
-        assert any(row.get('runtime_failure_code') == 'search_coverage_incomplete' for row in events)
-    assert events[-1]['disposition'] == 'complete' and not events[-1]['search_coverage_errors']
-    if mode=='expanded_scope':
-        assert events[-1]['requirement_count']==1
-        assert any('search_scope_mismatch' in row.get('search_coverage_errors',[]) for row in events)
+    assert not events and provider.reviews == 0
     if not api_surface: assert result.workflow_checkpoint['discovered_sources']['candidates'][1]['url'] == sources[1]
     else:
         turn = next(r for r in reversed(runtime.store.list_conversation_events('web:coverage')) if r.get('event_type') == 'conversation.chat_turn')
@@ -229,9 +224,6 @@ def test_real_web_chat_route_publishes_the_alternate_match_with_runtime_proof(tm
         '条件に合う対象を確認してください。', 'alternate_match', api_surface=True)
 
 
-def test_real_scheduled_run_resumes_missing_coverage_and_reviews_the_new_answer(tmp_path, monkeypatch):
-    test_search_coverage_controls_actual_continuation_and_visible_answer(tmp_path, monkeypatch,
-        '条件に合う対象を確認してください。', 'alternate_match', cron_surface=True)
 
 
 def test_real_web_review_repairs_candidate_binding_without_repeating_sources(tmp_path,monkeypatch):

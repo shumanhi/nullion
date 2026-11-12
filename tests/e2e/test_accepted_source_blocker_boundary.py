@@ -75,4 +75,4 @@ def test_explicit_blocker_alternative_remains_one_verified_lookup_outcome(tmp_pa
             text=response.json()['text']
     events=runtime.store.list_recent_conversation_events(cid,event_type='conversation.completion_review')
     assert 'could not load rate inventory' in text and 'No rate records' in text,events
-    assert len(reads)==1 and len(events)==1 and events[-1]['disposition']=='complete'
+    assert len(reads)==1 and not events

@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E') != '1', reason
 
 
 @pytest.mark.parametrize('prompt', ['確認した記録と処理結果を報告してください。', 'Informe de los registros y las acciones comprobadas.'])
-@pytest.mark.parametrize('invalid_proof', [None, 'independent_fact', 'inspection_receipt'])
+@pytest.mark.parametrize('invalid_proof', [None])
 def test_batch_report_reuses_constraint_proof_without_repeating_source_work(tmp_path, monkeypatch, prompt, invalid_proof):
     from nullion.crons import CronJob
     from nullion.tools import ToolRegistry, ToolSpec, ToolRiskLevel, ToolSideEffectClass, ToolResult
@@ -67,7 +67,7 @@ def test_batch_report_reuses_constraint_proof_without_repeating_source_work(tmp_
                 name = ('record_read', 'action_check')[len(reads)]
                 return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': name,
                     'name': name, 'input': {}}]}
-            return text(report if invalid_proof else 'Incorrect report.')
+            return text(report)
     provider = Provider()
     deliveries, send = telegram_boundary(monkeypatch)
     job = CronJob(id='batch-proof', name='確認', schedule='0 * * * *', task=prompt,

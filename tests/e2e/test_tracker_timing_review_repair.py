@@ -12,7 +12,7 @@ pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Doc
 
 
 @pytest.mark.parametrize('prompt',['15分ごとに3時間監視してください。','Comprueba cada 15 minutos durante tres horas.'])
-def test_reviewer_repairs_duration_without_rebuilding_the_source(fixture,prompt):
+def test_primary_declares_full_duration_without_rebuilding_the_source(fixture,prompt):
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.live_tracking_tools import register_live_tracker_tools
     from nullion.turn_context_policy import TurnToolScopeDecision
@@ -48,7 +48,7 @@ def test_reviewer_repairs_duration_without_rebuilding_the_source(fixture,prompt)
             if protocol is not None:return protocol
             self.steps+=1
             if self.steps==1:return tool('sensor_read',{})
-            if self.steps==2:return tool('create_live_tracker',{'name':'観測','duration_seconds':10500,'interval_seconds':900,
+            if self.steps==2:return tool('create_live_tracker',{'name':'観測','duration_seconds':10800,'interval_seconds':900,
                 'probe':[{'tool_name':'sensor_read','arguments':{}}],'matcher':matcher('greater_than',99)})
             if self.reviews and len(f.store.list('workspace_admin'))==1 and self.steps==4:
                 ident=f.store.list('workspace_admin')[0]['id']
@@ -63,8 +63,8 @@ def test_reviewer_repairs_duration_without_rebuilding_the_source(fixture,prompt)
         'failure':result.completion_failure_reply,'presentation':result.response_presentation,
         'review':str(result.outcome_review_receipt),'steps':model.steps,'reviews':model.reviews,
         'tools':[(r.tool_name,r.status,r.error) for r in result.tool_results]},ensure_ascii=False)
-    assert model.reviews==2 and len(f.readings)==1
-    assert [r.tool_name for r in result.tool_results]==['sensor_read','create_live_tracker','update_live_tracker']
+    assert model.reviews == 0 and len(f.readings) == 1
+    assert [r.tool_name for r in result.tool_results]==['sensor_read','create_live_tracker']
     assert len(f.store.list('workspace_admin'))==1
     receipts=[r.output['deferred_execution'] for r in result.tool_results if isinstance(r.output,dict) and 'deferred_execution' in r.output]
     assert receipts[0]['handle']==receipts[-1]['handle']

@@ -1012,7 +1012,7 @@ def test_telegram_browser_text_answer_survives_an_optional_failed_assertion(
         "review_calls": model.review_calls,
         "tool_results": chat_turns[-1].get("tool_results") if chat_turns else None,
     }
-    assert model.review_calls == 1
+    assert model.review_calls == 0
     assert "Dermaharmony" in reply
     assert "5% sulfur" in reply
     assert "$9.99" in reply
@@ -1529,7 +1529,7 @@ def test_telegram_browser_detail_answer_does_not_trigger_terminal_revalidation(
     assert terminal_form_action["output"]["session_id"] == final_browser_read["output"]["session_id"]
     assert len(terminal_mutation_invocation_ids) == 1
     assert "terminal_revalidation" not in final_browser_read["output"]
-    assert model.review_calls == 1, [row for row in runtime.store.list_conversation_events("telegram:100001")
+    assert model.review_calls == 0, [row for row in runtime.store.list_conversation_events("telegram:100001")
         if row.get("event_type") in {"conversation.completion_requirement_contract", "conversation.completion_review"}]
     click_result = next(
         item
@@ -1728,7 +1728,7 @@ def test_agent_browser_turns_run_concurrently_with_isolated_task_sessions() -> N
     assert len(set(result_sessions)) == 2
 
 
-def test_browser_turns_review_once_without_duplicate_delivery_latency() -> None:
+def test_browser_turns_finish_without_quality_review_or_duplicate_delivery_latency() -> None:
     from nullion.agent_orchestrator import AgentOrchestrator
     from nullion.tools import ToolRegistry, ToolResult, ToolRiskLevel, ToolSideEffectClass, ToolSpec
 
@@ -1814,7 +1814,7 @@ def test_browser_turns_review_once_without_duplicate_delivery_latency() -> None:
 
     average_ms = sum(elapsed_ms) / len(elapsed_ms)
     p95_ms = max(elapsed_ms)
-    assert model.review_calls == 5
+    assert model.review_calls == 0
     assert invocations == ["browser_extract_text"] * 5
     assert average_ms < 650, f"successful browser average latency regressed: avg={average_ms:.1f}ms samples={elapsed_ms!r}"
     assert p95_ms < 1200, f"successful browser p95 latency regressed: p95={p95_ms:.1f}ms samples={elapsed_ms!r}"

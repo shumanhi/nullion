@@ -183,6 +183,14 @@ def test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
             if 'select_attachment_format' in names:
                 return {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use', 'id': 'format', 'name': 'select_attachment_format', 'input': {'extension': None, 'confidence': 1}}]}
             self.outer_calls += 1
+            if self.outer_calls == 3:
+                captured = json.dumps(kwargs['messages'], ensure_ascii=False)
+                assert '73' in captured and '2h 17m' in captured
+                final = '- **候補 A** — 10:45; €73; 2h 17m'
+                if failure in {'comparison', 'comparison_document'}:
+                    final += '\n- **候補 B** — 11:30; €84; 3h 05m'
+                if failure == 'absence': final += '\n\nこのページには配達予定日の表示がありません。'
+                return response(final)
             name, args = ('request_tool_scope', {'capabilities': ['web'], 'tool_names': ['browser_run_task'], 'required_tool_names': ['browser_run_task']}) if self.outer_calls == 1 else (
                 'browser_run_task', {'task': '比較して。候補、時間、価格、所要時間を返して。', 'url': url, 'max_steps': 5})
             assert self.outer_calls <= 2, 'The outer graph must receive corrected evidence from the same browser invocation'
@@ -203,12 +211,12 @@ def test_invalid_done_is_repaired_in_same_real_browser_before_visible_delivery(
             assert reports[0]['rejection_counts'] == ({} if failure in {'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls'} else {('value_not_in_quote' if failure == 'value' else 'quote_not_captured'): 1})
             if failure not in {'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls'}: assert reports[0]['observations'][-1]['quote'] == '候補 A\n10:45\n€\n73\n2h 17m'
             assert model.browser_calls == (1 if failure in {'value', 'fields', 'absence', 'comparison', 'comparison_document', 'indexed_controls'} else 3)
-            if failure in {'comparison', 'comparison_document'}: assert model.review_calls >= 1 and '候補 B' in text and '84' in text and '3h 05m' in text
-            if failure == 'absence': assert model.review_calls >= 1 and '配達予定日の表示がありません' in text
-            if failure == 'fields': assert model.review_calls >= 1 and text.count('- **') == 1
+            if failure in {'comparison', 'comparison_document'}: assert model.review_calls == 0 and '候補 B' in text and ('84' in text) and ('3h 05m' in text)
+            if failure == 'absence': assert model.review_calls == 0 and '配達予定日の表示がありません' in text
+            if failure == 'fields': assert model.review_calls == 0 and text.count('- **') == 1
             if failure == 'value':
                 assert reports[0]['evidence_value_repair_count'] == 1
-                assert model.review_calls >= 1, 'An exact but irrelevant quote must not bypass outcome review'
+                assert model.review_calls == 0, 'An exact but irrelevant quote must not bypass outcome review'
             history = client.get('/api/chat/history/'+conversation, params={'turn_ids': json.dumps([turn['turn_id']])})
             assert history.json()['terminal_replies'][0]['text'] == text
         wire = []

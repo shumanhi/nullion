@@ -259,6 +259,8 @@ def _telegram_reply_context(message) -> dict[str, object] | None:
     replied_text = _message_text_or_caption(replied)
     if isinstance(replied_text, str) and replied_text.strip():
         context["reply_to_text"] = replied_text.strip()
+    if _telegram_message_has_attachment_candidate(replied) and not getattr(getattr(replied, "from_user", None), "is_bot", False):
+        context["reply_to_has_attachment"] = True
     replied_user = getattr(replied, "from_user", None)
     if replied_user is not None:
         is_bot = getattr(replied_user, "is_bot", None)
@@ -3554,6 +3556,60 @@ async def _download_telegram_attachment_messages(
     return attachments
 
 
+async def _telegram_reply_attachments(message, context, *, runtime, settings) -> list[dict[str, str]]:
+    """Resolve only the explicitly quoted message, even if its run was interrupted."""
+    replied = getattr(message, "reply_to_message", None)
+    if replied is None or not _telegram_message_has_attachment_candidate(replied):
+        return []
+    # A bot document is an output, not new user input. Its delivery receipt is
+    # resolved by the existing continuation path instead.
+    if getattr(getattr(replied, "from_user", None), "is_bot", False):
+        return []
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    replied_chat_id = getattr(getattr(replied, "chat", None), "id", None)
+    if chat_id is None or str(replied_chat_id) != str(chat_id):
+        return []
+    message_id = _telegram_message_id(message=replied, chat_id=str(chat_id))
+    media_group_id = _telegram_media_group_id(replied)
+    if media_group_id:
+        message_id = f"telegram-media-group:{chat_id}:{media_group_id}"
+    list_events = getattr(getattr(runtime, "store", None), "list_recent_conversation_events", None)
+    if callable(list_events):
+        for event in reversed(list_events(f"telegram:{chat_id}", event_type="conversation.attachment_received", limit=64)):
+            if event.get("message_id") != message_id:
+                continue
+            attachments = event.get("attachments")
+            if isinstance(attachments, list) and attachments and all(
+                isinstance(item, dict) and str(item.get("path") or "")
+                and Path(item["path"]).is_file() for item in attachments
+            ):
+                return [dict(item) for item in attachments]
+            break
+    # Telegram includes the original media reference in reply_to_message. It
+    # remains usable when no completed turn (or durable receipt) exists yet.
+    return await _download_telegram_attachments(replied, context, settings=settings)
+
+
+def _checkpoint_telegram_attachment_receipt(runtime, *, conversation_id, message_id, request_id, text, attachments):
+    """Persist input identity before admission/classification or a model call."""
+    receipt = {
+        "event_type": "conversation.attachment_received",
+        "created_at": datetime.now(UTC).isoformat(),
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "turn_id": request_id,
+        "user_message": text,
+        "attachments": [dict(item) for item in attachments],
+    }
+    runtime.store.add_conversation_event(receipt)
+    from nullion.runtime_persistence import checkpoint_runtime_conversation_events
+
+    checkpoint_runtime_conversation_events(
+        runtime.store, runtime.checkpoint_path, conversation_id=conversation_id,
+        conversation_events=[receipt], timeout_seconds=5,
+    )
+
+
 def _telegram_media_group_id(message: object | None) -> str | None:
     value = getattr(message, "media_group_id", None)
     if value is None:
@@ -5055,6 +5111,27 @@ class ChatOperatorService:
             if media_group_messages is not None
             else await _download_telegram_attachments(message, context, settings=self.settings)
         )
+        # Save owned input separately from processing/dedupe completion. A
+        # restart must not erase an image while admission is still running.
+        if telegram_attachments and early_conversation_id and message_id_local:
+            try:
+                await asyncio.to_thread(
+                    _checkpoint_telegram_attachment_receipt, self.runtime,
+                    conversation_id=early_conversation_id, message_id=message_id_local,
+                    request_id=request_id, text=text_for_ack, attachments=telegram_attachments,
+                )
+            except Exception:
+                logger.exception("Could not persist Telegram attachment input")
+                await _deliver_reply(
+                    message, "I received your attachment, but couldn't save the request safely. Please send it again.",
+                    request_id=request_id, turn_id=request_id, phase="telegram_attachment_persistence_failed",
+                )
+                return
+        quoted_attachments = await _telegram_reply_attachments(
+            message, context, runtime=self.runtime, settings=self.settings,
+        )
+        own_paths = {item.get("path") for item in telegram_attachments if item.get("path")}
+        telegram_attachments.extend(item for item in quoted_attachments if not item.get("path") or item["path"] not in own_paths)
         text_override_for_handler = None
         if text_for_ack is None and telegram_attachments:
             voice_transcript = _voice_instruction_transcript(

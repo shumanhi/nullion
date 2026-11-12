@@ -2182,7 +2182,7 @@ def test_agent_orchestrator_replaces_fake_completion_after_required_tool_retries
     )
 
     result = update["result"]
-    assert result.final_text == "I couldn't attach the requested file."
+    assert result.final_text == "The requested file has not been created."
     assert result.response_fulfilled is False
     assert result.completion_failure_reply == result.final_text
     assert "Created the requested" not in result.final_text
@@ -4340,7 +4340,7 @@ def test_scope_artifact_extension_rejects_text_sidecar_as_spreadsheet_delivery(
     )
 
     assert str(csv_path) not in reply
-    assert "couldn't attach the requested file" in enforced
+    assert "not available for delivery" in enforced
 
 
 def test_chat_attaches_all_explicit_mixed_format_artifacts(
@@ -6134,7 +6134,7 @@ def test_chat_rejects_pdf_pending_text_sidecar_for_pdf_request(
         required_attachment_extensions=(".pdf",),
     )
     assert decision.satisfied is False
-    assert decision.reply == "I couldn't attach the requested file."
+    assert decision.reply == "The requested file is not available for delivery."
 
 
 def test_chat_keeps_completed_file_write_text_artifact_internal_without_artifact_scope(
@@ -7830,7 +7830,7 @@ def test_response_fulfillment_blocks_completion_claims_without_required_evidence
     assert decision.satisfied is False
     assert "tool:file_write" in decision.missing_requirements
     assert "attachment:.txt" in decision.missing_requirements
-    assert decision.reply == "I couldn't attach the requested file."
+    assert decision.reply == "The requested file has not been created."
 
 
 def test_response_fulfillment_preserves_waiting_input_clarification(tmp_path) -> None:
@@ -9453,7 +9453,7 @@ def test_response_fulfillment_handles_structured_requested_deliverable_without_a
         required_attachment_extensions=(".png",),
     )
     assert no_claim.satisfied is False
-    assert no_claim.reply == "I couldn't attach the requested file."
+    assert no_claim.reply == "The requested file is not available for delivery."
 
     blocked = evaluate_response_fulfillment(
         store=Store(None),
@@ -9466,7 +9466,7 @@ def test_response_fulfillment_handles_structured_requested_deliverable_without_a
         required_attachment_extensions=(".png",),
     )
     assert blocked.satisfied is False
-    assert blocked.reply == "I couldn't attach the requested file."
+    assert blocked.reply == "The requested file has not been created."
 
 
 def test_response_fulfillment_does_not_promote_unrequested_scheduled_pdf_artifact(tmp_path) -> None:
@@ -9914,7 +9914,7 @@ def test_fulfillment_partial_mixed_artifact_pack_does_not_leak_tool_error(tmp_pa
     )
 
     assert decision.satisfied is False
-    assert decision.reply == "I couldn't attach all of the requested files."
+    assert decision.reply == "Some requested files are not available for delivery."
     assert "document_create output_path" not in decision.reply
     assert "attachment:.docx" in decision.missing_requirements
     assert "attachment:.html" in decision.missing_requirements
@@ -11309,7 +11309,10 @@ def test_last_mile_artifact_fulfillment_blocks_text_only_success(tmp_path: Path,
         conversation_id=conversation_id,
     )
 
-    assert reply == "I couldn't attach all of the requested files."
+    assert reply.endswith("Some requested files are not available for delivery.")
+    for path in (pdf, docx, pptx):
+        assert f"MEDIA:{path}" in reply
+    assert "package.html" not in reply
     assert "unrequested.xlsx" not in reply
 
 
@@ -18771,8 +18774,8 @@ def test_unavailable_review_keeps_search_leads_without_claiming_live_booking() -
     )
 
     assert handler_calls == ['web_search', 'browser_click_element']
-    assert result.response_fulfilled is None
-    assert result.response_presentation['outcome_review_status'] == 'unavailable'
+    assert result.response_fulfilled is True
+    assert 'outcome_review_status' not in result.response_presentation
     assert 'Review warning:' not in result.final_text
     assert 'Reservation form' not in result.final_text
 
@@ -19420,7 +19423,7 @@ async def test_scheduled_deep_agent_completion_gate_blocks_unverified_dependency
     assert result.error is None
     assert "The scheduled step did not have enough verified evidence." not in (result.error or "")
     assert context_bus.get("verified_research", group_id="group-report") is not None
-    assert result.report_presentation["outcome_review_role"] == "helper"
+    assert "outcome_review_role" not in (getattr(result, "report_presentation", None) or {})
 
 
 @pytest.mark.asyncio
@@ -21130,7 +21133,7 @@ async def test_deep_agent_unavailable_review_does_not_certify_fallback_workbook(
 
     assert result.status == "success"
     assert result.error is None
-    assert result.report_presentation["outcome_review_status"] == "unavailable"
+    assert "outcome_review_status" not in (getattr(result, "report_presentation", None) or {})
     assert result.output
     assert len(result.artifacts) == 1
     assert Path(result.artifacts[0]).is_file()
@@ -21193,7 +21196,7 @@ async def test_deep_agent_timeout_recovers_context_handoff_from_completed_file_t
 
     assert result.status == "success"
     assert result.error is None
-    assert result.report_presentation["outcome_review_status"] == "unavailable"
+    assert "outcome_review_status" not in (getattr(result, "report_presentation", None) or {})
     assert not result.artifacts
     assert isinstance(result.context_out, dict)
     workspace_files = result.context_out["workspace_files"]

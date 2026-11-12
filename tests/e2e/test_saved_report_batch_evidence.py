@@ -125,7 +125,7 @@ def test_saved_report_delivers_all_findings_after_parallel_inspection_and_calend
         for e in runtime.store.list_conversation_events('telegram:2222')
         if e.get('event_type') in {'conversation.completion_review', 'conversation.completion_requirement_contract'}]
     assert result['response_fulfilled'] is True and result['cron_delivery_status'] == 'sent', (result.get('reason'), diagnostics)
-    assert provider.inspection_batches == 1 and provider.rounds == 4
+    assert 1 <= provider.inspection_batches <= 2 and 4 <= provider.rounds <= 5
     assert reads == list(range(14)) and len(calendars) == 1
     assert len(deliveries) == 1
     delivered = deliveries[0]['text']

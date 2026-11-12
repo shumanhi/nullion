@@ -61,26 +61,6 @@ def test_explicit_shell_remains_selected_for_media_artifact_repairs(extension,re
     assert 'terminal_exec' in {row['name'] for row in widened.list_tool_definitions()}
 
 
-def test_completion_recovery_budget_is_bounded_even_with_large_global_limit(monkeypatch):
-    import nullion.agent_orchestrator as agent
-    from nullion.tools import ToolRegistry
-    monkeypatch.setattr(agent, '_review_risky_agent_completion', lambda *args, **kwargs:
-        agent._CompletionReviewDecision('retry', ('Repair the selected workbook cell.',), ('spreadsheet_create',)))
-    state={'user_message':'表を修正してください。','conversation_id':'web:budget','principal_id':'web:budget',
-        'tool_registry':ToolRegistry(),'runtime_store':None,'tool_results':[], 'artifacts':[],
-        'messages':[], 'content':[{'type':'text','text':'Prepared the files.'}],
-        'iterations':7,'max_iterations':60,'completion_review_count':0,'tool_flow_context':{'required_artifact_extensions':['.xlsx']}}
-    update=agent._agent_turn_finalize_node(state)
-    assert update['completion_review_count']==1
-    assert update['max_iterations']==60
-    assert update['completion_recovery_iteration_limit']==7+agent._COMPLETION_REVIEW_RECOVERY_MAX_ITERATIONS
-    assert update['completion_review_unresolved_requirements']==['Repair the selected workbook cell.']
-    terminal=agent._agent_turn_model_node({**state,**update,
-        'iterations':update['completion_recovery_iteration_limit']})
-    assert terminal['result'].response_fulfilled is not True
-    assert terminal['result'].reached_iteration_limit is False, 'Repair exhaustion must not request more global budget'
-    assert terminal['result'].response_presentation['outcome_review_role'] == 'helper'
-    assert terminal['result'].response_fulfilled is not True
 
 
 def test_explicit_selection_can_reselect_valid_covered_candidate(tmp_path):

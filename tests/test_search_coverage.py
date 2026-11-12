@@ -183,23 +183,6 @@ def test_query_and_fragment_scopes_are_never_silently_merged():
     assert len(discovery_ledger([row])['candidates']) == 4
 
 
-def test_rejected_scope_invalidates_review_cache_even_before_another_source_call(monkeypatch):
-    from nullion import agent_orchestrator as module
-    decisions = []
-    def review(state, **kwargs):
-        decisions.append(kwargs)
-        if len(decisions) == 1:
-            return module._CompletionReviewDecision('retry', ('Scope does not match original request',))
-        state['completion_requirement_contract_cache'].pop('invalid_search_scope')
-        return module._CompletionReviewDecision('complete')
-    monkeypatch.setattr(module, '_perform_completion_review', review)
-    state = {'user_message': '対象を確認', 'conversation_id': 'c', 'principal_id': 'c',
-        'completion_requirement_contract_cache': {}}
-    kwargs = {'final_text': 'Scoped result', 'tool_results': [], 'artifacts': [], 'force': True}
-    assert module._review_risky_agent_completion(state, **kwargs).disposition == 'retry'
-    state['completion_requirement_contract_cache']['invalid_search_scope'] = True
-    assert module._review_risky_agent_completion(state, **kwargs).disposition == 'complete'
-    assert len(decisions) == 2
 
 
 def test_bounded_observation_report_does_not_need_every_incidental_link_read():

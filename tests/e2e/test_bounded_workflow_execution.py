@@ -110,7 +110,7 @@ def test_large_saved_report_finishes_once_with_bounded_context_and_no_source_rer
     # therefore include that batch; the later small-batch view stays compact.
     assert max(provider.sizes) < 500_000 and sum(provider.sizes) < 2_000_000
     assert provider.sizes[5] < 180_000
-    assert provider.rounds == 8 and provider.reviews <= 2
+    assert provider.rounds == 8 and provider.reviews == 0
     timings = [e for e in runtime.store.list_conversation_events('telegram:2222') if e.get('event_type') == 'conversation.tool_timing']
     assert len(timings) == 130 and all(e.get('argument_fingerprint') for e in timings)
     # This measures local orchestration only; there is no live provider latency.

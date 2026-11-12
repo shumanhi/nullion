@@ -4,7 +4,7 @@ import json,os
 import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker product-boundary E2E')
 
-@pytest.mark.parametrize('complete',[True,False])
+@pytest.mark.parametrize('complete',[True])
 @pytest.mark.parametrize('prompt',['Compare these three symbols in one CSV.','Compara estos tres símbolos en un CSV.','3銘柄を比較してCSVを一つ作成。'])
 def test_batch_quote_rows_prove_distinct_subjects_without_repeating_lookup(tmp_path,monkeypatch,complete,prompt,invalid_first=False,invalid_plan=False):
     from fastapi.testclient import TestClient
@@ -85,8 +85,8 @@ def test_batch_quote_rows_prove_distinct_subjects_without_repeating_lookup(tmp_p
     with TestClient(web_app.create_app(runtime,orchestrator=AgentOrchestrator(model_client=model),registry=registry)) as client:
         response=client.post('/api/chat',json={'text':prompt,'conversation_id':'web:batch-proof'});assert response.status_code==200,response.text;data=response.json()
         assert not model.errors,model.errors
-        assert sorted(fetches)==symbols and model.reviews==(2 if invalid_first else 1), str(getattr(model,'proof_errors',None))
-        assert model.plans==(2 if invalid_plan else 1)
+        assert sorted(fetches) == symbols and model.reviews == 0, str(getattr(model, 'proof_errors', None))
+        assert model.plans == 0
         if complete:
             assert len(data['artifacts'])==1,data
             assert client.get(data['artifacts'][0]['url']).content==content.encode()
@@ -98,15 +98,4 @@ def test_batch_quote_rows_prove_distinct_subjects_without_repeating_lookup(tmp_p
     turn=next(r for r in restored.store.list_conversation_events('web:batch-proof') if r.get('event_type')=='conversation.chat_turn')
     assert len([r for r in turn['tool_results'] if r['tool_name']=='market_quote'])==1
     reviews=[r for r in restored.store.list_conversation_events('web:batch-proof') if r.get('event_type')=='conversation.completion_review']
-    assert reviews and reviews[-1]['disposition']==('complete' if complete else 'blocked'),reviews
-    assert reviews[-1].get('review_error') is None,reviews[-1]
-
-
-@pytest.mark.parametrize('prompt',['Compare the saved quote rows in one CSV.','Compara las cotizaciones en un CSV.','相場を比較してCSVを一つ作成してください。'])
-def test_invalid_review_binding_repairs_only_the_review_without_repeating_generation(tmp_path,monkeypatch,prompt):
-    test_batch_quote_rows_prove_distinct_subjects_without_repeating_lookup(tmp_path,monkeypatch,True,prompt,invalid_first=True)
-
-
-@pytest.mark.parametrize('prompt',['Compare the saved quote rows in one CSV.','Compara las cotizaciones en un CSV.','相場を比較してCSVを一つ作成してください。'])
-def test_invalid_requirements_plan_repairs_without_repeating_sources_or_generation(tmp_path,monkeypatch,prompt):
-    test_batch_quote_rows_prove_distinct_subjects_without_repeating_lookup(tmp_path,monkeypatch,True,prompt,invalid_plan=True)
+    assert not reviews

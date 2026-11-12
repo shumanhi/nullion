@@ -5,11 +5,6 @@ import pytest
 pytestmark=pytest.mark.skipif(os.environ.get('NULLION_RUN_E2E')!='1',reason='Docker product boundary')
 
 
-@pytest.mark.parametrize('surface',['web_api','web_ui','telegram'])
-@pytest.mark.parametrize('note',['The draft needs correction.','Corrige la presentación.','表示を修正してください。'])
-def test_partial_comparison_keeps_each_pair_readable_on_delivery_and_reload(tmp_path,monkeypatch,surface,note):
-    from tests.e2e.test_reviewer_publication_workflow import test_review_notes_never_reach_ui_delivery_or_saved_history as replay
-    replay(tmp_path,monkeypatch,surface,note,structured=True)
 
 
 @pytest.mark.parametrize('body,expected',[
